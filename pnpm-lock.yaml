@@ -25,10 +25,10 @@ importers:
         version: 0.2.1
       '@qontinui/ui-bridge':
         specifier: ^0.3.2
-        version: 0.3.2(@qontinui/ui-bridge-auto@0.1.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+        version: 0.3.2(@qontinui/ui-bridge-auto@0.1.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
       '@qontinui/ui-bridge-auto':
-        specifier: ^0.1.0
-        version: 0.1.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+        specifier: ^0.1.1
+        version: 0.1.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
       '@qontinui/workflow-ui':
         specifier: ^0.1.0
         version: 0.1.0(@xyflow/react@12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(lucide-react@1.14.0(react@19.2.5))(mermaid@11.14.0)(react-window@2.2.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)
@@ -148,7 +148,7 @@ importers:
         version: 2.4.1(react@19.2.5)
       qontinui-navigation:
         specifier: ^0.1.0
-        version: 0.1.0(@qontinui/ui-bridge@0.3.2(@qontinui/ui-bridge-auto@0.1.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react@19.2.5)
+        version: 0.1.0(@qontinui/ui-bridge@0.3.2(@qontinui/ui-bridge-auto@0.1.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react@19.2.5)
       qrcode.react:
         specifier: ^4.2.0
         version: 4.2.0(react@19.2.5)
@@ -1117,8 +1117,8 @@ packages:
   '@qontinui/shared-types@0.2.1':
     resolution: {integrity: sha512-j3fQg0gCMqQ7Rzfuhlxm0p5GhwsIb4i+ge0S9tBaUZiXAxCjm2lG4WZK6VMqjxo9Rg2yknMmyZ1RE1KigDSzmA==}
 
-  '@qontinui/ui-bridge-auto@0.1.0':
-    resolution: {integrity: sha512-bAzGqm7YcthyHT/7aPUKtOWEfaUZUHKXm65fCGXudH8mFQV95oCI4b4WWg3Esoc/TM0WM2ozaeXypnrwN5E3jQ==}
+  '@qontinui/ui-bridge-auto@0.1.1':
+    resolution: {integrity: sha512-5QlYxYqYcO+r98du/HhE0FqSUw/QWMXig8PRIBqxaeskZfVfIpsiAUw3RV/4diPFra/hjqxuyloHFT8Ou/DAhA==}
     hasBin: true
     peerDependencies:
       tesseract.js: '>=5.0.0'
@@ -1932,6 +1932,9 @@ packages:
     peerDependencies:
       '@testing-library/dom': '>=7.21.4'
 
+  '@ts-morph/common@0.28.1':
+    resolution: {integrity: sha512-W74iWf7ILp1ZKNYXY5qbddNaml7e9Sedv5lvU1V8lftlitkc9Pq1A+jlH23ltDgWYeZFFEqGCD1Ies9hqu3O+g==}
+
   '@tybys/wasm-util@0.10.1':
     resolution: {integrity: sha512-9tTaPJLSiejZKx+Bmog4uSubteqTvFrVrURwkmHixBo0G4seD0zUxp98E1DzUBJxLQ3NPwXrGKDiVjwx/DpPsg==}
 
@@ -2590,6 +2593,9 @@ packages:
   clsx@2.1.1:
     resolution: {integrity: sha512-eYm0QWBtUrBWZWG0d386OGAw16Z995PiOVo2B7bjWSbHedGl5e0ZWaq65kOGgUSNesEIDkB9ISbTg/JK9dhCZA==}
     engines: {node: '>=6'}
+
+  code-block-writer@13.0.3:
+    resolution: {integrity: sha512-Oofo0pq3IKnsFtuHqSF7TqBfr71aeyZDVJ0HpmqB7FBM2qEigL0iPONSCZSO9pE9dZTAxANe5XHG9Uy0YMv8cg==}
 
   color-convert@2.0.1:
     resolution: {integrity: sha512-RRECPsj7iu/xb5oKYcsFHSppFNnsj/52OVTRKb4zP5onXwVF3zVmmToNcOfGC+CRDpfK/U584fMg38ZHCaElKQ==}
@@ -4173,6 +4179,9 @@ packages:
   pascal-case@3.1.2:
     resolution: {integrity: sha512-uWlGT3YSnK9x3BQJaOdcZwrnV6hPpd8jFH1/ucpiLRPh/2zCVJKS19E4GvYHvaCcACn3foXZ0cLB9Wrx1KGe5g==}
 
+  path-browserify@1.0.1:
+    resolution: {integrity: sha512-b7uo2UCUOYZcnF/3ID0lulOJi/bafxa1xPe7ZPsammBSpjSWQkjNxlt635YGS2MiR9GjvuXCtz2emr3jbsz98g==}
+
   path-case@3.0.4:
     resolution: {integrity: sha512-qO4qCFjXqVTrcbPt/hQfhTQ+VhFsqNKOPtytgNKkKxSoEp3XPUQ8ObFuePylOIok5gjn69ry8XiULxCwot3Wfg==}
 
@@ -4780,6 +4789,9 @@ packages:
 
   ts-log@2.2.7:
     resolution: {integrity: sha512-320x5Ggei84AxzlXp91QkIGSw5wgaLT6GeAH0KsqDmRZdVWW2OiSeVvElVoatk3f7nicwXlElXsoFkARiGE2yg==}
+
+  ts-morph@27.0.2:
+    resolution: {integrity: sha512-fhUhgeljcrdZ+9DZND1De1029PrE+cMkIP7ooqkLRTrRLTqcki2AstsyJm0vRNbTbVCNJ0idGlbBrfqc7/nA8w==}
 
   tsconfig-paths@4.2.0:
     resolution: {integrity: sha512-NoZ4roiN7LnbKn9QqE1amc9DJfzvZXxF4xDavcOWt1BPkdx+m+0gJuPM+S0vCe7zTJMYUP0R8pO2XMr+Y8oLIg==}
@@ -6093,10 +6105,11 @@ snapshots:
 
   '@qontinui/shared-types@0.2.1': {}
 
-  '@qontinui/ui-bridge-auto@0.1.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)':
+  '@qontinui/ui-bridge-auto@0.1.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)':
     dependencies:
       '@qontinui/shared-types': 0.2.1
-      '@qontinui/ui-bridge': 0.3.2(@qontinui/ui-bridge-auto@0.1.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+      '@qontinui/ui-bridge': 0.3.2(@qontinui/ui-bridge-auto@0.1.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+      ts-morph: 27.0.2
     transitivePeerDependencies:
       - express
       - next
@@ -6113,11 +6126,11 @@ snapshots:
       - supports-color
       - typescript
 
-  '@qontinui/ui-bridge@0.3.2(@qontinui/ui-bridge-auto@0.1.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)':
+  '@qontinui/ui-bridge@0.3.2(@qontinui/ui-bridge-auto@0.1.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)':
     dependencies:
       react: 19.2.5
     optionalDependencies:
-      '@qontinui/ui-bridge-auto': 0.1.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+      '@qontinui/ui-bridge-auto': 0.1.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
       '@tauri-apps/api': 2.11.0
       react-dom: 19.2.5(react@19.2.5)
       ws: 8.20.0
@@ -6812,6 +6825,12 @@ snapshots:
   '@testing-library/user-event@14.6.1(@testing-library/dom@10.4.1)':
     dependencies:
       '@testing-library/dom': 10.4.1
+
+  '@ts-morph/common@0.28.1':
+    dependencies:
+      minimatch: 10.2.5
+      path-browserify: 1.0.1
+      tinyglobby: 0.2.16
 
   '@tybys/wasm-util@0.10.1':
     dependencies:
@@ -7614,6 +7633,8 @@ snapshots:
       wrap-ansi: 7.0.0
 
   clsx@2.1.1: {}
+
+  code-block-writer@13.0.3: {}
 
   color-convert@2.0.1:
     dependencies:
@@ -9577,6 +9598,8 @@ snapshots:
       no-case: 3.0.4
       tslib: 2.8.1
 
+  path-browserify@1.0.1: {}
+
   path-case@3.0.4:
     dependencies:
       dot-case: 3.0.4
@@ -9668,9 +9691,9 @@ snapshots:
 
   punycode@2.3.1: {}
 
-  qontinui-navigation@0.1.0(@qontinui/ui-bridge@0.3.2(@qontinui/ui-bridge-auto@0.1.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react@19.2.5):
+  qontinui-navigation@0.1.0(@qontinui/ui-bridge@0.3.2(@qontinui/ui-bridge-auto@0.1.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react@19.2.5):
     optionalDependencies:
-      '@qontinui/ui-bridge': 0.3.2(@qontinui/ui-bridge-auto@0.1.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+      '@qontinui/ui-bridge': 0.3.2(@qontinui/ui-bridge-auto@0.1.1(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
       react: 19.2.5
 
   qrcode.react@4.2.0(react@19.2.5):
@@ -10269,6 +10292,11 @@ snapshots:
   ts-dedent@2.2.0: {}
 
   ts-log@2.2.7: {}
+
+  ts-morph@27.0.2:
+    dependencies:
+      '@ts-morph/common': 0.28.1
+      code-block-writer: 13.0.3
 
   tsconfig-paths@4.2.0:
     dependencies:
