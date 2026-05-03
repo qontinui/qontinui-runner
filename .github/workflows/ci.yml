@@ -27,14 +27,21 @@ jobs:
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
-      # The remaining sibling-checkout is for src-tauri/Cargo.toml's
-      # `qontinui-types = { path = "../../qontinui-schemas/rust" }` — Rust
-      # publication is deferred per the cross-repo dep redesign plan.
-      # qontinui-schemas is public; no auth needed.
+      # The remaining sibling-checkouts are:
+      #   - qontinui-schemas: src-tauri/Cargo.toml's `qontinui-types = { path
+      #     = "../../qontinui-schemas/rust" }` — Rust publication is deferred
+      #     per the cross-repo dep redesign plan.
+      #   - qontinui-web: src/lib/spec-registry.ts is auto-generated and
+      #     statically imports 14 .spec.uibridge.json files from
+      #     qontinui-web/frontend/src/app at typecheck/build time. These are
+      #     cross-repo file imports rather than npm deps, so the redesign
+      #     doesn't migrate them.
+      # Both repos are public; no auth needed.
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
           git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-web.git
         shell: bash
 
       - name: Setup pnpm
