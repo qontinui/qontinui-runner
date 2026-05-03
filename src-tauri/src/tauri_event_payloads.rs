@@ -31,6 +31,61 @@ pub use qontinui_types::task_run::{
     TaskRunFindingSeverity as FindingSeverity, TaskRunFindingStatus as FindingStatus,
 };
 
+// ============================================================================
+// dev:seed-finding payload
+// ============================================================================
+
+/// Payload shape emitted on the `dev:seed-finding` Tauri event.
+///
+/// Field names use camelCase so the TS listener (`TauriFindingsListener.ts`)
+/// can spread them directly into a `Finding` object without translation.
+/// The actual emit site is in `commands::dev_findings::dev_seed_finding`.
+///
+/// Renamed in the schema registry to `DevSeedFindingPayload` to disambiguate
+/// from the various `Finding*` types in `qontinui_types::findings`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "DevSeedFindingPayload")]
+pub struct DevSeedFindingPayload {
+    pub id: String,
+    #[serde(rename = "categoryId")]
+    pub category_id: String,
+    pub severity: String,
+    pub status: String,
+    pub title: String,
+    pub description: String,
+    #[serde(rename = "detectedAt")]
+    pub detected_at: i64,
+    #[serde(rename = "actionType")]
+    pub action_type: String,
+    pub actionable: bool,
+    #[serde(rename = "sourceSessionId", skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
+}
+
+// ============================================================================
+// review-approved / review-rejected payloads
+// ============================================================================
+
+/// Payload shape for the `review-approved` and `review-rejected` Tauri events
+/// emitted by `commands::productivity::approve_recommendation` /
+/// `reject_recommendation` after a user resolves a medium-confidence
+/// recommendation card. Field names are explicit camelCase to match the
+/// `serde_json::json!()` literal previously used at the emit site.
+///
+/// Single struct shared by both channels: only `user_decision` differs
+/// (`"approved"` vs `"rejected"`), so a tagged enum would inflate the wire
+/// format without payoff.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "RecommendationReviewDecisionPayload")]
+pub struct RecommendationReviewDecisionPayload {
+    #[serde(rename = "reviewId")]
+    pub review_id: String,
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    #[serde(rename = "userDecision")]
+    pub user_decision: String,
+}
+
 /// Code context for a finding (runner-local wire shape).
 ///
 /// Renamed in the schema registry to `RunnerFindingCodeContext` to

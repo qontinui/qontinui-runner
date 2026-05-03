@@ -17,10 +17,11 @@
 //! [`commands::auth::get_test_auto_login`] which reads
 //! `QONTINUI_TEST_AUTO_LOGIN_EMAIL` from the process env.
 
-use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Runtime};
+
+use qontinui_runner_lib::tauri_event_payloads::DevSeedFindingPayload as SeedFindingPayload;
 
 /// Environment variable that gates all dev-only endpoints in this module.
 const DEV_ENV_VAR: &str = "QONTINUI_DEV_ENDPOINTS";
@@ -36,27 +37,10 @@ pub fn is_dev_endpoints_enabled() -> bool {
     std::env::var(DEV_ENV_VAR).as_deref() == Ok("1")
 }
 
-/// Payload shape emitted with the `dev:seed-finding` Tauri event.
-///
-/// Field names use camelCase so the TS listener can spread them directly
-/// into a `Finding` object without translation.
-#[derive(Debug, Clone, Serialize)]
-struct SeedFindingPayload {
-    id: String,
-    #[serde(rename = "categoryId")]
-    category_id: String,
-    severity: String,
-    status: String,
-    title: String,
-    description: String,
-    #[serde(rename = "detectedAt")]
-    detected_at: i64,
-    #[serde(rename = "actionType")]
-    action_type: String,
-    actionable: bool,
-    #[serde(rename = "sourceSessionId", skip_serializing_if = "Option::is_none")]
-    source_session_id: Option<String>,
-}
+// `SeedFindingPayload` is the canonical wire-format struct in
+// `qontinui_runner_lib::tauri_event_payloads::DevSeedFindingPayload`, which is
+// registered with schemars in `schema_export.rs` so the TS bindings stay in
+// sync with the Rust shape.
 
 /// Seed one or more synthetic findings into the frontend findings tracker.
 ///

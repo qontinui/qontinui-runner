@@ -601,41 +601,54 @@ async fn handle_outbound<S>(
             Ok(event) => {
                 let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("");
 
+                // Wire shapes are defined in `qontinui_runner_lib::relay_envelopes`
+                // (lib-side so the schema_export aggregator can register them) —
+                // see that module's docs for the discriminated-union contract
+                // shared with web + mobile consumers via
+                // `@qontinui/shared-types/tauri-events`.
+                use qontinui_runner_lib::relay_envelopes::RunnerRelayMessage;
                 let relay_msg = match channel {
                     "phase-result" => {
                         // event.payload = { execution_id, result }
                         let payload = event.get("payload").cloned().unwrap_or(Value::Null);
-                        serde_json::json!({
-                            "type": "phase_completed",
-                            "data": payload,
-                        })
+                        RunnerRelayMessage::PhaseCompleted { data: payload }
                     }
-                    "ui-error" => serde_json::json!({
-                        "type": "ui_error",
-                        "data": event.get("payload"),
-                    }),
-                    "recent-crash" => serde_json::json!({
-                        "type": "recent_crash",
-                        "data": event.get("payload"),
-                    }),
-                    "ai-output" => serde_json::json!({
-                        "type": "chat_response",
-                        "data": event.get("payload"),
-                    }),
-                    "session-state" => serde_json::json!({
-                        "type": "chat_session_state",
-                        "data": event.get("payload"),
-                    }),
-                    "terminal-output" => serde_json::json!({
-                        "type": "terminal_output",
-                        "terminal_id": event.get("payload").and_then(|p| p.get("terminal_id")),
-                        "data": event.get("payload").and_then(|p| p.get("data")),
-                    }),
-                    "terminal-exit" => serde_json::json!({
-                        "type": "terminal_exit",
-                        "terminal_id": event.get("payload").and_then(|p| p.get("terminal_id")),
-                        "exit_code": event.get("payload").and_then(|p| p.get("exit_code")),
-                    }),
+                    "ui-error" => RunnerRelayMessage::UiError {
+                        data: event.get("payload").cloned().unwrap_or(Value::Null),
+                    },
+                    "recent-crash" => RunnerRelayMessage::RecentCrash {
+                        data: event.get("payload").cloned().unwrap_or(Value::Null),
+                    },
+                    "ai-output" => RunnerRelayMessage::ChatResponse {
+                        data: event.get("payload").cloned().unwrap_or(Value::Null),
+                    },
+                    "session-state" => RunnerRelayMessage::ChatSessionState {
+                        data: event.get("payload").cloned().unwrap_or(Value::Null),
+                    },
+                    "terminal-output" => RunnerRelayMessage::TerminalOutput {
+                        terminal_id: event
+                            .get("payload")
+                            .and_then(|p| p.get("terminal_id"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        data: event
+                            .get("payload")
+                            .and_then(|p| p.get("data"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    },
+                    "terminal-exit" => RunnerRelayMessage::TerminalExit {
+                        terminal_id: event
+                            .get("payload")
+                            .and_then(|p| p.get("terminal_id"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        exit_code: event
+                            .get("payload")
+                            .and_then(|p| p.get("exit_code"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    },
                     _ => continue,
                 };
 

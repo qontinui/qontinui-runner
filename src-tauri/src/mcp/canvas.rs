@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -90,7 +91,16 @@ impl CanvasState {
 }
 
 /// A stored canvas panel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Wire-format mirror of `qontinui_types::app_events::CanvasPanel`. The
+/// canonical wire shape lives in qontinui-schemas so the schemars→TS
+/// pipeline can emit a typed `CanvasPanel` for the `canvas-update` Tauri
+/// event listener (`useCanvasData.ts`).
+///
+/// `data` stays `serde_json::Value` because each `component` type has a
+/// different inner shape — see the per-component data schemas in
+/// `qontinui-schemas/ts/src/canvas/index.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StoredPanel {
     pub panel_id: String,
     pub component: String,
@@ -245,11 +255,13 @@ async fn create_or_update_panel(
         canvas.panels.insert(panel.panel_id.clone(), panel.clone());
     }
 
-    // Emit canvas-update event
+    // Emit canvas-update event. `panel` now ships as a typed `StoredPanel`
+    // instead of a `serde_json::Value` so the schemars→TS pipeline produces
+    // a typed payload — wire format unchanged (snake_case fields).
     let event = AppEvent::CanvasUpdate {
         action: action.to_string(),
         panel_id: panel.panel_id.clone(),
-        panel: Some(serde_json::to_value(&panel).unwrap_or_default()),
+        panel: Some(panel.clone()),
         task_run_id: Some(task_run_id),
     };
     if let Err(e) = state.app_handle.emit(event.event_name(), &event) {
@@ -372,11 +384,11 @@ async fn patch_panel_data(
         updated_panel = panel.clone();
     }
 
-    // Emit canvas-update event
+    // Emit canvas-update event with the typed `StoredPanel` payload.
     let event = AppEvent::CanvasUpdate {
         action: "update".to_string(),
         panel_id: panel_id.clone(),
-        panel: Some(serde_json::to_value(&updated_panel).unwrap_or_default()),
+        panel: Some(updated_panel),
         task_run_id,
     };
     if let Err(e) = state.app_handle.emit(event.event_name(), &event) {
