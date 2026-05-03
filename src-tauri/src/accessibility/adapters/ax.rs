@@ -307,7 +307,10 @@ fn ax_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
     let count = array.len();
     let mut children = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let child = unsafe { *array.get(i) };
+        // core-foundation 0.10: CFArray::get returns Option<ItemRef<'_, T>>; deref ItemRef to recover T.
+        let Some(child) = array.get(i).map(|r| *r) else {
+            continue;
+        };
         if !child.is_null() {
             // Retain so that the child outlives the parent array
             unsafe { CFRetain(child as CFTypeRef) };
@@ -538,7 +541,10 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
     let title_lower = title.to_lowercase();
 
     for i in 0..array.len() {
-        let dict_ref = unsafe { *array.get(i) };
+        // core-foundation 0.10: CFArray::get returns Option<ItemRef<'_, T>>; deref ItemRef to recover T.
+        let Some(dict_ref) = array.get(i).map(|r| *r) else {
+            continue;
+        };
         if dict_ref.is_null() {
             continue;
         }
@@ -551,11 +557,11 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
             core_foundation::dictionary::CFDictionary::wrap_under_get_rule(dict_ref as *const _)
         };
 
-        // Use find() on the dictionary
-        let maybe_pid = pid_val.find(pid_key.as_CFTypeRef());
-        let maybe_name = pid_val.find(name_key.as_CFTypeRef());
+        // core-foundation 0.10: CFDictionary::find returns Option<ItemRef<'_, V>>; collapse to inner pointer.
+        let maybe_pid = pid_val.find(pid_key.as_CFTypeRef()).map(|r| *r);
+        let maybe_name = pid_val.find(name_key.as_CFTypeRef()).map(|r| *r);
 
-        if let (Some(&pid_ref), Some(&name_ref)) = (maybe_pid, maybe_name) {
+        if let (Some(pid_ref), Some(name_ref)) = (maybe_pid, maybe_name) {
             // Extract window name
             if name_ref.is_null() {
                 continue;
@@ -592,7 +598,10 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
                         unsafe { CFArray::wrap_under_create_rule(windows_val as *const _) };
 
                     for j in 0..windows.len() {
-                        let win = unsafe { *windows.get(j) };
+                        // core-foundation 0.10: CFArray::get returns Option<ItemRef<'_, T>>; deref ItemRef to recover T.
+                        let Some(win) = windows.get(j).map(|r| *r) else {
+                            continue;
+                        };
                         if win.is_null() {
                             continue;
                         }
