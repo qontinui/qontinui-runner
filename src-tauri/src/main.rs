@@ -158,6 +158,7 @@ mod vga;
 mod video_recorder;
 mod vision;
 mod wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
+mod win32_compat;
 mod window_manager;
 mod window_placement;
 mod workflow;
