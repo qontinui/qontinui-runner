@@ -865,7 +865,11 @@ fn compute_msys_augmented_path(bash_path: &str, current_path: &str) -> Option<St
 mod tests {
     use super::*;
 
+    // Windows-style backslash paths don't parse as paths on Linux/macOS
+    // (Path::parent returns None), so these tests can only validate the
+    // MSYS augmentation logic on Windows.
     #[test]
+    #[cfg(target_os = "windows")]
     fn test_compute_msys_augmented_path_prepends_when_missing() {
         let bash = r"C:\Program Files\Git\usr\bin\bash.exe";
         let path = r"C:\Windows\System32;C:\Windows";
@@ -881,6 +885,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn test_compute_msys_augmented_path_noop_when_present() {
         let bash = r"C:\Program Files\Git\usr\bin\bash.exe";
         // Current PATH already has the bash dir.

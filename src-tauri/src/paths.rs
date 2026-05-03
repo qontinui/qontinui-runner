@@ -459,7 +459,9 @@ mod tests {
 
     #[test]
     fn test_check_path_containment_passes_for_subdirectory() {
-        let boundary = PathBuf::from(if cfg!(windows) { "C:\\Users" } else { "/home" });
+        // /home doesn't exist on macOS (/Users instead); pick a directory
+        // that's guaranteed to exist on every platform.
+        let boundary = std::env::temp_dir();
         let child = boundary.join("test").join("subdir");
         let result = check_path_containment(&child, &boundary, "test/subdir");
         assert!(result.is_ok(), "Subdirectory should pass containment check");
