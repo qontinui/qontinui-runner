@@ -30,6 +30,22 @@ pub fn is_secondary() -> bool {
     instance_name().is_some()
 }
 
+/// Classify this runner from the env it was launched with.
+///
+/// Asymmetry note: `QONTINUI_INSTANCE_NAME` is set for both temp and named
+/// runners by the supervisor, so the runner alone cannot distinguish them.
+/// This helper returns `RunnerKind::Named { name }` for any secondary; the
+/// supervisor uses `RunnerKind::from_id` (with the runner id, not env) to
+/// produce the precise variant. Callers in the runner that need the
+/// secondary/primary split should still prefer `is_secondary()` for clarity.
+pub fn runner_kind() -> qontinui_types::wire::runner_kind::RunnerKind {
+    use qontinui_types::wire::runner_kind::RunnerKind;
+    match instance_name() {
+        Some(name) => RunnerKind::Named { name },
+        None => RunnerKind::Primary,
+    }
+}
+
 /// Returns the per-instance path segment, or `None` for the primary runner.
 ///
 /// Primary:   `None`                            → callers leave paths alone

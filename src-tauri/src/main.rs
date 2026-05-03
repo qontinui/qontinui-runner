@@ -489,7 +489,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Secondary instances (spawned by InstanceManager) must NOT use single-instance
     // plugin — it would prevent them from starting since they share the same binary.
-    let is_secondary_instance = std::env::var("QONTINUI_INSTANCE_NAME").is_ok();
+    let is_secondary_instance = instance::is_secondary();
 
     let mut builder = tauri::Builder::default();
 
@@ -1459,7 +1459,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 use tauri::Manager;
 
                 let data_dir = std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok();
-                let is_secondary = std::env::var("QONTINUI_INSTANCE_NAME").is_ok();
+                let is_secondary = instance::is_secondary();
 
                 if let Some(ref dir) = data_dir {
                     let _ = std::fs::create_dir_all(dir);
@@ -1751,7 +1751,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Start scheduler service in background (skip for secondary instances to avoid duplicate executions)
-            if std::env::var("QONTINUI_INSTANCE_NAME").is_ok() {
+            if instance::is_secondary() {
                 info!("Secondary instance — skipping scheduler service");
             } else {
                 info!("Starting scheduler service");
@@ -1946,7 +1946,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Auto-start processes (skip for secondary instances to avoid port conflicts)
-                let is_secondary = std::env::var("QONTINUI_INSTANCE_NAME").is_ok();
+                let is_secondary = instance::is_secondary();
                 if is_secondary {
                     info!("Secondary instance — skipping managed process auto-start");
                 } else {
@@ -2163,7 +2163,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Restore previously-running instances (primary instance only).
             // The session file only exists if the previous process was killed
             // (e.g. by a rebuild) rather than closed intentionally by the user.
-            if std::env::var("QONTINUI_INSTANCE_NAME").is_err() {
+            if !instance::is_secondary() {
                 let restore_ids = instance_manager::load_and_clear_active_instances();
                 if !restore_ids.is_empty() {
                     info!(
