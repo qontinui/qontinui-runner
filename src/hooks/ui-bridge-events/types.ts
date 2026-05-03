@@ -528,6 +528,13 @@ export interface UIBridgeRequestPayload {
   tabId?: string;
   /** DOM-tree depth for `get_element_dom_tree` (clamped server-side to [1,6]). */
   depth?: number;
+  /**
+   * Discover-only: force a registry rebuild before scanning. When true, the
+   * discovery handler dispatches `ui-bridge-route-change` (which clears the
+   * registry + bbox trackers and re-runs the auto-register scan) and waits
+   * for the scan-debounce window to settle so labels reflect live DOM.
+   */
+  force?: boolean;
 }
 
 /**

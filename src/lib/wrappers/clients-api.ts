@@ -15,7 +15,8 @@ export type AiClientId = "claude-cli" | "claude-desktop" | "cursor" | "continue"
 export type ConnectionState =
   | { kind: "Connected" }
   | { kind: "Drifted"; current_command: string; current_port: number | null }
-  | { kind: "NotConnected" };
+  | { kind: "NotConnected" }
+  | { kind: "ConfigParseError"; path: string };
 
 export interface ClientInfo {
   id: AiClientId;

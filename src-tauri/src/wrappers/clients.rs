@@ -92,6 +92,11 @@ pub enum ConnectionState {
         current_port: Option<u16>,
     },
     NotConnected,
+    // Surfaces malformed JSON at LIST time so the UI can disable Connect
+    // and point at the offending file before the user clicks anything.
+    ConfigParseError {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -193,11 +198,21 @@ fn connection_state_for(
     };
     let parsed: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
-        // Malformed JSON shows up here as NotConnected for the GET path —
-        // the connect handler surfaces ConfigParseFailed when the user
-        // actually tries to write.
-        Err(_) => return ConnectionState::NotConnected,
+        // Surface parse failure to the UI so Connect can be disabled and
+        // the bad path shown without waiting for an action-time 422.
+        Err(_) => {
+            return ConnectionState::ConfigParseError {
+                path: config_path.to_path_buf(),
+            }
+        }
     };
+    // A non-object root (e.g. a bare array) also can't host mcpServers —
+    // mirror connect_at_path's stricter check so the UI flags it the same way.
+    if !parsed.is_object() {
+        return ConnectionState::ConfigParseError {
+            path: config_path.to_path_buf(),
+        };
+    }
     let Some(entry) = parsed
         .get("mcpServers")
         .and_then(|v| v.get(MCP_KEY))
@@ -683,6 +698,22 @@ mod tests {
                 assert!(paths_equal(&current_command, &launcher));
             }
             other => panic!("expected Drifted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn detect_returns_config_parse_error_on_malformed_json() {
+        let _g = SERIAL.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg.json");
+        // Truncated mid-object — same shape as the AC #6 manual test.
+        fs::write(&cfg, r#"{"mcpServers": {"foo": "#).unwrap();
+        let launcher = launcher_for_tests(dir.path());
+
+        let state = connection_state_for(&cfg, &launcher, 9876);
+        match state {
+            ConnectionState::ConfigParseError { path } => assert_eq!(path, cfg),
+            other => panic!("expected ConfigParseError, got {:?}", other),
         }
     }
 

@@ -1293,7 +1293,10 @@ pub async fn ui_bridge_discover_handler(
             "limit": request.limit,
             "types": request.types,
             "selector": request.selector
-        }
+        },
+        // Top-level (not inside options) — force is a meta-flag about
+        // registry state rather than a discovery filter.
+        "force": request.force.unwrap_or(false)
     });
 
     match ui_bridge_request_sync(&state, "discover", payload).await {
@@ -1554,6 +1557,31 @@ pub async fn ui_bridge_get_snapshot_handler(
                                 "UI Bridge snapshot filter: visibleOnly={} currentRouteOnly={} kept {}/{} elements",
                                 visible_only, current_route_only, after, before
                             );
+                        }
+                    }
+                }
+            }
+
+            // Mirror the snapshot's top-level `activeTab` / `route` into the
+            // `registration` sub-object so callers reading `registration.activeTab`
+            // see the same value `/control/tabs` reports. Both top-level fields are
+            // populated by the SDK from the runner's `getActiveTab` callback (which
+            // reads `ACTIVE_TAB_STORAGE_KEY` — the source of truth `tabs_list` also
+            // reads), so we just copy them across without a second IPC round-trip.
+            // Purely additive: existing readers of `registration.{totalRegistered,
+            // everHadRegistrations, byRoute}` are unaffected.
+            {
+                let active_tab_val = data.get("activeTab").cloned();
+                let route_val = data.get("route").cloned();
+                if let Some(obj) = data.as_object_mut() {
+                    if let Some(reg_val) = obj.get_mut("registration") {
+                        if let Some(reg_obj) = reg_val.as_object_mut() {
+                            if let Some(v) = active_tab_val {
+                                reg_obj.insert("activeTab".to_string(), v);
+                            }
+                            if let Some(v) = route_val {
+                                reg_obj.insert("route".to_string(), v);
+                            }
                         }
                     }
                 }

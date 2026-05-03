@@ -280,6 +280,12 @@ function StatusPill({ info }: { info: ClientInfo }) {
           Not connected
         </span>
       );
+    case "ConfigParseError":
+      return (
+        <span className="inline-flex items-center rounded-full border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-400 uppercase tracking-wider whitespace-nowrap">
+          Invalid JSON
+        </span>
+      );
   }
 }
 
@@ -343,6 +349,16 @@ function ActionButton({ info, busy, onConnect, onReconnect, onDisconnect }: Acti
           {busy ? "Connecting…" : "Connect"}
         </button>
       );
+    case "ConfigParseError":
+      return (
+        <button
+          disabled
+          title={`Fix ${info.connection.path} first`}
+          className={`${baseClass} border border-border bg-muted/30 text-muted-foreground cursor-not-allowed`}
+        >
+          Connect
+        </button>
+      );
   }
 }
 
@@ -350,6 +366,8 @@ function DetailsPanel({ info }: { info: ClientInfo }) {
   const driftedCommand =
     info.connection.kind === "Drifted" ? info.connection.current_command : null;
   const driftedPort = info.connection.kind === "Drifted" ? info.connection.current_port : null;
+  const parseErrorPath =
+    info.connection.kind === "ConfigParseError" ? info.connection.path : null;
 
   return (
     <div className="rounded-md border border-border bg-background/40 p-3 text-xs space-y-3">
@@ -357,6 +375,18 @@ function DetailsPanel({ info }: { info: ClientInfo }) {
         <span className="font-medium text-muted-foreground">Config file:</span>{" "}
         <span className="font-mono text-foreground break-all">{info.config_path ?? "—"}</span>
       </div>
+
+      {parseErrorPath && (
+        <div className="rounded border border-red-500/30 bg-red-500/5 p-2 space-y-1">
+          <p className="font-medium text-red-400">Config error:</p>
+          <p>
+            <span className="font-mono break-all text-foreground">{parseErrorPath}</span>
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            Open this file and fix the JSON, or delete it to start fresh.
+          </p>
+        </div>
+      )}
 
       <div>
         <p className="font-medium text-muted-foreground mb-1">
