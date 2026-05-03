@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import type { TerminalInfo } from "@qontinui/shared-types/tauri-events";
 import type { CommandResponse } from "./types";
 import { createLogger } from "@/lib/logger";
 
@@ -26,25 +27,11 @@ export interface TerminalTab {
   claudeConfigDir?: string;
 }
 
-// Mirrors `qontinui-schemas/rust/src/terminal.rs::TerminalInfo`, which uses
-// `#[serde(rename_all = "camelCase")]`. Tauri's wire format ships these keys
-// as camelCase regardless of the Rust field names, so reading snake_case
-// (e.g. `event.payload.is_alive`) silently evaluates to `undefined`. See
-// memory `proj_tauri_event_payload_camelcase.md` and the sibling fix in
-// commit ed1b45d56 (TerminalInstance.tsx).
-interface TerminalInfo {
-  id: string;
-  title: string;
-  pid: number | null;
-  cols: number;
-  rows: number;
-  workingDir: string;
-  isAlive: boolean;
-  exitCode: number | null;
-  createdAt: number;
-  totalBytesProduced: number;
-  pageId?: string;
-}
+// `TerminalInfo` is imported from `@qontinui/shared-types/tauri-events` —
+// generated from the canonical Rust struct in
+// `qontinui-schemas/rust/src/terminal.rs`. Field names are camelCase via
+// `#[serde(rename_all = "camelCase")]`. Future serde renames break this
+// file at compile time instead of silently dropping events.
 
 export function useTerminalManager(pageId: string = "default") {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);

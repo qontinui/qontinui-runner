@@ -21,6 +21,19 @@ repos:
         language: system
         stages: [commit-msg]
 
+      # Drift guard for the Tauri event payload TypeScript bindings.
+      # Triggers when any of the source-of-truth Rust files change. The hook
+      # regenerates `qontinui-schemas/ts/src/generated/` + the `tauri-events`
+      # bundle and aborts the commit if the regenerated output differs from
+      # what's checked in. Run `npm run gen-events` from `qontinui-runner/`
+      # to refresh.
+      - id: gen-events-drift
+        name: Tauri Event Bindings Drift Guard
+        entry: bash .pre-commit-hooks/gen-events-drift.sh
+        language: system
+        files: '^(src-tauri/src/(event_system/types|tauri_event_payloads|findings/types|schema_export)\.rs|../qontinui-schemas/rust/src/(terminal|task_run|app_events)\.rs)$'
+        pass_filenames: false
+
 ci:
   autofix_prs: true
   autofix_commit_msg: 'chore: pre-commit auto fixes'

@@ -11,6 +11,7 @@
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
+import type { RunnerFinding } from "@qontinui/shared-types/tauri-events";
 import type {
   Finding,
   FindingSeverity,
@@ -21,60 +22,17 @@ import type {
 import { findingsTracker } from "./FindingsTracker";
 
 /**
- * Payload from Rust for finding_detected / finding_resolved events.
+ * Wire payload for `finding_detected` / `finding_resolved` events.
  *
- * Mirrors `qontinui-runner/src-tauri/src/findings/types.rs::Finding`, which
- * uses `#[serde(rename_all = "camelCase")]` (with `category` explicitly
- * renamed to `categoryId`). Tauri's wire format ships these keys as
- * camelCase regardless of the Rust field names, so reading snake_case
- * (e.g. `event.payload.task_run_id`) silently evaluates to `undefined`.
- * See memory `proj_tauri_event_payload_camelcase.md` and the sibling fix
- * in commit ed1b45d56 (TerminalInstance.tsx).
- *
- * `codeContext` and `userInput` are nested objects on the Rust struct, not
- * flattened — there is no `file_path` / `needs_input` / etc. on the wire.
+ * `RunnerFinding` is generated from the canonical Rust struct in
+ * `qontinui-runner/src-tauri/src/tauri_event_payloads.rs::Finding`. Future
+ * serde renames or shape changes break the TypeScript build at the call
+ * site instead of silently dropping events. The same wire shape covers
+ * both event channels (the Rust emit hands the entire `Finding` struct to
+ * both); the resolved listener only reads `id` / `resolution`.
  */
-interface FindingCodeContextWire {
-  file?: string;
-  line?: number;
-  column?: number;
-  snippet?: string;
-}
-
-interface FindingUserInputWire {
-  question: string;
-  input_type: string;
-  options?: string[];
-}
-
-interface FindingDetectedPayload {
-  id: string;
-  taskRunId: string;
-  sessionNum: number;
-  /** Renamed from `category` via `#[serde(rename = "categoryId")]`. */
-  categoryId: string;
-  severity: string;
-  status: string;
-  actionType: string;
-  title: string;
-  description: string;
-  resolution?: string;
-  codeContext?: FindingCodeContextWire;
-  signatureHash: string;
-  userInput?: FindingUserInputWire;
-  userResponse?: string;
-  detectedAt: string;
-  resolvedAt?: string;
-  resolvedInSession?: number;
-  updatedAt: string;
-}
-
-/**
- * Payload from Rust for finding_resolved event. Same wire shape as
- * `finding_detected` (the Rust emit hands the entire `Finding` struct to
- * both event channels), but the consumer only needs id / resolution.
- */
-type FindingResolvedPayload = FindingDetectedPayload;
+type FindingDetectedPayload = RunnerFinding;
+type FindingResolvedPayload = RunnerFinding;
 
 /**
  * Payload emitted by the dev-only `dev_seed_finding` Tauri command.
@@ -121,13 +79,16 @@ function seedPayloadToFinding(payload: DevSeedFindingPayload): Finding {
  * snake_case fields) — see the Wire shape comment on `FindingDetectedPayload`.
  */
 function payloadToFinding(payload: FindingDetectedPayload): Finding {
-  // Note: Rust payload exposes column on codeContext but frontend CodeContext doesn't use it
+  // Note: Rust payload exposes column on codeContext but frontend CodeContext doesn't use it.
+  // Generated `RunnerFindingCodeContext` uses `string | null | undefined` for nullable
+  // fields (Rust `Option<T>` with `skip_serializing_if`); coerce nulls to undefined to
+  // match the frontend `CodeContext` shape.
   const codeContext: CodeContext | undefined =
     payload.codeContext && (payload.codeContext.file || payload.codeContext.line)
       ? {
-          file: payload.codeContext.file,
-          line: payload.codeContext.line,
-          snippet: payload.codeContext.snippet,
+          file: payload.codeContext.file ?? undefined,
+          line: payload.codeContext.line ?? undefined,
+          snippet: payload.codeContext.snippet ?? undefined,
         }
       : undefined;
 
@@ -147,8 +108,8 @@ function payloadToFinding(payload: FindingDetectedPayload): Finding {
     actionType,
     actionable: actionType !== "informational",
     codeContext,
-    resolution: payload.resolution,
-    userResponse: payload.userResponse,
+    resolution: payload.resolution ?? undefined,
+    userResponse: payload.userResponse ?? undefined,
   };
 
   // Create pending question if user_input is present (the Rust `Finding`

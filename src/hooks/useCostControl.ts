@@ -10,6 +10,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import type { AppEvent } from "@qontinui/shared-types/tauri-events";
 import type {
   CostUpdateEvent,
   BudgetWarningEvent,
@@ -17,6 +18,15 @@ import type {
   CostDashboard,
   ActiveBudgetStatus,
 } from "../components/cost-control/types";
+
+/**
+ * Narrow `AppEvent` to a single variant by `event_type` discriminator.
+ * See `useTriggers.ts` for the full rationale.
+ */
+type AppEventOf<T extends AppEvent["event_type"]> = Extract<
+  AppEvent,
+  { event_type: T }
+>;
 
 const MAX_EVENTS = 200;
 
@@ -111,29 +121,33 @@ export function useCostControl() {
   useEffect(() => {
     const unlisteners: (() => void)[] = [];
 
-    listen<{ event_type: "CostUpdate"; data: CostUpdateEvent }>("cost-update", (event) => {
+    // The generated AppEvent envelope (from
+    // `qontinui-runner/src-tauri/src/event_system/types.rs`) is the source of
+    // truth for the wire shape. Narrowing by `event_type` keeps
+    // `event.payload.data.<field>` type-safe and breaks the build at this
+    // call site if the Rust struct drifts. The local `CostUpdateEvent` /
+    // `BudgetWarningEvent` / `CostAnomalyEvent` shapes still drive React
+    // state — they're a structural subset of the generated `data` shape.
+    listen<AppEventOf<"CostUpdate">>("cost-update", (event) => {
       const inner = event.payload?.data;
       if (!inner) return;
       setCostEvents((prev) => {
-        const next = [inner, ...prev];
+        const next = [inner as unknown as CostUpdateEvent, ...prev];
         return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
       });
       scheduleInvalidation();
     }).then((unlisten) => unlisteners.push(unlisten));
 
-    listen<{ event_type: "BudgetWarning"; data: BudgetWarningEvent }>(
-      "budget-warning",
-      (event) => {
-        const inner = event.payload?.data;
-        if (!inner) return;
-        setBudgetWarnings((prev) => [inner, ...prev]);
-      },
-    ).then((unlisten) => unlisteners.push(unlisten));
-
-    listen<{ event_type: "CostAnomaly"; data: CostAnomalyEvent }>("cost-anomaly", (event) => {
+    listen<AppEventOf<"BudgetWarning">>("budget-warning", (event) => {
       const inner = event.payload?.data;
       if (!inner) return;
-      setAnomalies((prev) => [inner, ...prev]);
+      setBudgetWarnings((prev) => [inner as unknown as BudgetWarningEvent, ...prev]);
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen<AppEventOf<"CostAnomaly">>("cost-anomaly", (event) => {
+      const inner = event.payload?.data;
+      if (!inner) return;
+      setAnomalies((prev) => [inner as unknown as CostAnomalyEvent, ...prev]);
     }).then((unlisten) => unlisteners.push(unlisten));
 
     return () => {

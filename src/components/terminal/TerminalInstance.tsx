@@ -3,6 +3,10 @@ import { FilePathLinkProvider } from "./FilePathLinkProvider";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useUIBridgeOptional } from "@qontinui/ui-bridge";
+import type {
+  TerminalOutputEvent,
+  TerminalExitEvent,
+} from "@qontinui/shared-types/tauri-events";
 import { createTerminalBackend } from "./backends";
 import type { BackendType, ITerminalBackend } from "./backends";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
@@ -56,15 +60,10 @@ interface TerminalInstanceProps {
   onTitleChange?: (title: string) => void;
 }
 
-interface TerminalOutputEvent {
-  terminalId: string;
-  data: string; // base64
-}
-
-interface TerminalExitEvent {
-  terminalId: string;
-  exitCode: number | null;
-}
+// `TerminalOutputEvent` and `TerminalExitEvent` are imported from
+// `@qontinui/shared-types/tauri-events` — generated from the canonical Rust
+// structs in `qontinui-schemas/rust/src/terminal.rs`. Future serde renames
+// will break this file at compile time instead of silently dropping events.
 
 /** Encode a Uint8Array to base64 without stack overflow on large buffers. */
 function uint8ToBase64(bytes: Uint8Array): string {
@@ -676,7 +675,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           backend.write(
             `\r\n\x1b[90m[Process exited with code ${event.payload.exitCode ?? "unknown"}]\x1b[0m\r\n`,
           );
-          onExitRef.current?.(event.payload.exitCode);
+          onExitRef.current?.(event.payload.exitCode ?? null);
         });
         if (disposed) return;
 

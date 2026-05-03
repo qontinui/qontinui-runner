@@ -113,6 +113,8 @@
     "graphql:codegen": "graphql-codegen",
     "graphql:check": "graphql-codegen && git diff --exit-code src/generated/graphql.ts || (echo 'GraphQL codegen output is stale — run npm run graphql:codegen' && exit 1)",
     "graphql:schema": "cd src-tauri && cargo test --bin qontinui-runner schema_exports_valid_sdl -- --nocapture",
+    "gen-events": "bash src-tauri/scripts/generate_types.sh --ts-only && cd ../qontinui-schemas/ts && npm run build",
+    "gen-events:check": "npm run gen-events && git -C ../qontinui-schemas diff --exit-code ts/src/generated ts/src/tauri-events ts/dist/tauri-events.d.ts ts/dist/tauri-events.d.cts || (echo 'Generated Tauri event bindings are stale — run npm run gen-events from qontinui-runner/' && exit 1)",
     "typecheck": "tsc --noEmit"
   },
   "type": "module",

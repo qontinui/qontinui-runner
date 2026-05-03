@@ -14,4 +14,6 @@ pub use types::*;
 // `.from_str()` / `.is_terminal()` methods we layered on top of the
 // schemas-crate enums. Without the `Ext` traits in scope, the methods are
 // invisible.
-pub use types::{FindingActionTypeExt, FindingCategoryExt, FindingSeverityExt, FindingStatusExt};
+pub use types::{
+    FindingActionTypeExt, FindingCategoryExt, FindingExt, FindingSeverityExt, FindingStatusExt,
+};
