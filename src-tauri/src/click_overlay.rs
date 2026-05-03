@@ -203,21 +203,20 @@ pub fn initialize_overlay(app_handle: &tauri::AppHandle) -> Result<(), String> {
             .map_err(|e| format!("Invalid overlay URL: {}", e))?,
     );
 
+    // `transparent` requires the `unstable` Tauri feature on macOS in 2.5+;
+    // we don't enable it, so on macOS the overlay window is opaque. Leaving
+    // it gated keeps Linux + Windows transparent, where the feature compiles.
     let mut builder = WebviewWindowBuilder::new(app_handle, "click-overlay", url)
         .title("Click Overlay")
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false); // Start hidden, show on first highlight
-    // `transparent` requires the `unstable` Tauri feature on macOS in 2.5+;
-    // we don't enable it, so on macOS the overlay window is opaque. Leaving
-    // it gated keeps Linux + Windows transparent, where the feature compiles.
     #[cfg(not(target_os = "macos"))]
     {
         builder = builder.transparent(true);
     }
-    match builder.build()
-    {
+    match builder.build() {
         Ok(_window) => {
             OVERLAY_INITIALIZED.store(true, Ordering::Relaxed);
             info!("Click overlay window initialized");
