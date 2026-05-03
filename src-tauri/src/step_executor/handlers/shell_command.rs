@@ -425,6 +425,18 @@ impl ShellCommandHandler {
         (bash_path, c)
     }
 
+    /// Non-Windows stub. The MSYS-PATH augmentation is Windows-only — on
+    /// Linux/macOS bash is on PATH and runs natively, so we just return
+    /// `bash` from PATH. The runtime call paths that reach this function
+    /// (`is_bash` branches, `.sh` interpreter detection) all check for an
+    /// installed bash anyway, so a plain `bash` command is the right shape.
+    #[cfg(not(target_os = "windows"))]
+    pub(crate) fn spawn_git_bash_with_msys_path() -> (String, tokio::process::Command) {
+        let bash_path = "bash".to_string();
+        let c = tokio::process::Command::new(&bash_path);
+        (bash_path, c)
+    }
+
     /// Find Git for Windows bash.exe, preferring it over WSL's bash.
     ///
     /// Checks common Git install locations. Returns None if not found,
