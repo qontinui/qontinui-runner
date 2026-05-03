@@ -198,6 +198,105 @@ pub async fn get_graph(State(_state): State<Arc<ApiState>>) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// GET /spec/list
+// ---------------------------------------------------------------------------
+
+/// Per-page `DiscoveredSpec` listing.
+///
+/// Returns a `specs` array where each entry mirrors the TypeScript
+/// `DiscoveredSpec` shape consumed by the runner / web prompt builders
+/// (`qontinui-runner/src/lib/spec-prompt-builder.ts`,
+/// `qontinui-web/frontend/src/lib/spec-prompt-builder.ts`):
+///
+/// ```json
+/// {
+///   "specId": "<page-dir-name>",
+///   "appName": "Qontinui Runner",
+///   "config": {
+///     "version": "<projection.version>",
+///     "description": "<projection.description>",
+///     "groups": <projection.groups>,
+///     "metadata": <projection.metadata-or-null>
+///   }
+/// }
+/// ```
+///
+/// Per-page error policy: skip pages whose projection fails to load (no
+/// IR + no projection + no embedded fallback). Rationale: `/spec/list` is
+/// for discovery-time enumeration and downstream consumers can call
+/// `/spec/page/:id` to get a per-page error envelope. Mixing well-formed
+/// entries with error entries here would force every consumer to filter.
+pub async fn get_list(State(_state): State<Arc<ApiState>>) -> Response {
+    build_list_response(&storage::resolve_specs_root())
+}
+
+/// Inner implementation of `get_list` parameterized by the storage root so
+/// tests can exercise the response-building logic without constructing an
+/// `ApiState`.
+pub(crate) fn build_list_response(root: &std::path::Path) -> Response {
+    let ids = match storage::list_pages(root) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "list-pages-failed",
+                    json!({ "error": e.to_string() }),
+                )),
+            )
+                .into_response();
+        }
+    };
+    if ids.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "specs": [],
+                "reason": "no-pages-registered"
+            })),
+        )
+            .into_response();
+    }
+
+    let mut specs: Vec<Value> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        // Mirror get_page's resolution: prefer the on-disk projection;
+        // fall back to projecting the IR document on-the-fly when the
+        // projection file is absent (or fails to parse).
+        let projection: Option<Value> = match storage::read_projection(root, id) {
+            Ok(Some(v)) => Some(v),
+            _ => match storage::read_ir(root, id) {
+                Ok(Some(doc)) => {
+                    let notes = storage::read_notes(root, id).unwrap_or(None);
+                    Some(project_ir_to_bundled_page(&doc, notes.as_deref()))
+                }
+                _ => None,
+            },
+        };
+        let Some(projection) = projection else {
+            continue;
+        };
+        specs.push(json!({
+            "specId": id,
+            "appName": "Qontinui Runner",
+            "config": {
+                "version": projection.get("version").cloned().unwrap_or(Value::Null),
+                "description": projection.get("description").cloned().unwrap_or(Value::Null),
+                "groups": projection.get("groups").cloned().unwrap_or(Value::Array(Vec::new())),
+                "metadata": projection.get("metadata").cloned().unwrap_or(Value::Null),
+            }
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "specs": specs })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // POST /spec/query
 // ---------------------------------------------------------------------------
 

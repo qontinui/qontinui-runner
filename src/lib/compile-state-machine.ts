@@ -176,7 +176,7 @@ export type CompilationResult =
 
 /**
  * A single (specId, config) input to the compiler. The `specId` is the
- * stable identifier from `spec-registry.ts:328 getAllSpecs()` and is used
+ * stable identifier provided by the discovered-specs loader and is used
  * to scope per-spec invariants such as element uniqueness.
  */
 export interface SpecCompilerInput {
@@ -189,8 +189,7 @@ export interface SpecCompilerInput {
  *
  * Element uniqueness is enforced **per-spec** — the same element across two
  * specs is allowed; the same element across two states within one spec is a
- * quarantine. The disambiguator is the registry-provided `specId` (see
- * `spec-registry.ts:328 getAllSpecs()`).
+ * quarantine. The disambiguator is the loader-provided `specId`.
  *
  * @param inputs              Authored specs paired with their stable
  *                            registry `specId`. The `specId` scopes the

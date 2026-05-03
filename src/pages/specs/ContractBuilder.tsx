@@ -34,7 +34,7 @@ import type {
 } from "@qontinui/ui-bridge/contracts";
 import { CONTRACT_CONFIG_VERSION, validateContractConfig } from "@qontinui/ui-bridge/contracts";
 import type { SpecAssertion } from "@qontinui/ui-bridge";
-import { getAllSpecs } from "@/lib/spec-registry";
+import { useDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 
 // =============================================================================
 // State management
@@ -561,16 +561,16 @@ export function ContractBuilder() {
   } = state;
 
   // Load spec IDs + group IDs from the spec registry
+  const { specs: discoveredSpecs } = useDiscoveredSpecs();
   const specOptions = useMemo(() => {
-    const specs = getAllSpecs();
-    return specs.map((spec) => ({
+    return discoveredSpecs.map((spec) => ({
       specId: spec.specId,
       groups: (spec.config.groups || []).map((g: { id: string; name: string }) => ({
         id: g.id,
         name: g.name,
       })),
     }));
-  }, []);
+  }, [discoveredSpecs]);
 
   const activeContract = config.contracts[activeContractIndex] ?? null;
 

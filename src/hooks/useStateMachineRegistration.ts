@@ -32,7 +32,7 @@ import {
 // its own isolated globalRegistry variable, causing elements to be invisible to the engine.
 import { getGlobalRegistry } from "@qontinui/ui-bridge";
 import { getUIBridgeGlobal } from "./ui-bridge-events/utils";
-import { getAllSpecs } from "@/lib/spec-registry";
+import { loadDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
 import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
 import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compilation";
@@ -421,37 +421,40 @@ export function useStateMachineRegistration(): void {
     } else {
       // No persisted config — auto-compile from bundled specs so the engine
       // is always available (enables prompt-home navigation, loadStateMachine, etc.)
-      try {
-        const inputs = getAllSpecs().map((s) => ({
-          specId: s.specId,
-          config: s.config as SpecConfig,
-        }));
-        const result = compileStateMachineFromSpecs(inputs);
-        if (!result.compiled) {
-          // Quarantined — do NOT register a partial engine. Persist the
-          // record so the conflict can be inspected offline.
-          console.warn(
-            `[StateMachine] Auto-compile quarantined (${result.quarantine.conflicts.length} conflicts); engine not registered`,
-          );
-          void persistQuarantinedCompilation(result.quarantine);
-        } else {
-          const { stateMachine, stats } = result;
-          const states = (stateMachine.states ?? []) as StateDefinition[];
-          const transitions = (stateMachine.transitions ?? []) as TransitionDefinition[];
-          if (states.length > 0) {
-            engineRef.current = createAndRegisterEngine(states, transitions, engineRef.current);
-            // eslint-disable-next-line no-console
-            console.info(
-              `[StateMachine] Auto-compiled from bundled specs: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions`,
+      void (async () => {
+        try {
+          const discovered = await loadDiscoveredSpecs();
+          const inputs = discovered.map((s) => ({
+            specId: s.specId,
+            config: s.config as SpecConfig,
+          }));
+          const result = compileStateMachineFromSpecs(inputs);
+          if (!result.compiled) {
+            // Quarantined — do NOT register a partial engine. Persist the
+            // record so the conflict can be inspected offline.
+            console.warn(
+              `[StateMachine] Auto-compile quarantined (${result.quarantine.conflicts.length} conflicts); engine not registered`,
             );
-            // Best-effort: also persist to the backend DB so the compiled machine
-            // is available via the HTTP API (and survives runner restarts).
-            void persistCompiledStateMachine(stateMachine);
+            void persistQuarantinedCompilation(result.quarantine);
+          } else {
+            const { stateMachine, stats } = result;
+            const states = (stateMachine.states ?? []) as StateDefinition[];
+            const transitions = (stateMachine.transitions ?? []) as TransitionDefinition[];
+            if (states.length > 0) {
+              engineRef.current = createAndRegisterEngine(states, transitions, engineRef.current);
+              // eslint-disable-next-line no-console
+              console.info(
+                `[StateMachine] Auto-compiled from bundled specs: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions`,
+              );
+              // Best-effort: also persist to the backend DB so the compiled machine
+              // is available via the HTTP API (and survives runner restarts).
+              void persistCompiledStateMachine(stateMachine);
+            }
           }
+        } catch (e) {
+          console.warn("[StateMachine] Auto-compile from specs failed:", e);
         }
-      } catch (e) {
-        console.warn("[StateMachine] Auto-compile from specs failed:", e);
-      }
+      })();
     }
   }, [loadAndRegister]);
 

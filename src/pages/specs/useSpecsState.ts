@@ -4,7 +4,7 @@
 
 import { useState, useCallback, useMemo, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { getAllSpecs } from "@/lib/spec-registry";
+import { loadDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import { getKnownPages, type KnownPage } from "@/lib/page-catalog";
 import { useSpecFileLoader } from "./useSpecFileLoader";
 import type { LoadedSpec, SpecSelection, SpecTreeNode, ConnectionState } from "./types";
@@ -202,7 +202,7 @@ export function useSpecsState() {
 
   // Load bundled + user-saved specs. User specs overlay bundled ones (same specId wins).
   const loadBundledSpecs = useCallback(async () => {
-    const discovered = getAllSpecs();
+    const discovered = await loadDiscoveredSpecs();
     const bundled: LoadedSpec[] = discovered.map((spec) => ({
       specId: spec.specId,
       appName: spec.appName || "Unknown",

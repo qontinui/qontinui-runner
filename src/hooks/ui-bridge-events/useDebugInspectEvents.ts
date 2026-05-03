@@ -3,7 +3,7 @@ import { getGlobalSpecStore, SpecExecutor } from "@qontinui/ui-bridge";
 import type { SpecExecutionOptions } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { closestElementIds, getUIBridgeGlobal } from "./utils";
-import { getAllSpecs } from "../../lib/spec-registry";
+import { loadDiscoveredSpecs } from "../../lib/ui-bridge/use-discovered-specs";
 
 // ---------------------------------------------------------------------------
 // Browser / Console capture type interfaces
@@ -270,7 +270,7 @@ export function useDebugInspectEvents(
             specs.push({ specId: id, config });
           }
           if (specs.length === 0) {
-            const bundled = getAllSpecs();
+            const bundled = await loadDiscoveredSpecs();
             specs = bundled.map((s) => ({ specId: s.specId, config: s.config }));
           }
 

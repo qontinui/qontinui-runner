@@ -45,6 +45,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/spec/get", get(handlers::get_file))
         .route("/spec/page/{id}", get(handlers::get_page))
         .route("/spec/graph", get(handlers::get_graph))
+        .route("/spec/list", get(handlers::get_list))
         .route("/spec/query", post(handlers::post_query))
         .route("/spec/derive", post(handlers::post_derive))
         .route("/spec/diff", get(handlers::get_diff))
