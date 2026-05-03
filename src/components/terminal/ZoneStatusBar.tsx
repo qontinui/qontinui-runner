@@ -25,6 +25,7 @@ import {
   VolumeOff,
   Wand2,
 } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
 import { DocFinderModal } from "./DocFinderModal";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
@@ -224,6 +225,17 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
   const isMultiZone = tabs.length > 1;
   const busy = isAnalyzing || isGenerating;
 
+  // UI Bridge: register the Sessions sidebar toggle so external clients can
+  // discover "what control unhides session-card-* / promote-to-worktree-* /
+  // commit-progress-*" via `GET /control/elements?revealsAny=session-card-*`
+  // without grepping source. See ui-bridge plan 2026-05-03 Phase 3.2.
+  const { ref: sessionsToggleRef } = useUIElement({
+    id: "button-browse-claude-code-sessions",
+    type: "button",
+    label: showSidebar ? "Hide session browser" : "Browse Claude Code sessions",
+    reveals: ["session-card-*", "promote-to-worktree-*", "commit-progress-*"],
+  });
+
   return (
     <div className="flex items-center gap-2 px-3 h-8 bg-[#13141f] border-b border-[#2a2d3d] shrink-0">
       {/* ── Left group (always visible) ─────────────────────────────── */}
@@ -235,6 +247,7 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
 
       {/* Sessions sidebar toggle */}
       <button
+        ref={sessionsToggleRef}
         onClick={onToggleSidebar}
         className={`
           flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors shrink-0

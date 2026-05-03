@@ -183,6 +183,13 @@ restate = ["restate-sdk"]
 # Tells Tauri to embed the frontend from dist/ instead of loading from devUrl.
 # Without this, debug builds load from localhost:1420 (Vite dev server).
 custom-protocol = ["tauri/custom-protocol"]
+# Phase 5.1 of the UI Bridge discoverability/effectiveness plan
+# (qontinui-dev-notes/ui-bridge/docs/2026-05-03-...): exposes the debug-only
+# `/ui-bridge/test/inject-session` + `/ui-bridge/test/clear-sessions`
+# endpoints in release builds. Debug builds always carry them via
+# `cfg(debug_assertions)`; this feature is the explicit opt-in for
+# release-mode regression / smoke harnesses.
+test-fixtures = []
 
 [[bin]]
 name = "mock_claude_cli"

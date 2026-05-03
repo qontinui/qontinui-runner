@@ -46,6 +46,58 @@ use super::types::{
     UIBridgeDiscoveryRequest, UiBridgeError,
 };
 
+/// Phase 3.2b (plan 2026-05-03) — bidirectional simple-glob match between
+/// a query value and a single `reveals` entry. Mirrors the canonical SDK
+/// matcher (`selector-match.ts::revealsEntryMatches`):
+///
+///   - Exact equality short-circuits both regex paths.
+///   - If the query contains `*`, treat it as a glob and match against the entry.
+///   - If the entry contains `*`, treat IT as a glob and match against the query.
+///
+/// `*` maps to `.*`; other regex metachars are escaped. The compiled regex
+/// is anchored (`^…$`) so `session-card` does NOT match `term-session-card-1`.
+fn reveals_entry_matches(query: &str, entry: &str) -> bool {
+    if query == entry {
+        return true;
+    }
+    if query.contains('*') {
+        if let Ok(re) = build_simple_glob_regex(query) {
+            if re.is_match(entry) {
+                return true;
+            }
+        }
+    }
+    if entry.contains('*') {
+        if let Ok(re) = build_simple_glob_regex(entry) {
+            if re.is_match(query) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Convert a simple `*`-wildcard glob into an anchored regex. Escapes
+/// regex metachars in the rest of the string so callers can pass values
+/// containing `.` or `+` without surprise.
+fn build_simple_glob_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    let mut out = String::with_capacity(pattern.len() + 2);
+    out.push('^');
+    for ch in pattern.chars() {
+        match ch {
+            '*' => out.push_str(".*"),
+            // Escape every regex metachar EXCEPT `*`, which we just handled.
+            '.' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.push('$');
+    regex::Regex::new(&out)
+}
+
 /// Get all registered UI elements from the React UI Bridge.
 pub async fn ui_bridge_get_elements_handler(
     State(state): State<Arc<ApiState>>,
@@ -101,6 +153,9 @@ pub async fn ui_bridge_get_elements_handler(
     let filter_title = query.get("title").map(|s| s.to_lowercase());
     let filter_aria_label = query.get("aria_label").map(|s| s.to_lowercase());
     let filter_text = query.get("text").map(|s| s.to_lowercase());
+    // Phase 3.2b (plan 2026-05-03): per-element `reveals` filter. Bidirectional
+    // simple-glob match — see `reveals_entry_matches` for semantics.
+    let filter_reveals_any = query.get("revealsAny").cloned();
 
     match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
         Ok(data) => {
@@ -147,6 +202,27 @@ pub async fn ui_bridge_get_elements_handler(
                     }
                     true
                 });
+            }
+
+            // Phase 3.2b (plan 2026-05-03): `revealsAny=<id-or-glob>` keeps
+            // only elements whose `reveals: string[]` array intersects the
+            // query under bidirectional simple-glob match. Mirrors the
+            // canonical SDK matcher in selector-match.ts.
+            if let Some(ref query_str) = filter_reveals_any {
+                if !query_str.is_empty() {
+                    elements_array.retain(|el| {
+                        let reveals = match el.get("reveals").and_then(|v| v.as_array()) {
+                            Some(arr) if !arr.is_empty() => arr,
+                            _ => return false,
+                        };
+                        reveals.iter().any(|entry| {
+                            entry
+                                .as_str()
+                                .map(|e| reveals_entry_matches(query_str, e))
+                                .unwrap_or(false)
+                        })
+                    });
+                }
             }
 
             let payload = if api_version_v1 {
@@ -1195,6 +1271,13 @@ pub async fn ui_bridge_get_components_handler(
 ///
 /// Phase A1: WS-transport registered apps win over the IPC path when their
 /// `appId` matches the URL `id` segment.
+///
+/// Phase 1.1 (plan 2026-05-03): when the IPC returns the runner's bare
+/// "Component not found: <id>" envelope, enrich the error with the SDK's
+/// canonical `Available components: [...]` + cross-route hint shape (mirrors
+/// the outer `/ui-bridge/sdk/component/:id` wrapper). The enrichment fetches
+/// a snapshot opportunistically; if that fails, the bare error falls
+/// through unchanged.
 pub async fn ui_bridge_get_component_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -1219,14 +1302,51 @@ pub async fn ui_bridge_get_component_handler(
         };
     }
 
-    wrap_ipc_result(
-        ui_bridge_request_sync(
-            &state,
-            "get_component",
-            serde_json::json!({ "componentId": id }),
-        )
-        .await,
+    let ipc_result = ui_bridge_request_sync(
+        &state,
+        "get_component",
+        serde_json::json!({ "componentId": id }),
     )
+    .await;
+
+    // Detect the runner's bare "Component not found: <id>" inner-failure
+    // envelope BEFORE wrap_ipc_result flattens it, so we can rewrite the
+    // error message with the enriched SDK shape. Anything else falls
+    // through to wrap_ipc_result unchanged.
+    if let Ok(ref data) = ipc_result {
+        if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            let bare_error = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            // Match by prefix — the runner's serializer emits exactly this
+            // bare text when `currentBridge.getComponent(id)` returns
+            // undefined (see useControlEvents.ts `case "get_component"`).
+            let is_not_found = bare_error.starts_with("Component not found:");
+            if is_not_found {
+                // Best-effort snapshot fetch — if it fails, surface the
+                // bare error rather than 5xx-ing the request.
+                if let Ok(snapshot) =
+                    ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await
+                {
+                    let enriched =
+                        super::component_errors::build_component_not_found_message(&id, &snapshot);
+                    // Reuse `element_not_found` as the closest match in the
+                    // structured-error taxonomy — the SDK's own error path
+                    // does not differentiate component-vs-element, and the
+                    // enriched human-readable message carries the
+                    // component-specific guidance.
+                    let mut body = api_error_detailed(
+                        enriched,
+                        UiBridgeError::element_not_found(&id),
+                    );
+                    if let Some(hint) = data.get("hint") {
+                        body.hint = Some(hint.clone());
+                    }
+                    return Err((StatusCode::NOT_FOUND, Json(body)));
+                }
+            }
+        }
+    }
+
+    wrap_ipc_result(ipc_result)
 }
 
 /// Execute an action on a component.
@@ -2548,6 +2668,281 @@ pub async fn ui_bridge_type_into_handler(
     }
 }
 
+// =========================================================================
+// Phase 1.3 (plan 2026-05-03) — GET /control/state-summary
+// =========================================================================
+
+/// Compose the seven-field state digest: visibleElementCount, modalOpen,
+/// hasErrors, idleSignals, registeredComponents, route, activeTab.
+///
+/// Synthesized Rust-side from a fresh `get_snapshot` (which already carries
+/// elements + components + route + activeTab + modalStack) plus best-effort
+/// `get_console_errors` and `get_idle_status` IPC calls. Fan-out runs in
+/// parallel so the wall time is approximately the slowest single IPC, not
+/// the sum of three. Each ancillary call falls back gracefully — a missing
+/// console-errors response just leaves `hasErrors=false`; missing idle
+/// status leaves `idleSignals=null`.
+pub async fn ui_bridge_get_state_summary_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: GET /control/state-summary");
+
+    let snapshot_future = ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({}));
+    let console_future =
+        ui_bridge_request_sync(&state, "get_console_errors", serde_json::json!({}));
+    let idle_future = ui_bridge_request_sync(&state, "get_idle_status", serde_json::json!({}));
+
+    let (snapshot_result, console_result, idle_result) =
+        tokio::join!(snapshot_future, console_future, idle_future);
+
+    let snapshot = match snapshot_result {
+        Ok(v) => v,
+        Err(e) => {
+            error!("UI Bridge API: state-summary snapshot failed: {}", e);
+            let detail = classify_transport_error(&e);
+            let status = match detail.code {
+                super::types::UiBridgeErrorCode::FrontendNotReady => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return Err((status, Json(api_error_detailed(e, detail))));
+        }
+    };
+
+    // visibleElementCount: same predicate the SDK's `getStateSummary` uses —
+    // element has layout (rect.width|height > 0) AND state.visible !== false.
+    let visible_element_count = snapshot
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|el| {
+                    let rect = el.get("state").and_then(|s| s.get("rect"));
+                    let has_layout = rect
+                        .map(|r| {
+                            let w = r.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let h = r.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            w > 0.0 || h > 0.0
+                        })
+                        .unwrap_or(false);
+                    let visible = el
+                        .get("state")
+                        .and_then(|s| s.get("visible"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    has_layout && visible
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    let modal_open = snapshot
+        .get("modalStack")
+        .and_then(|m| m.get("count"))
+        .and_then(|v| v.as_u64())
+        .map(|c| c > 0)
+        .unwrap_or(false);
+
+    let registered_components = snapshot
+        .get("components")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    let route = snapshot.get("route").cloned().unwrap_or(serde_json::Value::Null);
+    let active_tab = snapshot
+        .get("activeTab")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let has_errors = match console_result {
+        Ok(v) => {
+            // The runner returns `{ errors: [...], count, ... }` shape.
+            // Defensively also handle a bare array.
+            if let Some(c) = v.get("count").and_then(|c| c.as_u64()) {
+                c > 0
+            } else if let Some(arr) = v.get("errors").and_then(|e| e.as_array()) {
+                !arr.is_empty()
+            } else if let Some(arr) = v.as_array() {
+                !arr.is_empty()
+            } else {
+                false
+            }
+        }
+        Err(e) => {
+            warn!(
+                "UI Bridge API: state-summary console-errors fetch failed ({}); defaulting hasErrors=false",
+                e
+            );
+            false
+        }
+    };
+
+    let idle_signals = match idle_result {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "UI Bridge API: state-summary idle-status fetch failed ({}); defaulting idleSignals=null",
+                e
+            );
+            serde_json::Value::Null
+        }
+    };
+
+    let body = serde_json::json!({
+        "visibleElementCount": visible_element_count,
+        "modalOpen": modal_open,
+        "hasErrors": has_errors,
+        "idleSignals": idle_signals,
+        "registeredComponents": registered_components,
+        "route": route,
+        "activeTab": active_tab,
+    });
+    Ok(Json(ApiResponse::success(body)))
+}
+
+// =========================================================================
+// Phase 2.1 (plan 2026-05-03) — POST /control/element/:id/expect
+// =========================================================================
+
+/// Element predicate assertion endpoint. Returns HTTP 200 + `passed:true`
+/// when the predicate holds within the timeout; HTTP 422 + `passed:false`
+/// on timeout. Forwards to the SDK's `wait_for_element_state_predicate`
+/// runtime (already wired through the runner-side `useAISearchEvents`
+/// dispatcher) so the predicate semantics stay in lock-step with
+/// `/ai/wait-for-element`.
+pub async fn ui_bridge_expect_element_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let requested_state = body.get("state").and_then(|v| v.as_str());
+    if requested_state.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("expect: 'state' is required".to_string())),
+        ));
+    }
+    let requested_state = requested_state.unwrap();
+    if !VALID_WAIT_FOR_ELEMENT_STATES.contains(&requested_state) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "expect: invalid state '{}', expected one of {}",
+                requested_state,
+                VALID_WAIT_FOR_ELEMENT_STATES.join("|")
+            ))),
+        ));
+    }
+
+    let timeout_ms = body
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5000)
+        .min(30_000);
+    let poll_ms = body
+        .get("pollMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(100)
+        .max(10);
+
+    info!(
+        "UI Bridge API: expect element id={} state={} timeoutMs={} pollMs={}",
+        id, requested_state, timeout_ms, poll_ms
+    );
+
+    // Forward to the existing SDK predicate runtime — keeps semantics
+    // aligned with /ai/wait-for-element. The SDK returns
+    // `{found, durationMs, finalState | lastObservedState}`; we re-shape
+    // into `{passed, observedState, durationMs}` per the plan contract.
+    let payload = serde_json::json!({
+        "params": {
+            "elementId": id,
+            "state": requested_state,
+            "timeoutMs": timeout_ms,
+            "pollMs": poll_ms,
+        }
+    });
+
+    let started = Instant::now();
+    let ipc_result =
+        ui_bridge_request_sync(&state, "wait_for_element_state_predicate", payload).await;
+
+    let result = match ipc_result {
+        Ok(v) => v,
+        Err(e) => {
+            error!("UI Bridge API: expect IPC failed: {}", e);
+            let detail = classify_transport_error(&e);
+            let status = match detail.code {
+                super::types::UiBridgeErrorCode::FrontendNotReady => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return Err((status, Json(api_error_detailed(e, detail))));
+        }
+    };
+
+    // The SDK runtime returns `{success:false, error}` for validation
+    // errors at that layer — flatten to HTTP 400.
+    if result.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        let err = result
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("expect: predicate evaluation failed")
+            .to_string();
+        return Err((StatusCode::BAD_REQUEST, Json(api_error(err))));
+    }
+
+    // Project to {passed, observedState, durationMs}. The predicate runtime
+    // returns either `finalState` (on success) or `lastObservedState` (on
+    // timeout) — pick whichever is present.
+    let found = result
+        .get("found")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let observed_state = result
+        .get("finalState")
+        .cloned()
+        .or_else(|| result.get("lastObservedState").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let duration_ms = result
+        .get("durationMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| started.elapsed().as_millis() as u64);
+
+    let body = serde_json::json!({
+        "passed": found,
+        "observedState": observed_state,
+        "durationMs": duration_ms,
+    });
+
+    if found {
+        Ok(Json(ApiResponse::success(body)))
+    } else {
+        // Critical semantic — assertion miss surfaces as HTTP 422 so callers
+        // can fail-fast on the status code rather than parsing the body.
+        // Wrap in an error envelope alongside the raw payload so the body
+        // stays predictable.
+        let mut envelope = ApiResponse::<serde_json::Value>::success(body);
+        envelope.success = false;
+        Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                error: Some(format!(
+                    "Element predicate '{}' did not hold within {}ms",
+                    requested_state, timeout_ms
+                )),
+                error_detail: None,
+                hint: Some(envelope.data.unwrap_or(serde_json::Value::Null)),
+            }),
+        ))
+    }
+}
+
 /// Primary element operations, components, discovery/snapshot, wait-for-element,
 /// and the DOM-convenience family (find / find-by-text / click-by-text /
 /// click-by-selector / read-value / type-into).
@@ -2578,6 +2973,11 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_assert_element_handler),
         )
         .route(
+            // Phase 2.1 (plan 2026-05-03)
+            "/ui-bridge/control/element/{id}/expect",
+            post(ui_bridge_expect_element_handler),
+        )
+        .route(
             "/ui-bridge/control/element/{id}/action",
             post(ui_bridge_execute_action_handler),
         )
@@ -2604,6 +3004,11 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/control/snapshot",
             get(ui_bridge_get_snapshot_handler),
+        )
+        .route(
+            // Phase 1.3 (plan 2026-05-03)
+            "/ui-bridge/control/state-summary",
+            get(ui_bridge_get_state_summary_handler),
         );
     // Wait-for-element: identical handler under /control + /ai.
     let router = add_dual!(
@@ -2647,6 +3052,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/element/{id}"),
         ("GET", "/ui-bridge/control/element/{id}/tree"),
         ("POST", "/ui-bridge/control/element/{id}/assert"),
+        ("POST", "/ui-bridge/control/element/{id}/expect"),
         ("POST", "/ui-bridge/control/element/{id}/action"),
         ("POST", "/ui-bridge/control/batch-actions"),
         ("GET", "/ui-bridge/control/components"),
@@ -2657,6 +3063,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ),
         ("POST", "/ui-bridge/control/discover"),
         ("GET", "/ui-bridge/control/snapshot"),
+        ("GET", "/ui-bridge/control/state-summary"),
         ("POST", "/ui-bridge/control/wait-for-element"),
         ("POST", "/ui-bridge/ai/wait-for-element"),
         ("POST", "/ui-bridge/control/find"),

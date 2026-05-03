@@ -18,6 +18,7 @@ pub mod analytics;
 pub mod bookmarks;
 pub mod capabilities;
 pub mod circuit_breaker;
+pub mod component_errors;
 pub mod design;
 pub mod design_eval;
 pub mod elements;

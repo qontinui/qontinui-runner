@@ -111,6 +111,23 @@
           "enabled": true
         },
         {
+          "id": "term-action-sidebar-toggle-registered",
+          "description": "The Sessions sidebar toggle is registered with UI Bridge as id 'button-browse-claude-code-sessions' and carries a 'reveals' annotation listing the element families it gates the visibility of: 'session-card-*', 'promote-to-worktree-*', 'commit-progress-*'. This makes the toggle discoverable via GET /control/elements?revealsAny=session-card-* — automation can find which control to click to surface session-card / promote / commit elements without grepping source. Registration source: qontinui-runner/src/components/terminal/ZoneStatusBar.tsx (useUIElement call near the top of the component).",
+          "category": "accessibility",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "id": "button-browse-claude-code-sessions"
+            },
+            "label": "Sessions toggle (registered identity)"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
           "id": "term-action-generate",
           "description": "Users can generate a workflow from the latest Claude Code session transcript, transforming ad-hoc terminal work into a repeatable automated workflow",
           "category": "semantic",

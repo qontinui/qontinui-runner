@@ -504,6 +504,41 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         let liveStatus: SessionLiveStatus = "dormant";
         let zoneTabId: string | null = null;
 
+        // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:
+        // injected fakes (from the runner's debug-only
+        // `/ui-bridge/test/inject-session` route) carry an explicit
+        // `injected_live_status` so SessionCard's `canPromote` / `canCommit`
+        // predicates can fire without a real PTY tab being open. The
+        // override short-circuits the tab/digest correlation below — real
+        // transcripts never set the field so this branch is a no-op for
+        // them.
+        if (s.injected_live_status) {
+          liveStatus = s.injected_live_status as SessionLiveStatus;
+          return {
+            sessionId: s.session_id,
+            accountLabel: extractAccountLabel(s.config_dir),
+            configDir: s.config_dir,
+            projectPath: s.project_path,
+            projectLabel: extractProjectLabel(s.project_path),
+            displayName: s.display_name,
+            firstMessagePreview: s.first_message_preview,
+            messageCount: s.message_count,
+            lastModified: s.last_modified,
+            hasPlans: s.has_plans,
+            liveStatus,
+            zoneTabId: null,
+            zoneIndex: null,
+            startedAt: s.started_at ?? null,
+            durationMs: computeDuration(s.started_at, s.last_modified),
+            lastMessageType: "",
+            lastMessageTimestamp: s.last_modified,
+            lastMessagePreview: "",
+            workSummaryHint: "",
+            likelyFrozen: liveStatus === "frozen",
+            _transcript: s,
+          };
+        }
+
         if (tab) {
           zoneTabId = tab.id;
           const tabState = sessionStates[tab.id];

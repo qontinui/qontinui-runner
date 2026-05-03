@@ -609,6 +609,15 @@ export interface SerializedComponent {
   elementIds?: string[];
   registeredAt: number;
   mounted: boolean;
+  /**
+   * Phase 3.1 (plan 2026-05-03): discoverability scope echoed from the
+   * underlying RegisteredComponent. `'global'` = available regardless of
+   * route, `'route'` = only available while the mounting page is active.
+   * Materialized from `component.scope ?? 'route'` so the field is always
+   * present in the serialized payload (the SDK documents `undefined` as
+   * "the default — i.e. route", and we make that default explicit).
+   */
+  scope: "global" | "route";
 }
 
 /**
