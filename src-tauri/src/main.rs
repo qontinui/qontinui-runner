@@ -1520,14 +1520,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             {
                 use tauri::Manager;
 
-                let data_dir = std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok();
+                // Resolve via crate::instance so a runner launched standalone
+                // (no supervisor setting WEBVIEW2_USER_DATA_FOLDER) still
+                // gets the same per-runner profile layout. The helper
+                // returns None on non-Windows.
+                #[cfg(target_os = "windows")]
+                let data_dir = instance::webview2_data_dir();
+                #[cfg(not(target_os = "windows"))]
+                let data_dir: Option<std::path::PathBuf> = None;
                 let is_secondary = instance::is_secondary();
 
                 if let Some(ref dir) = data_dir {
                     let _ = std::fs::create_dir_all(dir);
                     info!(
                         "Creating window with isolated WebView2 profile (WEBVIEW2_USER_DATA_FOLDER={})",
-                        dir
+                        dir.display()
                     );
                 }
 
@@ -1667,7 +1674,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         .on_web_resource_request(asset_headers::stamp_no_store_on_index);
 
                     if let Some(ref dir) = data_dir {
-                        builder = builder.data_directory(std::path::PathBuf::from(dir));
+                        builder = builder.data_directory(dir.clone());
                     }
 
                     builder = placement.configure_builder(builder);
