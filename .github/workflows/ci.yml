@@ -120,7 +120,19 @@ jobs:
       # "Build frontend" step is intentionally omitted — `pnpm run tauri
       # build` re-runs it via `beforeBuildCommand: "npm run build"`
       # (tauri.conf.json:7).
+      #
+      # TAURI_PLATFORM=windows forces vite.config.ts:196 to use the
+      # `chrome105` esbuild target instead of the default `safari13`.
+      # The safari13 target trips esbuild on modern destructuring
+      # patterns from upstream deps (7155 errors observed in CI run
+      # 25272835354) and stalls the build for 20+ min. This step's
+      # only job is to populate dist/ for the cargo macro — the actual
+      # platform-specific bundling happens in `Build Tauri app` below,
+      # which sets TAURI_PLATFORM correctly via Tauri itself. Safe to
+      # use chrome105 here regardless of matrix platform.
       - name: Build frontend
+        env:
+          TAURI_PLATFORM: windows
         run: pnpm run build
 
       - name: Format Rust code check
