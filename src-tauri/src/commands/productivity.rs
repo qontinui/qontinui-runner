@@ -486,18 +486,59 @@ pub struct LeaderResponse {
 }
 
 /// Result returned by [`launch_coordinator_session`] / [`spawn_worker_session`].
-/// The frontend uses `terminal_id` to focus the new tab.
+///
+/// - `terminal_id` is `Some(id)` only for the legacy `claude_skill` mode
+///   (and for `spawn_worker_session`), where a pty was opened — the
+///   frontend uses it to focus the new tab. For `mode: "rust"` (the
+///   default Phase 1.5 path) the scheduler runs in-process so there is
+///   no terminal to focus and the field is `None`.
+/// - `mode` echoes back which path ran ("rust" | "claude_skill" |
+///   "worker") so the frontend can branch its post-launch UX (reveal
+///   terminal tab vs. just refresh the lease pill).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchResult {
-    pub terminal_id: String,
+    pub mode: String,
+    pub terminal_id: Option<String>,
 }
 
 /// Compute the `lease_status` discriminator for a `CoordinatorLeaderRow`.
-/// `leased_until` and `renewed_at` come back from PG as RFC3339-ish text
-/// (`::text` cast); we parse them to compare against `Utc::now()`.
+/// `leased_until` and `renewed_at` come back from PG as text via `::text`
+/// cast on `TIMESTAMPTZ`. PG's text format is `YYYY-MM-DD HH:MM:SS.ffffff+00`
+/// — note the SPACE separator (not `T`) and the trailing `+NN` offset
+/// (not RFC3339's `+NN:NN`). Parse both shapes so the dashboard pill works
+/// regardless of which serialiser fed the row.
 pub(crate) fn compute_lease_status_for_http(leader: &Option<CoordinatorLeaderRow>) -> String {
     compute_lease_status(leader)
+}
+
+/// Parse a PG-style timestamptz text representation into UTC.
+/// Accepts both:
+/// - `2026-05-03 18:01:08.681561+00` (PG ::text cast — space, no-colon offset)
+/// - `2026-05-03T18:01:08.681561+00:00` (strict RFC3339)
+fn parse_pg_timestamptz(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // PG's ::text cast: `YYYY-MM-DD HH:MM:SS[.fff]+NN` (NN may be 1 or 2
+    // digits, no colon). The `%#z` specifier accepts colon-less and
+    // colon-bearing offsets; `%.f` accepts optional fractional seconds.
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z") {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // Fallback: replace first space with T and try strict RFC3339 again
+    // (handles older driver versions that emit colon-less offsets without
+    // fractional seconds).
+    if let Some(idx) = s.find(' ') {
+        let mut rfc = String::with_capacity(s.len() + 1);
+        rfc.push_str(&s[..idx]);
+        rfc.push('T');
+        rfc.push_str(&s[idx + 1..]);
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&rfc) {
+            return Some(dt.with_timezone(&chrono::Utc));
+        }
+    }
+    None
 }
 
 fn compute_lease_status(leader: &Option<CoordinatorLeaderRow>) -> String {
@@ -506,23 +547,94 @@ fn compute_lease_status(leader: &Option<CoordinatorLeaderRow>) -> String {
     };
     let now = chrono::Utc::now();
 
-    let leased_until = match chrono::DateTime::parse_from_rfc3339(&row.leased_until) {
-        Ok(dt) => dt.with_timezone(&chrono::Utc),
-        Err(_) => return "vacant".to_string(),
+    let leased_until = match parse_pg_timestamptz(&row.leased_until) {
+        Some(dt) => dt,
+        None => return "vacant".to_string(),
     };
     if leased_until <= now {
         return "vacant".to_string();
     }
 
-    let renewed_at = match chrono::DateTime::parse_from_rfc3339(&row.renewed_at) {
-        Ok(dt) => dt.with_timezone(&chrono::Utc),
-        Err(_) => return "stale".to_string(),
+    let renewed_at = match parse_pg_timestamptz(&row.renewed_at) {
+        Some(dt) => dt,
+        None => return "stale".to_string(),
     };
     let age = now.signed_duration_since(renewed_at);
     if age <= chrono::Duration::seconds(90) {
         "active".to_string()
     } else {
         "stale".to_string()
+    }
+}
+
+#[cfg(test)]
+mod lease_status_tests {
+    use super::*;
+    use crate::database::pg::coordinator_leader::CoordinatorLeaderRow;
+
+    fn row(leased_until: &str, renewed_at: &str) -> Option<CoordinatorLeaderRow> {
+        Some(CoordinatorLeaderRow {
+            instance_id: "rust-test".to_string(),
+            leased_until: leased_until.to_string(),
+            acquired_at: "2026-05-03 17:59:43.892179+00".to_string(),
+            renewed_at: renewed_at.to_string(),
+        })
+    }
+
+    #[test]
+    fn parses_pg_text_format_with_fractional_seconds() {
+        let dt = parse_pg_timestamptz("2026-05-03 18:01:08.681561+00")
+            .expect("PG text format with fractional + colon-less offset must parse");
+        assert_eq!(dt.timestamp(), 1777831268);
+    }
+
+    #[test]
+    fn parses_strict_rfc3339() {
+        let dt = parse_pg_timestamptz("2026-05-03T18:01:08.681561+00:00")
+            .expect("RFC3339 strict must still parse");
+        assert_eq!(dt.timestamp(), 1777831268);
+    }
+
+    #[test]
+    fn parses_pg_text_without_fractional() {
+        let dt = parse_pg_timestamptz("2026-05-03 18:01:08+00")
+            .expect("PG text without fractional must parse");
+        assert_eq!(dt.timestamp(), 1777831268);
+    }
+
+    #[test]
+    fn vacant_when_leader_none() {
+        assert_eq!(compute_lease_status(&None), "vacant");
+    }
+
+    #[test]
+    fn vacant_when_lease_expired() {
+        let r = row("2020-01-01 00:00:00+00", "2020-01-01 00:00:00+00");
+        assert_eq!(compute_lease_status(&r), "vacant");
+    }
+
+    #[test]
+    fn active_when_lease_fresh_and_recently_renewed() {
+        let now = chrono::Utc::now();
+        let until = (now + chrono::Duration::seconds(60))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let renewed = now.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string();
+        let r = row(&until, &renewed);
+        assert_eq!(compute_lease_status(&r), "active");
+    }
+
+    #[test]
+    fn stale_when_lease_fresh_but_renew_old() {
+        let now = chrono::Utc::now();
+        let until = (now + chrono::Duration::seconds(60))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let renewed = (now - chrono::Duration::seconds(120))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let r = row(&until, &renewed);
+        assert_eq!(compute_lease_status(&r), "stale");
     }
 }
 
@@ -660,17 +772,42 @@ fn schedule_initial_command(
     });
 }
 
-/// Spawn a fresh "Coordinator" terminal tab running `claude "/coordinate ..."`
-/// with the runner port pre-injected. Defends against double-launch by
-/// checking the leader lease first — refuses when an existing lease is
-/// `active`. Stale and vacant leases proceed.
+/// Start the coordinator. Two modes:
+///
+/// - `mode = "rust"` (default, Phase 1.5): flips the in-process Rust
+///   scheduler's runtime-toggle flag to `true`. The scheduler task is
+///   already running (started at boot in `mcp_api.rs`) — flipping the
+///   flag makes its next tick acquire the lease and execute. No pty,
+///   no Claude CLI dependency, no terminal tab. Returns
+///   `terminal_id: None`.
+///
+/// - `mode = "claude_skill"`: spawns a fresh "Coordinator" terminal tab
+///   running `claude "/coordinate ..."` with the runner port
+///   pre-injected. Joshua's debug path — keeps working unchanged for
+///   his personal setup. Returns the terminal id so the frontend can
+///   focus the new tab.
+///
+/// Defends against double-launch by checking the leader lease first —
+/// refuses when an existing lease is `active`. Stale and vacant leases
+/// proceed.
 #[tauri::command]
 pub async fn launch_coordinator_session(
     app_handle: tauri::AppHandle,
+    mode: Option<String>,
     plan_path: Option<String>,
     title_hint: Option<String>,
 ) -> Result<LaunchResult, String> {
     let app_state = require_app_state(&app_handle)?;
+    let mode = mode.unwrap_or_else(|| "rust".to_string());
+
+    // Reject unknown modes early — keeps the surface small and surfaces
+    // typos in callers/tests immediately.
+    if mode != "rust" && mode != "claude_skill" {
+        return Err(format!(
+            "Unknown coordinator mode {:?} (expected 'rust' or 'claude_skill')",
+            mode
+        ));
+    }
 
     // Single-coordinator enforcement (defense-in-depth — frontend disables
     // the button anyway when status == "active"). Stale leases proceed —
@@ -686,11 +823,34 @@ pub async fn launch_coordinator_session(
         return Err(format!("Coordinator already running (instance {})", id));
     }
 
+    if mode == "rust" {
+        // Phase 1.5 path: flip the in-process scheduler's flag. The
+        // scheduler task is started at boot in `mcp_api.rs` and stashed
+        // its `CoordinatorSchedulerHandle` in Tauri-managed state.
+        let handle = app_handle
+            .try_state::<crate::coordinator::CoordinatorSchedulerHandle>()
+            .ok_or_else(|| {
+                "Coordinator scheduler handle not initialised — runner started without scheduler"
+                    .to_string()
+            })?
+            .inner()
+            .clone();
+        let prev = handle.set_enabled(true);
+        tracing::info!(
+            "launch_coordinator_session(mode=rust): rust_scheduler_enabled flipped {}→true",
+            prev
+        );
+        return Ok(LaunchResult {
+            mode,
+            terminal_id: None,
+        });
+    }
+
+    // mode == "claude_skill": legacy pty-spawn path.
     let runner_port = crate::mcp::types::runner_api_port(&app_state);
     let repo_path = resolve_runner_repo_path()
         .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
-    let initial_command =
-        build_coordinator_initial_command(runner_port, plan_path.as_deref())?;
+    let initial_command = build_coordinator_initial_command(runner_port, plan_path.as_deref())?;
     let title = title_hint.unwrap_or_else(|| "Coordinator".to_string());
 
     let terminal_manager = app_handle
@@ -711,8 +871,35 @@ pub async fn launch_coordinator_session(
     schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
 
     Ok(LaunchResult {
-        terminal_id: info.id,
+        mode,
+        terminal_id: Some(info.id),
     })
+}
+
+/// Stop the in-process Rust coordinator scheduler — Phase 1.5 sibling of
+/// [`launch_coordinator_session`] for `mode = "rust"`. Flips the
+/// runtime-toggle flag back to `false`; the next tick observes the flag
+/// and short-circuits without acquiring the lease. Returns the previous
+/// value of the flag so the frontend can detect no-op stops.
+///
+/// Has no effect on `claude_skill`-mode pty sessions — those are user-
+/// owned terminal tabs and the user closes them via the terminal UI.
+#[tauri::command]
+pub async fn stop_coordinator_session(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let handle = app_handle
+        .try_state::<crate::coordinator::CoordinatorSchedulerHandle>()
+        .ok_or_else(|| {
+            "Coordinator scheduler handle not initialised — runner started without scheduler"
+                .to_string()
+        })?
+        .inner()
+        .clone();
+    let prev = handle.set_enabled(false);
+    tracing::info!(
+        "stop_coordinator_session: rust_scheduler_enabled flipped {}→false",
+        prev
+    );
+    Ok(prev)
 }
 
 /// Spawn a fresh "Worker N" terminal tab running plain `claude` (no slash
@@ -756,6 +943,7 @@ pub async fn spawn_worker_session(
     schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
 
     Ok(LaunchResult {
-        terminal_id: info.id,
+        mode: "worker".to_string(),
+        terminal_id: Some(info.id),
     })
 }
