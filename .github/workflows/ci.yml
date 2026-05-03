@@ -25,17 +25,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # qontinui-runner has cross-repo deps to two sibling repos:
-      #   - frontend eslint config imports `@qontinui/ui-bridge-eslint-plugin`
-      #     (link: protocol via pnpm, points at ../ui-bridge/packages/...)
-      #   - src-tauri/Cargo.toml has `qontinui-types = { path = "../../qontinui-schemas/rust" }`
-      # CI must clone both as siblings before pnpm install / cargo build.
-      # Both repos are public; no auth needed.
+      # qontinui-runner has cross-repo deps to six sibling repos via pnpm `link:`
+      # protocol (see qontinui-runner/package.json) plus a Cargo `path:` dep:
+      #   - @qontinui/shared-types       -> ../qontinui-schemas/ts
+      #   - @qontinui/ui-bridge          -> ../ui-bridge/packages/ui-bridge
+      #   - @qontinui/ui-bridge-auto     -> ../ui-bridge-auto
+      #   - @qontinui/workflow-ui        -> ../qontinui-workflow-ui
+      #   - @qontinui/workflow-utils     -> ../qontinui-workflow-utils
+      #   - qontinui-navigation          -> ../qontinui-navigation
+      # Plus src-tauri/Cargo.toml: `qontinui-types = { path = "../../qontinui-schemas/rust" }`
+      # All six are public under github.com/qontinui/; no auth needed.
+      # pnpm install tolerates broken link: targets, but `tsc`/`vite build`
+      # (run during `pnpm run build` and `pnpm run tauri build`) will fail
+      # without these clones.
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
           git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 https://github.com/qontinui/ui-bridge-auto.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-workflow-ui.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-workflow-utils.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-navigation.git
         shell: bash
 
       - name: Setup pnpm
@@ -94,6 +105,17 @@ jobs:
       - name: Lint frontend code
         run: pnpm run lint
 
+      # MUST run before any cargo command. `tauri::generate_context!()`
+      # (a proc macro at src-tauri/src/lib.rs:84) validates that
+      # `frontendDist: "../dist"` (tauri.conf.json:8) physically exists at
+      # macro-expansion time. cargo fmt/clippy/test all expand the macro,
+      # so they need `dist/` already populated. The trailing standalone
+      # "Build frontend" step is intentionally omitted — `pnpm run tauri
+      # build` re-runs it via `beforeBuildCommand: "npm run build"`
+      # (tauri.conf.json:7).
+      - name: Build frontend
+        run: pnpm run build
+
       - name: Format Rust code check
         run: |
           cd src-tauri
@@ -110,9 +132,6 @@ jobs:
         run: |
           cd src-tauri
           cargo test --verbose
-
-      - name: Build frontend
-        run: pnpm run build
 
       - name: Build Tauri app (development)
         run: pnpm run tauri build -- --debug

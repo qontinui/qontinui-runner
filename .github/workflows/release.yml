@@ -111,6 +111,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # qontinui-runner has cross-repo deps to six sibling repos via pnpm `link:`
+      # protocol (see qontinui-runner/package.json) plus a Cargo `path:` dep
+      # (src-tauri/Cargo.toml -> qontinui-types). All six are public under
+      # github.com/qontinui/; no auth needed. pnpm install tolerates broken
+      # link: targets, but `pnpm run tauri build`'s internal `tsc`/`vite build`
+      # (triggered by tauri.conf.json's `beforeBuildCommand: "npm run build"`)
+      # will fail without these clones. Mirrors ci.yml's test-job step.
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 https://github.com/qontinui/ui-bridge-auto.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-workflow-ui.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-workflow-utils.git
+          git clone --depth 1 https://github.com/qontinui/qontinui-navigation.git
+        shell: bash
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
