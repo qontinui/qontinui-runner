@@ -219,7 +219,7 @@ impl WorkflowFixupHandler {
 
         // Check that each automatable criterion has a matching verification step with criterion_id
         let mut missing_criteria = Vec::new();
-        let mut covered = 0;
+        let mut covered: usize = 0;
 
         // Collect criterion_ids from verification steps
         let mut step_criterion_ids: Vec<String> = Vec::new();
