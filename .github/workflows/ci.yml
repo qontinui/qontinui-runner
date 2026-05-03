@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # qontinui-runner has cross-repo deps to six sibling repos via pnpm `link:`
+      # qontinui-runner has cross-repo deps to seven sibling repos via pnpm `link:`
       # protocol (see qontinui-runner/package.json) plus a Cargo `path:` dep:
       #   - @qontinui/shared-types       -> ../qontinui-schemas/ts
       #   - @qontinui/ui-bridge          -> ../ui-bridge/packages/ui-bridge
@@ -34,11 +34,17 @@ jobs:
       #   - @qontinui/workflow-utils     -> ../qontinui-workflow-utils
       #   - qontinui-navigation          -> ../qontinui-navigation
       # Plus src-tauri/Cargo.toml: `qontinui-types = { path = "../../qontinui-schemas/rust" }`
-      # All six are public under github.com/qontinui/; no auth needed.
+      # Plus src/lib/spec-registry.ts imports 14 .spec.uibridge.json files from
+      # ../qontinui-web/frontend/... (qontinui-web lives at jspinak/qontinui-web,
+      # is PRIVATE, and needs CROSS_REPO_TOKEN to clone — see schema-pg-sql-fresh.yml
+      # for prior art).
+      # The qontinui/ siblings are public; no auth needed for those.
       # pnpm install tolerates broken link: targets, but `tsc`/`vite build`
       # (run during `pnpm run build` and `pnpm run tauri build`) will fail
       # without these clones.
       - name: Checkout sibling repos
+        env:
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         run: |
           cd "$GITHUB_WORKSPACE/.."
           git clone --depth 1 https://github.com/qontinui/ui-bridge.git
@@ -47,6 +53,7 @@ jobs:
           git clone --depth 1 https://github.com/qontinui/qontinui-workflow-ui.git
           git clone --depth 1 https://github.com/qontinui/qontinui-workflow-utils.git
           git clone --depth 1 https://github.com/qontinui/qontinui-navigation.git
+          git clone --depth 1 "https://x-access-token:${CROSS_REPO_TOKEN}@github.com/jspinak/qontinui-web.git"
         shell: bash
 
       - name: Setup pnpm
