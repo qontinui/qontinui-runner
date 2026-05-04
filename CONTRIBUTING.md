@@ -178,6 +178,106 @@ cd python-bridge
 pytest
 ```
 
+## CI & Merge Readiness
+
+A PR is ready to merge when every required workflow is green on the PR's HEAD commit. Don't merge through red, and don't assume someone else's red is "fine" because `main` is also red — that's how `main` ended up with a 685-run failure streak going back to 2025-09-24.
+
+### What "main is green" means here
+
+This repo has six workflows. They split into two tiers by trigger type:
+
+**Merge gates** (must be green on your PR before merge):
+
+- `ci.yml` — runs on PR + push to `main`. The big one: build frontend, format/lint Rust, run Rust tests, build Tauri app. Each platform leg (`ubuntu-22.04`, `windows-latest`, `macos-latest`) must be either green **or** linked to a tracked open issue documenting an upstream-runner block (see "Platform escape valve" below). The escape valve is for hosted-runner pathologies you can't fix in the PR (e.g. rustc crashing on the GitHub `windows-latest` image), not for "tests are flaky, ignore."
+- `forbid-runner-schema.yml` — runs on PR + push to `main`. Cheap, fast, no excuse for letting it go red.
+- `spec-pairing.yml` — PR-only with a paths filter. Required when your PR touches the paths it watches (`*.spec.uibridge.json` and friends); otherwise it doesn't run and isn't a gate for that PR.
+
+**Conditional gate** (currently being repaired):
+
+- `schema-pg-sql-fresh.yml` — PR-only with a paths filter. **Not a hard gate yet:** the workflow itself has open infra bugs (missing `pgvector` pip dep in its install step; `Checkout qontinui-web (sibling)` has no `main` fallback when the PR branch doesn't exist on the sibling repo). The schema-diff step has not actually executed in the recent runs that show "failed." Once those two infra fixes land, promote it to a hard gate. Until then, treat its red status as "workflow is broken, not your code."
+
+**Not merge gates** (validated at release time, not PR time):
+
+- `release.yml` — `push: tags: ['v*']` + `workflow_dispatch`. Won't run on a PR. Verify when cutting a tag.
+- `build-python-executor.yml` — `workflow_dispatch` + `workflow_call` only. Called from `release.yml`. Verify when invoking manually or via release.
+
+If `release.yml` is red on `windows-latest`, that's a release-time problem, not a merge-time problem — but file an issue so it isn't a surprise on the next tag.
+
+### Platform escape valve
+
+`ci.yml` runs on three hosted GitHub runners, and a platform leg can sometimes fail for reasons you can't fix inside your PR — either a genuine upstream issue (a runner-image regression, a third-party action breaking change) or an in-progress project-side fight that's already being worked on a different branch. Strict-on-every-platform-no-matter-what would block all merges during those windows, which punishes contributors for problems being tracked elsewhere.
+
+Concrete current example: rustc-LLVM has been OOMing during codegen of the `qontinui_runner` test bin. On Windows the OOM surfaces as `STATUS_ILLEGAL_INSTRUCTION 0xc000001d` (rustc's allocator aborts; the OS reports the abort, not a real CPU instruction-set fault). On Linux the same root cause shows up as the runner agent receiving SIGTERM / exit 143 (the Linux OOM-killer takes the runner down before rustc can report). The mitigation lives in `Cargo.toml` profile overrides (`[profile.test] debug = 0`), `CARGO_BUILD_JOBS` caps, and pagefile / swap expansion — see `Cargo.toml:5-9` for the in-tree comment naming this exact symptom. Don't pin `target-cpu` or chase image-vintage theories; verify the OOM hypothesis first by grepping the log for `out of memory` and `Allocation failed`.
+
+The rule:
+
+- A platform leg may be temporarily exempted from the merge gate **if and only if** there's an open tracked issue or `_dev-notes-main/<slug>/SESSION_PROMPT.md` plan documenting the block, linked in the PR description. The block can be either an upstream-runner pathology *or* an in-progress project-side fix you can't land in your PR.
+- Exemption applies to that platform leg only — the other two must still go green.
+- Exemptions are not "permanent." Each one decays the moment the linked workstream closes; recheck before merging.
+
+Don't add new exemptions casually. The escape valve exists so known-tracked blocks don't grind merges to zero — it isn't a free pass for "tests are flaky, ignore" or "I'll fix this later."
+
+### Test locally first
+
+For the platforms you can run locally, run the relevant test before pushing — the feedback loop is much faster than waiting on CI, and a local failure means CI failure too. The reverse isn't always true: local can pass while CI fails on something CI-environment-specific (smaller memory budget on the hosted runner, runner-image regression, action vendor break — see "Platform escape valve"). So local-first is a productivity practice, not a CI replacement.
+
+```bash
+# Frontend typecheck + build
+npm run build
+
+# Rust format + check
+cd src-tauri && cargo fmt --check && cargo check --bin qontinui-runner
+
+# Rust tests (the slow one — only when relevant)
+cd src-tauri && cargo test --bin qontinui-runner
+```
+
+If your local environment matches one of CI's platform legs (e.g. you're on Windows), green local runs are strong evidence the platform leg will go green in CI. They are not, however, a substitute for the CI run itself — push and verify.
+
+### Hidden-red discipline
+
+`main` has been red for months. That means a CI failure on your PR may be a layer of pre-existing breakage that was previously masked by an earlier-failing layer. Before you assume your PR caused a failure (or, worse, assume your PR is innocent because "CI is always red"), do this:
+
+1. Pull up the latest run of the same workflow on `main`:
+
+   ```bash
+   gh run list --repo qontinui/qontinui-runner --branch main --workflow=<name> --limit 5
+   gh run view <run-id> --log-failed
+   ```
+
+2. Compare your PR's failing job to `main`'s most recent failing job for the same workflow + platform.
+
+   - **Symptom matches** → not your PR. Note this in the PR description, link the open issue or plan that owns the fix, and proceed.
+   - **Symptom is new** → it's yours. Fix before merge.
+   - **You can't tell** → check out a fresh `main`, push it to a throwaway branch, and see what CI does on a clean baseline. If the symptom appears there too, it's not yours.
+
+Don't merge red without doing this comparison. "Same as main" is a real answer, but it has to be a verified answer.
+
+### Active workstream awareness
+
+CI is a shared surface. Before opening a PR that touches `.github/workflows/` or anything CI-adjacent, check what's already in flight:
+
+```bash
+gh pr list --repo qontinui/qontinui-runner --state open
+gh api repos/qontinui/qontinui-runner/branches --jq '.[].name' | grep '^ci/'
+```
+
+There are usually several `ci/...` branches at any given time, some live and some stale. Don't accidentally re-do work that's already drafted on another branch. If you find a related open PR, coordinate (or rebase onto it) rather than opening a parallel attempt.
+
+### Branch protection — note for follow-up
+
+Ideally, GitHub branch protection on `main` would mirror the merge-gate set above (`ci.yml` on all platforms + `forbid-runner-schema.yml` + the path-triggered gates when they run). Currently it doesn't — `main` has been accepting merges through red. Aligning protection rules with this policy is a follow-up. Note that the platform escape valve described above is human-enforced (you check the linked exemption before merging) — GitHub branch protection can't natively express "green OR linked open issue," so this part of the policy lives in PR-review discipline, not the protection rules.
+
+### Quick checklist before clicking merge
+
+- [ ] Local build / test passed on whatever platform you're authoring on (frontend build, `cargo fmt --check`, `cargo check`, relevant `cargo test`)
+- [ ] `ci.yml` green on each platform leg, OR red leg has a tracked exemption per "Platform escape valve" linked in the PR description
+- [ ] `forbid-runner-schema.yml` green
+- [ ] `spec-pairing.yml` green if it ran (or didn't run because no paths matched)
+- [ ] `schema-pg-sql-fresh.yml` is not a hard gate yet — workflow itself is broken; ignore its red until the infra fixes land
+- [ ] Any new red compared against current `main` and either confirmed-not-yours-with-link or fixed
+- [ ] No open `ci/...` branch is doing the same work
+
 ## Building for Release
 
 ```bash
