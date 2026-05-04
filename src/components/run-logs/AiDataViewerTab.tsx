@@ -43,7 +43,7 @@ import {
 } from "lucide-react";
 
 const EVENTS_PAGE_SIZE = 50;
-import { isDevelopmentMode } from "qontinui-navigation";
+import { isDevelopmentMode } from "@qontinui/navigation";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
 import {
   useJsonlLogsForTaskRun,

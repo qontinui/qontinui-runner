@@ -6,7 +6,7 @@
  * identify pages that don't have specs yet.
  */
 
-import { getAllItems, getItemGroup } from "qontinui-navigation";
+import { getAllItems, getItemGroup } from "@qontinui/navigation";
 
 // ============================================================================
 // Types

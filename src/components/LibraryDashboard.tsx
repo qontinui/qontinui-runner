@@ -25,7 +25,7 @@ import {
   Star,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { isDevelopmentMode } from "qontinui-navigation";
+import { isDevelopmentMode } from "@qontinui/navigation";
 import { getAccentColors } from "@/design-system";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 

@@ -2,7 +2,7 @@
  * Sidebar.tsx
  *
  * Two-level sidebar navigation for the qontinui-runner application.
- * Uses the shared qontinui-navigation package for navigation structure and state management.
+ * Uses the shared @qontinui/navigation package for navigation structure and state management.
  *
  * Features:
  * - Main sidebar with collapsible groups
@@ -116,7 +116,7 @@ import {
   serializeState,
   deserializeState,
   useNavigationItem,
-} from "qontinui-navigation";
+} from "@qontinui/navigation";
 import { useProductMode, type ProductMode } from "@/contexts/ProductModeContext";
 
 // ============================================================================
