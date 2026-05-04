@@ -515,4 +515,433 @@ mod manifest_drift_tests {
             source_routes.len()
         );
     }
+
+    /// Phase 2a (plan 2026-05-03 ui-bridge-runner-wireup-discipline).
+    ///
+    /// Diff the SDK's authoritative `UI_BRIDGE_ROUTES` array against the
+    /// runner's `route_manifest()`. Catches the "SDK adds a route, runner
+    /// returns 404" gap that the sibling `manifest_matches_route_calls` test
+    /// is structurally blind to (it only checks runner-internal consistency).
+    ///
+    /// Skip — not fail — when the ui-bridge sibling repo isn't checked out
+    /// next to qontinui-runner: this test is best-effort, not a hard
+    /// dependency on the dev-tree layout.
+    #[test]
+    fn sdk_manifest_routes_are_exposed_by_runner() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let sdk_types_path = PathBuf::from(manifest_dir)
+            .join("../../ui-bridge/packages/ui-bridge/src/server/types.ts");
+
+        // Skip condition: ui-bridge repo not present alongside qontinui-runner.
+        // This is a dev-tree convention, not a build-time guarantee, so make
+        // the diff non-blocking when the source-of-truth file is unreachable.
+        let src = match std::fs::read_to_string(&sdk_types_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "skip sdk_manifest_routes_are_exposed_by_runner: {} unreadable ({})",
+                    sdk_types_path.display(),
+                    e
+                );
+                return;
+            }
+        };
+
+        // Bracket-balanced extraction of the UI_BRIDGE_ROUTES = [ ... ];
+        // block. A simple regex on the whole file would fight the nested
+        // object braces; restricting subsequent entry-scanning to the array
+        // body avoids accidentally matching unrelated `{ method: ... }`
+        // shapes elsewhere in the file (e.g. example snippets in JSDoc).
+        let array_start_re =
+            regex::Regex::new(r"export\s+const\s+UI_BRIDGE_ROUTES[^=]*=\s*\[").unwrap();
+        let start_match = array_start_re
+            .find(&src)
+            .expect("UI_BRIDGE_ROUTES = [ … ] not found in SDK types.ts");
+        let body_start = start_match.end();
+
+        let bytes = src.as_bytes();
+        let mut depth = 1usize;
+        let mut i = body_start;
+        let mut body_end = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        assert!(
+            body_end > body_start,
+            "UI_BRIDGE_ROUTES array body not balanced — regex/scan logic bug"
+        );
+        let array_body = &src[body_start..body_end];
+
+        // Within the array body, scrape each entry's method and path. Entries
+        // can span multiple lines (multiline `{ method: …, path: …, … }`) so
+        // match `path` and `method` independently per `{ … }` chunk rather
+        // than insisting on a same-line pair.
+        let entry_re = regex::Regex::new(r"(?s)\{[^{}]*\}").unwrap();
+        let method_re = regex::Regex::new(r#"method:\s*'([A-Z]+)'"#).unwrap();
+        let path_re = regex::Regex::new(r#"path:\s*'([^']+)'"#).unwrap();
+
+        let mut sdk_routes: HashSet<(String, String)> = HashSet::new();
+        for entry in entry_re.find_iter(array_body) {
+            let chunk = entry.as_str();
+            let method = match method_re.captures(chunk) {
+                Some(c) => c[1].to_string(),
+                None => continue,
+            };
+            let path = match path_re.captures(chunk) {
+                Some(c) => c[1].to_string(),
+                None => continue,
+            };
+            // SDK paths are relative to the /ui-bridge mount point and use
+            // `:id`-style placeholders; normalise to `/ui-bridge/...{id}`
+            // to match the runner's axum-style declarations.
+            let full_path = format!("/ui-bridge{}", path);
+            let canonical = canonicalise_path(&full_path);
+            sdk_routes.insert((method, canonical));
+        }
+
+        // Sanity floor: a regex-regression that silently matches nothing
+        // would let real drift slide through. The SDK has ~190 entries.
+        assert!(
+            sdk_routes.len() > 50,
+            "scrape extracted only {} SDK routes — regex likely broken",
+            sdk_routes.len()
+        );
+
+        // ── Runner-only allow-list ──────────────────────────────────────
+        //
+        // Routes the runner exposes that aren't part of the SDK contract.
+        // Captured here as a *baseline snapshot* of accepted divergence so
+        // this test stays focused on catching NEW drift, not re-litigating
+        // the long tail of pre-existing differences. Two reasons a path
+        // belongs here:
+        //
+        //   (a) Architecturally runner-only — IPC plumbing (`pong`,
+        //       `ipc-response`), Tauri-invoke proxy (`commands`, `invoke/*`),
+        //       discoverability surfaces (`_routes`, `_help`), debug
+        //       analytics (`/analytics/*`, `/explore/*`, `/diagnostics/*`,
+        //       `/circuit-breaker/*`, `/discover-states`, `/history/*`,
+        //       `/graph/*`).
+        //   (b) Pre-existing convenience the runner shipped before the SDK
+        //       documented an equivalent — listed here so the TEST CAN PASS
+        //       today and only flag NEW drift going forward. Promote to
+        //       UI_BRIDGE_ROUTES (and remove from this list) when wiring
+        //       the SDK side.
+        //
+        // The `/control/ai/*` aliases under `/control/` mirror SDK `/ai/*`
+        // routes — `add_dual!` registers both for the same handler. SDK
+        // declares only the `/ai/` form, hence the runner's `/control/ai/`
+        // siblings are intentionally runner-only.
+        let runner_only_baseline: HashSet<(&str, &str)> = [
+            // Runner infrastructure
+            ("GET", "/ui-bridge/_routes"),
+            ("GET", "/ui-bridge/_help"),
+            ("GET", "/ui-bridge/commands"),
+            ("POST", "/ui-bridge/invoke/{}"),
+            ("POST", "/ui-bridge/pong"),
+            ("POST", "/ui-bridge/ipc-response"),
+            ("POST", "/ui-bridge/batch"),
+            ("POST", "/ui-bridge/control/batch"),
+            ("POST", "/ui-bridge/render-log"),
+            ("POST", "/ui-bridge/control/render-log"),
+            ("POST", "/ui-bridge/control/assert"),
+            ("GET", "/ui-bridge/control/keyboard-shortcuts"),
+            ("GET", "/ui-bridge/control/element/{}/tree"),
+            ("POST", "/ui-bridge/control/element/{}/assert"),
+            ("POST", "/ui-bridge/control/batch-actions"),
+            ("POST", "/ui-bridge/circuit-breaker/reset"),
+            // /control/ai/* aliases mirroring SDK /ai/* (runner-side dual mount)
+            ("DELETE", "/ui-bridge/control/ai/bookmark/{}"),
+            ("GET", "/ui-bridge/control/ai/bookmark/{}"),
+            ("GET", "/ui-bridge/control/ai/bookmark/{}/diff"),
+            ("GET", "/ui-bridge/control/ai/bookmarks"),
+            ("GET", "/ui-bridge/control/ai/categorize-last-diff"),
+            ("GET", "/ui-bridge/control/ai/change-buffer/size"),
+            ("POST", "/ui-bridge/control/ai/bookmarks"),
+            ("POST", "/ui-bridge/control/ai/change-buffer/disable"),
+            ("POST", "/ui-bridge/control/ai/change-buffer/drain"),
+            ("POST", "/ui-bridge/control/ai/change-buffer/enable"),
+            ("POST", "/ui-bridge/control/ai/execute-with-diff"),
+            ("POST", "/ui-bridge/control/ai/find"),
+            ("POST", "/ui-bridge/control/ai/image-diff"),
+            ("POST", "/ui-bridge/control/ai/scoped-diff"),
+            ("POST", "/ui-bridge/control/ai/search"),
+            ("POST", "/ui-bridge/control/ai/structured-changes"),
+            ("POST", "/ui-bridge/control/ai/summarize-diff"),
+            ("POST", "/ui-bridge/control/ai/wait-for-change"),
+            // /ai/* runner extensions not in SDK contract
+            ("GET", "/ui-bridge/ai/element-screenshot"),
+            ("GET", "/ui-bridge/ai/elements/last-discovered"),
+            ("GET", "/ui-bridge/ai/forms"),
+            ("GET", "/ui-bridge/ai/idle-status"),
+            ("POST", "/ui-bridge/ai/analyze/data"),
+            ("POST", "/ui-bridge/ai/analyze/regions"),
+            ("POST", "/ui-bridge/ai/analyze/structured-data"),
+            ("POST", "/ui-bridge/ai/design-audit"),
+            ("POST", "/ui-bridge/ai/expect"),
+            ("POST", "/ui-bridge/ai/fill-form"),
+            ("POST", "/ui-bridge/ai/image-diff"),
+            ("POST", "/ui-bridge/ai/media/audit/{}"),
+            ("POST", "/ui-bridge/ai/page-summary"),
+            ("POST", "/ui-bridge/ai/wait-for-idle"),
+            ("POST", "/ui-bridge/ai/wait-for-navigation"),
+            ("POST", "/ui-bridge/ai/wait-for-route"),
+            // Analytics / debug surfaces (runner-only by design)
+            ("GET", "/ui-bridge/analytics/action-baselines"),
+            ("GET", "/ui-bridge/analytics/annotation-gaps"),
+            ("GET", "/ui-bridge/analytics/decay-curve"),
+            ("GET", "/ui-bridge/analytics/failure-taxonomy"),
+            ("GET", "/ui-bridge/analytics/fragility-heatmap"),
+            ("GET", "/ui-bridge/analytics/health-score"),
+            ("GET", "/ui-bridge/analytics/intervention-effectiveness"),
+            ("GET", "/ui-bridge/analytics/recommendations"),
+            ("GET", "/ui-bridge/analytics/regressions"),
+            ("GET", "/ui-bridge/analytics/stall-frequency"),
+            ("GET", "/ui-bridge/analytics/state-coverage"),
+            ("GET", "/ui-bridge/diagnostics/readiness"),
+            ("GET", "/ui-bridge/explore/results"),
+            ("GET", "/ui-bridge/explore/status"),
+            ("POST", "/ui-bridge/explore"),
+            ("POST", "/ui-bridge/explore/stop"),
+            ("POST", "/ui-bridge/discover-states"),
+            ("GET", "/ui-bridge/graph/element-reliability"),
+            ("GET", "/ui-bridge/history/element/{}"),
+            ("GET", "/ui-bridge/history/elements"),
+            ("GET", "/ui-bridge/history/flaky"),
+            // Runner-side /control/* convenience routes not yet in UI_BRIDGE_ROUTES
+            ("DELETE", "/ui-bridge/control/network/stubs"),
+            ("DELETE", "/ui-bridge/control/network/stubs/{}"),
+            ("GET", "/ui-bridge/control/action-plan/cache"),
+            ("GET", "/ui-bridge/control/action-plan/cache/stats"),
+            ("GET", "/ui-bridge/control/annotated-screenshot"),
+            ("GET", "/ui-bridge/control/design/evaluate/contexts"),
+            ("GET", "/ui-bridge/control/design/style-guide"),
+            ("GET", "/ui-bridge/control/element-screenshot"),
+            ("GET", "/ui-bridge/control/elements/last-discovered"),
+            ("GET", "/ui-bridge/control/health-signals"),
+            ("GET", "/ui-bridge/control/network/stubs"),
+            ("GET", "/ui-bridge/control/page/playbook"),
+            ("GET", "/ui-bridge/control/spec/{}"),
+            ("GET", "/ui-bridge/control/tabs"),
+            ("GET", "/ui-bridge/control/toasts"),
+            ("GET", "/ui-bridge/control/windows"),
+            ("POST", "/ui-bridge/control/action-plan"),
+            ("POST", "/ui-bridge/control/activate-tab/{}"),
+            ("POST", "/ui-bridge/control/annotations"),
+            ("POST", "/ui-bridge/control/capture-element-images"),
+            ("POST", "/ui-bridge/control/clear-storage"),
+            ("POST", "/ui-bridge/control/design/evaluate"),
+            ("POST", "/ui-bridge/control/design/evaluate/baseline"),
+            ("POST", "/ui-bridge/control/design/evaluate/diff"),
+            ("POST", "/ui-bridge/control/design/style-guide/clear"),
+            ("POST", "/ui-bridge/control/design/style-guide/load"),
+            ("POST", "/ui-bridge/control/diagnose-stuck"),
+            ("POST", "/ui-bridge/control/intents/execute"),
+            ("POST", "/ui-bridge/control/intents/execute-from-query"),
+            ("POST", "/ui-bridge/control/intents/find"),
+            ("POST", "/ui-bridge/control/navigate-and-wait"),
+            ("POST", "/ui-bridge/control/navigate-tab"),
+            ("POST", "/ui-bridge/control/network/stubs"),
+            ("POST", "/ui-bridge/control/network/verify-stub"),
+            ("POST", "/ui-bridge/control/page-health"),
+            ("POST", "/ui-bridge/control/page/close-request"),
+            ("POST", "/ui-bridge/control/page/evaluate-batch"),
+            ("POST", "/ui-bridge/control/page/evaluate-raw"),
+            ("POST", "/ui-bridge/control/page/evaluate-safe"),
+            ("POST", "/ui-bridge/control/page/hard-refresh"),
+            ("POST", "/ui-bridge/control/page/set-tab"),
+            ("POST", "/ui-bridge/control/page/summary"),
+            ("POST", "/ui-bridge/control/query-selector"),
+            ("POST", "/ui-bridge/control/screenshot"),
+            ("POST", "/ui-bridge/control/spec/{}/run"),
+            ("POST", "/ui-bridge/control/tab/activate"),
+            ("POST", "/ui-bridge/control/wait-for-element"),
+            ("POST", "/ui-bridge/control/wait-for-element-stable"),
+            ("POST", "/ui-bridge/control/wait-for-element-state"),
+            ("POST", "/ui-bridge/control/wait-for-navigation"),
+            ("POST", "/ui-bridge/control/wait-for-route"),
+            ("POST", "/ui-bridge/control/wait-for-route-change"),
+            ("POST", "/ui-bridge/control/with-diff"),
+        ]
+        .into_iter()
+        .collect();
+
+        // Allow-listed prefixes. `/ui-bridge/sdk/*` is the WS-transport outer
+        // wrapper layer in `mcp/sdk_client.rs` — runner-only by architectural
+        // design, never part of UI_BRIDGE_ROUTES.
+        let runner_only_prefixes: &[&str] = &["/ui-bridge/sdk/"];
+
+        let in_prefix_allowlist =
+            |p: &str| runner_only_prefixes.iter().any(|pre| p.starts_with(pre));
+
+        // ── SDK-only baseline ───────────────────────────────────────────
+        //
+        // Routes the SDK declares but the runner does not currently expose.
+        // These are real wire-through gaps captured as a *baseline snapshot*
+        // — none of them are the 5 friction-table entries from the
+        // 2026-05-03 plan (those have all been wired). They're long-tail
+        // SDK surface (annotations, design eval, intent registry, render-log
+        // file ops, etc.) that the runner has never plumbed through. Listed
+        // here so this test passes today and flags only NEW drift.
+        //
+        // To remove an entry: implement the runner handler in the matching
+        // `mcp/ui_bridge/<family>.rs`, register in `route_entries()`, then
+        // delete the line below. The test will then assert end-to-end
+        // wiring forever after.
+        let sdk_only_baseline: HashSet<(&str, &str)> = [
+            // Render log file ops
+            ("DELETE", "/ui-bridge/render-log"),
+            ("GET", "/ui-bridge/render-log/path"),
+            ("POST", "/ui-bridge/render-log/snapshot"),
+            // Annotations top-level surface (runner exposes /control/annotations only)
+            ("DELETE", "/ui-bridge/annotations/{}"),
+            ("GET", "/ui-bridge/annotations"),
+            ("GET", "/ui-bridge/annotations/coverage"),
+            ("GET", "/ui-bridge/annotations/export"),
+            ("GET", "/ui-bridge/annotations/{}"),
+            ("POST", "/ui-bridge/annotations/import"),
+            ("PUT", "/ui-bridge/annotations/{}"),
+            ("POST", "/ui-bridge/control/annotation/{}"),
+            // Design top-level surface (runner exposes /control/design/* aliases only)
+            ("DELETE", "/ui-bridge/design/style-guide"),
+            ("GET", "/ui-bridge/design/element/{}/styles"),
+            ("GET", "/ui-bridge/design/evaluate/contexts"),
+            ("GET", "/ui-bridge/design/style-guide"),
+            ("POST", "/ui-bridge/design/audit"),
+            ("POST", "/ui-bridge/design/element/{}/state-styles"),
+            ("POST", "/ui-bridge/design/evaluate"),
+            ("POST", "/ui-bridge/design/evaluate/baseline"),
+            ("POST", "/ui-bridge/design/evaluate/diff"),
+            ("POST", "/ui-bridge/design/responsive"),
+            ("POST", "/ui-bridge/design/snapshot"),
+            ("POST", "/ui-bridge/design/style-guide/load"),
+            // Bookmark singular form (runner only exposes /ai/bookmark/{}, not /ai/bookmarks/{})
+            ("DELETE", "/ui-bridge/ai/bookmarks/{}"),
+            ("GET", "/ui-bridge/ai/bookmarks/{}"),
+            ("GET", "/ui-bridge/ai/bookmarks/{}/diff"),
+            // /ai/intents — runner exposes /ai/intents/* and /control/intents/*; SDK declares both shapes
+            ("GET", "/ui-bridge/ai/intents"),
+            ("POST", "/ui-bridge/ai/intents/execute"),
+            ("POST", "/ui-bridge/ai/intents/execute-from-query"),
+            ("POST", "/ui-bridge/ai/intents/find"),
+            ("POST", "/ui-bridge/ai/intents/register"),
+            ("DELETE", "/ui-bridge/control/intent/{}"),
+            ("POST", "/ui-bridge/control/intent/{}/execute"),
+            // Cross-app analyze GET form (runner exposes POST form only)
+            ("GET", "/ui-bridge/ai/analyze/data"),
+            ("GET", "/ui-bridge/ai/analyze/regions"),
+            ("GET", "/ui-bridge/ai/analyze/structured-data"),
+            // Media audit named subpaths (runner exposes /ai/media/audit/{} param form)
+            ("POST", "/ui-bridge/ai/media/audit/accessibility"),
+            ("POST", "/ui-bridge/ai/media/audit/performance"),
+            // Misc /control/* the runner hasn't plumbed
+            ("GET", "/ui-bridge/control/changes/since"),
+            ("GET", "/ui-bridge/control/clipboard/read"),
+            ("GET", "/ui-bridge/control/element/{}/history"),
+            ("GET", "/ui-bridge/control/element/{}/react-state"),
+            ("GET", "/ui-bridge/control/history"),
+            ("GET", "/ui-bridge/control/interaction-metrics"),
+            ("GET", "/ui-bridge/control/page/routes"),
+            ("POST", "/ui-bridge/control/actions/batch"),
+            ("POST", "/ui-bridge/control/clipboard/write"),
+            ("POST", "/ui-bridge/control/elements/rank"),
+            ("POST", "/ui-bridge/control/page/navigate-to"),
+            ("POST", "/ui-bridge/control/sdk/spawn-headless"),
+            ("POST", "/ui-bridge/control/viewport-constraints"),
+            // Debug top-level surface (runner exposes /control/* equivalents)
+            ("GET", "/ui-bridge/debug/action-history"),
+            ("GET", "/ui-bridge/debug/element-history/{}"),
+            ("GET", "/ui-bridge/debug/metrics"),
+            // Heartbeat — runner uses /pong/IPC plumbing instead
+            ("POST", "/ui-bridge/heartbeat"),
+            // /ai/assert/batch slash form (runner exposes /ai/assert-batch hyphen form)
+            ("POST", "/ui-bridge/ai/assert/batch"),
+        ]
+        .into_iter()
+        .collect();
+
+        // Apply allow-list using the canonicalised path so `{}` placeholders
+        // match SDK `:id` and runner `{anything}` uniformly.
+        let runner_routes: HashSet<(String, String)> = route_manifest()
+            .iter()
+            .filter(|(_, p)| !in_prefix_allowlist(p))
+            .map(|(m, p)| ((*m).to_string(), canonicalise_path(p)))
+            .filter(|(m, p)| !runner_only_baseline.contains(&(m.as_str(), p.as_str())))
+            .collect();
+
+        let sdk_routes_filtered: HashSet<(String, String)> = sdk_routes
+            .iter()
+            .filter(|(m, p)| !sdk_only_baseline.contains(&(m.as_str(), p.as_str())))
+            .cloned()
+            .collect();
+
+        // SDK-declared routes the runner doesn't expose — what this plan exists to prevent.
+        let sdk_missing_in_runner: Vec<&(String, String)> =
+            sdk_routes_filtered.difference(&runner_routes).collect();
+
+        // Runner routes the SDK doesn't declare — undocumented runner extensions
+        // or stale routes that should be promoted to UI_BRIDGE_ROUTES. Surfaced
+        // separately so a real wire-through gap is distinguishable from
+        // "extend the allow-list".
+        let runner_extra_vs_sdk: Vec<&(String, String)> =
+            runner_routes.difference(&sdk_routes_filtered).collect();
+
+        if !sdk_missing_in_runner.is_empty() || !runner_extra_vs_sdk.is_empty() {
+            let mut sdk_missing_sorted: Vec<&(String, String)> = sdk_missing_in_runner.clone();
+            sdk_missing_sorted.sort();
+            let mut runner_extra_sorted: Vec<&(String, String)> = runner_extra_vs_sdk.clone();
+            runner_extra_sorted.sort();
+
+            panic!(
+                "SDK ↔ runner manifest drift detected.\n\
+                 SDK is the source of truth for the contract; runner must expose every entry.\n\
+                 Either add the missing handler in mcp/ui_bridge/<family>.rs or extend the\n\
+                 sdk_only_baseline / runner_only_baseline allow-list in this test if the\n\
+                 divergence is intentional.\n\n\
+                 SDK declares but runner does not expose ({}):\n  {}\n\n\
+                 Runner exposes but SDK does not declare ({}):\n  {}",
+                sdk_missing_in_runner.len(),
+                sdk_missing_sorted
+                    .iter()
+                    .map(|(m, p)| format!("{} {}", m, p))
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+                runner_extra_vs_sdk.len(),
+                runner_extra_sorted
+                    .iter()
+                    .map(|(m, p)| format!("{} {}", m, p))
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+            );
+        }
+    }
+
+    /// Canonicalise a path so SDK `:id` and runner `{id}` placeholders compare
+    /// equal. Strip the placeholder *name* too — axum routes by position, not
+    /// by binding name, so `{run_id}` vs `{runId}` are the same route
+    /// structurally and would otherwise generate spurious "drift" entries.
+    fn canonicalise_path(path: &str) -> String {
+        path.split('/')
+            .map(|seg| {
+                let is_axum = seg.starts_with('{') && seg.ends_with('}') && seg.len() >= 2;
+                let is_express = seg.starts_with(':');
+                if is_axum || is_express {
+                    "{}".to_string()
+                } else {
+                    seg.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
 }
