@@ -205,19 +205,21 @@ If `release.yml` is red on `windows-latest`, that's a release-time problem, not 
 
 ### Platform escape valve
 
-`ci.yml` runs on three hosted GitHub runners, and one of them can have a runner-image-specific block that no PR can fix (current example: `windows-latest` rustc crashing with `STATUS_ILLEGAL_INSTRUCTION` mid-compile, an instruction-set issue on the hosted image, not project code). Strict-on-every-platform here means no PR ever merges until GitHub fixes their image — which punishes contributors for upstream problems.
+`ci.yml` runs on three hosted GitHub runners, and a platform leg can sometimes fail for reasons you can't fix inside your PR — either a genuine upstream issue (a runner-image regression, a third-party action breaking change) or an in-progress project-side fight that's already being worked on a different branch. Strict-on-every-platform-no-matter-what would block all merges during those windows, which punishes contributors for problems being tracked elsewhere.
+
+Concrete current example: rustc-LLVM has been OOMing during codegen of the `qontinui_runner` test bin. On Windows the OOM surfaces as `STATUS_ILLEGAL_INSTRUCTION 0xc000001d` (rustc's allocator aborts; the OS reports the abort, not a real CPU instruction-set fault). On Linux the same root cause shows up as the runner agent receiving SIGTERM / exit 143 (the Linux OOM-killer takes the runner down before rustc can report). The mitigation lives in `Cargo.toml` profile overrides (`[profile.test] debug = 0`), `CARGO_BUILD_JOBS` caps, and pagefile / swap expansion — see `Cargo.toml:5-9` for the in-tree comment naming this exact symptom. Don't pin `target-cpu` or chase image-vintage theories; verify the OOM hypothesis first by grepping the log for `out of memory` and `Allocation failed`.
 
 The rule:
 
-- A platform leg may be temporarily exempted from the merge gate **if and only if** there's an open tracked issue describing the upstream-runner block, linked in the PR description.
+- A platform leg may be temporarily exempted from the merge gate **if and only if** there's an open tracked issue or `_dev-notes-main/<slug>/SESSION_PROMPT.md` plan documenting the block, linked in the PR description. The block can be either an upstream-runner pathology *or* an in-progress project-side fix you can't land in your PR.
 - Exemption applies to that platform leg only — the other two must still go green.
-- Exemptions are not "permanent." Each one decays the moment the upstream issue closes; recheck before merging.
+- Exemptions are not "permanent." Each one decays the moment the linked workstream closes; recheck before merging.
 
-Don't add new exemptions casually. The escape valve exists so genuine upstream blocks don't grind merges to zero, not so flaky tests get a free pass.
+Don't add new exemptions casually. The escape valve exists so known-tracked blocks don't grind merges to zero — it isn't a free pass for "tests are flaky, ignore" or "I'll fix this later."
 
 ### Test locally first
 
-For the platforms you can run locally, run the relevant test before pushing — the feedback loop is much faster than waiting on CI, and a local failure means CI failure too. The reverse isn't always true: local can pass while CI fails on something runner-image-specific (see "Platform escape valve"). So local-first is a productivity practice, not a CI replacement.
+For the platforms you can run locally, run the relevant test before pushing — the feedback loop is much faster than waiting on CI, and a local failure means CI failure too. The reverse isn't always true: local can pass while CI fails on something CI-environment-specific (smaller memory budget on the hosted runner, runner-image regression, action vendor break — see "Platform escape valve"). So local-first is a productivity practice, not a CI replacement.
 
 ```bash
 # Frontend typecheck + build
