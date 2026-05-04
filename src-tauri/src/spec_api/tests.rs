@@ -326,7 +326,10 @@ mod handler_tests {
         );
 
         // list_pages returns sorted ids ⇒ test-alpha, test-beta.
-        let ids: Vec<&str> = specs.iter().map(|s| s["specId"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = specs
+            .iter()
+            .map(|s| s["specId"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, vec!["test-alpha", "test-beta"]);
 
         for entry in specs {

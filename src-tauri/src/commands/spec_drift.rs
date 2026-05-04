@@ -210,7 +210,10 @@ fn scan_specs() -> (SpecAssertedIndex, usize) {
             Ok(Some(v)) => v,
             Ok(None) => continue,
             Err(e) => {
-                warn!("spec_drift: failed to read projection for {}: {}", page_id, e);
+                warn!(
+                    "spec_drift: failed to read projection for {}: {}",
+                    page_id, e
+                );
                 continue;
             }
         };

@@ -51,12 +51,8 @@ fn err_envelope(msg: impl Into<String>) -> DriftEnvelope<Value> {
 // Storage adapter — looks up the Pg-backed pool from the StorageCompartment
 // ---------------------------------------------------------------------------
 
-async fn fetch_drift_report(
-    _api_state: &ApiState,
-    run_id: &str,
-) -> Result<Option<Value>, String> {
-    let pg = PgDb::try_global()
-        .ok_or_else(|| "PgDb not initialized".to_string())?;
+async fn fetch_drift_report(_api_state: &ApiState, run_id: &str) -> Result<Option<Value>, String> {
+    let pg = PgDb::try_global().ok_or_else(|| "PgDb not initialized".to_string())?;
     pg.get_drift_report_for_logical_run_id(run_id).await
 }
 

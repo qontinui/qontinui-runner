@@ -83,8 +83,10 @@ pub fn project_scenarios(ir: &IrDocument) -> ScenarioProjection {
         let mut sorted_bucket: Vec<&IrTransition> = bucket.to_vec();
         sorted_bucket.sort_by(|a, b| a.id.cmp(&b.id));
 
-        let outbound: Vec<ProjectedTransition> =
-            sorted_bucket.iter().map(|t| project_transition(t)).collect();
+        let outbound: Vec<ProjectedTransition> = sorted_bucket
+            .iter()
+            .map(|t| project_transition(t))
+            .collect();
 
         let label = if !s.name.is_empty() && s.name != s.id {
             Some(s.name.clone())
