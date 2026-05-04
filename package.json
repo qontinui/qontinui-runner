@@ -99,6 +99,8 @@
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run validate:ws-actions && npm run vocab:check",
     "check:all": "npm run check && npm run rust:check && npm run rust:lint",
     "validate:ws-actions": "node scripts/validate-ws-actions.mjs",
+    "coverage-diff": "node scripts/coverage-diff.mjs",
+    "coverage-diff:test": "node --test scripts/__tests__/coverage-diff.test.mjs",
     "vocab:gen": "node scripts/validate-ws-actions.mjs --emit-doc ui-bridge/docs-site/docs/wrappers/action-vocabulary.md",
     "vocab:check": "node scripts/validate-ws-actions.mjs --check-doc ui-bridge/docs-site/docs/wrappers/action-vocabulary.md",
     "dev": "vite",

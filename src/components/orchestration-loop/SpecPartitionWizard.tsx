@@ -10,7 +10,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "../../lib/utils";
 import { Loader2, Play, ChevronRight, ChevronLeft } from "lucide-react";
-import { getAllSpecs } from "../../lib/spec-registry";
+import { useDiscoveredSpecs } from "../../lib/ui-bridge/use-discovered-specs";
 import { getApiBase, tracedFetch } from "../../lib/runner-api";
 import {
   buildMultiRunnerSpecWorkflow,
@@ -18,8 +18,6 @@ import {
   type MultiRunnerSpecWorkflowResult,
 } from "../../lib/workflow-builder";
 import { type PartitionStrategy } from "../../lib/workflow-builder";
-import type { DiscoveredSpec } from "../../lib/spec-prompt-builder";
-
 interface RunnerInstance {
   id: string;
   name: string;
@@ -45,7 +43,7 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
   const [error, setError] = useState<string | null>(null);
 
   // Data
-  const [specs, setSpecs] = useState<DiscoveredSpec[]>([]);
+  const { specs } = useDiscoveredSpecs();
   const [runnerInstances, setRunnerInstances] = useState<RunnerInstance[]>([]);
   const [selectedRunners, setSelectedRunners] = useState<Set<string>>(new Set());
 
@@ -59,14 +57,14 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
   // Preview
   const [result, setResult] = useState<MultiRunnerSpecWorkflowResult | null>(null);
 
-  // Load data on mount. Both setState calls are deferred into a microtask
-  // so the effect body itself doesn't synchronously trigger state updates
-  // (react-hooks/set-state-in-effect).
+  // Load runner instances on mount. The setState call is deferred into a
+  // microtask so the effect body itself doesn't synchronously trigger state
+  // updates (react-hooks/set-state-in-effect). Specs are now provided
+  // reactively by useDiscoveredSpecs() above.
   useEffect(() => {
     let cancelled = false;
     void Promise.resolve().then(() => {
       if (cancelled) return;
-      setSpecs(getAllSpecs());
       invoke<RunnerInstance[]>("get_runner_instances")
         .then((instances) => {
           if (!cancelled) setRunnerInstances(instances);

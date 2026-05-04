@@ -291,6 +291,60 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    async fn list_returns_per_page_discovered_specs() {
+        // Section 13 / Phase 1 — `GET /spec/list` enumerates all known
+        // pages and returns a per-page projection slice matching the
+        // TypeScript `DiscoveredSpec` shape (see
+        // qontinui-runner/src/lib/spec-prompt-builder.ts).
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Seed two distinct IR pages so the on-disk listing wins over
+        // the embedded snapshot fallback.
+        let mut doc_a = small_doc();
+        doc_a.id = "test-alpha".to_string();
+        let mut doc_b = small_doc();
+        doc_b.id = "test-beta".to_string();
+        super::super::storage::write_ir_and_regenerate(root, &doc_a).unwrap();
+        super::super::storage::write_ir_and_regenerate(root, &doc_b).unwrap();
+
+        let resp = super::super::handlers::build_list_response(root).into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(v["ok"], true);
+        let specs = v["specs"].as_array().expect("specs must be an array");
+        assert_eq!(
+            specs.len(),
+            2,
+            "expected exactly 2 entries, got {:?}",
+            specs
+        );
+
+        // list_pages returns sorted ids ⇒ test-alpha, test-beta.
+        let ids: Vec<&str> = specs.iter().map(|s| s["specId"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["test-alpha", "test-beta"]);
+
+        for entry in specs {
+            assert_eq!(entry["appName"], "Qontinui Runner");
+            let config = &entry["config"];
+            assert_eq!(config["version"], "1.0.0");
+            let groups = config["groups"]
+                .as_array()
+                .expect("config.groups must be an array");
+            assert_eq!(groups.len(), 1, "small_doc projects to a single group");
+            assert!(
+                config.get("description").is_some(),
+                "config must include description key (may be string or null)"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn projection_via_handler_storage_round_trip() {
         // End-to-end through storage: write a tempdir IR via env override,
         // then re-read the projection and assert reason-bearing 404 for an

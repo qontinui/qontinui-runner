@@ -54,7 +54,7 @@ import { useGenerateData, type SavedPrompt } from "./useGenerateData";
 import { useAdvancedOptions, PROVIDERS } from "./useAdvancedOptions";
 import { useTemplatePopover } from "./useTemplatePopover";
 import { instanceStorage } from "@/lib/instance-storage";
-import { getAllSpecs } from "@/lib/spec-registry";
+import { useDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import {
   buildSpecWorkflow,
   type SpecConfig as BuildSpecConfig,
@@ -188,7 +188,7 @@ export function AiGeneratePanel({
   } = useTemplatePopover();
 
   // --- Spec selection state ---
-  const allSpecs = useMemo(() => getAllSpecs(), []);
+  const { specs: allSpecs } = useDiscoveredSpecs();
   const [showSpecs, setShowSpecs] = useState(false);
   const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
   const [selectedGroupIds, setSelectedGroupIds] = useState<Set<string>>(new Set());

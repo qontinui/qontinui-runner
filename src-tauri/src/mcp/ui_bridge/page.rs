@@ -204,6 +204,7 @@ const VALID_TAB_IDS: &[&str] = &[
     "unified-workflow-builder",
     "state-machine",
     "specs",
+    "wrappers",
     "capture",
     "config-log-sources",
     "config-findings",
@@ -255,6 +256,7 @@ const VALID_TAB_IDS: &[&str] = &[
     "dag-workflow-editor",
     "project-explainer",
     "productivity",
+    "regression",
 ];
 
 // ============================================================================

@@ -12,7 +12,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { tracedFetch } from "@/lib/runner-api";
-import type { PersistedStateMachine } from "@qontinui/ui-bridge-auto";
+import type { PersistedStateMachine } from "@qontinui/ui-bridge-auto/runtime";
 
 export async function persistCompiledStateMachine(
   stateMachine: PersistedStateMachine,

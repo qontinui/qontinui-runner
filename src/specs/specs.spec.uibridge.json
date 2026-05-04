@@ -194,7 +194,7 @@
         },
         {
           "id": "specs-load-bundled-behavior",
-          "description": "Clicking 'Bundled' calls getAllSpecs() to load all bundled spec registry entries, then loads user-persisted specs via the Tauri 'load_user_specs' command. After loading, the spec tree populates with spec nodes grouped by application name, the stats row shows updated counts (N specs / M groups / K assertions), and no spec is automatically selected.",
+          "description": "Clicking 'Bundled' fetches the discovered specs from the runner's Spec API (GET /spec/list), then loads user-persisted specs via the Tauri 'load_user_specs' command. After loading, the spec tree populates with spec nodes grouped by application name, the stats row shows updated counts (N specs / M groups / K assertions), and no spec is automatically selected.",
           "category": "behavior",
           "severity": "critical",
           "target": {

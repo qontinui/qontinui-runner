@@ -290,12 +290,12 @@ The result: fewer wasted iterations, faster convergence, and better root-cause f
       resources: [
         {
           title: "Blame Attribution Spec",
-          url: "/specs/blame-attribution.spec.uibridge.json",
+          url: "http://localhost:9876/spec/page/blame-attribution",
           type: "documentation",
         },
         {
           title: "Convergence Widget Spec",
-          url: "/specs/convergence-widget.spec.uibridge.json",
+          url: "http://localhost:9876/spec/page/convergence-widget",
           type: "documentation",
         },
       ],

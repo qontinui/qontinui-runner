@@ -36,6 +36,7 @@ import {
   UIBridgeEventHandler,
   UIBridgeInvokeHandler,
   UIBridgeEvaluateHandler,
+  ScenarioProjectionHandler,
   SpecExecutionHandler,
 } from "./hooks";
 import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
@@ -72,7 +73,7 @@ import { PromptExecutionProvider } from "./components/prompt-home/PromptExecutio
 import { PromptAutomationOverlay } from "./components/prompt-home/PromptAutomationOverlay";
 import { BackgroundTaskPill } from "./components/prompt-home/BackgroundTaskPill";
 import { useTaskRuns } from "./hooks/useAiData";
-import { getAllSpecs } from "./lib/spec-registry";
+import { loadDiscoveredSpecs } from "./lib/ui-bridge/use-discovered-specs";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
 import { autoPopulateCtr, getGlobalCtr } from "@qontinui/ui-bridge/ctr";
 import { getGlobalRegistry } from "@qontinui/ui-bridge";
@@ -654,13 +655,23 @@ function AppWithTutorials() {
 function BundledSpecsLoader() {
   useEffect(() => {
     const store = getGlobalSpecStore();
-    const specs = getAllSpecs();
-    for (const spec of specs) {
-      store.load(spec.specId, spec.config as Parameters<typeof store.load>[1]);
-    }
+    let cancelled = false;
+    const loadedIds: string[] = [];
+    void loadDiscoveredSpecs()
+      .then((specs) => {
+        if (cancelled) return;
+        for (const spec of specs) {
+          store.load(spec.specId, spec.config as Parameters<typeof store.load>[1]);
+          loadedIds.push(spec.specId);
+        }
+      })
+      .catch(() => {
+        // Errors are surfaced by the loader; nothing to do here.
+      });
     return () => {
-      for (const spec of specs) {
-        store.unload(spec.specId);
+      cancelled = true;
+      for (const id of loadedIds) {
+        store.unload(id);
       }
     };
   }, []);
@@ -810,6 +821,7 @@ export default function App() {
         <UIBridgeEventHandler />
         <UIBridgeInvokeHandler />
         <UIBridgeEvaluateHandler />
+        <ScenarioProjectionHandler />
         <SpecExecutionHandler />
         <BundledSpecsLoader />
         <CtrAutoPopulator />

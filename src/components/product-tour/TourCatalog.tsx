@@ -17,7 +17,8 @@ import {
   Square,
 } from "lucide-react";
 import { useUIComponent } from "@qontinui/ui-bridge";
-import type { SpecConfig } from "@/lib/spec-prompt-builder";
+import type { DiscoveredSpec } from "@/lib/spec-prompt-builder";
+import { loadDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import type { ProductTour, TourAudience, TourGenerationState } from "@/types/product-tour";
 import { INITIAL_GENERATION_STATE, PRODUCT_TOURS_STORAGE_KEY } from "@/types/product-tour";
 import { fetchRegisteredElements, generateTour } from "@/lib/product-tour/tour-generator";
@@ -25,29 +26,6 @@ import { exportTour } from "@/lib/product-tour/tour-exporter";
 import { instanceStorage } from "@/lib/instance-storage";
 import { TourCard } from "./TourCard";
 import { TourPlayer } from "./TourPlayer";
-
-// =============================================================================
-// Spec Discovery (same pattern as DemoVideoPanel)
-// =============================================================================
-
-interface DiscoveredSpecEntry {
-  specId: string;
-  config: SpecConfig;
-}
-
-async function discoverSpecs(): Promise<DiscoveredSpecEntry[]> {
-  try {
-    const modules = import.meta.glob("../../specs/*.spec.uibridge.json", {
-      eager: true,
-    }) as Record<string, { default: SpecConfig }>;
-    return Object.entries(modules).map(([path, mod]) => {
-      const fileName = path.split("/").pop()?.replace(".spec.uibridge.json", "") ?? "unknown";
-      return { specId: fileName, config: mod.default };
-    });
-  } catch {
-    return [];
-  }
-}
 
 // =============================================================================
 // Tour Persistence
@@ -74,7 +52,7 @@ export function TourCatalog() {
   });
 
   // Spec discovery
-  const [specs, setSpecs] = useState<DiscoveredSpecEntry[]>([]);
+  const [specs, setSpecs] = useState<DiscoveredSpec[]>([]);
   const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
   const [audience, setAudience] = useState<TourAudience>("new-user");
 
@@ -87,10 +65,12 @@ export function TourCatalog() {
   // Player
   const [activeTour, setActiveTour] = useState<ProductTour | null>(null);
 
-  // Load on mount
+  // Load on mount via the runner Spec API (Section 13).
   useEffect(() => {
     /* eslint-disable react-hooks/set-state-in-effect -- data loading on mount */
-    discoverSpecs().then(setSpecs);
+    loadDiscoveredSpecs()
+      .then(setSpecs)
+      .catch(() => setSpecs([]));
     setSavedTours(loadSavedTours());
     /* eslint-enable react-hooks/set-state-in-effect */
   }, []);

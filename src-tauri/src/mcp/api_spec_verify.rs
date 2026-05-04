@@ -265,43 +265,34 @@ fn evaluate_field_assertion(body: &serde_json::Value, field: &FieldAssertion) ->
 // Spec Loading
 // =============================================================================
 
-/// Load a spec's apiAssertions from the embedded spec files.
+/// Load a spec's apiAssertions from the Spec API's projection storage.
 fn load_api_assertions(spec_id: &str) -> Result<Vec<ApiAssertion>, String> {
-    // Try to find the spec file on disk
-    let spec_dirs = [
-        std::path::PathBuf::from("src/specs"),
-        std::path::PathBuf::from("../src/specs"),
-    ];
-
-    for dir in &spec_dirs {
-        let path = dir.join(format!("{}.spec.uibridge.json", spec_id));
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read spec file: {}", e))?;
-            let spec: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|e| format!("Failed to parse spec JSON: {}", e))?;
-
-            let assertions = spec
-                .get("metadata")
-                .and_then(|m| m.get("apiAssertions"))
-                .and_then(|a| serde_json::from_value::<Vec<ApiAssertion>>(a.clone()).ok())
-                .unwrap_or_default();
-
-            if assertions.is_empty() {
-                return Err(format!(
-                    "Spec '{}' has no apiAssertions in metadata",
-                    spec_id
-                ));
-            }
-
-            return Ok(assertions);
+    let specs_root = crate::spec_api::storage::resolve_specs_root();
+    let spec = match crate::spec_api::storage::read_projection(&specs_root, spec_id)? {
+        Some(v) => v,
+        None => {
+            return Err(format!(
+                "Page '{}' not found under {}/pages/",
+                spec_id,
+                specs_root.display()
+            ));
         }
+    };
+
+    let assertions = spec
+        .get("metadata")
+        .and_then(|m| m.get("apiAssertions"))
+        .and_then(|a| serde_json::from_value::<Vec<ApiAssertion>>(a.clone()).ok())
+        .unwrap_or_default();
+
+    if assertions.is_empty() {
+        return Err(format!(
+            "Spec '{}' has no apiAssertions in metadata",
+            spec_id
+        ));
     }
 
-    Err(format!(
-        "Spec file '{}.spec.uibridge.json' not found",
-        spec_id
-    ))
+    Ok(assertions)
 }
 
 // =============================================================================

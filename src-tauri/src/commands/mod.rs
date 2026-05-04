@@ -211,6 +211,7 @@ pub mod productivity; // Phase 1 productivity stack: plans/tasks/upcoming-claims
 pub mod project_logs;
 pub mod rag;
 pub mod recap; // Session recap overview
+pub mod regression; // UI Bridge regression suite + run + diagnosis + per-assertion exercise log persistence (Section 11 Phase A2)
 pub mod saved_projects; // User-curated project registry (wizard-populated, consumed by UI Bridge panel)
 pub mod screenshot;
 pub mod screenshots;
