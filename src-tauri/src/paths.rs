@@ -354,12 +354,19 @@ fn check_path_containment(
 ) -> Result<PathBuf, String> {
     // Canonicalize both paths for reliable comparison.
     // If canonicalization fails (path doesn't exist yet), use the raw paths.
-    let canonical_resolved = std::fs::canonicalize(resolved)
-        .map(normalize_path_separators)
-        .unwrap_or_else(|_| resolved.to_path_buf());
-    let canonical_boundary = std::fs::canonicalize(boundary)
-        .map(normalize_path_separators)
-        .unwrap_or_else(|_| boundary.to_path_buf());
+    // Normalize symmetrically across both branches: on Windows, `canonicalize`
+    // adds a `\\?\` UNC prefix that `normalize_path_separators` strips. If we
+    // only normalize on the success branch, a non-existent `resolved` whose
+    // raw form already carries `\\?\` (typically because it was joined onto a
+    // canonicalized boundary) keeps the prefix while `boundary` loses it,
+    // and the `starts_with` check at the bottom of this function spuriously
+    // fails.
+    let canonical_resolved = normalize_path_separators(
+        std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf()),
+    );
+    let canonical_boundary = normalize_path_separators(
+        std::fs::canonicalize(boundary).unwrap_or_else(|_| boundary.to_path_buf()),
+    );
 
     let resolved_str = canonical_resolved.to_string_lossy().to_lowercase();
     let boundary_str = canonical_boundary.to_string_lossy().to_lowercase();
