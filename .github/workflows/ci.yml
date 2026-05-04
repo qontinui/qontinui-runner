@@ -177,7 +177,11 @@ jobs:
         shell: bash
 
       - name: Build Tauri app (development)
-        run: pnpm run tauri build -- --debug
+        # @tauri-apps/cli 2.11 stopped forwarding flags after `--` through to
+        # the tauri build command — anything after `--` is passed straight to
+        # `cargo build`, which rejects `--debug` (it's cargo's default, not a
+        # flag). `--debug` must now be a tauri CLI flag, so drop the `--`.
+        run: pnpm run tauri build --debug
 
   security:
     runs-on: ubuntu-latest
