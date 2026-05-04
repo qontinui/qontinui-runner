@@ -120,25 +120,22 @@ jobs:
           cd src-tauri
           cargo clippy -- -D warnings
 
-      # DIAGNOSTIC SPLIT (revert before merge): the Ubuntu leg's `Run Rust
-      # tests` step in CI run 25300119476 produced zero log output for 62 min
-      # before being killed. Splitting compile from execution discriminates
-      # between a `cargo test` build/link hang and a runtime test deadlock —
-      # whichever step times out names the phase. See
-      # qontinui-dev-notes/ubuntu-rust-test-hang/SESSION_PROMPT.md.
-      - name: Compile Rust tests (diagnostic)
-        run: |
-          cd src-tauri
-          cargo test --no-run --verbose
-
-      - name: Run Rust tests (diagnostic, single-threaded)
+      - name: Run Rust tests
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
-        # `--test-threads=1` orders output so the last test name printed before
-        # any stall identifies the offending test.
+        env:
+          # The ubuntu-22.04 hosted runner (4 CPU / 16 GB RAM) OOMs the host
+          # during `cargo test`'s codegen phase on this workspace — the runner
+          # VM loses comms with GitHub before any test step output is shipped
+          # back. Capping rustc to 2 concurrent jobs roughly halves peak RAM
+          # and keeps the build under the runner's memory budget. macOS and
+          # Windows hosted runners have the same 4 CPU but enough headroom at
+          # the default; CARGO_BUILD_JOBS=4 there is the default-equivalent
+          # and explicit so the matrix split is obvious.
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'ubuntu-22.04' && 2 || 4 }}
         run: |
           cd src-tauri
-          cargo test --verbose -- --test-threads=1 --nocapture
+          cargo test --verbose
 
       - name: Build Tauri app (development)
         run: pnpm run tauri build -- --debug
