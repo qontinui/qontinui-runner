@@ -46,6 +46,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::ai_provider::oneshot::{OneshotError, OneshotLlm, OneshotLlmExt};
+use crate::database::pg::completion_reports::{CompletionReport, CompletionSource};
 use crate::database::pg::reviews::InsertReviewInput;
 use crate::database::pg::PgDb;
 
@@ -136,6 +137,7 @@ impl std::error::Error for ReviewError {}
 ///   0.7–0.89 large/unfamiliar; 0.5–0.69 partial coverage; <0.5 escalate)
 /// - `reasoning` is a markdown body with file:line citations
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AutoReviewVerdict {
     /// One of `approved`, `needs_fix`, `escalate`.
     pub verdict: String,
@@ -144,6 +146,19 @@ pub struct AutoReviewVerdict {
     /// Markdown reasoning body. Should cite specific file:line locations
     /// for any defects (the slash command's §Rules require this).
     pub reasoning: String,
+    /// Optional structured completion report — emitted ONLY when the verdict
+    /// is `approved` AND the reviewer is confident enough to attest to the
+    /// task's completion shape (typically confidence >= 0.7). When present,
+    /// `auto_review_in_product` writes this alongside the verdict with
+    /// `completion_source = 'reviewer-attestation'`. Reviewer attestations
+    /// supersede worker self-reports per plan §3 "Reviewer attestation
+    /// (extension)".
+    ///
+    /// On `needs_fix` / `escalate` verdicts the reviewer should leave this
+    /// as `None` — the worker iterates and a future review pass attempts
+    /// the attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_report: Option<CompletionReport>,
 }
 
 // =============================================================================
@@ -191,6 +206,13 @@ Confidence bands (use this directly):
 - 0.70-0.89 — tests pass, claims match, but the change is large or touches unfamiliar territory
 - 0.50-0.69 — partial coverage (some tests didn't run, claim coverage is ambiguous)
 - < 0.50 — you cannot form a real opinion. Pair with verdict="escalate".
+
+Optional `completionReport` field:
+- When (and only when) verdict="approved" with confidence >= 0.7, you MAY emit a structured `completionReport` object that summarises the upstream task in the contract shape downstream tasks read. Emit it when you can attest to the task being shipped cleanly — it becomes the canonical completion record for that task.
+- Shape: `{summaryMd, deliverables[{kind,reference,description}], breakingChanges[{area,description,migrationStepsMd}], followUps[{description,priority,blockingForDependents}], artifacts}`.
+- `summaryMd` ≤ 4000 chars markdown narrative. `deliverables` typed pointers (kind ∈ commit|pr|file|endpoint|schema-change|spec|plan-stamp|fixture|doc-update|other). `breakingChanges` empty array if none. `followUps[*].priority` ∈ critical|important|nice-to-have; `blockingForDependents` defaults to false.
+- For verdict ∈ {needs_fix, escalate} OR confidence < 0.7, OMIT this field — the worker will iterate and a later review pass will attempt the attestation.
+- Do not invent deliverables. Cite only what you observed in the diff / test output / transcript.
 
 Output JSON only. No prose outside the JSON."#;
 
@@ -334,6 +356,54 @@ pub async fn auto_review_in_product(
         })
         .await
         .map_err(|e| ReviewError::Db(format!("{}", e)))?;
+
+    // Optional reviewer-attestation completion-report write. Per plan §3
+    // "Reviewer attestation (extension)": when the LLM emits a structured
+    // completion_report alongside an approved verdict, persist it with
+    // `completion_source = 'reviewer-attestation'`. Reviewer attestations
+    // supersede worker self-reports.
+    //
+    // Stash the worker's self-report (if present) under
+    // `artifacts.workerSelfReport` before overwriting — preserves the
+    // self-attestation for debugging while still letting the reviewer be
+    // the arbiter (per plan: "the reviewer is the arbiter; this matches the
+    // existing review-supersedes-session-claim pattern").
+    if let Some(mut report) = verdict.completion_report.clone() {
+        match pg.get_completion_report(task_id).await {
+            Ok(Some((existing, CompletionSource::SessionSelfReport))) => {
+                let existing_json = serde_json::to_value(&existing).unwrap_or(serde_json::json!(null));
+                report
+                    .artifacts
+                    .insert("workerSelfReport".to_string(), existing_json);
+            }
+            Ok(_) | Err(_) => {
+                // No existing report (fresh task) or non-self-report source —
+                // nothing to stash. A get_completion_report error here is
+                // non-fatal; we'd rather write the attestation than abort.
+            }
+        }
+        match pg
+            .write_completion_report(task_id, &report, CompletionSource::ReviewerAttestation)
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "auto_review: reviewer attestation written for task {}",
+                    task_id
+                );
+            }
+            Err(e) => {
+                // Don't fail the whole review on attestation write failure —
+                // the review row already landed; surface the failure as a
+                // warning so it shows in logs but the verdict still
+                // returns to the caller.
+                warn!(
+                    "auto_review: failed to persist reviewer attestation for task {}: {}",
+                    task_id, e
+                );
+            }
+        }
+    }
 
     Ok(ReviewResult {
         review_id: row.id,
@@ -837,6 +907,25 @@ fn normalize_verdict(v: AutoReviewVerdict) -> AutoReviewVerdict {
         v.confidence.clamp(0.0, 1.0)
     };
 
+    // Drop the completion_report on any non-approved verdict — the
+    // attestation contract per plan §3 only applies to approve+confident.
+    // This is defence-in-depth: the prompt already instructs the model to
+    // omit it, but a confused model emitting an attestation alongside
+    // verdict=needs_fix would silently overwrite the worker's self-report
+    // and contaminate the report log.
+    let completion_report = match (normalized_verdict.as_str(), confidence >= 0.7) {
+        ("approved", true) => v.completion_report,
+        _ => {
+            if v.completion_report.is_some() {
+                warn!(
+                    "auto_review: dropping completion_report from non-attestation verdict ({}, conf {:.2})",
+                    normalized_verdict, confidence
+                );
+            }
+            None
+        }
+    };
+
     AutoReviewVerdict {
         verdict: normalized_verdict,
         confidence,
@@ -845,6 +934,7 @@ fn normalize_verdict(v: AutoReviewVerdict) -> AutoReviewVerdict {
         } else {
             v.reasoning
         },
+        completion_report,
     }
 }
 
@@ -858,13 +948,19 @@ mod tests {
 
     // --- normalize_verdict --------------------------------------------------
 
+    /// Test helper — build an AutoReviewVerdict with `completion_report = None`.
+    fn mk_verdict(verdict: &str, confidence: f64, reasoning: &str) -> AutoReviewVerdict {
+        AutoReviewVerdict {
+            verdict: verdict.to_string(),
+            confidence,
+            reasoning: reasoning.to_string(),
+            completion_report: None,
+        }
+    }
+
     #[test]
     fn normalize_verdict_canonicalizes_known_strings() {
-        let v = AutoReviewVerdict {
-            verdict: "APPROVED".into(),
-            confidence: 0.91,
-            reasoning: "looks good".into(),
-        };
+        let v = mk_verdict("APPROVED", 0.91, "looks good");
         let out = normalize_verdict(v);
         assert_eq!(out.verdict, "approved");
         assert_eq!(out.confidence, 0.91);
@@ -879,58 +975,94 @@ mod tests {
             ("reject", "needs_fix"),
             ("OK", "approved"),
         ] {
-            let v = AutoReviewVerdict {
-                verdict: input.to_string(),
-                confidence: 0.5,
-                reasoning: "x".into(),
-            };
+            let v = mk_verdict(input, 0.5, "x");
             assert_eq!(normalize_verdict(v).verdict, expected, "{}", input);
         }
     }
 
     #[test]
     fn normalize_verdict_unknown_falls_back_to_escalate() {
-        let v = AutoReviewVerdict {
-            verdict: "wat".into(),
-            confidence: 0.7,
-            reasoning: "x".into(),
-        };
+        let v = mk_verdict("wat", 0.7, "x");
         assert_eq!(normalize_verdict(v).verdict, "escalate");
     }
 
     #[test]
     fn normalize_verdict_clamps_confidence() {
-        let v = AutoReviewVerdict {
-            verdict: "approved".into(),
-            confidence: 5.0,
-            reasoning: "x".into(),
-        };
-        assert_eq!(normalize_verdict(v).confidence, 1.0);
+        let out = normalize_verdict(mk_verdict("approved", 5.0, "x"));
+        assert_eq!(out.confidence, 1.0);
 
-        let v = AutoReviewVerdict {
-            verdict: "approved".into(),
-            confidence: -0.5,
-            reasoning: "x".into(),
-        };
-        assert_eq!(normalize_verdict(v).confidence, 0.0);
+        let out = normalize_verdict(mk_verdict("approved", -0.5, "x"));
+        assert_eq!(out.confidence, 0.0);
 
-        let v = AutoReviewVerdict {
-            verdict: "approved".into(),
-            confidence: f64::NAN,
-            reasoning: "x".into(),
-        };
-        assert_eq!(normalize_verdict(v).confidence, 0.0);
+        let out = normalize_verdict(mk_verdict("approved", f64::NAN, "x"));
+        assert_eq!(out.confidence, 0.0);
     }
 
     #[test]
     fn normalize_verdict_replaces_empty_reasoning() {
+        let v = mk_verdict("approved", 0.9, "   ");
+        let out = normalize_verdict(v);
+        assert!(out.reasoning.contains("empty reasoning"));
+    }
+
+    // --- completion_report attestation gating ------------------------------
+
+    fn mk_minimal_report() -> CompletionReport {
+        CompletionReport {
+            summary_md: "ok".to_string(),
+            deliverables: vec![],
+            breaking_changes: vec![],
+            follow_ups: vec![],
+            artifacts: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn normalize_verdict_keeps_completion_report_for_approved_high_confidence() {
         let v = AutoReviewVerdict {
             verdict: "approved".into(),
             confidence: 0.9,
-            reasoning: "   ".into(),
+            reasoning: "x".into(),
+            completion_report: Some(mk_minimal_report()),
         };
         let out = normalize_verdict(v);
-        assert!(out.reasoning.contains("empty reasoning"));
+        assert!(out.completion_report.is_some());
+    }
+
+    #[test]
+    fn normalize_verdict_drops_completion_report_for_low_confidence() {
+        let v = AutoReviewVerdict {
+            verdict: "approved".into(),
+            confidence: 0.5,
+            reasoning: "x".into(),
+            completion_report: Some(mk_minimal_report()),
+        };
+        let out = normalize_verdict(v);
+        assert!(out.completion_report.is_none());
+    }
+
+    #[test]
+    fn normalize_verdict_drops_completion_report_for_needs_fix() {
+        let v = AutoReviewVerdict {
+            verdict: "needs_fix".into(),
+            confidence: 0.95,
+            reasoning: "x".into(),
+            completion_report: Some(mk_minimal_report()),
+        };
+        let out = normalize_verdict(v);
+        assert!(out.completion_report.is_none());
+    }
+
+    #[test]
+    fn normalize_verdict_drops_completion_report_for_escalate() {
+        let v = AutoReviewVerdict {
+            verdict: "escalate".into(),
+            confidence: 0.95,
+            reasoning: "x".into(),
+            completion_report: Some(mk_minimal_report()),
+        };
+        let out = normalize_verdict(v);
+        assert!(out.completion_report.is_none());
     }
 
     // --- parse_diff_stat ----------------------------------------------------

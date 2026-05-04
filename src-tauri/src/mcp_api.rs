@@ -1461,6 +1461,8 @@ pub fn create_router(
         .merge(crate::mcp::physical_device_api::routes())
         .merge(crate::mcp::plans::routes())
         .merge(crate::mcp::coordinator::routes())
+        .merge(crate::mcp::completion_reports::routes())
+        .merge(crate::mcp::completion_sources::routes())
         .merge(crate::mcp::reflection::routes())
         .merge(crate::mcp::sessions::routes())
         .merge(crate::mcp::tunnel_api::routes())

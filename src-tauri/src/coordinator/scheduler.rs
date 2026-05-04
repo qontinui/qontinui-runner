@@ -34,12 +34,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::async_runtime;
+use tauri::Emitter;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::claude_session::state::SessionState;
+use crate::database::pg::completion_reports::{UnblockEvaluation, UnblockOutcome};
 use crate::database::pg::coordinator_decisions::InsertCoordinatorDecisionInput;
 use crate::mcp::coordinator::CoordinatorAction;
 use crate::mcp::types::ApiState;
@@ -337,26 +339,170 @@ pub(crate) async fn run_one_iteration(
         .await?;
 
         // Rule E side effect: after logging the unblock note, ask PG to
-        // do the actual `pending → ready` flip. The slash command's
-        // Rule E mentions "may also be handled server-side by a
-        // trigger" — there is no such trigger today (verified by grep
-        // of CREATE TRIGGER in this crate's PG schema), so we call
-        // `mark_ready_for_unblocked` per plan id directly.
+        // do the actual `pending → ready` flip. Per
+        // productivity-coordinator-completion-reports §4 the flip must:
+        //   (a) read each upstream's completion_report;
+        //   (b) refuse if any upstream's follow-ups flag
+        //       blocking_for_dependents (emit a coordinator-escalation
+        //       row with action `blocking-follow-up-detected`);
+        //   (c) emit `data-integrity-anomaly` when an upstream's report
+        //       is null despite being `done`;
+        //   (d) flip pending → ready in the same transaction that stashes
+        //       the upstream reports in `assignment_brief_extras` for
+        //       Rule B's brief composer to consume.
+        //
+        // `mark_ready_for_unblocked_with_briefs` returns one
+        // `UnblockOutcome` per candidate row so we can translate each into
+        // a per-task decision row here.
         if outcome.rule == "E" {
             if let Some(plan_id) = task_plan_for_target(&obs, target.as_deref()) {
-                if let Err(e) = state
+                match state
                     .app_state
                     .pg_db
-                    .mark_ready_for_unblocked(&plan_id)
+                    .mark_ready_for_unblocked_with_briefs(&plan_id)
                     .await
                 {
-                    warn!("Rule E mark_ready_for_unblocked failed: {}", e);
+                    Ok(outcomes) => {
+                        for o in outcomes {
+                            apply_rule_e_outcome(state, instance_id, iteration, o).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Rule E mark_ready_for_unblocked_with_briefs failed: {}", e);
+                    }
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Per-task post-processing for Rule E. Translates one `UnblockOutcome`
+/// into the right audit-row + Tauri-event pair so the dashboard can render
+/// the dependency-resolution progress without polling.
+async fn apply_rule_e_outcome(
+    state: &Arc<ApiState>,
+    instance_id: &str,
+    iteration: i64,
+    outcome: UnblockOutcome,
+) {
+    let task_id = outcome.task_id;
+    match outcome.evaluation {
+        UnblockEvaluation::Flipped => {
+            // No additional row — the outer Rule-E AdviseWithText already
+            // captured the unblock intent. Emit a coordinator-wakeup-style
+            // signal so the dashboard refreshes the task panel without
+            // polling.
+            if let Err(e) = state.app_handle.emit(
+                "task-flipped-ready",
+                serde_json::json!({
+                    "taskId": task_id,
+                }),
+            ) {
+                debug!("emit task-flipped-ready failed: {}", e);
+            }
+        }
+        UnblockEvaluation::Blocked { blockers } => {
+            // Build a human-readable reasoning string listing every
+            // blocking follow-up and which upstream surfaced it.
+            let mut body = format!(
+                "task {} has all deps done but Rule E refuses the flip — \
+                 upstream completion reports flag blocking follow-ups:",
+                task_id
+            );
+            for b in &blockers {
+                body.push_str(&format!(
+                    "\n  - upstream {} [{}]: {}",
+                    b.upstream_task_id, b.priority, b.description
+                ));
+            }
+            body.push_str(
+                "\n\nUser action: either mark the follow-ups not-blocking, \
+                 cancel the dependent task, or fire \
+                 `force-flip-ready-despite-blocker` from the dashboard.",
+            );
+            let reasoning = stamp_reasoning("E", &body);
+            if let Err(e) = log_decision(
+                state,
+                instance_id,
+                iteration,
+                "E",
+                "blocking-follow-up-detected",
+                Some(&task_id),
+                &reasoning,
+                false, // advisory: needs user resolution
+            )
+            .await
+            {
+                warn!(
+                    "rule_e blocking-follow-up-detected log failed for task {}: {}",
+                    task_id, e
+                );
+            }
+            // Surface as an escalation card so the dashboard's escalations
+            // panel notices.
+            if let Err(e) = state.app_handle.emit(
+                "coordinator-escalation",
+                serde_json::json!({
+                    "rule": "E",
+                    "action": "blocking-follow-up-detected",
+                    "target_id": task_id,
+                    "reasoning": reasoning,
+                }),
+            ) {
+                debug!("emit coordinator-escalation (blocker) failed: {}", e);
+            }
+        }
+        UnblockEvaluation::MissingReport { upstream_ids } => {
+            let body = format!(
+                "task {} has all deps done but at least one upstream is \
+                 done with a null completion_report (data-integrity \
+                 anomaly): upstream_ids={:?}. Backfill expected \
+                 'legacy-pre-completion-reports' or fire a manual-user-fire \
+                 source via the dashboard.",
+                task_id, upstream_ids
+            );
+            let reasoning = stamp_reasoning("E", &body);
+            if let Err(e) = log_decision(
+                state,
+                instance_id,
+                iteration,
+                "E",
+                "data-integrity-anomaly",
+                Some(&task_id),
+                &reasoning,
+                false,
+            )
+            .await
+            {
+                warn!(
+                    "rule_e data-integrity-anomaly log failed for task {}: {}",
+                    task_id, e
+                );
+            }
+            if let Err(e) = state.app_handle.emit(
+                "coordinator-escalation",
+                serde_json::json!({
+                    "rule": "E",
+                    "action": "data-integrity-anomaly",
+                    "target_id": task_id,
+                    "reasoning": reasoning,
+                }),
+            ) {
+                debug!("emit coordinator-escalation (anomaly) failed: {}", e);
+            }
+        }
+        UnblockEvaluation::Skipped { reason } => {
+            // No row — racing tick or the candidate became ineligible
+            // between SELECT and UPDATE. Debug-log so the audit trail isn't
+            // cluttered.
+            debug!(
+                "rule_e skipped task {}: {} (no row written)",
+                task_id, reason
+            );
+        }
+    }
 }
 
 /// Look up a task's plan id from the observation, since the unblock

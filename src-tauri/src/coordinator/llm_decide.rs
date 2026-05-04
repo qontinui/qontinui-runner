@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::ai_provider::claude_api_warm;
+use crate::database::pg::completion_reports::{CompletionReport, CompletionSource};
 use crate::database::pg::coordinator_decisions::CoordinatorDecisionRow;
 use crate::mcp::coordinator::CoordinatorAction;
 use crate::mcp::types::ApiState;
@@ -49,6 +50,15 @@ const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// Per-tick recent-decisions window the model gets as context.
 const RECENT_DECISIONS_WINDOW: usize = 20;
+
+/// Phase 5 upstream-reports cap for the LLM-branch consultation
+/// (productivity-coordinator-completion-reports §4 "LLM-branch
+/// consultation"). When a pending task is gated by upstreams, we surface up
+/// to this many of the most-recently-completed upstream `completion_report`
+/// payloads to the model so it can cite specific `breakingChanges[*].area`
+/// values when escalating or recommending an override. Bounded by the
+/// existing per-iteration token cap.
+const MAX_UPSTREAM_REPORTS_PER_TASK: usize = 5;
 
 // ============================================================================
 // Hourly budget
@@ -120,7 +130,7 @@ impl LlmBudget {
 /// failure, or schema-rejected payload. The scheduler treats `None` as
 /// "fall through to AdviseWithText 'no clear plan'".
 pub(crate) async fn maybe_decide_with_llm(
-    _state: &Arc<ApiState>,
+    state: &Arc<ApiState>,
     observation: &Observation,
     last_decisions: &[CoordinatorDecisionRow],
     budget: &mut LlmBudget,
@@ -139,7 +149,17 @@ pub(crate) async fn maybe_decide_with_llm(
     let claude_api_settings = crate::settings::get_ai_settings().claude_api;
     let schema = build_schema();
     let system_prefix = build_system_prefix();
-    let user_message = build_user_message(observation, last_decisions);
+
+    // Phase 5 productivity-coordinator-completion-reports §4: gather upstream
+    // completion reports for any pending task whose deps include at least one
+    // upstream with a non-null `completion_report`. The model uses these to
+    // cite specific `breakingChanges[*].area` /
+    // `followUps[*].blockingForDependents` values in its reasoning.
+    //
+    // Best-effort: a PG hiccup just means the LLM gets the prompt without the
+    // reports section, which is the same behavior as before this phase.
+    let upstream_report_section = build_upstream_reports_section(state, observation).await;
+    let user_message = build_user_message(observation, last_decisions, &upstream_report_section);
 
     let model = if claude_api_settings.model.is_empty() {
         DEFAULT_MODEL.to_string()
@@ -295,6 +315,9 @@ fn action_type_tag(action: &CoordinatorAction) -> &'static str {
         CoordinatorAction::CancelTask { .. } => "cancel-task",
         CoordinatorAction::AdviseWithText { .. } => "advise-with-text",
         CoordinatorAction::EscalateWithText { .. } => "escalate-with-text",
+        CoordinatorAction::ForceFlipReadyDespiteBlocker { .. } => {
+            "force-flip-ready-despite-blocker"
+        }
         CoordinatorAction::IdleNoAction => "idle-no-action",
     }
 }
@@ -364,11 +387,151 @@ Decision rules:
     )
 }
 
+/// Phase 5 helper: for each pending task in the observation, look up its
+/// upstream `completion_report` payloads (if any) and render them into a
+/// Markdown section the LLM prompt can consume. Bounded by
+/// `MAX_UPSTREAM_REPORTS_PER_TASK` per task — when a task has more
+/// upstreams, we keep the most-recently-completed five and add a
+/// `(N more upstreams omitted from prompt)` note.
+///
+/// Returns an empty string when no pending task has any upstream reports —
+/// callers append the section unconditionally and an empty section drops
+/// out at concat time.
+async fn build_upstream_reports_section(
+    state: &Arc<ApiState>,
+    observation: &Observation,
+) -> String {
+    let pg = &state.app_state.pg_db;
+
+    // Find the pending tasks that have at least one upstream id.
+    let pending_with_deps: Vec<&crate::database::pg::tasks::TaskRow> = observation
+        .tasks
+        .iter()
+        .filter(|t| t.status == "pending" && !t.depends_on.is_empty())
+        .collect();
+    if pending_with_deps.is_empty() {
+        return String::new();
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    for task in pending_with_deps {
+        // Resolve upstream rows so we can sort by completed_at desc.
+        let mut upstream_rows: Vec<crate::database::pg::tasks::TaskRow> = Vec::new();
+        for dep_id in &task.depends_on {
+            match pg.get_task_by_id(dep_id).await {
+                Ok(Some(t)) => upstream_rows.push(t),
+                Ok(None) => continue,
+                Err(e) => {
+                    debug!(
+                        "build_upstream_reports_section: get_task_by_id({}) failed: {}",
+                        dep_id, e
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // Most-recent first by completed_at (string-sortable since we store
+        // ISO 8601 timestamps; nulls float to the end).
+        upstream_rows.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+
+        let total = upstream_rows.len();
+        let kept: Vec<&crate::database::pg::tasks::TaskRow> =
+            upstream_rows.iter().take(MAX_UPSTREAM_REPORTS_PER_TASK).collect();
+
+        // Pull each upstream's completion_report.
+        let mut rendered_upstreams: Vec<String> = Vec::new();
+        for upstream in &kept {
+            let pair: Option<(CompletionReport, CompletionSource)> =
+                match pg.get_completion_report(&upstream.id).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!(
+                            "build_upstream_reports_section: get_completion_report({}) failed: {}",
+                            upstream.id, e
+                        );
+                        None
+                    }
+                };
+            let (report, source) = match pair {
+                Some(p) => p,
+                None => continue,
+            };
+            // Compact JSON of the typed fields the model is expected to cite.
+            // Skip artifacts — those are open-ended source-specific blobs and
+            // would burn tokens.
+            let payload = json!({
+                "upstreamTaskId": upstream.id,
+                "completedAt": upstream.completed_at,
+                "completionSource": source.as_str(),
+                "summaryMd": report.summary_md,
+                "deliverables": report.deliverables.iter().map(|d| json!({
+                    "kind": d.kind,
+                    "reference": d.reference,
+                    "description": d.description,
+                })).collect::<Vec<_>>(),
+                "breakingChanges": report.breaking_changes.iter().map(|bc| json!({
+                    "area": bc.area,
+                    "description": bc.description,
+                })).collect::<Vec<_>>(),
+                "followUps": report.follow_ups.iter().map(|fu| json!({
+                    "description": fu.description,
+                    "priority": fu.priority,
+                    "blockingForDependents": fu.blocking_for_dependents,
+                })).collect::<Vec<_>>(),
+            });
+            rendered_upstreams.push(payload.to_string());
+        }
+
+        if rendered_upstreams.is_empty() {
+            continue;
+        }
+
+        let omitted = total.saturating_sub(MAX_UPSTREAM_REPORTS_PER_TASK);
+        let mut block = String::new();
+        block.push_str(&format!(
+            "Pending task {} has {} upstream(s). Showing the {} most-recent with completion_report:\n",
+            task.id,
+            total,
+            rendered_upstreams.len()
+        ));
+        for r in rendered_upstreams {
+            block.push_str(&r);
+            block.push('\n');
+        }
+        if omitted > 0 {
+            block.push_str(&format!(
+                "({} more upstreams omitted from prompt)\n",
+                omitted
+            ));
+        }
+        sections.push(block);
+    }
+
+    if sections.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str(
+        "\n\nUpstream completion reports (for pending tasks with completed deps):\n\
+         The fields breakingChanges[*].area and followUps[*].blockingForDependents are \
+         load-bearing — when escalating or recommending an override, cite them by \
+         area / description.\n\n",
+    );
+    for s in sections {
+        out.push_str(&s);
+        out.push('\n');
+    }
+    out
+}
+
 /// Compact per-iteration user message: observation snapshot + recent
 /// decisions. Stays small so cache-keying stays cheap.
 fn build_user_message(
     observation: &Observation,
     last_decisions: &[CoordinatorDecisionRow],
+    upstream_reports_section: &str,
 ) -> String {
     // Trim the live-session and decision sets to the columns the model
     // actually needs. Drops the verbose stuff (full reasoning prose, IDs,
@@ -485,6 +648,9 @@ fn build_user_message(
     buf.push_str(&RECENT_DECISIONS_WINDOW.to_string());
     buf.push_str(" coordinator decisions:\n");
     buf.push_str(&decisions_json.to_string());
+    if !upstream_reports_section.is_empty() {
+        buf.push_str(upstream_reports_section);
+    }
     buf.push_str("\n\nWhat action should the coordinator take this iteration?");
 
     debug!(
@@ -646,5 +812,49 @@ mod tests {
                 tag
             );
         }
+    }
+
+    // --- Phase 5: upstream completion reports in the LLM prompt ----------
+
+    /// Helper: build a minimal Observation for `build_user_message` tests.
+    fn empty_observation() -> super::super::observe::Observation {
+        super::super::observe::Observation {
+            tasks: Vec::new(),
+            active_file_registry: Vec::new(),
+            upcoming_file_registry: Vec::new(),
+            live_sessions: Vec::new(),
+            recent_reviews: Vec::new(),
+            open_escalations: Vec::new(),
+            session_touched_files: std::collections::HashMap::new(),
+            recent_decisions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_user_message_appends_upstream_reports_section() {
+        let obs = empty_observation();
+        let decisions: Vec<CoordinatorDecisionRow> = Vec::new();
+        let section = "\n\nUpstream completion reports (test marker):\nbody\n";
+        let msg = build_user_message(&obs, &decisions, section);
+        assert!(
+            msg.contains("Upstream completion reports (test marker)"),
+            "user message must include the supplied upstream reports section"
+        );
+        // The closing "What action..." line should still be there after the
+        // section.
+        assert!(msg.contains("What action should the coordinator take this iteration?"));
+        // And the section must precede the closing question, not follow it.
+        let section_idx = msg.find("(test marker)").unwrap();
+        let question_idx = msg.find("What action").unwrap();
+        assert!(section_idx < question_idx);
+    }
+
+    #[test]
+    fn build_user_message_omits_empty_upstream_reports_section() {
+        let obs = empty_observation();
+        let decisions: Vec<CoordinatorDecisionRow> = Vec::new();
+        let msg = build_user_message(&obs, &decisions, "");
+        // No section heading anywhere when the section is empty.
+        assert!(!msg.contains("Upstream completion reports"));
     }
 }

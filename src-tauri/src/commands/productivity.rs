@@ -15,8 +15,10 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::commands::AppState;
+use crate::database::pg::completion_reports::{CompletionReport, CompletionSource};
 use crate::database::pg::coordinator_decisions::CoordinatorDecisionRow;
 use crate::database::pg::coordinator_leader::CoordinatorLeaderRow;
 use crate::database::pg::plans::PlanRow;
@@ -24,6 +26,7 @@ use crate::database::pg::productivity_knowledge::KnowledgeHit;
 use crate::database::pg::reviews::ReviewRow;
 use crate::database::pg::tasks::TaskRow;
 use crate::executor::upcoming_file_registry::UpcomingClaim;
+use crate::mcp::types::ApiState;
 use crate::terminal::TerminalManager;
 
 /// Detail payload for a single task — bundles the row plus
@@ -32,6 +35,11 @@ use crate::terminal::TerminalManager;
 /// `latest_review_summary` is populated by Phase 3 when a `reviews` row
 /// exists for the task: it's a one-paragraph "verdict + confidence + top
 /// reason" digest. `worker_session_meta` remains `None` until Phase 5.
+///
+/// `completion_report` / `completion_source` / `has_assignment_brief_extras`
+/// are populated from `coord.tasks` directly (Phase 4 of the
+/// productivity-coordinator-completion-reports plan) so the TaskDetailPanel
+/// can render the structured handoff payload without a second round-trip.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDetail {
@@ -39,6 +47,16 @@ pub struct TaskDetail {
     pub claimers_by_path: HashMap<String, Vec<UpcomingClaim>>,
     pub latest_review_summary: Option<String>,
     pub worker_session_meta: Option<serde_json::Value>,
+    /// Structured completion report for this task, if one has been written.
+    /// `None` when `coord.tasks.completion_report` is null.
+    pub completion_report: Option<CompletionReport>,
+    /// Tag identifying the actor that produced the report. `None` when no
+    /// report exists.
+    pub completion_source: Option<CompletionSource>,
+    /// True when `coord.tasks.assignment_brief_extras` is non-null — the
+    /// briefing-preview panel uses this as a cheap gate before invoking
+    /// `preview_assignment_brief`.
+    pub has_assignment_brief_extras: bool,
 }
 
 /// Format a review row as a one-paragraph summary for `TaskDetail`'s
@@ -150,11 +168,40 @@ pub async fn get_task_detail(
         }
     };
 
+    // Pull the structured completion report (Phase 4) so the
+    // TaskDetailPanel can render it without a second Tauri round-trip.
+    // Failures here are non-fatal: log and treat as "no report".
+    let (completion_report, completion_source) =
+        match app_state.pg_db.get_completion_report(&task_id).await {
+            Ok(Some((report, source))) => (Some(report), Some(source)),
+            Ok(None) => (None, None),
+            Err(e) => {
+                warn!("get_task_detail: get_completion_report failed: {}", e);
+                (None, None)
+            }
+        };
+
+    let has_assignment_brief_extras = match app_state
+        .pg_db
+        .get_assignment_brief_extras(&task_id)
+        .await
+    {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            warn!("get_task_detail: get_assignment_brief_extras failed: {}", e);
+            false
+        }
+    };
+
     Ok(Some(TaskDetail {
         task,
         claimers_by_path,
         latest_review_summary,
         worker_session_meta: None,
+        completion_report,
+        completion_source,
+        has_assignment_brief_extras,
     }))
 }
 
@@ -1034,6 +1081,12 @@ pub async fn auto_review_task(
     app_handle: tauri::AppHandle,
     task_id: String,
 ) -> Result<crate::productivity::review::ReviewResult, String> {
+    // P2 follow-up from productivity-coordinator-completion-reports plan
+    // §7 Phase 1: validate task_id is a UUID before passing to PG. Avoids
+    // the "raw error serializing parameter 0" log path that bites every
+    // PG-backed Tauri command taking `task_id: String`.
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+
     let app_state = require_app_state(&app_handle)?;
     let pg = app_state.pg_db.clone();
     let runner_port = crate::mcp::types::runner_api_port(&app_state);
@@ -1195,4 +1248,137 @@ pub async fn rewind_session(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Completion reports (Phase 1 of
+// productivity-coordinator-completion-reports.md §3 / §7)
+// ============================================================================
+
+/// Resolve `Arc<ApiState>` from the Tauri app handle so completion-report
+/// helpers that need `app_handle.emit` and `SessionManager` access can run
+/// from a `#[tauri::command]` body. Returns a 'string-typed' error on
+/// failure for parity with existing `require_app_state`.
+fn require_api_state(app_handle: &tauri::AppHandle) -> Result<Arc<ApiState>, String> {
+    match app_handle.try_state::<Arc<ApiState>>() {
+        Some(s) => Ok(s.inner().clone()),
+        None => Err(
+            "ApiState is not yet initialised — submit_task_completion_report \
+             requires the HTTP API server to be running"
+                .to_string(),
+        ),
+    }
+}
+
+/// Worker / dashboard self-attestation Tauri mirror of
+/// `POST /tasks/{id}/report`. The frontend can call this directly so it
+/// doesn't have to round-trip through the local HTTP server.
+#[tauri::command]
+pub async fn submit_task_completion_report(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+    report: CompletionReport,
+) -> Result<TaskRow, String> {
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+
+    pg.write_completion_report(&task_id, &report, CompletionSource::SessionSelfReport)
+        .await?;
+
+    if let Err(e) = app_handle.emit(
+        "completion-report-written",
+        serde_json::json!({
+            "taskId": task_id,
+            "source": CompletionSource::SessionSelfReport.as_str(),
+        }),
+    ) {
+        warn!("emit completion-report-written failed: {}", e);
+    }
+
+    pg.get_task_by_id(&task_id)
+        .await?
+        .ok_or_else(|| format!("task {} disappeared after write", task_id))
+}
+
+/// Read the structured completion report (and source tag) for a task.
+#[tauri::command]
+pub async fn get_task_completion_report(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+) -> Result<Option<(CompletionReport, CompletionSource)>, String> {
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+    let app_state = require_app_state(&app_handle)?;
+    app_state.pg_db.get_completion_report(&task_id).await
+}
+
+/// Server-side preview of the assignment brief that Rule B would inject
+/// into the worker's first message for this task. Calls
+/// `coordinator::act::build_assignment_brief` so the rendered Markdown is,
+/// by construction, identical to what the worker will see when the task
+/// is assigned.
+///
+/// Returns an empty string when the task has no `assignment_brief_extras`
+/// AND no `WORKER_ADDED_DEPENDENCY` audit row — i.e. no brief would be
+/// composed (fresh, no-deps assignment). The dashboard renders nothing in
+/// that case.
+#[tauri::command]
+pub async fn preview_assignment_brief(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+) -> Result<String, String> {
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+
+    let api_state = require_api_state(&app_handle)?;
+
+    // Cheap pre-check: if there are no upstreams stashed AND no audit row,
+    // there's nothing to render. `build_assignment_brief` would fall through
+    // to `task.description`-only, which the dashboard already shows in the
+    // task detail header — surfacing it in the brief panel just duplicates.
+    let pg = &api_state.app_state.pg_db;
+    let has_extras = pg
+        .get_assignment_brief_extras(&task_id)
+        .await
+        .map(|o| o.is_some())
+        .unwrap_or(false);
+    let has_audit = pg
+        .latest_worker_added_dependency_for_task(&task_id)
+        .await
+        .map(|o| o.is_some())
+        .unwrap_or(false);
+    if !has_extras && !has_audit {
+        return Ok(String::new());
+    }
+
+    crate::coordinator::act::build_assignment_brief(&api_state, &task_id).await
+}
+
+/// Worker-declared emergent dependency Tauri mirror of
+/// `POST /tasks/{id}/add-dependency`. Shares the
+/// `mcp::completion_reports::add_dependency_inner` business logic with the
+/// HTTP handler. From the desktop UI there is no calling-session ownership
+/// to enforce; pass `None` to skip the check.
+#[tauri::command]
+pub async fn add_task_dependency(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+    upstream_task_id: String,
+    reason: String,
+) -> Result<TaskRow, String> {
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+    Uuid::parse_str(&upstream_task_id)
+        .map_err(|e| format!("invalid upstream_task_id uuid: {e}"))?;
+
+    let api_state = require_api_state(&app_handle)?;
+    crate::mcp::completion_reports::add_dependency_inner(
+        &api_state,
+        &task_id,
+        &upstream_task_id,
+        &reason,
+        None,
+    )
+    .await
+    .map(|row| row)
+    .map_err(|(_, msg)| msg)
 }

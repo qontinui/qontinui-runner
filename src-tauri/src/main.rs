@@ -306,6 +306,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 info!("PostgreSQL connected successfully");
                 let pg = Arc::new(pg);
                 crate::database::pg::PgDb::set_global(pg.clone());
+
+                // Phase 5 startup sweep (productivity-coordinator-completion-reports
+                // §9 "Memory pressure audit"): clear any stale
+                // `assignment_brief_extras` rows on tasks past `pending`.
+                // Rule E populates the field for pending tasks; once the
+                // task is past pending, the AssignTask hook should have
+                // cleared it. Anything still set is a leak from a prior
+                // crash or a path that bypassed the clear. One-shot,
+                // idempotent — safe to run unconditionally.
+                match rt.block_on(pg.clear_stale_assignment_brief_extras()) {
+                    Ok(0) => {
+                        // No leaks — common case after a clean shutdown.
+                    }
+                    Ok(n) => {
+                        warn!(
+                            "PG bootstrap: cleared {} stale assignment_brief_extras row(s) \
+                             on non-pending tasks",
+                            n
+                        );
+                    }
+                    Err(e) => {
+                        // Non-fatal — the sweep is a hardening backstop, not
+                        // a load-bearing invariant. Log and continue.
+                        warn!(
+                            "PG bootstrap: clear_stale_assignment_brief_extras failed \
+                             (non-fatal): {}",
+                            e
+                        );
+                    }
+                }
                 pg
             }
             Err(e) => {
@@ -1117,6 +1147,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             process_capture::commands::stop_all_managed_processes,
             process_capture::commands::stop_managed_process,
             commands::productivity::acknowledge_advisory,
+            commands::productivity::add_task_dependency,
             commands::productivity::approve_recommendation,
             commands::productivity::archive_plan,
             commands::productivity::auto_review_task,
@@ -1129,17 +1160,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::get_plan_tasks,
             commands::productivity::get_recommendations,
             commands::productivity::get_reflection,
+            commands::productivity::get_task_completion_report,
             commands::productivity::get_task_detail,
             commands::productivity::get_upcoming_claims,
             commands::productivity::launch_coordinator_session,
             commands::productivity::list_plans,
             commands::productivity::list_plans_filtered,
+            commands::productivity::preview_assignment_brief,
             commands::productivity::reject_recommendation,
             commands::productivity::resolve_escalation,
             commands::productivity::rewind_session,
             commands::productivity::search_knowledge,
             commands::productivity::spawn_worker_session,
             commands::productivity::stop_coordinator_session,
+            commands::productivity::submit_task_completion_report,
             commands::productivity::summarize_session,
             commands::productivity::unarchive_plan,
             commands::project_logs::append_project_log,

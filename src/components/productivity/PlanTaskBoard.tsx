@@ -49,6 +49,12 @@ import {
   type RewindResult,
   type SummarizeResult,
 } from "./sessionApi";
+import {
+  BriefingPreview,
+  CompletionReportSection,
+  ManualFireForm,
+  UpstreamReportsPreview,
+} from "./CompletionReportSections";
 import type { PlanRow, PlanStatus, TaskDetail, TaskRow, TaskStatus } from "./types";
 
 /** localStorage key prefix for the per-plan reflection panel open/closed state. */
@@ -764,9 +770,12 @@ interface TaskDetailPanelProps {
   detail: TaskDetail | null;
   loading: boolean;
   error: string | null;
+  /** Triggered after a manual-fire (or any other in-panel action that
+   *  mutates the task) so the parent can re-fetch task detail + tasks list. */
+  onReloadDetail?: () => void;
 }
 
-function TaskDetailPanel({ detail, loading, error }: TaskDetailPanelProps) {
+function TaskDetailPanel({ detail, loading, error, onReloadDetail }: TaskDetailPanelProps) {
   return (
     <div
       role="region"
@@ -909,6 +918,15 @@ function TaskDetailPanel({ detail, loading, error }: TaskDetailPanelProps) {
                 </p>
               </section>
             )}
+
+            {/* Phase 4 of productivity-coordinator-completion-reports §5 —
+             *  structured completion report rendering, upstream-report preview
+             *  for pending tasks, briefing preview for assigned/ready+ tasks,
+             *  and the manual-fire form. */}
+            <CompletionReportSection detail={detail} />
+            <UpstreamReportsPreview detail={detail} />
+            <BriefingPreview detail={detail} />
+            <ManualFireForm detail={detail} onFired={onReloadDetail} />
           </>
         )}
       </div>
@@ -1198,7 +1216,15 @@ export function PlanTaskBoard() {
 
       {/* Right: Task detail (25%) */}
       <div className="shrink-0" style={{ width: "25%", minWidth: 260 }}>
-        <TaskDetailPanel detail={taskDetail} loading={detailLoading} error={detailError} />
+        <TaskDetailPanel
+          detail={taskDetail}
+          loading={detailLoading}
+          error={detailError}
+          onReloadDetail={() => {
+            if (selectedTaskId) void fetchDetail(selectedTaskId);
+            if (selectedPlanId) void fetchTasks(selectedPlanId);
+          }}
+        />
       </div>
 
       {/* Decompose-plan modal — Phase 3 of productivity-stack-product-readiness. */}

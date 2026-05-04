@@ -206,6 +206,21 @@ pub enum CoordinatorAction {
         target_id: Option<String>,
         reasoning: String,
     },
+    /// User-driven override: flip a `pending` task to `ready` even when
+    /// upstream completion reports flag a blocking follow-up. Per
+    /// productivity-coordinator-completion-reports §4 "Auto-act boundary"
+    /// this action is FORCED advisory — the Coordinator agent cannot
+    /// auto-act on it; only the user's explicit click on the dashboard
+    /// (which fires `/coordinator/act` with `auto_acted=false`) executes the
+    /// flip. The HTTP path in `coordinator_act` runs the `apply` branch
+    /// regardless of `must_advise_only` because the inbound POST itself IS
+    /// the user-confirmed escalation.
+    ForceFlipReadyDespiteBlocker {
+        #[serde(rename = "taskId")]
+        task_id: String,
+        #[serde(default)]
+        reasoning: Option<String>,
+    },
     IdleNoAction,
 }
 
@@ -250,7 +265,14 @@ async fn coordinator_act(
     let target_id = crate::coordinator::act::action_target(&req.action);
     let reasoning = crate::coordinator::act::action_reasoning(&req.action);
 
-    if auto_acted {
+    // The cheap-rules scheduler routes through `auto_acted` — destructive
+    // actions are advisory-only at that layer. The HTTP path additionally
+    // carves out user-fire actions (e.g. force-flip-ready-despite-blocker)
+    // so a user-confirmed POST executes the side effect even when the row
+    // is logged as advisory. See `is_user_fire_only_action` in act.rs.
+    let should_apply =
+        auto_acted || crate::coordinator::act::is_user_fire_only_action(&req.action);
+    if should_apply {
         crate::coordinator::act::apply(&state, &req.action).await?;
     }
 

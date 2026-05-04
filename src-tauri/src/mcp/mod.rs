@@ -39,6 +39,8 @@ pub mod cascade;
 pub mod checks;
 pub mod command_relay;
 pub mod comparison_api;
+pub mod completion_reports;
+pub mod completion_sources;
 pub mod configs;
 pub mod constraints_api;
 pub mod container_status;

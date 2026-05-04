@@ -1361,7 +1361,11 @@
           { "dataAttributes": { "ui-bridge-id": "productivity.show-archived-toggle" } },
           { "dataAttributes": { "ui-bridge-id": "productivity.reflection-panel" } },
           { "dataAttributes": { "ui-bridge-id": "productivity.reflection-top-knowledge" } },
-          { "dataAttributes": { "ui-bridge-id": "productivity.reflection-review-trail" } }
+          { "dataAttributes": { "ui-bridge-id": "productivity.reflection-review-trail" } },
+          { "dataAttributes": { "ui-bridge-id": "productivity.task-completion-report" }, "description": "Completion report rendering for the selected task — summaryMd, deliverables table, breaking changes (expandable amber cards), follow-ups list with priority + blocks-downstream pills, and the completion-source badge. Phase 4 of productivity-coordinator-completion-reports.md §5." },
+          { "dataAttributes": { "ui-bridge-id": "productivity.task-upstream-reports-preview" }, "description": "Upstream reports preview for a pending task whose dependsOn array is non-empty. Renders a compact summary card per upstream — first description line, summaryMd preview (≤300 chars), and a 'X breaking changes / Y follow-ups (Z blocking)' footer." },
+          { "dataAttributes": { "ui-bridge-id": "productivity.task-briefing-preview" }, "description": "Server-rendered preview of the assignment-brief Markdown that Rule B will inject into the worker's first message. Calls the preview_assignment_brief Tauri command (which calls Rust's compose_assignment_brief) so the preview matches the worker's brief by construction. Gated on hasAssignmentBriefExtras." },
+          { "dataAttributes": { "ui-bridge-id": "productivity.task-manual-fire-form" }, "description": "Manual-fire form for writing a completion report against a task whose external trigger source isn't wired up. Collapsed by default; expanded form takes summaryMd + deliverables/breakingChanges/followUps list editors and POSTs to /completion-sources/manual-user-fire." }
         ],
         "isInitial": true,
         "transitions": [

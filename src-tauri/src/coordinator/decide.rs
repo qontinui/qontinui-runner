@@ -560,10 +560,27 @@ pub(crate) fn rule_e_targets(obs: &Observation) -> Vec<UnblockTarget> {
     targets
 }
 
-/// Translate the first unblock target into an `IdleNoAction` decision so
+/// Translate the first unblock target into an `AdviseWithText` decision so
 /// the audit log has a row noting the unblock. The scheduler still has
-/// to call PG `mark_ready_for_unblocked` for the per-plan flip — see the
-/// scheduler module.
+/// to call PG `mark_ready_for_unblocked_with_briefs` for the per-plan
+/// flip — see the scheduler module.
+///
+/// Per productivity-coordinator-completion-reports §4 "Rule E extension"
+/// the Rust side-effect path additionally:
+///   - reads each upstream's `completion_report`;
+///   - aggregates `follow_ups[*].blocking_for_dependents` and emits a
+///     `blocking-follow-up-detected` coordinator-escalation row when any
+///     upstream flags a blocker (the row stays `pending`);
+///   - emits `data-integrity-anomaly` when a `done` upstream has a null
+///     report (shouldn't happen post-migration);
+///   - stashes the upstream reports in `assignment_brief_extras` for Rule
+///     B's brief composer to consume in the SAME transaction as the
+///     `pending → ready` flip.
+///
+/// The pure `rule_e` body here only signals the unblock to the audit
+/// log — the per-task evaluation lives in
+/// `database::pg::completion_reports::evaluate_and_flip_unblocked_task`,
+/// invoked from `coordinator::scheduler::apply_rule_e_outcome`.
 pub(crate) fn rule_e(obs: &Observation) -> Option<DecideOutcome> {
     let targets = rule_e_targets(obs);
     let first = targets.first()?;

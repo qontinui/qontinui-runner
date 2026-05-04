@@ -87,3 +87,21 @@ export interface ReviewResult {
 export async function autoReviewTask(taskId: string): Promise<ReviewResult> {
   return invoke<ReviewResult>("auto_review_task", { taskId });
 }
+
+// ----------------------------------------------------------------------------
+// Briefing preview — Phase 4 of productivity-coordinator-completion-reports.
+// ----------------------------------------------------------------------------
+
+/**
+ * Server-side rendered preview of the assignment-brief Markdown that Rule B
+ * will inject into the worker's first message for `taskId`. Returns the
+ * empty string when no brief would be composed (no upstreams stashed and no
+ * resume-from-pause audit row).
+ *
+ * The Rust handler calls `coordinator::act::build_assignment_brief`, the
+ * exact function used by the `AssignTask` apply branch — so the preview is,
+ * by construction, identical to what the worker will see.
+ */
+export async function previewAssignmentBrief(taskId: string): Promise<string> {
+  return invoke<string>("preview_assignment_brief", { taskId });
+}
