@@ -81,13 +81,16 @@ jobs:
             libatspi2.0-dev \
             at-spi2-core
 
-      # Hosted ubuntu-22.04 ships with 16 GB RAM + 4 GB swap. `cargo test`
-      # peak link-time memory on this workspace exceeds that and the runner
-      # host loses comms with GitHub before any log output ships back (run
-      # 25316983521 was the second confirmation: 1h3m kill, zero log lines
-      # under `Run Rust tests`). Capping CARGO_BUILD_JOBS alone wasn't
-      # enough — link is single-threaded. Pre-allocate a 12 GB swapfile so
-      # the OS can absorb the spike instead of the runner agent dying.
+      # Hosted ubuntu-22.04 / windows-latest both ship with 16 GB RAM and a
+      # small default pagefile/swap. `cargo test` peak codegen memory on
+      # this workspace exceeds that and the rustc/LLVM allocator dies (on
+      # Linux the OOM-killer takes the runner agent down → "shutdown
+      # signal … exit code 143"; on Windows rustc-LLVM emits
+      # "out of memory" / "Allocation failed" then aborts, surfaced by the
+      # OS as exit code 0xc000001d / STATUS_ILLEGAL_INSTRUCTION). Capping
+      # CARGO_BUILD_JOBS alone wasn't enough — link is single-threaded.
+      # Pre-allocate paging space so the OS can absorb the spike instead
+      # of the runner agent dying.
       - name: Add swapfile (Ubuntu — guard against link-time OOM)
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -99,6 +102,14 @@ jobs:
           echo "=== free / df after swap setup ==="
           free -h
           df -h
+
+      - name: Configure pagefile (Windows — guard against link-time OOM)
+        if: matrix.platform == 'windows-latest'
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 16GB
+          maximum-size: 16GB
+          disk-root: "D:"
 
       # macOS: The accessibility (AX) adapter links against system CoreFoundation
       # frameworks which are always available. No additional brew packages needed.
@@ -143,16 +154,20 @@ jobs:
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
         env:
-          # `CARGO_BUILD_JOBS=2` on Ubuntu reduces the parallel-rustc memory
-          # peak; the swapfile step above absorbs whatever spike is left
-          # (link is single-threaded and not capped by this knob). Keeping
-          # both belt and suspenders. macOS/Windows are at default-equivalent.
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'ubuntu-22.04' && 2 || 4 }}
+          # `CARGO_BUILD_JOBS=2` on both Ubuntu and Windows reduces the
+          # parallel-rustc memory peak; the swap/pagefile steps above
+          # absorb whatever spike is left (link is single-threaded and not
+          # capped by this knob). Keeping both belt and suspenders. macOS
+          # is on a fatter runner and stays at default.
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'macos-latest' && 4 || 2 }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
             free -h
             df -h
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            echo "=== Windows memory state before cargo test ==="
+            powershell -NoProfile -Command "Get-CimInstance Win32_PageFileUsage | Format-List *; Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory | Format-List"
           fi
           cd src-tauri
           cargo test --verbose
