@@ -154,12 +154,15 @@ jobs:
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
         env:
-          # `CARGO_BUILD_JOBS=2` on both Ubuntu and Windows reduces the
-          # parallel-rustc memory peak; the swap/pagefile steps above
-          # absorb whatever spike is left (link is single-threaded and not
-          # capped by this knob). Keeping both belt and suspenders. macOS
-          # is on a fatter runner and stays at default.
-          CARGO_BUILD_JOBS: ${{ matrix.platform == 'macos-latest' && 4 || 2 }}
+          # `CARGO_BUILD_JOBS` reduces the parallel-rustc memory peak.
+          # Empirically (run 25336049561):
+          #   - Windows passes at JOBS=2 with a 16 GB pagefile — Windows
+          #     pagefile commits lazily so peak fits.
+          #   - Ubuntu OOM-killer is harsher: even with a 12 GB swapfile,
+          #     JOBS=2 still trips the runner-agent shutdown. Drop Ubuntu
+          #     to JOBS=1 for a single-threaded compile.
+          #   - macOS is on a fatter runner and stays at default 4.
+          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'ubuntu-22.04' && 1) || (matrix.platform == 'macos-latest' && 4) || 2 }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
