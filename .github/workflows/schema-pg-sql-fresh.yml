@@ -48,6 +48,32 @@ jobs:
         with:
           path: qontinui-runner
 
+      - name: Resolve qontinui-web sibling ref
+        id: web_ref
+        # Probe whether the PR's branch name exists on jspinak/qontinui-web;
+        # fall back to `main` when it doesn't. The previous logic used
+        # `${{ github.head_ref || github.ref_name }}` directly, which made
+        # the subsequent checkout fail with `git` exit 1 whenever the PR
+        # branch only existed in qontinui-runner — see the cross-repo
+        # branch-fallback gap noted in CONTRIBUTING-merge-readiness.
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          CANDIDATE_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CANDIDATE_REF:-}" ]; then
+            echo "No candidate ref available; falling back to main."
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh api "repos/jspinak/qontinui-web/branches/${CANDIDATE_REF}" >/dev/null 2>&1; then
+            echo "Sibling branch ${CANDIDATE_REF} exists on jspinak/qontinui-web."
+            echo "ref=${CANDIDATE_REF}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Sibling branch ${CANDIDATE_REF} not found on jspinak/qontinui-web; falling back to main."
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout qontinui-web (sibling)
         uses: actions/checkout@v4
         with:
@@ -61,8 +87,9 @@ jobs:
           repository: jspinak/qontinui-web
           path: qontinui-web
           # Use the same branch name if it exists in qontinui-web,
-          # otherwise main. Avoids drift when both repos move together.
-          ref: ${{ github.head_ref || github.ref_name }}
+          # otherwise main. The previous step probes branch existence
+          # so this checkout never tries to clone a nonexistent ref.
+          ref: ${{ steps.web_ref.outputs.ref }}
           # CROSS_REPO_TOKEN must have Contents:Read on jspinak/qontinui-web
           # (qontinui-web is private). Falling back to github.token will fail.
           token: ${{ secrets.CROSS_REPO_TOKEN }}
@@ -76,7 +103,14 @@ jobs:
         working-directory: qontinui-web/backend
         run: |
           python -m pip install --upgrade pip
-          pip install alembic sqlalchemy psycopg2-binary python-dotenv
+          # `pgvector` is required because qontinui-web's models import
+          # `pgvector.sqlalchemy.Vector` at module load time
+          # (see backend/app/models/execution_issue.py); alembic env.py
+          # imports the model graph during `upgrade head`, so without
+          # this dep the gate dies with ModuleNotFoundError before any
+          # migration runs. Pin matches backend/pyproject.toml's
+          # `pgvector = "^0.4.2"`.
+          pip install alembic sqlalchemy psycopg2-binary python-dotenv "pgvector>=0.4.2,<0.5"
 
       - name: Apply alembic chain
         working-directory: qontinui-web/backend
