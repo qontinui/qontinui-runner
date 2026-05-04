@@ -14,15 +14,12 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
             "atomic_write: path has no parent directory",
         )
     })?;
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "atomic_write: path has no UTF-8 file name",
-            )
-        })?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic_write: path has no UTF-8 file name",
+        )
+    })?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

@@ -164,7 +164,10 @@ mod tests {
     #[test]
     fn launcher_path_is_under_local_data() {
         let p = launcher_path();
-        let expected_parent = dirs::data_local_dir().unwrap().join("qontinui-runner").join("bin");
+        let expected_parent = dirs::data_local_dir()
+            .unwrap()
+            .join("qontinui-runner")
+            .join("bin");
         assert_eq!(p.parent().unwrap(), expected_parent);
         assert_eq!(p.file_name().unwrap().to_string_lossy(), LAUNCHER_BIN);
     }

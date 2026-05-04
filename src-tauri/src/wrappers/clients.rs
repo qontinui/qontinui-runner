@@ -162,10 +162,7 @@ fn detect_one(id: AiClientId, primary_port: u16) -> ClientInfo {
     let config_path = config_path_for(id);
     let launcher_path = launcher::launcher_path();
 
-    let config_exists = config_path
-        .as_ref()
-        .map(|p| p.is_file())
-        .unwrap_or(false);
+    let config_exists = config_path.as_ref().map(|p| p.is_file()).unwrap_or(false);
     let on_path = id
         .launcher_name()
         .map(|name| launcher_on_path(name))
@@ -213,10 +210,7 @@ fn connection_state_for(
             path: config_path.to_path_buf(),
         };
     }
-    let Some(entry) = parsed
-        .get("mcpServers")
-        .and_then(|v| v.get(MCP_KEY))
-    else {
+    let Some(entry) = parsed.get("mcpServers").and_then(|v| v.get(MCP_KEY)) else {
         return ConnectionState::NotConnected;
     };
 
@@ -407,9 +401,10 @@ fn read_root(config_path: &Path) -> Result<Value, ClientError> {
     if trimmed.is_empty() {
         return Ok(Value::Object(Map::new()));
     }
-    let parsed: Value = serde_json::from_str(trimmed).map_err(|_| ClientError::ConfigParseFailed {
-        path: config_path.to_path_buf(),
-    })?;
+    let parsed: Value =
+        serde_json::from_str(trimmed).map_err(|_| ClientError::ConfigParseFailed {
+            path: config_path.to_path_buf(),
+        })?;
     if !parsed.is_object() {
         return Err(ClientError::ConfigParseFailed {
             path: config_path.to_path_buf(),
@@ -470,7 +465,10 @@ fn backup_once(config_path: &Path) -> Result<(), ClientError> {
         .as_secs();
     let backup_name = format!(
         "{}.qontinui-backup.{}",
-        config_path.file_name().unwrap_or_default().to_string_lossy(),
+        config_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
         ts
     );
     let backup_path = config_path

@@ -1899,30 +1899,26 @@ pub async fn ui_bridge_screenshot_handler(
         .title()
         .unwrap_or_else(|_| "Qontinui Runner".to_string());
 
-    let captured = match tokio::task::spawn_blocking(move || {
-        capture_runner_window(x, y, w, h, scale, &title)
-    })
-    .await
-    {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => {
-            error!("UI Bridge screenshot: capture failed: {}", e);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Screenshot capture failed: {}", e))),
-            ));
-        }
-        Err(e) => {
-            error!("UI Bridge screenshot: capture task join error: {}", e);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Screenshot capture task failed: {}",
-                    e
-                ))),
-            ));
-        }
-    };
+    let captured =
+        match tokio::task::spawn_blocking(move || capture_runner_window(x, y, w, h, scale, &title))
+            .await
+        {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                error!("UI Bridge screenshot: capture failed: {}", e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Screenshot capture failed: {}", e))),
+                ));
+            }
+            Err(e) => {
+                error!("UI Bridge screenshot: capture task join error: {}", e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Screenshot capture task failed: {}", e))),
+                ));
+            }
+        };
 
     // --- Phase 2: Optional crop to element bounds ------------------------
     if let Some(ref id) = req.element_id {

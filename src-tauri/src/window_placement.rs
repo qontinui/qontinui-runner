@@ -129,7 +129,10 @@ fn apply_via_setwindowpos<R: tauri::Runtime>(
     let tauri_hwnd = match win.hwnd() {
         Ok(h) => h,
         Err(e) => {
-            warn!("placement: hwnd() failed, falling back to set_position: {}", e);
+            warn!(
+                "placement: hwnd() failed, falling back to set_position: {}",
+                e
+            );
             let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
             let _ = win.set_size(tauri::PhysicalSize::new(w, h));
             return;

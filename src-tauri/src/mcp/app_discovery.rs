@@ -967,17 +967,18 @@ pub(crate) async fn wait_for_app_inner(
 
     // Build the matched-app payload only on present:true satisfactions —
     // disappearance waits have no entry to surface.
-    let pick_app = |live: &[crate::mcp::app_registry::RegisteredApp]| -> Option<RegisterAppResponse> {
-        if !req.present {
-            return None;
-        }
-        live.iter()
-            .find(|e| e.app.app_id == req.app_id)
-            .map(|e| RegisterAppResponse {
-                app: e.app.clone(),
-                transport: e.transport,
-            })
-    };
+    let pick_app =
+        |live: &[crate::mcp::app_registry::RegisteredApp]| -> Option<RegisterAppResponse> {
+            if !req.present {
+                return None;
+            }
+            live.iter()
+                .find(|e| e.app.app_id == req.app_id)
+                .map(|e| RegisterAppResponse {
+                    app: e.app.clone(),
+                    transport: e.transport,
+                })
+        };
 
     loop {
         let live = registry.list_live().await;
