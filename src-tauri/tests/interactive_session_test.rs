@@ -182,17 +182,31 @@ struct ControlRequestFromCli {
 // Test helpers
 // ============================================================================
 
-/// Find the mock_claude_cli binary path. Builds it on demand if missing —
-/// CI runs `cargo test --verbose` which doesn't build extra `[[bin]]`
-/// targets, so the first test to reach this kicks off the build. Cargo's
-/// target-dir lock serializes parallel callers.
+/// Find the mock_claude_cli binary path. Cargo populates
+/// `CARGO_BIN_EXE_<name>` for integration tests when the bin is in the
+/// same package, pointing at the actual built artifact (workspace-aware,
+/// profile-aware). Falls back to the legacy `target/{debug,release}/`
+/// search for non-cargo invocations (e.g. running the test binary
+/// directly), which also kicks off an on-demand build if needed.
 fn mock_cli_path() -> String {
+    // Cargo-provided path — set when `cargo test` (or `cargo run`) builds
+    // the bin via the package's [[bin]] declaration. This is the
+    // canonical path: it follows CARGO_TARGET_DIR, profile, workspace
+    // layout, etc.
+    if let Some(p) = option_env!("CARGO_BIN_EXE_mock_claude_cli") {
+        return p.to_string();
+    }
+
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let candidates = [
         format!("{}/target/debug/mock_claude_cli.exe", manifest_dir),
         format!("{}/target/debug/mock_claude_cli", manifest_dir),
         format!("{}/target/release/mock_claude_cli.exe", manifest_dir),
         format!("{}/target/release/mock_claude_cli", manifest_dir),
+        format!("{}/../target/debug/mock_claude_cli.exe", manifest_dir),
+        format!("{}/../target/debug/mock_claude_cli", manifest_dir),
+        format!("{}/../target/release/mock_claude_cli.exe", manifest_dir),
+        format!("{}/../target/release/mock_claude_cli", manifest_dir),
     ];
 
     let find = || {
