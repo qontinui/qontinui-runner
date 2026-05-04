@@ -72,9 +72,9 @@ pub enum InstallError {
 /// (works on macOS/Linux and on Windows when invoked from a shell), then
 /// fall back to `<name>.cmd` for Windows-shimmed installs.
 pub fn detect_package_manager() -> Option<&'static str> {
-    for pm in ["pnpm", "npm"] {
+    ["pnpm", "npm"].into_iter().find(|&pm| {
         if probe_pm(pm) {
-            return Some(pm);
+            return true;
         }
         #[cfg(windows)]
         {
@@ -84,11 +84,11 @@ pub fn detect_package_manager() -> Option<&'static str> {
             // mode, so we centralize the workaround in `pm_command`.
             let shim = format!("{}.cmd", pm);
             if probe_pm(&shim) {
-                return Some(pm);
+                return true;
             }
         }
-    }
-    None
+        false
+    })
 }
 
 fn probe_pm(name: &str) -> bool {

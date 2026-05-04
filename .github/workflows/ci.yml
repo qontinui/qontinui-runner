@@ -25,17 +25,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # qontinui-runner has cross-repo deps to two sibling repos:
-      #   - frontend eslint config imports `@qontinui/ui-bridge-eslint-plugin`
-      #     (link: protocol via pnpm, points at ../ui-bridge/packages/...)
-      #   - src-tauri/Cargo.toml has `qontinui-types = { path = "../../qontinui-schemas/rust" }`
-      # CI must clone both as siblings before pnpm install / cargo build.
-      # Both repos are public; no auth needed.
+      # qontinui-runner's frontend cross-repo deps now resolve via npm
+      # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
+      # The remaining sibling-checkouts are:
+      #   - qontinui-schemas: src-tauri/Cargo.toml's `qontinui-types = { path
+      #     = "../../qontinui-schemas/rust" }` — Rust publication is deferred
+      #     per the cross-repo dep redesign plan.
+      #   - qontinui-web: src/lib/spec-registry.ts is auto-generated and
+      #     statically imports 14 .spec.uibridge.json files from
+      #     qontinui-web/frontend/src/app at typecheck/build time. These are
+      #     cross-repo file imports rather than npm deps, so the redesign
+      #     doesn't migrate them.
+      # qontinui-schemas is public; qontinui-web is private and lives under
+      # jspinak/, so cloning it needs CROSS_REPO_TOKEN (PAT with read access).
       - name: Checkout sibling repos
+        env:
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         run: |
           cd "$GITHUB_WORKSPACE/.."
-          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
           git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 "https://x-access-token:${CROSS_REPO_TOKEN}@github.com/jspinak/qontinui-web.git"
         shell: bash
 
       - name: Setup pnpm
@@ -94,6 +103,13 @@ jobs:
       - name: Lint frontend code
         run: pnpm run lint
 
+      # Build the frontend before any cargo step. tauri::generate_context!()
+      # in src-tauri/src/lib.rs reads tauri.conf.json at compile time and
+      # panics if frontendDist (../dist) is missing — which broke `Clippy
+      # check`, `Run Rust tests`, and `Build Tauri app` on every platform.
+      - name: Build frontend
+        run: pnpm run build
+
       - name: Format Rust code check
         run: |
           cd src-tauri
@@ -111,9 +127,6 @@ jobs:
           cd src-tauri
           cargo test --verbose
 
-      - name: Build frontend
-        run: pnpm run build
-
       - name: Build Tauri app (development)
         run: pnpm run tauri build -- --debug
 
@@ -125,12 +138,12 @@ jobs:
 
       # cargo audit walks the workspace and resolves path: deps. The runner's
       # src-tauri/Cargo.toml depends on `qontinui-types` from a sibling repo.
-      # Same multi-checkout pattern as the test job.
+      # Same multi-checkout pattern as the test job. Frontend link: deps have
+      # moved to npm so ui-bridge no longer needs cloning here.
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
           git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
-          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
 
       - name: Run security audit on Rust dependencies
         # Cargo.lock lives at the workspace root (./Cargo.lock), not under

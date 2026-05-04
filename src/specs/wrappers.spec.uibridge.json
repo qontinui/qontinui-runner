@@ -4,7 +4,13 @@
   "metadata": {
     "component": "WrappersLibraryPage",
     "pageUrl": "wrappers",
-    "tags": ["wrappers", "extensions", "registry", "install", "library"]
+    "tags": [
+      "wrappers",
+      "extensions",
+      "registry",
+      "install",
+      "library"
+    ]
   },
   "groups": [
     {
@@ -716,7 +722,10 @@
           },
           "assertionType": "cssPropertyInSet",
           "propertyName": "font-size",
-          "expected": ["24px", "1.5rem"],
+          "expected": [
+            "24px",
+            "1.5rem"
+          ],
           "source": "ai-generated",
           "reviewed": false,
           "enabled": true
@@ -927,11 +936,6 @@
         "description": "Default view. The Installed tab is active and the page renders either the empty-state card, the loading spinner, the error card, or the wrapper card grid — whichever matches the backend state.",
         "elements": [
           {
-            "dataAttributes": {
-              "page-id": "wrappers"
-            }
-          },
-          {
             "tagName": "button",
             "textContent": "Installed"
           }
@@ -942,8 +946,12 @@
             "id": "installed-to-browse",
             "name": "Switch to Browse tab",
             "description": "Click the Browse tab button. The content area swaps to the Browse view (search + registry list).",
-            "activateStates": ["wrappers-browse-tab"],
-            "deactivateStates": ["wrappers-installed-tab"],
+            "activateStates": [
+              "wrappers-browse-tab"
+            ],
+            "deactivateStates": [
+              "wrappers-installed-tab"
+            ],
             "staysVisible": false,
             "process": [
               {
@@ -967,11 +975,6 @@
         "description": "The Browse tab is active. The search input + registry list are visible.",
         "elements": [
           {
-            "dataAttributes": {
-              "page-id": "wrappers"
-            }
-          },
-          {
             "placeholder": "Search wrappers by name, category, or author"
           }
         ],
@@ -980,8 +983,12 @@
             "id": "browse-to-installed",
             "name": "Switch to Installed tab",
             "description": "Click the Installed tab button to return to the local-wrappers grid.",
-            "activateStates": ["wrappers-installed-tab"],
-            "deactivateStates": ["wrappers-browse-tab"],
+            "activateStates": [
+              "wrappers-installed-tab"
+            ],
+            "deactivateStates": [
+              "wrappers-browse-tab"
+            ],
             "staysVisible": false,
             "process": [
               {

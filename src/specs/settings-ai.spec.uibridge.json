@@ -15,7 +15,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "AI Provider" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "AI Provider"
+            },
             "label": "AI Provider heading"
           },
           "assertionType": "exists",
@@ -30,7 +33,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Configure how the runner connects to AI" },
+            "criteria": {
+              "textContent": "Configure how the runner connects to AI"
+            },
             "label": "AI Provider description text"
           },
           "assertionType": "containsText",
@@ -46,7 +51,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "loading ai settings" },
+            "criteria": {
+              "dataContentLabel": "loading ai settings"
+            },
             "label": "Loading state container"
           },
           "assertionType": "behavior",
@@ -71,7 +78,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "radio", "idPattern": "provider-claude_cli" },
+            "criteria": {
+              "role": "radio",
+              "idPattern": "provider-claude_cli"
+            },
             "label": "Claude CLI radio button"
           },
           "assertionType": "exists",
@@ -86,7 +96,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "radio", "idPattern": "provider-claude_api" },
+            "criteria": {
+              "role": "radio",
+              "idPattern": "provider-claude_api"
+            },
             "label": "Claude API radio button"
           },
           "assertionType": "exists",
@@ -101,7 +114,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "radio", "idPattern": "provider-gemini_cli" },
+            "criteria": {
+              "role": "radio",
+              "idPattern": "provider-gemini_cli"
+            },
             "label": "Gemini CLI radio button"
           },
           "assertionType": "exists",
@@ -116,7 +132,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "radio", "idPattern": "provider-gemini_api" },
+            "criteria": {
+              "role": "radio",
+              "idPattern": "provider-gemini_api"
+            },
             "label": "Gemini API radio button"
           },
           "assertionType": "exists",
@@ -131,7 +150,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "radio", "idPattern": "provider-claude_api" },
+            "criteria": {
+              "role": "radio",
+              "idPattern": "provider-claude_api"
+            },
             "label": "Claude API radio button"
           },
           "assertionType": "behavior",
@@ -156,7 +178,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Closed" },
+            "criteria": {
+              "textContent": "Closed"
+            },
             "label": "Closed circuit breaker badge"
           },
           "assertionType": "semantic",
@@ -172,7 +196,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Open" },
+            "criteria": {
+              "textContent": "Open"
+            },
             "label": "Open circuit breaker badge area"
           },
           "assertionType": "behavior",
@@ -188,7 +214,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Closed" },
+            "criteria": {
+              "textContent": "Closed"
+            },
             "label": "Circuit breaker status badge"
           },
           "assertionType": "semantic",
@@ -213,7 +241,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "combobox", "idPattern": "claude-cli-execution-mode" },
+            "criteria": {
+              "role": "combobox",
+              "idPattern": "claude-cli-execution-mode"
+            },
             "label": "Claude CLI execution mode dropdown"
           },
           "assertionType": "visible",
@@ -229,7 +260,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Authenticated" },
+            "criteria": {
+              "textContent": "Authenticated"
+            },
             "label": "Auth status banner (authenticated state)"
           },
           "assertionType": "semantic",
@@ -245,7 +278,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Re-authenticate" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Re-authenticate"
+            },
             "label": "Re-authenticate button"
           },
           "assertionType": "behavior",
@@ -261,7 +297,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "combobox", "idPattern": "claude-cli-execution-mode" },
+            "criteria": {
+              "role": "combobox",
+              "idPattern": "claude-cli-execution-mode"
+            },
             "label": "Claude CLI execution mode dropdown"
           },
           "assertionType": "exists",
@@ -276,7 +315,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "spinbutton", "idPattern": "claude-cli-timeout" },
+            "criteria": {
+              "role": "spinbutton",
+              "idPattern": "claude-cli-timeout"
+            },
             "label": "Claude CLI timeout input"
           },
           "assertionType": "exists",
@@ -300,7 +342,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No accounts configured" },
+            "criteria": {
+              "textContent": "No accounts configured"
+            },
             "label": "Empty accounts state message"
           },
           "assertionType": "exists",
@@ -316,7 +360,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Add Directory" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Add Directory"
+            },
             "label": "Add Directory button"
           },
           "assertionType": "exists",
@@ -332,7 +379,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Auto-Detect" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Auto-Detect"
+            },
             "label": "Auto-Detect button"
           },
           "assertionType": "behavior",
@@ -348,7 +398,10 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Check Usage" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Check Usage"
+            },
             "label": "Check Usage button"
           },
           "assertionType": "exists",
@@ -364,7 +417,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Active" },
+            "criteria": {
+              "textContent": "Active"
+            },
             "label": "Active account badge on account card"
           },
           "assertionType": "semantic",
@@ -380,7 +435,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Least Usage" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Least Usage"
+            },
             "label": "Least Usage selection mode button"
           },
           "assertionType": "behavior",
@@ -405,7 +463,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "combobox", "idPattern": "claude-api-model" },
+            "criteria": {
+              "role": "combobox",
+              "idPattern": "claude-api-model"
+            },
             "label": "Claude API model dropdown"
           },
           "assertionType": "visible",
@@ -421,7 +482,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "claude api key configured" },
+            "criteria": {
+              "dataContentLabel": "claude api key configured"
+            },
             "label": "Claude API key configured status"
           },
           "assertionType": "exists",
@@ -437,7 +500,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save Key" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save Key"
+            },
             "label": "Claude API Save Key button"
           },
           "assertionType": "behavior",
@@ -453,7 +519,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "combobox", "idPattern": "claude-api-model" },
+            "criteria": {
+              "role": "combobox",
+              "idPattern": "claude-api-model"
+            },
             "label": "Claude API model dropdown"
           },
           "assertionType": "exists",
@@ -468,7 +537,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "per-token costs" },
+            "criteria": {
+              "textContent": "per-token costs"
+            },
             "label": "Claude API cost warning"
           },
           "assertionType": "exists",
@@ -492,7 +563,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "combobox", "idPattern": "gemini-cli-model" },
+            "criteria": {
+              "role": "combobox",
+              "idPattern": "gemini-cli-model"
+            },
             "label": "Gemini CLI model dropdown"
           },
           "assertionType": "visible",
@@ -508,7 +582,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "radio", "idPattern": "gemini-auth-oauth" },
+            "criteria": {
+              "role": "radio",
+              "idPattern": "gemini-auth-oauth"
+            },
             "label": "Gemini OAuth auth method radio"
           },
           "assertionType": "exists",
@@ -524,7 +601,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "radio", "idPattern": "gemini-auth-api_key" },
+            "criteria": {
+              "role": "radio",
+              "idPattern": "gemini-auth-api_key"
+            },
             "label": "Gemini API key auth method radio"
           },
           "assertionType": "exists",
@@ -540,7 +620,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "combobox", "idPattern": "gemini-cli-model" },
+            "criteria": {
+              "role": "combobox",
+              "idPattern": "gemini-cli-model"
+            },
             "label": "Gemini CLI model dropdown"
           },
           "assertionType": "exists",
@@ -555,7 +638,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "npm install -g @google/gemini-cli" },
+            "criteria": {
+              "textContent": "npm install -g @google/gemini-cli"
+            },
             "label": "Gemini CLI install tip"
           },
           "assertionType": "exists",
@@ -579,7 +664,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "combobox", "idPattern": "gemini-api-model" },
+            "criteria": {
+              "role": "combobox",
+              "idPattern": "gemini-api-model"
+            },
             "label": "Gemini API model dropdown"
           },
           "assertionType": "visible",
@@ -595,7 +683,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "dataContentLabel": "gemini api key configured" },
+            "criteria": {
+              "dataContentLabel": "gemini api key configured"
+            },
             "label": "Gemini API key configured status"
           },
           "assertionType": "exists",
@@ -611,7 +701,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save Key" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save Key"
+            },
             "label": "Gemini API Save Key button"
           },
           "assertionType": "behavior",
@@ -627,7 +720,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "spinbutton", "idPattern": "gemini-api-temperature" },
+            "criteria": {
+              "role": "spinbutton",
+              "idPattern": "gemini-api-temperature"
+            },
             "label": "Temperature input"
           },
           "assertionType": "exists",
@@ -642,7 +738,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Cost Savings" },
+            "criteria": {
+              "textContent": "Cost Savings"
+            },
             "label": "Gemini API cost savings note"
           },
           "assertionType": "exists",
@@ -666,7 +764,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Include Video After Iterations" },
+            "criteria": {
+              "textContent": "Include Video After Iterations"
+            },
             "label": "Include Video After Iterations label"
           },
           "assertionType": "exists",
@@ -681,7 +781,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "spinbutton", "idPattern": "auto-refine-iterations" },
+            "criteria": {
+              "role": "spinbutton",
+              "idPattern": "auto-refine-iterations"
+            },
             "label": "Auto-refine iterations input"
           },
           "assertionType": "exists",
@@ -696,7 +799,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "spinbutton", "idPattern": "auto-refine-iterations" },
+            "criteria": {
+              "role": "spinbutton",
+              "idPattern": "auto-refine-iterations"
+            },
             "label": "Auto-refine iterations input"
           },
           "assertionType": "behavior",
@@ -711,7 +817,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Video frames use significantly more tokens" },
+            "criteria": {
+              "textContent": "Video frames use significantly more tokens"
+            },
             "label": "Video token usage warning"
           },
           "assertionType": "exists",
@@ -735,7 +843,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "idPattern": "interactive-sessions-toggle" },
+            "criteria": {
+              "role": "button",
+              "idPattern": "interactive-sessions-toggle"
+            },
             "label": "Interactive sessions toggle"
           },
           "assertionType": "exists",
@@ -750,7 +861,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "idPattern": "interactive-sessions-toggle" },
+            "criteria": {
+              "role": "button",
+              "idPattern": "interactive-sessions-toggle"
+            },
             "label": "Interactive sessions toggle"
           },
           "assertionType": "behavior",
@@ -765,7 +879,9 @@
           "severity": "info",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "message queuing" },
+            "criteria": {
+              "textContent": "message queuing"
+            },
             "label": "Session mode info box"
           },
           "assertionType": "exists",
@@ -789,7 +905,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Test Connection" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Test Connection"
+            },
             "label": "Test Connection button"
           },
           "assertionType": "exists",
@@ -804,7 +923,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Test Connection" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Test Connection"
+            },
             "label": "Test Connection button"
           },
           "assertionType": "disabled",
@@ -820,7 +942,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Test Connection" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Test Connection"
+            },
             "label": "Test Connection button"
           },
           "assertionType": "behavior",
@@ -845,7 +970,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save AI Settings" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save AI Settings"
+            },
             "label": "Save AI Settings button"
           },
           "assertionType": "exists",
@@ -860,7 +988,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save AI Settings" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save AI Settings"
+            },
             "label": "Save AI Settings button"
           },
           "assertionType": "behavior",
@@ -875,7 +1006,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Settings saved successfully" },
+            "criteria": {
+              "textContent": "Settings saved successfully"
+            },
             "label": "Save success banner"
           },
           "assertionType": "behavior",
@@ -891,7 +1024,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save AI Settings" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save AI Settings"
+            },
             "label": "Save AI Settings button"
           },
           "assertionType": "behavior",
@@ -910,21 +1046,35 @@
         "id": "ai-loading",
         "name": "Loading",
         "description": "Initial state while get_ai_settings Tauri command is in flight. The spinner with data-content-label='loading ai settings' is visible; the settings form is not yet rendered.",
-        "elements": [{ "dataContentLabel": "loading ai settings" }],
+        "elements": [
+          {
+            "dataContentLabel": "loading ai settings"
+          }
+        ],
         "isInitial": true,
         "transitions": [
           {
             "id": "loading-to-claude-cli",
             "name": "Load completes — claude_cli provider saved",
             "description": "Settings load finishes with claude_cli as the saved provider",
-            "activateStates": ["ai-provider-claude-cli"],
-            "deactivateStates": ["ai-loading"],
+            "activateStates": [
+              "ai-provider-claude-cli"
+            ],
+            "deactivateStates": [
+              "ai-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "role": "radio", "idPattern": "provider-claude_cli" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-claude_cli"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           },
@@ -932,14 +1082,24 @@
             "id": "loading-to-claude-api",
             "name": "Load completes — claude_api provider saved",
             "description": "Settings load finishes with claude_api as the saved provider",
-            "activateStates": ["ai-provider-claude-api"],
-            "deactivateStates": ["ai-loading"],
+            "activateStates": [
+              "ai-provider-claude-api"
+            ],
+            "deactivateStates": [
+              "ai-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "role": "combobox", "idPattern": "claude-api-model" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "role": "combobox",
+                  "idPattern": "claude-api-model"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           },
@@ -947,14 +1107,24 @@
             "id": "loading-to-gemini-cli",
             "name": "Load completes — gemini_cli provider saved",
             "description": "Settings load finishes with gemini_cli as the saved provider",
-            "activateStates": ["ai-provider-gemini-cli"],
-            "deactivateStates": ["ai-loading"],
+            "activateStates": [
+              "ai-provider-gemini-cli"
+            ],
+            "deactivateStates": [
+              "ai-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "role": "combobox", "idPattern": "gemini-cli-model" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "role": "combobox",
+                  "idPattern": "gemini-cli-model"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           },
@@ -962,14 +1132,24 @@
             "id": "loading-to-gemini-api",
             "name": "Load completes — gemini_api provider saved",
             "description": "Settings load finishes with gemini_api as the saved provider",
-            "activateStates": ["ai-provider-gemini-api"],
-            "deactivateStates": ["ai-loading"],
+            "activateStates": [
+              "ai-provider-gemini-api"
+            ],
+            "deactivateStates": [
+              "ai-loading"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "wait",
-                "target": { "role": "combobox", "idPattern": "gemini-api-model" },
-                "waitAfter": { "type": "idle", "timeout": 5000 }
+                "target": {
+                  "role": "combobox",
+                  "idPattern": "gemini-api-model"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 5000
+                }
               }
             ]
           }
@@ -979,21 +1159,31 @@
         "id": "ai-provider-claude-cli",
         "name": "Claude CLI Provider Selected",
         "description": "Claude Code CLI is the active provider. The Claude CLI configuration section (auth banner, execution mode, accounts, timeout) is visible. All other provider sections are hidden.",
-        "elements": [{ "role": "combobox", "idPattern": "claude-cli-execution-mode" }],
+        "elements": [],
         "isInitial": false,
         "transitions": [
           {
             "id": "claude-cli-to-claude-api",
             "name": "Switch to Claude API",
             "description": "Click the Claude API radio button",
-            "activateStates": ["ai-provider-claude-api"],
-            "deactivateStates": ["ai-provider-claude-cli"],
+            "activateStates": [
+              "ai-provider-claude-api"
+            ],
+            "deactivateStates": [
+              "ai-provider-claude-cli"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-claude_api" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-claude_api"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -1001,14 +1191,24 @@
             "id": "claude-cli-to-gemini-cli",
             "name": "Switch to Gemini CLI",
             "description": "Click the Gemini CLI radio button",
-            "activateStates": ["ai-provider-gemini-cli"],
-            "deactivateStates": ["ai-provider-claude-cli"],
+            "activateStates": [
+              "ai-provider-gemini-cli"
+            ],
+            "deactivateStates": [
+              "ai-provider-claude-cli"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-gemini_cli" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-gemini_cli"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -1016,14 +1216,24 @@
             "id": "claude-cli-to-gemini-api",
             "name": "Switch to Gemini API",
             "description": "Click the Gemini API radio button",
-            "activateStates": ["ai-provider-gemini-api"],
-            "deactivateStates": ["ai-provider-claude-cli"],
+            "activateStates": [
+              "ai-provider-gemini-api"
+            ],
+            "deactivateStates": [
+              "ai-provider-claude-cli"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-gemini_api" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-gemini_api"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -1033,21 +1243,31 @@
         "id": "ai-provider-claude-api",
         "name": "Claude API Provider Selected",
         "description": "Claude API (direct billing) is the active provider. API key management, model dropdown, and max tokens input are visible. Claude CLI section is hidden.",
-        "elements": [{ "role": "combobox", "idPattern": "claude-api-model" }],
+        "elements": [],
         "isInitial": false,
         "transitions": [
           {
             "id": "claude-api-to-claude-cli",
             "name": "Switch to Claude CLI",
             "description": "Click the Claude CLI radio button",
-            "activateStates": ["ai-provider-claude-cli"],
-            "deactivateStates": ["ai-provider-claude-api"],
+            "activateStates": [
+              "ai-provider-claude-cli"
+            ],
+            "deactivateStates": [
+              "ai-provider-claude-api"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-claude_cli" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-claude_cli"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -1055,14 +1275,24 @@
             "id": "claude-api-to-gemini-cli",
             "name": "Switch to Gemini CLI",
             "description": "Click the Gemini CLI radio button",
-            "activateStates": ["ai-provider-gemini-cli"],
-            "deactivateStates": ["ai-provider-claude-api"],
+            "activateStates": [
+              "ai-provider-gemini-cli"
+            ],
+            "deactivateStates": [
+              "ai-provider-claude-api"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-gemini_cli" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-gemini_cli"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -1070,14 +1300,24 @@
             "id": "claude-api-to-gemini-api",
             "name": "Switch to Gemini API",
             "description": "Click the Gemini API radio button",
-            "activateStates": ["ai-provider-gemini-api"],
-            "deactivateStates": ["ai-provider-claude-api"],
+            "activateStates": [
+              "ai-provider-gemini-api"
+            ],
+            "deactivateStates": [
+              "ai-provider-claude-api"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-gemini_api" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-gemini_api"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -1087,21 +1327,31 @@
         "id": "ai-provider-gemini-cli",
         "name": "Gemini CLI Provider Selected",
         "description": "Gemini CLI is the active provider. Auth method radios, model dropdown, execution mode, and timeout are visible. All other provider sections are hidden.",
-        "elements": [{ "role": "combobox", "idPattern": "gemini-cli-model" }],
+        "elements": [],
         "isInitial": false,
         "transitions": [
           {
             "id": "gemini-cli-to-claude-cli",
             "name": "Switch to Claude CLI",
             "description": "Click the Claude CLI radio button",
-            "activateStates": ["ai-provider-claude-cli"],
-            "deactivateStates": ["ai-provider-gemini-cli"],
+            "activateStates": [
+              "ai-provider-claude-cli"
+            ],
+            "deactivateStates": [
+              "ai-provider-gemini-cli"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-claude_cli" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-claude_cli"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -1109,14 +1359,24 @@
             "id": "gemini-cli-to-claude-api",
             "name": "Switch to Claude API",
             "description": "Click the Claude API radio button",
-            "activateStates": ["ai-provider-claude-api"],
-            "deactivateStates": ["ai-provider-gemini-cli"],
+            "activateStates": [
+              "ai-provider-claude-api"
+            ],
+            "deactivateStates": [
+              "ai-provider-gemini-cli"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-claude_api" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-claude_api"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -1124,14 +1384,24 @@
             "id": "gemini-cli-to-gemini-api",
             "name": "Switch to Gemini API",
             "description": "Click the Gemini API radio button",
-            "activateStates": ["ai-provider-gemini-api"],
-            "deactivateStates": ["ai-provider-gemini-cli"],
+            "activateStates": [
+              "ai-provider-gemini-api"
+            ],
+            "deactivateStates": [
+              "ai-provider-gemini-cli"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-gemini_api" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-gemini_api"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -1141,21 +1411,31 @@
         "id": "ai-provider-gemini-api",
         "name": "Gemini API Provider Selected",
         "description": "Gemini API (direct billing) is the active provider. API key management, model dropdown, max output tokens, and temperature inputs are visible. All other provider sections are hidden.",
-        "elements": [{ "role": "combobox", "idPattern": "gemini-api-model" }],
+        "elements": [],
         "isInitial": false,
         "transitions": [
           {
             "id": "gemini-api-to-claude-cli",
             "name": "Switch to Claude CLI",
             "description": "Click the Claude CLI radio button",
-            "activateStates": ["ai-provider-claude-cli"],
-            "deactivateStates": ["ai-provider-gemini-api"],
+            "activateStates": [
+              "ai-provider-claude-cli"
+            ],
+            "deactivateStates": [
+              "ai-provider-gemini-api"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-claude_cli" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-claude_cli"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -1163,14 +1443,24 @@
             "id": "gemini-api-to-claude-api",
             "name": "Switch to Claude API",
             "description": "Click the Claude API radio button",
-            "activateStates": ["ai-provider-claude-api"],
-            "deactivateStates": ["ai-provider-gemini-api"],
+            "activateStates": [
+              "ai-provider-claude-api"
+            ],
+            "deactivateStates": [
+              "ai-provider-gemini-api"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-claude_api" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-claude_api"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           },
@@ -1178,14 +1468,24 @@
             "id": "gemini-api-to-gemini-cli",
             "name": "Switch to Gemini CLI",
             "description": "Click the Gemini CLI radio button",
-            "activateStates": ["ai-provider-gemini-cli"],
-            "deactivateStates": ["ai-provider-gemini-api"],
+            "activateStates": [
+              "ai-provider-gemini-cli"
+            ],
+            "deactivateStates": [
+              "ai-provider-gemini-api"
+            ],
             "staysVisible": false,
             "process": [
               {
                 "action": "click",
-                "target": { "role": "radio", "idPattern": "provider-gemini_cli" },
-                "waitAfter": { "type": "idle", "timeout": 2000 }
+                "target": {
+                  "role": "radio",
+                  "idPattern": "provider-gemini_cli"
+                },
+                "waitAfter": {
+                  "type": "idle",
+                  "timeout": 2000
+                }
               }
             ]
           }
@@ -1203,16 +1503,24 @@
             "id": "provider-switch-cli-to-api",
             "name": "Switch from Claude CLI to Claude API",
             "description": "Verify selecting Claude API hides the Claude CLI section and shows the Claude API section",
-            "groupIds": ["ai-provider-selection"],
+            "groupIds": [
+              "ai-provider-selection"
+            ],
             "difficulty": "easy",
             "steps": [
-              { "type": "navigate", "url": "/settings" },
+              {
+                "type": "navigate",
+                "url": "/settings"
+              },
               {
                 "type": "wait",
                 "condition": "element",
                 "target": {
                   "type": "search",
-                  "criteria": { "role": "radio", "idPattern": "provider-claude_cli" }
+                  "criteria": {
+                    "role": "radio",
+                    "idPattern": "provider-claude_cli"
+                  }
                 },
                 "timeoutMs": 5000
               },
@@ -1222,12 +1530,18 @@
                 "actionId": "click",
                 "params": {}
               },
-              { "type": "assert", "assertionId": "ai-claude-api-section-visible" }
+              {
+                "type": "assert",
+                "assertionId": "ai-claude-api-section-visible"
+              }
             ],
             "teardown": [],
             "requiresRealBackend": true,
             "hasTiming": false,
-            "retryStrategy": { "maxAttempts": 2, "delayMs": 500 }
+            "retryStrategy": {
+              "maxAttempts": 2,
+              "delayMs": 500
+            }
           }
         ],
         "requiresInfrastructure": {
@@ -1247,17 +1561,25 @@
             "id": "test-connection-flow",
             "name": "Test AI connection and observe result",
             "description": "Click Test Connection, wait for result, verify result section appears with success or failure message",
-            "groupIds": ["ai-test-connection"],
+            "groupIds": [
+              "ai-test-connection"
+            ],
             "difficulty": "hard",
             "hardnessReason": "Requires a real working AI provider installation and credentials",
             "steps": [
-              { "type": "navigate", "url": "/settings" },
+              {
+                "type": "navigate",
+                "url": "/settings"
+              },
               {
                 "type": "wait",
                 "condition": "element",
                 "target": {
                   "type": "search",
-                  "criteria": { "role": "button", "textContent": "Test Connection" }
+                  "criteria": {
+                    "role": "button",
+                    "textContent": "Test Connection"
+                  }
                 },
                 "timeoutMs": 5000
               },
@@ -1270,15 +1592,26 @@
               {
                 "type": "wait",
                 "condition": "element",
-                "target": { "type": "search", "criteria": { "textContent": "Testing..." } },
+                "target": {
+                  "type": "search",
+                  "criteria": {
+                    "textContent": "Testing..."
+                  }
+                },
                 "timeoutMs": 3000
               },
-              { "type": "assert", "assertionId": "ai-test-connection-behavior" }
+              {
+                "type": "assert",
+                "assertionId": "ai-test-connection-behavior"
+              }
             ],
             "teardown": [],
             "requiresRealBackend": true,
             "hasTiming": true,
-            "retryStrategy": { "maxAttempts": 1, "delayMs": 0 }
+            "retryStrategy": {
+              "maxAttempts": 1,
+              "delayMs": 0
+            }
           }
         ],
         "asyncStrategies": {
@@ -1297,7 +1630,9 @@
           "tauriEvents": true
         },
         "automationCoverage": 60,
-        "manualAssertions": ["Success message content varies per provider and model"],
+        "manualAssertions": [
+          "Success message content varies per provider and model"
+        ],
         "notes": "Full test requires working provider installation; mark as infrastructure-dependent"
       },
       "ai-save-settings": {
@@ -1306,16 +1641,24 @@
             "id": "save-settings-success",
             "name": "Save settings and verify success banner",
             "description": "Click Save AI Settings and verify the success banner appears then auto-dismisses",
-            "groupIds": ["ai-save-settings"],
+            "groupIds": [
+              "ai-save-settings"
+            ],
             "difficulty": "medium",
             "steps": [
-              { "type": "navigate", "url": "/settings" },
+              {
+                "type": "navigate",
+                "url": "/settings"
+              },
               {
                 "type": "wait",
                 "condition": "element",
                 "target": {
                   "type": "search",
-                  "criteria": { "role": "button", "textContent": "Save AI Settings" }
+                  "criteria": {
+                    "role": "button",
+                    "textContent": "Save AI Settings"
+                  }
                 },
                 "timeoutMs": 5000
               },
@@ -1330,16 +1673,24 @@
                 "condition": "element",
                 "target": {
                   "type": "search",
-                  "criteria": { "textContent": "Settings saved successfully" }
+                  "criteria": {
+                    "textContent": "Settings saved successfully"
+                  }
                 },
                 "timeoutMs": 5000
               },
-              { "type": "assert", "assertionId": "ai-save-success-feedback" }
+              {
+                "type": "assert",
+                "assertionId": "ai-save-success-feedback"
+              }
             ],
             "teardown": [],
             "requiresRealBackend": true,
             "hasTiming": true,
-            "retryStrategy": { "maxAttempts": 2, "delayMs": 1000 }
+            "retryStrategy": {
+              "maxAttempts": 2,
+              "delayMs": 1000
+            }
           }
         ],
         "asyncStrategies": {

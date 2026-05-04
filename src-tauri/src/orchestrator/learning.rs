@@ -655,7 +655,7 @@ impl LearningSystem {
             .iter()
             .map(|(k, v)| (k.clone(), v.total_uses))
             .collect();
-        top_tools.sort_by(|a, b| b.1.cmp(&a.1));
+        top_tools.sort_by_key(|t| std::cmp::Reverse(t.1));
         top_tools.truncate(5);
 
         // Find top strategies

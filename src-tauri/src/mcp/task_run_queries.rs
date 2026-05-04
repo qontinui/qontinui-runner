@@ -1393,7 +1393,7 @@ pub fn aggregate_step_events(events: &[crate::database::TaskRunEvent]) -> Aggreg
         .any(|s| s.phase.as_deref() == Some("agentic"));
 
     let mut steps: Vec<StepExecutionData> = step_map.into_values().collect();
-    steps.sort_by(|a, b| a.start_time.cmp(&b.start_time));
+    steps.sort_by_key(|s| s.start_time);
 
     AggregatedStepData {
         steps,

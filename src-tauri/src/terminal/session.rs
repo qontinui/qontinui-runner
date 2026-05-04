@@ -594,7 +594,13 @@ impl MasterPty for NoopMaster {
         Ok(Box::new(std::io::sink()))
     }
     #[cfg(unix)]
-    fn process_group_leader(&self) {}
+    fn process_group_leader(&self) -> Option<i32> {
+        None
+    }
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<i32> {
+        None
+    }
 }
 
 impl Drop for TerminalSession {
