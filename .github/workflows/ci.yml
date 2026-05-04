@@ -81,6 +81,25 @@ jobs:
             libatspi2.0-dev \
             at-spi2-core
 
+      # Hosted ubuntu-22.04 ships with 16 GB RAM + 4 GB swap. `cargo test`
+      # peak link-time memory on this workspace exceeds that and the runner
+      # host loses comms with GitHub before any log output ships back (run
+      # 25316983521 was the second confirmation: 1h3m kill, zero log lines
+      # under `Run Rust tests`). Capping CARGO_BUILD_JOBS alone wasn't
+      # enough — link is single-threaded. Pre-allocate a 12 GB swapfile so
+      # the OS can absorb the spike instead of the runner agent dying.
+      - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== free / df after swap setup ==="
+          free -h
+          df -h
+
       # macOS: The accessibility (AX) adapter links against system CoreFoundation
       # frameworks which are always available. No additional brew packages needed.
       # Note: AX integration tests require accessibility permissions at runtime,
@@ -124,18 +143,20 @@ jobs:
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
         env:
-          # The ubuntu-22.04 hosted runner (4 CPU / 16 GB RAM) OOMs the host
-          # during `cargo test`'s codegen phase on this workspace — the runner
-          # VM loses comms with GitHub before any test step output is shipped
-          # back. Capping rustc to 2 concurrent jobs roughly halves peak RAM
-          # and keeps the build under the runner's memory budget. macOS and
-          # Windows hosted runners have the same 4 CPU but enough headroom at
-          # the default; CARGO_BUILD_JOBS=4 there is the default-equivalent
-          # and explicit so the matrix split is obvious.
+          # `CARGO_BUILD_JOBS=2` on Ubuntu reduces the parallel-rustc memory
+          # peak; the swapfile step above absorbs whatever spike is left
+          # (link is single-threaded and not capped by this knob). Keeping
+          # both belt and suspenders. macOS/Windows are at default-equivalent.
           CARGO_BUILD_JOBS: ${{ matrix.platform == 'ubuntu-22.04' && 2 || 4 }}
         run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "=== free / df before cargo test ==="
+            free -h
+            df -h
+          fi
           cd src-tauri
           cargo test --verbose
+        shell: bash
 
       - name: Build Tauri app (development)
         run: pnpm run tauri build -- --debug
