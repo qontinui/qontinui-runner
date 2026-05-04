@@ -120,12 +120,25 @@ jobs:
           cd src-tauri
           cargo clippy -- -D warnings
 
-      - name: Run Rust tests
-        # Accessibility integration tests that require a real desktop session are
-        # skipped in CI. Only pure unit tests (no system dependencies) run here.
+      # DIAGNOSTIC SPLIT (revert before merge): the Ubuntu leg's `Run Rust
+      # tests` step in CI run 25300119476 produced zero log output for 62 min
+      # before being killed. Splitting compile from execution discriminates
+      # between a `cargo test` build/link hang and a runtime test deadlock —
+      # whichever step times out names the phase. See
+      # qontinui-dev-notes/ubuntu-rust-test-hang/SESSION_PROMPT.md.
+      - name: Compile Rust tests (diagnostic)
         run: |
           cd src-tauri
-          cargo test --verbose
+          cargo test --no-run --verbose
+
+      - name: Run Rust tests (diagnostic, single-threaded)
+        # Accessibility integration tests that require a real desktop session are
+        # skipped in CI. Only pure unit tests (no system dependencies) run here.
+        # `--test-threads=1` orders output so the last test name printed before
+        # any stall identifies the offending test.
+        run: |
+          cd src-tauri
+          cargo test --verbose -- --test-threads=1 --nocapture
 
       - name: Build Tauri app (development)
         run: pnpm run tauri build -- --debug
