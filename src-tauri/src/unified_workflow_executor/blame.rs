@@ -455,7 +455,7 @@ fn detect_oscillating_files(accumulated_diffs: &[IterationDiff]) -> Vec<Oscillat
         }
     }
 
-    oscillating.sort_by(|a, b| b.consecutive_blames.cmp(&a.consecutive_blames));
+    oscillating.sort_by_key(|o| std::cmp::Reverse(o.consecutive_blames));
     oscillating
 }
 

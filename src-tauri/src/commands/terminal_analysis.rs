@@ -566,7 +566,7 @@ pub fn get_latest_plan_content() -> Result<CommandResponse, String> {
     }
 
     // Sort newest first
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
     let (_, best_path) = &candidates[0];
 
     let filename = best_path

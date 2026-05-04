@@ -6058,6 +6058,7 @@ dependencies = [
  "jsonpath-rust",
  "jsonschema",
  "keyring",
+ "libc",
  "libloading 0.8.9",
  "lru",
  "mdns-sd 0.11.5",

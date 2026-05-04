@@ -200,8 +200,13 @@ export default defineConfig({
     target: (() => {
       const tauriPlatform = process.env.TAURI_PLATFORM;
       if (tauriPlatform === "windows") return "chrome105";
-      if (tauriPlatform === "darwin") return "safari13";
-      return process.platform === "darwin" ? "safari13" : "chrome105";
+      // macOS / Linux: WebKit on Tauri 2.5+ supports es2022. Bundled deps
+      // (e.g. @qontinui/ui-bridge transitively) use newer ES syntax (async
+      // destructuring with rename) that esbuild can't transpile down to
+      // safari13/14 — those targets hard-error with 7000+ destructuring
+      // errors during the build.
+      if (tauriPlatform === "darwin") return "es2022";
+      return process.platform === "darwin" ? "es2022" : "chrome105";
     })(),
     // don't minify for debug builds
     minify: !process.env.TAURI_DEBUG ? "esbuild" : false,

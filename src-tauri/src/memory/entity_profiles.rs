@@ -59,7 +59,7 @@ pub async fn generate_entity_profile(
 
     // Sort topics by frequency, take top 5
     let mut topics: Vec<(String, usize)> = topic_counts.into_iter().collect();
-    topics.sort_by(|a, b| b.1.cmp(&a.1));
+    topics.sort_by_key(|t| std::cmp::Reverse(t.1));
     let top_topics: Vec<String> = topics.iter().take(5).map(|(t, _)| t.clone()).collect();
 
     // 3. Search findings related to this entity (with title + status for LLM context)

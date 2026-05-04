@@ -140,6 +140,12 @@ tree-sitter-rust = "0.23"
 streaming-iterator = "0.1"  # For iterating over tree-sitter query matches
 syn = { version = "2.0", features = ["full", "parsing", "visit"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
+# Cross-platform: imported from non-cfg-gated source files. Previously
+# misplaced under [target.'cfg(windows)'.dependencies], which broke
+# Linux + macOS builds.
+walkdir = "2.5"
+glob-match = "0.2"
+jsonpath-rust = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -162,10 +168,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-core = "0.58"
-walkdir = "2.5"
-glob-match = "0.2"
-jsonpath-rust = "1"
-libloading = "0.8"
+libloading = "0.8"  # JAB adapter (Windows-only) loads WindowsAccessBridge-64.dll
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
@@ -174,6 +177,9 @@ core-foundation-sys = "0.8"
 [target.'cfg(target_os = "linux")'.dependencies]
 atspi = "0.22"
 zbus = "4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"  # SIGTERM/SIGKILL via libc::kill in cfg(not(windows)) blocks
 
 [features]
 default = ["restate"]
@@ -249,6 +255,5 @@ regex_creation_in_loops = "allow"
 [dev-dependencies]
 tempfile = "3"
 
-[profile.dev]
-debug = 0  # No debug info — prevents LLVM OOM during linking
-split-debuginfo = "packed"
+## Profile overrides moved to the workspace root Cargo.toml — cargo
+## ignores [profile.*] in package manifests when a workspace exists.

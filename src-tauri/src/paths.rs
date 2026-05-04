@@ -459,7 +459,12 @@ mod tests {
 
     #[test]
     fn test_check_path_containment_passes_for_subdirectory() {
-        let boundary = PathBuf::from(if cfg!(windows) { "C:\\Users" } else { "/home" });
+        // Use tempdir + canonicalize so the boundary matches what
+        // check_path_containment derives. On macOS /tmp is a symlink to
+        // /private/tmp, which trips the starts_with comparison if only one
+        // of the two paths is canonicalized.
+        let boundary = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp_dir should exist and be canonicalizable");
         let child = boundary.join("test").join("subdir");
         let result = check_path_containment(&child, &boundary, "test/subdir");
         assert!(result.is_ok(), "Subdirectory should pass containment check");

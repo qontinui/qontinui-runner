@@ -359,7 +359,7 @@ impl KnowledgeGraph {
                 (key.clone(), in_deg + out_deg)
             })
             .collect();
-        degree_list.sort_by(|a, b| b.1.cmp(&a.1));
+        degree_list.sort_by_key(|d| std::cmp::Reverse(d.1));
         degree_list.truncate(10);
 
         GraphSummary {

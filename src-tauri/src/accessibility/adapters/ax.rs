@@ -451,7 +451,7 @@ fn build_tree(
     }
 
     // Recurse into children unless we hit max_depth
-    let children = if max_depth.map_or(true, |md| depth < md) {
+    let children = if max_depth.is_none_or(|md| depth < md) {
         let child_refs = ax_children(element);
         let mut child_nodes = Vec::with_capacity(child_refs.len());
         for child_ref in child_refs {
@@ -639,6 +639,12 @@ pub struct AxAdapter {
     connected: Arc<AtomicBool>,
     /// Handle table mapping u64 -> retained AXUIElementRef.
     handles: Arc<HandleTable>,
+}
+
+impl Default for AxAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AxAdapter {
