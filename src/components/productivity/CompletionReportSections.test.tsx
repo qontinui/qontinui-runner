@@ -285,10 +285,11 @@ describe("manual-fire HTTP wire shape", () => {
    * The `ManualFireForm.handleSubmit` handler is private to the React
    * component. To verify the wire shape without a DOM, we replicate the
    * request body the form would send and confirm `fetch` is called with
-   * `task_id` + `completion_report` keys (snake_case to match the Rust
-   * handler shape at `mcp/completion_sources.rs`).
+   * `taskId` + `completionReport` keys (camelCase — the Rust
+   * `ManualUserFireBody` is `#[serde(rename_all = "camelCase")]` at
+   * `mcp/completion_sources.rs`, so snake_case keys would 422).
    */
-  it("posts {task_id, completion_report} to /completion-sources/manual-user-fire", async () => {
+  it("posts {taskId, completionReport} to /completion-sources/manual-user-fire", async () => {
     const port = 8080;
     const taskId = "11111111-1111-1111-1111-111111111111";
     const draft: DraftState = {
@@ -302,8 +303,8 @@ describe("manual-fire HTTP wire shape", () => {
       ],
     };
     const body = {
-      task_id: taskId,
-      completion_report: buildReportFromDraft(draft),
+      taskId,
+      completionReport: buildReportFromDraft(draft),
     };
 
     const res = await fetch(`http://localhost:${port}/completion-sources/manual-user-fire`, {
@@ -319,9 +320,11 @@ describe("manual-fire HTTP wire shape", () => {
     const sentInit = init as RequestInit;
     expect(sentInit.method).toBe("POST");
     const sentBody = JSON.parse(sentInit.body as string);
-    expect(sentBody.task_id).toBe(taskId);
-    expect(sentBody.completion_report.summaryMd).toBe("Manually fired completion");
-    expect(sentBody.completion_report.deliverables).toHaveLength(1);
-    expect(sentBody.completion_report.followUps).toHaveLength(1);
+    expect(sentBody).not.toHaveProperty("task_id");
+    expect(sentBody).not.toHaveProperty("completion_report");
+    expect(sentBody.taskId).toBe(taskId);
+    expect(sentBody.completionReport.summaryMd).toBe("Manually fired completion");
+    expect(sentBody.completionReport.deliverables).toHaveLength(1);
+    expect(sentBody.completionReport.followUps).toHaveLength(1);
   });
 });

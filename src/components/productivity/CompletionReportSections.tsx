@@ -636,8 +636,8 @@ export function ManualFireForm({ detail, onFired }: ManualFireFormProps) {
       const port = await invoke<number>("get_api_port");
       if (!port || port <= 0) throw new Error(`invalid runner port: ${port}`);
       const body = {
-        task_id: taskId,
-        completion_report: buildReportFromDraft(draft),
+        taskId,
+        completionReport: buildReportFromDraft(draft),
       };
       const res = await fetch(`http://localhost:${port}/completion-sources/manual-user-fire`, {
         method: "POST",
@@ -657,6 +657,18 @@ export function ManualFireForm({ detail, onFired }: ManualFireFormProps) {
       setSubmitting(false);
     }
   }, [draft, taskId, onFired]);
+
+  // Hide entirely for `done` tasks — the manual-fire path force-flips to
+  // `done` and overwrites any existing completion_report (the Rust handler
+  // is by-design idempotent on done). Plan §5: the form is for tasks
+  // "awaiting an external event whose adapter doesn't exist", not for
+  // amending finalized work. To correct a wrong report on a done task,
+  // edit `coord.tasks.completion_report` directly via SQL or extend this
+  // form with an explicit "override existing report" affordance. Placed
+  // here (after all hooks) to satisfy react-hooks/rules-of-hooks.
+  if (detail.task.status === "done") {
+    return null;
+  }
 
   const ToggleIcon = expanded ? ChevronDown : ChevronRight;
 

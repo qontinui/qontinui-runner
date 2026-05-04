@@ -47,6 +47,7 @@ use tracing::{debug, info, warn};
 
 use crate::ai_provider::oneshot::{OneshotError, OneshotLlm, OneshotLlmExt};
 use crate::database::pg::completion_reports::{CompletionReport, CompletionSource};
+use crate::database::pg::coordinator_decisions::InsertCoordinatorDecisionInput;
 use crate::database::pg::reviews::InsertReviewInput;
 use crate::database::pg::PgDb;
 
@@ -395,12 +396,37 @@ pub async fn auto_review_in_product(
             Err(e) => {
                 // Don't fail the whole review on attestation write failure —
                 // the review row already landed; surface the failure as a
-                // warning so it shows in logs but the verdict still
-                // returns to the caller.
+                // warning so it shows in logs AND insert a coordinator_decisions
+                // audit row so the dashboard's decision log surfaces it.
+                // Without this, the worker self-report stays canonical and
+                // there's no path back from logs to user attention. Per plan §3
+                // "reviewer attestation supersedes worker self-report" — when
+                // supersession can't happen, the user needs to know.
                 warn!(
                     "auto_review: failed to persist reviewer attestation for task {}: {}",
                     task_id, e
                 );
+                let reasoning = format!(
+                    "Reviewer LLM emitted a completionReport but write_completion_report rejected it: {}. \
+                     Worker self-report (if any) remains canonical. Either edit and resubmit via the \
+                     dashboard's manual-fire form, or accept the worker's self-report as-is.",
+                    e
+                );
+                let audit = InsertCoordinatorDecisionInput {
+                    session_id: reviewer_session_id,
+                    iteration: 0,
+                    rule: "REVIEWER_ATTESTATION_FAILURE",
+                    action: "reviewer-attestation-rejected",
+                    target_id: Some(task_id),
+                    reasoning: &reasoning,
+                    auto_acted: false,
+                };
+                if let Err(audit_err) = pg.insert_coordinator_decision(&audit).await {
+                    warn!(
+                        "auto_review: failed to insert REVIEWER_ATTESTATION_FAILURE audit row for {}: {}",
+                        task_id, audit_err
+                    );
+                }
             }
         }
     }

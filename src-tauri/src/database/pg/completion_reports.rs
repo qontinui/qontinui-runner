@@ -873,6 +873,13 @@ impl PgDb {
     /// responsibility for atomicity (WHERE status = $2) and skips the
     /// validator.
     ///
+    /// When `to = "pending"` this also clears `assigned_session_id`. The
+    /// schema invariant is that `assigned_session_id` is only set for
+    /// `assigned`/`running`/`review`/`needs_fix`; leaving the prior worker's
+    /// session id behind on a `pending` row contradicts that invariant and
+    /// makes Rule B's eventual reassignment look like an idempotent no-op
+    /// against the stale id.
+    ///
     /// Intentionally narrow: only used for the worker-added-dependency drop
     /// back to `pending`. Callers passing arbitrary transitions through this
     /// helper invalidate the state-machine invariant.
@@ -888,16 +895,25 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let sql = if to == "pending" {
+            r#"
+            UPDATE coord.tasks
+            SET status = $3,
+                assigned_session_id = NULL,
+                updated_at = NOW()
+            WHERE id = $1::uuid AND status = $2
+            "#
+        } else {
+            r#"
+            UPDATE coord.tasks
+            SET status = $3,
+                updated_at = NOW()
+            WHERE id = $1::uuid AND status = $2
+            "#
+        };
+
         let n = conn
-            .execute(
-                r#"
-                UPDATE coord.tasks
-                SET status = $3,
-                    updated_at = NOW()
-                WHERE id = $1::uuid AND status = $2
-                "#,
-                &[&task_id, &from, &to],
-            )
+            .execute(sql, &[&task_id, &from, &to])
             .await
             .map_err(|e| format!("transition_task_status_unchecked: {}", e))?;
 
