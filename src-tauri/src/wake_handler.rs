@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn detects_deep_link_args_from_argv() {
-        let argv = vec![
+        let argv = [
             "C:\\path\\to\\runner.exe".to_string(),
             "qontinui://wake?intent=abc".to_string(),
             "--unrelated-flag".to_string(),
