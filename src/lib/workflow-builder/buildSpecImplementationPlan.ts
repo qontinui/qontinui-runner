@@ -17,6 +17,20 @@ import type { SpecDiff } from "../spec-diff";
 // Assertion types that map to deterministic ui_check verifications
 const DETERMINISTIC_TYPES = new Set(["exists", "contains", "visible", "not_exists"]);
 
+/**
+ * Extract `target.criteria` from any spec target shape, returning null if
+ * the shape doesn't supply criteria. Mirrors the helper in buildSpecWorkflow.ts.
+ */
+function getTargetCriteria(target: unknown): Record<string, unknown> | null {
+  if (!target || typeof target !== "object") return null;
+  const t = target as Record<string, unknown>;
+  const criteria = t.criteria;
+  if (criteria && typeof criteria === "object") {
+    return criteria as Record<string, unknown>;
+  }
+  return null;
+}
+
 export interface SpecImplementationPlanInput {
   /** The spec configuration to build the plan from */
   specConfig: SpecConfig;
@@ -92,7 +106,7 @@ export function buildSpecImplementationPlan(input: SpecImplementationPlanInput):
   // Final integration phase: compile + all assertions
   const allAssertions = selectedGroups.flatMap((g) => g.assertions.filter((a) => a.enabled));
   const allUiChecks = allAssertions
-    .filter((a) => DETERMINISTIC_TYPES.has(a.assertionType ?? "exists") && a.target?.criteria)
+    .filter((a) => DETERMINISTIC_TYPES.has(a.assertionType ?? "exists") && getTargetCriteria(a.target))
     .map((a) => assertionToUiCheck(a));
 
   if (allUiChecks.length > 0) {
@@ -230,10 +244,10 @@ function buildTasksFromGroup(
 
   // Group deterministic assertions into one ui_check task
   const deterministic = enabledAssertions.filter(
-    (a) => DETERMINISTIC_TYPES.has(a.assertionType ?? "exists") && a.target?.criteria,
+    (a) => DETERMINISTIC_TYPES.has(a.assertionType ?? "exists") && getTargetCriteria(a.target),
   );
   const aiRequired = enabledAssertions.filter(
-    (a) => !DETERMINISTIC_TYPES.has(a.assertionType ?? "exists") || !a.target?.criteria,
+    (a) => !DETERMINISTIC_TYPES.has(a.assertionType ?? "exists") || !getTargetCriteria(a.target),
   );
 
   if (deterministic.length > 0) {
@@ -274,8 +288,8 @@ function assertionToUiCheck(a: SpecAssertion): UiCheckAssertion {
     description: a.description,
     assertionType:
       (a.assertionType as "exists" | "contains" | "visible" | "not_exists") ?? "exists",
-    criteria: (a.target?.criteria as Record<string, unknown>) ?? {},
-    expected: a.expected,
+    criteria: getTargetCriteria(a.target) ?? {},
+    expected: a.expected as string | undefined,
     severity: a.severity,
   };
 }

@@ -4,7 +4,7 @@ import type { SpecConfig } from "../buildSpecWorkflow";
 
 describe("buildSpecBrief", () => {
   it("partitions assertions into deterministic vs semantic and preserves setupHints", () => {
-    const specConfig: SpecConfig = {
+    const specConfig = {
       version: "1",
       description: "test spec",
       groups: [
@@ -40,7 +40,7 @@ describe("buildSpecBrief", () => {
       ],
     };
 
-    const brief = buildSpecBrief({ specConfig });
+    const brief = buildSpecBrief({ specConfig: specConfig as unknown as SpecConfig });
 
     expect(brief.version).toBe("1");
     expect(brief.elementSource).toBe("control");
@@ -67,7 +67,7 @@ describe("buildSpecBrief", () => {
 
   describe("targetStateId resolution", () => {
     it("maps precondition to a matching state by name", () => {
-      const specConfig: SpecConfig = {
+      const specConfig = {
         version: "1",
         description: "test spec",
         groups: [
@@ -112,12 +112,12 @@ describe("buildSpecBrief", () => {
         },
       };
 
-      const brief = buildSpecBrief({ specConfig });
+      const brief = buildSpecBrief({ specConfig: specConfig as unknown as SpecConfig });
       expect(brief.groups[0].targetStateId).toBe("findings-panel");
     });
 
     it("resolves via id-token fallback when name does not match", () => {
-      const specConfig: SpecConfig = {
+      const specConfig = {
         version: "1",
         description: "test spec",
         groups: [
@@ -154,12 +154,12 @@ describe("buildSpecBrief", () => {
         },
       };
 
-      const brief = buildSpecBrief({ specConfig });
+      const brief = buildSpecBrief({ specConfig: specConfig as unknown as SpecConfig });
       expect(brief.groups[0].targetStateId).toBe("findings-panel");
     });
 
     it("leaves targetStateId undefined when no state matches", () => {
-      const specConfig: SpecConfig = {
+      const specConfig = {
         version: "1",
         description: "test spec",
         groups: [
@@ -195,12 +195,12 @@ describe("buildSpecBrief", () => {
         },
       };
 
-      const brief = buildSpecBrief({ specConfig });
+      const brief = buildSpecBrief({ specConfig: specConfig as unknown as SpecConfig });
       expect(brief.groups[0].targetStateId).toBeUndefined();
     });
 
     it("leaves targetStateId undefined when spec has no stateMachine", () => {
-      const specConfig: SpecConfig = {
+      const specConfig = {
         version: "1",
         description: "test spec",
         groups: [
@@ -226,7 +226,7 @@ describe("buildSpecBrief", () => {
         // stateMachine intentionally absent (older specs)
       };
 
-      const brief = buildSpecBrief({ specConfig });
+      const brief = buildSpecBrief({ specConfig: specConfig as unknown as SpecConfig });
       expect(brief.groups[0].targetStateId).toBeUndefined();
     });
   });

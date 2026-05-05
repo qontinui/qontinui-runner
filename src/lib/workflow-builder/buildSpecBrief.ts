@@ -51,7 +51,7 @@ function capitalize(word: string): string {
  * Tolerant of shape drift — accepts any string at `assertion.precondition`.
  */
 function readAssertionPrecondition(assertion: SpecAssertion): string | undefined {
-  const raw = (assertion as Record<string, unknown>).precondition;
+  const raw = assertion.precondition;
   if (typeof raw === "string" && raw.trim().length > 0) {
     return raw.trim();
   }

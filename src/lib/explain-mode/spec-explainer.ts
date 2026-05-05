@@ -4,27 +4,11 @@
  * the AI-generated explanations with context about what UI elements do.
  */
 
+import type { SpecConfig } from "@qontinui/ui-bridge/specs";
+
 interface SpecStore {
   getAll(): Array<{ specId: string; config: SpecConfig }>;
   get(specId: string): SpecConfig | undefined;
-}
-
-interface SpecConfig {
-  description?: string;
-  groups: SpecGroup[];
-}
-
-interface SpecGroup {
-  id: string;
-  name: string;
-  description: string;
-  assertions: SpecAssertion[];
-}
-
-interface SpecAssertion {
-  id: string;
-  description: string;
-  target: { type: string; elementId?: string; logicalName?: string; label?: string };
 }
 
 function getSpecStore(): SpecStore | null {
@@ -49,7 +33,11 @@ export function findSpecDescription(targetName: string): string | null {
   for (const { config } of allSpecs) {
     for (const group of config.groups) {
       for (const assertion of group.assertions) {
-        const label = assertion.target.label ?? assertion.target.logicalName ?? "";
+        const target = assertion.target;
+        const label =
+          target.label ??
+          (target.type === "ctr" ? target.logicalName : undefined) ??
+          "";
         if (label.toLowerCase().includes(targetName.toLowerCase())) {
           return assertion.description;
         }

@@ -12,9 +12,9 @@
 use serde_json::{json, Map, Value};
 
 use super::types::{
-    IrDocument, IrElementCriteria, IrState, IrTransition, IrTransitionAction, LegacyAssertion,
-    LegacyAssertionTarget, LegacyGroup, LegacyProcessStep, LegacySpec, LegacyStateMachine,
-    LegacyStateMachineState, LegacyTransition,
+    IrAssertion, IrDocument, IrElementCriteria, IrGroup, IrState, IrTransition, IrTransitionAction,
+    LegacyAssertion, LegacyAssertionTarget, LegacyGroup, LegacyProcessStep, LegacySpec,
+    LegacyStateMachine, LegacyStateMachineState, LegacyTransition,
 };
 
 /// Recursively sort object keys lexicographically. Arrays preserve input
@@ -149,6 +149,50 @@ fn build_group(state: &IrState) -> LegacyGroup {
     }
 }
 
+/// Convert an `IrAssertion` (synthesis-produced) into the legacy assertion
+/// shape. Mirrors the TS `synthesizedAssertionToLegacy` helper. The criteria
+/// pass through verbatim — `LegacyAssertionTarget.criteria` is already
+/// `serde_json::Value`, so no re-shaping happens.
+fn synthesized_assertion_to_legacy(assertion: &IrAssertion) -> LegacyAssertion {
+    LegacyAssertion {
+        id: assertion.id.clone(),
+        description: assertion.description.clone(),
+        category: assertion.category.clone(),
+        severity: assertion.severity.clone(),
+        assertion_type: assertion.assertion_type.clone(),
+        target: LegacyAssertionTarget {
+            kind: assertion.target.kind.clone(),
+            criteria: assertion.target.criteria.clone(),
+            label: assertion.target.label.clone(),
+        },
+        source: assertion.source.clone(),
+        reviewed: assertion.reviewed,
+        enabled: assertion.enabled,
+        precondition: assertion.precondition.clone(),
+    }
+}
+
+/// Convert a synthesized `IrGroup` into a `LegacyGroup`. Mirrors the TS
+/// `synthesizedGroupToLegacy` helper. Falls back to `"ai-generated"` for the
+/// rare case where the IR group omits `source`.
+fn synthesized_group_to_legacy(group: &IrGroup) -> LegacyGroup {
+    LegacyGroup {
+        id: group.id.clone(),
+        name: group.name.clone(),
+        description: group.description.clone(),
+        category: group.category.clone(),
+        assertions: group
+            .assertions
+            .iter()
+            .map(synthesized_assertion_to_legacy)
+            .collect(),
+        source: group
+            .source
+            .clone()
+            .unwrap_or_else(|| "ai-generated".to_string()),
+    }
+}
+
 fn build_process_step(action: &IrTransitionAction) -> LegacyProcessStep {
     LegacyProcessStep {
         action: action.kind.clone(),
@@ -227,7 +271,14 @@ pub fn project_ir_to_bundled_page(doc: &IrDocument, notes: Option<&str>) -> Valu
         }
     }
 
-    let groups: Vec<LegacyGroup> = doc.states.iter().map(build_group).collect();
+    let mut groups: Vec<LegacyGroup> = doc.states.iter().map(build_group).collect();
+    if let Some(synth) = &doc.synthesized_groups {
+        // Append synthesis-produced groups AFTER state-derived ones, in
+        // declared order. Byte-stable output requires this exact ordering.
+        for g in synth {
+            groups.push(synthesized_group_to_legacy(g));
+        }
+    }
     let sm_states: Vec<LegacyStateMachineState> = doc
         .states
         .iter()

@@ -839,11 +839,18 @@ pub fn classify_spec_target(criteria: &AcceptanceCriteria, description: &str) ->
     }
 }
 
-/// Write a group to a page's projection, replacing any existing group with
-/// the same ID. Reads + writes through the Spec API storage helpers so the
-/// projection lives at `<specs_root>/pages/<page_id>/spec.uibridge.json`.
+/// Write a synthesized group to a page's IR (`synthesized_groups`), replacing
+/// any existing group with the same ID. Reads + writes through the Spec API
+/// storage helpers so the IR lives at
+/// `<specs_root>/pages/<page_id>/state-machine.derived.json`. The projection
+/// (`spec.uibridge.json`) is regenerated automatically by
+/// `write_ir_and_regenerate`, so the synthesized group survives any future
+/// IR write without the IR/projection desync that the legacy direct-write
+/// path suffered from (ADR-013.5).
 ///
-/// Returns the absolute path of the written projection on success.
+/// Returns the absolute path of the written projection on success (the IR
+/// write happens too — the path returned matches the projection so the caller's
+/// `result.updated_paths` keeps the same external behavior).
 fn write_group_to_page_projection(
     specs_root: &std::path::Path,
     page_id: &str,
@@ -851,45 +858,41 @@ fn write_group_to_page_projection(
     group_id: &str,
     criteria_count: usize,
 ) -> Result<std::path::PathBuf, String> {
-    let mut spec_json = match crate::spec_api::storage::read_projection(specs_root, page_id)? {
-        Some(v) => v,
-        None => return Err(format!("Page '{}' has no projection to update", page_id)),
+    use crate::spec_api::types::IrGroup;
+
+    let mut ir = match crate::spec_api::storage::read_ir(specs_root, page_id)? {
+        Some(doc) => doc,
+        None => {
+            return Err(format!(
+                "Page '{}' has no IR document — synthesis cannot write to a projection-only page",
+                page_id
+            ))
+        }
     };
 
-    // Replace existing group if present
-    if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
-        let had_group = groups.len();
-        groups.retain(|g| g.get("id").and_then(|v| v.as_str()) != Some(group_id));
-        if groups.len() < had_group {
-            debug!(
-                "Page '{}' had existing group '{}', replacing",
-                page_id, group_id
-            );
-        }
-    }
+    // Deserialize the synthesized group JSON into the typed `IrGroup`. The
+    // JSON shape is built by `criteria_to_spec_group` to match the legacy
+    // group shape one-to-one; `IrGroup` mirrors the same fields.
+    let new_group: IrGroup = serde_json::from_value(group.clone())
+        .map_err(|e| format!("synthesized group not valid IrGroup shape: {}", e))?;
 
-    // Append the new group
-    if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
-        groups.push(group.clone());
-    } else {
-        spec_json["groups"] = json!([group.clone()]);
-    }
-
-    // Update metadata.updatedAt
-    if let Some(metadata) = spec_json
-        .get_mut("metadata")
-        .and_then(|m| m.as_object_mut())
-    {
-        metadata.insert(
-            "updatedAt".to_string(),
-            json!(chrono::Utc::now().to_rfc3339()),
+    // Replace existing synthesized group with the same id, or append.
+    let mut groups = ir.synthesized_groups.take().unwrap_or_default();
+    let prev_len = groups.len();
+    groups.retain(|g| g.id != group_id);
+    if groups.len() < prev_len {
+        debug!(
+            "Page '{}' had existing synthesized group '{}', replacing",
+            page_id, group_id
         );
     }
+    groups.push(new_group);
+    ir.synthesized_groups = Some(groups);
 
-    let written = crate::spec_api::storage::write_projection(specs_root, page_id, &spec_json)?;
+    let written = crate::spec_api::storage::write_ir_and_regenerate(specs_root, &ir)?;
 
     info!(
-        "Updated projection for page '{}' with {} acceptance criteria",
+        "Updated IR for page '{}' with {} acceptance criteria (projection regenerated)",
         page_id, criteria_count,
     );
 
@@ -907,10 +910,10 @@ fn write_group_to_page_projection(
 /// catch-all `workflow-criteria` page. Tooling/ops prompts are skipped
 /// entirely.
 ///
-/// Note: this function writes only the projection (`spec.uibridge.json`).
-/// The IR (`state-machine.derived.json`) is left untouched because the IR
-/// has no `groups` shape yet — see ADR-013.5 for the IR/projection desync
-/// caveat.
+/// The synthesized group is appended to the IR's `synthesized_groups` field
+/// and persisted via `write_ir_and_regenerate`, so the projection (still the
+/// runtime contract) is regenerated atomically. The IR/projection desync
+/// caveat from ADR-013.5 no longer applies.
 pub fn update_page_specs_from_criteria(
     criteria: &AcceptanceCriteria,
     description: &str,
@@ -1464,16 +1467,60 @@ mod tests {
         assert!(score > 0.2, "Expected score > 0.2, got {}", score);
     }
 
-    /// Helper: write a page projection at
-    /// `<root>/pages/<page_id>/spec.uibridge.json` and return its path.
-    fn write_test_projection(root: &std::path::Path, page_id: &str, content: &Value) {
-        let page_dir = root.join("pages").join(page_id);
-        std::fs::create_dir_all(&page_dir).unwrap();
-        std::fs::write(
-            page_dir.join("spec.uibridge.json"),
-            serde_json::to_string_pretty(content).unwrap(),
-        )
-        .unwrap();
+    /// Helper: write a minimal IR document for a page and let
+    /// `write_ir_and_regenerate` derive the projection. This matches what
+    /// production does (the IR is the source of truth — see ADR-013.5) and
+    /// keeps the test fixtures honest about the storage contract.
+    ///
+    /// `existing_synthesized_groups` lets a test seed pre-existing synthesized
+    /// groups (e.g. an old `wf-acceptance-criteria` group that should be
+    /// replaced, or an unrelated group that should survive an append).
+    fn write_test_ir(
+        root: &std::path::Path,
+        page_id: &str,
+        description: &str,
+        purpose: Option<&str>,
+        tags: Option<Vec<&str>>,
+        existing_synthesized_groups: Vec<Value>,
+    ) {
+        use crate::spec_api::types::{IrDocument, IrGroup, IrMetadata};
+
+        let metadata = if purpose.is_some() || tags.is_some() {
+            Some(IrMetadata {
+                description: None,
+                purpose: purpose.map(|p| p.to_string()),
+                tags: tags.map(|ts| ts.into_iter().map(|t| t.to_string()).collect()),
+                related_elements: None,
+                notes: None,
+            })
+        } else {
+            None
+        };
+
+        let synthesized_groups: Vec<IrGroup> = existing_synthesized_groups
+            .into_iter()
+            .map(|v| serde_json::from_value(v).expect("synthesized group fixture must parse"))
+            .collect();
+
+        let doc = IrDocument {
+            version: "1.0".to_string(),
+            id: page_id.to_string(),
+            name: page_id.to_string(),
+            description: Some(description.to_string()),
+            metadata,
+            provenance: None,
+            states: vec![],
+            transitions: vec![],
+            synthesized_groups: if synthesized_groups.is_empty() {
+                None
+            } else {
+                Some(synthesized_groups)
+            },
+            initial_state: None,
+        };
+
+        crate::spec_api::storage::write_ir_and_regenerate(root, &doc)
+            .expect("write_ir_and_regenerate must succeed for fixture");
     }
 
     fn projection_path(root: &std::path::Path, page_id: &str) -> std::path::PathBuf {
@@ -1485,26 +1532,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spec_path = projection_path(dir.path(), "settings");
 
-        let spec_content = json!({
-            "version": "1.0.0",
-            "description": "Settings page with dark mode toggle",
-            "metadata": {
-                "pageUrl": "/settings",
-                "component": "SettingsPage",
-                "tags": ["dark-mode", "settings"]
-            },
-            "groups": [
-                {
-                    "id": "existing-group",
-                    "name": "Existing",
-                    "description": "Existing tests",
-                    "category": "element-presence",
-                    "assertions": [],
-                    "source": "manual"
-                }
-            ]
+        // Pre-existing synthesized group on the page — survives the append.
+        let existing_group = json!({
+            "id": "existing-group",
+            "name": "Existing",
+            "description": "Existing tests",
+            "category": "element-presence",
+            "assertions": [],
+            "source": "manual"
         });
-        write_test_projection(dir.path(), "settings", &spec_content);
+        write_test_ir(
+            dir.path(),
+            "settings",
+            "Settings page with dark mode toggle",
+            Some("SettingsPage"),
+            Some(vec!["dark-mode", "settings"]),
+            vec![existing_group],
+        );
 
         let criteria = AcceptanceCriteria {
             goal_summary: "Dark mode settings toggle works".to_string(),
@@ -1531,7 +1575,9 @@ mod tests {
         assert_eq!(result.specs_updated, 1);
         assert!(result.errors.is_empty());
 
-        // Verify the file was updated
+        // Verify the projection (regenerated by write_ir_and_regenerate) was
+        // updated. The existing synthesized group survives; the new
+        // wf-acceptance-criteria group is appended after.
         let updated: Value =
             serde_json::from_str(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
         let groups = updated["groups"].as_array().unwrap();
@@ -1545,22 +1591,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spec_path = projection_path(dir.path(), "settings");
 
-        let spec_content = json!({
-            "version": "1.0.0",
-            "description": "Settings page",
-            "metadata": { "pageUrl": "/settings", "tags": ["settings"] },
-            "groups": [
-                {
-                    "id": "wf-acceptance-criteria",
-                    "name": "Already exists",
-                    "description": "Previous criteria",
-                    "category": "semantic",
-                    "assertions": [{"id": "old-assertion"}],
-                    "source": "ai-generated"
-                }
-            ]
+        // Pre-existing synthesized group with the same id as the new one —
+        // must be REPLACED on append (not duplicated).
+        let stale_group = json!({
+            "id": "wf-acceptance-criteria",
+            "name": "Already exists",
+            "description": "Previous criteria",
+            "category": "semantic",
+            "assertions": [{
+                "id": "old-assertion",
+                "description": "Old",
+                "category": "semantic",
+                "severity": "info",
+                "assertionType": "exists",
+                "target": { "type": "search", "criteria": {}, "label": "old" },
+                "source": "ai-generated",
+                "reviewed": false,
+                "enabled": true
+            }],
+            "source": "ai-generated"
         });
-        write_test_projection(dir.path(), "settings", &spec_content);
+        write_test_ir(
+            dir.path(),
+            "settings",
+            "Settings page",
+            None,
+            Some(vec!["settings"]),
+            vec![stale_group],
+        );
 
         let criteria = AcceptanceCriteria {
             goal_summary: "New goal".to_string(),
@@ -1601,13 +1659,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _spec_path = projection_path(dir.path(), "dashboard");
 
-        let spec_content = json!({
-            "version": "1.0.0",
-            "description": "Dashboard overview page",
-            "metadata": { "pageUrl": "/dashboard", "component": "Dashboard" },
-            "groups": []
-        });
-        write_test_projection(dir.path(), "dashboard", &spec_content);
+        write_test_ir(
+            dir.path(),
+            "dashboard",
+            "Dashboard overview page",
+            Some("Dashboard"),
+            None,
+            vec![],
+        );
 
         let criteria = AcceptanceCriteria {
             goal_summary: "Fix auth".to_string(),
@@ -1731,13 +1790,14 @@ mod tests {
     #[test]
     fn test_ops_skip_prevents_spec_update() {
         let dir = tempfile::tempdir().unwrap();
-        let spec_content = json!({
-            "version": "1.0.0",
-            "description": "Settings page",
-            "metadata": { "pageUrl": "/settings", "tags": ["settings"] },
-            "groups": []
-        });
-        write_test_projection(dir.path(), "settings", &spec_content);
+        write_test_ir(
+            dir.path(),
+            "settings",
+            "Settings page",
+            None,
+            Some(vec!["settings"]),
+            vec![],
+        );
 
         let criteria = AcceptanceCriteria {
             goal_summary: "Push succeeds".to_string(),
@@ -1770,13 +1830,14 @@ mod tests {
         let catchall_path = projection_path(dir.path(), "workflow-criteria");
 
         // Pre-create the catch-all page (as it would exist in the repo)
-        let catchall_spec = json!({
-            "version": "1.0.0",
-            "description": "Catch-all spec for workflow acceptance criteria",
-            "metadata": { "pageUrl": "/workflows", "tags": ["catch-all"] },
-            "groups": []
-        });
-        write_test_projection(dir.path(), "workflow-criteria", &catchall_spec);
+        write_test_ir(
+            dir.path(),
+            "workflow-criteria",
+            "Catch-all spec for workflow acceptance criteria",
+            None,
+            Some(vec!["catch-all"]),
+            vec![],
+        );
 
         let criteria = AcceptanceCriteria {
             goal_summary: "WAL checkpoint works".to_string(),

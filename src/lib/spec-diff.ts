@@ -169,16 +169,20 @@ function diffAssertion(oldA: SpecAssertion, newA: SpecAssertion): AssertionModif
   const fields = ["description", "assertionType", "severity", "enabled"] as const;
 
   for (const field of fields) {
-    const oldVal = String((oldA as Record<string, unknown>)[field] ?? "");
-    const newVal = String((newA as Record<string, unknown>)[field] ?? "");
+    const oldVal = String((oldA as unknown as Record<string, unknown>)[field] ?? "");
+    const newVal = String((newA as unknown as Record<string, unknown>)[field] ?? "");
     if (oldVal !== newVal) {
       mods.push({ id: newA.id, field, from: oldVal, to: newVal });
     }
   }
 
-  // Check target criteria changes
-  const oldCriteria = JSON.stringify(oldA.target?.criteria ?? {});
-  const newCriteria = JSON.stringify(newA.target?.criteria ?? {});
+  // Check target criteria changes — only the "search" target variant has criteria
+  const oldCriteria = JSON.stringify(
+    oldA.target.type === "search" ? oldA.target.criteria : {},
+  );
+  const newCriteria = JSON.stringify(
+    newA.target.type === "search" ? newA.target.criteria : {},
+  );
   if (oldCriteria !== newCriteria) {
     mods.push({ id: newA.id, field: "target.criteria", from: oldCriteria, to: newCriteria });
   }
