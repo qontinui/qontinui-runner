@@ -436,8 +436,10 @@ async fn build_upstream_reports_section(
         upstream_rows.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
 
         let total = upstream_rows.len();
-        let kept: Vec<&crate::database::pg::tasks::TaskRow> =
-            upstream_rows.iter().take(MAX_UPSTREAM_REPORTS_PER_TASK).collect();
+        let kept: Vec<&crate::database::pg::tasks::TaskRow> = upstream_rows
+            .iter()
+            .take(MAX_UPSTREAM_REPORTS_PER_TASK)
+            .collect();
 
         // Pull each upstream's completion_report.
         let mut rendered_upstreams: Vec<String> = Vec::new();

@@ -372,7 +372,8 @@ pub async fn auto_review_in_product(
     if let Some(mut report) = verdict.completion_report.clone() {
         match pg.get_completion_report(task_id).await {
             Ok(Some((existing, CompletionSource::SessionSelfReport))) => {
-                let existing_json = serde_json::to_value(&existing).unwrap_or(serde_json::json!(null));
+                let existing_json =
+                    serde_json::to_value(&existing).unwrap_or(serde_json::json!(null));
                 report
                     .artifacts
                     .insert("workerSelfReport".to_string(), existing_json);
@@ -457,7 +458,8 @@ pub async fn insert_disabled_stub_review(
             reviewed_session_id,
             verdict: "escalate",
             confidence: 0.0,
-            reasoning: "awaiting LLM provider — configure an LLM in Settings → AI to enable auto-review",
+            reasoning:
+                "awaiting LLM provider — configure an LLM in Settings → AI to enable auto-review",
             diff_summary: None,
             test_results: None,
         })
@@ -557,7 +559,9 @@ pub struct DiffSummary {
 }
 
 async fn inspect_diff(repo_path: &str, expected_claims: &[String]) -> DiffSummary {
-    let stat_text = run_git(repo_path, &["diff", "--stat"]).await.unwrap_or_default();
+    let stat_text = run_git(repo_path, &["diff", "--stat"])
+        .await
+        .unwrap_or_default();
     let (files_changed, lines_added, lines_removed) = parse_diff_stat(&stat_text);
 
     let mut diff_text = String::new();
@@ -704,7 +708,9 @@ async fn run_relevant_tests(repo_path: &str, touched: &[String]) -> TestResults 
     let touches_py = touched.iter().any(|p| p.ends_with(".py"));
 
     if touches_rust {
-        let manifest = PathBuf::from(repo_path).join("src-tauri").join("Cargo.toml");
+        let manifest = PathBuf::from(repo_path)
+            .join("src-tauri")
+            .join("Cargo.toml");
         match run_command_with_timeout(
             "cargo",
             &[
@@ -1141,11 +1147,7 @@ mod tests {
 
     #[test]
     fn scope_creep_returns_unclaimed_paths() {
-        let touched = vec![
-            "a.rs".to_string(),
-            "b.rs".to_string(),
-            "c.rs".to_string(),
-        ];
+        let touched = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
         let claims = vec!["a.rs".to_string(), "b.rs".to_string()];
         let creep = scope_creep_candidates(&touched, &claims);
         assert_eq!(creep, vec!["c.rs".to_string()]);
@@ -1242,7 +1244,10 @@ mod tests {
                 // non-fatal — the assertion is "we don't hang past the
                 // deadline".
             }
-            other => panic!("expected Timeout/SpawnError, got {:?}", outcome_kind(&other)),
+            other => panic!(
+                "expected Timeout/SpawnError, got {:?}",
+                outcome_kind(&other)
+            ),
         }
     }
 

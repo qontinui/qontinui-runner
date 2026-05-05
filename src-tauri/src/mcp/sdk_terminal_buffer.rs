@@ -257,12 +257,8 @@ pub async fn handle_terminal_search(
                     Json(api_error(format!("Grid lock poisoned: {}", e))),
                 )
             })?;
-            g.search(&q.q, q.regex).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(api_error(e.to_string())),
-                )
-            })?
+            g.search(&q.q, q.regex)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e.to_string()))))?
         };
         if !hits.is_empty() {
             total += hits.len();

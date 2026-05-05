@@ -123,10 +123,9 @@ impl std::fmt::Display for SummarizeError {
             SummarizeError::LlmDisabled => {
                 write!(f, "no LLM provider is configured (Settings → AI)")
             }
-            SummarizeError::LlmNoCredentials => write!(
-                f,
-                "the active LLM provider has no credentials configured"
-            ),
+            SummarizeError::LlmNoCredentials => {
+                write!(f, "the active LLM provider has no credentials configured")
+            }
             SummarizeError::LlmCallFailed(e) => write!(f, "LLM call failed: {}", e),
             SummarizeError::LlmSchemaParse(e) => {
                 write!(f, "LLM response did not match expected schema: {}", e)
@@ -564,7 +563,12 @@ mod tests {
     fn user_prompt_includes_verdict_for_each_failed_value() {
         for v in FAILED_VERDICTS {
             let prompt = build_user_prompt("t", v, "body");
-            assert!(prompt.contains(&format!("Verdict: {}", v)), "{}: {}", v, prompt);
+            assert!(
+                prompt.contains(&format!("Verdict: {}", v)),
+                "{}: {}",
+                v,
+                prompt
+            );
         }
     }
 
@@ -581,7 +585,12 @@ mod tests {
             .await
             .expect("typed call");
 
-        let captured = mock.last_user_prompt.lock().unwrap().clone().expect("captured");
+        let captured = mock
+            .last_user_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("captured");
         assert!(captured.contains("Verdict: escalate"), "{}", captured);
     }
 
@@ -619,7 +628,11 @@ mod tests {
         let err = SummarizeError::from(result.expect_err("schema mismatch"));
         match err {
             SummarizeError::LlmSchemaParse(msg) => {
-                assert!(msg.contains("deserialize") || msg.contains("missing"), "{}", msg);
+                assert!(
+                    msg.contains("deserialize") || msg.contains("missing"),
+                    "{}",
+                    msg
+                );
             }
             other => panic!("expected LlmSchemaParse, got {:?}", other),
         }

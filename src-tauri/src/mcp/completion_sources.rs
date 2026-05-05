@@ -94,11 +94,13 @@ async fn resolve_target_task(
         return pg
             .get_task_by_id(tid)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
-            .ok_or((
-                StatusCode::NOT_FOUND,
-                format!("task {} not found", tid),
-            ));
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("get_task: {}", e),
+                )
+            })?
+            .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", tid)));
     }
 
     // JSONB containment query — find tasks whose `completion_report.deliverables`
@@ -122,7 +124,12 @@ async fn resolve_target_task(
             &[&containment],
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("resolve_target_task: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("resolve_target_task: {}", e),
+            )
+        })?;
 
     let ids: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
     drop(conn);
@@ -135,7 +142,12 @@ async fn resolve_target_task(
         1 => pg
             .get_task_by_id(&ids[0])
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("get_task: {}", e),
+                )
+            })?
             .ok_or((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "task vanished after containment match".to_string(),
@@ -235,7 +247,12 @@ async fn github_merge(
     let reloaded = pg
         .get_task_by_id(&task.id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("get_task: {}", e),
+            )
+        })?
         .ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             "task disappeared after force-done".to_string(),
@@ -266,21 +283,30 @@ async fn manual_user_fire(
     let task = pg
         .get_task_by_id(&body.task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("get_task: {}", e),
+            )
+        })?
         .ok_or((
             StatusCode::NOT_FOUND,
             format!("task {} not found", body.task_id),
         ))?;
 
-    pg.write_completion_report(&task.id, &body.completion_report, CompletionSource::ManualUserFire)
-        .await
-        .map_err(|e| {
-            if e.starts_with("validation:") {
-                (StatusCode::BAD_REQUEST, e)
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, e)
-            }
-        })?;
+    pg.write_completion_report(
+        &task.id,
+        &body.completion_report,
+        CompletionSource::ManualUserFire,
+    )
+    .await
+    .map_err(|e| {
+        if e.starts_with("validation:") {
+            (StatusCode::BAD_REQUEST, e)
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })?;
 
     // Audit: coordinator_decisions row tagging this as an external trigger.
     // Reuses the same shape Phase 1's WORKER_ADDED_DEPENDENCY row used.
@@ -330,7 +356,12 @@ async fn manual_user_fire(
     let reloaded = pg
         .get_task_by_id(&task.id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("get_task: {}", e),
+            )
+        })?
         .ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             "task disappeared after force-done".to_string(),
@@ -461,10 +492,7 @@ pub fn parse_breaking_changes_from_pr_body(body: &str) -> Vec<BreakingChange> {
 ///   `[nice-to-have]`, capture priority and strip the prefix.
 /// - Both prefixes can stack — `[blocking][critical] foo` works.
 pub fn parse_follow_ups_from_pr_body(body: &str) -> Vec<FollowUp> {
-    let bullets = collect_section_bullets(
-        body,
-        &["Follow-ups", "Follow ups", "Followups"],
-    );
+    let bullets = collect_section_bullets(body, &["Follow-ups", "Follow ups", "Followups"]);
     bullets
         .into_iter()
         .map(|raw| {
@@ -520,7 +548,10 @@ pub fn parse_follow_ups_from_pr_body(body: &str) -> Vec<FollowUp> {
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/completion-sources/github-merge", post(github_merge))
-        .route("/completion-sources/manual-user-fire", post(manual_user_fire))
+        .route(
+            "/completion-sources/manual-user-fire",
+            post(manual_user_fire),
+        )
         .route("/completion-sources/ci-pipeline", post(ci_pipeline_stub))
 }
 
@@ -662,7 +693,8 @@ mod tests {
 
     #[test]
     fn follow_ups_blocking_and_priority_stack() {
-        let body = "## Follow-ups\n- [blocking][critical] urgent\n- [critical][blocking] also urgent\n";
+        let body =
+            "## Follow-ups\n- [blocking][critical] urgent\n- [critical][blocking] also urgent\n";
         let out = parse_follow_ups_from_pr_body(body);
         assert_eq!(out.len(), 2);
         assert!(out[0].blocking_for_dependents);

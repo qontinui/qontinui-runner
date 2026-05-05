@@ -496,8 +496,8 @@ impl Grid {
         }
         let mut hits = Vec::new();
         if regex {
-            let re = regex::Regex::new(needle)
-                .map_err(|e| SearchError::InvalidRegex(e.to_string()))?;
+            let re =
+                regex::Regex::new(needle).map_err(|e| SearchError::InvalidRegex(e.to_string()))?;
             for row in 0..self.rows {
                 let line = self.row_text(row);
                 if let Some(m) = re.find(&line) {

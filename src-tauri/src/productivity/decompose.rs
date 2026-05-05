@@ -114,10 +114,9 @@ impl std::fmt::Display for DecomposeError {
             DecomposeError::LlmDisabled => {
                 write!(f, "no LLM provider is configured (Settings -> AI)")
             }
-            DecomposeError::LlmNoCredentials => write!(
-                f,
-                "the active LLM provider has no credentials configured"
-            ),
+            DecomposeError::LlmNoCredentials => {
+                write!(f, "the active LLM provider has no credentials configured")
+            }
             DecomposeError::LlmCallFailed(e) => write!(f, "LLM call failed: {}", e),
             DecomposeError::LlmSchemaParse(e) => {
                 write!(f, "LLM response did not match expected schema: {}", e)
@@ -366,12 +365,7 @@ async fn post_decompose(
 ) -> Result<String, DecomposeError> {
     let url = format!("http://127.0.0.1:{}/plans/decompose", runner_port);
 
-    let summary_truncated: String = decomposed
-        .plan_summary
-        .summary
-        .chars()
-        .take(500)
-        .collect();
+    let summary_truncated: String = decomposed.plan_summary.summary.chars().take(500).collect();
 
     let body = WireDecomposePlanRequest {
         markdown_path: plan_path,
@@ -668,8 +662,8 @@ mod tests {
 
     #[test]
     fn decomposed_tasks_schema_is_well_formed() {
-        let schema = serde_json::to_value(schemars::schema_for!(DecomposedTasks))
-            .expect("schema_for!");
+        let schema =
+            serde_json::to_value(schemars::schema_for!(DecomposedTasks)).expect("schema_for!");
         // Top-level should be an object with `plan_summary` and `tasks`.
         let s = schema.to_string();
         assert!(s.contains("plan_summary"));

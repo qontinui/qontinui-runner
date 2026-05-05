@@ -1333,10 +1333,8 @@ pub async fn ui_bridge_get_component_handler(
                     // does not differentiate component-vs-element, and the
                     // enriched human-readable message carries the
                     // component-specific guidance.
-                    let mut body = api_error_detailed(
-                        enriched,
-                        UiBridgeError::element_not_found(&id),
-                    );
+                    let mut body =
+                        api_error_detailed(enriched, UiBridgeError::element_not_found(&id));
                     if let Some(hint) = data.get("hint") {
                         body.hint = Some(hint.clone());
                     }
@@ -2750,7 +2748,10 @@ pub async fn ui_bridge_get_state_summary_handler(
         .map(|a| a.len())
         .unwrap_or(0);
 
-    let route = snapshot.get("route").cloned().unwrap_or(serde_json::Value::Null);
+    let route = snapshot
+        .get("route")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let active_tab = snapshot
         .get("activeTab")
         .cloned()

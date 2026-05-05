@@ -35,7 +35,9 @@ use tracing::{info, warn};
 
 use crate::ai_provider::oneshot::OneshotLlm;
 use crate::database::pg::PgDb;
-use crate::productivity::summarize::{summarize_session_in_product, SummarizeError, SummarizeResult};
+use crate::productivity::summarize::{
+    summarize_session_in_product, SummarizeError, SummarizeResult,
+};
 
 // =============================================================================
 // Public API
@@ -562,7 +564,11 @@ mod tests {
         // Empty by_area still produces a useful warning preamble.
         assert!(block.contains("FAILED"), "{}", block);
         assert!(block.contains("verdict: escalate"), "{}", block);
-        assert!(block.contains("No specific learnings extracted"), "{}", block);
+        assert!(
+            block.contains("No specific learnings extracted"),
+            "{}",
+            block
+        );
     }
 
     // --- RewindOptions defaults -------------------------------------------

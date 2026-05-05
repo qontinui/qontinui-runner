@@ -270,8 +270,7 @@ async fn coordinator_act(
     // carves out user-fire actions (e.g. force-flip-ready-despite-blocker)
     // so a user-confirmed POST executes the side effect even when the row
     // is logged as advisory. See `is_user_fire_only_action` in act.rs.
-    let should_apply =
-        auto_acted || crate::coordinator::act::is_user_fire_only_action(&req.action);
+    let should_apply = auto_acted || crate::coordinator::act::is_user_fire_only_action(&req.action);
     if should_apply {
         crate::coordinator::act::apply(&state, &req.action).await?;
     }

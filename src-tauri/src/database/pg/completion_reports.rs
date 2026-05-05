@@ -850,20 +850,22 @@ impl PgDb {
             .await
             .map_err(|e| format!("latest_worker_added_dependency_for_task: {}", e))?;
 
-        Ok(row.map(|r| crate::database::pg::coordinator_decisions::CoordinatorDecisionRow {
-            id: r.get(0),
-            session_id: r.get(1),
-            iteration: r.get(2),
-            rule: r.get(3),
-            action: r.get(4),
-            target_id: r.get(5),
-            reasoning: r.get(6),
-            auto_acted: r.get(7),
-            resolved: r.get(8),
-            resolution: r.get(9),
-            resolved_at: r.get(10),
-            created_at: r.get(11),
-        }))
+        Ok(row.map(
+            |r| crate::database::pg::coordinator_decisions::CoordinatorDecisionRow {
+                id: r.get(0),
+                session_id: r.get(1),
+                iteration: r.get(2),
+                rule: r.get(3),
+                action: r.get(4),
+                target_id: r.get(5),
+                reasoning: r.get(6),
+                auto_acted: r.get(7),
+                resolved: r.get(8),
+                resolution: r.get(9),
+                resolved_at: r.get(10),
+                created_at: r.get(11),
+            },
+        ))
     }
 
     /// Bypass-validator transition used by `mcp::completion_reports::add_dependency_inner`
@@ -1199,7 +1201,11 @@ mod tests {
         let mut report = valid_report();
         report.breaking_changes[0].description = String::new();
         let err = validate_report(&report).expect_err("empty bc desc should reject");
-        assert!(err.contains("breakingChanges[0].description"), "got: {}", err);
+        assert!(
+            err.contains("breakingChanges[0].description"),
+            "got: {}",
+            err
+        );
         assert!(err.contains("must not be empty"), "got: {}", err);
     }
 
@@ -1208,7 +1214,11 @@ mod tests {
         let mut report = valid_report();
         report.breaking_changes[0].description = "x".repeat(MAX_BREAKING_CHANGE_DESCRIPTION + 1);
         let err = validate_report(&report).expect_err("oversize bc desc should reject");
-        assert!(err.contains("breakingChanges[0].description"), "got: {}", err);
+        assert!(
+            err.contains("breakingChanges[0].description"),
+            "got: {}",
+            err
+        );
         assert!(err.contains("too long"), "got: {}", err);
     }
 
@@ -1427,11 +1437,7 @@ mod tests {
                 VALUES ($1, $2, $3)
                 RETURNING id::text, plan_version_hash
                 "#,
-                &[
-                    &"/tmp/cycle-test.md",
-                    &"deadbeef",
-                    &"decomposed",
-                ],
+                &[&"/tmp/cycle-test.md", &"deadbeef", &"decomposed"],
             )
             .await
             .expect("insert plan");
@@ -1533,11 +1539,7 @@ mod tests {
                 VALUES ($1, $2, $3)
                 RETURNING id::text, plan_version_hash
                 "#,
-                &[
-                    &"/tmp/linear-test.md",
-                    &"feedface",
-                    &"decomposed",
-                ],
+                &[&"/tmp/linear-test.md", &"feedface", &"decomposed"],
             )
             .await
             .expect("insert plan");

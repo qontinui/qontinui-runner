@@ -410,7 +410,11 @@ pub(crate) fn compose_assignment_brief(
     // Header block — the lead paragraph reads naturally for 1, 2, or N
     // upstreams.
     let n = upstreams.len();
-    let upstream_word = if n == 1 { "upstream task" } else { "upstream tasks" };
+    let upstream_word = if n == 1 {
+        "upstream task"
+    } else {
+        "upstream tasks"
+    };
     out.push_str("## Upstream completion reports\n\n");
     out.push_str(&format!(
         "{} {} shipped before this one. Read their reports below before \
@@ -611,7 +615,8 @@ pub(crate) fn compose_assignment_brief_with_budget(
         .map(|(t, mut r)| {
             for d in &mut r.deliverables {
                 if d.description.chars().count() > CONDENSED_DELIVERABLE_DESC_BYTES {
-                    d.description = condense_chars(&d.description, CONDENSED_DELIVERABLE_DESC_BYTES);
+                    d.description =
+                        condense_chars(&d.description, CONDENSED_DELIVERABLE_DESC_BYTES);
                 }
             }
             for bc in &mut r.breaking_changes {
@@ -1110,13 +1115,8 @@ mod tests {
             })
             .collect();
 
-        let brief = compose_assignment_brief_with_budget(
-            &task,
-            &upstreams,
-            None,
-            MAX_BRIEF_BYTES,
-            None,
-        );
+        let brief =
+            compose_assignment_brief_with_budget(&task, &upstreams, None, MAX_BRIEF_BYTES, None);
         assert!(
             brief.len() <= MAX_BRIEF_BYTES,
             "5-upstream brief should fit, got {} > {}",
@@ -1199,13 +1199,8 @@ mod tests {
             })
             .collect();
 
-        let brief = compose_assignment_brief_with_budget(
-            &task,
-            &upstreams,
-            None,
-            MAX_BRIEF_BYTES,
-            None,
-        );
+        let brief =
+            compose_assignment_brief_with_budget(&task, &upstreams, None, MAX_BRIEF_BYTES, None);
         assert!(
             brief.len() <= MAX_BRIEF_BYTES,
             "hard-truncated brief must not exceed budget, got {} > {}",

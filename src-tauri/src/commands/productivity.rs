@@ -181,18 +181,15 @@ pub async fn get_task_detail(
             }
         };
 
-    let has_assignment_brief_extras = match app_state
-        .pg_db
-        .get_assignment_brief_extras(&task_id)
-        .await
-    {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(e) => {
-            warn!("get_task_detail: get_assignment_brief_extras failed: {}", e);
-            false
-        }
-    };
+    let has_assignment_brief_extras =
+        match app_state.pg_db.get_assignment_brief_extras(&task_id).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                warn!("get_task_detail: get_assignment_brief_extras failed: {}", e);
+                false
+            }
+        };
 
     Ok(Some(TaskDetail {
         task,
@@ -419,11 +416,12 @@ pub async fn approve_recommendation(
                     review.task_id, e
                 );
             }
-            let payload = qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
-                review_id: review.id,
-                task_id: review.task_id,
-                user_decision: "approved".to_string(),
-            };
+            let payload =
+                qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
+                    review_id: review.id,
+                    task_id: review.task_id,
+                    user_decision: "approved".to_string(),
+                };
             if let Err(e) = app_handle.emit("review-approved", &payload) {
                 warn!("approve_recommendation: emit failed: {}", e);
             }
@@ -449,11 +447,12 @@ pub async fn reject_recommendation(
 
     if updated {
         if let Some(review) = app_state.pg_db.get_review_by_id(&review_id).await? {
-            let payload = qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
-                review_id: review.id,
-                task_id: review.task_id,
-                user_decision: "rejected".to_string(),
-            };
+            let payload =
+                qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
+                    review_id: review.id,
+                    task_id: review.task_id,
+                    user_decision: "rejected".to_string(),
+                };
             if let Err(e) = app_handle.emit("review-rejected", &payload) {
                 warn!("reject_recommendation: emit failed: {}", e);
             }

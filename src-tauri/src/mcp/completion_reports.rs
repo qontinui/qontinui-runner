@@ -50,7 +50,12 @@ fn extract_task_run_id(headers: &HeaderMap) -> Result<String, (StatusCode, Strin
     ))?;
     let s = raw
         .to_str()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid task_run_id header: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid task_run_id header: {}", e),
+            )
+        })?
         .trim();
     if s.is_empty() {
         return Err((
@@ -73,7 +78,12 @@ async fn require_calling_session_owns_task(
     let task = pg
         .get_task_by_id(task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("get_task: {}", e),
+            )
+        })?
         .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
 
     match task.assigned_session_id.as_deref() {
@@ -140,7 +150,12 @@ async fn submit_report(
     let task = pg
         .get_task_by_id(&task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("get_task: {}", e),
+            )
+        })?
         .ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             "task disappeared after write".to_string(),
@@ -186,13 +201,23 @@ pub(crate) async fn add_dependency_inner(
     let task = pg
         .get_task_by_id(task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("get_task: {}", e),
+            )
+        })?
         .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
 
     let upstream = pg
         .get_task_by_id(upstream_task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("get_task: {}", e),
+            )
+        })?
         .ok_or((
             StatusCode::NOT_FOUND,
             format!("upstream task {} not found", upstream_task_id),
@@ -313,15 +338,8 @@ pub(crate) async fn add_dependency_inner(
     }
 
     // (d) Synchronous pause hook — push a directive to the worker.
-    let upstream_brief: String = upstream
-        .description
-        .chars()
-        .take(60)
-        .collect();
-    let pause_msg = format!(
-        "Pause and wait — added dependency on {}",
-        upstream_brief
-    );
+    let upstream_brief: String = upstream.description.chars().take(60).collect();
+    let pause_msg = format!("Pause and wait — added dependency on {}", upstream_brief);
     if let Some(sid) = task.assigned_session_id.as_deref() {
         crate::coordinator::act::send_message_to_worker(state, sid, &pause_msg).await;
     }
@@ -341,7 +359,12 @@ pub(crate) async fn add_dependency_inner(
     let reloaded = pg
         .get_task_by_id(task_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get_task: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("get_task: {}", e),
+            )
+        })?
         .ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             "task disappeared after edge append".to_string(),
