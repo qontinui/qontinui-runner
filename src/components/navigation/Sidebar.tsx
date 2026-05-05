@@ -116,7 +116,7 @@ import {
   serializeState,
   deserializeState,
   useNavigationItem,
-} from "qontinui-navigation";
+} from "@qontinui/navigation";
 import { useProductMode, type ProductMode } from "@/contexts/ProductModeContext";
 
 // ============================================================================
