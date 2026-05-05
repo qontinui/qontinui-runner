@@ -46,7 +46,7 @@
     "lucide-react": "^1.7.0",
     "mermaid": "^11.14.0",
     "prism-react-renderer": "^2.4.1",
-    "qontinui-navigation": "^0.1.0",
+    "@qontinui/navigation": "^0.1.0",
     "qrcode.react": "^4.2.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
