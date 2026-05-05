@@ -193,6 +193,8 @@ This repo has five workflows in `.github/workflows/`. They split into two tiers 
   - `security` job (`ci.yml:191-228`) on `ubuntu-latest` only: `cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071` + `pnpm audit --audit-level=moderate`. Runs in parallel with the matrix; treated as part of the same `ci.yml` gate. Don't ignore it just because it's separate from the platform legs.
 - `forbid-runner-schema.yml` — runs on PR + push to `main` and `develop` (`.github/workflows/forbid-runner-schema.yml:21-25`). Cheap, fast, no excuse for letting it go red.
 
+> **Note on `spec-pairing.yml`**: a previous draft of this section claimed `spec-pairing.yml` is a path-triggered gate in this repo. It isn't — `spec-pairing.yml` lives in `jspinak/qontinui-web`, not in `qontinui-runner`. Don't expect to see it in this repo's PR checks.
+
 **Conditional gate** (currently being repaired):
 
 - `schema-pg-sql-fresh.yml` — `pull_request: [main]` + `workflow_dispatch`, paths-filtered to `src-tauri/queries/**` and `src-tauri/schema.pg.sql.generated` (`.github/workflows/schema-pg-sql-fresh.yml:18-25`). **Not a hard gate yet:** the workflow itself has open infra bugs:
