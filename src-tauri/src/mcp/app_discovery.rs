@@ -1498,7 +1498,7 @@ mod tests {
         };
         let (status, body) = dispatch_to_app_inner(&registry, &dispatcher, "ghost-app", &req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body.success, false);
+        assert!(!body.success);
         assert_eq!(body.error.as_deref(), Some("app not registered"));
     }
 

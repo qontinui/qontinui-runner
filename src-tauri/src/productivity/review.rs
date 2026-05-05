@@ -1125,7 +1125,7 @@ mod tests {
 
     #[test]
     fn tail_chars_truncates_with_marker() {
-        let s: String = std::iter::repeat('x').take(500).collect();
+        let s: String = "x".repeat(500);
         let out = tail_chars(&s, 100);
         assert!(out.contains("[…truncated…]"));
         // Marker length + 100 chars, give or take.

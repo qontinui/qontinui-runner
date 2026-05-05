@@ -268,7 +268,7 @@ pub(crate) async fn run_one_iteration(
                 state,
                 &obs,
                 &obs.recent_decisions,
-                &mut *budget_guard,
+                &mut budget_guard,
                 max_llm_calls_per_hour,
             )
             .await;

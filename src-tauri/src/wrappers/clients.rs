@@ -506,7 +506,7 @@ fn prune_old_backups(config_path: &Path) {
     if backups.len() <= 5 {
         return;
     }
-    backups.sort_by(|a, b| b.0.cmp(&a.0));
+    backups.sort_by_key(|x| std::cmp::Reverse(x.0));
     for (_, path) in backups.into_iter().skip(5) {
         let _ = fs::remove_file(path);
     }

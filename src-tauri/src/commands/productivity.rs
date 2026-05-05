@@ -1378,6 +1378,5 @@ pub async fn add_task_dependency(
         None,
     )
     .await
-    .map(|row| row)
     .map_err(|(_, msg)| msg)
 }
