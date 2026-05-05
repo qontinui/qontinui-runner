@@ -112,7 +112,11 @@ fn project_scenarios_sorts_states_by_id_ascending() {
 fn project_scenarios_sorts_outbound_transitions_by_id() {
     let ir = make_ir();
     let proj = project_scenarios(&ir);
-    let state_a = proj.states.iter().find(|s| s.state_id == "state-a").unwrap();
+    let state_a = proj
+        .states
+        .iter()
+        .find(|s| s.state_id == "state-a")
+        .unwrap();
     let trans_ids: Vec<&str> = state_a
         .outbound_transitions
         .iter()
@@ -125,7 +129,11 @@ fn project_scenarios_sorts_outbound_transitions_by_id() {
 fn project_scenarios_sorts_target_state_ids_ascending() {
     let ir = make_ir();
     let proj = project_scenarios(&ir);
-    let state_a = proj.states.iter().find(|s| s.state_id == "state-a").unwrap();
+    let state_a = proj
+        .states
+        .iter()
+        .find(|s| s.state_id == "state-a")
+        .unwrap();
     let t2 = state_a
         .outbound_transitions
         .iter()
@@ -140,11 +148,19 @@ fn project_scenarios_omits_label_when_equal_to_id() {
     let proj = project_scenarios(&ir);
 
     // state-b has name == id → no label.
-    let state_b = proj.states.iter().find(|s| s.state_id == "state-b").unwrap();
+    let state_b = proj
+        .states
+        .iter()
+        .find(|s| s.state_id == "state-b")
+        .unwrap();
     assert!(state_b.label.is_none());
 
     // state-a has name "State A" != "state-a" → label populated.
-    let state_a = proj.states.iter().find(|s| s.state_id == "state-a").unwrap();
+    let state_a = proj
+        .states
+        .iter()
+        .find(|s| s.state_id == "state-a")
+        .unwrap();
     assert_eq!(state_a.label.as_deref(), Some("State A"));
 }
 
@@ -152,7 +168,11 @@ fn project_scenarios_omits_label_when_equal_to_id() {
 fn project_scenarios_includes_action_count_and_required_element_count() {
     let ir = make_ir();
     let proj = project_scenarios(&ir);
-    let state_a = proj.states.iter().find(|s| s.state_id == "state-a").unwrap();
+    let state_a = proj
+        .states
+        .iter()
+        .find(|s| s.state_id == "state-a")
+        .unwrap();
     assert_eq!(state_a.required_element_count, 0);
 
     let t2 = state_a

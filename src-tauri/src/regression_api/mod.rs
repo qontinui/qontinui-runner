@@ -32,10 +32,7 @@ use crate::mcp::types::ApiState;
 /// `/scenarios/...` in `mcp_api.rs::create_router`.
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
-        .route(
-            "/runs/{run_id}/drift",
-            get(handlers::get_run_drift_report),
-        )
+        .route("/runs/{run_id}/drift", get(handlers::get_run_drift_report))
         .route(
             "/runs/{run_id}/drift/{entry_id}",
             get(handlers::get_run_drift_entry),

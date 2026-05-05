@@ -1577,12 +1577,8 @@ mod tests {
             bugfix_context: None,
         };
 
-        let result = update_page_specs_from_criteria(
-            &criteria,
-            "Update the settings page",
-            dir.path(),
-            0.2,
-        );
+        let result =
+            update_page_specs_from_criteria(&criteria, "Update the settings page", dir.path(), 0.2);
 
         // Should replace the old group, not skip
         assert_eq!(result.specs_updated, 1);

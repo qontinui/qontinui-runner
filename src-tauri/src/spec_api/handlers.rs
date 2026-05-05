@@ -289,11 +289,7 @@ pub(crate) fn build_list_response(root: &std::path::Path) -> Response {
         }));
     }
 
-    (
-        StatusCode::OK,
-        Json(json!({ "ok": true, "specs": specs })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({ "ok": true, "specs": specs }))).into_response()
 }
 
 // ---------------------------------------------------------------------------
