@@ -12,6 +12,11 @@ env:
 jobs:
   test:
     strategy:
+      # Surface platform-specific failures independently. Default fail-fast
+      # cancels ubuntu/windows the moment macos clippy trips, masking
+      # whether the linux/win build is actually OK. Now blocked only by
+      # genuine per-platform failures.
+      fail-fast: false
       matrix:
         platform: [ubuntu-22.04, macos-latest, windows-latest]
 
@@ -19,6 +24,28 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # qontinui-runner's frontend cross-repo deps now resolve via npm
+      # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
+      # The remaining sibling-checkouts are:
+      #   - qontinui-schemas: src-tauri/Cargo.toml's `qontinui-types = { path
+      #     = "../../qontinui-schemas/rust" }` — Rust publication is deferred
+      #     per the cross-repo dep redesign plan.
+      #   - qontinui-web: src/lib/spec-registry.ts is auto-generated and
+      #     statically imports 14 .spec.uibridge.json files from
+      #     qontinui-web/frontend/src/app at typecheck/build time. These are
+      #     cross-repo file imports rather than npm deps, so the redesign
+      #     doesn't migrate them.
+      # qontinui-schemas is public; qontinui-web is private and lives under
+      # jspinak/, so cloning it needs CROSS_REPO_TOKEN (PAT with read access).
+      - name: Checkout sibling repos
+        env:
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 "https://x-access-token:${CROSS_REPO_TOKEN}@github.com/jspinak/qontinui-web.git"
+        shell: bash
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -54,6 +81,36 @@ jobs:
             libatspi2.0-dev \
             at-spi2-core
 
+      # Hosted ubuntu-22.04 / windows-latest both ship with 16 GB RAM and a
+      # small default pagefile/swap. `cargo test` peak codegen memory on
+      # this workspace exceeds that and the rustc/LLVM allocator dies (on
+      # Linux the OOM-killer takes the runner agent down → "shutdown
+      # signal … exit code 143"; on Windows rustc-LLVM emits
+      # "out of memory" / "Allocation failed" then aborts, surfaced by the
+      # OS as exit code 0xc000001d / STATUS_ILLEGAL_INSTRUCTION). Capping
+      # CARGO_BUILD_JOBS alone wasn't enough — link is single-threaded.
+      # Pre-allocate paging space so the OS can absorb the spike instead
+      # of the runner agent dying.
+      - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== free / df after swap setup ==="
+          free -h
+          df -h
+
+      - name: Configure pagefile (Windows — guard against link-time OOM)
+        if: matrix.platform == 'windows-latest'
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 16GB
+          maximum-size: 16GB
+          disk-root: "D:"
+
       # macOS: The accessibility (AX) adapter links against system CoreFoundation
       # frameworks which are always available. No additional brew packages needed.
       # Note: AX integration tests require accessibility permissions at runtime,
@@ -76,6 +133,13 @@ jobs:
       - name: Lint frontend code
         run: pnpm run lint
 
+      # Build the frontend before any cargo step. tauri::generate_context!()
+      # in src-tauri/src/lib.rs reads tauri.conf.json at compile time and
+      # panics if frontendDist (../dist) is missing — which broke `Clippy
+      # check`, `Run Rust tests`, and `Build Tauri app` on every platform.
+      - name: Build frontend
+        run: pnpm run build
+
       - name: Format Rust code check
         run: |
           cd src-tauri
@@ -89,15 +153,40 @@ jobs:
       - name: Run Rust tests
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
+        env:
+          # `CARGO_BUILD_JOBS` reduces the parallel-rustc memory peak.
+          # Empirically (run 25336049561):
+          #   - Windows passes at JOBS=2 with a 16 GB pagefile — Windows
+          #     pagefile commits lazily so peak fits.
+          #   - Ubuntu OOM-killer is harsher: even with a 12 GB swapfile,
+          #     JOBS=2 still trips the runner-agent shutdown. Drop Ubuntu
+          #     to JOBS=1 for a single-threaded compile.
+          #   - macOS is on a fatter runner and stays at default 4.
+          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'ubuntu-22.04' && 1) || (matrix.platform == 'macos-latest' && 4) || 2 }}
         run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "=== free / df before cargo test ==="
+            free -h
+            df -h
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            echo "=== Windows memory state before cargo test ==="
+            powershell -NoProfile -Command "Get-CimInstance Win32_PageFileUsage | Format-List *; Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory | Format-List"
+          fi
           cd src-tauri
           cargo test --verbose
-
-      - name: Build frontend
-        run: pnpm run build
+        shell: bash
 
       - name: Build Tauri app (development)
-        run: pnpm run tauri build -- --debug
+        # @tauri-apps/cli 2.11 changes that affect this step:
+        #   1. Args after `--` are forwarded straight to `cargo build`, which
+        #      rejects `--debug` (cargo's default profile, not a flag). So
+        #      `--debug` must be parsed by tauri CLI directly — no `--`.
+        #   2. `createUpdaterArtifacts: true` in tauri.conf.json now forces
+        #      updater signing at bundle time even when `pubkey: ""`, failing
+        #      the build with "A public key has been found, but no private
+        #      key." CI doesn't ship artifacts, so skip bundling entirely with
+        #      `--no-bundle` — compilation + link is the sanity gate we want.
+        run: pnpm run tauri build --debug --no-bundle
 
   security:
     runs-on: ubuntu-latest
@@ -105,11 +194,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cargo audit walks the workspace and resolves path: deps. The runner's
+      # src-tauri/Cargo.toml depends on `qontinui-types` from a sibling repo.
+      # Same multi-checkout pattern as the test job. Frontend link: deps have
+      # moved to npm so ui-bridge no longer needs cloning here.
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+
       - name: Run security audit on Rust dependencies
+        # Cargo.lock lives at the workspace root (./Cargo.lock), not under
+        # src-tauri/. cargo-audit doesn't auto-walk to the workspace root,
+        # so --file points it at the right lockfile.
+        #
+        # --ignore RUSTSEC-2023-0071: Marvin Attack timing sidechannel in
+        # rsa 0.9.x, pulled in transitively by adb_client v3 (ADB device
+        # auth). Upstream advisory says "No fixed upgrade is available!".
+        # Threat model is mitigated for desktop ADB host-side use:
+        # attacker would need physical/local access AND the ability to
+        # drive many timing-measured auth attempts. Revisit when rsa
+        # ships a fix or adb_client switches RSA implementations.
         run: |
           cargo install cargo-audit
-          cd src-tauri
-          cargo audit
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

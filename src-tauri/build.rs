@@ -90,5 +90,177 @@ fn main() {
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs/heads");
 
+    // Section 4 (UI Bridge redesign) — refresh the runner's IR baseline if
+    // any tsx source is newer. Best-effort only; never fails the build.
+    refresh_ir_if_stale();
+
     tauri_build::build()
+}
+
+/// Re-emit the runner's IR documents if any tsx source under ../src is newer
+/// than the IR baseline at ../specs/pages/runner-root/state-machine.derived.json.
+///
+/// Piggybacks on the existing `cargo:rerun-if-changed=../dist` rule (which
+/// already re-fires when the frontend rebuilds), so we don't add a parallel
+/// `rerun-if-changed=../src` watch — that would over-fire on hot-reload-only
+/// edits during dev. The dist watch is a sufficient proxy: a fresh frontend
+/// bundle always implies fresh tsx sources, so the staleness check below
+/// catches the meaningful changes without coupling the build script to every
+/// keystroke.
+///
+/// Failure modes are non-fatal — if the IR build fails, we print a warning
+/// (visible via `cargo:warning=`) and let the runner build proceed. The
+/// embedded `include_dir!` snapshot of `../specs/pages` is the safety net for
+/// production binaries: even if a fresh emit didn't happen, the previous IR
+/// is baked in.
+///
+/// The IR build is gated to avoid running by default on every cargo build:
+///   - If `QONTINUI_BUILD_IR=1` is set, always attempt.
+///   - Otherwise, attempt only when both `npm` is on PATH and the runner's
+///     `package.json` has a `build-ir` script.
+///   - Otherwise skip silently with a `cargo:warning=` hint.
+fn refresh_ir_if_stale() {
+    use std::path::Path;
+
+    // Page id matches package.json's `build-ir` script (`--document-id=runner-root`).
+    let baseline = Path::new("../specs/pages/runner-root/state-machine.derived.json");
+    // Baseline missing — first-run case; skip silently.
+    let baseline_mtime = std::fs::metadata(baseline).and_then(|m| m.modified()).ok();
+
+    // Walk ../src for *.tsx files; collect newest mtime. We do this manually
+    // to avoid pulling in a walkdir build-dep. Recursive depth is unbounded
+    // but the runner's src tree is small enough that this is fine.
+    let src_dir = Path::new("../src");
+    let newest_tsx_mtime = newest_tsx_mtime(src_dir);
+
+    // If both timestamps available, compare; otherwise skip (no signal).
+    let needs_refresh = match (baseline_mtime, newest_tsx_mtime) {
+        (Some(baseline_t), Some(src_t)) => src_t > baseline_t,
+        // No baseline yet — the embedded snapshot will fall back to whatever
+        // is currently on disk (possibly nothing for runner-root). Attempt
+        // the emit so future builds have a baseline.
+        (None, Some(_)) => true,
+        _ => false,
+    };
+
+    if !needs_refresh {
+        return;
+    }
+
+    // Gate: explicit env var, OR npm-on-PATH + package.json has build-ir script.
+    let force = std::env::var("QONTINUI_BUILD_IR").ok().as_deref() == Some("1");
+    let auto_eligible = npm_available() && package_json_has_build_ir();
+    if !force && !auto_eligible {
+        println!(
+            "cargo:warning=qontinui-runner IR is stale but build-ir was skipped (set QONTINUI_BUILD_IR=1 or ensure npm is on PATH with a `build-ir` script in package.json)"
+        );
+        return;
+    }
+
+    // Run `npm run build-ir` in the qontinui-runner root (one level above
+    // src-tauri). Capture both streams so failures show up in cargo output.
+    let runner_root = Path::new("..");
+    // On Windows, `npm` is `npm.cmd` and bare `npm` doesn't resolve through
+    // std::process::Command — wrap via `cmd /C` for portability.
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "npm", "run", "build-ir"]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("npm");
+        c.args(["run", "build-ir"]);
+        c
+    };
+    cmd.current_dir(runner_root);
+
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            // Quiet success — IR is fresh.
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // cargo:warning= can only emit a single line — collapse whitespace.
+            let combined = format!("{} {}", stderr.trim(), stdout.trim());
+            let single_line: String = combined
+                .chars()
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .collect();
+            println!(
+                "cargo:warning=qontinui-runner build-ir failed (exit {}): {}",
+                output.status, single_line
+            );
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=qontinui-runner build-ir invocation failed: {}",
+                e
+            );
+        }
+    }
+}
+
+/// Walk `dir` recursively and return the newest mtime among `*.tsx` files.
+fn newest_tsx_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    if !dir.exists() {
+        return None;
+    }
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut stack: Vec<std::path::PathBuf> = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                // Skip node_modules and similar — they explode the walk and
+                // never contain authoring-time tsx anyway.
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if matches!(name, "node_modules" | ".next" | "dist" | "build") {
+                        continue;
+                    }
+                }
+                stack.push(path);
+            } else if ft.is_file() {
+                if path.extension().and_then(|e| e.to_str()) == Some("tsx") {
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            newest = Some(newest.map_or(modified, |cur| cur.max(modified)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// Probe whether `npm` is available on PATH. Fast and side-effect-free.
+fn npm_available() -> bool {
+    #[cfg(windows)]
+    let probe = std::process::Command::new("cmd")
+        .args(["/C", "npm", "--version"])
+        .output();
+    #[cfg(not(windows))]
+    let probe = std::process::Command::new("npm").arg("--version").output();
+    matches!(probe, Ok(o) if o.status.success())
+}
+
+/// Check whether `../package.json` declares a `build-ir` script. We do a
+/// substring scan rather than a full JSON parse to avoid a serde_json
+/// build-dep. The match is intentionally conservative.
+fn package_json_has_build_ir() -> bool {
+    match std::fs::read_to_string("../package.json") {
+        Ok(s) => s.contains("\"build-ir\""),
+        Err(_) => false,
+    }
 }

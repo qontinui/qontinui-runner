@@ -1,0 +1,34 @@
+{
+  "version": "1.0",
+  "id": "sidebar",
+  "name": "Sidebar",
+  "states": [
+    {
+      "id": "sidebar-presence",
+      "name": "Sidebar Presence",
+      "requiredElements": [
+        {
+          "role": "navigation",
+          "accessibleName": "Main navigation"
+        }
+      ],
+      "description": "The sidebar navigation is always visible",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Sidebar navigation — persistent navigation menu with links to all major pages. Always visible (collapsed or expanded) alongside the active page content.",
+  "metadata": {
+    "tags": [
+      "runner",
+      "navigation",
+      "sidebar",
+      "global"
+    ]
+  }
+}

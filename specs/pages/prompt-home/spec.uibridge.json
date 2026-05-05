@@ -1,0 +1,737 @@
+{
+  "description": "Prompt Home — the runner's Google-style landing page. Users type a natural language request (e.g., 'schedule a workflow at 3am'), the AI plans a sequence of UI actions, and the runner steers itself via the state machine and NLActionExecutor. Optional 'Explain steps' mode narrates each action via tutorial overlays.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Page Layout & Structure",
+          "enabled": true,
+          "id": "ph-layout-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "page-id": "prompt-home"
+              }
+            },
+            "label": "Required element for Page Layout & Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Page Layout & Structure",
+          "enabled": true,
+          "id": "ph-layout-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "page-id": "prompt-home"
+              }
+            },
+            "label": "Required element for Page Layout & Structure",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The page is a full-height centered flex column with the app wordmark, a search-style input bar, suggestion chips, and an explain toggle. Content is vertically and horizontally centered.",
+      "id": "ph-layout",
+      "name": "Page Layout & Structure",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state App Wordmark",
+          "enabled": true,
+          "id": "ph-wordmark-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "qontinui"
+            },
+            "label": "Required element for App Wordmark",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state App Wordmark",
+          "enabled": true,
+          "id": "ph-wordmark-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "qontinui"
+            },
+            "label": "Required element for App Wordmark",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A subtle 'qontinui' wordmark with a Sparkles icon appears above the input, establishing brand identity without dominating the page.",
+      "id": "ph-wordmark",
+      "name": "App Wordmark",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Search Input Bar",
+          "enabled": true,
+          "id": "ph-search-input-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Search Input Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Search Input Bar",
+          "enabled": true,
+          "id": "ph-search-input-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Search Input Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Search Input Bar",
+          "enabled": true,
+          "id": "ph-search-input-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Search Input Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Search Input Bar",
+          "enabled": true,
+          "id": "ph-search-input-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Search Input Bar",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Search Input Bar",
+          "enabled": true,
+          "id": "ph-search-input-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Search Input Bar",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The primary input — a rounded search bar with a search icon, placeholder text, and a submit arrow that appears when text is entered.",
+      "id": "ph-search-input",
+      "name": "Search Input Bar",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Suggestion Chips",
+          "enabled": true,
+          "id": "ph-suggestions-elem-0",
+          "precondition": "Page is in idle state (no active execution) and no prompt history exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Show me the error monitor"
+            },
+            "label": "Required element for Suggestion Chips",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Suggestion Chips",
+          "enabled": true,
+          "id": "ph-suggestions-elem-1",
+          "precondition": "Page is in idle state (no active execution) and no prompt history exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Show me the error monitor"
+            },
+            "label": "Required element for Suggestion Chips",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Suggestion Chips",
+          "enabled": true,
+          "id": "ph-suggestions-elem-2",
+          "precondition": "Page is in idle state (no active execution) and no prompt history exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Show me the error monitor"
+            },
+            "label": "Required element for Suggestion Chips",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Below the input, suggestion chips show recent prompts (if history exists) or example prompts for new users. Chips are rounded-full pill buttons.",
+      "id": "ph-suggestions",
+      "name": "Suggestion Chips",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Explain Steps Toggle",
+          "enabled": true,
+          "id": "ph-explain-toggle-elem-0",
+          "precondition": "Page is in idle state",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Explain steps"
+            },
+            "label": "Required element for Explain Steps Toggle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Explain Steps Toggle",
+          "enabled": true,
+          "id": "ph-explain-toggle-elem-1",
+          "precondition": "Page is in idle state",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Explain steps"
+            },
+            "label": "Required element for Explain Steps Toggle",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A checkbox toggle below suggestions that enables tutorial overlay narration during execution. Persisted to instanceStorage.",
+      "id": "ph-explain-toggle",
+      "name": "Explain Steps Toggle",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Planning State",
+          "enabled": true,
+          "id": "ph-planning-state-elem-0",
+          "precondition": "A prompt has just been submitted and the backend is generating a plan",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Understanding your request"
+            },
+            "label": "Required element for Planning State",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Planning State",
+          "enabled": true,
+          "id": "ph-planning-state-elem-1",
+          "precondition": "A prompt has just been submitted and the backend is generating a plan",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Planning State",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "After submission, the page shows a spinner with 'Understanding your request...' while the AI plans the action sequence.",
+      "id": "ph-planning-state",
+      "name": "Planning State",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Executing State — Step Progress",
+          "enabled": true,
+          "id": "ph-executing-state-elem-0",
+          "precondition": "Page is in executing phase with a plan loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "p"
+            },
+            "label": "Required element for Executing State — Step Progress",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Executing State — Step Progress",
+          "enabled": true,
+          "id": "ph-executing-state-elem-1",
+          "precondition": "Page is in executing phase with a plan loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "page-id": "prompt-home"
+              }
+            },
+            "label": "Required element for Executing State — Step Progress",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Executing State — Step Progress",
+          "enabled": true,
+          "id": "ph-executing-state-elem-2",
+          "precondition": "Page is in executing phase with a plan loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "page-id": "prompt-home"
+              }
+            },
+            "label": "Required element for Executing State — Step Progress",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "During execution, the page displays the AI's plan summary and a step-by-step progress list. Each step shows a status icon (done/current/pending) and its explanation text.",
+      "id": "ph-executing-state",
+      "name": "Executing State — Step Progress",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Done State",
+          "enabled": true,
+          "id": "ph-done-state-elem-0",
+          "precondition": "All plan steps have completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Done!"
+            },
+            "label": "Required element for Done State",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Done State",
+          "enabled": true,
+          "id": "ph-done-state-elem-1",
+          "precondition": "All plan steps have completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Start another task"
+            },
+            "label": "Required element for Done State",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "After all steps complete, shows a green 'Done!' message with a 'Start another task' link to reset.",
+      "id": "ph-done-state",
+      "name": "Done State",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Error State",
+          "enabled": true,
+          "id": "ph-error-state-elem-0",
+          "precondition": "The backend returned an error or a step failed during execution",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "page-id": "prompt-home"
+              }
+            },
+            "label": "Required element for Error State",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Error State",
+          "enabled": true,
+          "id": "ph-error-state-elem-1",
+          "precondition": "The backend returned an error or a step failed during execution",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Retry"
+            },
+            "label": "Required element for Error State",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "If planning or execution fails, shows a red error message with Retry and Start over options.",
+      "id": "ph-error-state",
+      "name": "Error State",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Self-Steering Execution — Domain Logic",
+          "enabled": true,
+          "id": "ph-self-steering-elem-0",
+          "precondition": "A navigate step is executing during plan execution",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "page-id": "prompt-home"
+              }
+            },
+            "label": "Required element for Self-Steering Execution — Domain Logic",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Self-Steering Execution — Domain Logic",
+          "enabled": true,
+          "id": "ph-self-steering-elem-1",
+          "precondition": "A navigate step is executing during plan execution",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "page-id": "prompt-home"
+              }
+            },
+            "label": "Required element for Self-Steering Execution — Domain Logic",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Self-Steering Execution — Domain Logic",
+          "enabled": true,
+          "id": "ph-self-steering-elem-2",
+          "precondition": "A navigate step is executing during plan execution",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Self-Steering Execution — Domain Logic",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The core feature: the runner steers itself by using the UI Bridge state machine for navigation and NLActionExecutor for page interactions. The AI plans a sequence of navigate + action steps, and the runner executes them visibly.",
+      "id": "ph-self-steering",
+      "name": "Self-Steering Execution — Domain Logic",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "prompt-home",
+    "tags": [
+      "prompt",
+      "home",
+      "self-steering",
+      "navigation",
+      "landing-page"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The page is a full-height centered flex column with the app wordmark, a search-style input bar, suggestion chips, and an explain toggle. Content is vertically and horizontally centered.",
+        "elements": [
+          {
+            "dataAttributes": {
+              "page-id": "prompt-home"
+            }
+          },
+          {
+            "dataAttributes": {
+              "page-id": "prompt-home"
+            }
+          }
+        ],
+        "id": "ph-layout",
+        "isInitial": false,
+        "name": "Page Layout & Structure",
+        "transitions": []
+      },
+      {
+        "description": "A subtle 'qontinui' wordmark with a Sparkles icon appears above the input, establishing brand identity without dominating the page.",
+        "elements": [
+          {
+            "textContent": "qontinui"
+          },
+          {
+            "textContent": "qontinui"
+          }
+        ],
+        "id": "ph-wordmark",
+        "isInitial": false,
+        "name": "App Wordmark",
+        "transitions": []
+      },
+      {
+        "description": "The primary input — a rounded search bar with a search icon, placeholder text, and a submit arrow that appears when text is entered.",
+        "elements": [
+          {},
+          {},
+          {},
+          {},
+          {}
+        ],
+        "id": "ph-search-input",
+        "isInitial": false,
+        "name": "Search Input Bar",
+        "transitions": []
+      },
+      {
+        "description": "Below the input, suggestion chips show recent prompts (if history exists) or example prompts for new users. Chips are rounded-full pill buttons.",
+        "elements": [
+          {
+            "textContent": "Show me the error monitor"
+          },
+          {
+            "textContent": "Show me the error monitor"
+          },
+          {
+            "textContent": "Show me the error monitor"
+          }
+        ],
+        "id": "ph-suggestions",
+        "isInitial": false,
+        "name": "Suggestion Chips",
+        "transitions": []
+      },
+      {
+        "description": "A checkbox toggle below suggestions that enables tutorial overlay narration during execution. Persisted to instanceStorage.",
+        "elements": [
+          {
+            "textContains": "Explain steps"
+          },
+          {
+            "textContains": "Explain steps"
+          }
+        ],
+        "id": "ph-explain-toggle",
+        "isInitial": false,
+        "name": "Explain Steps Toggle",
+        "transitions": []
+      },
+      {
+        "description": "After submission, the page shows a spinner with 'Understanding your request...' while the AI plans the action sequence.",
+        "elements": [
+          {
+            "textContains": "Understanding your request"
+          },
+          {}
+        ],
+        "id": "ph-planning-state",
+        "isInitial": false,
+        "name": "Planning State",
+        "transitions": []
+      },
+      {
+        "description": "During execution, the page displays the AI's plan summary and a step-by-step progress list. Each step shows a status icon (done/current/pending) and its explanation text.",
+        "elements": [
+          {
+            "tagName": "p"
+          },
+          {
+            "dataAttributes": {
+              "page-id": "prompt-home"
+            }
+          },
+          {
+            "dataAttributes": {
+              "page-id": "prompt-home"
+            }
+          }
+        ],
+        "id": "ph-executing-state",
+        "isInitial": false,
+        "name": "Executing State — Step Progress",
+        "transitions": []
+      },
+      {
+        "description": "After all steps complete, shows a green 'Done!' message with a 'Start another task' link to reset.",
+        "elements": [
+          {
+            "textContains": "Done!"
+          },
+          {
+            "textContent": "Start another task"
+          }
+        ],
+        "id": "ph-done-state",
+        "isInitial": false,
+        "name": "Done State",
+        "transitions": []
+      },
+      {
+        "description": "If planning or execution fails, shows a red error message with Retry and Start over options.",
+        "elements": [
+          {
+            "dataAttributes": {
+              "page-id": "prompt-home"
+            }
+          },
+          {
+            "textContent": "Retry"
+          }
+        ],
+        "id": "ph-error-state",
+        "isInitial": false,
+        "name": "Error State",
+        "transitions": []
+      },
+      {
+        "description": "The core feature: the runner steers itself by using the UI Bridge state machine for navigation and NLActionExecutor for page interactions. The AI plans a sequence of navigate + action steps, and the runner executes them visibly.",
+        "elements": [
+          {
+            "dataAttributes": {
+              "page-id": "prompt-home"
+            }
+          },
+          {
+            "dataAttributes": {
+              "page-id": "prompt-home"
+            }
+          },
+          {}
+        ],
+        "id": "ph-self-steering",
+        "isInitial": false,
+        "name": "Self-Steering Execution — Domain Logic",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

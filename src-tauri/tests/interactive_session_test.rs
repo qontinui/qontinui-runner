@@ -182,33 +182,64 @@ struct ControlRequestFromCli {
 // Test helpers
 // ============================================================================
 
-/// Find the mock_claude_cli binary path.
-/// It should be in the target directory after `cargo build`.
+/// Find the mock_claude_cli binary path. Cargo populates
+/// `CARGO_BIN_EXE_<name>` for integration tests when the bin is in the
+/// same package, pointing at the actual built artifact (workspace-aware,
+/// profile-aware). Falls back to the legacy `target/{debug,release}/`
+/// search for non-cargo invocations (e.g. running the test binary
+/// directly), which also kicks off an on-demand build if needed.
 fn mock_cli_path() -> String {
-    // Look for the binary in the target/debug directory
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    // Cargo-provided path — set when `cargo test` (or `cargo run`) builds
+    // the bin via the package's [[bin]] declaration. This is the
+    // canonical path: it follows CARGO_TARGET_DIR, profile, workspace
+    // layout, etc.
+    if let Some(p) = option_env!("CARGO_BIN_EXE_mock_claude_cli") {
+        return p.to_string();
+    }
 
-    // Try the standard debug binary location
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let candidates = [
         format!("{}/target/debug/mock_claude_cli.exe", manifest_dir),
         format!("{}/target/debug/mock_claude_cli", manifest_dir),
-        // In case tests run from a different profile
         format!("{}/target/release/mock_claude_cli.exe", manifest_dir),
         format!("{}/target/release/mock_claude_cli", manifest_dir),
+        format!("{}/../target/debug/mock_claude_cli.exe", manifest_dir),
+        format!("{}/../target/debug/mock_claude_cli", manifest_dir),
+        format!("{}/../target/release/mock_claude_cli.exe", manifest_dir),
+        format!("{}/../target/release/mock_claude_cli", manifest_dir),
     ];
 
-    for candidate in &candidates {
-        if std::path::Path::new(candidate).exists() {
-            return candidate.clone();
-        }
+    let find = || {
+        candidates
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .cloned()
+    };
+
+    if let Some(p) = find() {
+        return p;
     }
 
-    // Fall back to asking cargo
-    panic!(
-        "mock_claude_cli binary not found. Build it first with: cargo build --bin mock_claude_cli\n\
-         Searched in: {:?}",
-        candidates
-    );
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--bin", "mock_claude_cli", "--manifest-path"])
+        .arg(format!("{}/Cargo.toml", manifest_dir))
+        .status();
+
+    if !matches!(&status, Ok(s) if s.success()) {
+        panic!(
+            "mock_claude_cli binary not found and on-demand build failed ({:?}).\n\
+             Build manually with: cargo build --bin mock_claude_cli\n\
+             Searched in: {:?}",
+            status, candidates
+        );
+    }
+
+    find().unwrap_or_else(|| {
+        panic!(
+            "mock_claude_cli built but still not found in candidates: {:?}",
+            candidates
+        )
+    })
 }
 
 /// Spawn the mock CLI and return (child, stdin writer, stdout reader).

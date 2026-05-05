@@ -1,0 +1,293 @@
+{
+  "version": "1.0",
+  "id": "cost-control",
+  "name": "CostControlPanel",
+  "states": [
+    {
+      "id": "cc-page-structure",
+      "name": "Page Structure & Layout",
+      "requiredElements": [
+        {
+          "textContains": "Cost Control"
+        },
+        {
+          "textContains": "Budget tracking, anomaly detection"
+        },
+        {
+          "role": "button",
+          "accessibleName": "Refresh cost data"
+        },
+        {
+          "tagName": "svg"
+        },
+        {
+          "textContains": "Cost Control"
+        }
+      ],
+      "description": "Overall layout of the Cost Control panel: header with title and refresh button, followed by budget warnings, summary cards, budget gauge + phase chart, safety section, cost feed table, and optimization recommendations.",
+      "precondition": "Data is still loading (isLoading is true)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-summary-cards",
+      "name": "Summary Metric Cards",
+      "requiredElements": [
+        {
+          "textContains": "Total Cost"
+        },
+        {
+          "textContains": "Total Tokens"
+        },
+        {
+          "textContains": "Cache Hit Rate"
+        },
+        {
+          "textContains": "Cache Savings"
+        },
+        {
+          "textContains": "Total Cost"
+        }
+      ],
+      "description": "Four metric cards in a responsive grid showing Total Cost, Total Tokens, Cache Hit Rate, and Cache Savings. Uses 2 columns on mobile, 4 on desktop.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-budget-gauge",
+      "name": "Budget Utilization Gauge",
+      "requiredElements": [
+        {
+          "textContains": "Budget Utilization"
+        },
+        {
+          "textContains": "No active run"
+        },
+        {
+          "textContains": "remaining"
+        },
+        {
+          "tagName": "svg"
+        }
+      ],
+      "description": "Circular SVG gauge showing budget utilization percentage. Color-coded: green (<60% used), yellow (60-80%), red (>80%). Shows cost amounts and remaining percentage below the gauge.",
+      "precondition": "No workflow run is currently active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-phase-breakdown",
+      "name": "Cost by Phase Chart",
+      "requiredElements": [
+        {
+          "textContains": "Cost by Phase"
+        },
+        {
+          "textContains": "No phase cost data"
+        },
+        {
+          "textContains": "Cost by Phase"
+        }
+      ],
+      "description": "Horizontal bar chart showing cost per workflow phase using recharts. Sorted by cost descending. Custom tooltip with token breakdown.",
+      "precondition": "No phase cost data in the database",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-circuit-breaker",
+      "name": "Circuit Breaker Status",
+      "requiredElements": [
+        {
+          "textContains": "Circuit Breaker"
+        },
+        {
+          "textContains": "Closed"
+        },
+        {
+          "textContains": "Tripped"
+        },
+        {
+          "textContains": "Anomaly samples"
+        }
+      ],
+      "description": "Card showing the cost circuit breaker state: green Shield icon with 'Closed' badge when healthy, red ShieldAlert icon with 'Tripped' badge when triggered. Shows anomaly detector stats.",
+      "precondition": "Circuit breaker is not tripped",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-anomaly-feed",
+      "name": "Anomaly Detection Feed",
+      "requiredElements": [
+        {
+          "textContains": "Anomaly Detection"
+        },
+        {
+          "textContains": "No anomalies detected"
+        },
+        {
+          "textContains": "z-score"
+        }
+      ],
+      "description": "Scrollable list of detected cost anomalies with z-scores, costs, and mean values. Yellow-tinted cards with severity indicators.",
+      "precondition": "No cost anomalies detected during the current or recent runs",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-budget-warnings",
+      "name": "Budget Warning Banner",
+      "requiredElements": [
+        {
+          "textContains": "Budget Warning"
+        },
+        {
+          "role": "button",
+          "accessibleName": "Dismiss warning"
+        },
+        {
+          "textContains": "more warning"
+        }
+      ],
+      "description": "Dismissible alert banner at the top of the page when budget warnings fire (>80% consumed). Shows remaining percentage, warning message, cost amounts, and dismiss button.",
+      "precondition": "A budget warning event has been emitted (budget >80% consumed)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-cost-feed-table",
+      "name": "Recent Cost Events Table",
+      "requiredElements": [
+        {
+          "textContains": "Recent Cost Events"
+        },
+        {
+          "textContains": "No cost events yet"
+        },
+        {
+          "textContains": "Cumulative"
+        },
+        {
+          "tagName": "tr"
+        }
+      ],
+      "description": "Scrollable table showing the last 50 cost events with time, phase, iteration, token counts, cost, cumulative cost, and cache hit rate. Newest events first.",
+      "precondition": "No workflow runs have generated cost events",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-recommendations",
+      "name": "Optimization Recommendations",
+      "requiredElements": [
+        {
+          "textContains": "Optimization Recommendations"
+        },
+        {
+          "textContains": "No cost optimization recommendations"
+        },
+        {
+          "textContains": "Optimization Recommendations"
+        },
+        {
+          "textContains": "Optimization Recommendations"
+        }
+      ],
+      "description": "Section showing cost optimization recommendations from the meta-optimizer and dashboard-derived insights. Includes cache efficiency, duplicate prompt detection, and model downgrade suggestions.",
+      "precondition": "No recommendations or insights available",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-visual-design",
+      "name": "Visual Design & Styling",
+      "requiredElements": [
+        {
+          "textContains": "Cost Control"
+        },
+        {
+          "textContains": "Cost by Phase"
+        },
+        {
+          "textContains": "Last 30 days"
+        },
+        {
+          "textContains": "Budget Warning"
+        }
+      ],
+      "description": "Design token compliance, color scheme, typography, and card styling across the Cost Control panel.",
+      "precondition": "Warning elements are visible",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-realtime-behavior",
+      "name": "Real-Time Data Flow",
+      "requiredElements": [
+        {
+          "textContains": "Recent Cost Events"
+        },
+        {
+          "textContains": "Budget Utilization"
+        },
+        {
+          "textContains": "Total Cost"
+        },
+        {
+          "accessibleName": "Refresh cost data"
+        }
+      ],
+      "description": "Real-time event subscription behavior: cost events update the feed table, budget warnings trigger the banner, anomaly events populate the anomaly feed, and dashboard queries refresh on cost events.",
+      "precondition": "A workflow run is active and making AI calls",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "cc-state-consistency",
+      "name": "Budget & Safety State Consistency",
+      "requiredElements": [
+        {
+          "textContains": "remaining"
+        },
+        {
+          "textContains": "Cumulative"
+        },
+        {
+          "textContains": "Circuit Breaker"
+        }
+      ],
+      "description": "Validates that the displayed budget, circuit breaker, and anomaly data is internally consistent and reflects the actual state of the cost management engine.",
+      "precondition": "Active budget exists",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Cost Control Panel — real-time budget tracking, cost anomaly detection, circuit breaker status, and cost optimization recommendations. Provides live monitoring during active workflow runs and historical cost analysis when idle. Budget gauge, phase breakdown chart, cost event feed, and recommendation engine.",
+  "metadata": {
+    "tags": [
+      "cost-optimization",
+      "budget-tracking",
+      "circuit-breaker",
+      "anomaly-detection",
+      "real-time",
+      "observability"
+    ]
+  }
+}

@@ -1753,8 +1753,8 @@ pub async fn run_unified_workflow(
                 .flat_map(|s| {
                     s.setup_automation_steps
                         .into_iter()
-                        .chain(s.verification_steps.into_iter())
-                        .chain(s.completion_automation_steps.into_iter())
+                        .chain(s.verification_steps)
+                        .chain(s.completion_automation_steps)
                 })
                 .collect();
 

@@ -1,0 +1,247 @@
+{
+  "version": "1.0",
+  "id": "turix-cua-multimodal",
+  "name": "TuriXCUAMultimodalPipeline",
+  "states": [
+    {
+      "id": "nav-vision-pages",
+      "name": "Vision Feature Page Reachability",
+      "requiredElements": [
+        {
+          "text": "AI Provider"
+        },
+        {
+          "text": "Agentic Verification"
+        },
+        {
+          "text": "Summary|complete|failed"
+        }
+      ],
+      "description": "Users access vision pipeline configuration and results across several existing pages. The AI provider settings page is where multimodal support is configured. The Run Options Dialog is where agentic verification architecture (including Brain/Actor) is selected before running a workflow. Run detail pages show the results. These are all existing pages that now carry additional data from the vision pipeline.",
+      "precondition": "A workflow exists in the workflow list and the user has opened the Run Options Dialog for it",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "presence-ai-settings",
+      "name": "AI Provider Settings Elements",
+      "requiredElements": [
+        {
+          "text": "Claude Code CLI"
+        },
+        {
+          "text": "Claude API"
+        },
+        {
+          "role": "textbox",
+          "text": "API Key|key"
+        },
+        {
+          "text": "Model"
+        },
+        {
+          "role": "button",
+          "text": "Test|Verify|Check"
+        }
+      ],
+      "description": "The Settings > AI page contains controls for selecting the AI provider and configuring API keys. The provider choice determines whether multimodal (vision) prompts are supported. Data is read and written via Tauri IPC commands (get_ai_settings, save_ai_settings) backed by settings.rs in the Rust backend. API keys are stored in the OS keychain via the keyring crate.",
+      "precondition": "An API provider (Claude API or Gemini API) is selected as the active provider",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "interaction-ai-settings",
+      "name": "AI Provider Settings Interactions",
+      "requiredElements": [
+        {
+          "text": "Claude API|Gemini API"
+        },
+        {
+          "role": "button",
+          "text": "Save"
+        },
+        {
+          "role": "button",
+          "text": "Test|Verify"
+        }
+      ],
+      "description": "Users interact with the AI settings to configure which provider powers their automation. Switching providers affects whether multimodal vision features work (API providers support images, CLI providers fall back to text-only).",
+      "precondition": "An API provider is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "presence-run-options-architecture",
+      "name": "Workflow Architecture Selection",
+      "requiredElements": [
+        {
+          "text": "Traditional|Agentic Verification|Multi-Agent Pipeline"
+        },
+        {
+          "text": "AI verifier"
+        }
+      ],
+      "description": "When launching a workflow, users choose the execution architecture from the Run Options Dialog. The 'Agentic Verification' architecture enables the verification-agent/worker-agent loop where the Brain/Actor vision pipeline operates. The architecture choice is stored in the workflow's LoopConfig and sent to the Rust backend via the /run Tauri command.",
+      "precondition": "The Run Options Dialog is open for a workflow",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "data-display-run-results",
+      "name": "Agentic Verification Run Results Display",
+      "requiredElements": [
+        {
+          "text": "complete|failed|stopped|achieved"
+        },
+        {
+          "text": "Pass|Fail|Partial|%"
+        },
+        {
+          "text": "worker|Worker|action"
+        },
+        {
+          "text": "Visual Analysis|Brain Agent|Brain Analysis"
+        },
+        {
+          "text": "\\[1\\]|\\[2\\]|Screen Elements"
+        },
+        {
+          "text": "token|cost|usage"
+        }
+      ],
+      "description": "After an agentic verification workflow completes, the Run Summary page displays per-iteration results. Each iteration shows the verification verdict (Pass/Fail/Partial with confidence percentage), worker summary, and timing. When Brain/Actor mode was active, iterations additionally show the Brain's screen analysis and action plan injected into the worker context. Data is fetched via Tauri IPC commands (get_task_run, get_task_run_events) reading from the PostgreSQL task_runs and task_run_events tables.",
+      "precondition": "At least one agentic verification workflow run has completed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "behavior-agentic-loop",
+      "name": "Agentic Verification Loop Behavior",
+      "requiredElements": [
+        {
+          "text": "iteration|Iteration|verif"
+        },
+        {
+          "role": "button",
+          "text": "Stop|stop"
+        },
+        {
+          "text": "achieved|complete|Pass"
+        },
+        {
+          "text": "max iterations|Max Iterations|iterations reached"
+        },
+        {
+          "text": "CLI|text-only|fallback"
+        }
+      ],
+      "description": "The agentic verification loop runs iterations of verification-agent followed by worker-agent until the goal is achieved or max_iterations is reached. Key automatic behaviors include: progressive iteration history compression (keeps context under 4000 chars), consecutive pass tracking (requires N passes before declaring success), and stop-signal responsiveness. When Brain/Actor mode is enabled, the Brain is invoked with multimodal prompts when should_invoke_brain() returns true (first iteration, cache expired, or RequestContext signal). The loop is orchestrated by LoopController in unified_workflow_executor/agentic_verification_loop.rs.",
+      "precondition": "An agentic verification workflow is currently running",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "state-consistency-config-execution",
+      "name": "Configuration-to-Execution State Consistency",
+      "requiredElements": [
+        {
+          "text": "Claude|Gemini|provider"
+        },
+        {
+          "text": "Agentic|Traditional|verdict|confidence"
+        },
+        {
+          "text": "iteration|Iteration"
+        }
+      ],
+      "description": "The UI must accurately reflect the relationship between configuration state (which provider is active, whether Brain/Actor is enabled) and execution results (whether multimodal was used, whether Brain analysis appears). Mismatches indicate bugs in the config propagation through the Tauri IPC layer.",
+      "precondition": "At least one workflow run has completed with the current provider configuration",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "interaction-run-detail",
+      "name": "Run Detail Interactions",
+      "requiredElements": [
+        {
+          "role": "tab|tablist",
+          "text": "Timeline|Verification|Knowledge"
+        },
+        {
+          "role": "button",
+          "text": "Continue"
+        },
+        {
+          "text": "AI Output|AI Data|output"
+        }
+      ],
+      "description": "Users interact with run detail pages to inspect iteration results, view AI output, and continue failed runs. The Run Summary page uses tabs (Timeline, Verification, Knowledge, Context, Canvas, Errors) for deep dives. Data is fetched from the Rust backend via get_task_run and get_task_run_events Tauri commands.",
+      "precondition": "A completed run's summary page is open",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "semantic-vision-pipeline",
+      "name": "Vision Pipeline Purpose and Mental Model",
+      "requiredElements": [
+        {
+          "text": "Agentic Verification"
+        },
+        {
+          "text": "Previous Attempts|iteration|approach"
+        },
+        {
+          "text": "Skill|skill|playbook|Playbook"
+        }
+      ],
+      "description": "The vision pipeline serves two user needs: (1) for developers automating their own web apps (UI Bridge white-box), it provides rich element data for intelligent verification without fragile selectors; (2) for automating third-party desktop apps (visual GUI black-box), it provides screenshot-based element detection with LLM vision reasoning. Users should understand which mode is active and why the system chose it.",
+      "precondition": "An agentic verification run with 3+ iterations has completed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "design-click-highlights",
+      "name": "Click Highlight Visual Design",
+      "requiredElements": [
+        {
+          "role": "presentation"
+        },
+        {
+          "role": "presentation"
+        }
+      ],
+      "description": "During automation execution, brief visual highlights appear at action locations (click, type, scroll targets). For UI Bridge apps, this is a CSS overlay injected by showClickHighlight() in debug/click-highlight.ts, called from action-executor.ts after each performAction() succeeds. Highlights use position:fixed, pointer-events:none, z-index:999999 to avoid interfering with the page. The animation is a pulsing circle that scales from 0.5 to 1.2 and fades from opacity 1 to 0 over 600ms.",
+      "precondition": "An action (click, type, etc.) has been executed via the UI Bridge action executor within the last 600ms",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The TuriX-CUA Multimodal Vision Pipeline adds visual AI capabilities to qontinui's agentic verification loop. When users run workflows with agentic verification architecture, the system can capture screenshots, annotate them with numbered element markers, and send annotated images to vision-capable LLMs (Claude API, Gemini API) for screen analysis. A two-phase Brain/Actor pattern splits expensive vision reasoning from cheap action execution. This spec covers the pages where these capabilities are configured (Settings > AI, Run Options Dialog), where results are displayed (Run Summary, Active Dashboard, AI Output), and where supporting features surface (Skills page for playbooks, action executor for click highlights). Data flows from the Rust backend through Tauri IPC commands to the React frontend.",
+  "metadata": {
+    "tags": [
+      "turix-cua",
+      "multimodal",
+      "vision",
+      "brain-actor",
+      "annotation",
+      "playbook",
+      "click-highlight",
+      "compression",
+      "agentic-verification"
+    ]
+  }
+}

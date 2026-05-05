@@ -1,0 +1,632 @@
+{
+  "version": "1.0",
+  "id": "state-machine",
+  "name": "UIBridgeStateMachinePage",
+  "states": [
+    {
+      "id": "sm-page-header",
+      "name": "Page Header and Config Selector",
+      "requiredElements": [
+        {
+          "text": "UI Bridge States"
+        },
+        {
+          "text": "Select configuration..."
+        },
+        {
+          "text": "Refresh"
+        },
+        {
+          "tagName": "h1"
+        }
+      ],
+      "description": "The page header shows a Network icon, the active config name (or 'UI Bridge States' when none is selected), and a config selector dropdown with a Refresh button. Users pick an existing config to load it. There is no 'New' or 'Delete' button — configs are created through the Discovery flow.",
+      "precondition": "No config is currently selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-tab-bar",
+      "name": "Tab Navigation Bar",
+      "requiredElements": [
+        {
+          "text": "Discovery"
+        },
+        {
+          "text": "Graph Editor"
+        },
+        {
+          "text": "State View"
+        },
+        {
+          "text": "Transitions"
+        },
+        {
+          "text": "Pathfinding"
+        },
+        {
+          "text": "Exploration Results"
+        },
+        {
+          "text": "Export"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "Seven tabs appear below the header and are always visible (regardless of config selection): Discovery, Graph Editor, State View, Transitions, Pathfinding, Exploration Results, and Export. The active tab is highlighted with a background shadow. Each tab has an icon and label.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-empty-states",
+      "name": "Empty States (No Config Selected)",
+      "requiredElements": [
+        {
+          "text": "Select a configuration to view the state graph"
+        },
+        {
+          "text": "Select a configuration to view states"
+        },
+        {
+          "text": "Select a configuration to view transitions"
+        },
+        {
+          "text": "Select a configuration to use pathfinding"
+        },
+        {
+          "text": "Select a configuration to export"
+        }
+      ],
+      "description": "When no config is selected, most tabs show centered placeholder text guiding the user. Discovery and Exploration Results tabs are always available regardless of config selection.",
+      "precondition": "No config is selected, Graph Editor tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-discovery-connect",
+      "name": "Discovery Tab: Connect to SDK App",
+      "requiredElements": [
+        {
+          "text": "Scan for Apps"
+        },
+        {
+          "text": "Connect to SDK App"
+        },
+        {
+          "text": "Connect"
+        },
+        {
+          "text": "Connected:"
+        },
+        {
+          "text": "Click Scan to find apps with the UI Bridge SDK installed."
+        }
+      ],
+      "description": "Phase 1 of the Discovery flow. Users scan for SDK-integrated apps (web and desktop), see discovered apps in a list, and connect to one. Once connected, a green 'Connected: [AppName]' banner appears and the app list hides. Auto-scans on mount.",
+      "precondition": "Discovery tab is active, no co-occurrence data collected yet",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-discovery-collect",
+      "name": "Discovery Tab: Data Collection (Explore/Record)",
+      "requiredElements": [
+        {
+          "text": "Explore"
+        },
+        {
+          "text": "Record"
+        },
+        {
+          "text": "Start Exploration"
+        },
+        {
+          "text": "Start Recording"
+        },
+        {
+          "text": "Stop Recording"
+        },
+        {
+          "text": "Progress:"
+        }
+      ],
+      "description": "Phase 2 of Discovery. After connecting to an app, two sub-tabs appear: 'Explore' (automated exploration) and 'Record' (manual capture session). Explore automatically interacts with UI elements; Record lets users manually navigate while capturing states. Both produce co-occurrence data for state discovery.",
+      "precondition": "Discovery tab is active, connected to an app",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-discovery-discover",
+      "name": "Discovery Tab: State Discovery and Save",
+      "requiredElements": [
+        {
+          "text": "Co-occurrence Data Collected"
+        },
+        {
+          "text": "Start Over"
+        },
+        {
+          "text": "Discover States"
+        },
+        {
+          "text": "Discovery Complete"
+        },
+        {
+          "text": "Save Configuration"
+        },
+        {
+          "role": "generic"
+        }
+      ],
+      "description": "Phase 3-4 of Discovery. After co-occurrence data is collected, the connection card hides and a data summary card appears. Users click 'Discover States' to run fingerprint-based state discovery. Results show discovered states with confidence scores. After auto-save or manual save with a config name, the user is redirected to the Graph Editor tab.",
+      "precondition": "Discovery tab is active, co-occurrence data has been collected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-graph-tab",
+      "name": "Graph Editor Tab Content",
+      "requiredElements": [
+        {
+          "text": "Add Transition"
+        },
+        {
+          "text": "No states discovered yet"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        }
+      ],
+      "description": "The Graph Editor tab renders an interactive node-edge graph using @xyflow/react with dagre layout. States are nodes and transitions are edges. A floating 'Add Transition' button is positioned at top-left. Clicking a node opens the state detail side panel; clicking an edge opens the transition editor side panel. Supports drag-and-drop element reassignment between states and transition deletion. An empty graph shows an instructional message.",
+      "precondition": "A config is selected, Graph Editor tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-graph-controls",
+      "name": "Graph Visualization Controls",
+      "requiredElements": [
+        {
+          "text": "Fit"
+        },
+        {
+          "text": "Re-layout"
+        },
+        {
+          "text": "Keyboard Shortcuts"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        }
+      ],
+      "description": "The graph canvas has control buttons in the top-right (Fit, keyboard shortcut toggle, Re-layout), a MiniMap in the bottom-right, and keyboard shortcuts. Nodes display element thumbnails, badges (START, outgoing/incoming counts), and confidence indicators. Extra shortcut entries show 'Create transition: Drag element' and 'Move element: Alt+Drag'.",
+      "precondition": "A config is selected with states, Graph Editor tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-states-tab",
+      "name": "State View Tab Content",
+      "requiredElements": [
+        {
+          "text": "States"
+        },
+        {
+          "role": "textbox"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "text": "No capture screenshots available"
+        }
+      ],
+      "description": "The State View tab shows all states using the shared StateViewPanel component. It supports three view modes: List (collapsible text list), Spatial (force-directed canvas), and Screenshot (three-panel viewer with bounding box overlays). State selection syncs with the graph tab's selectedStateId. No 'Add State' button — states come from Discovery.",
+      "precondition": "A config is selected, State View tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-transitions-tab",
+      "name": "Transitions Tab Content",
+      "requiredElements": [
+        {
+          "text": "Transitions"
+        },
+        {
+          "role": "textbox"
+        },
+        {
+          "text": "All from states"
+        },
+        {
+          "text": "Action Playback"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "text": "Select a transition to view its details"
+        },
+        {
+          "text": "No transitions match filters."
+        }
+      ],
+      "description": "The Transitions tab shows all transitions using the shared TransitionsPanel component with a left sidebar (searchable transition list with state filters) and a right detail panel with action playback controls.",
+      "precondition": "A config is selected, Transitions tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-pathfinding-tab",
+      "name": "Pathfinding Tab Content",
+      "requiredElements": [
+        {
+          "text": "Pathfinding"
+        },
+        {
+          "text": "From"
+        },
+        {
+          "text": "To"
+        },
+        {
+          "text": "Find Path"
+        },
+        {
+          "text": "Dijkstra"
+        },
+        {
+          "role": "generic"
+        }
+      ],
+      "description": "The Pathfinding tab provides graph pathfinding between states using the shared PathfindingPanel component. Users select a 'From' and 'To' state from dropdowns, choose an algorithm (Dijkstra or BFS), and click 'Find Path'. Results show the path steps with transition names and costs. Found paths are highlighted on the graph.",
+      "precondition": "A config is selected, Pathfinding tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-sidebar-state-detail",
+      "name": "Side Panel: State Detail",
+      "requiredElements": [
+        {
+          "text": "State Details"
+        },
+        {
+          "text": "Name"
+        },
+        {
+          "text": "State ID"
+        },
+        {
+          "text": "Elements"
+        },
+        {
+          "text": "Acceptance Criteria"
+        },
+        {
+          "text": "Domain Knowledge"
+        },
+        {
+          "text": "Save Changes"
+        }
+      ],
+      "description": "When a state is selected in the Graph Editor, a w-80 side panel opens on the right showing the shared StateDetailPanel component. It provides a 'State Details' header with Close button, editable name, description, metadata grid, element list with type-colored badges, acceptance criteria list, domain knowledge cards, and save/delete actions.",
+      "precondition": "A state is selected in Graph Editor, side panel is open",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-sidebar-transition-detail",
+      "name": "Side Panel: Transition Editor",
+      "requiredElements": [
+        {
+          "text": "New Transition"
+        },
+        {
+          "text": "Edit Transition"
+        },
+        {
+          "role": "textbox"
+        },
+        {
+          "text": "From States"
+        },
+        {
+          "text": "Actions"
+        },
+        {
+          "text": "Path Cost"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "When a transition is selected or 'Add Transition' is clicked in the Graph Editor, a w-80 side panel opens on the right showing the shared TransitionEditor component. In create mode it shows 'New Transition' header; in edit mode it shows 'Edit Transition' header. The editor provides a Close button, name input, state toggle groups (From, Activate, Exit), action list with type-specific fields, path cost, and stays-visible checkbox.",
+      "precondition": "User clicked 'Add Transition', side panel is open",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-exploration-dashboard",
+      "name": "Exploration Results: Summary Dashboard",
+      "requiredElements": [
+        {
+          "text": "Exploration Results"
+        },
+        {
+          "text": "Dashboard"
+        },
+        {
+          "text": "History"
+        },
+        {
+          "text": "Overall Pass Rate"
+        },
+        {
+          "text": "State Coverage"
+        },
+        {
+          "text": "Transition Coverage"
+        }
+      ],
+      "description": "The Exploration Results tab shows a summary dashboard with pass rate, state coverage, transition coverage, discrepancy counts by severity, and recent exploration runs. View mode toggles allow switching between Dashboard and History views. An AI Analysis button is shown (disabled until a run is selected). The tab uses off-screen positioning instead of display:none so that UI Bridge SDK can still scan severity elements when the tab is inactive.",
+      "precondition": "Exploration Results tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-exploration-discrepancies",
+      "name": "Exploration Results: Discrepancy Severity Groups",
+      "requiredElements": [
+        {
+          "text": "Discrepancy Counts"
+        },
+        {},
+        {},
+        {},
+        {
+          "role": "list"
+        }
+      ],
+      "description": "The dashboard displays discrepancy counts grouped by severity in a 3-column grid: Critical (red, XCircle icon), Warning (amber, AlertTriangle icon), and Info (blue, Info icon). Each severity group has a data-testid attribute for automated testing. A role='list' with aria-label='discrepancy severity groups critical warning info' wraps the groups.",
+      "precondition": "Exploration Results tab is active, Dashboard view",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-exploration-history",
+      "name": "Exploration Results: History and Run List",
+      "requiredElements": [
+        {
+          "text": "Recent Exploration Runs"
+        },
+        {
+          "text": "Refresh"
+        },
+        {
+          "text": "No exploration history"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "Exploration History"
+        }
+      ],
+      "description": "The dashboard shows recent exploration runs (up to 5) and the History view shows all runs. Each run row displays a status badge (Passed/Failed/Unknown), config name, strategy badge (color-coded), timestamp, summary text, and run ID. Clicking a run navigates to the detail view.",
+      "precondition": "Exploration Results tab is active, Dashboard view",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-exploration-detail",
+      "name": "Exploration Results: Detail View",
+      "requiredElements": [
+        {
+          "role": "button"
+        },
+        {
+          "text": "Pass Rate"
+        },
+        {
+          "text": "Discrepancies by Severity"
+        },
+        {
+          "text": "State Details"
+        },
+        {
+          "text": "AI Analysis"
+        }
+      ],
+      "description": "When a run is selected, the detail view shows the report header (config name, strategy badge, timestamp), summary stats grid (Pass Rate, States, Transitions, Discrepancies), discrepancies by severity, expandable state detail cards with confidence scores and element verification, and an AI Analysis prompt button.",
+      "precondition": "Exploration Results tab is active, detail view of a run",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-export-tab",
+      "name": "Export Tab",
+      "requiredElements": [
+        {
+          "text": "Export"
+        },
+        {
+          "text": "UIBridgeRuntime.from_dict()"
+        },
+        {
+          "text": "Save to File"
+        },
+        {
+          "text": "Load into Runtime"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "The Export tab provides a centered panel with a FileJson icon heading, description text about JSON export compatible with UIBridgeRuntime.from_dict(), config summary (name, state count, transition count), and two action buttons: 'Save to File' (Tauri save dialog) and 'Load into Runtime' (POST to /state-machine/load). Both show spinners during operation.",
+      "precondition": "A config is selected, Export tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-discovery-algorithm",
+      "name": "Discovery Algorithm: Fingerprint-Based State Grouping",
+      "requiredElements": [
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "text": "captures"
+        }
+      ],
+      "description": "The state discovery algorithm uses fingerprint-based co-occurrence analysis to group UI elements into states. Co-occurrence data is collected via exploration (automated interaction) or recording (manual capture). Each capture produces a fingerprint of visible interactive elements. States are discovered by clustering fingerprints with similar element sets. The algorithm correctness can be verified by examining the discovered states' element lists and confidence scores.",
+      "precondition": "Discovery has completed with results",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-state-model-rules",
+      "name": "State Model Rules (qontinui/multistate)",
+      "requiredElements": [
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        },
+        {
+          "role": "generic"
+        }
+      ],
+      "description": "The state machine follows the multistate model (qontinui/multistate), which extends model-based GUI automation theory. These rules define how states, elements, and screenshots relate to each other. The multistate formal model is Ω = (S, T, G, ω, Td) where S is the set of states, T the transitions, G state groups, ω the occlusion function, and Td dynamic transition generation. All state machine features — discovery, graph editing, state view, screenshots, and export — must conform to these rules. Source: https://qontinui.github.io/multistate/",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sm-observation-pipeline",
+      "name": "Observation Pipeline Surface",
+      "requiredElements": [
+        {
+          "textContains": "Drift fit score"
+        },
+        {
+          "role": "button",
+          "text": "Re-derive all"
+        },
+        {
+          "role": "button",
+          "text": "Invalidate spec observations"
+        },
+        {
+          "textContains": "Invalidation log"
+        },
+        {
+          "textContains": "No invalidations"
+        },
+        {
+          "text": "Invalidation log"
+        },
+        {
+          "text": "observed"
+        },
+        {
+          "text": "ai-generated"
+        },
+        {
+          "text": "ai-fallback"
+        },
+        {
+          "text": "Re-derive all"
+        },
+        {
+          "text": "State View"
+        }
+      ],
+      "description": "Co-occurrence observations drive state element lists via a derive → promote → invalidate → undo loop. The page surface exposes this via ObservationsPanel (mounted below the page header) and ProvenanceBadge (rendered next to each state name in the detail panel). ObservationsPanel shows the most recent drift fit_score (from GET /state-discovery/drift-scores), offers a 'Re-derive all' bulk action (POST /state-discovery/derive?window_days=90), an 'Invalidate spec observations' button (POST /co-occurrence/invalidate — disabled with tooltip when the StateMachineConfig has no spec_id), and an invalidation log table fed by GET /co-occurrence/invalidations. Each invalidation is grouped by undo_token; rows within the 24 h window show an Undo button (POST /co-occurrence/invalidate/undo). ProvenanceBadge renders three variants — green 'observed' (with support/contrast tooltip + observation count + age), gray 'ai-generated', yellow 'ai-fallback' (with invalidation age). Missing provenance on older compiled SMs silently falls back to 'ai-generated'.",
+      "precondition": "No invalidations have been emitted for this spec within the current window",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "UI Bridge State Machine page — connect to SDK-integrated apps, discover UI states via automated exploration or manual recording with fingerprint-based co-occurrence analysis, then manage state machine configs across seven tabs: Discovery (SDK app connection, explore/record data collection, fingerprint-based state discovery with auto-save), Graph Editor (interactive dagre node-edge layout with element thumbnails, drag-and-drop element reassignment, transition creation), State View (list + spatial + screenshot modes via shared StateViewPanel), Transitions (list with action playback via shared TransitionsPanel), Pathfinding (find optimal paths between states via shared PathfindingPanel), Exploration Results (dashboard with pass rate, coverage stats, discrepancy severity groups, history list, and per-state detail with confidence scores, element verification, and AI analysis prompt), and Export (save to JSON file or load into Python runtime).",
+  "metadata": {
+    "tags": [
+      "runner",
+      "state-machine",
+      "builder",
+      "graph",
+      "config",
+      "ui-bridge",
+      "discovery"
+    ]
+  }
+}

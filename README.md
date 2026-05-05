@@ -222,6 +222,26 @@ npm run tauri build
 # Linux:   src-tauri/target/release/bundle/appimage/
 ```
 
+## Scripts
+
+CI-friendly helpers in `scripts/` that don't require booting the runner:
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/coverage-diff.mjs` | Gate regression-suite coverage in CI. Wraps the pure `coverageDiff` from `@qontinui/ui-bridge-auto/regression`; exits non-zero when `uncoveredRatio` exceeds a threshold. |
+| `scripts/validate-ws-actions.mjs` | Cross-language action-name validator (runner Rust ↔ wrapper SDK TS). |
+
+Example — fail CI when more than 10% of regression assertions are un-exercised:
+
+```bash
+npm run coverage-diff -- \
+  --suite ./suite.json \
+  --exercise-log ./exercise-log.json \
+  --threshold 0.10
+```
+
+`--format json` prints the full `CoverageDiffReport` for piping into other tools. Run `node scripts/coverage-diff.mjs --help` for the full usage and exit-code matrix. Tests live at `scripts/__tests__/coverage-diff.test.mjs` and run via `npm run coverage-diff:test`.
+
 ## Wrappers
 
 The wrapper subsystem (install, list, dispatch, credentials) is **owned by the primary runner**.

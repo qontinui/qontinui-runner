@@ -1,0 +1,395 @@
+{
+  "version": "1.0",
+  "id": "specs",
+  "name": "SpecsPage",
+  "states": [
+    {
+      "id": "page-structure",
+      "name": "Page Structure and View Modes",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Specs"
+        },
+        {
+          "text": "viewer"
+        },
+        {
+          "role": "button",
+          "text": "Editor"
+        },
+        {
+          "role": "button",
+          "text": "Contracts"
+        },
+        {
+          "role": "button",
+          "text": "Experimentation"
+        },
+        {
+          "role": "button",
+          "text": "Contracts"
+        }
+      ],
+      "description": "The Specs page header contains a ShieldCheck icon, the 'Specs' title, a mode badge ('viewer' or 'editor'), and three view-mode toggle buttons on the right: Editor (default), Contracts, and Experimentation. The initial view mode is 'Editor'. Each button activates its mode and the selected button gets a highlighted background.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "connection-bar-load",
+      "name": "Connection Bar — Spec Loading Controls",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {},
+        {},
+        {}
+      ],
+      "description": "Below the page header, the connection bar provides controls for loading specs. 'Bundled' (purple, BookOpen icon) loads all pre-packaged specs shipped with the runner. 'File' (emerald, FolderOpen icon) opens a file dialog to load spec files from disk. A URL input (defaulting to http://localhost:3001) and 'Discover' (cyan, Search icon) button connect to a running application via UI Bridge to discover its specs. These controls are always visible regardless of current spec selection state.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "connection-bar-actions",
+      "name": "Connection Bar — Spec Action Controls",
+      "requiredElements": [
+        {},
+        {},
+        {},
+        {},
+        {},
+        {
+          "text": "specs"
+        }
+      ],
+      "description": "When a spec is selected, additional action buttons appear in the connection bar. 'Edit'/'Done' (amber, Pencil/PencilOff icon) toggles edit mode for page specs. 'Save' (Save icon) exports the selected spec to disk. 'AI Eval' (Brain icon, amber when active) forces all assertions to be AI-evaluated instead of using fast deterministic checks. 'Regression (N)' (Bug icon, purple) appears only when known issues exist and N > 0. 'Generate with AI (spec brief)' (Sparkles, fuchsia when on, id=specs-ai-toggle, role=switch) toggles the AI workflow-generation pipeline. 'Build Workflow'/'Generating…' (orange Hammer/Loader2) builds a verification workflow. 'Sync All Specs' (teal RefreshCw) re-syncs all stale specs with AI. 'Check Drift' (SpecDriftButton) scans source for unspecced elements. 'Compile State Machine' (violet Network) compiles stateMachine sections into the runtime engine.",
+      "precondition": "A page-spec is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "connection-status-row",
+      "name": "Connection Status Row",
+      "requiredElements": [
+        {
+          "text": "Connecting"
+        },
+        {
+          "text": "Connected"
+        }
+      ],
+      "description": "A second row below the connection bar buttons appears when the connection status is not 'disconnected'. It shows real-time discovery status: cyan spinner and 'Connecting…' while in flight, green CheckCircle2 and the app name when connected, red AlertCircle and the error message when discovery failed. The row is absent when disconnected.",
+      "precondition": "Discover was clicked and the request is in flight",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sync-progress-banner",
+      "name": "Sync Progress Banner",
+      "requiredElements": [
+        {
+          "text": "Analyzing specs"
+        },
+        {
+          "text": "Sync complete"
+        },
+        {}
+      ],
+      "description": "When 'Sync All Specs' is triggered, a teal-tinted banner appears below the connection bar showing real-time sync progress. Phase labels cycle through: 'Analyzing specs…', 'Syncing N+1/M' (with a progress bar and current spec name truncated to 200px), 'Compiling state machine…', and 'Sync complete'. On completion the banner shows counts: green 'N updated' (CheckCircle2), muted 'M skipped', optional red 'K failed' (AlertTriangle), optional amber 'J warnings'. An X button cancels in-progress syncs or dismisses the completed banner.",
+      "precondition": "Sync All Specs was clicked with at least one spec loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "spec-tree",
+      "name": "Spec Tree — Navigation Sidebar",
+      "requiredElements": [
+        {
+          "text": "Specifications"
+        },
+        {
+          "text": "No specs loaded"
+        },
+        {
+          "text": "Specifications"
+        },
+        {
+          "text": "Specifications"
+        },
+        {
+          "text": "Specifications"
+        }
+      ],
+      "description": "The left sidebar shows a hierarchical tree of all loaded specs under a 'Specifications' heading. Specs are grouped by application name when specs from multiple apps are loaded. Each node shows a type-specific icon (Shield for page-spec, Server for architecture, Globe for API, Database for data, GitBranch for dependency, Gauge for constraint), a truncated label, and a child-item count in muted text. Page specs expand via a ChevronRight/ChevronDown chevron to show child group nodes. data-ui-id attributes follow the pattern 'spec-tree-{specId}'.",
+      "precondition": "No specs have been loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "detail-panel-empty",
+      "name": "Detail Panel — No Selection",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Generate Spec"
+        },
+        {
+          "role": "button",
+          "text": "Generate Spec"
+        }
+      ],
+      "description": "When no spec is selected, the center detail panel renders the GlobalIssuesPanel component. When an unspecced-page node is selected, a centered view appears with an amber Shield icon, the page label as a heading, the expected spec ID in a code element (amber text), and a 'Generate Spec' button (purple Plus icon) that triggers AI spec creation.",
+      "precondition": "An unspecced-page node is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "detail-panel-tabs",
+      "name": "Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Assertions"
+        },
+        {
+          "role": "button",
+          "text": "Issues"
+        },
+        {
+          "role": "button",
+          "text": "Triage"
+        },
+        {
+          "role": "button",
+          "text": "Issues"
+        }
+      ],
+      "description": "When a page-spec is selected at the spec level (not a group), the center panel shows three tabs: 'Assertions' (Shield icon, default active) renders PageSpecOverview. 'Issues' (Bug icon) renders SpecIssuesPanel showing known issues filtered by specId and pageUrl. 'Triage' (AlertTriangle icon) renders SpecTriageView for regression triage. The active tab has a highlighted border-b-0 rounded-t style. Tab state is local to SpecDetailPanel and resets when a new spec is selected.",
+      "precondition": "A page-spec is selected at the spec level",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "detail-panel-spec-overview",
+      "name": "Detail Panel — Page Spec Overview (Assertions Tab)",
+      "requiredElements": [
+        {
+          "text": "Groups"
+        },
+        {
+          "text": "Categories"
+        },
+        {
+          "text": "Groups"
+        }
+      ],
+      "description": "The Assertions tab for a selected page-spec renders PageSpecOverview: the spec ID as a heading, description text, a 'Categories' section listing unique assertion categories used, and a 'Groups' section listing all groups. Each group row shows its category badge, name, and enabled assertion count. Clicking a group row navigates to GroupDetail for that group. In edit mode, groups show trash icons and an 'Add group' form appears at the bottom.",
+      "precondition": "A page-spec with at least one group is selected on the Assertions tab",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "detail-panel-group-detail",
+      "name": "Detail Panel — Group Detail View",
+      "requiredElements": [
+        {
+          "text": "critical"
+        },
+        {
+          "text": "critical"
+        }
+      ],
+      "description": "When a group node is selected, the center panel shows GroupDetail: the group name as a heading with a category badge, the group description, and a scrollable list of all assertions. Each assertion row shows a severity badge (red=critical, yellow=warning, blue=info), eye icon for enabled state (full opacity=enabled, dimmed=disabled), description text, assertionType badge, category badge, and source badge. A precondition tag appears when set. In edit mode, eye icons are clickable and trash icons appear.",
+      "precondition": "A group with at least one assertion is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "edit-mode",
+      "name": "Edit Mode — Inline Assertion and Group Management",
+      "requiredElements": [
+        {
+          "text": "editor"
+        },
+        {
+          "text": "Done"
+        },
+        {
+          "role": "button",
+          "text": "Add assertion"
+        },
+        {
+          "role": "button",
+          "text": "Add group"
+        }
+      ],
+      "description": "Edit mode is activated by clicking 'Edit' in the connection bar (only available for page-spec selections). The mode badge changes from 'viewer' to 'editor', and the Edit button shows 'Done' in amber. In group detail: eye icons become clickable toggles, trash icons appear on each assertion, and an 'Add assertion' button reveals an inline form. In spec overview: group rows show trash icons and an 'Add group' button reveals a creation form. Clicking 'Done' exits edit mode.",
+      "precondition": "Edit mode is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-chat-panel",
+      "name": "AI Chat Panel",
+      "requiredElements": [
+        {
+          "text": "AI Chat"
+        },
+        {
+          "role": "button",
+          "text": "New"
+        },
+        {
+          "text": "Apply as"
+        },
+        {
+          "text": "AI Chat"
+        }
+      ],
+      "description": "The right panel is the AI Chat interface. It shows an 'AI Chat' heading, a scrollable message history, a textarea input, and a send/stop button. User messages show a cyan User icon in a small circle with cyan-tinted background. AI responses show a purple Bot icon with dark background and full markdown rendering (code blocks, lists, inline code). System messages appear centered in italic muted text. A session status indicator and a 'New' button reset the session and clear history. When the AI generates a spec JSON in a ```json block, an 'Apply as [type] spec' button appears below the message with data-testid='apply-{kind}-{specId}'.",
+      "precondition": "The AI has responded with a message containing a valid spec JSON code block",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-chat-modes",
+      "name": "AI Chat — Review and Create Modes",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Review"
+        },
+        {
+          "role": "button",
+          "text": "Create"
+        },
+        {
+          "role": "button",
+          "text": "Review spec quality"
+        },
+        {
+          "role": "button",
+          "text": "Build verification workflow"
+        },
+        {
+          "role": "button",
+          "text": "New Page Spec"
+        }
+      ],
+      "description": "The chat panel has two toggle modes: 'Review' and 'Create'. In Review mode, four quick-action buttons appear ('Review spec quality', 'Find gaps', 'Suggest improvements', 'Generate assertions'), and for page specs a 'Build verification workflow' button (Hammer) also appears. In Create mode, template buttons appear ('New Page Spec', 'New Architecture Spec', 'New API Spec', 'New Data Spec'). The modes are mutually exclusive toggles — clicking the active mode's button deactivates it. Input placeholder text reflects the active mode.",
+      "precondition": "Review mode is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "workflow-pipeline",
+      "name": "Build Workflow Pipeline",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "The 'Build Workflow' button triggers workflow generation from the selected spec. Two paths exist: AI path (toggle on, default) calls buildSpecBrief() → generateFromBrief() to produce a richer workflow with setup/navigation steps; deterministic path (toggle off) calls buildSpecWorkflow() for a straightforward assertion verification workflow. For non-page specs, the workflow embeds the full spec JSON as an agentic step prompt. All workflows are POSTed to /unified-workflows with category='spec-generated' and tags=['spec','auto-generated'], then the user is navigated to the workflow builder tab.",
+      "precondition": "A page-spec is selected and AI toggle is on (aria-pressed=true)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "spec-drift",
+      "name": "Spec Drift Detection",
+      "requiredElements": [
+        {
+          "text": "Check Drift"
+        },
+        {
+          "text": "Check Drift"
+        }
+      ],
+      "description": "The SpecDriftButton in the connection bar invokes the Tauri 'scan_spec_drift' command with the runner project root (D:/qontinui-root/qontinui-runner). It scans source files for useUIElement({ id: '...' }) registrations and compares them against assertion target IDs in all loaded .spec.uibridge.json files. The resulting DriftReport has two lists: missing_from_spec (elements in code but not in specs) and orphans_in_spec (assertion targets not matching any useUIElement registration). Results are shown in a modal with suggested assertion JSON for copy-paste.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "compile-state-machine",
+      "name": "Compile State Machine",
+      "requiredElements": [
+        {},
+        {}
+      ],
+      "description": "The 'Compile State Machine' button (violet Network icon, id=specs-btn-compile-sm) compiles the stateMachine sections from all loaded .spec.uibridge.json files into a single runtime state machine via compileStateMachineFromSpecs(). It then persists the result to the backend DB via persistCompiledStateMachine() and loads it into the UI Bridge engine so the pathfinder can navigate by state ID. Specs without a stateMachine section are skipped. This is distinct from the State Machine page's 'Generate for Runner' which reverse-engineers from React source.",
+      "precondition": "At least one spec with a stateMachine section is loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "file-operations",
+      "name": "File Loading and Saving",
+      "requiredElements": [
+        {},
+        {},
+        {}
+      ],
+      "description": "Specs can be loaded from and saved to disk via Tauri file dialogs. Loading supports six extensions: .spec.uibridge.json (page-spec), .architecture.uibridge.json, .api.uibridge.json, .data.uibridge.json, .deps.uibridge.json, .constraints.uibridge.json. Kind detection is from filename extension first, then content structure (groups array → page-spec, endpoints → api, entities → data, modules → dependency, budgets/techStack → constraint/architecture). Loaded file specs appear under 'File' in the tree and are auto-selected. Saving exports the config as indented JSON with the correct extension.",
+      "precondition": "Any spec is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "ai-generation-toggle",
+      "name": "AI Spec-Brief Toggle",
+      "requiredElements": [
+        {
+          "role": "switch"
+        },
+        {},
+        {
+          "text": "Generating"
+        }
+      ],
+      "description": "The 'Generate with AI (spec brief)' switch (id=specs-ai-toggle, role=switch) controls which pipeline runs when 'Build Workflow' is clicked. On by default (aria-pressed=true, fuchsia). Off state (aria-pressed=false, muted) routes to deterministic buildSpecWorkflow(). State persists via instanceStorage key 'specs.useAiGeneration'. The Sparkles icon always shows regardless of state.",
+      "precondition": "AI toggle is on and Build Workflow was clicked with a spec selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Specs Viewer/Editor page — a three-panel layout for viewing, editing, and managing project specifications of all types (page specs, architecture, API, data, dependency, constraint). The left panel shows a hierarchical spec tree grouped by application. The center panel shows spec details with inline editing, a tabbed view (Assertions / Issues / Triage) for page specs, and specialized views for other spec types. The right panel provides AI chat for spec review, gap analysis, creation, and workflow building. A connection bar below the header provides buttons to load bundled specs, load/save files, discover specs from running apps via UI Bridge, toggle edit mode, trigger AI eval, run spec sync, check drift, and compile the runtime state machine. The page header offers three view modes: Editor (default), Contracts, and Experimentation.",
+  "metadata": {
+    "tags": [
+      "specs",
+      "viewer",
+      "editor",
+      "ai-chat",
+      "workflow-builder",
+      "spec-tree",
+      "ui-bridge",
+      "sync",
+      "drift",
+      "compile-state-machine",
+      "contracts",
+      "experimentation"
+    ]
+  }
+}

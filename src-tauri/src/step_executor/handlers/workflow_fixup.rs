@@ -219,7 +219,7 @@ impl WorkflowFixupHandler {
 
         // Check that each automatable criterion has a matching verification step with criterion_id
         let mut missing_criteria = Vec::new();
-        let mut covered = 0;
+        let mut covered: usize = 0;
 
         // Collect criterion_ids from verification steps
         let mut step_criterion_ids: Vec<String> = Vec::new();
@@ -258,11 +258,9 @@ impl WorkflowFixupHandler {
             .filter(|c| c.method != VerificationMethod::Manual)
             .count();
 
-        let coverage_pct = if automatable_count > 0 {
-            covered * 100 / automatable_count
-        } else {
-            100
-        };
+        let coverage_pct = (covered * 100)
+            .checked_div(automatable_count)
+            .unwrap_or(100);
 
         if missing_criteria.is_empty() {
             StepHandlerResult::success_with_data(serde_json::json!({

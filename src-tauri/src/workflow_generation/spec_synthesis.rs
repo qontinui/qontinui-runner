@@ -839,18 +839,22 @@ pub fn classify_spec_target(criteria: &AcceptanceCriteria, description: &str) ->
     }
 }
 
-/// Write a group to a specific spec file, replacing any existing group with the same ID.
-fn write_group_to_spec_file(
-    path: &std::path::Path,
+/// Write a group to a page's projection, replacing any existing group with
+/// the same ID. Reads + writes through the Spec API storage helpers so the
+/// projection lives at `<specs_root>/pages/<page_id>/spec.uibridge.json`.
+///
+/// Returns the absolute path of the written projection on success.
+fn write_group_to_page_projection(
+    specs_root: &std::path::Path,
+    page_id: &str,
     group: &Value,
     group_id: &str,
     criteria_count: usize,
-) -> Result<(), String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-
-    let mut spec_json: Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+) -> Result<std::path::PathBuf, String> {
+    let mut spec_json = match crate::spec_api::storage::read_projection(specs_root, page_id)? {
+        Some(v) => v,
+        None => return Err(format!("Page '{}' has no projection to update", page_id)),
+    };
 
     // Replace existing group if present
     if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
@@ -858,9 +862,8 @@ fn write_group_to_spec_file(
         groups.retain(|g| g.get("id").and_then(|v| v.as_str()) != Some(group_id));
         if groups.len() < had_group {
             debug!(
-                "Spec {:?} had existing group '{}', replacing",
-                path.file_name(),
-                group_id
+                "Page '{}' had existing group '{}', replacing",
+                page_id, group_id
             );
         }
     }
@@ -883,34 +886,35 @@ fn write_group_to_spec_file(
         );
     }
 
-    let updated_content = serde_json::to_string_pretty(&spec_json)
-        .map_err(|e| format!("Failed to serialize {}: {}", path.display(), e))?;
-
-    std::fs::write(path, updated_content)
-        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    let written = crate::spec_api::storage::write_projection(specs_root, page_id, &spec_json)?;
 
     info!(
-        "Updated spec {:?} with {} acceptance criteria",
-        path.file_name(),
-        criteria_count,
+        "Updated projection for page '{}' with {} acceptance criteria",
+        page_id, criteria_count,
     );
 
-    Ok(())
+    Ok(written)
 }
 
 /// Update page spec files by appending acceptance criteria as a new SpecGroup.
 ///
-/// Scans spec files in the given directories, scores each against the workflow
-/// description, and appends the criteria as a new group to matching specs
-/// (score >= `match_threshold`).
+/// Scans page projections under the Spec API storage root (e.g.
+/// `<runner>/specs/pages/<id>/spec.uibridge.json`), scores each against the
+/// workflow description, and appends the criteria as a new group to matching
+/// pages (score >= `match_threshold`).
 ///
 /// For backend/infra criteria that match no page spec, falls back to a
-/// catch-all `workflow-criteria.spec.uibridge.json` file. Tooling/ops
-/// prompts are skipped entirely.
+/// catch-all `workflow-criteria` page. Tooling/ops prompts are skipped
+/// entirely.
+///
+/// Note: this function writes only the projection (`spec.uibridge.json`).
+/// The IR (`state-machine.derived.json`) is left untouched because the IR
+/// has no `groups` shape yet — see ADR-013.5 for the IR/projection desync
+/// caveat.
 pub fn update_page_specs_from_criteria(
     criteria: &AcceptanceCriteria,
     description: &str,
-    spec_dirs: &[&std::path::Path],
+    specs_root: &std::path::Path,
     match_threshold: f32,
 ) -> PageSpecUpdateResult {
     let start = Instant::now();
@@ -934,58 +938,73 @@ pub fn update_page_specs_from_criteria(
 
     let new_group = criteria_to_spec_group(criteria);
     let group_id = "wf-acceptance-criteria";
+    const CATCHALL_PAGE_ID: &str = "workflow-criteria";
+
+    let page_ids = match crate::spec_api::storage::list_pages(specs_root) {
+        Ok(ids) => ids,
+        Err(e) => {
+            debug!(
+                "Cannot list pages under {:?}: {} — skipping page spec update",
+                specs_root, e
+            );
+            return result;
+        }
+    };
 
     // Try to match against existing page specs
-    for spec_dir in spec_dirs {
-        let entries = match std::fs::read_dir(spec_dir) {
-            Ok(e) => e,
+    for page_id in &page_ids {
+        // Skip the catch-all during page matching
+        if page_id == CATCHALL_PAGE_ID {
+            continue;
+        }
+
+        let spec_json = match crate::spec_api::storage::read_projection(specs_root, page_id) {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
             Err(e) => {
-                debug!("Cannot read spec dir {:?}: {}", spec_dir, e);
+                result
+                    .errors
+                    .push(format!("Failed to read page '{}': {}", page_id, e));
                 continue;
             }
         };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let score = score_spec_match(&spec_json, description);
+        if score < match_threshold {
+            continue;
+        }
 
-            if !file_name.ends_with(".spec.uibridge.json") {
-                continue;
+        match write_group_to_page_projection(
+            specs_root,
+            page_id,
+            &new_group,
+            group_id,
+            criteria.criteria.len(),
+        ) {
+            Ok(path) => {
+                result.specs_updated += 1;
+                result.updated_paths.push(path.display().to_string());
             }
-
-            // Skip the catch-all file during page matching
-            if file_name == "workflow-criteria.spec.uibridge.json" {
-                continue;
+            Err(e) => {
+                result.errors.push(e);
             }
+        }
+    }
 
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    result
-                        .errors
-                        .push(format!("Failed to read {}: {}", path.display(), e));
-                    continue;
-                }
-            };
-
-            let spec_json: Value = match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    result
-                        .errors
-                        .push(format!("Failed to parse {}: {}", path.display(), e));
-                    continue;
-                }
-            };
-
-            let score = score_spec_match(&spec_json, description);
-
-            if score < match_threshold {
-                continue;
-            }
-
-            match write_group_to_spec_file(&path, &new_group, group_id, criteria.criteria.len()) {
-                Ok(()) => {
+    // If no page spec matched, fall back to the catch-all page. This handles
+    // backend/infra criteria that don't map to any UI page. The
+    // `workflow-criteria` page is pre-created in the runner repo and included
+    // in the spec registry so it appears in the Specs page UI.
+    if result.specs_updated == 0 {
+        if page_ids.iter().any(|id| id == CATCHALL_PAGE_ID) {
+            match write_group_to_page_projection(
+                specs_root,
+                CATCHALL_PAGE_ID,
+                &new_group,
+                group_id,
+                criteria.criteria.len(),
+            ) {
+                Ok(path) => {
                     result.specs_updated += 1;
                     result.updated_paths.push(path.display().to_string());
                 }
@@ -993,40 +1012,11 @@ pub fn update_page_specs_from_criteria(
                     result.errors.push(e);
                 }
             }
-        }
-    }
-
-    // If no page spec matched, fall back to the catch-all spec file.
-    // This handles backend/infra criteria that don't map to any UI page.
-    // The file workflow-criteria.spec.uibridge.json is pre-created in the repo
-    // and included in the spec registry so it appears in the Specs page UI.
-    if result.specs_updated == 0 {
-        let mut found_catchall = false;
-        for spec_dir in spec_dirs {
-            let catchall_path = spec_dir.join("workflow-criteria.spec.uibridge.json");
-            if catchall_path.exists() {
-                match write_group_to_spec_file(
-                    &catchall_path,
-                    &new_group,
-                    group_id,
-                    criteria.criteria.len(),
-                ) {
-                    Ok(()) => {
-                        result.specs_updated += 1;
-                        result
-                            .updated_paths
-                            .push(catchall_path.display().to_string());
-                    }
-                    Err(e) => {
-                        result.errors.push(e);
-                    }
-                }
-                found_catchall = true;
-                break;
-            }
-        }
-        if !found_catchall {
-            debug!("No catch-all spec file (workflow-criteria.spec.uibridge.json) found in spec directories");
+        } else {
+            debug!(
+                "No catch-all page '{}' found under {:?}",
+                CATCHALL_PAGE_ID, specs_root
+            );
         }
     }
 
@@ -1474,10 +1464,26 @@ mod tests {
         assert!(score > 0.2, "Expected score > 0.2, got {}", score);
     }
 
+    /// Helper: write a page projection at
+    /// `<root>/pages/<page_id>/spec.uibridge.json` and return its path.
+    fn write_test_projection(root: &std::path::Path, page_id: &str, content: &Value) {
+        let page_dir = root.join("pages").join(page_id);
+        std::fs::create_dir_all(&page_dir).unwrap();
+        std::fs::write(
+            page_dir.join("spec.uibridge.json"),
+            serde_json::to_string_pretty(content).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn projection_path(root: &std::path::Path, page_id: &str) -> std::path::PathBuf {
+        root.join("pages").join(page_id).join("spec.uibridge.json")
+    }
+
     #[test]
     fn test_update_page_specs_writes_to_matching_file() {
         let dir = tempfile::tempdir().unwrap();
-        let spec_path = dir.path().join("settings.spec.uibridge.json");
+        let spec_path = projection_path(dir.path(), "settings");
 
         let spec_content = json!({
             "version": "1.0.0",
@@ -1498,11 +1504,7 @@ mod tests {
                 }
             ]
         });
-        std::fs::write(
-            &spec_path,
-            serde_json::to_string_pretty(&spec_content).unwrap(),
-        )
-        .unwrap();
+        write_test_projection(dir.path(), "settings", &spec_content);
 
         let criteria = AcceptanceCriteria {
             goal_summary: "Dark mode settings toggle works".to_string(),
@@ -1522,7 +1524,7 @@ mod tests {
         let result = update_page_specs_from_criteria(
             &criteria,
             "Fix the dark-mode toggle on settings page",
-            &[dir.path()],
+            dir.path(),
             0.2,
         );
 
@@ -1541,7 +1543,7 @@ mod tests {
     #[test]
     fn test_update_page_specs_replaces_existing_group() {
         let dir = tempfile::tempdir().unwrap();
-        let spec_path = dir.path().join("settings.spec.uibridge.json");
+        let spec_path = projection_path(dir.path(), "settings");
 
         let spec_content = json!({
             "version": "1.0.0",
@@ -1558,11 +1560,7 @@ mod tests {
                 }
             ]
         });
-        std::fs::write(
-            &spec_path,
-            serde_json::to_string_pretty(&spec_content).unwrap(),
-        )
-        .unwrap();
+        write_test_projection(dir.path(), "settings", &spec_content);
 
         let criteria = AcceptanceCriteria {
             goal_summary: "New goal".to_string(),
@@ -1579,12 +1577,8 @@ mod tests {
             bugfix_context: None,
         };
 
-        let result = update_page_specs_from_criteria(
-            &criteria,
-            "Update the settings page",
-            &[dir.path()],
-            0.2,
-        );
+        let result =
+            update_page_specs_from_criteria(&criteria, "Update the settings page", dir.path(), 0.2);
 
         // Should replace the old group, not skip
         assert_eq!(result.specs_updated, 1);
@@ -1605,7 +1599,7 @@ mod tests {
     #[test]
     fn test_update_page_specs_skips_low_scoring() {
         let dir = tempfile::tempdir().unwrap();
-        let spec_path = dir.path().join("dashboard.spec.uibridge.json");
+        let _spec_path = projection_path(dir.path(), "dashboard");
 
         let spec_content = json!({
             "version": "1.0.0",
@@ -1613,11 +1607,7 @@ mod tests {
             "metadata": { "pageUrl": "/dashboard", "component": "Dashboard" },
             "groups": []
         });
-        std::fs::write(
-            &spec_path,
-            serde_json::to_string_pretty(&spec_content).unwrap(),
-        )
-        .unwrap();
+        write_test_projection(dir.path(), "dashboard", &spec_content);
 
         let criteria = AcceptanceCriteria {
             goal_summary: "Fix auth".to_string(),
@@ -1638,7 +1628,7 @@ mod tests {
         let result = update_page_specs_from_criteria(
             &criteria,
             "Fix authentication backend service",
-            &[dir.path()],
+            dir.path(),
             0.3,
         );
 
@@ -1648,6 +1638,12 @@ mod tests {
     #[test]
     fn test_update_page_specs_empty_criteria() {
         let dir = tempfile::tempdir().unwrap();
+        // Create the pages dir so list_pages doesn't fall back to the embedded
+        // snapshot (which would otherwise score against unrelated bundled
+        // pages). With an empty criteria list, the function returns early
+        // before scanning anyway, but this keeps the test environment clean.
+        std::fs::create_dir_all(dir.path().join("pages")).unwrap();
+
         let criteria = AcceptanceCriteria {
             goal_summary: "".to_string(),
             criteria: vec![],
@@ -1656,7 +1652,7 @@ mod tests {
         };
 
         let result =
-            update_page_specs_from_criteria(&criteria, "some description", &[dir.path()], 0.3);
+            update_page_specs_from_criteria(&criteria, "some description", dir.path(), 0.3);
 
         assert_eq!(result.specs_updated, 0);
     }
@@ -1735,18 +1731,13 @@ mod tests {
     #[test]
     fn test_ops_skip_prevents_spec_update() {
         let dir = tempfile::tempdir().unwrap();
-        let spec_path = dir.path().join("settings.spec.uibridge.json");
         let spec_content = json!({
             "version": "1.0.0",
             "description": "Settings page",
             "metadata": { "pageUrl": "/settings", "tags": ["settings"] },
             "groups": []
         });
-        std::fs::write(
-            &spec_path,
-            serde_json::to_string_pretty(&spec_content).unwrap(),
-        )
-        .unwrap();
+        write_test_projection(dir.path(), "settings", &spec_content);
 
         let criteria = AcceptanceCriteria {
             goal_summary: "Push succeeds".to_string(),
@@ -1766,7 +1757,7 @@ mod tests {
         let result = update_page_specs_from_criteria(
             &criteria,
             "git push the branch to remote",
-            &[dir.path()],
+            dir.path(),
             0.2,
         );
 
@@ -1776,20 +1767,16 @@ mod tests {
     #[test]
     fn test_backend_criteria_uses_catchall() {
         let dir = tempfile::tempdir().unwrap();
-        let catchall_path = dir.path().join("workflow-criteria.spec.uibridge.json");
+        let catchall_path = projection_path(dir.path(), "workflow-criteria");
 
-        // Pre-create the catch-all file (as it would exist in the repo)
+        // Pre-create the catch-all page (as it would exist in the repo)
         let catchall_spec = json!({
             "version": "1.0.0",
             "description": "Catch-all spec for workflow acceptance criteria",
             "metadata": { "pageUrl": "/workflows", "tags": ["catch-all"] },
             "groups": []
         });
-        std::fs::write(
-            &catchall_path,
-            serde_json::to_string_pretty(&catchall_spec).unwrap(),
-        )
-        .unwrap();
+        write_test_projection(dir.path(), "workflow-criteria", &catchall_spec);
 
         let criteria = AcceptanceCriteria {
             goal_summary: "WAL checkpoint works".to_string(),
@@ -1809,7 +1796,7 @@ mod tests {
         let result = update_page_specs_from_criteria(
             &criteria,
             "Fix SQLite WAL checkpoint timeout",
-            &[dir.path()],
+            dir.path(),
             0.3,
         );
 

@@ -1,0 +1,2020 @@
+{
+  "description": "The Prompt Registry manages prompt template versioning with diff comparison, and canary A/B test deployments that split traffic between baseline and candidate prompt versions to evaluate performance via statistical analysis. Backend: 6 prompt version endpoints, PromptTemplateVersion model with SHA256 content hashing, PromptTemplateCanary in SQLite+PG with proportion_analysis statistics.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-0",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Version History"
+            },
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-1",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "versions"
+            },
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-2",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "v\\d+"
+            },
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-3",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-4",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No description"
+            },
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-5",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-6",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-7",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No versions recorded for this template yet."
+            },
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 8 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-8",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 9 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-9",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Failed to load version history."
+            },
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 10 for state Version History List",
+          "enabled": true,
+          "id": "version-history-list-elem-10",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh"
+            },
+            "label": "Required element for Version History List",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The version history list shows all versions for a prompt template sorted by version number descending. Each version row shows the version number badge (v1, v2...), the change description, a truncated SHA256 content hash, and the creation date. The list header displays a count of versions and provides Compare and Refresh controls. In compare mode, two versions can be selected as A and B with highlighted selection indicators.",
+      "id": "version-history-list",
+      "name": "Version History List",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-0",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Back to history"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-1",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "v\\d+"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-2",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "hash:"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-3",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Prompt Content"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-4",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Success Rate"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-5",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Avg Cost"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-6",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Avg Latency"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-7",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Performance Metrics"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 8 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-8",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Restore this version"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 9 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-9",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Create new version with this content?"
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 10 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-10",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Restoring..."
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 11 for state Version Detail View",
+          "enabled": true,
+          "id": "version-detail-view-elem-11",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Failed to load version details."
+            },
+            "label": "Required element for Version Detail View",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The version detail view shows the full prompt content, metadata, performance metrics, and a 'Restore this version' button. It displays the version number, creation timestamp, truncated content hash, change description, and the full prompt content in a scrollable pre block. Performance metrics show success rate, average cost, and average latency when available.",
+      "id": "version-detail-view",
+      "name": "Version Detail View",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-0",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Compare"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-1",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select first version"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-2",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Select second version"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-3",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Ready to compare"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-4",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "View Diff"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-5",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "A|B"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-6",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cancel"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-7",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Comparing"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 8 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-8",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 9 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-9",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 10 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-10",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Inline"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 11 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-11",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Side-by-side"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 12 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-12",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No differences found."
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 13 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-13",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Back to history"
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 14 for state Version Comparison",
+          "enabled": true,
+          "id": "version-comparison-elem-14",
+          "precondition": "At least one prompt variant exists with at least 2 versions",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Failed to load diff."
+            },
+            "label": "Required element for Version Comparison",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The version comparison feature allows users to view a unified or side-by-side diff between two selected versions. Compare mode allows selecting two versions as A and B. The diff view parses unified diff output into addition (green), deletion (red), context, and header lines. Two view modes are available: 'Inline' and 'Side-by-side'.",
+      "id": "version-comparison",
+      "name": "Version Comparison",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-0",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Prompt Canary A/B Tests"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-1",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "active|promoted|rolled_back|completed"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-2",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "vs"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-3",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "candidate traffic"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-4",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Metric"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-5",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Success Rate"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-6",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Avg Cost"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-7",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Avg Latency"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 8 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-8",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "pp"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 9 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-9",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "p-value"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 10 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-10",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Verdict"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 11 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-11",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Total Runs"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 12 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-12",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Candidate sample progress"
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 13 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-13",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "No prompt canary A/B tests found. Create one to compare prompt versions."
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 14 for state Canary A/B Testing",
+          "enabled": true,
+          "id": "canary-ab-testing-elem-14",
+          "precondition": "An active prompt canary exists with at least one recorded run",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loading canary tests..."
+            },
+            "label": "Required element for Canary A/B Testing",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The PromptCanaryPanel displays active and completed prompt canary A/B tests. Each canary card shows the status badge, template ID, version comparison (baseline vs candidate), traffic percentage, and a metrics comparison grid with Success Rate, Avg Cost, Avg Latency, and Delta columns. Statistical evaluation shows the p-value, verdict (promote/rollback/keep/pending), and total runs. Active canaries display a progress bar toward the minimum 20 candidate runs needed for a verdict.",
+      "id": "canary-ab-testing",
+      "name": "Canary A/B Testing",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-0",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Create Prompt Canary A/B Test"
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-1",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Template ID"
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-2",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Baseline Version"
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-3",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Candidate Version"
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-4",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Candidate Traffic:"
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-5",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Create Canary"
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-6",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Canary A/B test created successfully."
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-7",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Create Another"
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 8 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-8",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 9 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-9",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Close"
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 10 for state Canary Creation",
+          "enabled": true,
+          "id": "canary-creation-elem-10",
+          "precondition": "At least one prompt variant exists in the registry",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Create A/B Test"
+            },
+            "label": "Required element for Canary Creation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The CreatePromptCanaryForm allows users to set up a new prompt canary A/B test. The form has fields for Template ID, Baseline Version, Candidate Version, and a Candidate Traffic percentage slider (1-100%). When opened from a prompt variant, the template ID and baseline version are pre-filled.",
+      "id": "canary-creation",
+      "name": "Canary Creation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Canary Lifecycle",
+          "enabled": true,
+          "id": "canary-lifecycle-elem-0",
+          "precondition": "An active canary exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Promote"
+            },
+            "label": "Required element for Canary Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Canary Lifecycle",
+          "enabled": true,
+          "id": "canary-lifecycle-elem-1",
+          "precondition": "An active canary exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Rollback"
+            },
+            "label": "Required element for Canary Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Canary Lifecycle",
+          "enabled": true,
+          "id": "canary-lifecycle-elem-2",
+          "precondition": "An active canary exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "active"
+            },
+            "label": "Required element for Canary Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Canary Lifecycle",
+          "enabled": true,
+          "id": "canary-lifecycle-elem-3",
+          "precondition": "An active canary exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Version History"
+            },
+            "label": "Required element for Canary Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Canary Lifecycle",
+          "enabled": true,
+          "id": "canary-lifecycle-elem-4",
+          "precondition": "An active canary exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Create A/B Test"
+            },
+            "label": "Required element for Canary Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state Canary Lifecycle",
+          "enabled": true,
+          "id": "canary-lifecycle-elem-5",
+          "precondition": "An active canary exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Activate"
+            },
+            "label": "Required element for Canary Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state Canary Lifecycle",
+          "enabled": true,
+          "id": "canary-lifecycle-elem-6",
+          "precondition": "An active canary exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Canary Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state Canary Lifecycle",
+          "enabled": true,
+          "id": "canary-lifecycle-elem-7",
+          "precondition": "An active canary exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Refresh"
+            },
+            "label": "Required element for Canary Lifecycle",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Active canary tests have Promote and Rollback action buttons that control the canary lifecycle. Promoting a canary makes the candidate version the new active version. Rolling back reverts to the baseline. The PromptRegistryTab integrates both features: each expanded prompt variant has a 'Version History' button and a 'Create A/B Test' button. The canary panel at the top of the registry shows all canaries across templates.",
+      "id": "canary-lifecycle",
+      "name": "Canary Lifecycle",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Navigation",
+          "enabled": true,
+          "id": "navigation-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Version History"
+            },
+            "label": "Required element for Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Navigation",
+          "enabled": true,
+          "id": "navigation-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Back to history"
+            },
+            "label": "Required element for Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Navigation",
+          "enabled": true,
+          "id": "navigation-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Back to history"
+            },
+            "label": "Required element for Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Navigation",
+          "enabled": true,
+          "id": "navigation-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Create A/B Test"
+            },
+            "label": "Required element for Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Navigation",
+          "enabled": true,
+          "id": "navigation-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Navigation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Navigation flows between the prompt registry, version history, version detail, diff view, and canary creation form. Users navigate via buttons that toggle inline panels or switch between list/detail/diff sub-views within PromptVersionHistory.",
+      "id": "navigation",
+      "name": "Navigation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state State Consistency",
+          "enabled": true,
+          "id": "state-consistency-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "v\\d+"
+            },
+            "label": "Required element for State Consistency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state State Consistency",
+          "enabled": true,
+          "id": "state-consistency-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Active:"
+            },
+            "label": "Required element for State Consistency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state State Consistency",
+          "enabled": true,
+          "id": "state-consistency-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for State Consistency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state State Consistency",
+          "enabled": true,
+          "id": "state-consistency-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Baseline"
+            },
+            "label": "Required element for State Consistency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state State Consistency",
+          "enabled": true,
+          "id": "state-consistency-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Candidate"
+            },
+            "label": "Required element for State Consistency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 5 for state State Consistency",
+          "enabled": true,
+          "id": "state-consistency-elem-5",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "candidate traffic"
+            },
+            "label": "Required element for State Consistency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 6 for state State Consistency",
+          "enabled": true,
+          "id": "state-consistency-elem-6",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "p-value"
+            },
+            "label": "Required element for State Consistency",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 7 for state State Consistency",
+          "enabled": true,
+          "id": "state-consistency-elem-7",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Restore this version"
+            },
+            "label": "Required element for State Consistency",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Assertions verifying that displayed state remains internally consistent: version numbering is sequential, current-version indicators match, diff stats are accurate, canary metrics update correctly, and statistical values converge as expected.",
+      "id": "state-consistency",
+      "name": "State Consistency",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Element Presence",
+          "enabled": true,
+          "id": "element-presence-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Element Presence",
+          "enabled": true,
+          "id": "element-presence-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Element Presence",
+          "enabled": true,
+          "id": "element-presence-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Promote|Rollback"
+            },
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Element Presence",
+          "enabled": true,
+          "id": "element-presence-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Element Presence",
+          "enabled": true,
+          "id": "element-presence-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Version History|Create A/B Test"
+            },
+            "label": "Required element for Element Presence",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Assertions verifying that required UI elements are present in each view: version row metadata, diff line numbers, canary action buttons, metrics grid columns, and registry variant action buttons.",
+      "id": "element-presence",
+      "name": "Element Presence",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "prompt-management",
+    "tags": [
+      "prompt-versions",
+      "prompt-canary",
+      "a-b-testing",
+      "opik",
+      "tier-2"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The version history list shows all versions for a prompt template sorted by version number descending. Each version row shows the version number badge (v1, v2...), the change description, a truncated SHA256 content hash, and the creation date. The list header displays a count of versions and provides Compare and Refresh controls. In compare mode, two versions can be selected as A and B with highlighted selection indicators.",
+        "elements": [
+          {
+            "textContent": "Version History"
+          },
+          {
+            "textContent": "versions"
+          },
+          {
+            "textContent": "v\\d+"
+          },
+          {},
+          {
+            "textContent": "No description"
+          },
+          {},
+          {
+            "role": "button"
+          },
+          {
+            "textContent": "No versions recorded for this template yet."
+          },
+          {},
+          {
+            "textContent": "Failed to load version history."
+          },
+          {
+            "role": "button",
+            "textContent": "Refresh"
+          }
+        ],
+        "id": "version-history-list",
+        "isInitial": false,
+        "name": "Version History List",
+        "transitions": []
+      },
+      {
+        "description": "The version detail view shows the full prompt content, metadata, performance metrics, and a 'Restore this version' button. It displays the version number, creation timestamp, truncated content hash, change description, and the full prompt content in a scrollable pre block. Performance metrics show success rate, average cost, and average latency when available.",
+        "elements": [
+          {
+            "textContent": "Back to history"
+          },
+          {
+            "textContent": "v\\d+"
+          },
+          {
+            "textContent": "hash:"
+          },
+          {
+            "textContent": "Prompt Content"
+          },
+          {
+            "textContent": "Success Rate"
+          },
+          {
+            "textContent": "Avg Cost"
+          },
+          {
+            "textContent": "Avg Latency"
+          },
+          {
+            "textContent": "Performance Metrics"
+          },
+          {
+            "textContent": "Restore this version"
+          },
+          {
+            "textContent": "Create new version with this content?"
+          },
+          {
+            "textContent": "Restoring..."
+          },
+          {
+            "textContent": "Failed to load version details."
+          }
+        ],
+        "id": "version-detail-view",
+        "isInitial": false,
+        "name": "Version Detail View",
+        "transitions": []
+      },
+      {
+        "description": "The version comparison feature allows users to view a unified or side-by-side diff between two selected versions. Compare mode allows selecting two versions as A and B. The diff view parses unified diff output into addition (green), deletion (red), context, and header lines. Two view modes are available: 'Inline' and 'Side-by-side'.",
+        "elements": [
+          {
+            "textContent": "Compare"
+          },
+          {
+            "textContent": "Select first version"
+          },
+          {
+            "textContent": "Select second version"
+          },
+          {
+            "textContent": "Ready to compare"
+          },
+          {
+            "textContent": "View Diff"
+          },
+          {
+            "textContent": "A|B"
+          },
+          {
+            "textContent": "Cancel"
+          },
+          {
+            "textContent": "Comparing"
+          },
+          {},
+          {},
+          {
+            "textContent": "Inline"
+          },
+          {
+            "textContent": "Side-by-side"
+          },
+          {
+            "textContent": "No differences found."
+          },
+          {
+            "textContent": "Back to history"
+          },
+          {
+            "textContent": "Failed to load diff."
+          }
+        ],
+        "id": "version-comparison",
+        "isInitial": false,
+        "name": "Version Comparison",
+        "transitions": []
+      },
+      {
+        "description": "The PromptCanaryPanel displays active and completed prompt canary A/B tests. Each canary card shows the status badge, template ID, version comparison (baseline vs candidate), traffic percentage, and a metrics comparison grid with Success Rate, Avg Cost, Avg Latency, and Delta columns. Statistical evaluation shows the p-value, verdict (promote/rollback/keep/pending), and total runs. Active canaries display a progress bar toward the minimum 20 candidate runs needed for a verdict.",
+        "elements": [
+          {
+            "textContent": "Prompt Canary A/B Tests"
+          },
+          {
+            "textContent": "active|promoted|rolled_back|completed"
+          },
+          {
+            "textContent": "vs"
+          },
+          {
+            "textContent": "candidate traffic"
+          },
+          {
+            "textContent": "Metric"
+          },
+          {
+            "textContent": "Success Rate"
+          },
+          {
+            "textContent": "Avg Cost"
+          },
+          {
+            "textContent": "Avg Latency"
+          },
+          {
+            "textContent": "pp"
+          },
+          {
+            "textContent": "p-value"
+          },
+          {
+            "textContent": "Verdict"
+          },
+          {
+            "textContent": "Total Runs"
+          },
+          {
+            "textContent": "Candidate sample progress"
+          },
+          {
+            "textContent": "No prompt canary A/B tests found. Create one to compare prompt versions."
+          },
+          {
+            "textContent": "Loading canary tests..."
+          }
+        ],
+        "id": "canary-ab-testing",
+        "isInitial": false,
+        "name": "Canary A/B Testing",
+        "transitions": []
+      },
+      {
+        "description": "The CreatePromptCanaryForm allows users to set up a new prompt canary A/B test. The form has fields for Template ID, Baseline Version, Candidate Version, and a Candidate Traffic percentage slider (1-100%). When opened from a prompt variant, the template ID and baseline version are pre-filled.",
+        "elements": [
+          {
+            "textContent": "Create Prompt Canary A/B Test"
+          },
+          {
+            "textContent": "Template ID"
+          },
+          {
+            "textContent": "Baseline Version"
+          },
+          {
+            "textContent": "Candidate Version"
+          },
+          {
+            "textContent": "Candidate Traffic:"
+          },
+          {
+            "textContent": "Create Canary"
+          },
+          {
+            "textContent": "Canary A/B test created successfully."
+          },
+          {
+            "textContent": "Create Another"
+          },
+          {},
+          {
+            "textContent": "Close"
+          },
+          {
+            "textContent": "Create A/B Test"
+          }
+        ],
+        "id": "canary-creation",
+        "isInitial": false,
+        "name": "Canary Creation",
+        "transitions": []
+      },
+      {
+        "description": "Active canary tests have Promote and Rollback action buttons that control the canary lifecycle. Promoting a canary makes the candidate version the new active version. Rolling back reverts to the baseline. The PromptRegistryTab integrates both features: each expanded prompt variant has a 'Version History' button and a 'Create A/B Test' button. The canary panel at the top of the registry shows all canaries across templates.",
+        "elements": [
+          {
+            "textContent": "Promote"
+          },
+          {
+            "textContent": "Rollback"
+          },
+          {
+            "textContent": "active"
+          },
+          {
+            "textContent": "Version History"
+          },
+          {
+            "textContent": "Create A/B Test"
+          },
+          {
+            "textContent": "Activate"
+          },
+          {},
+          {
+            "textContent": "Refresh"
+          }
+        ],
+        "id": "canary-lifecycle",
+        "isInitial": false,
+        "name": "Canary Lifecycle",
+        "transitions": []
+      },
+      {
+        "description": "Navigation flows between the prompt registry, version history, version detail, diff view, and canary creation form. Users navigate via buttons that toggle inline panels or switch between list/detail/diff sub-views within PromptVersionHistory.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Version History"
+          },
+          {
+            "textContent": "Back to history"
+          },
+          {
+            "textContent": "Back to history"
+          },
+          {
+            "role": "button",
+            "textContent": "Create A/B Test"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "navigation",
+        "isInitial": false,
+        "name": "Navigation",
+        "transitions": []
+      },
+      {
+        "description": "Assertions verifying that displayed state remains internally consistent: version numbering is sequential, current-version indicators match, diff stats are accurate, canary metrics update correctly, and statistical values converge as expected.",
+        "elements": [
+          {
+            "textContent": "v\\d+"
+          },
+          {
+            "textContent": "Active:"
+          },
+          {},
+          {
+            "textContent": "Baseline"
+          },
+          {
+            "textContent": "Candidate"
+          },
+          {
+            "textContent": "candidate traffic"
+          },
+          {
+            "textContent": "p-value"
+          },
+          {
+            "textContent": "Restore this version"
+          }
+        ],
+        "id": "state-consistency",
+        "isInitial": false,
+        "name": "State Consistency",
+        "transitions": []
+      },
+      {
+        "description": "Assertions verifying that required UI elements are present in each view: version row metadata, diff line numbers, canary action buttons, metrics grid columns, and registry variant action buttons.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {},
+          {
+            "textContent": "Promote|Rollback"
+          },
+          {},
+          {
+            "textContent": "Version History|Create A/B Test"
+          }
+        ],
+        "id": "element-presence",
+        "isInitial": false,
+        "name": "Element Presence",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

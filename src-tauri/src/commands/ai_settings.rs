@@ -1383,7 +1383,7 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
         // On macOS/Linux, open a terminal with the auth command
         let script = format!(
             "echo 'Authenticating Claude CLI...'; {}{} auth login; echo ''; echo 'Authentication complete. You can close this window.'; read -p 'Press Enter to close'",
-            config_env.replace("$env:", "export ").replace(" = ", "=").replace("; ", "; "),
+            config_env.replace("$env:", "export ").replace(" = ", "="),
             claude_program
         );
 

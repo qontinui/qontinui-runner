@@ -1,0 +1,125 @@
+{
+  "version": "1.0",
+  "id": "execute",
+  "name": "WorkflowQueueTab",
+  "states": [
+    {
+      "id": "exec-library-browsing",
+      "name": "Workflow Library Browsing",
+      "requiredElements": [
+        {
+          "role": "searchbox"
+        },
+        {
+          "text": "all"
+        },
+        {
+          "text": "Library"
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        }
+      ],
+      "description": "Users arrive at the Execute page to select which workflows to run. The left panel presents the full workflow library with search and category filtering. Users should be able to quickly locate workflows by name or description, narrow results by category, and see relevant metadata (step counts, run history) for each workflow before adding it to the queue. The library panel is collapsible to maximize queue space when selection is complete.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "exec-queue-management",
+      "name": "Execution Queue Management",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Workflow Queue"
+        },
+        {
+          "text": "Queue:"
+        },
+        {
+          "role": "button",
+          "text": "Clear"
+        }
+      ],
+      "description": "The right panel is the execution queue where users build an ordered sequence of workflows to run. Users add workflows from the library, reorder them via drag-and-drop to control execution sequence, remove individual items, or clear the entire queue. The queue persists across browser sessions so users do not lose their selections when navigating away. Queue state (count and total steps) is always visible in the bottom bar.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "exec-options-config",
+      "name": "Execution Options Configuration",
+      "requiredElements": [
+        {
+          "text": "Execution options"
+        },
+        {
+          "text": "Stop on failure"
+        },
+        {
+          "text": "Stop the sequence if any workflow fails"
+        }
+      ],
+      "description": "Before launching the queue, users can configure execution behavior through an options panel. The primary option is 'stop on failure' which controls whether the composed workflow should halt when any individual workflow fails or continue through the remaining queue. Options are persisted in localStorage so the user's preference is remembered across sessions. The options panel is accessible from the bottom bar via a settings toggle.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "exec-run-queue",
+      "name": "Queue Execution Launch",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Run Queue"
+        },
+        {
+          "role": "button",
+          "text": "Run Queue"
+        },
+        {
+          "role": "button",
+          "text": "Clear"
+        }
+      ],
+      "description": "The primary action on this page is launching the composed workflow. Users click 'Run Queue' to send all queued workflows to the runner for sequential execution. The button is disabled when the queue is empty or when execution is already in progress. During launch, the button shows a loading state to provide feedback. Upon successful launch, the user is automatically navigated to the Active Dashboard to monitor execution progress.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "exec-two-panel-layout",
+      "name": "Two-Panel Layout Structure",
+      "requiredElements": [
+        {
+          "text": "Workflow Queue"
+        },
+        {
+          "text": "Queue:"
+        },
+        {
+          "text": "Library"
+        }
+      ],
+      "description": "The Execute page uses a two-panel layout optimized for the workflow selection and queuing workflow. The left panel contains the workflow library with search and filtering, while the right panel shows the execution queue. A bottom bar provides queue statistics, execution options, and the primary action buttons (Clear, Run Queue). This layout allows users to see both their available workflows and their current queue simultaneously, supporting an efficient drag-and-select interaction model.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Workflow Queue (Execute) page -- the primary interface for composing and executing sequential workflow runs. Users browse a workflow library, build an ordered execution queue, configure execution options like stop-on-failure, and launch the entire queue as a composed workflow. The page persists queue state and options across sessions via localStorage, ensuring users can return to an in-progress queue without losing their selections.",
+  "metadata": {
+    "tags": [
+      "execute",
+      "workflow-queue",
+      "composed-workflow",
+      "run-group",
+      "tier-1"
+    ]
+  }
+}

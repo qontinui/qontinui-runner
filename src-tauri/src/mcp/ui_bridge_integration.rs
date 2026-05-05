@@ -2768,15 +2768,6 @@ async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, Strin
 
     // Check existing artifacts for each page
     for page in &mut pages {
-        let page_dir = project
-            .join(&page.component_path)
-            .parent()
-            .map(|p| p.to_path_buf());
-        let page_stem = std::path::Path::new(&page.component_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("page");
-
         // Check for useUIElement/useUIComponent and data-page-id in the file
         if let Ok(content) = tokio::fs::read_to_string(project.join(&page.component_path)).await {
             page.has_registrations =
@@ -2784,19 +2775,14 @@ async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, Strin
             page.has_data_page_id = content.contains("data-page-id");
         }
 
-        // Check for .spec.uibridge.json nearby or in specs/
-        let spec_name = format!(
-            "{}.spec.uibridge.json",
-            page.route.trim_start_matches('/').replace('/', "-")
+        // Check for a page projection in the Spec API storage. The spec id
+        // is derived from the route (matching the legacy filename convention).
+        let spec_id = page.route.trim_start_matches('/').replace('/', "-");
+        let specs_root = crate::spec_api::storage::resolve_specs_root();
+        page.has_spec = matches!(
+            crate::spec_api::storage::read_projection(&specs_root, &spec_id),
+            Ok(Some(_))
         );
-        if let Some(ref dir) = page_dir {
-            page.has_spec = dir.join(&spec_name).exists();
-        }
-        if !page.has_spec {
-            // Also check project-level specs directory
-            page.has_spec = project.join("src/specs").join(&spec_name).exists()
-                || project.join("specs").join(&spec_name).exists();
-        }
 
         // Check for tutorial data file
         let tutorial_name = format!(

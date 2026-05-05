@@ -1,0 +1,747 @@
+{
+  "description": "Triggers page — configures event-driven workflow triggers that automatically execute workflows in response to schedules, webhooks, filesystem changes, and other events.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Trigger Inventory and System Status",
+          "enabled": true,
+          "id": "triggers-overview-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Triggers"
+            },
+            "label": "Required element for Trigger Inventory and System Status",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Trigger Inventory and System Status",
+          "enabled": true,
+          "id": "triggers-overview-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "enabled"
+            },
+            "label": "Required element for Trigger Inventory and System Status",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Trigger Inventory and System Status",
+          "enabled": true,
+          "id": "triggers-overview-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "New Trigger"
+            },
+            "label": "Required element for Trigger Inventory and System Status",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Triggers page shows all configured event-driven workflow triggers along with the health status of the trigger system itself. Users need to see at a glance how many triggers exist, how many are enabled vs disabled, whether any are currently executing, and if any events have been dropped due to system overload. This status information is critical for understanding whether the event-driven automation layer is functioning correctly. The header provides system-wide status indicators and quick access to creating new triggers and refreshing the list.",
+      "id": "triggers-overview",
+      "name": "Trigger Inventory and System Status",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Trigger List and Operations",
+          "enabled": true,
+          "id": "triggers-list-management-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "All Triggers"
+            },
+            "label": "Required element for Trigger List and Operations",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Trigger List and Operations",
+          "enabled": true,
+          "id": "triggers-list-management-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Trigger List and Operations",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Trigger List and Operations",
+          "enabled": true,
+          "id": "triggers-list-management-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Test Result"
+            },
+            "label": "Required element for Trigger List and Operations",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Trigger List and Operations",
+          "enabled": true,
+          "id": "triggers-list-management-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Trigger List and Operations",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The trigger list shows each configured trigger with its name, type, associated workflow, and enabled state. Users need to perform common operations directly from the list: editing a trigger's configuration, deleting it (with confirmation), toggling it enabled/disabled, testing it to verify it would fire correctly, and viewing its execution history. The sub-tab navigation lets users switch between the trigger list view and the history view for a selected trigger. These operations must be responsive and provide clear feedback through toast notifications.",
+      "id": "triggers-list-management",
+      "name": "Trigger List and Operations",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Trigger Execution History",
+          "enabled": true,
+          "id": "triggers-history-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "History"
+            },
+            "label": "Required element for Trigger Execution History",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Trigger Execution History",
+          "enabled": true,
+          "id": "triggers-history-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Trigger Execution History",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Trigger Execution History",
+          "enabled": true,
+          "id": "triggers-history-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Refresh"
+            },
+            "label": "Required element for Trigger Execution History",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Users need to review the execution history of their triggers to understand whether they are firing as expected, how often they execute, and whether the associated workflow runs succeeded. The History sub-tab shows a filterable log of trigger executions for the selected trigger, including timestamps, execution outcomes, and any errors encountered. This historical view is essential for debugging triggers that fire too often, not often enough, or at the wrong times, and for correlating trigger executions with workflow outcomes.",
+      "id": "triggers-history",
+      "name": "Trigger Execution History",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Trigger Editor Form",
+          "enabled": true,
+          "id": "triggers-editor-form-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Name *"
+            },
+            "label": "Required element for Trigger Editor Form",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Trigger Editor Form",
+          "enabled": true,
+          "id": "triggers-editor-form-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Target Workflow"
+            },
+            "label": "Required element for Trigger Editor Form",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Trigger Editor Form",
+          "enabled": true,
+          "id": "triggers-editor-form-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Trigger Type"
+            },
+            "label": "Required element for Trigger Editor Form",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Trigger Editor Form",
+          "enabled": true,
+          "id": "triggers-editor-form-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Debounce"
+            },
+            "label": "Required element for Trigger Editor Form",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Trigger Editor Form",
+          "enabled": true,
+          "id": "triggers-editor-form-elem-4",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Create"
+            },
+            "label": "Required element for Trigger Editor Form",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The trigger editor form allows users to create new triggers or edit existing ones. It includes required fields (name, target workflow dropdown), optional fields (description), a trigger type selector offering webhook, file_watch, workflow_chain, git_event, health_check, and schedule types, type-specific configuration sections that appear based on the selected type, an overrides JSON editor, conditions, and advanced settings for debounce, cooldown, and retry. Inline validation highlights invalid fields with red borders.",
+      "id": "triggers-editor-form",
+      "name": "Trigger Editor Form",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Test Result Modal",
+          "enabled": true,
+          "id": "triggers-test-modal-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Test Result"
+            },
+            "label": "Required element for Test Result Modal",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Test Result Modal",
+          "enabled": true,
+          "id": "triggers-test-modal-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "execute"
+            },
+            "label": "Required element for Test Result Modal",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Test Result Modal",
+          "enabled": true,
+          "id": "triggers-test-modal-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Workflow"
+            },
+            "label": "Required element for Test Result Modal",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Test Result Modal",
+          "enabled": true,
+          "id": "triggers-test-modal-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Close"
+            },
+            "label": "Required element for Test Result Modal",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When a user tests a trigger via dry run, a modal overlay displays the test result showing whether the trigger would or wouldn't execute, the trigger name, the action status, and the target workflow ID. The modal can be dismissed with a Close button.",
+      "id": "triggers-test-modal",
+      "name": "Test Result Modal",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Webhook Details and Trigger Type Badges",
+          "enabled": true,
+          "id": "triggers-webhook-details-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "webhook"
+            },
+            "label": "Required element for Webhook Details and Trigger Type Badges",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Webhook Details and Trigger Type Badges",
+          "enabled": true,
+          "id": "triggers-webhook-details-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Webhook Details and Trigger Type Badges",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Webhook Details and Trigger Type Badges",
+          "enabled": true,
+          "id": "triggers-webhook-details-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "webhook"
+            },
+            "label": "Required element for Webhook Details and Trigger Type Badges",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Webhook-type triggers display a generated webhook URL that users can copy to their clipboard for use in external integrations. A Copied! feedback message confirms the copy action. Each trigger row also displays a type badge label indicating the trigger type (webhook, file_watch, schedule, etc.).",
+      "id": "triggers-webhook-details",
+      "name": "Webhook Details and Trigger Type Badges",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Per-Trigger Actions Row",
+          "enabled": true,
+          "id": "triggers-actions-row-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "ON"
+            },
+            "label": "Required element for Per-Trigger Actions Row",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Per-Trigger Actions Row",
+          "enabled": true,
+          "id": "triggers-actions-row-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Test"
+            },
+            "label": "Required element for Per-Trigger Actions Row",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Per-Trigger Actions Row",
+          "enabled": true,
+          "id": "triggers-actions-row-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Edit"
+            },
+            "label": "Required element for Per-Trigger Actions Row",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Per-Trigger Actions Row",
+          "enabled": true,
+          "id": "triggers-actions-row-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Delete"
+            },
+            "label": "Required element for Per-Trigger Actions Row",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Each trigger in the list has an actions row containing an ON/OFF toggle for enabling/disabling the trigger, a Test button for dry-run execution, a History button to view execution history, an Edit button to open the editor, and a Delete button with confirmation. The toggle provides visual feedback reflecting the current enabled state.",
+      "id": "triggers-actions-row",
+      "name": "Per-Trigger Actions Row",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Toast Notifications",
+          "enabled": true,
+          "id": "triggers-notifications-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "success"
+            },
+            "label": "Required element for Toast Notifications",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Toast Notifications",
+          "enabled": true,
+          "id": "triggers-notifications-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "error"
+            },
+            "label": "Required element for Toast Notifications",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Toast Notifications",
+          "enabled": true,
+          "id": "triggers-notifications-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "alert"
+            },
+            "label": "Required element for Toast Notifications",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Triggers page displays toast notifications in the bottom-right corner to provide feedback on user actions. Success toasts confirm operations like trigger creation, update, deletion, and toggle changes. Error toasts alert users to failures such as network errors or validation issues. Toasts are dismissible and auto-expire after a brief duration.",
+      "id": "triggers-notifications",
+      "name": "Toast Notifications",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "triggers",
+    "tags": [
+      "triggers",
+      "event-driven",
+      "automation",
+      "webhooks",
+      "dev-only",
+      "runner-only"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The Triggers page shows all configured event-driven workflow triggers along with the health status of the trigger system itself. Users need to see at a glance how many triggers exist, how many are enabled vs disabled, whether any are currently executing, and if any events have been dropped due to system overload. This status information is critical for understanding whether the event-driven automation layer is functioning correctly. The header provides system-wide status indicators and quick access to creating new triggers and refreshing the list.",
+        "elements": [
+          {
+            "textContent": "Triggers"
+          },
+          {
+            "textContent": "enabled"
+          },
+          {
+            "textContent": "New Trigger"
+          }
+        ],
+        "id": "triggers-overview",
+        "isInitial": false,
+        "name": "Trigger Inventory and System Status",
+        "transitions": []
+      },
+      {
+        "description": "The trigger list shows each configured trigger with its name, type, associated workflow, and enabled state. Users need to perform common operations directly from the list: editing a trigger's configuration, deleting it (with confirmation), toggling it enabled/disabled, testing it to verify it would fire correctly, and viewing its execution history. The sub-tab navigation lets users switch between the trigger list view and the history view for a selected trigger. These operations must be responsive and provide clear feedback through toast notifications.",
+        "elements": [
+          {
+            "textContent": "All Triggers"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "textContent": "Test Result"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "triggers-list-management",
+        "isInitial": false,
+        "name": "Trigger List and Operations",
+        "transitions": []
+      },
+      {
+        "description": "Users need to review the execution history of their triggers to understand whether they are firing as expected, how often they execute, and whether the associated workflow runs succeeded. The History sub-tab shows a filterable log of trigger executions for the selected trigger, including timestamps, execution outcomes, and any errors encountered. This historical view is essential for debugging triggers that fire too often, not often enough, or at the wrong times, and for correlating trigger executions with workflow outcomes.",
+        "elements": [
+          {
+            "textContent": "History"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "textContent": "Refresh"
+          }
+        ],
+        "id": "triggers-history",
+        "isInitial": false,
+        "name": "Trigger Execution History",
+        "transitions": []
+      },
+      {
+        "description": "The trigger editor form allows users to create new triggers or edit existing ones. It includes required fields (name, target workflow dropdown), optional fields (description), a trigger type selector offering webhook, file_watch, workflow_chain, git_event, health_check, and schedule types, type-specific configuration sections that appear based on the selected type, an overrides JSON editor, conditions, and advanced settings for debounce, cooldown, and retry. Inline validation highlights invalid fields with red borders.",
+        "elements": [
+          {
+            "textContent": "Name *"
+          },
+          {
+            "textContent": "Target Workflow"
+          },
+          {
+            "textContent": "Trigger Type"
+          },
+          {
+            "textContent": "Debounce"
+          },
+          {
+            "role": "button",
+            "textContent": "Create"
+          }
+        ],
+        "id": "triggers-editor-form",
+        "isInitial": false,
+        "name": "Trigger Editor Form",
+        "transitions": []
+      },
+      {
+        "description": "When a user tests a trigger via dry run, a modal overlay displays the test result showing whether the trigger would or wouldn't execute, the trigger name, the action status, and the target workflow ID. The modal can be dismissed with a Close button.",
+        "elements": [
+          {
+            "textContent": "Test Result"
+          },
+          {
+            "textContent": "execute"
+          },
+          {
+            "textContent": "Workflow"
+          },
+          {
+            "textContent": "Close"
+          }
+        ],
+        "id": "triggers-test-modal",
+        "isInitial": false,
+        "name": "Test Result Modal",
+        "transitions": []
+      },
+      {
+        "description": "Webhook-type triggers display a generated webhook URL that users can copy to their clipboard for use in external integrations. A Copied! feedback message confirms the copy action. Each trigger row also displays a type badge label indicating the trigger type (webhook, file_watch, schedule, etc.).",
+        "elements": [
+          {
+            "textContent": "webhook"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "textContent": "webhook"
+          }
+        ],
+        "id": "triggers-webhook-details",
+        "isInitial": false,
+        "name": "Webhook Details and Trigger Type Badges",
+        "transitions": []
+      },
+      {
+        "description": "Each trigger in the list has an actions row containing an ON/OFF toggle for enabling/disabling the trigger, a Test button for dry-run execution, a History button to view execution history, an Edit button to open the editor, and a Delete button with confirmation. The toggle provides visual feedback reflecting the current enabled state.",
+        "elements": [
+          {
+            "textContent": "ON"
+          },
+          {
+            "textContent": "Test"
+          },
+          {
+            "textContent": "Edit"
+          },
+          {
+            "textContent": "Delete"
+          }
+        ],
+        "id": "triggers-actions-row",
+        "isInitial": false,
+        "name": "Per-Trigger Actions Row",
+        "transitions": []
+      },
+      {
+        "description": "The Triggers page displays toast notifications in the bottom-right corner to provide feedback on user actions. Success toasts confirm operations like trigger creation, update, deletion, and toggle changes. Error toasts alert users to failures such as network errors or validation issues. Toasts are dismissible and auto-expire after a brief duration.",
+        "elements": [
+          {
+            "textContent": "success"
+          },
+          {
+            "textContent": "error"
+          },
+          {
+            "role": "alert"
+          }
+        ],
+        "id": "triggers-notifications",
+        "isInitial": false,
+        "name": "Toast Notifications",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

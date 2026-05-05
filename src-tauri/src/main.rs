@@ -94,12 +94,14 @@ mod prompts;
 mod rag;
 mod recording;
 mod reflection;
+mod regression_api;
 mod restate;
 mod rework;
 mod routing;
 mod runtime_env;
 mod safe_lock;
 mod saved_api_requests;
+mod scenarios;
 mod scheduler;
 mod scheduler_service;
 mod schema_registry;
@@ -142,6 +144,7 @@ mod test_orchestrator;
 mod ticket_system;
 mod tiered_info;
 mod timeout_config;
+mod trace_api;
 mod tracing_layers;
 mod trigger_system;
 mod tunnel;
@@ -1194,6 +1197,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::rag::search_rag_elements_semantic,
             commands::rag::start_rag_processing,
             commands::recap::get_task_run_recap,
+            commands::regression::get_recent_diagnoses_for_suite,
+            commands::regression::get_regression_suite_by_id,
+            commands::regression::list_regression_runs_for_suite,
+            commands::regression::list_regression_suites,
+            commands::regression::query_assertion_executions_for_suite,
+            commands::regression::record_assertion_executions_batch,
+            commands::regression::record_regression_diagnosis,
+            commands::regression::record_regression_run,
+            commands::regression::save_regression_suite,
             commands::saved_projects::add_saved_project,
             commands::saved_projects::list_saved_projects,
             commands::saved_projects::remove_saved_project,

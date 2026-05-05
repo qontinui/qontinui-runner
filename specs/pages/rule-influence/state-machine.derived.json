@@ -1,0 +1,118 @@
+{
+  "version": "1.0",
+  "id": "rule-influence",
+  "name": "RuleInfluencePanel",
+  "states": [
+    {
+      "id": "rule-influence-overview",
+      "name": "Rule Influence Overview",
+      "requiredElements": [
+        {
+          "text": "Rule Influence"
+        },
+        {
+          "text": "Loaded"
+        },
+        {
+          "text": "No effect"
+        },
+        {
+          "text": "Prevented"
+        }
+      ],
+      "description": "Users need to see which generation rules are ineffective, with load counts and prevention rates, to decide which rules should be disabled or improved.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "rule-influence-effectiveness",
+      "name": "Rule Effectiveness Ratio",
+      "requiredElements": [
+        {
+          "text": "%"
+        },
+        {
+          "text": "effective"
+        }
+      ],
+      "description": "Users need a clear effectiveness ratio for each rule to quickly assess which rules contribute value.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "rule-influence-alerts",
+      "name": "High No-Effect Warning Badges",
+      "requiredElements": [
+        {
+          "text": "high no-effect"
+        }
+      ],
+      "description": "Rules with high no-effect counts are flagged with an orange warning badge.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "rule-influence-states",
+      "name": "Loading and Empty States",
+      "requiredElements": [
+        {
+          "text": "Loading rules..."
+        },
+        {
+          "text": "All rules appear effective"
+        }
+      ],
+      "description": "Empty state communicates that all rules appear healthy.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "rule-influence-data-display",
+      "name": "Rule Data Rendering",
+      "requiredElements": [
+        {
+          "text": "Loaded"
+        },
+        {
+          "text": "effective"
+        }
+      ],
+      "description": "Each rule row must accurately render the rule ID (first 16 chars, monospace), total loaded count, no-effect count, prevented-error count, and calculated effectiveness ratio.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "rule-influence-state-consistency",
+      "name": "Rule State Transitions",
+      "requiredElements": [
+        {
+          "text": "All rules appear effective"
+        }
+      ],
+      "description": "The panel transitions between loading, error, empty ('All rules appear effective'), and populated states without visual glitches.",
+      "precondition": "No rules meet the ineffectiveness threshold (this is the healthy state)",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Rule Influence Panel — identifies generation rules that have been loaded many times without measurable positive effect, helping developers prune ineffective rules that waste prompt tokens.",
+  "metadata": {
+    "tags": [
+      "knowledge-graph",
+      "rules",
+      "generation",
+      "effectiveness",
+      "runner-only"
+    ]
+  }
+}

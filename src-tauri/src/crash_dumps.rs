@@ -200,7 +200,7 @@ fn find_latest_fresh_dump(dump_dir: &Path, freshness: Duration) -> Option<Recent
         candidates.push((mtime, path));
     }
 
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
     let (mtime, path) = candidates.into_iter().next()?;
     parse_crash_dump(&path, mtime)
 }

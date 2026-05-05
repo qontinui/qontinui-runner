@@ -1,0 +1,83 @@
+{
+  "version": "1.0",
+  "id": "help",
+  "name": "HelpTab",
+  "states": [
+    {
+      "id": "help-purpose",
+      "name": "Page Purpose",
+      "requiredElements": [
+        {
+          "text": "Help"
+        },
+        {
+          "role": "tablist"
+        }
+      ],
+      "description": "The Help page is the primary learning and support resource within the runner application.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "help-tutorials",
+      "name": "Tutorial Goals",
+      "requiredElements": [
+        {
+          "text": "Tutorials"
+        },
+        {
+          "role": "button",
+          "text": "Start"
+        }
+      ],
+      "description": "Users need interactive guided tutorials that walk them through key workflows step by step.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "help-shortcuts",
+      "name": "Keyboard Shortcuts Goals",
+      "requiredElements": [
+        {
+          "text": "Shortcuts"
+        }
+      ],
+      "description": "Power users need quick reference to all keyboard shortcuts organized by feature area.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "help-troubleshooting",
+      "name": "Troubleshooting and Support Goals",
+      "requiredElements": [
+        {
+          "text": "Troubleshooting"
+        },
+        {
+          "text": "About"
+        }
+      ],
+      "description": "When users encounter problems they need quick access to common issue solutions and debugging guidance.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Help page",
+  "metadata": {
+    "tags": [
+      "help",
+      "tutorials",
+      "documentation",
+      "shortcuts",
+      "troubleshooting"
+    ]
+  }
+}

@@ -1,0 +1,365 @@
+{
+  "version": "1.0",
+  "id": "evaluation",
+  "name": "EvaluationDashboard",
+  "states": [
+    {
+      "id": "eval-dataset-management",
+      "name": "Dataset Management",
+      "requiredElements": [
+        {
+          "text": "Evaluation Dashboard"
+        },
+        {
+          "text": "Datasets"
+        },
+        {
+          "role": "button",
+          "text": "New Dataset"
+        },
+        {
+          "text": "Dataset Name"
+        },
+        {
+          "text": "items"
+        },
+        {
+          "role": "button",
+          "text": "Confirm"
+        },
+        {
+          "text": "No datasets yet"
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        },
+        {
+          "text": "Failed to load evaluation data"
+        }
+      ],
+      "description": "Users need to create, browse, select, and delete evaluation datasets. The dataset list is the entry point for all evaluation workflows â€” selecting a dataset populates the detail panel and scopes the experiment list. Datasets show name, version badge, item count, and last-updated date. Deletion requires a two-step confirmation (trash icon then Confirm/Cancel) to prevent accidental data loss.",
+      "precondition": "At least one dataset exists in the list",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "eval-dataset-items",
+      "name": "Dataset Items",
+      "requiredElements": [
+        {
+          "text": "Input"
+        },
+        {
+          "text": "Expected Output"
+        },
+        {
+          "role": "button",
+          "text": "Add Items"
+        },
+        {
+          "text": "Paste JSON array of items"
+        },
+        {
+          "role": "button",
+          "text": "Import File"
+        },
+        {
+          "role": "button",
+          "text": "JSON"
+        },
+        {
+          "role": "button",
+          "text": "CSV"
+        },
+        {
+          "role": "button",
+          "text": "Delete item"
+        },
+        {
+          "text": "No items in this dataset"
+        },
+        {
+          "text": "Select a dataset to view its items"
+        }
+      ],
+      "description": "Once a dataset is selected, users need to view, add, import, export, and delete individual items. Items are displayed in a two-column table (Input / Expected Output). Users can add items by pasting a JSON array, importing a JSON or CSV file, or export existing items as JSON or CSV. Individual items can be deleted with a browser confirmation dialog.",
+      "precondition": "A dataset is selected and has at least one item",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "eval-experiment-management",
+      "name": "Experiment Management",
+      "requiredElements": [
+        {
+          "text": "Experiments"
+        },
+        {
+          "role": "button",
+          "text": "New Experiment"
+        },
+        {
+          "role": "status",
+          "text": "pending|running|completed|failed"
+        },
+        {
+          "text": "completed"
+        },
+        {
+          "text": "Select a dataset to view experiments"
+        },
+        {
+          "text": "No experiments yet"
+        },
+        {
+          "text": "Experiment name"
+        }
+      ],
+      "description": "Users create and browse experiments scoped to the selected dataset. Each experiment has a name, optional description, optional prompt variant ID, and a status badge (pending/running/completed/failed) with color coding. The experiment creation form appears inline with fields for name, description, and prompt variant ID. The experiment list shows completion progress (e.g. '3/10 completed') and creation date.",
+      "precondition": "A dataset is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "eval-experiment-results",
+      "name": "Experiment Results",
+      "requiredElements": [
+        {
+          "text": "%"
+        },
+        {
+          "text": "Total Cost"
+        },
+        {
+          "text": "Total Tokens"
+        },
+        {
+          "text": "Results"
+        },
+        {
+          "text": "Scores"
+        },
+        {
+          "text": "Duration"
+        },
+        {
+          "text": "Cost"
+        },
+        {
+          "text": "Tokens"
+        },
+        {
+          "text": "%"
+        },
+        {
+          "text": "Previous"
+        },
+        {
+          "text": "Next"
+        },
+        {
+          "text": "Evaluate"
+        },
+        {
+          "text": "No results yet"
+        },
+        {
+          "text": "Select an experiment to view results"
+        },
+        {
+          "text": "Select a dataset first"
+        }
+      ],
+      "description": "When an experiment is selected, users see a detailed results view with summary cards at the top (average scores, total cost, total tokens, results count) and a paginated table below. The table shows Input, Output, Scores (as colored percentage badges), Duration, Cost, and Tokens columns. All numeric columns and individual score names are sortable. Pagination displays 20 results per page with Previous/Next buttons and a 'Showing X-Y of Z results' indicator.",
+      "precondition": "An experiment is selected and has at least one result",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "eval-live-evaluation",
+      "name": "Live Evaluation",
+      "requiredElements": [
+        {
+          "text": "Run Evaluation"
+        },
+        {
+          "text": "Evaluate an input/output pair using LLM-as-judge assertions"
+        },
+        {
+          "text": "Eval Spec"
+        },
+        {
+          "text": "Saved"
+        },
+        {
+          "text": "Inline JSON"
+        },
+        {
+          "text": "Input (prompt / question)"
+        },
+        {
+          "text": "Output (LLM response)"
+        },
+        {
+          "text": "Context"
+        },
+        {
+          "role": "button",
+          "text": "Evaluate"
+        },
+        {
+          "role": "button",
+          "text": "Reset"
+        },
+        {
+          "text": "Pass|Fail"
+        },
+        {
+          "text": "passed"
+        },
+        {
+          "text": "Evaluation failed"
+        },
+        {
+          "text": "No assertions were evaluated"
+        }
+      ],
+      "description": "The live evaluation panel (lazy-loaded under the 'Run Evaluation' tab) lets users run on-demand LLM-as-judge evaluations. Users provide an input (prompt/question), output (LLM response), and optional context (for RAG), select an eval spec (saved or inline JSON), and click Evaluate. Results show pass/fail badges per assertion with actual vs threshold percentages and explanatory messages. A Reset button clears the form and results.",
+      "precondition": "At least one eval spec exists in the system",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "eval-cross-panel-navigation",
+      "name": "Cross-Panel Navigation",
+      "requiredElements": [
+        {
+          "text": "Select a dataset to view its items"
+        },
+        {
+          "text": "Select a dataset to view experiments"
+        },
+        {
+          "text": "Select an experiment to view results"
+        },
+        {
+          "text": "Evaluate this input/output"
+        },
+        {
+          "text": "Experiments"
+        }
+      ],
+      "description": "The Evaluation Dashboard uses a two-panel layout where selecting items in one panel drives content in others. Selecting a dataset populates the detail panel with items and scopes the experiment list. Selecting an experiment populates the results panel. Clicking 'Evaluate' on a result row switches to the Run Evaluation tab and pre-fills the input/output fields. Tab switching between 'Experiments' and 'Run Evaluation' controls what the right panel displays.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "eval-behavior-workflows",
+      "name": "Behavior â€” Multi-Step Workflows",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Add Items"
+        },
+        {
+          "role": "button",
+          "text": "Evaluate"
+        },
+        {
+          "role": "button",
+          "text": "JSON"
+        },
+        {
+          "role": "button",
+          "text": "Import File"
+        },
+        {
+          "role": "button",
+          "text": "Confirm"
+        }
+      ],
+      "description": "End-to-end behavioral assertions verifying that multi-step user workflows complete correctly: creating a dataset then adding items, running a live evaluation through the full form flow, exporting and importing data files, and deleting datasets with confirmation.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "eval-state-consistency",
+      "name": "State Consistency â€” Data Correctness",
+      "requiredElements": [
+        {
+          "text": "items"
+        },
+        {
+          "role": "status",
+          "text": "pending|running|completed|failed"
+        },
+        {
+          "text": "Input"
+        },
+        {
+          "role": "button",
+          "text": "Delete item"
+        },
+        {
+          "text": "Page"
+        },
+        {
+          "text": "%"
+        }
+      ],
+      "description": "Assertions verifying that displayed data is consistent across panels, matches backend state, and updates reactively after mutations. Covers item counts, experiment status badges, optimistic table updates after add/delete, pagination math, and score value accuracy.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "eval-element-presence",
+      "name": "Element Presence â€” Critical UI Elements",
+      "requiredElements": [
+        {
+          "text": "items"
+        },
+        {
+          "role": "status",
+          "text": "pending|running|completed|failed"
+        },
+        {
+          "text": "Input"
+        },
+        {
+          "text": "Input (prompt / question)"
+        },
+        {
+          "text": "Page"
+        }
+      ],
+      "description": "Assertions verifying that critical UI elements are present and correctly structured in the rendered DOM. Covers dataset row composition, experiment row badges, results table column headers, live evaluation input areas, and pagination indicators.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The Evaluation Dashboard provides dataset management, experiment tracking, and live LLM-as-judge evaluation. Two-panel layout: datasets/detail on the left, experiments/results on the right, with a lazy-loaded live evaluation tab.",
+  "metadata": {
+    "tags": [
+      "evaluation",
+      "datasets",
+      "experiments",
+      "llm-judge",
+      "opik",
+      "tier-2"
+    ]
+  }
+}

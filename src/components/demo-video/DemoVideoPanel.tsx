@@ -25,7 +25,6 @@ import type { ProductTour } from "@/types/product-tour";
 import { PRODUCT_TOURS_STORAGE_KEY } from "@/types/product-tour";
 import { instanceStorage } from "@/lib/instance-storage";
 import { TourPlayer } from "@/components/product-tour/TourPlayer";
-import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import type {
   DemoScript,
   DemoRecordingConfig,
@@ -37,36 +36,9 @@ import { fetchRegisteredElements, planDemoScript } from "@/lib/demo-video/script
 import { executeScript, abortExecution } from "@/lib/demo-video/script-executor";
 import { generateNarration } from "@/lib/demo-video/narration-generator";
 import type { NarrationOutput } from "@/lib/demo-video/narration-generator";
+import type { DiscoveredSpec } from "@/lib/spec-prompt-builder";
+import { loadDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import { ScriptPreview } from "./ScriptPreview";
-
-// =============================================================================
-// Spec Discovery
-// =============================================================================
-
-interface DiscoveredSpecEntry {
-  specId: string;
-  config: SpecConfig;
-}
-
-async function discoverSpecs(): Promise<DiscoveredSpecEntry[]> {
-  // Load specs from the specs directory via dynamic import of the spec index
-  // Fall back to fetching from the API
-  try {
-    const modules = import.meta.glob("../../specs/*.spec.uibridge.json", {
-      eager: true,
-    }) as Record<string, { default: SpecConfig }>;
-
-    return Object.entries(modules).map(([path, mod]) => {
-      const fileName = path.split("/").pop()?.replace(".spec.uibridge.json", "") ?? "unknown";
-      return {
-        specId: fileName,
-        config: mod.default,
-      };
-    });
-  } catch {
-    return [];
-  }
-}
 
 // =============================================================================
 // Recording Config Panel
@@ -152,7 +124,7 @@ export function DemoVideoPanel() {
     actions: [],
   });
 
-  const [specs, setSpecs] = useState<DiscoveredSpecEntry[]>([]);
+  const [specs, setSpecs] = useState<DiscoveredSpec[]>([]);
   const [activeTour, setActiveTour] = useState<ProductTour | null>(null);
   const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
   const [config, setConfig] = useState<DemoRecordingConfig>(DEFAULT_RECORDING_CONFIG);
@@ -167,11 +139,15 @@ export function DemoVideoPanel() {
   const [batchIndex, setBatchIndex] = useState(0);
   const scriptsRef = useRef<DemoScript[]>([]);
 
-  // Load specs on mount
+  // Load specs on mount via the runner Spec API (Section 13).
   useEffect(() => {
-    discoverSpecs().then((found) => {
-      setSpecs(found);
-    });
+    loadDiscoveredSpecs()
+      .then((found) => {
+        setSpecs(found);
+      })
+      .catch(() => {
+        setSpecs([]);
+      });
   }, []);
 
   const toggleSpec = useCallback((specId: string) => {

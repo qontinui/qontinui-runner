@@ -757,6 +757,85 @@ pub fn create_router(
         info!("UI Bridge: page/evaluate response listener set up");
     }
 
+    // Set up `ui-bridge:project-current-scenario-response` listener
+    // (Section 11 / Phase B2 — runtime-aware scenario projection IPC).
+    //
+    // Mirrors the `ui-bridge:invoke-response` listener above and reuses
+    // the same `ui_bridge_invoke_store` for routing responses by
+    // `request_id` — the response payload shape (`{ ok, result, error }`)
+    // is identical, so a separate store would just be duplication.
+    {
+        let invoke_store = api_state.ui_bridge_invoke_store.clone();
+        let handle = app_handle.clone();
+
+        use tauri::Listener;
+
+        let _listener_id =
+            handle.listen("ui-bridge:project-current-scenario-response", move |event| {
+                let payload_str = event.payload();
+                let parsed: Option<serde_json::Value> =
+                    serde_json::from_str::<serde_json::Value>(payload_str)
+                        .ok()
+                        .and_then(|v| {
+                            if v.is_object() {
+                                Some(v)
+                            } else if let Some(s) = v.as_str() {
+                                serde_json::from_str::<serde_json::Value>(s).ok()
+                            } else {
+                                Some(v)
+                            }
+                        });
+
+                let Some(parsed) = parsed else {
+                    warn!(
+                        "scenarios/current: failed to parse projection response payload: {}",
+                        &payload_str[..payload_str.len().min(200)]
+                    );
+                    return;
+                };
+
+                let request_id = parsed
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let Some(request_id) = request_id else {
+                    warn!(
+                        "scenarios/current: projection response missing request_id: {}",
+                        &payload_str[..payload_str.len().min(200)]
+                    );
+                    return;
+                };
+
+                let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                let result = parsed.get("result").cloned();
+                let error = parsed
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let response = crate::ui_bridge_invoke::InvokeResponse { ok, result, error };
+
+                let store = invoke_store.clone();
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    rt.spawn(async move {
+                        let delivered = store.deliver(&request_id, response).await;
+                        if !delivered {
+                            tracing::debug!(
+                                "scenarios/current: response for unknown request_id {} (likely timed out)",
+                                request_id
+                            );
+                        }
+                    });
+                } else {
+                    warn!(
+                        "scenarios/current: no tokio runtime available — dropping response for {}",
+                        request_id
+                    );
+                }
+            });
+        info!("scenarios/current: projection response listener set up");
+    }
+
     // UI Bridge invoke-proxy wire-contract probe (Phase 1 of
     // optimized-toasting-badger). Dry-runs every allowlisted command with
     // `{}` args on startup and cross-checks Tauri's "missing required key"
@@ -1564,7 +1643,27 @@ pub fn create_router(
         // Section 2 of UI Bridge redesign — `/spec/...` Spec API. Mounted
         // outside `/ui-bridge/...` because the surface is consumed
         // differently (IR + projection storage, not page-control RPC).
-        .merge(crate::spec_api::routes());
+        .merge(crate::spec_api::routes())
+        // Section 11 / Phase B2 — `/scenarios/...` scenario projection.
+        // Static endpoint is pure Rust; runtime endpoint IPC's into the
+        // webview to combine with the live registry. Both load the IR
+        // through the same `spec_api::storage` layer.
+        .merge(crate::scenarios::routes())
+        // Section 11 follow-up FU-3 — `/runs/:run_id/drift[/:entry_id]`
+        // drift report endpoints. Pass-through of `regression_runs.drift_report_json`
+        // for the qontinui-web drift dashboard proxy. Reads only — the
+        // executor writes drift reports via the `record_regression_run`
+        // Tauri command.
+        .merge(crate::regression_api::routes())
+        // Section 5b of UI Bridge redesign — `/trace/...` Trace API. Gated
+        // on `settings.trace_api.enabled` (default false) because it
+        // depends on the Alembic migration `section_5b_01_ui_bridge_causal_columns`
+        // being applied to the shared Postgres host.
+        .merge(if crate::settings::load_settings().trace_api.enabled {
+            crate::trace_api::routes()
+        } else {
+            axum::Router::new()
+        });
 
     // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:
     // debug-only `/ui-bridge/test/inject-session` + `/ui-bridge/test/clear-sessions`

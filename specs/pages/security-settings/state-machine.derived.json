@@ -1,0 +1,248 @@
+{
+  "version": "1.0",
+  "id": "security-settings",
+  "name": "SecuritySettings",
+  "states": [
+    {
+      "id": "sec-page-header",
+      "name": "Page Header & Title",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "textContains": "Security"
+        },
+        {
+          "textContains": "sandbox constraints"
+        }
+      ],
+      "description": "The page header shows the Shield icon, title 'Security & Sandboxing', and subtitle description.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sec-profile-selector",
+      "name": "Security Profile Selector",
+      "requiredElements": [
+        {
+          "textContains": "Security Profile"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "textContains": "restrictions"
+        },
+        {
+          "textContains": "AST Fingerprint"
+        },
+        {
+          "role": "combobox"
+        }
+      ],
+      "description": "Dropdown to select the active security profile. Options: Permissive, Standard, Strict, Custom. Selecting a built-in profile shows its description and AST fingerprint.",
+      "precondition": "A built-in profile (not custom) is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sec-posture-visualization",
+      "name": "Security Posture Visualization",
+      "requiredElements": [
+        {
+          "textContains": "Security Posture"
+        },
+        {
+          "textContains": "L1:Compute"
+        },
+        {
+          "textContains": "L4:Network"
+        }
+      ],
+      "description": "A 7-layer bar chart showing the current profile's security scores. Each layer (L1:Compute through L7:Audit) has a colored bar indicating enforcement level: None (red), Cooperative (orange), Software (yellow), Kernel (green).",
+      "precondition": "Permissive profile is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sec-custom-profile-editor",
+      "name": "Custom Profile Editor",
+      "requiredElements": [
+        {
+          "textContains": "Custom Policy Editor"
+        },
+        {
+          "textContains": "Network"
+        },
+        {
+          "textContains": "Block destructive"
+        },
+        {
+          "textContains": "CPU limit"
+        },
+        {
+          "textContains": "Direct (current behavior)"
+        }
+      ],
+      "description": "When 'Custom' profile is selected, a full sub-policy editor appears with sections for Network, Actions, Filesystem, Resources, and Credentials. Each section has appropriate form controls.",
+      "precondition": "Profile is set to 'Custom'",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sec-features-section",
+      "name": "Features Section",
+      "requiredElements": [
+        {
+          "textContains": "Features"
+        },
+        {
+          "textContains": "Credential Proxy"
+        },
+        {
+          "textContains": "Network Mediation"
+        },
+        {
+          "textContains": "Security Audit Log"
+        },
+        {
+          "textContains": "Audit Retention"
+        }
+      ],
+      "description": "Toggle switches for the three main security features: Credential Proxy, Network Mediation, and Security Audit Log.",
+      "precondition": "Security Audit Log toggle is enabled",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sec-audit-log-viewer",
+      "name": "Audit Log Viewer",
+      "requiredElements": [
+        {
+          "textContains": "Audit Log"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "role": "table"
+        },
+        {
+          "role": "table"
+        },
+        {
+          "textContains": "No audit events"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "When audit logging is enabled, a scrollable table shows recent security audit events with summary badges, filter dropdown, refresh button, and JSON export button.",
+      "precondition": "Security Audit Log toggle is enabled",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sec-ast-info-banner",
+      "name": "AST 7-Layer Info Banner",
+      "requiredElements": [
+        {
+          "textContains": "Agent Sandbox Taxonomy"
+        }
+      ],
+      "description": "An informational banner explaining the Agent Sandbox Taxonomy (AST) 7-layer model at the bottom of the page.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sec-action-buttons",
+      "name": "Action Buttons",
+      "requiredElements": [
+        {
+          "role": "button",
+          "textContains": "Reset to Defaults"
+        },
+        {
+          "role": "button",
+          "textContains": "Save Security Settings"
+        },
+        {
+          "role": "button",
+          "textContains": "Save"
+        },
+        {
+          "role": "button",
+          "textContains": "Reset"
+        }
+      ],
+      "description": "Reset to Defaults and Save Security Settings buttons at the bottom of the page.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sec-visual-design",
+      "name": "Visual Design & Typography",
+      "requiredElements": [
+        {
+          "textContains": "Security Profile"
+        },
+        {
+          "role": "heading"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "role": "button",
+          "textContains": "Save"
+        }
+      ],
+      "description": "Dark theme styling with neutral-800 card backgrounds, blue-400 accents, and consistent text hierarchy.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "sec-loading-error-states",
+      "name": "Loading & Error States",
+      "requiredElements": [
+        {
+          "textContains": "Loading security settings"
+        },
+        {
+          "textContains": "Failed"
+        },
+        {
+          "textContains": "Settings saved"
+        }
+      ],
+      "description": "The page handles loading, error, and success states appropriately.",
+      "precondition": "A save or load operation has failed",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Security & Sandboxing settings page. Configures agent sandboxing policies following the AST 7-layer defense model: compute isolation, resource limits, filesystem boundaries, network mediation, credential proxy, action governance, and audit logging. Supports three built-in profiles (permissive/standard/strict) plus a custom profile editor with full sub-policy configuration.",
+  "metadata": {
+    "tags": [
+      "settings",
+      "security",
+      "sandboxing",
+      "ast",
+      "audit",
+      "profiles"
+    ]
+  }
+}

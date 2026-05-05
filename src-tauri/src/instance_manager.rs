@@ -590,7 +590,7 @@ impl InstanceManager {
             .map(|row| probe_instance_api(row.port as u16));
         let results = futures::future::join_all(probes).await;
 
-        for (row, api_ready) in to_probe.into_iter().zip(results.into_iter()) {
+        for (row, api_ready) in to_probe.into_iter().zip(results) {
             let port = row.port as u16;
             by_port.insert(
                 port,

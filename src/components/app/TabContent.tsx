@@ -78,6 +78,7 @@ import { WrappersLibraryPage } from "@/pages/wrappers/WrappersLibraryPage";
 import { UIBridgeStateMachinePage } from "@/pages/state-machine";
 import { ImageQualityTestsPage } from "@/pages/ImageQualityTestsPage";
 import { EventHistoryPage } from "@/pages/EventHistoryPage";
+import { RegressionTabPage } from "@/pages/regression/RegressionTabPage";
 import { lazy, Suspense } from "react";
 import { Loader2 } from "lucide-react";
 
@@ -1212,6 +1213,18 @@ export function TabContent({
             description="Install and manage wrapper extensions — typed actions for the runner"
           />
           <WrappersLibraryPage />
+        </div>
+      );
+
+    case "regression":
+      return (
+        <div data-page-id="regression" className="h-full overflow-hidden">
+          <PageRegistration
+            id="regression"
+            name="Regression"
+            description="UI Bridge regression suites — run a suite, walk live registry assertions, and review coverage"
+          />
+          <RegressionTabPage />
         </div>
       );
 

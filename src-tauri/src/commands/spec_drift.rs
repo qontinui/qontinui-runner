@@ -1,8 +1,9 @@
 //! Spec drift detection.
 //!
 //! Scans the runner source tree for `useUIElement(...)` registrations and
-//! compares them against the assertions declared in every
-//! `src/specs/*.spec.uibridge.json` file. Reports:
+//! compares them against the assertions declared in every page projection
+//! served by the Spec API (`<runner>/specs/pages/<id>/spec.uibridge.json`).
+//! Reports:
 //! - `missing_from_spec`: elements registered in code but not referenced by
 //!   any assertion's `target.elementId` (covers the case where a new button
 //!   was added in code but the spec wasn't updated).
@@ -22,6 +23,8 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
+
+use crate::spec_api::storage;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RegisteredElement {
@@ -191,28 +194,31 @@ fn collect_assertion_text(target: &serde_json::Value) -> Vec<String> {
     out
 }
 
-fn scan_specs(root: &Path) -> (SpecAssertedIndex, usize) {
+fn scan_specs() -> (SpecAssertedIndex, usize) {
     let mut idx = SpecAssertedIndex::default();
     let mut files = 0;
-    let specs_dir = root.join("src").join("specs");
-    let Ok(entries) = std::fs::read_dir(&specs_dir) else {
-        return (idx, 0);
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if !name.ends_with(".spec.uibridge.json") {
-            continue;
+    let specs_root = storage::resolve_specs_root();
+    let page_ids = match storage::list_pages(&specs_root) {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!("spec_drift: list_pages failed: {}", e);
+            return (idx, 0);
         }
+    };
+    for page_id in page_ids {
+        let root_v = match storage::read_projection(&specs_root, &page_id) {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(
+                    "spec_drift: failed to read projection for {}: {}",
+                    page_id, e
+                );
+                continue;
+            }
+        };
         files += 1;
-        let spec_id = name.trim_end_matches(".spec.uibridge.json").to_string();
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(root_v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            warn!("spec_drift: failed to parse {}", name);
-            continue;
-        };
+        let spec_id = page_id.clone();
         let Some(groups) = root_v.get("groups").and_then(|g| g.as_array()) else {
             continue;
         };
@@ -265,7 +271,7 @@ pub async fn scan_spec_drift(project_root: String) -> Result<DriftReport, String
     }
     info!("scan_spec_drift: scanning {}", project_root);
     let (elements, source_files) = scan_source_tree(&root);
-    let (asserted, spec_files) = scan_specs(&root);
+    let (asserted, spec_files) = scan_specs();
     debug!(
         "scan_spec_drift: {} elements, {} asserted ids, {} source files, {} spec files",
         elements.len(),

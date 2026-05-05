@@ -1157,6 +1157,26 @@ pub struct Settings {
     /// Back-compat: missing key in an existing settings.json loads as empty.
     #[serde(default)]
     pub saved_projects: Vec<SavedProject>,
+    /// Trace API gate (Section 5b of the UI Bridge redesign). When enabled,
+    /// `/trace/...` routes are mounted on the runner's HTTP API and the
+    /// runner persists causal traces to `project.ui_bridge_events` (requires
+    /// Alembic migration `section_5b_01_ui_bridge_causal_columns`).
+    /// Default: false (shipped but inert until the migration is applied).
+    #[serde(default)]
+    pub trace_api: TraceApiSettings,
+}
+
+// ============================================================================
+// Trace API Settings (Section 5b)
+// ============================================================================
+
+/// Trace API gate. When `enabled` is false, the `/trace/...` routes are not
+/// mounted and no causal-trace DB writes are issued. The default is `false` —
+/// matches the "shipped but inert" rollout pattern used elsewhere in the
+/// redesign.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TraceApiSettings {
+    pub enabled: bool,
 }
 
 // ============================================================================

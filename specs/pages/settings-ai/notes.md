@@ -1,0 +1,3 @@
+# AiSettings
+
+_(notes)_

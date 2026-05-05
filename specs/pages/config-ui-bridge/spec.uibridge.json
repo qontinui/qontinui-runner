@@ -1,0 +1,274 @@
+{
+  "description": "UI Bridge Integration page — manages discovery, connection, injection, monitoring, and exploration of UI Bridge-enabled applications across five specialized tabs.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Integration Hub Navigation",
+          "enabled": true,
+          "id": "uibridge-navigation-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "UI Bridge"
+            },
+            "label": "Required element for Integration Hub Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Integration Hub Navigation",
+          "enabled": true,
+          "id": "uibridge-navigation-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Discovery"
+            },
+            "label": "Required element for Integration Hub Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Integration Hub Navigation",
+          "enabled": true,
+          "id": "uibridge-navigation-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Runtime Injection"
+            },
+            "label": "Required element for Integration Hub Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Integration Hub Navigation",
+          "enabled": true,
+          "id": "uibridge-navigation-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Source Integration"
+            },
+            "label": "Required element for Integration Hub Navigation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The UI Bridge Integration page is the central hub for connecting the runner to external applications through the UI Bridge SDK. It provides five specialized tabs covering the full lifecycle of UI Bridge integration: Discovery (finding apps on the network), Runtime Injection (adding the SDK to running apps without code changes), Source Integration (embedding the SDK in app source code), Health Monitor (tracking connected app health metrics), and State Explorer (live inspection of connected app UI state). Users need to navigate between these tabs fluidly, and the page supports a flow where discovering an app in the Discovery tab can transition directly to the Injection tab with the app's URL pre-filled.",
+      "id": "uibridge-navigation",
+      "name": "Integration Hub Navigation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Health Monitoring and Diagnostics",
+          "enabled": true,
+          "id": "uibridge-monitoring-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Health Monitor"
+            },
+            "label": "Required element for Health Monitoring and Diagnostics",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Health Monitoring and Diagnostics",
+          "enabled": true,
+          "id": "uibridge-monitoring-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "State Explorer"
+            },
+            "label": "Required element for Health Monitoring and Diagnostics",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Health Monitoring and Diagnostics",
+          "enabled": true,
+          "id": "uibridge-monitoring-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "integration"
+            },
+            "label": "Required element for Health Monitoring and Diagnostics",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Once applications are connected via UI Bridge, users need ongoing visibility into connection health. The Health Monitor tab tracks response times, error rates, and connection stability for each connected application. Users should be able to identify degraded connections before they cause workflow failures, spot patterns in connectivity issues (e.g., timeouts during heavy load), and understand the real-time state of all their UI Bridge integrations. This proactive monitoring transforms the UI Bridge from a fire-and-forget setup into a managed integration layer.",
+      "id": "uibridge-monitoring",
+      "name": "Health Monitoring and Diagnostics",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Discovery-to-Integration Workflow",
+          "enabled": true,
+          "id": "uibridge-integration-flow-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Discovery"
+            },
+            "label": "Required element for Discovery-to-Integration Workflow",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Discovery-to-Integration Workflow",
+          "enabled": true,
+          "id": "uibridge-integration-flow-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "tablist"
+            },
+            "label": "Required element for Discovery-to-Integration Workflow",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Discovery-to-Integration Workflow",
+          "enabled": true,
+          "id": "uibridge-integration-flow-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Required element for Discovery-to-Integration Workflow",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The UI Bridge page supports a cohesive workflow that takes users from discovering an app to fully integrating it. The Discovery tab finds apps, and users can click to inject the SDK, which automatically navigates to the Runtime Injection tab with the app's URL pre-populated. This seamless handoff between tabs reduces friction in the integration process. For permanent integration, the Source Integration tab provides code snippets and instructions. The five-tab architecture means each phase of integration (find, inject temporarily, embed permanently, monitor health, explore state) has a dedicated, focused interface.",
+      "id": "uibridge-integration-flow",
+      "name": "Discovery-to-Integration Workflow",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "config-ui-bridge",
+    "tags": [
+      "ui-bridge",
+      "integration",
+      "discovery",
+      "health-monitoring",
+      "runner-only"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The UI Bridge Integration page is the central hub for connecting the runner to external applications through the UI Bridge SDK. It provides five specialized tabs covering the full lifecycle of UI Bridge integration: Discovery (finding apps on the network), Runtime Injection (adding the SDK to running apps without code changes), Source Integration (embedding the SDK in app source code), Health Monitor (tracking connected app health metrics), and State Explorer (live inspection of connected app UI state). Users need to navigate between these tabs fluidly, and the page supports a flow where discovering an app in the Discovery tab can transition directly to the Injection tab with the app's URL pre-filled.",
+        "elements": [
+          {
+            "textContent": "UI Bridge"
+          },
+          {
+            "textContent": "Discovery"
+          },
+          {
+            "textContent": "Runtime Injection"
+          },
+          {
+            "textContent": "Source Integration"
+          }
+        ],
+        "id": "uibridge-navigation",
+        "isInitial": false,
+        "name": "Integration Hub Navigation",
+        "transitions": []
+      },
+      {
+        "description": "Once applications are connected via UI Bridge, users need ongoing visibility into connection health. The Health Monitor tab tracks response times, error rates, and connection stability for each connected application. Users should be able to identify degraded connections before they cause workflow failures, spot patterns in connectivity issues (e.g., timeouts during heavy load), and understand the real-time state of all their UI Bridge integrations. This proactive monitoring transforms the UI Bridge from a fire-and-forget setup into a managed integration layer.",
+        "elements": [
+          {
+            "textContent": "Health Monitor"
+          },
+          {
+            "textContent": "State Explorer"
+          },
+          {
+            "textContent": "integration"
+          }
+        ],
+        "id": "uibridge-monitoring",
+        "isInitial": false,
+        "name": "Health Monitoring and Diagnostics",
+        "transitions": []
+      },
+      {
+        "description": "The UI Bridge page supports a cohesive workflow that takes users from discovering an app to fully integrating it. The Discovery tab finds apps, and users can click to inject the SDK, which automatically navigates to the Runtime Injection tab with the app's URL pre-populated. This seamless handoff between tabs reduces friction in the integration process. For permanent integration, the Source Integration tab provides code snippets and instructions. The five-tab architecture means each phase of integration (find, inject temporarily, embed permanently, monitor health, explore state) has a dedicated, focused interface.",
+        "elements": [
+          {
+            "textContent": "Discovery"
+          },
+          {
+            "role": "tablist"
+          },
+          {
+            "role": "tab"
+          }
+        ],
+        "id": "uibridge-integration-flow",
+        "isInitial": false,
+        "name": "Discovery-to-Integration Workflow",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

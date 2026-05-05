@@ -15,7 +15,7 @@ use atspi::proxy::action::ActionProxy;
 use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::value::ValueProxy;
-use atspi::{AccessibilityConnection, CoordType, Interface, Role, State};
+use atspi::{AccessibilityConnection, CoordType, Interface, InterfaceSet, Role, State};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, trace, warn};
 use zbus::proxy::CacheProperties;
@@ -47,6 +47,12 @@ pub struct AtspiAdapter {
     /// Monotonic ref counter for node ref IDs.
     next_ref: AtomicU64,
     connected: AtomicBool,
+}
+
+impl Default for AtspiAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AtspiAdapter {
@@ -94,7 +100,10 @@ impl AtspiAdapter {
 
     /// Build an AccessibleProxy for a given address. Uses `CacheProperties::No`
     /// to avoid stale D-Bus property caches for dynamic UI elements.
-    async fn accessible_proxy(&self, addr: &AtspiAddress) -> anyhow::Result<AccessibleProxy<'_>> {
+    async fn accessible_proxy<'a>(
+        &self,
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<AccessibleProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = AccessibleProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -107,7 +116,7 @@ impl AtspiAdapter {
     }
 
     /// Build an ActionProxy for the given address.
-    async fn action_proxy(&self, addr: &AtspiAddress) -> anyhow::Result<ActionProxy<'_>> {
+    async fn action_proxy<'a>(&self, addr: &'a AtspiAddress) -> anyhow::Result<ActionProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = ActionProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -120,7 +129,10 @@ impl AtspiAdapter {
     }
 
     /// Build a ComponentProxy for the given address.
-    async fn component_proxy(&self, addr: &AtspiAddress) -> anyhow::Result<ComponentProxy<'_>> {
+    async fn component_proxy<'a>(
+        &self,
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<ComponentProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = ComponentProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -133,10 +145,10 @@ impl AtspiAdapter {
     }
 
     /// Build an EditableTextProxy for the given address.
-    async fn editable_text_proxy(
+    async fn editable_text_proxy<'a>(
         &self,
-        addr: &AtspiAddress,
-    ) -> anyhow::Result<EditableTextProxy<'_>> {
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<EditableTextProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = EditableTextProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -149,7 +161,7 @@ impl AtspiAdapter {
     }
 
     /// Build a ValueProxy for the given address.
-    async fn value_proxy(&self, addr: &AtspiAddress) -> anyhow::Result<ValueProxy<'_>> {
+    async fn value_proxy<'a>(&self, addr: &'a AtspiAddress) -> anyhow::Result<ValueProxy<'a>> {
         let conn = self.zbus_conn()?;
         let proxy = ValueProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -161,123 +173,149 @@ impl AtspiAdapter {
         Ok(proxy)
     }
 
-    /// Recursively capture the accessibility tree starting from an address.
-    async fn capture_node(
+    /// Build an ApplicationProxy for the given address (used for PID lookup).
+    async fn application_proxy<'a>(
         &self,
-        addr: &AtspiAddress,
+        addr: &'a AtspiAddress,
+    ) -> anyhow::Result<atspi::proxy::application::ApplicationProxy<'a>> {
+        let conn = self.zbus_conn()?;
+        let proxy = atspi::proxy::application::ApplicationProxy::builder(conn)
+            .destination(addr.bus_name.as_str())?
+            .path(addr.object_path.as_str())?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .context("Failed to build ApplicationProxy")?;
+        Ok(proxy)
+    }
+
+    /// Recursively capture the accessibility tree starting from an address.
+    ///
+    /// Returns a `BoxFuture` rather than `async fn` because the function calls
+    /// itself recursively for child nodes, and Rust requires explicit boxing
+    /// to give the resulting future a known size (E0733).
+    fn capture_node<'a>(
+        &'a self,
+        addr: &'a AtspiAddress,
         current_depth: u32,
         max_depth: Option<u32>,
         include_hidden: bool,
-    ) -> anyhow::Result<Option<UnifiedNode>> {
-        // Depth limit check.
-        if let Some(max) = max_depth {
-            if current_depth > max {
-                return Ok(None);
-            }
-        }
-
-        let proxy = match self.accessible_proxy(addr).await {
-            Ok(p) => p,
-            Err(e) => {
-                trace!("Skipping inaccessible node {}: {e}", addr.object_path);
-                return Ok(None);
-            }
-        };
-
-        // Fetch properties concurrently where possible.
-        let name = proxy.name().await.unwrap_or_default();
-        let description = proxy.description().await.ok().filter(|d| !d.is_empty());
-        let role = proxy.get_role().await.unwrap_or(Role::Invalid);
-        let state_set = proxy.get_state().await.unwrap_or_default();
-        let interfaces = proxy.get_interfaces().await.unwrap_or_default();
-
-        // Convert AT-SPI states.
-        let is_hidden = state_set.contains(State::Defunct)
-            || (!state_set.contains(State::Showing) && !state_set.contains(State::Visible));
-
-        // Skip hidden nodes unless requested.
-        if is_hidden && !include_hidden {
-            return Ok(None);
-        }
-
-        let unified_role = map_atspi_role(role);
-        let state = convert_atspi_state(&state_set);
-
-        // Fetch bounds via Component interface (if available).
-        let bounds = if interfaces.contains(Interface::Component) {
-            match self.component_proxy(addr).await {
-                Ok(comp) => match comp.get_extents(CoordType::Screen).await {
-                    Ok((x, y, w, h)) => Some(UnifiedBounds {
-                        x,
-                        y,
-                        width: w,
-                        height: h,
-                    }),
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-        // Determine supported interaction patterns from interfaces.
-        let supported_patterns = determine_patterns(&interfaces);
-        let is_interactive = unified_role.is_interactive_role() || !supported_patterns.is_empty();
-
-        // Register handle for this element.
-        let handle = self.register_handle(addr.clone()).await;
-
-        // Recurse into children.
-        let children_addrs = match proxy.get_children().await {
-            Ok(children) => children,
-            Err(e) => {
-                trace!("Could not get children for {}: {e}", addr.object_path);
-                vec![]
-            }
-        };
-
-        let mut children_nodes = Vec::new();
-        for child_obj_ref in &children_addrs {
-            let child_addr = AtspiAddress {
-                bus_name: child_obj_ref.name.to_string(),
-                object_path: child_obj_ref.path.to_string(),
-            };
-            match self
-                .capture_node(&child_addr, current_depth + 1, max_depth, include_hidden)
-                .await
-            {
-                Ok(Some(node)) => children_nodes.push(node),
-                Ok(None) => {} // hidden or depth-limited
-                Err(e) => {
-                    trace!("Error capturing child {}: {e}", child_addr.object_path);
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<Option<UnifiedNode>>> {
+        Box::pin(async move {
+            // Depth limit check.
+            if let Some(max) = max_depth {
+                if current_depth > max {
+                    return Ok(None);
                 }
             }
-        }
 
-        let node = UnifiedNode {
-            ref_id: self.alloc_ref(),
-            role: unified_role,
-            name: if name.is_empty() { None } else { Some(name) },
-            value: None,
-            description,
-            bounds,
-            state,
-            is_interactive,
-            level: None,
-            automation_id: None,
-            class_name: None,
-            html_tag: None,
-            url: None,
-            source: NodeSource::Atspi,
-            platform_handle: Some(handle),
+            let proxy = match self.accessible_proxy(addr).await {
+                Ok(p) => p,
+                Err(e) => {
+                    trace!("Skipping inaccessible node {}: {e}", addr.object_path);
+                    return Ok(None);
+                }
+            };
 
-            supported_patterns,
-            generation: 0,
-            children: children_nodes,
-        };
+            // Fetch properties concurrently where possible.
+            let name = proxy.name().await.unwrap_or_default();
+            let description = proxy.description().await.ok().filter(|d| !d.is_empty());
+            let role = proxy.get_role().await.unwrap_or(Role::Invalid);
+            let state_set = proxy.get_state().await.unwrap_or_default();
+            let interfaces = proxy
+                .get_interfaces()
+                .await
+                .unwrap_or_else(|_| InterfaceSet::empty());
 
-        Ok(Some(node))
+            // Convert AT-SPI states.
+            let is_hidden = state_set.contains(State::Defunct)
+                || (!state_set.contains(State::Showing) && !state_set.contains(State::Visible));
+
+            // Skip hidden nodes unless requested.
+            if is_hidden && !include_hidden {
+                return Ok(None);
+            }
+
+            let unified_role = map_atspi_role(role);
+            let state = convert_atspi_state(&state_set);
+
+            // Fetch bounds via Component interface (if available).
+            let bounds = if interfaces.contains(Interface::Component) {
+                match self.component_proxy(addr).await {
+                    Ok(comp) => match comp.get_extents(CoordType::Screen).await {
+                        Ok((x, y, w, h)) => Some(UnifiedBounds {
+                            x,
+                            y,
+                            width: w,
+                            height: h,
+                        }),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            // Determine supported interaction patterns from interfaces.
+            let supported_patterns = determine_patterns(&interfaces);
+            let is_interactive =
+                unified_role.is_interactive_role() || !supported_patterns.is_empty();
+
+            // Register handle for this element.
+            let handle = self.register_handle(addr.clone()).await;
+
+            // Recurse into children.
+            let children_addrs = match proxy.get_children().await {
+                Ok(children) => children,
+                Err(e) => {
+                    trace!("Could not get children for {}: {e}", addr.object_path);
+                    vec![]
+                }
+            };
+
+            let mut children_nodes = Vec::new();
+            for child_obj_ref in &children_addrs {
+                let child_addr = AtspiAddress {
+                    bus_name: child_obj_ref.name.to_string(),
+                    object_path: child_obj_ref.path.to_string(),
+                };
+                match self
+                    .capture_node(&child_addr, current_depth + 1, max_depth, include_hidden)
+                    .await
+                {
+                    Ok(Some(node)) => children_nodes.push(node),
+                    Ok(None) => {} // hidden or depth-limited
+                    Err(e) => {
+                        trace!("Error capturing child {}: {e}", child_addr.object_path);
+                    }
+                }
+            }
+
+            let node = UnifiedNode {
+                ref_id: self.alloc_ref(),
+                role: unified_role,
+                name: if name.is_empty() { None } else { Some(name) },
+                value: None,
+                description,
+                bounds,
+                state,
+                is_interactive,
+                level: None,
+                automation_id: None,
+                class_name: None,
+                html_tag: None,
+                url: None,
+                source: NodeSource::Atspi,
+                platform_handle: Some(handle),
+
+                supported_patterns,
+                generation: 0,
+                children: children_nodes,
+            };
+
+            Ok(Some(node))
+        })
     }
 
     /// Find a child application on the desktop by window title (partial, case-insensitive).
@@ -342,22 +380,14 @@ impl AtspiAdapter {
                 bus_name: child_ref.name.to_string(),
                 object_path: child_ref.path.to_string(),
             };
-            if let Ok(proxy) = self.accessible_proxy(&child_addr).await {
+            if let Ok(_proxy) = self.accessible_proxy(&child_addr).await {
                 // AT-SPI applications expose get_id() or we can check the Application interface.
                 // The accessible application proxy has a method to get the PID.
-                if let Ok(app_proxy) =
-                    atspi::proxy::application::ApplicationProxy::builder(self.zbus_conn()?)
-                        .destination(child_addr.bus_name.as_str())
-                        .ok()
-                        .and_then(|b| b.path(child_addr.object_path.as_str()).ok())
-                        .map(|b| b.cache_properties(CacheProperties::No))
-                {
-                    if let Ok(app) = app_proxy.build().await {
-                        // The `id` property on Application interface is the PID.
-                        if let Ok(app_id) = app.id().await {
-                            if app_id as u32 == pid {
-                                return Ok(child_addr);
-                            }
+                if let Ok(app) = self.application_proxy(&child_addr).await {
+                    // The `id` property on Application interface is the PID.
+                    if let Ok(app_id) = app.id().await {
+                        if app_id as u32 == pid {
+                            return Ok(child_addr);
                         }
                     }
                 }
@@ -492,8 +522,15 @@ impl PlatformAdapter for AtspiAdapter {
                 "type='signal',interface='org.a11y.atspi.Event.Object',member='ChildrenChanged'";
 
             for rule in &[focus_rule, object_rule, children_rule] {
-                if let Err(e) = proxy.add_match(rule).await {
-                    warn!("Failed to add match rule {rule}: {e}");
+                match zbus::MatchRule::try_from(*rule) {
+                    Ok(match_rule) => {
+                        if let Err(e) = proxy.add_match_rule(match_rule).await {
+                            warn!("Failed to add match rule {rule}: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse match rule {rule}: {e}");
+                    }
                 }
             }
 
@@ -501,6 +538,16 @@ impl PlatformAdapter for AtspiAdapter {
             let mut stream = zbus::MessageStream::from(&zconn);
 
             while let Some(msg) = stream.next().await {
+                // zbus 4 yields `Result<Message, Error>` from MessageStream rather
+                // than the bare `Arc<Message>` of zbus 3. Drop transient errors and
+                // continue listening.
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("AT-SPI message stream error: {e}");
+                        continue;
+                    }
+                };
                 let header = msg.header();
                 let interface = header.interface().map(|i| i.as_str().to_string());
                 let member = header.member().map(|m| m.as_str().to_string());
@@ -672,7 +719,7 @@ impl PlatformAdapter for AtspiAdapter {
                 match self.action_proxy(&addr).await {
                     Ok(action) => {
                         // Try to find a "select" action by name.
-                        let n_actions = action.n_actions().await.unwrap_or(0);
+                        let n_actions = action.nactions().await.unwrap_or(0);
                         let mut select_idx: Option<i32> = None;
                         for i in 0..n_actions {
                             if let Ok(name) = action.get_name(i).await {
@@ -719,7 +766,7 @@ impl PlatformAdapter for AtspiAdapter {
                 // AT-SPI doesn't have a dedicated scroll interface; use Action "scroll".
                 match self.action_proxy(&addr).await {
                     Ok(action) => {
-                        let n_actions = action.n_actions().await.unwrap_or(0);
+                        let n_actions = action.nactions().await.unwrap_or(0);
                         let mut scroll_idx: Option<i32> = None;
                         for i in 0..n_actions {
                             if let Ok(name) = action.get_name(i).await {
@@ -834,8 +881,11 @@ fn map_atspi_role(role: Role) -> UnifiedRole {
         Role::ScrollPane => UnifiedRole::Pane,
         Role::Viewport => UnifiedRole::Region,
         Role::PasswordText => UnifiedRole::Textbox,
-        Role::EditBar => UnifiedRole::Edit,
-        Role::Glass => UnifiedRole::Pane,
+        // NOTE: atspi 0.22 renamed these variants — `EditBar` → `Editbar`
+        // (lowercase b) and `Glass` → `GlassPane`. The original mappings
+        // (Edit / Pane) are preserved.
+        Role::Editbar => UnifiedRole::Edit,
+        Role::GlassPane => UnifiedRole::Pane,
         Role::Extended => UnifiedRole::Custom,
         _ => UnifiedRole::Unknown,
     }
@@ -877,22 +927,25 @@ fn convert_atspi_state(state_set: &atspi::StateSet) -> UnifiedState {
 }
 
 /// Determine which interaction patterns are supported based on AT-SPI interfaces.
-fn determine_patterns(interfaces: &[Interface]) -> Vec<InteractionPattern> {
+///
+/// Takes `&InterfaceSet` (atspi's bitflag-based interface bag) rather than a slice.
+/// `InterfaceSet::contains` accepts the `Interface` enum by value.
+fn determine_patterns(interfaces: &InterfaceSet) -> Vec<InteractionPattern> {
     let mut patterns = Vec::new();
 
-    if interfaces.contains(&Interface::Action) {
+    if interfaces.contains(Interface::Action) {
         patterns.push(InteractionPattern::Invoke);
     }
-    if interfaces.contains(&Interface::EditableText) {
+    if interfaces.contains(Interface::EditableText) {
         patterns.push(InteractionPattern::Value);
     }
-    if interfaces.contains(&Interface::Value) {
+    if interfaces.contains(Interface::Value) {
         patterns.push(InteractionPattern::RangeValue);
     }
-    if interfaces.contains(&Interface::Selection) {
+    if interfaces.contains(Interface::Selection) {
         patterns.push(InteractionPattern::Selection);
     }
-    if interfaces.contains(&Interface::Component) {
+    if interfaces.contains(Interface::Component) {
         patterns.push(InteractionPattern::CoordinateClick);
     }
 

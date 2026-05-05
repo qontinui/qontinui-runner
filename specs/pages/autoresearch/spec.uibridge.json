@@ -1,0 +1,1015 @@
+{
+  "description": "Autoresearch Page — A dev-only dashboard for launching and analyzing parallel workflow architecture comparison runs with statistical A/B testing. Users select a workflow and a variation type (Architecture: Traditional vs Agentic Verification vs Multi-Agent Pipeline; Same: 3 identical runs for repeatability), then observe each entry's live status as workflows execute in isolated worktrees. When all entries complete, a structured metric comparison (success, iterations, duration_ms) and an AI-generated prose report identify the winning architecture with a confidence score. Comparison runs are stored in the comparison_runs PostgreSQL table and served via runner HTTP endpoints POST /comparison/start, GET /comparison/:id, GET /comparisons and Tauri commands under the qontinui_comparison plugin. This page surfaces the research infrastructure underlying architecture selection decisions.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Page Structure & Layout",
+          "enabled": true,
+          "id": "page-structure-elem-0",
+          "precondition": "No comparison runs exist in the database",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading"
+            },
+            "label": "Required element for Page Structure & Layout",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Page Structure & Layout",
+          "enabled": true,
+          "id": "page-structure-elem-1",
+          "precondition": "No comparison runs exist in the database",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Compare"
+            },
+            "label": "Required element for Page Structure & Layout",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Page Structure & Layout",
+          "enabled": true,
+          "id": "page-structure-elem-2",
+          "precondition": "No comparison runs exist in the database",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Page Structure & Layout",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Page Structure & Layout",
+          "enabled": true,
+          "id": "page-structure-elem-3",
+          "precondition": "No comparison runs exist in the database",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Page Structure & Layout",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Autoresearch page is a dev-only tab rendered in the main content area. It displays a header with the page title and a launch button, a list of existing comparison runs, and a detail panel for the selected run.",
+      "id": "page-structure",
+      "name": "Page Structure & Layout",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Workflow Selection",
+          "enabled": true,
+          "id": "workflow-selection-elem-0",
+          "precondition": "A workflow that no longer exists is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Workflow Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Workflow Selection",
+          "enabled": true,
+          "id": "workflow-selection-elem-1",
+          "precondition": "A workflow that no longer exists is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "alert"
+            },
+            "label": "Required element for Workflow Selection",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Workflow Selection",
+          "enabled": true,
+          "id": "workflow-selection-elem-2",
+          "precondition": "A workflow that no longer exists is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Workflow Selection",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Before starting a comparison, the user must select which unified workflow to run. The backend validates that the workflow exists in PostgreSQL via GET /unified-workflows/:id before accepting a POST /comparison/start request. The Tauri command start_comparison (plugin: qontinui_comparison) performs the same lookup before inserting the comparison_runs row.",
+      "id": "workflow-selection",
+      "name": "Workflow Selection",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Comparison Launch Form",
+          "enabled": true,
+          "id": "comparison-launch-elem-0",
+          "precondition": "A workflow is selected and a variation type is chosen",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "group"
+            },
+            "label": "Required element for Comparison Launch Form",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Comparison Launch Form",
+          "enabled": true,
+          "id": "comparison-launch-elem-1",
+          "precondition": "A workflow is selected and a variation type is chosen",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "checkbox"
+            },
+            "label": "Required element for Comparison Launch Form",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Comparison Launch Form",
+          "enabled": true,
+          "id": "comparison-launch-elem-2",
+          "precondition": "A workflow is selected and a variation type is chosen",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Run"
+            },
+            "label": "Required element for Comparison Launch Form",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Comparison Launch Form",
+          "enabled": true,
+          "id": "comparison-launch-elem-3",
+          "precondition": "A workflow is selected and a variation type is chosen",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Required element for Comparison Launch Form",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Comparison Launch Form",
+          "enabled": true,
+          "id": "comparison-launch-elem-4",
+          "precondition": "A workflow is selected and a variation type is chosen",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Required element for Comparison Launch Form",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The launch form or dialog allows the user to configure a new comparison run: select a workflow, choose a variation type (architecture or same), and optionally toggle worktree isolation. Submitting posts to POST /comparison/start via the runner HTTP API or via the Tauri qontinui_comparison.start_comparison command.",
+      "id": "comparison-launch",
+      "name": "Comparison Launch Form",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Comparison Run List",
+          "enabled": true,
+          "id": "comparison-list-elem-0",
+          "precondition": "At least one comparison run exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Required element for Comparison Run List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Comparison Run List",
+          "enabled": true,
+          "id": "comparison-list-elem-1",
+          "precondition": "At least one comparison run exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Required element for Comparison Run List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Comparison Run List",
+          "enabled": true,
+          "id": "comparison-list-elem-2",
+          "precondition": "At least one comparison run exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Required element for Comparison Run List",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Comparison Run List",
+          "enabled": true,
+          "id": "comparison-list-elem-3",
+          "precondition": "At least one comparison run exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh"
+            },
+            "label": "Required element for Comparison Run List",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The page lists recent comparison runs fetched from GET /comparisons (up to 50 most recent, returned as an array of ComparisonRunView). Each run shows its ID (or short ID), workflow ID, variation type, status, and creation date. The list is the primary navigation surface for entering a run's detail view.",
+      "id": "comparison-list",
+      "name": "Comparison Run List",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Running Comparison Detail View",
+          "enabled": true,
+          "id": "running-comparison-detail-elem-0",
+          "precondition": "A running comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Required element for Running Comparison Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Running Comparison Detail View",
+          "enabled": true,
+          "id": "running-comparison-detail-elem-1",
+          "precondition": "A running comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Required element for Running Comparison Detail View",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Running Comparison Detail View",
+          "enabled": true,
+          "id": "running-comparison-detail-elem-2",
+          "precondition": "A running comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "main"
+            },
+            "label": "Required element for Running Comparison Detail View",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When a comparison run with status 'running' is selected, the detail view shows all entries and their individual live statuses. Entry statuses are fetched from GET /comparison/:id which enriches the stored entries with live task_run statuses from PostgreSQL. Entries transition from 'pending' → 'running' → 'completed'/'failed' as workflow runs progress.",
+      "id": "running-comparison-detail",
+      "name": "Running Comparison Detail View",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Completed Comparison Detail — Results Overview",
+          "enabled": true,
+          "id": "completed-comparison-detail-elem-0",
+          "precondition": "A completed comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "table"
+            },
+            "label": "Required element for Completed Comparison Detail — Results Overview",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Completed Comparison Detail — Results Overview",
+          "enabled": true,
+          "id": "completed-comparison-detail-elem-1",
+          "precondition": "A completed comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Completed Comparison Detail — Results Overview",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Completed Comparison Detail — Results Overview",
+          "enabled": true,
+          "id": "completed-comparison-detail-elem-2",
+          "precondition": "A completed comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Completed Comparison Detail — Results Overview",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Completed Comparison Detail — Results Overview",
+          "enabled": true,
+          "id": "completed-comparison-detail-elem-3",
+          "precondition": "A completed comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Completed Comparison Detail — Results Overview",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When a comparison run completes (status='completed'), the detail view shows the full result breakdown: per-entry results (success/fail, iteration count, duration_ms), the AI comparison report, and the AI recommendation with confidence score. The completed_at timestamp is shown. Status auto-transitions to 'completed' when the GET /comparison/:id handler detects all_done=true.",
+      "id": "completed-comparison-detail",
+      "name": "Completed Comparison Detail — Results Overview",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Structured Metric Analysis",
+          "enabled": true,
+          "id": "metric-analysis-elem-0",
+          "precondition": "A completed comparison run with at least 2 completed entries is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "table"
+            },
+            "label": "Required element for Structured Metric Analysis",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Structured Metric Analysis",
+          "enabled": true,
+          "id": "metric-analysis-elem-1",
+          "precondition": "A completed comparison run with at least 2 completed entries is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Structured Metric Analysis",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Structured Metric Analysis",
+          "enabled": true,
+          "id": "metric-analysis-elem-2",
+          "precondition": "A completed comparison run with at least 2 completed entries is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "table"
+            },
+            "label": "Required element for Structured Metric Analysis",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Structured Metric Analysis",
+          "enabled": true,
+          "id": "metric-analysis-elem-3",
+          "precondition": "A completed comparison run with at least 2 completed entries is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Structured Metric Analysis",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Structured Metric Analysis",
+          "enabled": true,
+          "id": "metric-analysis-elem-4",
+          "precondition": "A completed comparison run with at least 2 completed entries is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Structured Metric Analysis",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The page displays machine-readable metric comparisons across variants from StructuredComparisonReport (built by build_structured_report in comparison.rs). The HTTP API surfaces three metrics per completed entry from ComparisonEntryResultJson: success (bool → 1.0/0.0, higher=better), iterations (u32, lower=better), and duration_ms (u64, lower=better). A winner is identified by which variant wins the most metrics, with a confidence score expressed as winner_wins / total_metrics (0.0–1.0).",
+      "id": "metric-analysis",
+      "name": "Structured Metric Analysis",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Comparison Algorithm Correctness",
+          "enabled": true,
+          "id": "comparison-algorithm-correctness-elem-0",
+          "precondition": "A completed comparison run with at least 2 completed entries is displayed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Comparison Algorithm Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Comparison Algorithm Correctness",
+          "enabled": true,
+          "id": "comparison-algorithm-correctness-elem-1",
+          "precondition": "A completed comparison run with at least 2 completed entries is displayed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Comparison Algorithm Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Comparison Algorithm Correctness",
+          "enabled": true,
+          "id": "comparison-algorithm-correctness-elem-2",
+          "precondition": "A completed comparison run with at least 2 completed entries is displayed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Required element for Comparison Algorithm Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Comparison Algorithm Correctness",
+          "enabled": true,
+          "id": "comparison-algorithm-correctness-elem-3",
+          "precondition": "A completed comparison run with at least 2 completed entries is displayed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Comparison Algorithm Correctness",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The winner and confidence in StructuredComparisonReport are derived by a specific algorithm in build_structured_report (comparison.rs): winner = variant with the most metric wins (tie-broken by highest success_rate); confidence = winner_metric_wins / total_metrics_count (0.0–1.0). With 3 metrics, valid confidence values are 0.33, 0.67, or 1.0. An AI verification workflow can check that displayed winner and confidence match these formulas applied to the visible metric values.",
+      "id": "comparison-algorithm-correctness",
+      "name": "Comparison Algorithm Correctness",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Comparison Status Lifecycle",
+          "enabled": true,
+          "id": "comparison-states-elem-0",
+          "precondition": "A 'running' comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Comparison Status Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Comparison Status Lifecycle",
+          "enabled": true,
+          "id": "comparison-states-elem-1",
+          "precondition": "A 'running' comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Comparison Status Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Comparison Status Lifecycle",
+          "enabled": true,
+          "id": "comparison-states-elem-2",
+          "precondition": "A 'running' comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Comparison Status Lifecycle",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Comparison Status Lifecycle",
+          "enabled": true,
+          "id": "comparison-states-elem-3",
+          "precondition": "A 'running' comparison run is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Comparison Status Lifecycle",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The page correctly reflects the status progression for comparison runs: running (entries launching and executing) → completed (all entries done, auto-transitioned by GET /comparison/:id when all_done=true). The 'comparing' status is a valid enum variant but requires a separate AI analysis pipeline to be set — the GET endpoint does not set it automatically. Failed state is shown when all entries fail on launch.",
+      "id": "comparison-states",
+      "name": "Comparison Status Lifecycle",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Research Configuration (Multi-Trial, Aspirational)",
+          "enabled": true,
+          "id": "research-config-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "form"
+            },
+            "label": "Required element for Research Configuration (Multi-Trial, Aspirational)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Research Configuration (Multi-Trial, Aspirational)",
+          "enabled": true,
+          "id": "research-config-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "group"
+            },
+            "label": "Required element for Research Configuration (Multi-Trial, Aspirational)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Research Configuration (Multi-Trial, Aspirational)",
+          "enabled": true,
+          "id": "research-config-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Required element for Research Configuration (Multi-Trial, Aspirational)",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Beyond single-shot comparisons, the ResearchConfig data structure in comparison.rs defines multi-trial experiment parameters: trials_per_experiment, search_dimensions (model, multi_agent_mode, max_iterations, context_tokens, workflow_architecture, custom), mutation_strategy (sequential/random_perturbation/ai_guided), and acceptance_criteria. If this advanced configuration UI is implemented, it should surface these fields. Currently the HTTP API only supports single-trial comparisons and p_value is always null.",
+      "id": "research-config",
+      "name": "Research Configuration (Multi-Trial, Aspirational)",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "autoresearch",
+    "tags": [
+      "dev-only",
+      "comparison",
+      "a-b-testing",
+      "architectures",
+      "statistics",
+      "research"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The Autoresearch page is a dev-only tab rendered in the main content area. It displays a header with the page title and a launch button, a list of existing comparison runs, and a detail panel for the selected run.",
+        "elements": [
+          {
+            "role": "heading"
+          },
+          {
+            "role": "button",
+            "textContent": "Compare"
+          },
+          {},
+          {}
+        ],
+        "id": "page-structure",
+        "isInitial": false,
+        "name": "Page Structure & Layout",
+        "transitions": []
+      },
+      {
+        "description": "Before starting a comparison, the user must select which unified workflow to run. The backend validates that the workflow exists in PostgreSQL via GET /unified-workflows/:id before accepting a POST /comparison/start request. The Tauri command start_comparison (plugin: qontinui_comparison) performs the same lookup before inserting the comparison_runs row.",
+        "elements": [
+          {
+            "role": "combobox"
+          },
+          {
+            "role": "alert"
+          },
+          {
+            "role": "combobox"
+          }
+        ],
+        "id": "workflow-selection",
+        "isInitial": false,
+        "name": "Workflow Selection",
+        "transitions": []
+      },
+      {
+        "description": "The launch form or dialog allows the user to configure a new comparison run: select a workflow, choose a variation type (architecture or same), and optionally toggle worktree isolation. Submitting posts to POST /comparison/start via the runner HTTP API or via the Tauri qontinui_comparison.start_comparison command.",
+        "elements": [
+          {
+            "role": "group"
+          },
+          {
+            "role": "checkbox"
+          },
+          {
+            "role": "button",
+            "textContent": "Run"
+          },
+          {
+            "role": "list"
+          },
+          {
+            "role": "list"
+          }
+        ],
+        "id": "comparison-launch",
+        "isInitial": false,
+        "name": "Comparison Launch Form",
+        "transitions": []
+      },
+      {
+        "description": "The page lists recent comparison runs fetched from GET /comparisons (up to 50 most recent, returned as an array of ComparisonRunView). Each run shows its ID (or short ID), workflow ID, variation type, status, and creation date. The list is the primary navigation surface for entering a run's detail view.",
+        "elements": [
+          {
+            "role": "list"
+          },
+          {
+            "role": "list"
+          },
+          {
+            "role": "list"
+          },
+          {
+            "role": "button",
+            "textContent": "Refresh"
+          }
+        ],
+        "id": "comparison-list",
+        "isInitial": false,
+        "name": "Comparison Run List",
+        "transitions": []
+      },
+      {
+        "description": "When a comparison run with status 'running' is selected, the detail view shows all entries and their individual live statuses. Entry statuses are fetched from GET /comparison/:id which enriches the stored entries with live task_run statuses from PostgreSQL. Entries transition from 'pending' → 'running' → 'completed'/'failed' as workflow runs progress.",
+        "elements": [
+          {
+            "role": "list"
+          },
+          {
+            "role": "list"
+          },
+          {
+            "role": "main"
+          }
+        ],
+        "id": "running-comparison-detail",
+        "isInitial": false,
+        "name": "Running Comparison Detail View",
+        "transitions": []
+      },
+      {
+        "description": "When a comparison run completes (status='completed'), the detail view shows the full result breakdown: per-entry results (success/fail, iteration count, duration_ms), the AI comparison report, and the AI recommendation with confidence score. The completed_at timestamp is shown. Status auto-transitions to 'completed' when the GET /comparison/:id handler detects all_done=true.",
+        "elements": [
+          {
+            "role": "table"
+          },
+          {
+            "role": "region"
+          },
+          {
+            "role": "region"
+          },
+          {
+            "role": "region"
+          }
+        ],
+        "id": "completed-comparison-detail",
+        "isInitial": false,
+        "name": "Completed Comparison Detail — Results Overview",
+        "transitions": []
+      },
+      {
+        "description": "The page displays machine-readable metric comparisons across variants from StructuredComparisonReport (built by build_structured_report in comparison.rs). The HTTP API surfaces three metrics per completed entry from ComparisonEntryResultJson: success (bool → 1.0/0.0, higher=better), iterations (u32, lower=better), and duration_ms (u64, lower=better). A winner is identified by which variant wins the most metrics, with a confidence score expressed as winner_wins / total_metrics (0.0–1.0).",
+        "elements": [
+          {
+            "role": "table"
+          },
+          {
+            "role": "region"
+          },
+          {
+            "role": "table"
+          },
+          {
+            "role": "region"
+          },
+          {
+            "role": "region"
+          }
+        ],
+        "id": "metric-analysis",
+        "isInitial": false,
+        "name": "Structured Metric Analysis",
+        "transitions": []
+      },
+      {
+        "description": "The winner and confidence in StructuredComparisonReport are derived by a specific algorithm in build_structured_report (comparison.rs): winner = variant with the most metric wins (tie-broken by highest success_rate); confidence = winner_metric_wins / total_metrics_count (0.0–1.0). With 3 metrics, valid confidence values are 0.33, 0.67, or 1.0. An AI verification workflow can check that displayed winner and confidence match these formulas applied to the visible metric values.",
+        "elements": [
+          {
+            "role": "region"
+          },
+          {
+            "role": "region"
+          },
+          {
+            "role": "list"
+          },
+          {
+            "role": "region"
+          }
+        ],
+        "id": "comparison-algorithm-correctness",
+        "isInitial": false,
+        "name": "Comparison Algorithm Correctness",
+        "transitions": []
+      },
+      {
+        "description": "The page correctly reflects the status progression for comparison runs: running (entries launching and executing) → completed (all entries done, auto-transitioned by GET /comparison/:id when all_done=true). The 'comparing' status is a valid enum variant but requires a separate AI analysis pipeline to be set — the GET endpoint does not set it automatically. Failed state is shown when all entries fail on launch.",
+        "elements": [
+          {
+            "role": "region"
+          },
+          {
+            "role": "region"
+          },
+          {
+            "role": "region"
+          },
+          {
+            "role": "region"
+          }
+        ],
+        "id": "comparison-states",
+        "isInitial": false,
+        "name": "Comparison Status Lifecycle",
+        "transitions": []
+      },
+      {
+        "description": "Beyond single-shot comparisons, the ResearchConfig data structure in comparison.rs defines multi-trial experiment parameters: trials_per_experiment, search_dimensions (model, multi_agent_mode, max_iterations, context_tokens, workflow_architecture, custom), mutation_strategy (sequential/random_perturbation/ai_guided), and acceptance_criteria. If this advanced configuration UI is implemented, it should surface these fields. Currently the HTTP API only supports single-trial comparisons and p_value is always null.",
+        "elements": [
+          {
+            "role": "form"
+          },
+          {
+            "role": "group"
+          },
+          {
+            "role": "region"
+          }
+        ],
+        "id": "research-config",
+        "isInitial": false,
+        "name": "Research Configuration (Multi-Trial, Aspirational)",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

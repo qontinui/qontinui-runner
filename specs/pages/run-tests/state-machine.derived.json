@@ -1,0 +1,100 @@
+{
+  "version": "1.0",
+  "id": "run-tests",
+  "name": "TestResultsTab",
+  "states": [
+    {
+      "id": "tests-summary-overview",
+      "name": "Test Results Summary",
+      "requiredElements": [
+        {
+          "text": "passed|failed|total"
+        },
+        {
+          "text": "Verification|iteration"
+        },
+        {
+          "text": "Test Results"
+        }
+      ],
+      "description": "The Tests page opens with an aggregate summary of all test results from the workflow run. Users need to immediately understand the overall test health: how many passed, how many failed, how many were skipped, and the total count. This summary drives the user's next action — if everything passed they can move on, if tests failed they need to drill into the failures. The summary also includes a loop result banner when the workflow used iterative verification, showing whether verification ultimately passed across all iterations.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "tests-verification-results",
+      "name": "Verification Phase Results by Iteration",
+      "requiredElements": [
+        {
+          "text": "Iteration"
+        },
+        {
+          "text": "Verification Step|step"
+        },
+        {
+          "text": "Error|Console Output"
+        },
+        {
+          "text": "assertions"
+        }
+      ],
+      "description": "Verification results are grouped by iteration, reflecting the workflow loop structure. Each iteration is collapsible and shows its own pass/fail status and duration. Within each iteration, individual verification steps are displayed as test cards. Users can drill into any step to see console output, page snapshots, assertion counts, and error details. This hierarchical organization (iteration > step > details) mirrors the execution structure and helps users trace failures to specific verification phases and iterations.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "tests-playwright-results",
+      "name": "Playwright Test Results",
+      "requiredElements": [
+        {
+          "text": "Playwright"
+        },
+        {
+          "text": "Failure Screenshot"
+        },
+        {
+          "text": "Page Snapshot"
+        }
+      ],
+      "description": "In addition to verification phase results, the page displays Playwright browser test results when the workflow included Playwright test execution. Playwright tests provide end-to-end browser verification and produce rich artifacts including failure screenshots, page snapshots (YAML), and console output. These results are displayed separately from verification results since they come from a different execution mechanism.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "tests-empty-and-running-states",
+      "name": "Empty and Running States",
+      "requiredElements": [
+        {
+          "text": "Select a run"
+        },
+        {
+          "text": "after the run completes"
+        },
+        {
+          "text": "No test results"
+        }
+      ],
+      "description": "The Tests page handles several states gracefully. When no run is selected, it guides the user to select one. When the selected run is still executing, it informs the user that results will be available after completion. When no tests were executed during the run, it explains that tests appear when the workflow includes verification or test steps. These states prevent user confusion and set appropriate expectations.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Run Tests page — displays Playwright test results and verification phase results for a workflow run. Shows pass/fail summaries, individual test cards with assertions, console output, failure screenshots, error messages, and iteration-grouped verification results.",
+  "metadata": {
+    "tags": [
+      "run-tests",
+      "test-results",
+      "verification",
+      "playwright",
+      "observe"
+    ]
+  }
+}

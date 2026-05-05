@@ -1,0 +1,17 @@
+{
+  "description": "Catch-all spec for workflow acceptance criteria that do not map to a specific UI page. Contains backend, infrastructure, and cross-cutting criteria generated from workflow prompts. Groups are appended automatically by the workflow generation pipeline when acceptance criteria have no matching page spec.",
+  "groups": [],
+  "metadata": {
+    "component": "workflow-criteria",
+    "tags": [
+      "workflow-generated",
+      "backend",
+      "infrastructure",
+      "catch-all"
+    ]
+  },
+  "stateMachine": {
+    "states": []
+  },
+  "version": "1.0.0"
+}

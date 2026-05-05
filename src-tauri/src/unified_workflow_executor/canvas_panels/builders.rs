@@ -652,7 +652,7 @@ pub fn build_step_duration_chart(
 ) -> Value {
     // Sort by duration descending, take top N
     let mut sorted = step_timings.to_vec();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.1));
     sorted.truncate(max_steps);
 
     let max_duration = sorted.first().map(|s| s.1).unwrap_or(0);

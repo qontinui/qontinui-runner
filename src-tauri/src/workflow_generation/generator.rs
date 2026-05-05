@@ -1060,38 +1060,27 @@ pub fn generate_workflow(
                 write_back_verification_templates(pg, &relevant_issues, &spec_result.criteria);
             }
 
-            // Append acceptance criteria to matching page spec files so that
-            // prompt-driven goals become part of the persistent spec definitions.
-            // All runner instances (including protected ones) share the same
-            // src/specs/ directory, so local file writes reach every instance.
+            // Append acceptance criteria to matching page projections so that
+            // prompt-driven goals become part of the persistent spec
+            // definitions. Page projections live under the Spec API storage
+            // root (`<runner>/specs/pages/<id>/spec.uibridge.json`); writes
+            // reach every runner instance because they share the same root.
             {
-                let runner_specs_dir = std::path::Path::new("src/specs");
-                let runner_specs_alt = std::path::Path::new("../src/specs");
-                let mut spec_dirs: Vec<&std::path::Path> = Vec::new();
-                if runner_specs_dir.exists() {
-                    spec_dirs.push(runner_specs_dir);
-                }
-                if runner_specs_alt.exists() {
-                    spec_dirs.push(runner_specs_alt);
-                }
-                if spec_dirs.is_empty() {
-                    debug!("No spec directories found for page spec update (checked src/specs and ../src/specs)");
-                } else {
-                    let spec_update = super::spec_synthesis::update_page_specs_from_criteria(
-                        &spec_result.criteria,
-                        &effective_request.description,
-                        &spec_dirs,
-                        0.3,
+                let specs_root = crate::spec_api::storage::resolve_specs_root();
+                let spec_update = super::spec_synthesis::update_page_specs_from_criteria(
+                    &spec_result.criteria,
+                    &effective_request.description,
+                    &specs_root,
+                    0.3,
+                );
+                if spec_update.specs_updated > 0 {
+                    info!(
+                        "Appended acceptance criteria to {} page spec(s): {:?}",
+                        spec_update.specs_updated, spec_update.updated_paths
                     );
-                    if spec_update.specs_updated > 0 {
-                        info!(
-                            "Appended acceptance criteria to {} page spec(s): {:?}",
-                            spec_update.specs_updated, spec_update.updated_paths
-                        );
-                    }
-                    if !spec_update.errors.is_empty() {
-                        warn!("Page spec update errors: {:?}", spec_update.errors);
-                    }
+                }
+                if !spec_update.errors.is_empty() {
+                    warn!("Page spec update errors: {:?}", spec_update.errors);
                 }
             }
 

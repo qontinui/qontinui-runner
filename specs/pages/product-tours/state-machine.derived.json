@@ -1,0 +1,336 @@
+{
+  "version": "1.0",
+  "id": "product-tours",
+  "name": "TourCatalog",
+  "states": [
+    {
+      "id": "pt-page-structure",
+      "name": "Page Structure",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Product Tours"
+        },
+        {
+          "role": "heading",
+          "text": "Generate New Tours"
+        },
+        {},
+        {
+          "role": "heading",
+          "text": "Product Tours"
+        }
+      ],
+      "description": "Core layout and headings that establish the page identity. The page is a flex column with a fixed header and a scrollable content area. The main heading and section heading must be present for the page to be considered loaded.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-spec-selector",
+      "name": "Page Spec Selector",
+      "requiredElements": [
+        {
+          "text": "Select Pages"
+        },
+        {
+          "role": "button",
+          "text": "Select all"
+        },
+        {
+          "text": "No specs found"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "Multi-select control that lists all discovered UI Bridge spec files (*.spec.uibridge.json). Users select which pages to generate tours from. Includes a 'Select all' / 'Deselect all' toggle. Specs are discovered via import.meta.glob at build time.",
+      "precondition": "At least one spec file exists and not all specs are selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-audience-selector",
+      "name": "Target Audience Selector",
+      "requiredElements": [
+        {
+          "text": "Target Audience"
+        },
+        {
+          "role": "option",
+          "text": "New User — basics & common workflows"
+        },
+        {
+          "role": "option",
+          "text": "Power User — advanced features"
+        },
+        {
+          "role": "option",
+          "text": "Evaluator — differentiators & ROI"
+        }
+      ],
+      "description": "A select dropdown that determines the persona the AI uses when generating tour content. Three audiences are available: new-user, power-user, and evaluator. The selected audience also controls how saved tours are grouped and labeled in the catalog.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-generation-controls",
+      "name": "Generation Action Controls",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Generate Tour"
+        },
+        {
+          "role": "button",
+          "text": "Generate Tour"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "role": "button",
+          "text": "Regenerate"
+        },
+        {
+          "role": "button",
+          "text": "Reset"
+        }
+      ],
+      "description": "The action buttons in the generation workflow change based on the current phase. In idle/error/done phases the 'Generate Tour(s)' button is shown. In the previewing phase, 'Save' and 'Regenerate' buttons replace it. A 'Reset' button appears in the header whenever the phase is not idle.",
+      "precondition": "Page is in idle phase",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-generation-status",
+      "name": "Generation Status Messages",
+      "requiredElements": [
+        {
+          "text": "Generating tour(s) with AI..."
+        },
+        {
+          "role": "alert"
+        },
+        {
+          "text": "saved"
+        }
+      ],
+      "description": "Contextual status indicators appear below the action buttons during active phases. The generating phase shows a spinner and loading text. The error phase shows an error message in a red-bordered box. The done phase shows a success message in green. These messages are mutually exclusive.",
+      "precondition": "Page is in generating phase (AI request is in flight)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-preview-section",
+      "name": "Generated Tours Preview",
+      "requiredElements": [
+        {
+          "text": "Preview"
+        },
+        {
+          "role": "button",
+          "text": "Start Tour"
+        },
+        {
+          "role": "button",
+          "text": "Start Tour"
+        }
+      ],
+      "description": "When AI generation completes, the page enters the previewing phase and displays a 'Preview' heading above a grid of TourCard components — one per generated tour. Users review these before deciding to save or regenerate.",
+      "precondition": "Page is in previewing phase",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-saved-tours-catalog",
+      "name": "Saved Tours Catalog",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Saved Tours"
+        },
+        {
+          "text": "Getting Started"
+        },
+        {
+          "text": "Power Features"
+        },
+        {
+          "text": "Product Overview"
+        },
+        {
+          "role": "button",
+          "text": "Remove"
+        },
+        {
+          "role": "heading",
+          "text": "Saved Tours"
+        }
+      ],
+      "description": "The lower section of the page displays all previously saved tours, separated from the generation controls by a divider. Tours are grouped by audience type with labeled category headings. This section only appears when at least one tour has been saved to instanceStorage.",
+      "precondition": "At least one tour has been saved to instanceStorage",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-tour-card",
+      "name": "Tour Card Component",
+      "requiredElements": [
+        {
+          "tagName": "div"
+        },
+        {
+          "role": "button",
+          "text": "Start Tour"
+        },
+        {
+          "text": "min"
+        },
+        {
+          "role": "button",
+          "text": "Start Tour"
+        },
+        {
+          "role": "button",
+          "text": "HTML"
+        }
+      ],
+      "description": "TourCard renders the metadata and actions for a single ProductTour. It appears in both the preview grid and the saved tours catalog. The card layout includes a header (title, subtitle, badge), a metadata row, and action buttons.",
+      "precondition": "At least one TourCard is rendered",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-tour-player",
+      "name": "Tour Player Modal",
+      "requiredElements": [
+        {
+          "text": "Next"
+        },
+        {
+          "role": "heading"
+        },
+        {
+          "text": "Next"
+        },
+        {
+          "role": "button",
+          "text": "Next"
+        },
+        {
+          "text": "Demonstrating..."
+        },
+        {
+          "role": "heading",
+          "text": "Tour Complete"
+        },
+        {
+          "text": "Next"
+        }
+      ],
+      "description": "TourPlayer is a fixed-position floating card (bottom-right, z-[9998]) that overlays the current page while playing a tour. It displays one step at a time, executes demo actions automatically, and provides Back/Next navigation. It does not navigate away — the product tours page remains visible behind it.",
+      "precondition": "A tour has been launched by clicking 'Start Tour'",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-ai-generation-quality",
+      "name": "AI Tour Generation Output Quality",
+      "requiredElements": [
+        {
+          "text": "steps"
+        },
+        {
+          "role": "button",
+          "text": "Start Tour"
+        },
+        {
+          "role": "button",
+          "text": "Start Tour"
+        },
+        {
+          "role": "heading"
+        },
+        {
+          "text": "Demonstrating..."
+        }
+      ],
+      "description": "The AI generation process is the core domain logic of this page. It sends a structured prompt containing the spec's assertion data, the page's registered UI elements, and an audience context to the /ai/prompt endpoint. The output must conform to the ProductTour schema and meet specific quality criteria. These assertions define what 'correct' AI output looks like.",
+      "precondition": "Page is in previewing phase and at least one tour was generated",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-export-functionality",
+      "name": "Tour Export",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "JSON"
+        },
+        {
+          "role": "button",
+          "text": "MD"
+        },
+        {
+          "role": "button",
+          "text": "HTML"
+        }
+      ],
+      "description": "Tours in the saved catalog can be exported in three formats: JSON (raw data), Markdown (human-readable documentation), and HTML (standalone dark-themed self-contained page). All exports trigger a browser file download using an ObjectURL blob.",
+      "precondition": "At least one tour is in the saved tours catalog",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "pt-help-tab-integration",
+      "name": "Help Tab Integration",
+      "requiredElements": [
+        {
+          "text": "No tours generated yet"
+        },
+        {
+          "text": "Interactive tours that demonstrate features automatically"
+        },
+        {
+          "role": "button",
+          "text": "Start Tour"
+        }
+      ],
+      "description": "The Product Tours feature also appears as a sub-tab in the Help section of the runner, accessible at the 'Product Tours' tab (MapPin icon). This view reads from the same instanceStorage key and supports playback and export. It serves as a launcher for tours discovered elsewhere in the app.",
+      "precondition": "User is on the Help > Product Tours sub-tab and no tours are saved",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The Product Tours page (TourCatalog) enables users to generate AI-powered interactive product tours from existing UI Bridge page specs. Users select one or more page specs, choose a target audience (new user, power user, or evaluator), then trigger AI generation via the runner's /ai/prompt endpoint. Generated tours are previewed as TourCard components before being persisted to instanceStorage. Saved tours are cataloged by audience category and can be played back with the floating TourPlayer modal, or exported as JSON, Markdown, or HTML. The page implements a multi-phase generation workflow: idle → generating → previewing → done (or error on failure). Tour steps reference registered UI elements by ID and can execute demo actions (click, type, select, navigate) that the player performs automatically.",
+  "metadata": {
+    "tags": [
+      "product-tour",
+      "ai-generation",
+      "runner",
+      "catalog",
+      "tour-player",
+      "export"
+    ]
+  }
+}

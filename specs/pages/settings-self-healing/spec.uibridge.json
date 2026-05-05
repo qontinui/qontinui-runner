@@ -1,0 +1,1209 @@
+{
+  "description": "The Self-Healing settings page in the qontinui-runner desktop application, accessed via the 'Self-Healing' tab in the Settings sidebar. It configures three automation self-healing subsystems: Action Caching (TTL-based cache that avoids redundant template matching and screen captures), Visual Validation (post-action screen state verification to detect failed actions), and LLM Assistance (AI-powered element recovery using local Ollama or remote OpenAI/Anthropic APIs). Each subsystem is presented as an independently collapsible section with a toggle switch or mode selector. When LLM Mode is set to Remote API, the page adds API key management backed by the OS keychain (Windows Credential Manager) — separate from the main settings file. All six settings fields are persisted via the save_self_healing_settings Tauri IPC command and passed directly to the qontinui Python library at workflow execution time. The SelfHealingSettings Rust struct is the canonical type; the TypeScript interface mirrors it exactly.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Page Structure",
+          "enabled": true,
+          "id": "sh-page-structure-elem-0",
+          "precondition": "Settings have loaded (loading indicator is gone)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Self-Healing Configuration"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Page Structure",
+          "enabled": true,
+          "id": "sh-page-structure-elem-1",
+          "precondition": "Settings have loaded (loading indicator is gone)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Configure automation self-healing features"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Page Structure",
+          "enabled": true,
+          "id": "sh-page-structure-elem-2",
+          "precondition": "Settings have loaded (loading indicator is gone)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Action Caching"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Page Structure",
+          "enabled": true,
+          "id": "sh-page-structure-elem-3",
+          "precondition": "Settings have loaded (loading indicator is gone)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Visual Validation"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Page Structure",
+          "enabled": true,
+          "id": "sh-page-structure-elem-4",
+          "precondition": "Settings have loaded (loading indicator is gone)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "LLM Assistance"
+            },
+            "label": "Required element for Page Structure",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The self-healing tab renders a titled page header, a descriptive subtitle, and three collapsible section panels. This group verifies the top-level structure is present after settings have loaded.",
+      "id": "sh-page-structure",
+      "name": "Page Structure",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Loading State",
+          "enabled": true,
+          "id": "sh-loading-state-elem-0",
+          "precondition": "Page has just mounted and the get_self_healing_settings fetch has not yet completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Loading State",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Loading State",
+          "enabled": true,
+          "id": "sh-loading-state-elem-1",
+          "precondition": "Page has just mounted and the get_self_healing_settings fetch has not yet completed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Self-Healing Configuration"
+            },
+            "label": "Required element for Loading State",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When the page first mounts, it fetches settings via the get_self_healing_settings Tauri IPC command. During this fetch, a loading indicator is shown in place of the settings form. This group verifies the loading and transition-to-loaded behavior.",
+      "id": "sh-loading-state",
+      "name": "Loading State",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Action Caching Section",
+          "enabled": true,
+          "id": "sh-action-caching-elem-0",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cache action results to avoid redundant operations"
+            },
+            "label": "Required element for Action Caching Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Action Caching Section",
+          "enabled": true,
+          "id": "sh-action-caching-elem-1",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cache TTL (seconds)"
+            },
+            "label": "Required element for Action Caching Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Action Caching Section",
+          "enabled": true,
+          "id": "sh-action-caching-elem-2",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Action caching prevents redundant template matching"
+            },
+            "label": "Required element for Action Caching Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Action Caching Section",
+          "enabled": true,
+          "id": "sh-action-caching-elem-3",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Action Caching"
+            },
+            "label": "Required element for Action Caching Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Action Caching Section",
+          "enabled": true,
+          "id": "sh-action-caching-elem-4",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Cache TTL (seconds)"
+            },
+            "label": "Required element for Action Caching Section",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A collapsible panel with a section header containing a toggle switch. Clicking the header expands/collapses the body. When expanded, it shows a Cache TTL number input (min 30, max 3600, step 30 seconds) and an info box explaining the caching behavior. The TTL input is disabled when the toggle is off. Defaults: enabled=true, ttl=300.",
+      "id": "sh-action-caching",
+      "name": "Action Caching Section",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Visual Validation Section",
+          "enabled": true,
+          "id": "sh-visual-validation-elem-0",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Validate actions by checking screen state after execution"
+            },
+            "label": "Required element for Visual Validation Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Visual Validation Section",
+          "enabled": true,
+          "id": "sh-visual-validation-elem-1",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "When enabled, actions are validated by checking"
+            },
+            "label": "Required element for Visual Validation Section",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Visual Validation Section",
+          "enabled": true,
+          "id": "sh-visual-validation-elem-2",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Visual Validation"
+            },
+            "label": "Required element for Visual Validation Section",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A collapsible panel with a toggle switch in the header. When expanded, it shows only an info box explaining that actions are validated by checking expected screen state after execution. There are no additional configuration fields. Defaults to enabled=true.",
+      "id": "sh-visual-validation",
+      "name": "Visual Validation Section",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state LLM Assistance Section — Mode Selector",
+          "enabled": true,
+          "id": "sh-llm-assistance-elem-0",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Use AI to assist with element identification and recovery"
+            },
+            "label": "Required element for LLM Assistance Section — Mode Selector",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state LLM Assistance Section — Mode Selector",
+          "enabled": true,
+          "id": "sh-llm-assistance-elem-1",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "LLM Mode"
+            },
+            "label": "Required element for LLM Assistance Section — Mode Selector",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state LLM Assistance Section — Mode Selector",
+          "enabled": true,
+          "id": "sh-llm-assistance-elem-2",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "LLM Mode"
+            },
+            "label": "Required element for LLM Assistance Section — Mode Selector",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state LLM Assistance Section — Mode Selector",
+          "enabled": true,
+          "id": "sh-llm-assistance-elem-3",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "LLM Mode"
+            },
+            "label": "Required element for LLM Assistance Section — Mode Selector",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state LLM Assistance Section — Mode Selector",
+          "enabled": true,
+          "id": "sh-llm-assistance-elem-4",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "LLM assistance enables AI-powered element identification"
+            },
+            "label": "Required element for LLM Assistance Section — Mode Selector",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A collapsible panel without a toggle switch (unlike the other two sections). It contains an LLM Mode dropdown with three options. The selected mode determines which sub-configuration panel appears below the dropdown. An info box is always shown at the bottom of the expanded section. Defaults to mode=disabled.",
+      "id": "sh-llm-assistance",
+      "name": "LLM Assistance Section — Mode Selector",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state LLM Assistance — Local Ollama Configuration",
+          "enabled": true,
+          "id": "sh-llm-local-ollama-elem-0",
+          "precondition": "LLM Assistance is expanded and LLM Mode is set to Local Ollama",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for LLM Assistance — Local Ollama Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state LLM Assistance — Local Ollama Configuration",
+          "enabled": true,
+          "id": "sh-llm-local-ollama-elem-1",
+          "precondition": "LLM Assistance is expanded and LLM Mode is set to Local Ollama",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Model Name"
+            },
+            "label": "Required element for LLM Assistance — Local Ollama Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state LLM Assistance — Local Ollama Configuration",
+          "enabled": true,
+          "id": "sh-llm-local-ollama-elem-2",
+          "precondition": "LLM Assistance is expanded and LLM Mode is set to Local Ollama",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for LLM Assistance — Local Ollama Configuration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When LLM Mode is 'Local Ollama', a sub-section appears labeled 'Local Ollama Configuration' with a Server icon. It contains a single Model Name text input defaulting to 'llava'. This model name is passed to the qontinui Python library to address a locally running Ollama instance for visual understanding tasks during automation recovery.",
+      "id": "sh-llm-local-ollama",
+      "name": "LLM Assistance — Local Ollama Configuration",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state LLM Assistance — Remote API Configuration",
+          "enabled": true,
+          "id": "sh-llm-remote-api-elem-0",
+          "precondition": "LLM Assistance is expanded and LLM Mode is set to Remote API",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for LLM Assistance — Remote API Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state LLM Assistance — Remote API Configuration",
+          "enabled": true,
+          "id": "sh-llm-remote-api-elem-1",
+          "precondition": "LLM Assistance is expanded and LLM Mode is set to Remote API",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "API Provider"
+            },
+            "label": "Required element for LLM Assistance — Remote API Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state LLM Assistance — Remote API Configuration",
+          "enabled": true,
+          "id": "sh-llm-remote-api-elem-2",
+          "precondition": "LLM Assistance is expanded and LLM Mode is set to Remote API",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "API Provider"
+            },
+            "label": "Required element for LLM Assistance — Remote API Configuration",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state LLM Assistance — Remote API Configuration",
+          "enabled": true,
+          "id": "sh-llm-remote-api-elem-3",
+          "precondition": "LLM Assistance is expanded and LLM Mode is set to Remote API",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for LLM Assistance — Remote API Configuration",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When LLM Mode is 'Remote API', a sub-section appears labeled 'Remote API Configuration' with a Cloud icon. It contains an API Provider dropdown (OpenAI or Anthropic) and an API key management area. Changing the provider triggers a fresh keychain check. This sub-section is exclusive to Remote API mode.",
+      "id": "sh-llm-remote-api",
+      "name": "LLM Assistance — Remote API Configuration",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state API Key Management — Two-State UI",
+          "enabled": true,
+          "id": "sh-api-key-management-elem-0",
+          "precondition": "LLM Mode is Remote API and the selected provider has an API key in the OS keychain",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for API Key Management — Two-State UI",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state API Key Management — Two-State UI",
+          "enabled": true,
+          "id": "sh-api-key-management-elem-1",
+          "precondition": "LLM Mode is Remote API and the selected provider has an API key in the OS keychain",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save API Key"
+            },
+            "label": "Required element for API Key Management — Two-State UI",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state API Key Management — Two-State UI",
+          "enabled": true,
+          "id": "sh-api-key-management-elem-2",
+          "precondition": "LLM Mode is Remote API and the selected provider has an API key in the OS keychain",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save API Key"
+            },
+            "label": "Required element for API Key Management — Two-State UI",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state API Key Management — Two-State UI",
+          "enabled": true,
+          "id": "sh-api-key-management-elem-3",
+          "precondition": "LLM Mode is Remote API and the selected provider has an API key in the OS keychain",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Remove"
+            },
+            "label": "Required element for API Key Management — Two-State UI",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state API Key Management — Two-State UI",
+          "enabled": true,
+          "id": "sh-api-key-management-elem-4",
+          "precondition": "LLM Mode is Remote API and the selected provider has an API key in the OS keychain",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "API key is stored securely in the OS keychain"
+            },
+            "label": "Required element for API Key Management — Two-State UI",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The API key area within Remote API mode has two mutually exclusive states. State A (no key): shows a password input with Show/Hide toggle and a 'Save API Key' button (disabled until input is non-empty). State B (key exists): shows a muted 'API key configured' status element and a red 'Remove' button. Transitions between states happen immediately on save or remove. The key is stored in the OS keychain, not the settings file.",
+      "id": "sh-api-key-management",
+      "name": "API Key Management — Two-State UI",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Action Buttons — Save and Reset",
+          "enabled": true,
+          "id": "sh-action-buttons-elem-0",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save Self-Healing Settings"
+            },
+            "label": "Required element for Action Buttons — Save and Reset",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Action Buttons — Save and Reset",
+          "enabled": true,
+          "id": "sh-action-buttons-elem-1",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Reset to Defaults"
+            },
+            "label": "Required element for Action Buttons — Save and Reset",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Action Buttons — Save and Reset",
+          "enabled": true,
+          "id": "sh-action-buttons-elem-2",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Save Self-Healing Settings"
+            },
+            "label": "Required element for Action Buttons — Save and Reset",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Action Buttons — Save and Reset",
+          "enabled": true,
+          "id": "sh-action-buttons-elem-3",
+          "precondition": "Settings have loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Reset to Defaults"
+            },
+            "label": "Required element for Action Buttons — Save and Reset",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Two action buttons appear at the bottom of the page. 'Reset to Defaults' (left, muted) restores all form fields to their default values in-memory without saving. 'Save Self-Healing Settings' (right, primary) calls save_self_healing_settings and shows animated state feedback during and after the save.",
+      "id": "sh-action-buttons",
+      "name": "Action Buttons — Save and Reset",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Feedback Alerts — Error and Success",
+          "enabled": true,
+          "id": "sh-feedback-alerts-elem-0",
+          "precondition": "A save operation has just completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Settings saved successfully!"
+            },
+            "label": "Required element for Feedback Alerts — Error and Success",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Feedback Alerts — Error and Success",
+          "enabled": true,
+          "id": "sh-feedback-alerts-elem-1",
+          "precondition": "A save operation has just completed successfully",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Self-Healing Configuration"
+            },
+            "label": "Required element for Feedback Alerts — Error and Success",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The page shows contextual alerts at the top of the form area (above the sections) in response to save operations. Success alerts auto-dismiss after 3 seconds. Error alerts persist until the next user action clears them.",
+      "id": "sh-feedback-alerts",
+      "name": "Feedback Alerts — Error and Success",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Settings Persistence and Data Model",
+          "enabled": true,
+          "id": "sh-settings-persistence-elem-0",
+          "precondition": "Settings have been saved and the user navigated away and back",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Self-Healing Configuration"
+            },
+            "label": "Required element for Settings Persistence and Data Model",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Settings Persistence and Data Model",
+          "enabled": true,
+          "id": "sh-settings-persistence-elem-1",
+          "precondition": "Settings have been saved and the user navigated away and back",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Self-Healing Configuration"
+            },
+            "label": "Required element for Settings Persistence and Data Model",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Settings Persistence and Data Model",
+          "enabled": true,
+          "id": "sh-settings-persistence-elem-2",
+          "precondition": "Settings have been saved and the user navigated away and back",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "passed to qontinui Python when executing workflows"
+            },
+            "label": "Required element for Settings Persistence and Data Model",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Self-healing settings are persisted via save_self_healing_settings and retrieved via get_self_healing_settings. The data model has exactly six fields. API keys are stored separately in the OS keychain. This group verifies the round-trip integrity and the semantic contract of the settings object.",
+      "id": "sh-settings-persistence",
+      "name": "Settings Persistence and Data Model",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "settings-self-healing",
+    "tags": [
+      "settings",
+      "self-healing",
+      "action-caching",
+      "visual-validation",
+      "llm",
+      "ollama",
+      "openai",
+      "anthropic",
+      "api-key",
+      "keychain",
+      "runner"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The self-healing tab renders a titled page header, a descriptive subtitle, and three collapsible section panels. This group verifies the top-level structure is present after settings have loaded.",
+        "elements": [
+          {
+            "textContent": "Self-Healing Configuration"
+          },
+          {
+            "textContent": "Configure automation self-healing features"
+          },
+          {
+            "textContent": "Action Caching"
+          },
+          {
+            "textContent": "Visual Validation"
+          },
+          {
+            "textContent": "LLM Assistance"
+          }
+        ],
+        "id": "sh-page-structure",
+        "isInitial": false,
+        "name": "Page Structure",
+        "transitions": []
+      },
+      {
+        "description": "When the page first mounts, it fetches settings via the get_self_healing_settings Tauri IPC command. During this fetch, a loading indicator is shown in place of the settings form. This group verifies the loading and transition-to-loaded behavior.",
+        "elements": [
+          {},
+          {
+            "textContent": "Self-Healing Configuration"
+          }
+        ],
+        "id": "sh-loading-state",
+        "isInitial": false,
+        "name": "Loading State",
+        "transitions": []
+      },
+      {
+        "description": "A collapsible panel with a section header containing a toggle switch. Clicking the header expands/collapses the body. When expanded, it shows a Cache TTL number input (min 30, max 3600, step 30 seconds) and an info box explaining the caching behavior. The TTL input is disabled when the toggle is off. Defaults: enabled=true, ttl=300.",
+        "elements": [
+          {
+            "textContent": "Cache action results to avoid redundant operations"
+          },
+          {
+            "textContent": "Cache TTL (seconds)"
+          },
+          {
+            "textContent": "Action caching prevents redundant template matching"
+          },
+          {
+            "textContent": "Action Caching"
+          },
+          {
+            "textContent": "Cache TTL (seconds)"
+          }
+        ],
+        "id": "sh-action-caching",
+        "isInitial": false,
+        "name": "Action Caching Section",
+        "transitions": []
+      },
+      {
+        "description": "A collapsible panel with a toggle switch in the header. When expanded, it shows only an info box explaining that actions are validated by checking expected screen state after execution. There are no additional configuration fields. Defaults to enabled=true.",
+        "elements": [
+          {
+            "textContent": "Validate actions by checking screen state after execution"
+          },
+          {
+            "textContent": "When enabled, actions are validated by checking"
+          },
+          {
+            "textContent": "Visual Validation"
+          }
+        ],
+        "id": "sh-visual-validation",
+        "isInitial": false,
+        "name": "Visual Validation Section",
+        "transitions": []
+      },
+      {
+        "description": "A collapsible panel without a toggle switch (unlike the other two sections). It contains an LLM Mode dropdown with three options. The selected mode determines which sub-configuration panel appears below the dropdown. An info box is always shown at the bottom of the expanded section. Defaults to mode=disabled.",
+        "elements": [
+          {
+            "textContent": "Use AI to assist with element identification and recovery"
+          },
+          {
+            "textContent": "LLM Mode"
+          },
+          {
+            "textContent": "LLM Mode"
+          },
+          {
+            "textContent": "LLM Mode"
+          },
+          {
+            "textContent": "LLM assistance enables AI-powered element identification"
+          }
+        ],
+        "id": "sh-llm-assistance",
+        "isInitial": false,
+        "name": "LLM Assistance Section — Mode Selector",
+        "transitions": []
+      },
+      {
+        "description": "When LLM Mode is 'Local Ollama', a sub-section appears labeled 'Local Ollama Configuration' with a Server icon. It contains a single Model Name text input defaulting to 'llava'. This model name is passed to the qontinui Python library to address a locally running Ollama instance for visual understanding tasks during automation recovery.",
+        "elements": [
+          {},
+          {
+            "textContent": "Model Name"
+          },
+          {}
+        ],
+        "id": "sh-llm-local-ollama",
+        "isInitial": false,
+        "name": "LLM Assistance — Local Ollama Configuration",
+        "transitions": [
+          {
+            "activateStates": [
+              "sh-llm-disabled"
+            ],
+            "deactivateStates": [
+              "sh-llm-local-ollama"
+            ],
+            "id": "sh-ollama-to-disabled",
+            "name": "Switch back to Disabled",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Local Ollama"
+                },
+                "waitAfter": {
+                  "timeout": 300,
+                  "type": "idle"
+                }
+              },
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Disabled"
+                },
+                "waitAfter": {
+                  "timeout": 500,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          },
+          {
+            "activateStates": [
+              "sh-llm-remote-api"
+            ],
+            "deactivateStates": [
+              "sh-llm-local-ollama"
+            ],
+            "id": "sh-ollama-to-remote-api",
+            "name": "Switch to Remote API",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Local Ollama"
+                },
+                "waitAfter": {
+                  "timeout": 300,
+                  "type": "idle"
+                }
+              },
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Remote API"
+                },
+                "waitAfter": {
+                  "timeout": 500,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          }
+        ]
+      },
+      {
+        "description": "When LLM Mode is 'Remote API', a sub-section appears labeled 'Remote API Configuration' with a Cloud icon. It contains an API Provider dropdown (OpenAI or Anthropic) and an API key management area. Changing the provider triggers a fresh keychain check. This sub-section is exclusive to Remote API mode.",
+        "elements": [
+          {},
+          {
+            "textContent": "API Provider"
+          },
+          {
+            "textContent": "API Provider"
+          },
+          {}
+        ],
+        "id": "sh-llm-remote-api",
+        "isInitial": false,
+        "name": "LLM Assistance — Remote API Configuration",
+        "transitions": [
+          {
+            "activateStates": [
+              "sh-llm-disabled"
+            ],
+            "deactivateStates": [
+              "sh-llm-remote-api"
+            ],
+            "id": "sh-remote-api-to-disabled",
+            "name": "Switch back to Disabled",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Remote API"
+                },
+                "waitAfter": {
+                  "timeout": 300,
+                  "type": "idle"
+                }
+              },
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Disabled"
+                },
+                "waitAfter": {
+                  "timeout": 500,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          },
+          {
+            "activateStates": [
+              "sh-llm-local-ollama"
+            ],
+            "deactivateStates": [
+              "sh-llm-remote-api"
+            ],
+            "id": "sh-remote-api-to-ollama",
+            "name": "Switch to Local Ollama",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Remote API"
+                },
+                "waitAfter": {
+                  "timeout": 300,
+                  "type": "idle"
+                }
+              },
+              {
+                "action": "click",
+                "target": {
+                  "textContent": "Local Ollama"
+                },
+                "waitAfter": {
+                  "timeout": 500,
+                  "type": "idle"
+                }
+              }
+            ],
+            "staysVisible": false
+          }
+        ]
+      },
+      {
+        "description": "The API key area within Remote API mode has two mutually exclusive states. State A (no key): shows a password input with Show/Hide toggle and a 'Save API Key' button (disabled until input is non-empty). State B (key exists): shows a muted 'API key configured' status element and a red 'Remove' button. Transitions between states happen immediately on save or remove. The key is stored in the OS keychain, not the settings file.",
+        "elements": [
+          {},
+          {
+            "role": "button",
+            "textContent": "Save API Key"
+          },
+          {
+            "role": "button",
+            "textContent": "Save API Key"
+          },
+          {
+            "role": "button",
+            "textContent": "Remove"
+          },
+          {
+            "textContent": "API key is stored securely in the OS keychain"
+          }
+        ],
+        "id": "sh-api-key-management",
+        "isInitial": false,
+        "name": "API Key Management — Two-State UI",
+        "transitions": []
+      },
+      {
+        "description": "Two action buttons appear at the bottom of the page. 'Reset to Defaults' (left, muted) restores all form fields to their default values in-memory without saving. 'Save Self-Healing Settings' (right, primary) calls save_self_healing_settings and shows animated state feedback during and after the save.",
+        "elements": [
+          {
+            "role": "button",
+            "textContent": "Save Self-Healing Settings"
+          },
+          {
+            "role": "button",
+            "textContent": "Reset to Defaults"
+          },
+          {
+            "role": "button",
+            "textContent": "Save Self-Healing Settings"
+          },
+          {
+            "role": "button",
+            "textContent": "Reset to Defaults"
+          }
+        ],
+        "id": "sh-action-buttons",
+        "isInitial": false,
+        "name": "Action Buttons — Save and Reset",
+        "transitions": []
+      },
+      {
+        "description": "The page shows contextual alerts at the top of the form area (above the sections) in response to save operations. Success alerts auto-dismiss after 3 seconds. Error alerts persist until the next user action clears them.",
+        "elements": [
+          {
+            "textContent": "Settings saved successfully!"
+          },
+          {
+            "textContent": "Self-Healing Configuration"
+          }
+        ],
+        "id": "sh-feedback-alerts",
+        "isInitial": false,
+        "name": "Feedback Alerts — Error and Success",
+        "transitions": []
+      },
+      {
+        "description": "Self-healing settings are persisted via save_self_healing_settings and retrieved via get_self_healing_settings. The data model has exactly six fields. API keys are stored separately in the OS keychain. This group verifies the round-trip integrity and the semantic contract of the settings object.",
+        "elements": [
+          {
+            "textContent": "Self-Healing Configuration"
+          },
+          {
+            "textContent": "Self-Healing Configuration"
+          },
+          {
+            "textContent": "passed to qontinui Python when executing workflows"
+          }
+        ],
+        "id": "sh-settings-persistence",
+        "isInitial": false,
+        "name": "Settings Persistence and Data Model",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

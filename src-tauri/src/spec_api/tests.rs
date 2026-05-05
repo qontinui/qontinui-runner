@@ -157,6 +157,37 @@ fn storage_round_trip_in_tempdir() {
 }
 
 #[test]
+fn embedded_pages_snapshot_is_populated() {
+    // Section 4 (UI Bridge redesign) — production binaries embed
+    // <runner>/specs/pages at compile time so the Spec API still answers
+    // /spec/page/<id> when shipped without a sibling specs/ directory.
+    //
+    // We assert via the public API: `list_pages` against an empty tempdir
+    // root must fall back to the embedded snapshot and surface at least one
+    // page id (the runner repo currently ships ~95 pages under specs/pages/).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let pages = storage::list_pages(root).unwrap();
+    assert!(
+        !pages.is_empty(),
+        "EMBEDDED_PAGES fallback should surface at least one page when the \
+         filesystem root is empty; got {:?}",
+        pages
+    );
+    // Spot-check that `active` (the canonical existing page id) is among them.
+    assert!(
+        pages.contains(&"active".to_string()),
+        "embedded snapshot should include the `active` page; got {:?}",
+        pages
+    );
+    // The snapshot should be readable end-to-end via read_ir.
+    let doc = storage::read_ir(root, "active")
+        .expect("read_ir should not error on embedded fallback")
+        .expect("active page must be present in the embedded snapshot");
+    assert_eq!(doc.id, "active");
+}
+
+#[test]
 fn storage_path_traversal_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -257,6 +288,63 @@ mod handler_tests {
             .expect("event must arrive");
         assert_eq!(received.page_id, "active");
         assert_eq!(received.kind, "ir-and-projection");
+    }
+
+    #[tokio::test]
+    async fn list_returns_per_page_discovered_specs() {
+        // Section 13 / Phase 1 — `GET /spec/list` enumerates all known
+        // pages and returns a per-page projection slice matching the
+        // TypeScript `DiscoveredSpec` shape (see
+        // qontinui-runner/src/lib/spec-prompt-builder.ts).
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Seed two distinct IR pages so the on-disk listing wins over
+        // the embedded snapshot fallback.
+        let mut doc_a = small_doc();
+        doc_a.id = "test-alpha".to_string();
+        let mut doc_b = small_doc();
+        doc_b.id = "test-beta".to_string();
+        super::super::storage::write_ir_and_regenerate(root, &doc_a).unwrap();
+        super::super::storage::write_ir_and_regenerate(root, &doc_b).unwrap();
+
+        let resp = super::super::handlers::build_list_response(root).into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(v["ok"], true);
+        let specs = v["specs"].as_array().expect("specs must be an array");
+        assert_eq!(
+            specs.len(),
+            2,
+            "expected exactly 2 entries, got {:?}",
+            specs
+        );
+
+        // list_pages returns sorted ids ⇒ test-alpha, test-beta.
+        let ids: Vec<&str> = specs
+            .iter()
+            .map(|s| s["specId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["test-alpha", "test-beta"]);
+
+        for entry in specs {
+            assert_eq!(entry["appName"], "Qontinui Runner");
+            let config = &entry["config"];
+            assert_eq!(config["version"], "1.0.0");
+            let groups = config["groups"]
+                .as_array()
+                .expect("config.groups must be an array");
+            assert_eq!(groups.len(), 1, "small_doc projects to a single group");
+            assert!(
+                config.get("description").is_some(),
+                "config must include description key (may be string or null)"
+            );
+        }
     }
 
     #[tokio::test]

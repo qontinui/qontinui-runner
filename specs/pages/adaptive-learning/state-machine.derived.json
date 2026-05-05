@@ -1,0 +1,391 @@
+{
+  "version": "1.0",
+  "id": "adaptive-learning",
+  "name": "PlaybookPanel, LearningDashboard, PromptEvolutionPanel",
+  "states": [
+    {
+      "id": "tab-navigation",
+      "name": "Tab Navigation",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Adaptive Learning",
+          "attributes": {
+            "tutorial-id": "learning-tab"
+          }
+        },
+        {
+          "role": "button",
+          "text": "Playbook",
+          "attributes": {
+            "tutorial-id": "playbook-tab"
+          }
+        },
+        {
+          "role": "button",
+          "text": "Prompt Evolution",
+          "attributes": {
+            "tutorial-id": "prompt_evolution-tab"
+          }
+        },
+        {
+          "role": "button",
+          "text": "Adaptive Learning"
+        }
+      ],
+      "description": "The three adaptive learning tabs in the Meta-Optimizer page tab bar: Adaptive Learning, Playbook, and Prompt Evolution.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "dashboard-stat-cards",
+      "name": "Learning Dashboard — Stat Cards",
+      "requiredElements": [
+        {
+          "textContains": "Playbook Lessons"
+        },
+        {
+          "textContains": "Curated Examples"
+        },
+        {
+          "textContains": "Templates Tracked"
+        },
+        {
+          "textContains": "GEPA Optimizations"
+        },
+        {
+          "textContains": "Playbook Lessons"
+        }
+      ],
+      "description": "The Adaptive Learning tab displays four stat cards at the top showing aggregate counts from the adaptive learning system.",
+      "precondition": "Adaptive Learning tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "dashboard-charts",
+      "name": "Learning Dashboard — Trend Charts",
+      "requiredElements": [
+        {
+          "textContains": "Lesson Growth"
+        },
+        {
+          "textContains": "Domain Distribution"
+        },
+        {
+          "textContains": "Helpfulness Trend"
+        }
+      ],
+      "description": "SVG-based charts showing lesson growth, domain distribution, and helpfulness trends over the last 30 days.",
+      "precondition": "Adaptive Learning tab is selected and data loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "dashboard-template-table",
+      "name": "Learning Dashboard — Template Performance Table",
+      "requiredElements": [
+        {
+          "textContains": "Template Performance"
+        },
+        {
+          "textContains": "Confidence"
+        },
+        {
+          "textContains": "Confidence"
+        }
+      ],
+      "description": "Table showing verification template performance data with success/failure counts, confidence, and quality scores.",
+      "precondition": "Adaptive Learning tab is selected and templates exist",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "dashboard-error-state",
+      "name": "Learning Dashboard — Error & Empty States",
+      "requiredElements": [
+        {
+          "textContains": "Loading dashboard"
+        },
+        {
+          "textContains": "Retry"
+        }
+      ],
+      "description": "Error handling and empty states for the Learning Dashboard.",
+      "precondition": "Adaptive Learning tab selected and data is being fetched",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "playbook-header",
+      "name": "Playbook Panel — Header & Filters",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "textContains": "Playbook Lessons"
+        },
+        {
+          "role": "combobox",
+          "textContains": "All Domains"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        }
+      ],
+      "description": "The Playbook tab header with title, domain filter, status filter, and refresh button.",
+      "precondition": "Playbook tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "playbook-severity-groups",
+      "name": "Playbook Panel — Severity Groups",
+      "requiredElements": [
+        {
+          "textContains": "CRITICAL"
+        },
+        {
+          "textContains": "IMPORTANT"
+        },
+        {
+          "textContains": "No playbook entries found"
+        }
+      ],
+      "description": "Lessons are organized into three severity groups: Critical (red), Important (yellow), Minor (gray). Each group has an uppercase header with count.",
+      "precondition": "Playbook tab selected and critical entries exist",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "playbook-lesson-row",
+      "name": "Playbook Panel — Lesson Row Content",
+      "requiredElements": [
+        {
+          "textContains": "DO"
+        },
+        {
+          "textContains": "Construction"
+        },
+        {
+          "textContains": "%"
+        }
+      ],
+      "description": "Each lesson row displays a DO/DON'T prefix, lesson text, category label, helpfulness ratio, and action buttons.",
+      "precondition": "Playbook tab selected and entries are visible",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "playbook-actions",
+      "name": "Playbook Panel — Lesson Actions",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Activate"
+        },
+        {
+          "role": "button",
+          "text": "Retire"
+        },
+        {
+          "role": "button",
+          "textContains": "Delete"
+        }
+      ],
+      "description": "Interactive controls for managing playbook entries: activate, retire, delete with confirmation.",
+      "precondition": "Playbook tab selected, status filter set to 'staged', at least one staged entry",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "playbook-detail-panel",
+      "name": "Playbook Panel — Expanded Detail View",
+      "requiredElements": [
+        {
+          "textContains": "DO"
+        },
+        {
+          "textContains": "Applied"
+        },
+        {
+          "textContains": "Source Run"
+        }
+      ],
+      "description": "Clicking a lesson row expands it to show metadata and source run context.",
+      "precondition": "Playbook tab selected and entries are visible",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evolution-header",
+      "name": "Prompt Evolution Panel — Header & Filter",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "textContains": "Prompt Evolution"
+        },
+        {
+          "role": "combobox"
+        },
+        {
+          "textContains": "No GEPA optimization runs yet"
+        }
+      ],
+      "description": "The Prompt Evolution tab header with title, domain filter, and refresh button.",
+      "precondition": "Prompt Evolution tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evolution-domain-cards",
+      "name": "Prompt Evolution Panel — Domain Summary Cards",
+      "requiredElements": [
+        {
+          "textContains": "improved"
+        },
+        {
+          "textContains": "improved"
+        }
+      ],
+      "description": "Summary cards showing per-domain GEPA optimization stats with total improvement.",
+      "precondition": "Prompt Evolution tab selected and GEPA runs exist",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evolution-run-table",
+      "name": "Prompt Evolution Panel — Run History Table",
+      "requiredElements": [
+        {
+          "textContains": "Old Score"
+        },
+        {
+          "textContains": "%"
+        },
+        {
+          "textContains": "completed"
+        }
+      ],
+      "description": "Table of GEPA optimization runs with columns for date, domain, old score, new score, improvement, and status.",
+      "precondition": "Prompt Evolution tab selected and GEPA runs exist",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evolution-prompt-diff",
+      "name": "Prompt Evolution Panel — Before/After Prompt Diff",
+      "requiredElements": [
+        {
+          "textContains": "Old Score"
+        },
+        {
+          "textContains": "Before"
+        },
+        {
+          "textContains": "improvement"
+        }
+      ],
+      "description": "Expanded GEPA run detail showing the old and new generation instructions side-by-side with score delta.",
+      "precondition": "Prompt Evolution tab selected and GEPA runs exist",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "auto-refresh",
+      "name": "Auto-Refresh Behavior",
+      "requiredElements": [
+        {
+          "textContains": "Playbook"
+        },
+        {
+          "textContains": "Playbook Lessons"
+        },
+        {
+          "textContains": "Adaptive Learning"
+        }
+      ],
+      "description": "All three adaptive learning panels auto-refresh on learning-update events and periodic timers.",
+      "precondition": "Playbook tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "visual-design",
+      "name": "Visual Design — Colors & Typography",
+      "requiredElements": [
+        {
+          "textContains": "Playbook"
+        },
+        {
+          "textContains": "Lessons"
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        }
+      ],
+      "description": "Consistent dark theme design across all adaptive learning panels.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "learning-loop-correctness",
+      "name": "Learning Loop — Data Correctness",
+      "requiredElements": [
+        {
+          "textContains": "Playbook Lessons"
+        },
+        {
+          "textContains": "CRITICAL"
+        },
+        {
+          "textContains": "%"
+        },
+        {
+          "textContains": "improved"
+        }
+      ],
+      "description": "Semantic assertions verifying that the adaptive learning system produces correct, consistent data across its three panels.",
+      "precondition": "Both Adaptive Learning and Playbook tabs have loaded data",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Adaptive Learning system — three panels within the Meta-Optimizer page that display playbook lessons, curated examples, template performance, GEPA prompt evolution history, and learning trend charts. The system learns from every workflow run and injects lessons into future generation prompts.",
+  "metadata": {
+    "tags": [
+      "adaptive-learning",
+      "playbook",
+      "gepa",
+      "prompt-evolution",
+      "few-shot",
+      "template-lifecycle",
+      "plan-15"
+    ]
+  }
+}

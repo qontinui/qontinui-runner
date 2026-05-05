@@ -1,0 +1,1206 @@
+{
+  "description": "Meta-Optimizer Page — The central dashboard for the prompt optimization pipeline. Contains 14 sub-tabs covering progress tracking, recommendations, prompt optimization via beam search + dueling bandits, canary A/B testing, eval specs, and adaptive learning. The three new tabs (Duel Pools, Beam Runs, Span Events) display data from the agent-lightning + prompt-ops integration: beam search candidate generation, pairwise duel evaluation with Copeland ranking, and granular span-level execution instrumentation.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Page Layout & Structure",
+          "enabled": true,
+          "id": "page-layout-structure-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "tutorial-id": "progress-tab"
+              }
+            },
+            "label": "Required element for Page Layout & Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Page Layout & Structure",
+          "enabled": true,
+          "id": "page-layout-structure-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "tutorial-id": "progress-tab"
+              }
+            },
+            "label": "Required element for Page Layout & Structure",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Page Layout & Structure",
+          "enabled": true,
+          "id": "page-layout-structure-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "tutorial-id": "progress-tab"
+              }
+            },
+            "label": "Required element for Page Layout & Structure",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The MetaOptimizerPage renders a horizontal tab bar at the top and a scrollable content area below. The tab bar contains 14 tabs. The page fills the full height of its container.",
+      "id": "page-layout-structure",
+      "name": "Page Layout & Structure",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Tab Navigation",
+          "enabled": true,
+          "id": "tab-navigation-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "tutorial-id": "duel_pools-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Tab Navigation",
+          "enabled": true,
+          "id": "tab-navigation-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "tutorial-id": "beam_runs-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Tab Navigation",
+          "enabled": true,
+          "id": "tab-navigation-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "tutorial-id": "span_events-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Tab Navigation",
+          "enabled": true,
+          "id": "tab-navigation-elem-3",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "tutorial-id": "progress-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Clicking any tab button switches the visible content panel. Only one tab's content is rendered at a time.",
+      "id": "tab-navigation",
+      "name": "Tab Navigation",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Duel Pools — Layout & Empty State",
+          "enabled": true,
+          "id": "duel-pools-layout-elem-0",
+          "precondition": "Duel Pools tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContains": "Duel Pools"
+            },
+            "label": "Required element for Duel Pools — Layout & Empty State",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Duel Pools — Layout & Empty State",
+          "enabled": true,
+          "id": "duel-pools-layout-elem-1",
+          "precondition": "Duel Pools tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "No duel pools yet"
+            },
+            "label": "Required element for Duel Pools — Layout & Empty State",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Duel Pools — Layout & Empty State",
+          "enabled": true,
+          "id": "duel-pools-layout-elem-2",
+          "precondition": "Duel Pools tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContent": "Loading..."
+            },
+            "label": "Required element for Duel Pools — Layout & Empty State",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The DuelPoolsTab has a two-panel layout: a fixed-width (w-80) pool list sidebar on the left and a flexible detail panel on the right. On initial load it fetches pools from GET /meta-optimizer/duel-pools.",
+      "id": "duel-pools-layout",
+      "name": "Duel Pools — Layout & Empty State",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Duel Pools — Pool List & Detail",
+          "enabled": true,
+          "id": "duel-pools-data-display-elem-0",
+          "precondition": "Duel Pools tab is selected and at least one pool exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Duel Pools — Pool List & Detail",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Duel Pools — Pool List & Detail",
+          "enabled": true,
+          "id": "duel-pools-data-display-elem-1",
+          "precondition": "Duel Pools tab is selected and at least one pool exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Duel Pools — Pool List & Detail",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Duel Pools — Pool List & Detail",
+          "enabled": true,
+          "id": "duel-pools-data-display-elem-2",
+          "precondition": "Duel Pools tab is selected and at least one pool exists",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "tr"
+            },
+            "label": "Required element for Duel Pools — Pool List & Detail",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When pools exist, the sidebar lists them with status badges, agent type, generation, and timestamps. Clicking a pool loads its candidates in the detail panel with a Copeland ranking table.",
+      "id": "duel-pools-data-display",
+      "name": "Duel Pools — Pool List & Detail",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Duel Pools — Duel Results",
+          "enabled": true,
+          "id": "duel-pools-results-elem-0",
+          "precondition": "A pool is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Duel Results"
+            },
+            "label": "Required element for Duel Pools — Duel Results",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Duel Pools — Duel Results",
+          "enabled": true,
+          "id": "duel-pools-results-elem-1",
+          "precondition": "A pool is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Duel Pools — Duel Results",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Duel Pools — Duel Results",
+          "enabled": true,
+          "id": "duel-pools-results-elem-2",
+          "precondition": "A pool is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "No duel results"
+            },
+            "label": "Required element for Duel Pools — Duel Results",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The duel results section shows pairwise comparison outcomes. Loaded on demand via a 'Show Duel Results' button.",
+      "id": "duel-pools-results",
+      "name": "Duel Pools — Duel Results",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Duel Pools — Copeland Ranking Correctness",
+          "enabled": true,
+          "id": "duel-pools-copeland-correctness-elem-0",
+          "precondition": "A pool is selected with 2+ candidates",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Duel Pools — Copeland Ranking Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Duel Pools — Copeland Ranking Correctness",
+          "enabled": true,
+          "id": "duel-pools-copeland-correctness-elem-1",
+          "precondition": "A pool is selected with 2+ candidates",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Duel Pools — Copeland Ranking Correctness",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Duel Pools — Copeland Ranking Correctness",
+          "enabled": true,
+          "id": "duel-pools-copeland-correctness-elem-2",
+          "precondition": "A pool is selected with 2+ candidates",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Duel Pools — Copeland Ranking Correctness",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Copeland ranking displayed in the candidates table must correctly reflect pairwise dominance. This validates the duel engine's ranking algorithm output as displayed on the page.",
+      "id": "duel-pools-copeland-correctness",
+      "name": "Duel Pools — Copeland Ranking Correctness",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Beam Runs — Layout & Empty State",
+          "enabled": true,
+          "id": "beam-runs-layout-elem-0",
+          "precondition": "Beam Runs tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContains": "Beam Search Runs"
+            },
+            "label": "Required element for Beam Runs — Layout & Empty State",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Beam Runs — Layout & Empty State",
+          "enabled": true,
+          "id": "beam-runs-layout-elem-1",
+          "precondition": "Beam Runs tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "No beam search runs yet"
+            },
+            "label": "Required element for Beam Runs — Layout & Empty State",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The BeamRunsTab has the same two-panel layout as DuelPoolsTab: fixed-width sidebar with runs list, flexible detail panel showing candidates grouped by generation.",
+      "id": "beam-runs-layout",
+      "name": "Beam Runs — Layout & Empty State",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Beam Runs — Run List & Candidates",
+          "enabled": true,
+          "id": "beam-runs-data-display-elem-0",
+          "precondition": "Beam Runs tab is selected and runs exist",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Beam Runs — Run List & Candidates",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Beam Runs — Run List & Candidates",
+          "enabled": true,
+          "id": "beam-runs-data-display-elem-1",
+          "precondition": "Beam Runs tab is selected and runs exist",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Generation"
+            },
+            "label": "Required element for Beam Runs — Run List & Candidates",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Beam Runs — Run List & Candidates",
+          "enabled": true,
+          "id": "beam-runs-data-display-elem-2",
+          "precondition": "Beam Runs tab is selected and runs exist",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Beam Runs — Run List & Candidates",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Beam Runs — Run List & Candidates",
+          "enabled": true,
+          "id": "beam-runs-data-display-elem-3",
+          "precondition": "Beam Runs tab is selected and runs exist",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Beam Runs — Run List & Candidates",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Run list shows status, agent_type, generation. Selecting a run loads candidates grouped by generation with expandable cards showing critique, changes, and prompt content.",
+      "id": "beam-runs-data-display",
+      "name": "Beam Runs — Run List & Candidates",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Span Events — Filter Controls",
+          "enabled": true,
+          "id": "span-events-filters-elem-0",
+          "precondition": "Span Events tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContains": "Span Events"
+            },
+            "label": "Required element for Span Events — Filter Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Span Events — Filter Controls",
+          "enabled": true,
+          "id": "span-events-filters-elem-1",
+          "precondition": "Span Events tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Span Events — Filter Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Span Events — Filter Controls",
+          "enabled": true,
+          "id": "span-events-filters-elem-2",
+          "precondition": "Span Events tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {},
+            "label": "Required element for Span Events — Filter Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Span Events — Filter Controls",
+          "enabled": true,
+          "id": "span-events-filters-elem-3",
+          "precondition": "Span Events tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Load"
+            },
+            "label": "Required element for Span Events — Filter Controls",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Span Events — Filter Controls",
+          "enabled": true,
+          "id": "span-events-filters-elem-4",
+          "precondition": "Span Events tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "No span events loaded"
+            },
+            "label": "Required element for Span Events — Filter Controls",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The SpanEventsTab has filter inputs for execution_id and agent_type, plus a Load button. Events are fetched on demand (not on mount).",
+      "id": "span-events-filters",
+      "name": "Span Events — Filter Controls",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Span Events — Event Display & Grouping",
+          "enabled": true,
+          "id": "span-events-data-display-elem-0",
+          "precondition": "Span events have been loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Span Events — Event Display & Grouping",
+          "enabled": true,
+          "id": "span-events-data-display-elem-1",
+          "precondition": "Span events have been loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Span Events — Event Display & Grouping",
+          "enabled": true,
+          "id": "span-events-data-display-elem-2",
+          "precondition": "Span events have been loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "td"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Span Events — Event Display & Grouping",
+          "enabled": true,
+          "id": "span-events-data-display-elem-3",
+          "precondition": "Span events have been loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Span Events — Event Display & Grouping",
+          "enabled": true,
+          "id": "span-events-data-display-elem-4",
+          "precondition": "Span events have been loaded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Loaded events are grouped by execution_id with collapsible sections. Each group shows an event table with type-specific detail rendering.",
+      "id": "span-events-data-display",
+      "name": "Span Events — Event Display & Grouping",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Visual Design — Dark Theme Compliance",
+          "enabled": true,
+          "id": "visual-design-dark-theme-elem-0",
+          "precondition": "Any of the three new tabs is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContains": "Duel Pools"
+            },
+            "label": "Required element for Visual Design — Dark Theme Compliance",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Visual Design — Dark Theme Compliance",
+          "enabled": true,
+          "id": "visual-design-dark-theme-elem-1",
+          "precondition": "Any of the three new tabs is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading"
+            },
+            "label": "Required element for Visual Design — Dark Theme Compliance",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state Visual Design — Dark Theme Compliance",
+          "enabled": true,
+          "id": "visual-design-dark-theme-elem-2",
+          "precondition": "Any of the three new tabs is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "span"
+            },
+            "label": "Required element for Visual Design — Dark Theme Compliance",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state Visual Design — Dark Theme Compliance",
+          "enabled": true,
+          "id": "visual-design-dark-theme-elem-3",
+          "precondition": "Any of the three new tabs is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Visual Design — Dark Theme Compliance",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "All three new tabs follow the runner's dark zinc theme. Background colors, text colors, borders, and interactive states must be consistent with the existing meta-optimizer tabs.",
+      "id": "visual-design-dark-theme",
+      "name": "Visual Design — Dark Theme Compliance",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state API Integration & Data Flow",
+          "enabled": true,
+          "id": "api-integration-elem-0",
+          "precondition": "Duel Pools tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "textContains": "Refresh"
+            },
+            "label": "Required element for API Integration & Data Flow",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state API Integration & Data Flow",
+          "enabled": true,
+          "id": "api-integration-elem-1",
+          "precondition": "Duel Pools tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContains": "Beam Search Runs"
+            },
+            "label": "Required element for API Integration & Data Flow",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state API Integration & Data Flow",
+          "enabled": true,
+          "id": "api-integration-elem-2",
+          "precondition": "Duel Pools tab is selected",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContent": "Load"
+            },
+            "label": "Required element for API Integration & Data Flow",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "All three tabs fetch data from the runner's HTTP API. API failures should not crash the UI.",
+      "id": "api-integration",
+      "name": "API Integration & Data Flow",
+      "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Accessibility",
+          "enabled": true,
+          "id": "accessibility-elem-0",
+          "precondition": "Any tab with interactive list items",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Accessibility",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state Accessibility",
+          "enabled": true,
+          "id": "accessibility-elem-1",
+          "precondition": "Any tab with interactive list items",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Accessibility",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Interactive elements have proper ARIA roles, tabIndex, and keyboard event handlers for accessibility.",
+      "id": "accessibility",
+      "name": "Accessibility",
+      "source": "migrated"
+    }
+  ],
+  "metadata": {
+    "component": "meta-optimizer-page",
+    "tags": [
+      "meta-optimizer",
+      "duel-pools",
+      "beam-search",
+      "span-events",
+      "copeland-ranking",
+      "prompt-optimization"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The MetaOptimizerPage renders a horizontal tab bar at the top and a scrollable content area below. The tab bar contains 14 tabs. The page fills the full height of its container.",
+        "elements": [
+          {
+            "dataAttributes": {
+              "tutorial-id": "progress-tab"
+            }
+          },
+          {
+            "dataAttributes": {
+              "tutorial-id": "progress-tab"
+            }
+          },
+          {
+            "dataAttributes": {
+              "tutorial-id": "progress-tab"
+            }
+          }
+        ],
+        "id": "page-layout-structure",
+        "isInitial": false,
+        "name": "Page Layout & Structure",
+        "transitions": []
+      },
+      {
+        "description": "Clicking any tab button switches the visible content panel. Only one tab's content is rendered at a time.",
+        "elements": [
+          {
+            "dataAttributes": {
+              "tutorial-id": "duel_pools-tab"
+            }
+          },
+          {
+            "dataAttributes": {
+              "tutorial-id": "beam_runs-tab"
+            }
+          },
+          {
+            "dataAttributes": {
+              "tutorial-id": "span_events-tab"
+            }
+          },
+          {
+            "dataAttributes": {
+              "tutorial-id": "progress-tab"
+            }
+          }
+        ],
+        "id": "tab-navigation",
+        "isInitial": false,
+        "name": "Tab Navigation",
+        "transitions": []
+      },
+      {
+        "description": "The DuelPoolsTab has a two-panel layout: a fixed-width (w-80) pool list sidebar on the left and a flexible detail panel on the right. On initial load it fetches pools from GET /meta-optimizer/duel-pools.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContains": "Duel Pools"
+          },
+          {
+            "textContains": "No duel pools yet"
+          },
+          {
+            "textContent": "Loading..."
+          }
+        ],
+        "id": "duel-pools-layout",
+        "isInitial": false,
+        "name": "Duel Pools — Layout & Empty State",
+        "transitions": []
+      },
+      {
+        "description": "When pools exist, the sidebar lists them with status badges, agent type, generation, and timestamps. Clicking a pool loads its candidates in the detail panel with a Copeland ranking table.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "tagName": "tr"
+          }
+        ],
+        "id": "duel-pools-data-display",
+        "isInitial": false,
+        "name": "Duel Pools — Pool List & Detail",
+        "transitions": []
+      },
+      {
+        "description": "The duel results section shows pairwise comparison outcomes. Loaded on demand via a 'Show Duel Results' button.",
+        "elements": [
+          {
+            "textContains": "Duel Results"
+          },
+          {
+            "tagName": "table"
+          },
+          {
+            "textContains": "No duel results"
+          }
+        ],
+        "id": "duel-pools-results",
+        "isInitial": false,
+        "name": "Duel Pools — Duel Results",
+        "transitions": []
+      },
+      {
+        "description": "The Copeland ranking displayed in the candidates table must correctly reflect pairwise dominance. This validates the duel engine's ranking algorithm output as displayed on the page.",
+        "elements": [
+          {
+            "tagName": "table"
+          },
+          {
+            "tagName": "table"
+          },
+          {
+            "tagName": "table"
+          }
+        ],
+        "id": "duel-pools-copeland-correctness",
+        "isInitial": false,
+        "name": "Duel Pools — Copeland Ranking Correctness",
+        "transitions": []
+      },
+      {
+        "description": "The BeamRunsTab has the same two-panel layout as DuelPoolsTab: fixed-width sidebar with runs list, flexible detail panel showing candidates grouped by generation.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContains": "Beam Search Runs"
+          },
+          {
+            "textContains": "No beam search runs yet"
+          }
+        ],
+        "id": "beam-runs-layout",
+        "isInitial": false,
+        "name": "Beam Runs — Layout & Empty State",
+        "transitions": []
+      },
+      {
+        "description": "Run list shows status, agent_type, generation. Selecting a run loads candidates grouped by generation with expandable cards showing critique, changes, and prompt content.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "textContains": "Generation"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "beam-runs-data-display",
+        "isInitial": false,
+        "name": "Beam Runs — Run List & Candidates",
+        "transitions": []
+      },
+      {
+        "description": "The SpanEventsTab has filter inputs for execution_id and agent_type, plus a Load button. Events are fetched on demand (not on mount).",
+        "elements": [
+          {
+            "role": "heading",
+            "textContains": "Span Events"
+          },
+          {},
+          {},
+          {
+            "role": "button",
+            "textContent": "Load"
+          },
+          {
+            "textContains": "No span events loaded"
+          }
+        ],
+        "id": "span-events-filters",
+        "isInitial": false,
+        "name": "Span Events — Filter Controls",
+        "transitions": []
+      },
+      {
+        "description": "Loaded events are grouped by execution_id with collapsible sections. Each group shows an event table with type-specific detail rendering.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "tagName": "table"
+          },
+          {
+            "tagName": "td"
+          },
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "span-events-data-display",
+        "isInitial": false,
+        "name": "Span Events — Event Display & Grouping",
+        "transitions": []
+      },
+      {
+        "description": "All three new tabs follow the runner's dark zinc theme. Background colors, text colors, borders, and interactive states must be consistent with the existing meta-optimizer tabs.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContains": "Duel Pools"
+          },
+          {
+            "role": "heading"
+          },
+          {
+            "tagName": "span"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "visual-design-dark-theme",
+        "isInitial": false,
+        "name": "Visual Design — Dark Theme Compliance",
+        "transitions": []
+      },
+      {
+        "description": "All three tabs fetch data from the runner's HTTP API. API failures should not crash the UI.",
+        "elements": [
+          {
+            "textContains": "Refresh"
+          },
+          {
+            "role": "heading",
+            "textContains": "Beam Search Runs"
+          },
+          {
+            "role": "button",
+            "textContent": "Load"
+          }
+        ],
+        "id": "api-integration",
+        "isInitial": false,
+        "name": "API Integration & Data Flow",
+        "transitions": []
+      },
+      {
+        "description": "Interactive elements have proper ARIA roles, tabIndex, and keyboard event handlers for accessibility.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "accessibility",
+        "isInitial": false,
+        "name": "Accessibility",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

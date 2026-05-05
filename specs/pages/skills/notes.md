@@ -1,0 +1,3 @@
+# SkillApprovalPanel
+
+_(notes)_

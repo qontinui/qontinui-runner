@@ -1,0 +1,370 @@
+{
+  "version": "1.0",
+  "id": "prompt-management",
+  "name": "PromptRegistryTab",
+  "states": [
+    {
+      "id": "version-history-list",
+      "name": "Version History List",
+      "requiredElements": [
+        {
+          "text": "Version History"
+        },
+        {
+          "text": "versions"
+        },
+        {
+          "text": "v\\d+"
+        },
+        {},
+        {
+          "text": "No description"
+        },
+        {},
+        {
+          "role": "button"
+        },
+        {
+          "text": "No versions recorded for this template yet."
+        },
+        {},
+        {
+          "text": "Failed to load version history."
+        },
+        {
+          "role": "button",
+          "text": "Refresh"
+        }
+      ],
+      "description": "The version history list shows all versions for a prompt template sorted by version number descending. Each version row shows the version number badge (v1, v2...), the change description, a truncated SHA256 content hash, and the creation date. The list header displays a count of versions and provides Compare and Refresh controls. In compare mode, two versions can be selected as A and B with highlighted selection indicators.",
+      "precondition": "At least one prompt variant exists with at least 2 versions",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "version-detail-view",
+      "name": "Version Detail View",
+      "requiredElements": [
+        {
+          "text": "Back to history"
+        },
+        {
+          "text": "v\\d+"
+        },
+        {
+          "text": "hash:"
+        },
+        {
+          "text": "Prompt Content"
+        },
+        {
+          "text": "Success Rate"
+        },
+        {
+          "text": "Avg Cost"
+        },
+        {
+          "text": "Avg Latency"
+        },
+        {
+          "text": "Performance Metrics"
+        },
+        {
+          "text": "Restore this version"
+        },
+        {
+          "text": "Create new version with this content?"
+        },
+        {
+          "text": "Restoring..."
+        },
+        {
+          "text": "Failed to load version details."
+        }
+      ],
+      "description": "The version detail view shows the full prompt content, metadata, performance metrics, and a 'Restore this version' button. It displays the version number, creation timestamp, truncated content hash, change description, and the full prompt content in a scrollable pre block. Performance metrics show success rate, average cost, and average latency when available.",
+      "precondition": "At least one prompt variant exists with at least 2 versions",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "version-comparison",
+      "name": "Version Comparison",
+      "requiredElements": [
+        {
+          "text": "Compare"
+        },
+        {
+          "text": "Select first version"
+        },
+        {
+          "text": "Select second version"
+        },
+        {
+          "text": "Ready to compare"
+        },
+        {
+          "text": "View Diff"
+        },
+        {
+          "text": "A|B"
+        },
+        {
+          "text": "Cancel"
+        },
+        {
+          "text": "Comparing"
+        },
+        {},
+        {},
+        {
+          "text": "Inline"
+        },
+        {
+          "text": "Side-by-side"
+        },
+        {
+          "text": "No differences found."
+        },
+        {
+          "text": "Back to history"
+        },
+        {
+          "text": "Failed to load diff."
+        }
+      ],
+      "description": "The version comparison feature allows users to view a unified or side-by-side diff between two selected versions. Compare mode allows selecting two versions as A and B. The diff view parses unified diff output into addition (green), deletion (red), context, and header lines. Two view modes are available: 'Inline' and 'Side-by-side'.",
+      "precondition": "At least one prompt variant exists with at least 2 versions",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "canary-ab-testing",
+      "name": "Canary A/B Testing",
+      "requiredElements": [
+        {
+          "text": "Prompt Canary A/B Tests"
+        },
+        {
+          "text": "active|promoted|rolled_back|completed"
+        },
+        {
+          "text": "vs"
+        },
+        {
+          "text": "candidate traffic"
+        },
+        {
+          "text": "Metric"
+        },
+        {
+          "text": "Success Rate"
+        },
+        {
+          "text": "Avg Cost"
+        },
+        {
+          "text": "Avg Latency"
+        },
+        {
+          "text": "pp"
+        },
+        {
+          "text": "p-value"
+        },
+        {
+          "text": "Verdict"
+        },
+        {
+          "text": "Total Runs"
+        },
+        {
+          "text": "Candidate sample progress"
+        },
+        {
+          "text": "No prompt canary A/B tests found. Create one to compare prompt versions."
+        },
+        {
+          "text": "Loading canary tests..."
+        }
+      ],
+      "description": "The PromptCanaryPanel displays active and completed prompt canary A/B tests. Each canary card shows the status badge, template ID, version comparison (baseline vs candidate), traffic percentage, and a metrics comparison grid with Success Rate, Avg Cost, Avg Latency, and Delta columns. Statistical evaluation shows the p-value, verdict (promote/rollback/keep/pending), and total runs. Active canaries display a progress bar toward the minimum 20 candidate runs needed for a verdict.",
+      "precondition": "An active prompt canary exists with at least one recorded run",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "canary-creation",
+      "name": "Canary Creation",
+      "requiredElements": [
+        {
+          "text": "Create Prompt Canary A/B Test"
+        },
+        {
+          "text": "Template ID"
+        },
+        {
+          "text": "Baseline Version"
+        },
+        {
+          "text": "Candidate Version"
+        },
+        {
+          "text": "Candidate Traffic:"
+        },
+        {
+          "text": "Create Canary"
+        },
+        {
+          "text": "Canary A/B test created successfully."
+        },
+        {
+          "text": "Create Another"
+        },
+        {},
+        {
+          "text": "Close"
+        },
+        {
+          "text": "Create A/B Test"
+        }
+      ],
+      "description": "The CreatePromptCanaryForm allows users to set up a new prompt canary A/B test. The form has fields for Template ID, Baseline Version, Candidate Version, and a Candidate Traffic percentage slider (1-100%). When opened from a prompt variant, the template ID and baseline version are pre-filled.",
+      "precondition": "At least one prompt variant exists in the registry",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "canary-lifecycle",
+      "name": "Canary Lifecycle",
+      "requiredElements": [
+        {
+          "text": "Promote"
+        },
+        {
+          "text": "Rollback"
+        },
+        {
+          "text": "active"
+        },
+        {
+          "text": "Version History"
+        },
+        {
+          "text": "Create A/B Test"
+        },
+        {
+          "text": "Activate"
+        },
+        {},
+        {
+          "text": "Refresh"
+        }
+      ],
+      "description": "Active canary tests have Promote and Rollback action buttons that control the canary lifecycle. Promoting a canary makes the candidate version the new active version. Rolling back reverts to the baseline. The PromptRegistryTab integrates both features: each expanded prompt variant has a 'Version History' button and a 'Create A/B Test' button. The canary panel at the top of the registry shows all canaries across templates.",
+      "precondition": "An active canary exists",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "navigation",
+      "name": "Navigation",
+      "requiredElements": [
+        {
+          "role": "button",
+          "text": "Version History"
+        },
+        {
+          "text": "Back to history"
+        },
+        {
+          "text": "Back to history"
+        },
+        {
+          "role": "button",
+          "text": "Create A/B Test"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "description": "Navigation flows between the prompt registry, version history, version detail, diff view, and canary creation form. Users navigate via buttons that toggle inline panels or switch between list/detail/diff sub-views within PromptVersionHistory.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "state-consistency",
+      "name": "State Consistency",
+      "requiredElements": [
+        {
+          "text": "v\\d+"
+        },
+        {
+          "text": "Active:"
+        },
+        {},
+        {
+          "text": "Baseline"
+        },
+        {
+          "text": "Candidate"
+        },
+        {
+          "text": "candidate traffic"
+        },
+        {
+          "text": "p-value"
+        },
+        {
+          "text": "Restore this version"
+        }
+      ],
+      "description": "Assertions verifying that displayed state remains internally consistent: version numbering is sequential, current-version indicators match, diff stats are accurate, canary metrics update correctly, and statistical values converge as expected.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "element-presence",
+      "name": "Element Presence",
+      "requiredElements": [
+        {
+          "role": "button"
+        },
+        {},
+        {
+          "text": "Promote|Rollback"
+        },
+        {},
+        {
+          "text": "Version History|Create A/B Test"
+        }
+      ],
+      "description": "Assertions verifying that required UI elements are present in each view: version row metadata, diff line numbers, canary action buttons, metrics grid columns, and registry variant action buttons.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The Prompt Registry manages prompt template versioning with diff comparison, and canary A/B test deployments that split traffic between baseline and candidate prompt versions to evaluate performance via statistical analysis. Backend: 6 prompt version endpoints, PromptTemplateVersion model with SHA256 content hashing, PromptTemplateCanary in SQLite+PG with proportion_analysis statistics.",
+  "metadata": {
+    "tags": [
+      "prompt-versions",
+      "prompt-canary",
+      "a-b-testing",
+      "opik",
+      "tier-2"
+    ]
+  }
+}

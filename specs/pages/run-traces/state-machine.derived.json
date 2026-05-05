@@ -1,0 +1,421 @@
+{
+  "version": "1.0",
+  "id": "run-traces",
+  "name": "TraceViewerPage",
+  "states": [
+    {
+      "id": "traces-view-mode-navigation",
+      "name": "View Mode Navigation",
+      "requiredElements": [
+        {
+          "text": "Waterfall"
+        },
+        {
+          "text": "Flamechart"
+        },
+        {
+          "text": "Comparison"
+        },
+        {
+          "text": "Agent Graph"
+        },
+        {
+          "text": "Waterfall"
+        }
+      ],
+      "description": "The Traces page offers four visualization modes via tab buttons: Waterfall (default, timeline-positioned spans), Flamechart (gap-collapsed, duration-proportional), Comparison (cross-run diff), and Agent Graph (conditional — only when agent pipeline spans exist). Users switch between modes using the tab bar at the top of the widget. The active tab is visually highlighted. Each mode shares the same underlying span data from useTraceViewerData but presents it differently. The Waterfall and Flamechart views share the SpanDetailPanel sidebar and PerformanceInsights footer; the Comparison view has its own summary bar and inline detail expansion; the Agent Graph view shows multi-agent pipeline topology.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-waterfall-visualization",
+      "name": "Trace Waterfall Visualization",
+      "requiredElements": [
+        {
+          "text": "Name"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "setup|verification|agentic|completion|ai|python"
+        },
+        {
+          "text": "ms|s$"
+        }
+      ],
+      "description": "The default view is a waterfall chart that visualizes execution spans as horizontal bars arranged on a timeline. Each bar represents an operation (workflow phase, AI session, verification step, command execution, etc.) and its width indicates duration relative to total trace time. Parent-child relationships between spans create a hierarchical tree structure via depth-based indentation. The waterfall uses react-window for virtualization (32px row height), supporting traces with hundreds of spans. Time bounds are computed from all spans (not just filtered), ensuring the timeline stays stable as filters change. The timeline header shows time marks at 0%, 25%, 50%, 75%, and 100% of total duration.",
+      "precondition": "At least one workflow has been run and the run is selected in RunSelector",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-flamechart",
+      "name": "Flamechart Visualization",
+      "requiredElements": [
+        {
+          "tagName": "canvas"
+        },
+        {
+          "tagName": "canvas"
+        },
+        {
+          "tagName": "canvas"
+        },
+        {
+          "text": "Reset zoom"
+        },
+        {
+          "text": "Depth"
+        },
+        {
+          "text": "Root"
+        },
+        {
+          "text": "Double-click to focus subtree"
+        }
+      ],
+      "description": "The Flamechart view is a canvas-based (HTML5 Canvas) stacked visualization that shows span hierarchy by call depth, with each span's width proportional to its duration. Unlike the waterfall (which shows wall-clock position), the flamechart collapses idle gaps between sibling spans so it shows where time is *spent*. Children are packed proportionally within their parent's width range — a parent with two children of 600ms and 400ms allocates 60% and 40% of its width respectively, regardless of idle gaps between them. The canvas renders at device pixel ratio for crisp display on HiDPI screens, with a dark zinc-900 background. Phase colors use raw hex values (not Tailwind) for canvas rendering.",
+      "precondition": "At least one workflow has been run and the Flamechart tab is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-comparison",
+      "name": "Cross-Run Trace Comparison",
+      "requiredElements": [
+        {
+          "text": "Run A (baseline)"
+        },
+        {
+          "text": "Run A (baseline)"
+        },
+        {
+          "text": "overall"
+        },
+        {
+          "text": "Regressions detected"
+        },
+        {
+          "text": "Slower"
+        },
+        {
+          "text": "Run A"
+        },
+        {
+          "text": "Duration comparison"
+        },
+        {
+          "text": "No previous runs available"
+        }
+      ],
+      "description": "The Comparison view enables side-by-side analysis of execution spans from two runs of the same workflow, highlighting timing differences, added/removed spans, and regressions. It aligns spans between runs by matching on name + phase + iteration, then classifies each pair as unchanged, faster, slower, added, removed, or status_changed. The view defaults to comparing the current run (Run B) against the most recent prior run with the same workflow_name (Run A). Both runs can be overridden via dropdown selectors. Data is fetched from the same execution_spans API for each run independently via useTraceComparisonData, which calls useTraceViewerData for each run ID.",
+      "precondition": "Comparison tab is active and at least two runs exist",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-critical-path",
+      "name": "Critical Path Analysis",
+      "requiredElements": [
+        {
+          "text": "Critical Path"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "tagName": "line"
+        },
+        {
+          "tagName": "canvas"
+        },
+        {
+          "text": "Critical path"
+        },
+        {
+          "text": "critical path"
+        }
+      ],
+      "description": "When the 'Critical Path' checkbox is enabled, the system computes and highlights the longest sequential chain of spans from root to leaf — the critical path that determines total execution time. The algorithm walks the span tree bottom-up: each node's 'weight' is its own duration plus the maximum child weight. The root-to-leaf path with the highest total weight is the critical path. For parallel siblings, only the longest is on the critical path. Non-critical spans have 'slack' — how much longer they could run without extending total time. This analysis works on both the Waterfall and Flamechart views and is computed on-demand (only when the toggle is checked) via computeCriticalPath() in trace-utils.ts.",
+      "precondition": "Critical Path toggle is checked and at least one run with multiple spans is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-filtering-and-search",
+      "name": "Filtering and Search",
+      "requiredElements": [
+        {
+          "text": "Search spans"
+        },
+        {
+          "text": "Min ms"
+        },
+        {
+          "text": "All Phases"
+        },
+        {
+          "text": "All Status"
+        },
+        {
+          "text": "spans"
+        }
+      ],
+      "description": "The TraceToolbar provides four filter controls that work together to narrow the visible spans in Waterfall and Flamechart views (not shown in Comparison mode). Filters are applied client-side via filterSpans() after building and flattening the span tree. The toolbar also shows a span count indicator ('N / M spans' when filtered, 'M spans' when unfiltered). All filter state is maintained in the parent TraceViewerWidget and passed down.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-span-details",
+      "name": "Span Detail Inspection",
+      "requiredElements": [
+        {
+          "role": "button"
+        },
+        {
+          "text": "Status"
+        },
+        {
+          "text": "✕"
+        },
+        {
+          "text": "Total"
+        }
+      ],
+      "description": "When the user clicks a span in the Waterfall or Flamechart view, a 280px-wide detail panel opens on the right side showing comprehensive information about that span. The panel displays: span name (stripped of 'qontinui.' prefix), status (Success/Error), phase with colored badge, formatted duration, start and end timestamps, trace/span/parent IDs in monospace, error message (if any), and all span attributes as key-value pairs. When critical path is enabled, the panel also shows whether the span is on the critical path and its slack time. Clicking the same span again or clicking the close button deselects it.",
+      "precondition": "Waterfall or Flamechart view is active with spans loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-empty-and-loading-states",
+      "name": "Empty, Loading, and Error States",
+      "requiredElements": [
+        {
+          "text": "Select a task run"
+        },
+        {
+          "text": "Loading trace data"
+        },
+        {
+          "text": "Failed to load traces"
+        },
+        {
+          "text": "spans"
+        }
+      ],
+      "description": "The Traces page handles four boundary states: (1) no run selected — shows 'Select a task run to view traces'; (2) loading — shows 'Loading trace data...' while the first fetch is in progress; (3) error — shows 'Failed to load traces: {error}' in red; (4) empty — shows 'No spans to display' when a run is selected but has zero execution spans. These early returns happen before any view rendering, so they apply regardless of the active view mode.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-token-overlay",
+      "name": "Token/Cost Heatmap Overlay",
+      "requiredElements": [
+        {
+          "text": "No token overlay"
+        },
+        {
+          "text": "Input tokens"
+        },
+        {
+          "tagName": "canvas"
+        },
+        {
+          "text": "tokens"
+        }
+      ],
+      "description": "Token and cost heatmap overlay on waterfall and flamechart views. A dropdown selector in the toolbar offers four options: 'No token overlay', 'Input tokens', 'Output tokens', and 'Cost'. When an overlay mode is active, span bars (waterfall) and rectangles (flamechart) are tinted red proportional to their token usage or cost relative to the maximum in the trace. The PerformanceInsights footer shows aggregate token counts and cost when any token overlay is active.",
+      "precondition": "Flamechart tab is active and a token overlay mode is selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-ai-session-drilldown",
+      "name": "AI Session Drill-Down",
+      "requiredElements": [
+        {
+          "text": "Token Usage"
+        },
+        {
+          "text": "Tool Calls"
+        },
+        {
+          "text": "GenAI Attributes"
+        },
+        {
+          "text": "Attributes"
+        }
+      ],
+      "description": "When an AI session span is selected, the SpanDetailPanel shows expanded information specific to AI operations: a token usage grid displaying input tokens, output tokens, and cost; a child tool call list showing all tool invocations within the session; and a GenAI (OpenTelemetry) attributes section that separates gen_ai.* attributes from generic span attributes, displaying them with the 'gen_ai.' prefix stripped for readability.",
+      "precondition": "An AI session span is selected in Waterfall or Flamechart view",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-agent-graph",
+      "name": "Agent Communication Graph",
+      "requiredElements": [
+        {
+          "text": "Agent Graph"
+        },
+        {
+          "role": "group"
+        },
+        {
+          "text": "No agent pipeline"
+        },
+        {
+          "role": "group"
+        }
+      ],
+      "description": "A ReactFlow-based directed graph showing multi-agent pipeline topology. The Agent Graph tab only appears when the current trace contains agent pipeline spans (conditional rendering). Nodes represent agent roles and display duration and token counts. Edges represent data flow between agents. The graph uses dark mode compatible colors (rgba values). When no agent pipeline spans exist, an empty state message is shown. Clicking a node selects the corresponding span.",
+      "precondition": "Agent Graph tab is active and agent pipeline spans exist",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-replay",
+      "name": "Step-Through Replay",
+      "requiredElements": [
+        {
+          "text": "Replay"
+        },
+        {
+          "role": "toolbar"
+        },
+        {
+          "role": "button"
+        },
+        {
+          "text": "Step"
+        },
+        {
+          "role": "toolbar"
+        },
+        {
+          "text": "Exit"
+        }
+      ],
+      "description": "Step-through replay mode for debugging execution traces. A Replay button in the toolbar activates replay mode. When active, a ReplayController bar appears with transport controls: skip to start, step backward, play/pause, step forward, skip to end, and a scrub slider. The SpanDetailPanel is replaced by a ReplayPanel showing step context (current span details, step number, and surrounding context). The current span is highlighted with a blue pulsing ring. Keyboard shortcuts support navigation (left/right arrows for step, space for play/pause). Exiting replay returns to normal trace viewing mode.",
+      "precondition": "Replay mode is active (Replay button has been clicked)",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-minimap",
+      "name": "Trace Timeline Minimap",
+      "requiredElements": [
+        {
+          "tagName": "canvas"
+        },
+        {
+          "tagName": "canvas"
+        },
+        {
+          "tagName": "canvas"
+        },
+        {
+          "tagName": "canvas"
+        },
+        {
+          "tagName": "canvas"
+        }
+      ],
+      "description": "A 40px-tall canvas overview rendered above the waterfall and flamechart views for traces with 10 or more spans. The minimap shows phase-colored bars representing all spans in a compressed timeline, a viewport indicator with a blue border showing the currently visible region, and dimmed areas outside the viewport. Clicking or dragging the minimap scrolls the waterfall/flamechart to the corresponding position. Scrolling the waterfall/flamechart updates the minimap viewport indicator bidirectionally.",
+      "precondition": "A trace with 10 or more spans is loaded in Waterfall or Flamechart view",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-comparison-filtering",
+      "name": "Comparison View Filtering",
+      "requiredElements": [
+        {
+          "text": "Search"
+        },
+        {
+          "text": "Min delta"
+        },
+        {
+          "text": "All Phases"
+        },
+        {
+          "text": "Run A"
+        },
+        {
+          "text": "Run A"
+        }
+      ],
+      "description": "Extended filtering for the comparison view with three controls: a name search input for filtering matched spans by name, a minimum delta threshold input for hiding small differences, and a phase filter dropdown. The filter bar is positioned between the status category tabs and the match list. All three filters work together (AND logic) to reduce the match list to relevant entries.",
+      "precondition": "Comparison tab is active with two runs selected",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "traces-visual-design",
+      "name": "Visual Design Coverage",
+      "requiredElements": [
+        {
+          "role": "region"
+        },
+        {
+          "role": "separator"
+        },
+        {
+          "text": "Name"
+        },
+        {
+          "text": "setup|verification|agentic|completion|ai|python"
+        },
+        {
+          "text": "Search spans"
+        }
+      ],
+      "description": "Visual design assertions for the trace viewer covering dark theme colors, spacing, and typography. Verifies the zinc-based dark theme (background zinc-900, borders zinc-700, text hierarchy zinc-300/400/500), phase color palette consistency across all views, and input styling consistency for filter controls.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Run Traces page — a multi-view execution trace analysis tool showing parent-child span relationships, operation durations, phase groupings, and performance insights. Provides five visualization modes: a waterfall timeline, a flamechart showing where time is spent (with gap collapsing), a cross-run comparison view for regression detection, an agent communication graph (conditional on agent pipeline spans), and a step-through replay mode for debugging. Additional features include token/cost heatmap overlay on waterfall and flamechart, AI session drill-down with GenAI (OpenTelemetry) attributes, a trace timeline minimap for large traces, comparison filtering with name search and delta thresholds, and visual design coverage for dark theme consistency. All views are powered by the execution_spans API (GET /execution-spans?execution_id={id}&order=asc) which returns TraceSpan records with trace_id, span_id, parent_span_id, duration_ms, and phase information. Data is polled every 2 seconds for live updates via React Query. The page is mounted inside RunSelectionProvider, which supplies the selected run ID from the RunSelector dropdown in RunPageLayout.",
+  "metadata": {
+    "tags": [
+      "run-traces",
+      "trace-viewer",
+      "waterfall",
+      "flamechart",
+      "comparison",
+      "critical-path",
+      "performance",
+      "execution-spans",
+      "observe",
+      "token-overlay",
+      "agent-graph",
+      "replay",
+      "minimap",
+      "genai-attributes",
+      "ai-session",
+      "visual-design"
+    ]
+  }
+}

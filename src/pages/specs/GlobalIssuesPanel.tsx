@@ -32,7 +32,7 @@ import type {
   ListKnownIssuesQuery,
 } from "@qontinui/shared-types";
 import { ISSUE_CATEGORIES, ISSUE_SEVERITIES } from "@qontinui/shared-types";
-import { getAllSpecs } from "@/lib/spec-registry";
+import { useDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import { SEVERITY_STYLES, CATEGORY_STYLES, STATUS_STYLES } from "./issue-styles";
 
 type StatusFilter = "all" | "active" | "resolved" | "monitoring";
@@ -244,6 +244,7 @@ function CreateIssueForm({
   const [verificationHint, setVerificationHint] = useState("");
   const [reproductionContext, setReproductionContext] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const { specs: discoveredSpecs } = useDiscoveredSpecs();
 
   const handleSubmit = async () => {
     if (!title.trim() || !description.trim()) return;
@@ -360,7 +361,7 @@ function CreateIssueForm({
           className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
         >
           <option value="">Select a page spec...</option>
-          {getAllSpecs().map((s) => {
+          {discoveredSpecs.map((s) => {
             const displayName = s.specId.replace(/^runner:/, "");
             return (
               <option key={s.specId} value={s.specId}>

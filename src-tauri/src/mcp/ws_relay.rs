@@ -704,7 +704,7 @@ mod tests {
         uninstall_ws_sdk_connection(&mgr, &synthetic, prior).await;
         let guard = mgr.lock().await;
         assert!(guard.active_url.is_none());
-        assert!(guard.connections.get("ws-app://wapp").is_none());
+        assert!(!guard.connections.contains_key("ws-app://wapp"));
     }
 
     #[tokio::test]
@@ -721,6 +721,6 @@ mod tests {
         let guard = mgr.lock().await;
         assert_eq!(guard.active_url.as_deref(), Some("http://other"));
         // Our synthetic entry should still be removed even if active_url moved on.
-        assert!(guard.connections.get("ws-app://wapp").is_none());
+        assert!(!guard.connections.contains_key("ws-app://wapp"));
     }
 }

@@ -1,0 +1,249 @@
+{
+  "version": "1.0",
+  "id": "event-history",
+  "name": "EventHistoryPage",
+  "states": [
+    {
+      "id": "evh-header",
+      "name": "Page Header and Identity",
+      "requiredElements": [
+        {
+          "text": "Workflow Event History"
+        },
+        {
+          "text": "event"
+        },
+        {
+          "text": "subscription"
+        }
+      ],
+      "description": "The page header establishes the Workflow Event History identity with a Radio icon, shows aggregate counts (event count, subscription count), and auto-refreshes data every 5 seconds.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evh-filter",
+      "name": "Event Filtering",
+      "requiredElements": [
+        {
+          "role": "textbox"
+        },
+        {
+          "text": "Filter by event name or source"
+        },
+        {
+          "role": "textbox"
+        },
+        {
+          "text": "No events match the filter"
+        }
+      ],
+      "description": "A search/filter bar allows users to narrow down events by name pattern or source workflow. Essential when the event history is busy during multi-workflow orchestration.",
+      "precondition": "At least one event exists but the filter excludes all of them",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evh-queue-status",
+      "name": "Durable Queue Status Dashboard",
+      "requiredElements": [
+        {
+          "text": "Pending"
+        },
+        {
+          "text": "Running"
+        },
+        {
+          "text": "Max Concurrent"
+        },
+        {
+          "text": "Max Depth"
+        },
+        {
+          "text": "Durable"
+        },
+        {
+          "text": "Pending"
+        },
+        {
+          "text": "Pending"
+        }
+      ],
+      "description": "Compact widget displaying real-time state of the durable workflow queue. Data from GET /inngest/queue reflecting WorkflowQueue semaphore state and crash-recovery status. Backend: workflow_queue.rs, database/queue_ops.rs (SQLite + PG), main.rs (startup recovery).",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evh-circuit-breaker",
+      "name": "Circuit Breaker Health Widget",
+      "requiredElements": [
+        {
+          "text": "Circuit"
+        },
+        {
+          "text": "Circuit"
+        },
+        {
+          "text": "Failures"
+        },
+        {
+          "text": "Cooldown"
+        },
+        {
+          "text": "Circuit"
+        }
+      ],
+      "description": "Displays state of the global circuit breaker (orchestrator/retry.rs). Shows: state (Closed=green, Open=red, Half-Open=yellow), failure count vs threshold, cooldown. When Open, all retries are rejected. After cooldown, a probe request is allowed (Half-Open). Backend: CircuitBreaker in AppState, queried via GET /inngest/circuit-breaker from mcp/inngest.rs.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evh-event-table",
+      "name": "Event History Table",
+      "requiredElements": [
+        {
+          "text": "Timestamp"
+        },
+        {
+          "text": "Event Name"
+        },
+        {
+          "text": "Source"
+        },
+        {
+          "text": "Data Preview"
+        },
+        {
+          "text": "workflow.completed"
+        },
+        {
+          "text": "workflow"
+        },
+        {
+          "text": "Timestamp"
+        },
+        {
+          "text": "Data Preview"
+        },
+        {
+          "role": "row"
+        },
+        {
+          "text": "Full Payload"
+        },
+        {
+          "text": "Task Run ID"
+        },
+        {
+          "role": "row"
+        }
+      ],
+      "description": "Reverse-chronological table of workflow events. Each row: timestamp, color-coded event name, source workflow, truncated data preview. Rows are expandable to show full JSON payload and metadata. Events emitted by workflow_event_bus.rs at lifecycle transitions in task_lifecycle.rs.",
+      "precondition": "An event row has been clicked/expanded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evh-subscriptions",
+      "name": "Active Subscriptions Panel",
+      "requiredElements": [
+        {
+          "text": "Active Subscriptions"
+        },
+        {
+          "text": "workflow"
+        },
+        {
+          "text": "Active Subscriptions"
+        },
+        {
+          "text": "once"
+        },
+        {
+          "text": "Active Subscriptions"
+        }
+      ],
+      "description": "Grid of active event subscriptions below the event table. Each card shows event pattern (monospace), green active dot, and 'once' badge. Subscriptions registered by trigger_system for WorkflowChain triggers. Polls GET /inngest/subscriptions every 15 seconds.",
+      "precondition": "At least one subscription is registered",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evh-empty-error-states",
+      "name": "Empty, Loading, and Error States",
+      "requiredElements": [
+        {
+          "text": "Runner not connected"
+        },
+        {
+          "text": "error"
+        },
+        {
+          "text": "Loading event history"
+        },
+        {
+          "text": "No events recorded yet"
+        }
+      ],
+      "description": "The page handles edge cases: offline runner (yellow warning), API errors (red banner), loading (spinner message), empty history (centered icon + message). These ensure users always understand system state.",
+      "precondition": "Runner is not running or unreachable",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evh-navigation",
+      "name": "Navigation and Page Access",
+      "requiredElements": [
+        {
+          "text": "Workflow Event History"
+        }
+      ],
+      "description": "The Event History page is accessible from the main app navigation at /event-history. It should load independently without requiring other pages to be visited first.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "evh-data-freshness",
+      "name": "Auto-Refresh and Data Freshness",
+      "requiredElements": [
+        {
+          "text": "Workflow Event History"
+        },
+        {
+          "text": "Active Subscriptions"
+        },
+        {
+          "text": "Workflow Event History"
+        }
+      ],
+      "description": "All data auto-refreshes via polling through useRunnerQuery. Events + queue + circuit-breaker poll every 5s; subscriptions every 15s. Polling is deduplicated by shared API client.",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "Workflow Event History page -- the central observability hub for the Inngest-inspired workflow orchestration system. Displays a live-updating table of all workflow lifecycle events (completed, failed, started, step completed, verification passed/failed), a durable queue status dashboard showing pending/running/max-concurrent/max-depth with persistence indicator, a circuit breaker health widget showing open/closed/half-open state with failure count vs threshold, and active event subscriptions registered by the trigger system. Events are emitted by the Rust event bus (workflow_event_bus.rs) at task lifecycle transitions and consumed by the trigger_system for reactive WorkflowChain triggers. The page polls the MCP API endpoints GET /inngest/events, /inngest/subscriptions, /inngest/queue, and /inngest/circuit-breaker. Backend: mcp/inngest.rs (5 endpoints), workflow_event_bus.rs (pub/sub), database/queue_ops.rs (durable persistence), orchestrator/retry.rs (CircuitBreaker).",
+  "metadata": {
+    "tags": [
+      "inngest",
+      "event-bus",
+      "observability",
+      "queue",
+      "circuit-breaker",
+      "durable-execution",
+      "tier-2"
+    ]
+  }
+}

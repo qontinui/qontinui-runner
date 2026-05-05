@@ -34,6 +34,22 @@ repos:
         files: '^(src-tauri/src/(event_system/types|tauri_event_payloads|findings/types|schema_export)\.rs|../qontinui-schemas/rust/src/(terminal|task_run|app_events)\.rs)$'
         pass_filenames: false
 
+      # Pre-push only: cargo fmt --check + clippy -D warnings, mirroring
+      # CI's Rust gate. Runs once per `git push` (not per commit), and
+      # only when src-tauri/ changed in the pushed range. Lets you catch
+      # the same lint/fmt failures CI would 8-15 min later in 60-90s
+      # locally. Bypass with `git push --no-verify` or
+      # QONTINUI_PREPUSH_SKIP=1.
+      #
+      # Install once with: pre-commit install --hook-type pre-push
+      - id: cargo-prepush
+        name: cargo fmt + clippy (pre-push)
+        entry: bash .pre-commit-hooks/cargo-prepush.sh
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+        always_run: true
+
 ci:
   autofix_prs: true
   autofix_commit_msg: 'chore: pre-commit auto fixes'

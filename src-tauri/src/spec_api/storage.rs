@@ -17,8 +17,21 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use include_dir::{include_dir, Dir};
+
 use super::projection::project_to_pretty_json;
 use super::types::IrDocument;
+
+/// Compile-time snapshot of `<runner>/specs/pages/`. Section 4 ships an
+/// offline-capable runner: production binaries serve specs from this embedded
+/// bundle when the on-disk path is missing.
+///
+/// Resolution order in `read_ir` / `read_projection` / `list_pages` /
+/// `read_notes` is filesystem-first, embedded-second:
+/// - Filesystem hits during dev (hot-reload, /update-spec writes).
+/// - Embedded fallback when the binary is shipped without its sibling specs/
+///   tree (e.g. a standalone build).
+static EMBEDDED_PAGES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../specs/pages");
 
 /// Resolve the storage root for the Spec API.
 ///
@@ -72,68 +85,112 @@ impl PagePaths {
 /// List the page IDs that exist under `<root>/pages/`. Returns an empty
 /// vector if the directory does not exist (callers should attach a `reason`
 /// before returning to the user).
+///
+/// Falls back to enumerating the compile-time `EMBEDDED_PAGES` snapshot when
+/// the on-disk pages directory is missing or empty. Filesystem entries take
+/// precedence on collisions; the embedded set is merged in only as a fallback
+/// to cover production binaries shipped without a sibling specs/ tree.
 pub fn list_pages(root: &Path) -> std::io::Result<Vec<String>> {
     let pages_dir = root.join("pages");
-    if !pages_dir.exists() {
-        return Ok(Vec::new());
-    }
     let mut ids: Vec<String> = Vec::new();
-    for entry in fs::read_dir(&pages_dir)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            if let Some(name) = entry.file_name().to_str() {
+    if pages_dir.exists() {
+        for entry in fs::read_dir(&pages_dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+    }
+    if ids.is_empty() {
+        for embedded_dir in EMBEDDED_PAGES.dirs() {
+            if let Some(name) = embedded_dir.path().file_name().and_then(|n| n.to_str()) {
                 ids.push(name.to_string());
             }
         }
     }
     ids.sort();
+    ids.dedup();
     Ok(ids)
 }
 
 /// Read an IR document from disk. Returns `Ok(None)` if the file is missing
 /// (so callers can return a `reason: "page-not-found"` rather than an
 /// internal error).
+///
+/// Filesystem-first, embedded-second. The embedded snapshot
+/// (`EMBEDDED_PAGES`) only kicks in when the on-disk file is absent — dev
+/// hot-reload and `/update-spec` writes always win.
 pub fn read_ir(root: &Path, page_id: &str) -> Result<Option<IrDocument>, String> {
     let paths = PagePaths::for_page(root, page_id);
-    if !paths.ir_path.exists() {
-        return Ok(None);
+    if paths.ir_path.exists() {
+        let data = fs::read_to_string(&paths.ir_path)
+            .map_err(|e| format!("read {} failed: {}", paths.ir_path.display(), e))?;
+        let doc: IrDocument = serde_json::from_str(&data)
+            .map_err(|e| format!("parse {} failed: {}", paths.ir_path.display(), e))?;
+        return Ok(Some(doc));
     }
-    let data = fs::read_to_string(&paths.ir_path)
-        .map_err(|e| format!("read {} failed: {}", paths.ir_path.display(), e))?;
-    let doc: IrDocument = serde_json::from_str(&data)
-        .map_err(|e| format!("parse {} failed: {}", paths.ir_path.display(), e))?;
-    Ok(Some(doc))
+    // Embedded fallback.
+    let embedded_rel = format!("{}/state-machine.derived.json", page_id);
+    if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
+        let doc: IrDocument = serde_json::from_slice(file.contents())
+            .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
+        return Ok(Some(doc));
+    }
+    Ok(None)
 }
 
 /// Read the bundled projection (pretty JSON) as a `serde_json::Value`.
+///
+/// Filesystem-first, embedded-second (see [`read_ir`] for the rationale).
 pub fn read_projection(root: &Path, page_id: &str) -> Result<Option<serde_json::Value>, String> {
     let paths = PagePaths::for_page(root, page_id);
-    if !paths.projection_path.exists() {
-        return Ok(None);
+    if paths.projection_path.exists() {
+        let data = fs::read_to_string(&paths.projection_path)
+            .map_err(|e| format!("read {} failed: {}", paths.projection_path.display(), e))?;
+        let v: serde_json::Value = serde_json::from_str(&data)
+            .map_err(|e| format!("parse {} failed: {}", paths.projection_path.display(), e))?;
+        return Ok(Some(v));
     }
-    let data = fs::read_to_string(&paths.projection_path)
-        .map_err(|e| format!("read {} failed: {}", paths.projection_path.display(), e))?;
-    let v: serde_json::Value = serde_json::from_str(&data)
-        .map_err(|e| format!("parse {} failed: {}", paths.projection_path.display(), e))?;
-    Ok(Some(v))
+    let embedded_rel = format!("{}/spec.uibridge.json", page_id);
+    if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
+        let v: serde_json::Value = serde_json::from_slice(file.contents())
+            .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
+        return Ok(Some(v));
+    }
+    Ok(None)
 }
 
 /// Read the notes companion file. Returns `None` if absent. Empty/whitespace
 /// content normalizes to `None`.
+///
+/// Filesystem-first, embedded-second (see [`read_ir`] for the rationale).
 pub fn read_notes(root: &Path, page_id: &str) -> Result<Option<String>, String> {
     let paths = PagePaths::for_page(root, page_id);
-    if !paths.notes_path.exists() {
-        return Ok(None);
+    if paths.notes_path.exists() {
+        let s = fs::read_to_string(&paths.notes_path)
+            .map_err(|e| format!("read {} failed: {}", paths.notes_path.display(), e))?;
+        let trimmed = s.trim().to_string();
+        return if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed))
+        };
     }
-    let s = fs::read_to_string(&paths.notes_path)
-        .map_err(|e| format!("read {} failed: {}", paths.notes_path.display(), e))?;
-    let trimmed = s.trim().to_string();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed))
+    let embedded_rel = format!("{}/notes.md", page_id);
+    if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
+        let s = std::str::from_utf8(file.contents())
+            .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
+        let trimmed = s.trim().to_string();
+        return if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed))
+        };
     }
+    Ok(None)
 }
 
 /// Atomic write: write to `<target>.tmp` then rename. Cleans up the tmp
@@ -159,8 +216,37 @@ fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
     })
 }
 
+/// Write a projection (bundled-page) JSON value directly to
+/// `<root>/pages/<page_id>/spec.uibridge.json`.
+///
+/// This is a narrow helper for migration callers (e.g.
+/// `workflow_generation::spec_synthesis`) that mutate the projection without
+/// going through the IR. The IR remains untouched, so callers should be aware
+/// that subsequent `write_ir_and_regenerate` calls will overwrite changes
+/// written through this helper. Documented as a known IR/projection desync
+/// caveat in ADR-013.5 — the IR has no `groups` shape yet.
+pub fn write_projection(
+    root: &Path,
+    page_id: &str,
+    value: &serde_json::Value,
+) -> Result<PathBuf, String> {
+    let paths = PagePaths::for_page(root, page_id);
+    let pretty = serde_json::to_string_pretty(value)
+        .map_err(|e| format!("serialize projection failed: {}", e))?;
+    let mut buf = pretty.into_bytes();
+    buf.push(b'\n');
+    atomic_write(&paths.projection_path, &buf)
+        .map_err(|e| format!("write {} failed: {}", paths.projection_path.display(), e))?;
+    Ok(paths.projection_path)
+}
+
 /// Write an IR document and regenerate its projection. Returns the absolute
 /// path to the projection file on success.
+///
+/// Writes always hit the filesystem — `EMBEDDED_PAGES` is a compile-time
+/// snapshot and cannot be mutated at runtime. After this call, subsequent
+/// `read_ir` / `read_projection` calls will resolve to the freshly-written
+/// file (filesystem wins over embedded).
 pub fn write_ir_and_regenerate(root: &Path, doc: &IrDocument) -> Result<PathBuf, String> {
     let paths = PagePaths::for_page(root, &doc.id);
     let ir_json =
@@ -206,11 +292,18 @@ pub enum ReadWithinRootError {
 
 /// Stat-based mtime check; returns the modified time as seconds since epoch
 /// for IR + projection files. Used by `/spec/diff?since=`.
+///
+/// Embedded-only pages (no on-disk files) return `Some(0)` so callers' `since=`
+/// cursor behaves predictably — `0` is older than any real epoch timestamp,
+/// so a client polling with a non-zero cursor won't see spurious "modified"
+/// signals for content that hasn't actually changed.
 pub fn newest_mtime_for_page(root: &Path, page_id: &str) -> Option<u64> {
     let paths = PagePaths::for_page(root, page_id);
     let mut newest: Option<u64> = None;
+    let mut any_on_disk = false;
     for p in [&paths.ir_path, &paths.projection_path, &paths.notes_path] {
         if let Ok(meta) = fs::metadata(p) {
+            any_on_disk = true;
             if let Ok(modified) = meta.modified() {
                 if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
                     let secs = dur.as_secs();
@@ -219,5 +312,22 @@ pub fn newest_mtime_for_page(root: &Path, page_id: &str) -> Option<u64> {
             }
         }
     }
-    newest
+    if newest.is_some() {
+        return newest;
+    }
+    // If nothing was on disk but the page exists in the embedded snapshot,
+    // return 0 so the caller still sees "the page exists" (vs `None`, which
+    // means "no such page").
+    if !any_on_disk {
+        let ir_rel = format!("{}/state-machine.derived.json", page_id);
+        let proj_rel = format!("{}/spec.uibridge.json", page_id);
+        let notes_rel = format!("{}/notes.md", page_id);
+        if EMBEDDED_PAGES.get_file(&ir_rel).is_some()
+            || EMBEDDED_PAGES.get_file(&proj_rel).is_some()
+            || EMBEDDED_PAGES.get_file(&notes_rel).is_some()
+        {
+            return Some(0);
+        }
+    }
+    None
 }

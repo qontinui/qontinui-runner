@@ -1,0 +1,314 @@
+{
+  "version": "1.0",
+  "id": "wrappers",
+  "name": "WrappersLibraryPage",
+  "states": [
+    {
+      "id": "page-structure",
+      "name": "Page Structure & Layout",
+      "requiredElements": [
+        {
+          "attributes": {
+            "page-id": "wrappers"
+          }
+        },
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        },
+        {
+          "textContains": "Install wrapper extensions to give the runner"
+        }
+      ],
+      "description": "The page uses a centered max-width container with a header, tab bar, and content area. Layout is consistent with other refined runner pages (UI Bridge, etc.) — max-w-[1024px] container, padded content, dark theme.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "header-icon-tile",
+      "name": "Header Icon Tile",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        }
+      ],
+      "description": "The header includes a 36×36 cyan-tinted icon tile holding a Package icon — this matches the 'icon-tile' visual pattern established on the UI Bridge integration page.",
+      "precondition": "The Wrappers page is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "tab-navigation",
+      "name": "Tab Navigation (Installed / Browse)",
+      "requiredElements": [
+        {
+          "tagName": "button",
+          "text": "Installed"
+        },
+        {
+          "tagName": "button",
+          "text": "Browse"
+        },
+        {
+          "tagName": "button",
+          "text": "Browse"
+        },
+        {
+          "tagName": "button",
+          "text": "Installed"
+        }
+      ],
+      "description": "Two tabs at the top of the content area let users switch between viewing installed wrappers and browsing the public registry. The active tab is indicated by a cyan-400 underline and cyan-400 text color. The Installed tab also shows a count badge of installed wrappers when > 0.",
+      "precondition": "At least one wrapper is installed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "installed-tab-empty-state",
+      "name": "Installed Tab — Empty State",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "No wrappers installed yet"
+        },
+        {
+          "textContains": "Switch to the Browse tab to discover wrappers"
+        }
+      ],
+      "description": "When no wrappers are installed, the Installed tab renders an empty-state card with a dashed border, a Package icon-tile, the heading 'No wrappers installed yet', and a hint pointing the user to the Browse tab.",
+      "precondition": "No wrappers are installed and the Installed tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "installed-tab-loading-error",
+      "name": "Installed Tab — Loading & Error States",
+      "requiredElements": [
+        {
+          "textContains": "Loading installed wrappers"
+        },
+        {
+          "textContains": "Failed to load installed wrappers"
+        },
+        {
+          "tagName": "button",
+          "text": "Retry"
+        }
+      ],
+      "description": "While the wrapper list is being fetched from GET /wrappers, a centered spinner with the text 'Loading installed wrappers…' is shown. If the fetch fails, an error card is shown with a Retry button that re-runs the fetch.",
+      "precondition": "GET /wrappers is in flight",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "installed-tab-card-grid",
+      "name": "Installed Tab — Wrapper Card Grid",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        },
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        },
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        },
+        {
+          "textContains": "actions"
+        },
+        {
+          "accessibleName": "Wrapper actions"
+        },
+        {
+          "tagName": "button",
+          "text": "Open"
+        },
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        }
+      ],
+      "description": "When wrappers are installed, the Installed tab renders a 1- or 2-column grid (responsive on md+) of wrapper cards. Each card displays the wrapper's display name, package name + version, description (line-clamped to 2 lines), transport badge, status badge, action count, a three-dot menu for lifecycle actions, and an Open button.",
+      "precondition": "At least one wrapper is installed and the Installed tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "browse-tab-search",
+      "name": "Browse Tab — Search & Refresh",
+      "requiredElements": [
+        {},
+        {},
+        {
+          "tagName": "button",
+          "text": "Refresh"
+        }
+      ],
+      "description": "The Browse tab has a search input (with a Search icon prefix) and a Refresh button next to it. Search filters the registry entries by id, package, displayName, description, categories, or author name (case-insensitive substring match). Refresh forces a re-fetch of the registry, bypassing the 24h cache.",
+      "precondition": "The Browse tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "browse-tab-states",
+      "name": "Browse Tab — Loading / Error / Empty States",
+      "requiredElements": [
+        {
+          "textContains": "Loading registry"
+        },
+        {
+          "textContains": "reach the registry"
+        },
+        {
+          "textContains": "registry is empty"
+        }
+      ],
+      "description": "The Browse tab handles three non-populated states: a loading spinner while fetching the registry, an error card if the fetch fails, and an empty/no-results state when the registry is empty or the search query matches nothing.",
+      "precondition": "Registry fetch is in flight",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "browse-tab-entries",
+      "name": "Browse Tab — Registry Entries",
+      "requiredElements": [
+        {
+          "tagName": "li"
+        },
+        {
+          "tagName": "li"
+        },
+        {
+          "text": "verified"
+        },
+        {
+          "tagName": "li"
+        },
+        {
+          "tagName": "button",
+          "text": "Install"
+        },
+        {
+          "tagName": "button",
+          "text": "Installed"
+        },
+        {
+          "text": "repo"
+        }
+      ],
+      "description": "Each registry entry is rendered as a list item showing the wrapper's displayName, an optional 'verified' badge (with ShieldCheck icon, emerald-tinted), the author name, the npm package name + version (monospace), description, category chips, an optional repo link (with ExternalLink icon), a TransportBadge, and an Install button.",
+      "precondition": "The Browse tab is active and at least one registry entry is loaded",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "visual-typography",
+      "name": "Visual Design — Typography",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        },
+        {
+          "textContains": "Install wrapper extensions"
+        }
+      ],
+      "description": "Heading hierarchy: h1 'Wrappers' is text-2xl + font-bold + tracking-tight. Section headings (e.g., 'No wrappers installed yet') are h3 + text-sm + font-semibold. Body text is text-xs muted. Package names are font-mono.",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "visual-color-scheme",
+      "name": "Visual Design — Color Scheme",
+      "requiredElements": [
+        {
+          "tagName": "button",
+          "text": "Installed"
+        },
+        {
+          "tagName": "button",
+          "text": "Install"
+        }
+      ],
+      "description": "Cyan-400 is the primary accent (active tab, icon-tile borders, links, ring highlights). Cyan-to-purple gradient is reserved for primary action buttons (Install). Status badges use semantic colors: green for running, red for error, yellow for degraded.",
+      "precondition": "The Installed tab is active",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "visual-spacing-layout",
+      "name": "Visual Design — Spacing & Layout",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        },
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        }
+      ],
+      "description": "The content is constrained to a centered max-w-[1024px] container with px-4/sm:px-6 horizontal padding and py-8 vertical padding. Inside the container, a flex column with gap-4 spaces the header / tab bar / content. Wrapper cards in the Installed grid use gap-4 and switch from 1 column to 2 columns at md+.",
+      "precondition": "At least 2 wrappers are installed",
+      "provenance": {
+        "source": "migrated"
+      }
+    },
+    {
+      "id": "data-correctness",
+      "name": "Data Correctness — Installed list reflects backend",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        },
+        {
+          "tagName": "button",
+          "text": "Installed"
+        },
+        {
+          "role": "heading",
+          "text": "Wrappers"
+        },
+        {
+          "tagName": "button",
+          "text": "Browse"
+        }
+      ],
+      "description": "The Installed tab is the user's window into the runner's wrapper subsystem. What the page shows MUST match what the backend reports. These assertions specify the contract between the UI and GET /wrappers / GET /wrappers/:id/status.",
+      "precondition": "The Installed tab is active and the runner is reachable",
+      "provenance": {
+        "source": "migrated"
+      }
+    }
+  ],
+  "transitions": [],
+  "provenance": {
+    "source": "migrated"
+  },
+  "description": "The Wrappers Library page lists installed wrapper extensions and lets users discover/install new ones from the public registry. Wrappers are first-class extensions that add typed actions to the runner — think MCP servers, but native. The page has two tabs (Installed / Browse) and is the entry point to per-wrapper detail views (Actions, Settings, Logs, About). Backed by the runner's HTTP endpoints under /wrappers/* (registry, install, lifecycle, dispatch).",
+  "metadata": {
+    "tags": [
+      "wrappers",
+      "extensions",
+      "registry",
+      "install",
+      "library"
+    ]
+  }
+}
