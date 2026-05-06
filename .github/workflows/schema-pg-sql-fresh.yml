@@ -48,19 +48,33 @@ jobs:
         with:
           path: qontinui-runner
 
+      # Resolve which qontinui-web ref to use: prefer the same branch
+      # name as the qontinui-runner side (so coordinated cross-repo
+      # changes can be tested together), but fall back to `main` when
+      # that branch doesn't exist on qontinui-web. A pure YAML
+      # expression can't do this — `github.head_ref` is always
+      # non-empty on PRs, so `${{ github.head_ref || 'main' }}` would
+      # never reach the fallback. Use `git ls-remote` to check
+      # existence, then expose the resolved ref as a step output.
+      - name: Resolve qontinui-web ref
+        id: resolve_ref
+        shell: bash
+        run: |
+          branch="${{ github.head_ref || github.ref_name }}"
+          if [ -n "$branch" ] && git ls-remote --heads https://github.com/qontinui/qontinui-web.git "$branch" | grep -q .; then
+            echo "Using qontinui-web ref: $branch (matches this PR's branch)"
+            echo "ref=$branch" >> "$GITHUB_OUTPUT"
+          else
+            echo "Using qontinui-web ref: main (PR branch '$branch' does not exist on qontinui-web)"
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout qontinui-web (sibling)
         uses: actions/checkout@v4
         with:
           repository: qontinui/qontinui-web
           path: qontinui-web
-          # Use the same branch name if it exists in qontinui-web,
-          # otherwise main. Avoids drift when both repos move together.
-          # The `|| 'main'` fallback is required: if the PR's branch
-          # name doesn't exist on qontinui-web, actions/checkout's
-          # bare `head_ref` resolves to a 404 before alembic ever runs
-          # (the workflow's own comment promised the main fallback but
-          # didn't implement it).
-          ref: ${{ github.head_ref || github.ref_name || 'main' }}
+          ref: ${{ steps.resolve_ref.outputs.ref }}
 
       - name: Checkout qontinui-schemas (sibling)
         uses: actions/checkout@v4
