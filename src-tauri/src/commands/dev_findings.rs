@@ -17,11 +17,10 @@
 //! [`commands::auth::get_test_auto_login`] which reads
 //! `QONTINUI_TEST_AUTO_LOGIN_EMAIL` from the process env.
 
+use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Runtime};
-
-use qontinui_runner_lib::tauri_event_payloads::DevSeedFindingPayload as SeedFindingPayload;
 
 /// Environment variable that gates all dev-only endpoints in this module.
 const DEV_ENV_VAR: &str = "QONTINUI_DEV_ENDPOINTS";
@@ -34,21 +33,30 @@ const DEV_ENV_VAR: &str = "QONTINUI_DEV_ENDPOINTS";
 /// running in dev mode", which is already implied by other dev-mode UI.
 #[tauri::command]
 pub fn is_dev_endpoints_enabled() -> bool {
-    is_dev_endpoints_value(std::env::var(DEV_ENV_VAR).ok().as_deref())
+    std::env::var(DEV_ENV_VAR).as_deref() == Ok("1")
 }
 
-/// Pure policy: the gate is on iff the env value is exactly `"1"`. Split out
-/// from `is_dev_endpoints_enabled()` so tests can exercise the predicate
-/// without racing on `std::env` mutations from sibling tests in the same
-/// `cargo test` process.
-fn is_dev_endpoints_value(v: Option<&str>) -> bool {
-    v == Some("1")
+/// Payload shape emitted with the `dev:seed-finding` Tauri event.
+///
+/// Field names use camelCase so the TS listener can spread them directly
+/// into a `Finding` object without translation.
+#[derive(Debug, Clone, Serialize)]
+struct SeedFindingPayload {
+    id: String,
+    #[serde(rename = "categoryId")]
+    category_id: String,
+    severity: String,
+    status: String,
+    title: String,
+    description: String,
+    #[serde(rename = "detectedAt")]
+    detected_at: i64,
+    #[serde(rename = "actionType")]
+    action_type: String,
+    actionable: bool,
+    #[serde(rename = "sourceSessionId", skip_serializing_if = "Option::is_none")]
+    source_session_id: Option<String>,
 }
-
-// `SeedFindingPayload` is the canonical wire-format struct in
-// `qontinui_runner_lib::tauri_event_payloads::DevSeedFindingPayload`, which is
-// registered with schemars in `schema_export.rs` so the TS bindings stay in
-// sync with the Rust shape.
 
 /// Seed one or more synthetic findings into the frontend findings tracker.
 ///
@@ -143,22 +151,33 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 mod tests {
     use super::*;
 
-    // Tests exercise the pure policy directly instead of mutating the process
-    // env. Earlier versions of these tests called set_var/remove_var and
-    // raced against each other under cargo's test-thread parallelism (saw
-    // failures on Ubuntu, macOS, and locally on Windows depending on which
-    // sibling test happened to interleave).
-
+    // These assertions all touch the same process-global env var
+    // (`QONTINUI_DEV_ENDPOINTS`), so they cannot run as separate
+    // `#[test]` functions — cargo's default thread pool would let them
+    // race against each other and against any other env-touching test
+    // in the suite. CI Windows hit exactly this race on PR #48 run
+    // 25424040391: `gate_off_returns_false` saw the var as `1` because a
+    // sibling test had set it concurrently. Bundling the assertions in
+    // one test and clearing the var at start + finally serializes them
+    // by construction.
     #[test]
-    fn gate_off_returns_false() {
-        assert!(!is_dev_endpoints_value(None));
-        assert!(!is_dev_endpoints_value(Some("")));
-        assert!(!is_dev_endpoints_value(Some("0")));
-        assert!(!is_dev_endpoints_value(Some("true")));
-    }
+    fn gate_reads_env_var() {
+        std::env::remove_var(DEV_ENV_VAR);
+        assert!(
+            !is_dev_endpoints_enabled(),
+            "gate must be off when var unset"
+        );
 
-    #[test]
-    fn gate_on_returns_true() {
-        assert!(is_dev_endpoints_value(Some("1")));
+        std::env::set_var(DEV_ENV_VAR, "1");
+        assert!(is_dev_endpoints_enabled(), "gate must be on when var=1");
+
+        std::env::set_var(DEV_ENV_VAR, "0");
+        assert!(!is_dev_endpoints_enabled(), "gate must be off when var!=1");
+
+        std::env::remove_var(DEV_ENV_VAR);
+        assert!(
+            !is_dev_endpoints_enabled(),
+            "gate must be off when var unset (final)"
+        );
     }
 }

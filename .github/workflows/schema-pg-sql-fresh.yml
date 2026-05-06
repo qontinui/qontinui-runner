@@ -48,43 +48,73 @@ jobs:
         with:
           path: qontinui-runner
 
+      # Resolve which qontinui-web ref to use: prefer the same branch
+      # name as the qontinui-runner side (so coordinated cross-repo
+      # changes can be tested together), but fall back to `main` when
+      # that branch doesn't exist on qontinui-web. A pure YAML
+      # expression can't do this — `github.head_ref` is always
+      # non-empty on PRs, so `${{ github.head_ref || 'main' }}` would
+      # never reach the fallback. Use `git ls-remote` to check
+      # existence, then expose the resolved ref as a step output.
+      - name: Resolve qontinui-web ref
+        id: resolve_ref
+        shell: bash
+        run: |
+          branch="${{ github.head_ref || github.ref_name }}"
+          if [ -n "$branch" ] && git ls-remote --heads https://github.com/qontinui/qontinui-web.git "$branch" | grep -q .; then
+            echo "Using qontinui-web ref: $branch (matches this PR's branch)"
+            echo "ref=$branch" >> "$GITHUB_OUTPUT"
+          else
+            echo "Using qontinui-web ref: main (PR branch '$branch' does not exist on qontinui-web)"
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout qontinui-web (sibling)
         uses: actions/checkout@v4
         with:
           repository: qontinui/qontinui-web
           path: qontinui-web
-          # Use the same branch name if it exists in qontinui-web,
-          # otherwise main. Avoids drift when both repos move together.
-          # The `|| 'main'` fallback is required: if the PR's branch
-          # name doesn't exist on qontinui-web, actions/checkout's
-          # bare `head_ref` resolves to a 404 before alembic ever runs
-          # (the workflow's own comment promised the main fallback but
-          # didn't implement it).
-          ref: ${{ github.head_ref || github.ref_name || 'main' }}
+          ref: ${{ steps.resolve_ref.outputs.ref }}
+
+      # qontinui-web/backend/pyproject.toml has path-deps on sibling
+      # repos (qontinui-schemas, qontinui). alembic's env.py imports
+      # `from app.db.base_class import *`, which transitively imports
+      # `from qontinui_schemas.common import utc_now` (and many more)
+      # via the model files. So a minimal `pip install alembic ...`
+      # is fundamentally insufficient — the whole backend import
+      # graph has to resolve. Mirror the canonical pattern from
+      # qontinui-web's own backend-ci.yml: clone the public sibling
+      # repos, install via poetry. We skip qontinui-cloud-control
+      # (private, requires PAT) because the model layer doesn't
+      # import it; alembic should still load. We skip the optional
+      # `ml` poetry group (qontinui-train), keeping the install
+      # weight reasonable.
+      - name: Checkout sibling repos (qontinui-schemas, qontinui)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 https://github.com/qontinui/qontinui.git
+        shell: bash
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install alembic dependencies
-        working-directory: qontinui-web/backend
+      - name: Install Poetry
         run: |
-          python -m pip install --upgrade pip
-          # `pgvector` is required because three migrations
-          # (05a366f58455_initial_schema_squashed.py,
-          # a84bf9dcb2dc_add_text_embedding_to_project_embeddings.py,
-          # b5c6d7e8f9a0_add_semantic_search_embeddings.py) do
-          # `from pgvector.sqlalchemy import Vector` at module
-          # import time. Without it, `alembic upgrade head` blows
-          # up with `ImportError` before the schema-diff step.
-          pip install alembic sqlalchemy psycopg2-binary pgvector python-dotenv
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install backend dependencies (poetry, default groups only)
+        working-directory: qontinui-web/backend
+        run: poetry install --no-interaction --no-root
 
       - name: Apply alembic chain
         working-directory: qontinui-web/backend
         env:
           DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
-        run: alembic upgrade head
+        run: poetry run alembic upgrade head
 
       - name: Install Postgres client (for pg_dump)
         run: |
@@ -108,15 +138,40 @@ jobs:
         run: bash src-tauri/scripts/regenerate_schema_pg_sql.sh
 
       - name: Diff against checked-in
+        id: diff_check
         working-directory: qontinui-runner/src-tauri
         run: |
-          if ! diff -q /tmp/schema.checked-in.sql schema.pg.sql.generated; then
+          # Strip the `-- Dumped by pg_dump version ...` header comment
+          # before comparison. That line records the OS vendor string of
+          # whichever pg_dump produced the file (e.g. "Debian 16.13-1..."
+          # vs "Ubuntu 16.13-1..."), which differs between a contributor's
+          # local Docker setup and CI's apt-installed client. It's pure
+          # environmental noise — not real schema drift — and ratchets
+          # the artifact between regen environments if not filtered.
+          grep -v '^-- Dumped by pg_dump version' /tmp/schema.checked-in.sql > /tmp/schema.checked-in.normalized.sql
+          grep -v '^-- Dumped by pg_dump version' schema.pg.sql.generated > /tmp/schema.generated.normalized.sql
+          if ! diff -q /tmp/schema.checked-in.normalized.sql /tmp/schema.generated.normalized.sql; then
             echo "::error::schema.pg.sql.generated is stale relative to a fresh alembic upgrade head + pg_dump."
             echo "::error::Regenerate locally via:"
             echo "::error::  bash src-tauri/scripts/regenerate_schema_pg_sql.sh"
+            echo "::error::Or download the fresh artifact uploaded by this job (see Artifacts tab) and commit it directly."
             echo ""
             echo "Diff:"
             diff -u /tmp/schema.checked-in.sql schema.pg.sql.generated | head -80
             exit 1
           fi
           echo "schema.pg.sql.generated is up to date."
+
+      # If the diff step failed (drift detected), upload the freshly
+      # regenerated file so a contributor can download + commit it
+      # without spinning up Postgres + alembic locally. The drift
+      # signal has been red since at least 2026-05-06; this turns
+      # "the workflow is mad at you" into "click Artifacts, commit
+      # the file, push."
+      - name: Upload regenerated schema (on diff failure)
+        if: failure() && steps.diff_check.conclusion == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema.pg.sql.generated-fresh
+          path: qontinui-runner/src-tauri/schema.pg.sql.generated
+          if-no-files-found: error
