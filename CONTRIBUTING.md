@@ -264,9 +264,39 @@ gh api repos/qontinui/qontinui-runner/branches --jq '.[].name' | grep '^ci/'
 
 There are usually several `ci/...` branches at any given time, some live and some stale. Don't accidentally re-do work that's already drafted on another branch. If you find a related open PR, coordinate (or rebase onto it) rather than opening a parallel attempt.
 
-### Branch protection — note for follow-up
+### Branch protection
 
-Ideally, GitHub branch protection on `main` would mirror the merge-gate set above (`ci.yml` on all platforms + `forbid-runner-schema.yml` + the path-triggered gates when they run). Currently it doesn't — `main` has been accepting merges through red. Aligning protection rules with this policy is a follow-up. Note that the platform escape valve described above is human-enforced (you check the linked exemption before merging) — GitHub branch protection can't natively express "green OR linked open issue," so this part of the policy lives in PR-review discipline, not the protection rules.
+The merge-gate set above is mechanically enforced by the `main-merge-gates` Repository Ruleset on `qontinui-runner` `main` (ruleset id `16044811`, [admin UI](https://github.com/qontinui/qontinui-runner/rules/16044811)). The rule blocks force-push, branch deletion, and any merge to `main` whose PR doesn't have these check contexts green:
+
+- `forbid-runner-schema`
+- `security`
+- `test (ubuntu-22.04)`
+- `test (macos-latest)`
+- `test (windows-latest)`
+- `schema-fresh` — required *when run*, i.e. only on PRs touching `src-tauri/queries/**` or `src-tauri/schema.pg.sql.generated`
+
+Required-when-run is the rulesets default: checks that didn't trigger on a PR don't show as `pending` and don't block merge. PRs also have to go through a pull request — direct push to `main` is blocked.
+
+The escape-valve case ("merge with a red leg if a tracked plan documents the block") is intentionally **not** encoded in the ruleset. GitHub can't natively express "green OR linked open issue," so that part of the policy still lives in PR-review discipline, plus admin override (below) for the mechanical case.
+
+#### Admin bypass
+
+The ruleset has `OrganizationAdmin` as a `bypass_mode: always` actor. The org owner (currently jspinak) can override any rule — required checks, force-push block, deletion block — without going through the gate. This exists for two reasons:
+
+1. **Solo-maintainer rescue.** With one admin, getting locked out by a misconfigured rule has no recovery path short of GitHub Support.
+2. **Platform escape valve.** When a hosted-runner pathology blocks a leg and the project-side workstream tracking the fix is documented, an admin override is the mechanical answer for the gate that can't natively express "green OR linked open issue."
+
+If you find yourself overriding routinely, the rule is wrong, not the override. Fix the rule.
+
+#### How to override (admin runbook)
+
+When you legitimately need to merge a red PR — documented hosted-runner block, in-flight project-side fix, etc. — and the escape-valve criteria in "Platform escape valve" above are satisfied:
+
+1. Confirm the failure matches a tracked plan or open issue and link it in the PR description.
+2. Click `Merge` on the PR. GitHub surfaces a "Bypass branch protections" prompt for org admins. Select "Bypass and merge."
+3. Note in the merge commit message which rule was bypassed and why.
+
+If a rule fires unexpectedly — e.g. a `.github/workflows/*.yml` job was renamed and the check context the ruleset pins no longer matches — update the ruleset, don't override repeatedly. Renaming a workflow job is a silent ruleset break: the ruleset references check contexts by name (`forbid-runner-schema`, `test (ubuntu-22.04)`, etc.), and those names follow the workflow file's `jobs.<id>` and matrix expansion. Sync the ruleset whenever those rename.
 
 ### Quick checklist before clicking merge
 
