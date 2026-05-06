@@ -1368,7 +1368,17 @@ mod tests {
             .copied()
             .unwrap_or(0);
         assert_eq!(after_hits - before_hits, 1);
-        assert_eq!(snapshot_after.cache_read_tokens - before_read, 333);
+        // `cache_read_tokens` is a global (not per-provider) counter, so a
+        // parallel `record_call_ok_increments_calls_total` test that also
+        // contributes cache_read_tokens (200) can land between this test's
+        // before/after snapshots, making the diff >= 333. Assert >= rather
+        // than == to tolerate parallel-test ordering — observed flaky on
+        // macos-latest, where rust-test parallelism interleaves these.
+        assert!(
+            snapshot_after.cache_read_tokens - before_read >= 333,
+            "expected cache_read_tokens to increase by at least 333, saw {}",
+            snapshot_after.cache_read_tokens - before_read
+        );
     }
 
     #[tokio::test]
