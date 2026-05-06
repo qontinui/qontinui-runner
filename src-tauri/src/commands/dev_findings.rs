@@ -34,7 +34,15 @@ const DEV_ENV_VAR: &str = "QONTINUI_DEV_ENDPOINTS";
 /// running in dev mode", which is already implied by other dev-mode UI.
 #[tauri::command]
 pub fn is_dev_endpoints_enabled() -> bool {
-    std::env::var(DEV_ENV_VAR).as_deref() == Ok("1")
+    is_dev_endpoints_value(std::env::var(DEV_ENV_VAR).ok().as_deref())
+}
+
+/// Pure policy: the gate is on iff the env value is exactly `"1"`. Split out
+/// from `is_dev_endpoints_enabled()` so tests can exercise the predicate
+/// without racing on `std::env` mutations from sibling tests in the same
+/// `cargo test` process.
+fn is_dev_endpoints_value(v: Option<&str>) -> bool {
+    v == Some("1")
 }
 
 // `SeedFindingPayload` is the canonical wire-format struct in
@@ -135,18 +143,22 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 mod tests {
     use super::*;
 
+    // Tests exercise the pure policy directly instead of mutating the process
+    // env. Earlier versions of these tests called set_var/remove_var and
+    // raced against each other under cargo's test-thread parallelism (saw
+    // failures on Ubuntu, macOS, and locally on Windows depending on which
+    // sibling test happened to interleave).
+
     #[test]
     fn gate_off_returns_false() {
-        // Ensure the gate is off for this test (no setter — we rely on the
-        // default test env not having QONTINUI_DEV_ENDPOINTS=1).
-        std::env::remove_var(DEV_ENV_VAR);
-        assert!(!is_dev_endpoints_enabled());
+        assert!(!is_dev_endpoints_value(None));
+        assert!(!is_dev_endpoints_value(Some("")));
+        assert!(!is_dev_endpoints_value(Some("0")));
+        assert!(!is_dev_endpoints_value(Some("true")));
     }
 
     #[test]
     fn gate_on_returns_true() {
-        std::env::set_var(DEV_ENV_VAR, "1");
-        assert!(is_dev_endpoints_enabled());
-        std::env::remove_var(DEV_ENV_VAR);
+        assert!(is_dev_endpoints_value(Some("1")));
     }
 }

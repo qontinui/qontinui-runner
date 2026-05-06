@@ -695,8 +695,20 @@ mod tests {
     #[test]
     fn budget_slides_window_after_one_hour() {
         // Pin the window start to ~61 minutes ago so the next try_consume
-        // detects the slide.
-        let past = Instant::now() - Duration::from_secs(61 * 60);
+        // detects the slide. On Windows CI runners the system Instant base
+        // can be very recent (boot time minutes ago) so direct subtraction
+        // panics with "overflow when subtracting duration from instant" —
+        // skip the test instead of panicking when that happens.
+        let past = match Instant::now().checked_sub(Duration::from_secs(61 * 60)) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "skip budget_slides_window_after_one_hour: Instant base \
+                     too recent for 61-min lookback (system uptime < 61min)"
+                );
+                return;
+            }
+        };
         let mut b = LlmBudget::with_window_start(past);
         // Pretend we already filled the cap in the prior window.
         for _ in 0..5 {
