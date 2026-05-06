@@ -76,48 +76,45 @@ jobs:
           path: qontinui-web
           ref: ${{ steps.resolve_ref.outputs.ref }}
 
-      - name: Checkout qontinui-schemas (sibling)
-        uses: actions/checkout@v4
-        with:
-          # qontinui-web/backend models import `qontinui_schemas` at
-          # module-load time (see app/models/execution_run.py:13:
-          # `from qontinui_schemas.common import utc_now`). Without
-          # this clone the alembic env.py crashes on import before
-          # the schema-diff step. We follow the same head-ref-or-main
-          # convention as the qontinui-web checkout above.
-          repository: qontinui/qontinui-schemas
-          path: qontinui-schemas
-          ref: ${{ github.head_ref || github.ref_name || 'main' }}
+      # qontinui-web/backend/pyproject.toml has path-deps on sibling
+      # repos (qontinui-schemas, qontinui). alembic's env.py imports
+      # `from app.db.base_class import *`, which transitively imports
+      # `from qontinui_schemas.common import utc_now` (and many more)
+      # via the model files. So a minimal `pip install alembic ...`
+      # is fundamentally insufficient — the whole backend import
+      # graph has to resolve. Mirror the canonical pattern from
+      # qontinui-web's own backend-ci.yml: clone the public sibling
+      # repos, install via poetry. We skip qontinui-cloud-control
+      # (private, requires PAT) because the model layer doesn't
+      # import it; alembic should still load. We skip the optional
+      # `ml` poetry group (qontinui-train), keeping the install
+      # weight reasonable.
+      - name: Checkout sibling repos (qontinui-schemas, qontinui)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          git clone --depth 1 https://github.com/qontinui/qontinui.git
+        shell: bash
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install alembic dependencies
-        working-directory: qontinui-web/backend
+      - name: Install Poetry
         run: |
-          python -m pip install --upgrade pip
-          # `pgvector` is required because three migrations
-          # (05a366f58455_initial_schema_squashed.py,
-          # a84bf9dcb2dc_add_text_embedding_to_project_embeddings.py,
-          # b5c6d7e8f9a0_add_semantic_search_embeddings.py) do
-          # `from pgvector.sqlalchemy import Vector` at module
-          # import time. Without it, `alembic upgrade head` blows
-          # up with `ImportError` before the schema-diff step.
-          pip install alembic sqlalchemy psycopg2-binary pgvector python-dotenv
-          # `qontinui-schemas` is the path-dep declared in
-          # qontinui-web/backend/pyproject.toml as
-          # `qontinui-schemas = {path = "../../qontinui-schemas"}`.
-          # Backend models import it at module-load time, so the
-          # alembic env.py needs it on sys.path.
-          pip install ../../qontinui-schemas
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install backend dependencies (poetry, default groups only)
+        working-directory: qontinui-web/backend
+        run: poetry install --no-interaction --no-root
 
       - name: Apply alembic chain
         working-directory: qontinui-web/backend
         env:
           DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
-        run: alembic upgrade head
+        run: poetry run alembic upgrade head
 
       - name: Install Postgres client (for pg_dump)
         run: |
