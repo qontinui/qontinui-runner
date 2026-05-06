@@ -17,6 +17,7 @@ pub mod checks;
 pub mod chunk_labels;
 pub mod comparison;
 pub mod compensation;
+pub mod completion_reports;
 pub mod contradiction;
 pub mod coordinator_decisions;
 pub mod coordinator_leader;

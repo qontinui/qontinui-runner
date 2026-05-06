@@ -122,6 +122,26 @@ impl TerminalManager {
         self.sessions.lock().map(|s| s.len()).unwrap_or(0)
     }
 
+    /// Snapshot of `(session_id, Arc<TerminalSession>)` pairs for
+    /// callers that need to iterate every active session — e.g. the
+    /// cross-session grid search endpoint. Sorted by creation time
+    /// for stable output ordering.
+    pub fn sessions_snapshot(&self) -> Vec<(String, Arc<TerminalSession>)> {
+        let sessions = match self.sessions.lock() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Sessions lock poisoned: {}", e);
+                return Vec::new();
+            }
+        };
+        let mut pairs: Vec<(String, Arc<TerminalSession>)> = sessions
+            .iter()
+            .map(|(id, sess)| (id.clone(), sess.clone()))
+            .collect();
+        pairs.sort_by_key(|(_, sess)| sess.info().created_at);
+        pairs
+    }
+
     /// Close all terminal sessions. Called on app shutdown.
     pub fn close_all(&self) {
         let sessions: Vec<Arc<TerminalSession>> = {

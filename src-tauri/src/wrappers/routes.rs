@@ -32,6 +32,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::clients::{self, AiClientId, ClientError, ClientInfo};
 use super::credentials::CredentialStore;
 use super::dispatch::dispatch_handler;
 use super::install::{install, uninstall, update, InstallError, InstallRequest, InstallResponse};
@@ -39,7 +40,7 @@ use super::manager::WrapperStatus;
 use super::primary_proxy::{self, into_http as proxy_error_to_http};
 use super::registry::Wrapper;
 use super::WrapperState;
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{api_error, runner_api_port, ApiResponse, ApiState};
 
 /// Pull the wrapper subsystem off `ApiState` or 503 if not yet
 /// initialized. Centralized so every handler returns the same envelope.
@@ -76,6 +77,10 @@ pub fn router() -> Router<Arc<ApiState>> {
             "/wrappers/{id}/credentials/{name}",
             put(set_credential).delete(delete_credential),
         )
+        // AI client connect/disconnect
+        .route("/wrappers/clients", get(list_clients))
+        .route("/wrappers/clients/{id}/connect", post(connect_client))
+        .route("/wrappers/clients/{id}/disconnect", post(disconnect_client))
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +354,82 @@ async fn set_credential(
             Json(api_error(format!("failed to set credential: {}", e))),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// AI client handlers
+// ---------------------------------------------------------------------------
+
+fn parse_client_id(s: &str) -> Result<AiClientId, (StatusCode, Json<ApiResponse<()>>)> {
+    serde_json::from_value::<AiClientId>(serde_json::Value::String(s.to_string())).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("unknown AI client id: {}", s))),
+        )
+    })
+}
+
+fn client_error_to_http(e: ClientError) -> (StatusCode, Json<ApiResponse<()>>) {
+    let (status, msg) = match e {
+        ClientError::NotInstalled => (StatusCode::NOT_FOUND, "client is not installed".to_string()),
+        ClientError::ConfigParseFailed { ref path } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "Your config at {} has invalid JSON. Open it and fix it, or delete it to start fresh.",
+                path.display()
+            ),
+        ),
+        ClientError::LauncherMissing => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        ClientError::IoError { ref path, ref msg } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("I/O error for {}: {}", path.display(), msg),
+        ),
+    };
+    (status, Json(api_error(msg)))
+}
+
+async fn list_clients(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<ClientInfo>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let infos = primary_proxy::list_clients()
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success(infos)));
+    }
+    let port = runner_api_port(&state.app_state);
+    Ok(Json(ApiResponse::success(clients::detect_all(port))))
+}
+
+async fn connect_client(
+    State(state): State<Arc<ApiState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let id = parse_client_id(&id)?;
+    if primary_proxy::is_secondary() {
+        primary_proxy::connect_client(id)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success("connected")));
+    }
+    let port = runner_api_port(&state.app_state);
+    clients::connect(id, port).map_err(client_error_to_http)?;
+    Ok(Json(ApiResponse::success("connected")))
+}
+
+async fn disconnect_client(
+    State(_state): State<Arc<ApiState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let id = parse_client_id(&id)?;
+    if primary_proxy::is_secondary() {
+        primary_proxy::disconnect_client(id)
+            .await
+            .map_err(proxy_error_to_http)?;
+        return Ok(Json(ApiResponse::success("disconnected")));
+    }
+    clients::disconnect(id).map_err(client_error_to_http)?;
+    Ok(Json(ApiResponse::success("disconnected")))
 }
 
 async fn delete_credential(

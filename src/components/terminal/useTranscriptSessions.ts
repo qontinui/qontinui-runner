@@ -12,6 +12,16 @@ export interface TranscriptSession {
   first_message_preview: string | null;
   has_plans: boolean;
   display_name: string;
+  /**
+   * Optional `liveStatus` override populated only by the runner's
+   * debug-gated `/ui-bridge/test/inject-session` path
+   * (`mcp::test_fixtures` in qontinui-runner). Real on-disk transcripts
+   * omit the field entirely. When present, `useSessionManager` uses
+   * this value verbatim instead of computing live-status from
+   * tab/digest correlation, so SessionCard's `canPromote` / `canCommit`
+   * predicates can fire without a real PTY tab being open.
+   */
+  injected_live_status?: string | null;
 }
 
 export interface TranscriptMessage {

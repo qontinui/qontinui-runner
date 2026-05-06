@@ -10,18 +10,24 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::commands::AppState;
+use crate::database::pg::completion_reports::{CompletionReport, CompletionSource};
 use crate::database::pg::coordinator_decisions::CoordinatorDecisionRow;
+use crate::database::pg::coordinator_leader::CoordinatorLeaderRow;
 use crate::database::pg::plans::PlanRow;
 use crate::database::pg::productivity_knowledge::KnowledgeHit;
 use crate::database::pg::reviews::ReviewRow;
 use crate::database::pg::tasks::TaskRow;
 use crate::executor::upcoming_file_registry::UpcomingClaim;
+use crate::mcp::types::ApiState;
+use crate::terminal::TerminalManager;
 
 /// Detail payload for a single task — bundles the row plus
 /// upcoming-claim peers (other tasks claiming the same paths).
@@ -29,6 +35,11 @@ use crate::executor::upcoming_file_registry::UpcomingClaim;
 /// `latest_review_summary` is populated by Phase 3 when a `reviews` row
 /// exists for the task: it's a one-paragraph "verdict + confidence + top
 /// reason" digest. `worker_session_meta` remains `None` until Phase 5.
+///
+/// `completion_report` / `completion_source` / `has_assignment_brief_extras`
+/// are populated from `coord.tasks` directly (Phase 4 of the
+/// productivity-coordinator-completion-reports plan) so the TaskDetailPanel
+/// can render the structured handoff payload without a second round-trip.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDetail {
@@ -36,6 +47,16 @@ pub struct TaskDetail {
     pub claimers_by_path: HashMap<String, Vec<UpcomingClaim>>,
     pub latest_review_summary: Option<String>,
     pub worker_session_meta: Option<serde_json::Value>,
+    /// Structured completion report for this task, if one has been written.
+    /// `None` when `coord.tasks.completion_report` is null.
+    pub completion_report: Option<CompletionReport>,
+    /// Tag identifying the actor that produced the report. `None` when no
+    /// report exists.
+    pub completion_source: Option<CompletionSource>,
+    /// True when `coord.tasks.assignment_brief_extras` is non-null — the
+    /// briefing-preview panel uses this as a cheap gate before invoking
+    /// `preview_assignment_brief`.
+    pub has_assignment_brief_extras: bool,
 }
 
 /// Format a review row as a one-paragraph summary for `TaskDetail`'s
@@ -147,11 +168,37 @@ pub async fn get_task_detail(
         }
     };
 
+    // Pull the structured completion report (Phase 4) so the
+    // TaskDetailPanel can render it without a second Tauri round-trip.
+    // Failures here are non-fatal: log and treat as "no report".
+    let (completion_report, completion_source) =
+        match app_state.pg_db.get_completion_report(&task_id).await {
+            Ok(Some((report, source))) => (Some(report), Some(source)),
+            Ok(None) => (None, None),
+            Err(e) => {
+                warn!("get_task_detail: get_completion_report failed: {}", e);
+                (None, None)
+            }
+        };
+
+    let has_assignment_brief_extras =
+        match app_state.pg_db.get_assignment_brief_extras(&task_id).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                warn!("get_task_detail: get_assignment_brief_extras failed: {}", e);
+                false
+            }
+        };
+
     Ok(Some(TaskDetail {
         task,
         claimers_by_path,
         latest_review_summary,
         worker_session_meta: None,
+        completion_report,
+        completion_source,
+        has_assignment_brief_extras,
     }))
 }
 
@@ -369,11 +416,12 @@ pub async fn approve_recommendation(
                     review.task_id, e
                 );
             }
-            let payload = serde_json::json!({
-                "reviewId": review.id,
-                "taskId": review.task_id,
-                "userDecision": "approved",
-            });
+            let payload =
+                qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
+                    review_id: review.id,
+                    task_id: review.task_id,
+                    user_decision: "approved".to_string(),
+                };
             if let Err(e) = app_handle.emit("review-approved", &payload) {
                 warn!("approve_recommendation: emit failed: {}", e);
             }
@@ -399,11 +447,12 @@ pub async fn reject_recommendation(
 
     if updated {
         if let Some(review) = app_state.pg_db.get_review_by_id(&review_id).await? {
-            let payload = serde_json::json!({
-                "reviewId": review.id,
-                "taskId": review.task_id,
-                "userDecision": "rejected",
-            });
+            let payload =
+                qontinui_runner_lib::tauri_event_payloads::RecommendationReviewDecisionPayload {
+                    review_id: review.id,
+                    task_id: review.task_id,
+                    user_decision: "rejected".to_string(),
+                };
             if let Err(e) = app_handle.emit("review-rejected", &payload) {
                 warn!("reject_recommendation: emit failed: {}", e);
             }
@@ -461,4 +510,873 @@ pub async fn acknowledge_advisory(
         .pg_db
         .resolve_coordinator_decision(&decision_id, "acknowledged")
         .await
+}
+
+// ============================================================================
+// Coordinator launch controls — Phases 1 & 2
+// ============================================================================
+
+/// Snapshot of the coordinator-leader lease + a discriminator the dashboard
+/// uses to colour the status pill.
+///
+/// `lease_status` rules (computed against `chrono::Utc::now()`):
+/// - `"active"`: `leased_until > NOW()` AND `renewed_at` within last 90s
+/// - `"stale"`:  `leased_until > NOW()` but `renewed_at` older than 90s
+/// - `"vacant"`: no leader row OR `leased_until <= NOW()`
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaderResponse {
+    pub leader: Option<CoordinatorLeaderRow>,
+    /// One of `"active" | "stale" | "vacant"`.
+    pub lease_status: String,
+}
+
+/// Result returned by [`launch_coordinator_session`] / [`spawn_worker_session`].
+///
+/// - `terminal_id` is `Some(id)` only for the legacy `claude_skill` mode
+///   (and for `spawn_worker_session`), where a pty was opened — the
+///   frontend uses it to focus the new tab. For `mode: "rust"` (the
+///   default Phase 1.5 path) the scheduler runs in-process so there is
+///   no terminal to focus and the field is `None`.
+/// - `mode` echoes back which path ran ("rust" | "claude_skill" |
+///   "worker") so the frontend can branch its post-launch UX (reveal
+///   terminal tab vs. just refresh the lease pill).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchResult {
+    pub mode: String,
+    pub terminal_id: Option<String>,
+}
+
+/// Compute the `lease_status` discriminator for a `CoordinatorLeaderRow`.
+/// `leased_until` and `renewed_at` come back from PG as text via `::text`
+/// cast on `TIMESTAMPTZ`. PG's text format is `YYYY-MM-DD HH:MM:SS.ffffff+00`
+/// — note the SPACE separator (not `T`) and the trailing `+NN` offset
+/// (not RFC3339's `+NN:NN`). Parse both shapes so the dashboard pill works
+/// regardless of which serialiser fed the row.
+pub(crate) fn compute_lease_status_for_http(leader: &Option<CoordinatorLeaderRow>) -> String {
+    compute_lease_status(leader)
+}
+
+/// Parse a PG-style timestamptz text representation into UTC.
+/// Accepts both:
+/// - `2026-05-03 18:01:08.681561+00` (PG ::text cast — space, no-colon offset)
+/// - `2026-05-03T18:01:08.681561+00:00` (strict RFC3339)
+fn parse_pg_timestamptz(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // PG's ::text cast: `YYYY-MM-DD HH:MM:SS[.fff]+NN` (NN may be 1 or 2
+    // digits, no colon). The `%#z` specifier accepts colon-less and
+    // colon-bearing offsets; `%.f` accepts optional fractional seconds.
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z") {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // Fallback: replace first space with T and try strict RFC3339 again
+    // (handles older driver versions that emit colon-less offsets without
+    // fractional seconds).
+    if let Some(idx) = s.find(' ') {
+        let mut rfc = String::with_capacity(s.len() + 1);
+        rfc.push_str(&s[..idx]);
+        rfc.push('T');
+        rfc.push_str(&s[idx + 1..]);
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&rfc) {
+            return Some(dt.with_timezone(&chrono::Utc));
+        }
+    }
+    None
+}
+
+fn compute_lease_status(leader: &Option<CoordinatorLeaderRow>) -> String {
+    let Some(row) = leader.as_ref() else {
+        return "vacant".to_string();
+    };
+    let now = chrono::Utc::now();
+
+    let leased_until = match parse_pg_timestamptz(&row.leased_until) {
+        Some(dt) => dt,
+        None => return "vacant".to_string(),
+    };
+    if leased_until <= now {
+        return "vacant".to_string();
+    }
+
+    let renewed_at = match parse_pg_timestamptz(&row.renewed_at) {
+        Some(dt) => dt,
+        None => return "stale".to_string(),
+    };
+    let age = now.signed_duration_since(renewed_at);
+    if age <= chrono::Duration::seconds(90) {
+        "active".to_string()
+    } else {
+        "stale".to_string()
+    }
+}
+
+#[cfg(test)]
+mod lease_status_tests {
+    use super::*;
+    use crate::database::pg::coordinator_leader::CoordinatorLeaderRow;
+
+    fn row(leased_until: &str, renewed_at: &str) -> Option<CoordinatorLeaderRow> {
+        Some(CoordinatorLeaderRow {
+            instance_id: "rust-test".to_string(),
+            leased_until: leased_until.to_string(),
+            acquired_at: "2026-05-03 17:59:43.892179+00".to_string(),
+            renewed_at: renewed_at.to_string(),
+        })
+    }
+
+    #[test]
+    fn parses_pg_text_format_with_fractional_seconds() {
+        let dt = parse_pg_timestamptz("2026-05-03 18:01:08.681561+00")
+            .expect("PG text format with fractional + colon-less offset must parse");
+        assert_eq!(dt.timestamp(), 1777831268);
+    }
+
+    #[test]
+    fn parses_strict_rfc3339() {
+        let dt = parse_pg_timestamptz("2026-05-03T18:01:08.681561+00:00")
+            .expect("RFC3339 strict must still parse");
+        assert_eq!(dt.timestamp(), 1777831268);
+    }
+
+    #[test]
+    fn parses_pg_text_without_fractional() {
+        let dt = parse_pg_timestamptz("2026-05-03 18:01:08+00")
+            .expect("PG text without fractional must parse");
+        assert_eq!(dt.timestamp(), 1777831268);
+    }
+
+    #[test]
+    fn vacant_when_leader_none() {
+        assert_eq!(compute_lease_status(&None), "vacant");
+    }
+
+    #[test]
+    fn vacant_when_lease_expired() {
+        let r = row("2020-01-01 00:00:00+00", "2020-01-01 00:00:00+00");
+        assert_eq!(compute_lease_status(&r), "vacant");
+    }
+
+    #[test]
+    fn active_when_lease_fresh_and_recently_renewed() {
+        let now = chrono::Utc::now();
+        let until = (now + chrono::Duration::seconds(60))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let renewed = now.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string();
+        let r = row(&until, &renewed);
+        assert_eq!(compute_lease_status(&r), "active");
+    }
+
+    #[test]
+    fn stale_when_lease_fresh_but_renew_old() {
+        let now = chrono::Utc::now();
+        let until = (now + chrono::Duration::seconds(60))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let renewed = (now - chrono::Duration::seconds(120))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let r = row(&until, &renewed);
+        assert_eq!(compute_lease_status(&r), "stale");
+    }
+}
+
+/// Read the current coordinator-leader lease + computed status. Drives the
+/// dashboard's "Coordinator: active/stale/vacant" status pill and the
+/// enabled-state of the Start/Force-takeover button.
+#[tauri::command]
+pub async fn get_coordinator_leader(
+    app_handle: tauri::AppHandle,
+) -> Result<LeaderResponse, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let leader = app_state.pg_db.current_coordinator_leader().await?;
+    let lease_status = compute_lease_status(&leader);
+    Ok(LeaderResponse {
+        leader,
+        lease_status,
+    })
+}
+
+/// Resolve `<workspace_root>/qontinui-runner` for use as the working dir
+/// of the spawned terminal. Falls back to whatever
+/// `current_project_path()` returns, since the terminal manager itself
+/// also defaults there.
+fn resolve_runner_repo_path() -> Option<String> {
+    let workspace_root = crate::mcp::shared::current_project_path()?;
+    let repo = std::path::Path::new(&workspace_root).join("qontinui-runner");
+    if repo.is_dir() {
+        Some(repo.to_string_lossy().to_string())
+    } else {
+        // Fallback: workspace root itself (terminal manager handles missing).
+        Some(workspace_root)
+    }
+}
+
+/// Build the wiring prompt the user would otherwise type by hand and
+/// stage it on disk. Returns a single-line shell invocation that feeds
+/// the prompt to `claude` via `Get-Content -Raw`.
+///
+/// Why temp-file + Get-Content rather than `cd <path> && claude "<prompt>"`:
+/// 1. PowerShell 5.1 (the default Windows shell the pty inherits) does
+///    NOT support `&&` as a chain operator — `cd ... && claude ...`
+///    raises `The token '&&' is not a valid statement separator`.
+/// 2. Multi-line prompts written into a pty are interpreted line-by-line
+///    by PSReadLine; embedded `\n` characters break out of the quoted
+///    arg and PowerShell tries to execute the prompt body as commands.
+/// Bundling the prompt into a temp file sidesteps both — the pty sees
+/// one short line that PowerShell parses cleanly, and `cd` is unneeded
+/// because `TerminalManager::create` already starts the pty in
+/// `working_dir = Some(repo_path)`.
+fn build_coordinator_initial_command(
+    runner_port: u16,
+    plan_path: Option<&str>,
+) -> Result<String, String> {
+    let plan_line = match plan_path {
+        Some(p) if !p.is_empty() => format!("\nPlan to schedule: {}", p),
+        _ => String::new(),
+    };
+    let prompt = format!(
+        "/coordinate\n\nCoordinate against THIS runner (port {port}, not 9876). \
+All HTTP calls in your observe->decide->act loop must hit \
+http://localhost:{port}/coordinator/state and /coordinator/act.{plan_line}\n",
+        port = runner_port,
+        plan_line = plan_line,
+    );
+
+    let dir = std::env::temp_dir().join("qontinui-launch-prompts");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create launch-prompt dir: {}", e))?;
+    let file_name = format!("coordinator-{}.md", uuid::Uuid::new_v4());
+    let path = dir.join(file_name);
+    std::fs::write(&path, &prompt)
+        .map_err(|e| format!("Failed to write launch-prompt file: {}", e))?;
+
+    // PowerShell single-quoted strings don't expand variables and don't
+    // interpret backslash escapes — safest quoting for a Windows path.
+    // Double any literal single quotes per PS escape rules (rare on
+    // temp paths but cheap defense).
+    let escaped_path = path.to_string_lossy().replace('\'', "''");
+    // --dangerously-skip-permissions is required for the Coordinator to
+    // run its observe→decide→act loop autonomously. The /coordinate
+    // skill is a trusted built-in role (see qontinui-claude-config/
+    // .claude/commands/coordinate.md): cheap rules cover most cases,
+    // destructive actions (kill-session, force-promote-to-worktree)
+    // are server-enforced as advisory regardless of the agent's claim
+    // (mcp/coordinator.rs::must_advise_only). Per the project CLAUDE.md
+    // the flag now bypasses prompts for writes to .claude/, .git/, etc.
+    Ok(format!(
+        "claude --dangerously-skip-permissions (Get-Content -Raw '{}')",
+        escaped_path
+    ))
+}
+
+/// Auto-numbered "Worker N" title — finds the highest existing N across
+/// open terminals matching `^Worker (\d+)$` and returns `Worker (N+1)`.
+fn next_worker_title(manager: &TerminalManager) -> String {
+    let mut max_n: u32 = 0;
+    for info in manager.list() {
+        let title = info.title.trim();
+        if let Some(rest) = title.strip_prefix("Worker ") {
+            if let Ok(n) = rest.trim().parse::<u32>() {
+                if n > max_n {
+                    max_n = n;
+                }
+            }
+        }
+    }
+    format!("Worker {}", max_n + 1)
+}
+
+/// Spawn the post-init shell-line write that `terminal_create` doesn't
+/// do for us when invoked via Tauri (the HTTP path at
+/// `mcp/terminals.rs:115-126` does this; we replicate it here so the
+/// dashboard's launch buttons get the same behaviour).
+fn schedule_initial_command(
+    manager: Arc<TerminalManager>,
+    terminal_id: String,
+    initial_command: String,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Some(session) = manager.get(&terminal_id) {
+            let line = format!("{}\r\n", initial_command);
+            if let Err(e) = session.write(line.as_bytes()) {
+                warn!(
+                    "launch session: failed to write initial command to {}: {}",
+                    terminal_id, e
+                );
+            }
+        } else {
+            warn!(
+                "launch session: terminal {} vanished before initial command write",
+                terminal_id
+            );
+        }
+    });
+}
+
+/// Start the coordinator. Two modes:
+///
+/// - `mode = "rust"` (default, Phase 1.5): flips the in-process Rust
+///   scheduler's runtime-toggle flag to `true`. The scheduler task is
+///   already running (started at boot in `mcp_api.rs`) — flipping the
+///   flag makes its next tick acquire the lease and execute. No pty,
+///   no Claude CLI dependency, no terminal tab. Returns
+///   `terminal_id: None`.
+///
+/// - `mode = "claude_skill"`: spawns a fresh "Coordinator" terminal tab
+///   running `claude "/coordinate ..."` with the runner port
+///   pre-injected. Joshua's debug path — keeps working unchanged for
+///   his personal setup. Returns the terminal id so the frontend can
+///   focus the new tab.
+///
+/// Defends against double-launch by checking the leader lease first —
+/// refuses when an existing lease is `active`. Stale and vacant leases
+/// proceed.
+#[tauri::command]
+pub async fn launch_coordinator_session(
+    app_handle: tauri::AppHandle,
+    mode: Option<String>,
+    plan_path: Option<String>,
+    title_hint: Option<String>,
+) -> Result<LaunchResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let mode = mode.unwrap_or_else(|| "rust".to_string());
+
+    // Reject unknown modes early — keeps the surface small and surfaces
+    // typos in callers/tests immediately.
+    if mode != "rust" && mode != "claude_skill" {
+        return Err(format!(
+            "Unknown coordinator mode {:?} (expected 'rust' or 'claude_skill')",
+            mode
+        ));
+    }
+
+    // Single-coordinator enforcement (defense-in-depth — frontend disables
+    // the button anyway when status == "active"). Stale leases proceed —
+    // the takeover happens transparently when the new Coordinator's
+    // try_acquire_coordinator_lease fires.
+    let leader = app_state.pg_db.current_coordinator_leader().await?;
+    let status = compute_lease_status(&leader);
+    if status == "active" {
+        let id = leader
+            .as_ref()
+            .map(|l| l.instance_id.as_str())
+            .unwrap_or("unknown");
+        return Err(format!("Coordinator already running (instance {})", id));
+    }
+
+    if mode == "rust" {
+        // Phase 1.5 path: flip the in-process scheduler's flag. The
+        // scheduler task is started at boot in `mcp_api.rs` and stashed
+        // its `CoordinatorSchedulerHandle` in Tauri-managed state.
+        let handle = app_handle
+            .try_state::<crate::coordinator::CoordinatorSchedulerHandle>()
+            .ok_or_else(|| {
+                "Coordinator scheduler handle not initialised — runner started without scheduler"
+                    .to_string()
+            })?
+            .inner()
+            .clone();
+        let prev = handle.set_enabled(true);
+        tracing::info!(
+            "launch_coordinator_session(mode=rust): rust_scheduler_enabled flipped {}→true",
+            prev
+        );
+        return Ok(LaunchResult {
+            mode,
+            terminal_id: None,
+        });
+    }
+
+    // mode == "claude_skill": legacy pty-spawn path.
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+    let repo_path = resolve_runner_repo_path()
+        .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
+    let initial_command = build_coordinator_initial_command(runner_port, plan_path.as_deref())?;
+    let title = title_hint.unwrap_or_else(|| "Coordinator".to_string());
+
+    let terminal_manager = app_handle
+        .try_state::<Arc<TerminalManager>>()
+        .ok_or_else(|| "TerminalManager not initialised".to_string())?
+        .inner()
+        .clone();
+
+    let info = terminal_manager.create(
+        Some(title),
+        Some(repo_path),
+        None,
+        None,
+        None,
+        app_handle.clone(),
+    )?;
+
+    schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
+
+    Ok(LaunchResult {
+        mode,
+        terminal_id: Some(info.id),
+    })
+}
+
+/// Stop the in-process Rust coordinator scheduler — Phase 1.5 sibling of
+/// [`launch_coordinator_session`] for `mode = "rust"`. Flips the
+/// runtime-toggle flag back to `false`; the next tick observes the flag
+/// and short-circuits without acquiring the lease. Returns the previous
+/// value of the flag so the frontend can detect no-op stops.
+///
+/// Has no effect on `claude_skill`-mode pty sessions — those are user-
+/// owned terminal tabs and the user closes them via the terminal UI.
+#[tauri::command]
+pub async fn stop_coordinator_session(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let handle = app_handle
+        .try_state::<crate::coordinator::CoordinatorSchedulerHandle>()
+        .ok_or_else(|| {
+            "Coordinator scheduler handle not initialised — runner started without scheduler"
+                .to_string()
+        })?
+        .inner()
+        .clone();
+    let prev = handle.set_enabled(false);
+    tracing::info!(
+        "stop_coordinator_session: rust_scheduler_enabled flipped {}→false",
+        prev
+    );
+    Ok(prev)
+}
+
+/// Spawn a fresh "Worker N" terminal tab running plain `claude` (no slash
+/// command). Workers sit idle at the prompt until the Coordinator
+/// dispatches an `assign-task` action.
+#[tauri::command]
+pub async fn spawn_worker_session(
+    app_handle: tauri::AppHandle,
+    title_hint: Option<String>,
+) -> Result<LaunchResult, String> {
+    let _app_state = require_app_state(&app_handle)?;
+
+    let repo_path = resolve_runner_repo_path()
+        .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
+
+    let terminal_manager = app_handle
+        .try_state::<Arc<TerminalManager>>()
+        .ok_or_else(|| "TerminalManager not initialised".to_string())?
+        .inner()
+        .clone();
+
+    let title = title_hint.unwrap_or_else(|| next_worker_title(&terminal_manager));
+    // PowerShell 5.1 doesn't accept `&&`, and the pty already starts
+    // with `working_dir = Some(repo_path)` — no `cd` needed. Worker tabs
+    // sit idle at the Claude prompt; Coordinator dispatches via
+    // assign-task → POST /sessions/<id>/message. The
+    // --dangerously-skip-permissions flag lets the worker run the
+    // dispatched task without per-tool approval prompts (matches the
+    // Coordinator's flag for the same reason).
+    let initial_command = "claude --dangerously-skip-permissions".to_string();
+
+    let info = terminal_manager.create(
+        Some(title),
+        Some(repo_path),
+        None,
+        None,
+        None,
+        app_handle.clone(),
+    )?;
+
+    schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
+
+    Ok(LaunchResult {
+        mode: "worker".to_string(),
+        terminal_id: Some(info.id),
+    })
+}
+
+// ============================================================================
+// Decompose Plan — Phase 3 (in-product replacement for /decompose-plan)
+// ============================================================================
+//
+// Promotes the personal `qontinui-claude-config/.claude/commands/decompose-
+// plan.md` slash command to a Tauri command so any qontinui user can run
+// it from the UI without depending on the Claude CLI. Underlying
+// implementation lives at `crate::productivity::decompose`.
+
+/// Hint surfaced in the UI when the active LLM provider is unconfigured.
+/// Same string for `Disabled` and `NoCredentials` — both flow through the
+/// same Settings -> AI affordance.
+const DECOMPOSE_PROVIDER_HINT: &str =
+    "Configure an LLM provider in Settings → AI to use Decompose Plan.";
+
+/// Decompose a plan markdown into a structured task graph + populate the
+/// upcoming-file claim registry. Wraps the in-process `OneshotLlm` call
+/// followed by a loopback POST to `/plans/decompose`.
+///
+/// Returns a structured payload with `planId` + `taskCount` so the UI can
+/// render a success toast. On `OneshotError::Disabled` /
+/// `OneshotError::NoCredentials`, returns the error string
+/// [`DECOMPOSE_PROVIDER_HINT`] so the modal can show the affordance + a
+/// link to Settings.
+#[tauri::command]
+pub async fn decompose_plan(
+    app_handle: tauri::AppHandle,
+    plan_path: String,
+) -> Result<crate::productivity::decompose::DecomposeResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+
+    let llm = crate::ai_provider::oneshot::oneshot_for_settings();
+
+    crate::productivity::decompose::decompose_plan_in_product(
+        &pg,
+        llm.as_ref(),
+        &plan_path,
+        runner_port,
+    )
+    .await
+    .map_err(|e| match e {
+        crate::productivity::decompose::DecomposeError::LlmDisabled
+        | crate::productivity::decompose::DecomposeError::LlmNoCredentials => {
+            DECOMPOSE_PROVIDER_HINT.to_string()
+        }
+        other => other.to_string(),
+    })
+}
+
+// ============================================================================
+// Auto-Review — Phase 4 (in-product replacement for /auto-review)
+// ============================================================================
+//
+// Manual trigger for `productivity::review::auto_review_in_product`. The
+// scheduler also fires reviews automatically on task completion (see
+// `coordinator/scheduler.rs`); this Tauri command is for the per-row "Review
+// now" button next to ReviewBadge on the Productivity tab and the terminal
+// tab bar.
+
+/// Hint surfaced in the UI when the active LLM provider is unconfigured.
+/// Mirrors `DECOMPOSE_PROVIDER_HINT` so the modal can render a single
+/// "configure LLM" affordance in either flow.
+const REVIEW_PROVIDER_HINT: &str =
+    "LLM provider not configured; review queued as 'user must verify' — go to Settings → AI to enable auto-review.";
+
+/// Stable identifier the manual-trigger path uses as the reviewer's
+/// `reviewer_session_id`. We don't have a real second session here (the
+/// review is being fired from the dashboard, not from another worker), so
+/// we hardcode an in-product identity. This passes the `/reviews` self-
+/// review check as long as no worker has the same id.
+const RUST_AUTO_REVIEWER_ID: &str = "rust-auto-reviewer";
+
+/// Run an auto-review against `task_id` and persist the verdict.
+///
+/// On `OneshotError::Disabled` / `OneshotError::NoCredentials`, inserts a
+/// stub `escalate / confidence=0` review row so the dashboard surfaces it,
+/// and returns [`REVIEW_PROVIDER_HINT`] as the error string. The frontend
+/// distinguishes "queued for user" from a real failure by the prefix
+/// `"LLM provider not configured"`.
+#[tauri::command]
+pub async fn auto_review_task(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+) -> Result<crate::productivity::review::ReviewResult, String> {
+    // P2 follow-up from productivity-coordinator-completion-reports plan
+    // §7 Phase 1: validate task_id is a UUID before passing to PG. Avoids
+    // the "raw error serializing parameter 0" log path that bites every
+    // PG-backed Tauri command taking `task_id: String`.
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+    let llm = crate::ai_provider::oneshot::oneshot_for_settings();
+
+    let result = crate::productivity::review::auto_review_in_product(
+        &pg,
+        llm.as_ref(),
+        runner_port,
+        &task_id,
+        RUST_AUTO_REVIEWER_ID,
+    )
+    .await;
+
+    match result {
+        Ok(r) => {
+            // Best-effort: emit `review-completed` so the dashboard /
+            // ReviewBadge picks it up without polling. The pg insert path
+            // doesn't emit (the HTTP route does); we add the emit here so
+            // the manual-trigger UX matches the slash-command POST path.
+            let _ = app_handle.emit(
+                "review-completed",
+                serde_json::json!({
+                    "id": r.review_id,
+                    "taskId": task_id,
+                    "reviewerSessionId": RUST_AUTO_REVIEWER_ID,
+                    "verdict": r.verdict,
+                    "confidence": r.confidence,
+                }),
+            );
+            Ok(r)
+        }
+        Err(crate::productivity::review::ReviewError::LlmDisabled(_)) => {
+            // Queue a stub row so the dashboard reflects "user must verify"
+            // — same UX as the DECOMPOSE flow's "no provider" path.
+            let task = pg
+                .get_task_by_id(&task_id)
+                .await
+                .map_err(|e| format!("get_task_by_id failed: {}", e))?
+                .ok_or_else(|| format!("task {} not found", task_id))?;
+            let reviewed_session_id = task.assigned_session_id.clone().ok_or_else(|| {
+                format!(
+                    "task {} has no assigned worker session — cannot queue stub review",
+                    task_id
+                )
+            })?;
+            // Skip the stub-row insert if the only candidate reviewer is
+            // the worker itself — the SelfReview check would 409 anyway.
+            if reviewed_session_id == RUST_AUTO_REVIEWER_ID {
+                return Err(REVIEW_PROVIDER_HINT.to_string());
+            }
+            match crate::productivity::review::insert_disabled_stub_review(
+                &pg,
+                &task_id,
+                RUST_AUTO_REVIEWER_ID,
+                &reviewed_session_id,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        "auto_review_task: stub-row insert failed for {}: {}",
+                        task_id, e
+                    );
+                }
+            }
+            Err(REVIEW_PROVIDER_HINT.to_string())
+        }
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+// ============================================================================
+// Summarize / Rewind Session — Phase 5 (in-product replacements for
+// /summarize-session and /rewind-session)
+// ============================================================================
+//
+// Promotes the personal `qontinui-claude-config/.claude/commands/
+// {summarize,rewind}-session.md` slash commands to Tauri commands so any
+// qontinui user can run them from the UI without depending on the Claude
+// CLI. Underlying implementations live at
+// `crate::productivity::{summarize, rewind}`.
+
+/// Summarize a finished AI session: extract learnings via the configured
+/// `OneshotLlm` and persist them to `productivity_knowledge`. The slash
+/// command's §1 verdict-driven Outcome-tag rule is enforced server-side
+/// via the system prompt (see `productivity::summarize`).
+///
+/// On `OneshotError::Disabled` / `OneshotError::NoCredentials`, falls
+/// back to inserting a single placeholder knowledge row (`area="other"`,
+/// `body="LLM provider not configured; manual summary required."`) so
+/// the user has a UI affordance and the session still surfaces in the
+/// knowledge browser.
+#[tauri::command]
+pub async fn summarize_session(
+    app_handle: tauri::AppHandle,
+    task_run_id: String,
+) -> Result<crate::productivity::summarize::SummarizeResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+
+    let llm = crate::ai_provider::oneshot::oneshot_for_settings();
+
+    match crate::productivity::summarize::summarize_session_in_product(
+        &pg,
+        llm.as_ref(),
+        runner_port,
+        &task_run_id,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(crate::productivity::summarize::SummarizeError::LlmDisabled)
+        | Err(crate::productivity::summarize::SummarizeError::LlmNoCredentials) => {
+            // No LLM provider configured — write a single placeholder
+            // knowledge row so the user sees the session in the
+            // knowledge browser with a "manual summary required" hint.
+            crate::productivity::summarize::write_placeholder_summary(runner_port, &task_run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// Rewind a failed AI session: restore the pre-edit file snapshots, kill
+/// the failed worker, and (by default) spawn a replacement with
+/// failure-context prepended. `no_replay = Some(true)` flips this to
+/// "revert + leave tab empty for manual re-prompt" per the slash
+/// command's `--no-replay` flag.
+///
+/// File-restore + kill are LLM-independent so a disabled provider
+/// doesn't break them; the summarize step (which builds the
+/// failure-context block) silently skips when no LLM is configured.
+#[tauri::command]
+pub async fn rewind_session(
+    app_handle: tauri::AppHandle,
+    task_run_id: String,
+    no_replay: Option<bool>,
+) -> Result<crate::productivity::rewind::RewindResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+    let runner_port = crate::mcp::types::runner_api_port(&app_state);
+
+    let llm = crate::ai_provider::oneshot::oneshot_for_settings();
+
+    let options = crate::productivity::rewind::RewindOptions {
+        replay: !no_replay.unwrap_or(false),
+    };
+
+    crate::productivity::rewind::rewind_session_in_product(
+        &pg,
+        llm.as_ref(),
+        runner_port,
+        &task_run_id,
+        options,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Completion reports (Phase 1 of
+// productivity-coordinator-completion-reports.md §3 / §7)
+// ============================================================================
+
+/// Resolve `Arc<ApiState>` from the Tauri app handle so completion-report
+/// helpers that need `app_handle.emit` and `SessionManager` access can run
+/// from a `#[tauri::command]` body. Returns a 'string-typed' error on
+/// failure for parity with existing `require_app_state`.
+fn require_api_state(app_handle: &tauri::AppHandle) -> Result<Arc<ApiState>, String> {
+    match app_handle.try_state::<Arc<ApiState>>() {
+        Some(s) => Ok(s.inner().clone()),
+        None => Err(
+            "ApiState is not yet initialised — submit_task_completion_report \
+             requires the HTTP API server to be running"
+                .to_string(),
+        ),
+    }
+}
+
+/// Worker / dashboard self-attestation Tauri mirror of
+/// `POST /tasks/{id}/report`. The frontend can call this directly so it
+/// doesn't have to round-trip through the local HTTP server.
+#[tauri::command]
+pub async fn submit_task_completion_report(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+    report: CompletionReport,
+) -> Result<TaskRow, String> {
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+
+    pg.write_completion_report(&task_id, &report, CompletionSource::SessionSelfReport)
+        .await?;
+
+    if let Err(e) = app_handle.emit(
+        "completion-report-written",
+        serde_json::json!({
+            "taskId": task_id,
+            "source": CompletionSource::SessionSelfReport.as_str(),
+        }),
+    ) {
+        warn!("emit completion-report-written failed: {}", e);
+    }
+
+    pg.get_task_by_id(&task_id)
+        .await?
+        .ok_or_else(|| format!("task {} disappeared after write", task_id))
+}
+
+/// Read the structured completion report (and source tag) for a task.
+#[tauri::command]
+pub async fn get_task_completion_report(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+) -> Result<Option<(CompletionReport, CompletionSource)>, String> {
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+    let app_state = require_app_state(&app_handle)?;
+    app_state.pg_db.get_completion_report(&task_id).await
+}
+
+/// Server-side preview of the assignment brief that Rule B would inject
+/// into the worker's first message for this task. Calls
+/// `coordinator::act::build_assignment_brief` so the rendered Markdown is,
+/// by construction, identical to what the worker will see when the task
+/// is assigned.
+///
+/// Returns an empty string when the task has no `assignment_brief_extras`
+/// AND no `WORKER_ADDED_DEPENDENCY` audit row — i.e. no brief would be
+/// composed (fresh, no-deps assignment). The dashboard renders nothing in
+/// that case.
+#[tauri::command]
+pub async fn preview_assignment_brief(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+) -> Result<String, String> {
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+
+    let api_state = require_api_state(&app_handle)?;
+
+    // Cheap pre-check: if there are no upstreams stashed AND no audit row,
+    // there's nothing to render. `build_assignment_brief` would fall through
+    // to `task.description`-only, which the dashboard already shows in the
+    // task detail header — surfacing it in the brief panel just duplicates.
+    let pg = &api_state.app_state.pg_db;
+    let has_extras = pg
+        .get_assignment_brief_extras(&task_id)
+        .await
+        .map(|o| o.is_some())
+        .unwrap_or(false);
+    let has_audit = pg
+        .latest_worker_added_dependency_for_task(&task_id)
+        .await
+        .map(|o| o.is_some())
+        .unwrap_or(false);
+    if !has_extras && !has_audit {
+        return Ok(String::new());
+    }
+
+    crate::coordinator::act::build_assignment_brief(&api_state, &task_id).await
+}
+
+/// Worker-declared emergent dependency Tauri mirror of
+/// `POST /tasks/{id}/add-dependency`. Shares the
+/// `mcp::completion_reports::add_dependency_inner` business logic with the
+/// HTTP handler. From the desktop UI there is no calling-session ownership
+/// to enforce; pass `None` to skip the check.
+#[tauri::command]
+pub async fn add_task_dependency(
+    app_handle: tauri::AppHandle,
+    task_id: String,
+    upstream_task_id: String,
+    reason: String,
+) -> Result<TaskRow, String> {
+    Uuid::parse_str(&task_id).map_err(|e| format!("invalid task_id uuid: {e}"))?;
+    Uuid::parse_str(&upstream_task_id)
+        .map_err(|e| format!("invalid upstream_task_id uuid: {e}"))?;
+
+    let api_state = require_api_state(&app_handle)?;
+    crate::mcp::completion_reports::add_dependency_inner(
+        &api_state,
+        &task_id,
+        &upstream_task_id,
+        &reason,
+        None,
+    )
+    .await
+    .map_err(|(_, msg)| msg)
 }

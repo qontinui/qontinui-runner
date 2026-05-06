@@ -217,6 +217,13 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: true,
     },
     ProxyableCommand {
+        name: "get_oneshot_stats",
+        description: "Process-local counters for `OneshotLlm` adapter calls (Phase 0 of productivity-stack-product-readiness). Resets on runner restart. Backs the sibling tile on `ScriptedOutputPanel`.",
+        args_schema: "{}",
+        response_schema: "{ \"callsTotal\": { [provider: string]: number }, \"errorsTotal\": { [kind: string]: number }, \"cacheHitsTotal\": { [provider: string]: number }, \"cacheReadTokens\": number, \"cacheCreationTokens\": number, \"totalTokensIn\": number, \"totalTokensOut\": number }",
+        probe_with_empty_args: true,
+    },
+    ProxyableCommand {
         name: "get_scripted_output_settings",
         description: "Read the persisted `ScriptedOutputSettings` (provider mode, model override, Gemma local endpoint, Gemma model alias, kill switch). Used by the provider-selection panel on the LLM Analytics tab to render form state.",
         args_schema: "{}",
@@ -296,6 +303,34 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}"#,
         response_schema: r#"{"type":"null"}"#,
         // Required `path` arg; empty-args probe would error.
+        probe_with_empty_args: false,
+    },
+    // Productivity Stack — Phase 3 (in-product /decompose-plan replacement).
+    ProxyableCommand {
+        name: "decompose_plan",
+        description: "Decompose a plan markdown into a structured task graph + populate the upcoming-file claim registry. Reads the plan, computes a SHA-256 hash for idempotency, asks the active LLM provider to identify phases/tasks/claims/dependencies, then POSTs the structured payload to /plans/decompose. Returns `{ planId, taskCount, versionHash, idempotentSkip, stamped }`. When no LLM provider is configured, returns the error string \"Configure an LLM provider in Settings → AI to use Decompose Plan.\" so the calling modal can show the affordance.",
+        args_schema: r#"{"type":"object","required":["planPath"],"properties":{"planPath":{"type":"string"}}}"#,
+        response_schema: r#"{"type":"object","required":["planId","taskCount","versionHash","idempotentSkip","stamped"],"properties":{"planId":{"type":"string"},"taskCount":{"type":"integer"},"versionHash":{"type":"string"},"idempotentSkip":{"type":"boolean"},"stamped":{"type":"boolean"}}}"#,
+        // Required `planPath` arg; empty-args probe would always fail.
+        probe_with_empty_args: false,
+    },
+    // Productivity Stack — Phase 5 (in-product /summarize-session and /rewind-session replacements).
+    ProxyableCommand {
+        name: "summarize_session",
+        description: "Summarize a finished AI session: extract learnings via the configured `OneshotLlm` and persist them to `productivity_knowledge`. Encodes the slash command's verdict-driven Outcome-tag rule (failed-attempt sessions get `## Outcome: APPROACH FAILED — do not retry without addressing X` prepended to each learning body). When no LLM provider is configured, falls back to inserting a single placeholder knowledge row with `area=\"other\"` and `body=\"LLM provider not configured; manual summary required.\"` so the user has a UI affordance.",
+        args_schema: r#"{"type":"object","required":["taskRunId"],"properties":{"taskRunId":{"type":"string"}}}"#,
+        response_schema: r#"{"type":"object","required":["taskRunId","verdict","learningCount","byArea","placeholder"],"properties":{"taskRunId":{"type":"string"},"verdict":{"type":"string"},"learningCount":{"type":"integer"},"byArea":{"type":"object","additionalProperties":{"type":"integer"}},"placeholder":{"type":"boolean"}}}"#,
+        // Required `taskRunId` arg; empty-args probe would always fail.
+        probe_with_empty_args: false,
+    },
+    ProxyableCommand {
+        name: "rewind_session",
+        description: "Rewind a failed AI session: restore pre-edit file snapshots (sha256-verified), kill the failed worker, and (by default) spawn a replacement with failure-context prepended. Pass `noReplay: true` for revert + leave-tab-empty (manual re-prompt). File-restore + kill are LLM-independent; the summarize step that builds the failure-context block silently skips when no LLM is configured.",
+        args_schema: r#"{"type":"object","required":["taskRunId"],"properties":{"taskRunId":{"type":"string"},"noReplay":{"type":["boolean","null"]}}}"#,
+        response_schema: r#"{"type":"object","required":["taskRunId","filesRestored","filesSkipped","summarized"],"properties":{"taskRunId":{"type":"string"},"filesRestored":{"type":"integer"},"filesSkipped":{"type":"integer"},"replaySessionId":{"type":["string","null"]},"summarized":{"type":"boolean"},"verdict":{"type":["string","null"]}}}"#,
+        // Required `taskRunId` arg; destructive (mutates filesystem +
+        // kills sessions). Probe-with-empty-args would always fail
+        // anyway, but mark explicit for safety.
         probe_with_empty_args: false,
     },
 ];

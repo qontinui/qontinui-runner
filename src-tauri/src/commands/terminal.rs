@@ -115,13 +115,13 @@ pub fn terminal_list(
     })
 }
 
-/// Get the scrollback buffer for a terminal session (used for reconnection).
+/// Get the server-side cell grid snapshot for a terminal session.
 ///
-/// Returns the buffered PTY output so a reconnecting frontend can replay it,
-/// along with byte offset metadata. Also resets flow control so the reconnecting
-/// frontend doesn't immediately hit backpressure.
+/// Returns the parsed `GridSnapshot` rather than raw scrollback bytes, so the
+/// frontend can paint the final visible state in one synchronous write.
+/// See `plans/terminal-grid-snapshot.md`.
 #[tauri::command]
-pub fn terminal_get_buffer(
+pub fn terminal_get_grid(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     terminal_id: String,
 ) -> Result<CommandResponse, String> {
@@ -129,22 +129,132 @@ pub fn terminal_get_buffer(
         .get(&terminal_id)
         .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
 
-    let (data, start_offset) = session.get_scrollback_buffer();
-    let total_bytes_produced = session.info().total_bytes_produced;
-
-    // Reset flow control so the reconnecting frontend starts fresh
-    session.reset_flow_control();
-
-    let encoded = STANDARD.encode(&data);
+    let grid_handle = session.grid();
+    let snapshot = {
+        let g = grid_handle
+            .lock()
+            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
+        g.snapshot()
+    };
+    let value = serde_json::to_value(&snapshot).map_err(|e| {
+        String::from(AppError::EncodingError(format!(
+            "Failed to serialize grid snapshot: {}",
+            e
+        )))
+    })?;
 
     Ok(CommandResponse {
         success: true,
         message: None,
+        data: Some(value),
+    })
+}
+
+/// Compact text-only snapshot for verifiers and external tools.
+///
+/// Returns the rendered grid as `lines: Vec<String>` plus a single
+/// `text` field with the lines joined by `\n` — the shape the
+/// verification module expects to feed into a prompt or diff.
+#[tauri::command]
+pub fn terminal_grid_text(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+    let grid_handle = session.grid();
+    let snapshot = {
+        let g = grid_handle
+            .lock()
+            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
+        g.text_snapshot()
+    };
+    let value = serde_json::to_value(&snapshot).map_err(|e| {
+        String::from(AppError::EncodingError(format!(
+            "Failed to serialize text snapshot: {}",
+            e
+        )))
+    })?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(value),
+    })
+}
+
+/// Search the rendered grid of one terminal for a substring or regex.
+///
+/// `regex=true` compiles the needle as a regex; `regex=false` is a
+/// case-sensitive substring match. Returns at most one hit per row.
+#[tauri::command]
+pub fn terminal_grid_search(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+    needle: String,
+    regex: Option<bool>,
+) -> Result<CommandResponse, String> {
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+    let grid_handle = session.grid();
+    let hits = {
+        let g = grid_handle
+            .lock()
+            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
+        g.search(&needle, regex.unwrap_or(false))
+            .map_err(|e| e.to_string())?
+    };
+    let value = serde_json::to_value(&hits).map_err(|e| {
+        String::from(AppError::EncodingError(format!(
+            "Failed to serialize search hits: {}",
+            e
+        )))
+    })?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
         data: Some(serde_json::json!({
-            "data": encoded,
-            "start_offset": start_offset,
-            "total_bytes_produced": total_bytes_produced,
+            "terminalId": terminal_id,
+            "hits": value,
         })),
+    })
+}
+
+/// Row-by-row diff of two terminal grids.
+#[tauri::command]
+pub fn terminal_grid_diff(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    a_terminal_id: String,
+    b_terminal_id: String,
+) -> Result<CommandResponse, String> {
+    let a = terminal_manager
+        .get(&a_terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", a_terminal_id))?;
+    let b = terminal_manager
+        .get(&b_terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", b_terminal_id))?;
+    let a_grid_handle = a.grid();
+    let b_grid_handle = b.grid();
+    let diff = {
+        let ag = a_grid_handle
+            .lock()
+            .map_err(|e| format!("Grid A lock poisoned: {}", e))?;
+        let bg = b_grid_handle
+            .lock()
+            .map_err(|e| format!("Grid B lock poisoned: {}", e))?;
+        ag.diff_lines(&bg)
+    };
+    let value = serde_json::to_value(&diff).map_err(|e| {
+        String::from(AppError::EncodingError(format!(
+            "Failed to serialize grid diff: {}",
+            e
+        )))
+    })?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(value),
     })
 }
 
@@ -429,11 +539,14 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_close,
             terminal_list,
             terminal_ack,
-            terminal_get_buffer,
             terminal_save_scrollback,
             terminal_get_saved_scrollback,
             terminal_cleanup_scrollback,
             terminal_collect_session_metadata,
+            terminal_get_grid,
+            terminal_grid_text,
+            terminal_grid_search,
+            terminal_grid_diff,
         ])
         .build()
 }

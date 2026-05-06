@@ -56,6 +56,13 @@ pub struct UIBridgeDiscoveryRequest {
     pub(crate) types: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) selector: Option<String>,
+    /// When true, drop the registry's cached id/label entries and rebuild
+    /// from the live DOM before returning. Workaround for React components
+    /// that swap visible button text via state — the registry stamps a
+    /// label at first registration and the existing per-element early-return
+    /// in the auto-register scanner never re-derives it on subsequent scans.
+    #[serde(default)]
+    pub(crate) force: Option<bool>,
 }
 
 /// Request to start UI Bridge exploration

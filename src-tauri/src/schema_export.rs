@@ -60,6 +60,9 @@ pub fn export_all_schemas() -> Value {
     add!("ReflectionFixOutput", qwo::ReflectionFixOutput);
     add!("FlowEvent", qae::FlowEvent);
     add!("AppEvent", qae::AppEvent);
+    // Wire-format canvas panel struct carried inside AppEvent::CanvasUpdate's
+    // `data.panel` field. Mirrors the runner's `mcp::canvas::StoredPanel`.
+    add!("CanvasPanel", qae::CanvasPanel);
 
     // ── qontinui-types: ai_workflows ──
     add!("ExecutionStep", qaw::ExecutionStep);
@@ -416,6 +419,32 @@ pub fn export_all_schemas() -> Value {
     add!("TerminalOutputEvent", qtm::TerminalOutputEvent);
     add!("TerminalExitEvent", qtm::TerminalExitEvent);
 
+    // ── runner-local: findings (Tauri `finding_detected` / `finding_resolved`
+    // payloads). Distinct from `qontinui_types::verification::Finding`
+    // (different shape: `confidence`, `findingType`, `evidence`). Registered
+    // under `Runner*` titles so both schemas coexist in the registry. The
+    // canonical structs live in `crate::tauri_event_payloads` so the schema
+    // export pipeline (here, in the lib) and the binary's `findings::types`
+    // module share one source of truth. ──
+    use crate::tauri_event_payloads as tep;
+    add!("RunnerFinding", tep::Finding);
+    add!("RunnerFindingCodeContext", tep::FindingCodeContext);
+    add!("RunnerFindingUserInput", tep::FindingUserInput);
+
+    // ── runner-local: dev-only seed-finding payload (`dev:seed-finding`
+    // Tauri event from `commands::dev_findings`). Schema lives in
+    // `tauri_event_payloads` to be visible to this lib-side aggregator. ──
+    add!("DevSeedFindingPayload", tep::DevSeedFindingPayload);
+
+    // ── runner-local: review-approved / review-rejected payloads
+    // (`commands::productivity::approve_recommendation` /
+    // `reject_recommendation`). Same shape on both channels — only the
+    // `user_decision` string ("approved" | "rejected") differs. ──
+    add!(
+        "RecommendationReviewDecisionPayload",
+        tep::RecommendationReviewDecisionPayload
+    );
+
     // ── qontinui-types: ticket_system ──
     add!("TicketSource", qts::TicketSource);
     add!("TicketState", qts::TicketState);
@@ -604,6 +633,17 @@ pub fn export_all_schemas() -> Value {
     add!("RunnerUiError", qrn::RunnerUiError);
     add!("RunnerCrash", qrn::RunnerCrash);
 
+    // ── runner-local: WS relay envelopes + backend-originated runner-status
+    // events (`crate::relay_envelopes`). These bind the previously-untyped
+    // payloads `mcp/backend_relay.rs::handle_outbound` ships over the WS
+    // relay AND the events the Python backend pushes on the per-user
+    // runner-status channel. Source of truth for the consumer-side
+    // discriminated unions in `@qontinui/shared-types/tauri-events`. ──
+    use crate::relay_envelopes as re;
+    add!("RunnerRelayMessage", re::RunnerRelayMessage);
+    add!("RunnerStatusEvent", re::RunnerStatusEvent);
+    add!("RunnerConnectedConnection", re::RunnerConnectedConnection);
+
     Value::Object(m)
 }
 
@@ -627,7 +667,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 420, "Expected 420 schema entries");
+        assert_eq!(obj.len(), 429, "Expected 429 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

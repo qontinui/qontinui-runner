@@ -19,7 +19,7 @@
  * lucide-react icons.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   RefreshCw,
   ChevronDown,
@@ -33,11 +33,28 @@ import {
   XCircle,
   Sparkles,
   Archive,
+  BookOpen,
+  Undo2,
+  ClipboardList,
+  ShieldCheck,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { getTaskDetail, getPlanTasks } from "./api";
+import { autoReviewTask, getTaskDetail, getPlanTasks, type DecomposeResult } from "./api";
 import { listPlansFiltered } from "./reflectionApi";
 import { ReflectionPanel } from "./ReflectionPanel";
+import { DecomposePlanModal } from "./DecomposePlanModal";
+import {
+  rewindSession,
+  summarizeSession,
+  type RewindResult,
+  type SummarizeResult,
+} from "./sessionApi";
+import {
+  BriefingPreview,
+  CompletionReportSection,
+  ManualFireForm,
+  UpstreamReportsPreview,
+} from "./CompletionReportSections";
 import type { PlanRow, PlanStatus, TaskDetail, TaskRow, TaskStatus } from "./types";
 
 /** localStorage key prefix for the per-plan reflection panel open/closed state. */
@@ -164,6 +181,7 @@ interface PlansListProps {
   error: string | null;
   showArchived: boolean;
   onShowArchivedChange: (next: boolean) => void;
+  onDecompose: () => void;
 }
 
 function PlansList({
@@ -175,6 +193,7 @@ function PlansList({
   error,
   showArchived,
   onShowArchivedChange,
+  onDecompose,
 }: PlansListProps) {
   return (
     <div
@@ -202,6 +221,15 @@ function PlansList({
             <Archive className="w-3 h-3" />
             archived
           </label>
+          <button
+            onClick={onDecompose}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border border-border text-foreground hover:bg-primary/10 hover:text-primary hover:border-primary/40 transition-colors"
+            data-ui-bridge-id="productivity.decompose-plan-button"
+            title="Decompose a plan markdown into the task graph"
+          >
+            <ClipboardList className="w-3 h-3" />
+            Decompose
+          </button>
           <button
             onClick={onRefresh}
             disabled={loading}
@@ -428,6 +456,313 @@ function TasksList({
 }
 
 // ============================================================================
+// Session actions (Phase 5)
+// ============================================================================
+//
+// Surfaces the in-product /summarize-session and /rewind-session features
+// for the assigned worker session. Renders Summarize + Rewind buttons
+// inside the task detail panel; results are shown inline as a small
+// status block (toast-style) that the user can dismiss.
+
+// ============================================================================
+// Review Now button — Phase 4 manual auto-review trigger
+// ============================================================================
+//
+// Fires `auto_review_task` against the task currently in detail view. The
+// row hits the dashboard's recommendations / ReviewBadge surfaces via the
+// `review-completed` event the Tauri command emits — no parent re-fetch
+// required from this side. Errors prefixed with "LLM provider not
+// configured" render an extra "Settings → AI" hint inline.
+
+interface ReviewNowButtonProps {
+  taskId: string;
+}
+
+type ReviewNowState =
+  | { kind: "idle" }
+  | { kind: "running" }
+  | { kind: "ok"; verdict: string; confidence: number }
+  | { kind: "error"; message: string };
+
+function ReviewNowButton({ taskId }: ReviewNowButtonProps) {
+  const [state, setState] = useState<ReviewNowState>({ kind: "idle" });
+
+  const handleClick = useCallback(async () => {
+    setState({ kind: "running" });
+    try {
+      const result = await autoReviewTask(taskId);
+      setState({ kind: "ok", verdict: result.verdict, confidence: result.confidence });
+    } catch (err) {
+      setState({ kind: "error", message: String(err) });
+    }
+  }, [taskId]);
+
+  const isRunning = state.kind === "running";
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={isRunning}
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded border border-border bg-card hover:bg-muted/30 text-foreground disabled:opacity-50 transition-colors"
+        data-ui-bridge-id="productivity.review-now-button"
+        title="Run an automated review against the latest worker output"
+      >
+        {isRunning ? (
+          <Loader2 className="w-3 h-3 animate-spin" />
+        ) : (
+          <ShieldCheck className="w-3 h-3" />
+        )}
+        Review now
+      </button>
+      {state.kind === "ok" && (
+        <span
+          className="text-[10px] text-emerald-300"
+          data-ui-bridge-id="productivity.review-now-result"
+        >
+          {state.verdict} ({(state.confidence * 100).toFixed(0)}%)
+        </span>
+      )}
+      {state.kind === "error" && (
+        <span
+          className="text-[10px] text-amber-300 truncate max-w-[180px]"
+          title={state.message}
+          data-ui-bridge-id="productivity.review-now-error"
+        >
+          {state.message.startsWith("LLM provider not configured")
+            ? "LLM not configured"
+            : state.message}
+        </span>
+      )}
+    </div>
+  );
+}
+
+interface SessionActionsProps {
+  sessionId: string;
+}
+
+type ActionState =
+  | { kind: "idle" }
+  | { kind: "running"; action: "summarize" | "rewind" }
+  | { kind: "summarized"; result: SummarizeResult }
+  | { kind: "rewound"; result: RewindResult }
+  | { kind: "error"; message: string };
+
+function SessionActions({ sessionId }: SessionActionsProps) {
+  const [state, setState] = useState<ActionState>({ kind: "idle" });
+  const [confirmRewind, setConfirmRewind] = useState(false);
+
+  const handleSummarize = useCallback(async () => {
+    setState({ kind: "running", action: "summarize" });
+    try {
+      const result = await summarizeSession(sessionId);
+      setState({ kind: "summarized", result });
+    } catch (err) {
+      setState({ kind: "error", message: String(err) });
+    }
+  }, [sessionId]);
+
+  const handleRewind = useCallback(
+    async (noReplay: boolean) => {
+      setConfirmRewind(false);
+      setState({ kind: "running", action: "rewind" });
+      try {
+        const result = await rewindSession(sessionId, noReplay);
+        setState({ kind: "rewound", result });
+      } catch (err) {
+        setState({ kind: "error", message: String(err) });
+      }
+    },
+    [sessionId],
+  );
+
+  const isRunning = state.kind === "running";
+
+  return (
+    <section data-ui-bridge-id="productivity.session-actions">
+      <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        Session actions
+      </h3>
+      <div className="mt-2 flex gap-2">
+        <button
+          onClick={handleSummarize}
+          disabled={isRunning}
+          className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] rounded border border-border bg-card hover:bg-muted/30 text-foreground disabled:opacity-50 transition-colors"
+          data-ui-bridge-id="productivity.summarize-button"
+        >
+          {state.kind === "running" && state.action === "summarize" ? (
+            <Loader2 className="w-3 h-3 animate-spin" />
+          ) : (
+            <BookOpen className="w-3 h-3" />
+          )}
+          Summarize
+        </button>
+        <button
+          onClick={() => setConfirmRewind(true)}
+          disabled={isRunning}
+          className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] rounded border border-amber-700/50 bg-amber-950/20 hover:bg-amber-900/30 text-amber-200 disabled:opacity-50 transition-colors"
+          data-ui-bridge-id="productivity.rewind-button"
+        >
+          {state.kind === "running" && state.action === "rewind" ? (
+            <Loader2 className="w-3 h-3 animate-spin" />
+          ) : (
+            <Undo2 className="w-3 h-3" />
+          )}
+          Rewind
+        </button>
+      </div>
+
+      {confirmRewind && (
+        <div
+          className="mt-2 p-2 rounded border border-amber-700/50 bg-amber-950/30 text-[11px] space-y-2"
+          data-ui-bridge-id="productivity.rewind-confirm"
+          role="alertdialog"
+          aria-labelledby="productivity-rewind-confirm-heading"
+        >
+          <p
+            id="productivity-rewind-confirm-heading"
+            className="font-medium text-amber-200"
+          >
+            Rewind session {sessionId.slice(0, 8)}…?
+          </p>
+          <p className="text-amber-300/90">
+            This restores files from the pre-edit snapshots, kills the worker, and (by default) spawns a replacement with failure context. Destructive — files modified by this session will be reverted.
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => handleRewind(false)}
+              className="px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 text-amber-50 transition-colors"
+              data-ui-bridge-id="productivity.rewind-confirm-replay"
+            >
+              Rewind + Replay
+            </button>
+            <button
+              onClick={() => handleRewind(true)}
+              className="px-2 py-1 rounded bg-amber-900/50 hover:bg-amber-800 text-amber-100 transition-colors"
+              data-ui-bridge-id="productivity.rewind-confirm-no-replay"
+            >
+              Rewind only
+            </button>
+            <button
+              onClick={() => setConfirmRewind(false)}
+              className="px-2 py-1 rounded bg-muted/30 hover:bg-muted/50 text-muted-foreground transition-colors"
+              data-ui-bridge-id="productivity.rewind-confirm-cancel"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {(state.kind === "summarized" ||
+        state.kind === "rewound" ||
+        state.kind === "error") && (
+        <SessionActionResult state={state} onDismiss={() => setState({ kind: "idle" })} />
+      )}
+    </section>
+  );
+}
+
+interface SessionActionResultProps {
+  state: ActionState;
+  onDismiss: () => void;
+}
+
+function SessionActionResult({ state, onDismiss }: SessionActionResultProps) {
+  let body: ReactNode = null;
+  let bgClass = "border-border bg-muted/20 text-foreground";
+  let testId = "";
+
+  if (state.kind === "summarized") {
+    const { result } = state;
+    bgClass = result.placeholder
+      ? "border-amber-700/50 bg-amber-950/20 text-amber-200"
+      : "border-emerald-700/50 bg-emerald-950/20 text-emerald-200";
+    testId = "productivity.summarize-result";
+    body = (
+      <>
+        <div className="font-medium">
+          {result.placeholder
+            ? "Placeholder summary inserted (no LLM provider configured)"
+            : `Summarized ${result.learningCount} learning(s) — verdict: ${result.verdict}`}
+        </div>
+        {!result.placeholder && Object.keys(result.byArea).length > 0 && (
+          <ul className="mt-1 space-y-0.5 text-[11px]">
+            {Object.entries(result.byArea)
+              .sort((a, b) => a[0].localeCompare(b[0]))
+              .map(([area, count]) => (
+                <li key={area} className="font-mono">
+                  {area}: {count}
+                </li>
+              ))}
+          </ul>
+        )}
+        {result.placeholder && (
+          <p className="mt-1 text-[11px]">
+            Configure an LLM provider in Settings → AI to extract real learnings.
+          </p>
+        )}
+      </>
+    );
+  } else if (state.kind === "rewound") {
+    const { result } = state;
+    bgClass = "border-emerald-700/50 bg-emerald-950/20 text-emerald-200";
+    testId = "productivity.rewind-result";
+    body = (
+      <>
+        <div className="font-medium">Rewound session</div>
+        <ul className="mt-1 space-y-0.5 text-[11px]">
+          <li>Files restored: {result.filesRestored}</li>
+          <li>Files skipped: {result.filesSkipped}</li>
+          <li>
+            Replay session:{" "}
+            {result.replaySessionId == null ? (
+              <span className="italic">none (no-replay)</span>
+            ) : (
+              <span className="font-mono">{result.replaySessionId.slice(0, 16)}…</span>
+            )}
+          </li>
+          {result.summarized && result.verdict && (
+            <li>
+              Verdict captured: <span className="font-mono">{result.verdict}</span>
+            </li>
+          )}
+        </ul>
+      </>
+    );
+  } else if (state.kind === "error") {
+    bgClass = "border-rose-700/50 bg-rose-950/20 text-rose-200";
+    testId = "productivity.session-action-error";
+    body = (
+      <>
+        <div className="font-medium">Action failed</div>
+        <p className="mt-1 whitespace-pre-wrap text-[11px]">{state.message}</p>
+      </>
+    );
+  }
+
+  if (body == null) return null;
+
+  return (
+    <div
+      className={`mt-2 p-2 rounded border text-[11px] ${bgClass}`}
+      data-ui-bridge-id={testId}
+    >
+      {body}
+      <button
+        onClick={onDismiss}
+        className="mt-2 text-[10px] underline opacity-80 hover:opacity-100"
+        data-ui-bridge-id="productivity.session-action-dismiss"
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
+// ============================================================================
 // Task detail column
 // ============================================================================
 
@@ -435,9 +770,12 @@ interface TaskDetailPanelProps {
   detail: TaskDetail | null;
   loading: boolean;
   error: string | null;
+  /** Triggered after a manual-fire (or any other in-panel action that
+   *  mutates the task) so the parent can re-fetch task detail + tasks list. */
+  onReloadDetail?: () => void;
 }
 
-function TaskDetailPanel({ detail, loading, error }: TaskDetailPanelProps) {
+function TaskDetailPanel({ detail, loading, error, onReloadDetail }: TaskDetailPanelProps) {
   return (
     <div
       role="region"
@@ -545,10 +883,13 @@ function TaskDetailPanel({ detail, loading, error }: TaskDetailPanelProps) {
               )}
             </section>
 
-            <section>
-              <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Latest review summary
-              </h3>
+            <section data-ui-bridge-id="productivity.task-review">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Latest review summary
+                </h3>
+                <ReviewNowButton taskId={detail.task.id} />
+              </div>
               <p className="mt-1 text-xs text-muted-foreground">
                 {detail.latestReviewSummary ?? "—"}
               </p>
@@ -563,6 +904,10 @@ function TaskDetailPanel({ detail, loading, error }: TaskDetailPanelProps) {
               </p>
             </section>
 
+            {detail.task.assignedSessionId && (
+              <SessionActions sessionId={detail.task.assignedSessionId} />
+            )}
+
             {detail.task.notes && (
               <section>
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -573,6 +918,15 @@ function TaskDetailPanel({ detail, loading, error }: TaskDetailPanelProps) {
                 </p>
               </section>
             )}
+
+            {/* Phase 4 of productivity-coordinator-completion-reports §5 —
+             *  structured completion report rendering, upstream-report preview
+             *  for pending tasks, briefing preview for assigned/ready+ tasks,
+             *  and the manual-fire form. */}
+            <CompletionReportSection detail={detail} />
+            <UpstreamReportsPreview detail={detail} />
+            <BriefingPreview detail={detail} />
+            <ManualFireForm detail={detail} onFired={onReloadDetail} />
           </>
         )}
       </div>
@@ -602,6 +956,15 @@ export function PlanTaskBoard() {
   const [detailError, setDetailError] = useState<string | null>(null);
 
   const [reflectionOpen, setReflectionOpen] = useState<boolean>(false);
+
+  // Decompose-plan modal state. `decomposeInitialPath` is seeded from the
+  // currently-selected plan (so re-decomposing an existing plan is a
+  // one-click operation). When no plan is selected, the modal opens
+  // empty and the user types/pastes a path manually. A future revision
+  // could scan `D:/qontinui-root/plans/` for the most-recently-modified
+  // *.md, but that requires a Tauri command we don't have today.
+  const [decomposeOpen, setDecomposeOpen] = useState<boolean>(false);
+  const [decomposeInitialPath, setDecomposeInitialPath] = useState<string | null>(null);
 
   const fetchPlans = useCallback(async () => {
     setPlansLoading(true);
@@ -777,6 +1140,23 @@ export function PlanTaskBoard() {
     [plans, selectedPlanId],
   );
 
+  const handleOpenDecompose = useCallback(() => {
+    // Seed with the currently-selected plan's path so re-decomposing is
+    // one-click. The modal happily accepts an empty path otherwise.
+    setDecomposeInitialPath(selectedPlan?.markdownPath ?? null);
+    setDecomposeOpen(true);
+  }, [selectedPlan]);
+
+  const handleDecomposeSuccess = useCallback(
+    (result: DecomposeResult) => {
+      // Refresh the plan list so the freshly-decomposed plan shows up,
+      // then surface it as the active selection.
+      void fetchPlans();
+      setSelectedPlanId(result.planId);
+    },
+    [fetchPlans],
+  );
+
   return (
     <div className="h-full flex" data-page-id="productivity-plans">
       {/* Left: Plans (25%) */}
@@ -790,6 +1170,7 @@ export function PlanTaskBoard() {
           error={plansError}
           showArchived={showArchived}
           onShowArchivedChange={setShowArchived}
+          onDecompose={handleOpenDecompose}
         />
       </div>
 
@@ -835,8 +1216,24 @@ export function PlanTaskBoard() {
 
       {/* Right: Task detail (25%) */}
       <div className="shrink-0" style={{ width: "25%", minWidth: 260 }}>
-        <TaskDetailPanel detail={taskDetail} loading={detailLoading} error={detailError} />
+        <TaskDetailPanel
+          detail={taskDetail}
+          loading={detailLoading}
+          error={detailError}
+          onReloadDetail={() => {
+            if (selectedTaskId) void fetchDetail(selectedTaskId);
+            if (selectedPlanId) void fetchTasks(selectedPlanId);
+          }}
+        />
       </div>
+
+      {/* Decompose-plan modal — Phase 3 of productivity-stack-product-readiness. */}
+      <DecomposePlanModal
+        open={decomposeOpen}
+        onClose={() => setDecomposeOpen(false)}
+        initialPlanPath={decomposeInitialPath}
+        onSuccess={handleDecomposeSuccess}
+      />
     </div>
   );
 }

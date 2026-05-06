@@ -283,6 +283,30 @@ fn read_bytes_avoided(meta: &serde_json::Value) -> Option<u64> {
         .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
 }
 
+// ============================================================================
+// One-shot LLM aggregates (Phase 0 of productivity-stack-product-readiness)
+// ============================================================================
+
+/// Snapshot of in-process counters for `OneshotLlm` adapter calls.
+///
+/// Backs the sibling tile on `ScriptedOutputPanel` that surfaces one-shot
+/// productivity-task LLM activity. Counters live in
+/// `crate::ai_provider::oneshot::stats_store` and reset on runner restart
+/// — same lifecycle as the scripted-output Phase A counters.
+///
+/// **Stable wire keys** (the frontend `useOneshotStats` hook reads these
+/// directly):
+/// - `callsTotal[provider]` — successful calls per adapter name.
+/// - `errorsTotal[kind]` — error count per `kind` label (`transport`,
+///   `no_credentials`, `disabled`, `schema_parse`, `join_error`).
+/// - `cacheHitsTotal[provider]` — calls with `cache_read_tokens > 0`.
+/// - `cacheReadTokens` / `cacheCreationTokens` — running totals.
+/// - `totalTokensIn` / `totalTokensOut` — running totals.
+#[tauri::command]
+pub async fn get_oneshot_stats() -> Result<crate::ai_provider::OneshotStats, String> {
+    Ok(crate::ai_provider::snapshot_oneshot_stats())
+}
+
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_activity_timeline")
         .invoke_handler(tauri::generate_handler![
@@ -295,6 +319,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             delete_activity_timeline_entry,
             get_activity_timeline_stats,
             get_scripted_output_stats,
+            get_oneshot_stats,
         ])
         .build()
 }

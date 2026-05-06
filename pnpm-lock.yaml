@@ -24,8 +24,8 @@ importers:
         specifier: ^0.1.0
         version: 0.1.1(@qontinui/ui-bridge@0.3.4(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react@19.2.5)
       '@qontinui/shared-types':
-        specifier: ^0.2.1
-        version: 0.2.1
+        specifier: ^0.2.3
+        version: 0.2.3
       '@qontinui/ui-bridge':
         specifier: ^0.3.4
         version: 0.3.4(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
@@ -1125,8 +1125,8 @@ packages:
       react:
         optional: true
 
-  '@qontinui/shared-types@0.2.1':
-    resolution: {integrity: sha512-j3fQg0gCMqQ7Rzfuhlxm0p5GhwsIb4i+ge0S9tBaUZiXAxCjm2lG4WZK6VMqjxo9Rg2yknMmyZ1RE1KigDSzmA==}
+  '@qontinui/shared-types@0.2.3':
+    resolution: {integrity: sha512-kxRsgYyi4YaCDmYKYNe4t8MR9Rqc/vrxj1cHzP5YG0zDKVpRXb4d9yMXwZggWQr0eb69Ik4XMEAwbHPv25zhmg==}
 
   '@qontinui/ui-bridge-auto@0.1.5':
     resolution: {integrity: sha512-C4i4SNHsfMNHzBTUIp9MQc8XXjQGFUkPD71IudfYRXxsJ24nDklsbPjBVpjEBS+SGQczQc0TAXZ2YnAM/XD2BQ==}
@@ -6111,11 +6111,11 @@ snapshots:
       '@qontinui/ui-bridge': 0.3.4(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
       react: 19.2.5
 
-  '@qontinui/shared-types@0.2.1': {}
+  '@qontinui/shared-types@0.2.3': {}
 
   '@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)':
     dependencies:
-      '@qontinui/shared-types': 0.2.1
+      '@qontinui/shared-types': 0.2.3
       '@qontinui/ui-bridge': 0.3.4(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
       ts-morph: 27.0.2
     transitivePeerDependencies:
@@ -6146,7 +6146,7 @@ snapshots:
 
   '@qontinui/workflow-ui@0.1.0(@xyflow/react@12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(lucide-react@1.14.0(react@19.2.5))(mermaid@11.14.0)(react-window@2.2.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)':
     dependencies:
-      '@qontinui/shared-types': 0.2.1
+      '@qontinui/shared-types': 0.2.3
       '@qontinui/workflow-utils': 0.1.0
       '@xyflow/react': 12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
       lucide-react: 1.14.0(react@19.2.5)
@@ -6157,7 +6157,7 @@ snapshots:
 
   '@qontinui/workflow-utils@0.1.0':
     dependencies:
-      '@qontinui/shared-types': 0.2.1
+      '@qontinui/shared-types': 0.2.3
 
   '@radix-ui/number@1.1.1': {}
 

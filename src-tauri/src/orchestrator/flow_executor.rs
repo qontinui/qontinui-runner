@@ -185,6 +185,29 @@ pub enum FlowEvent {
         completed: usize,
         total: usize,
     },
+    /// Flow execution was paused via `pause_flow_execution`.
+    ///
+    /// Mirrors `qontinui_types::app_events::FlowEvent::FlowPaused`. The
+    /// executor itself never emits this — `commands/flow.rs` does at the
+    /// pause API entry point. Listed here so callers (and the `flow-event`
+    /// Tauri channel TS bindings) see a single closed enum.
+    /// `step_id` serializes as `null` (not skipped) to preserve the legacy
+    /// `serde_json::json!` wire shape.
+    FlowPaused {
+        instance_id: String,
+        flow_id: String,
+        step_id: Option<String>,
+    },
+    /// Flow execution was resumed via `resume_flow_execution`.
+    ///
+    /// Mirrors `qontinui_types::app_events::FlowEvent::FlowResumed`.
+    /// `step_id` serializes as `null` (not skipped) to preserve the legacy
+    /// `serde_json::json!` wire shape.
+    FlowResumed {
+        instance_id: String,
+        flow_id: String,
+        step_id: Option<String>,
+    },
 }
 
 // ============================================================================

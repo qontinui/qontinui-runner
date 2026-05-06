@@ -115,6 +115,10 @@ imageproc = "0.25"
 toml = "1"
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 portable-pty = "0.8"
+# VT parser (Paul Williams state machine) used by alacritty/wezterm.
+# Powers per-session terminal grids in `terminal::grid`.
+vte = "0.15"
+unicode-width = "0.2"
 arboard = "3.4"
 dashmap = "6"
 lru = "0.12"
@@ -150,11 +154,14 @@ jsonpath-rust = "1"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 windows = { version = "0.58", features = [
     "implement",
@@ -187,6 +194,13 @@ restate = ["restate-sdk"]
 # Tells Tauri to embed the frontend from dist/ instead of loading from devUrl.
 # Without this, debug builds load from localhost:1420 (Vite dev server).
 custom-protocol = ["tauri/custom-protocol"]
+# Phase 5.1 of the UI Bridge discoverability/effectiveness plan
+# (qontinui-dev-notes/ui-bridge/docs/2026-05-03-...): exposes the debug-only
+# `/ui-bridge/test/inject-session` + `/ui-bridge/test/clear-sessions`
+# endpoints in release builds. Debug builds always carry them via
+# `cfg(debug_assertions)`; this feature is the explicit opt-in for
+# release-mode regression / smoke harnesses.
+test-fixtures = []
 
 [[bin]]
 name = "mock_claude_cli"

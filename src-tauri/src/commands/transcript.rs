@@ -99,15 +99,24 @@ pub async fn transcript_list_sessions(
         config_dirs.len()
     );
 
-    if config_dirs.is_empty() {
-        return Ok(CommandResponse {
-            success: true,
-            message: Some("No Claude Code config directories found".to_string()),
-            data: Some(serde_json::json!([])),
-        });
-    }
+    // Note: don't early-return on empty config_dirs — Phase 5.1 fakes still
+    // need to flow through even when the host has no Claude installations.
+    let all_sessions = if config_dirs.is_empty() {
+        Vec::new()
+    } else {
+        collect_all_sessions(&project_paths, &config_dirs)
+    };
 
-    let all_sessions = collect_all_sessions(&project_paths, &config_dirs);
+    // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:
+    // append any fakes injected via the debug-only
+    // `/ui-bridge/test/inject-session` route so SessionCard can render
+    // without a live PTY. The merge is a no-op (and the module + accessor
+    // don't exist) on production release builds without `test-fixtures`.
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    let all_sessions = crate::mcp::test_fixtures::merge_with_injected(
+        all_sessions,
+        crate::mcp::test_fixtures::injected_test_sessions(),
+    );
 
     info!(
         "transcript_list_sessions: found {} total sessions",

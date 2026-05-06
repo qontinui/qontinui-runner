@@ -1058,11 +1058,12 @@ impl CanvasPanelManager {
             canvas.insert_panel(panel.clone());
         }
 
-        // Emit event
+        // Emit event with the typed `StoredPanel` payload (wire format
+        // unchanged from the previous `serde_json::to_value` path).
         let event = AppEvent::CanvasUpdate {
             action: "update".to_string(),
             panel_id: panel.panel_id.clone(),
-            panel: Some(serde_json::to_value(&panel).unwrap_or_default()),
+            panel: Some(panel.clone()),
             task_run_id: Some(self.execution_id.clone()),
         };
         if let Err(e) = self.app_handle.emit(event.event_name(), &event) {

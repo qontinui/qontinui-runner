@@ -459,6 +459,10 @@ pub fn create_router(
     // the bootstrap on secondaries eliminates the cross-runner `notify`
     // watcher / `pnpm install` contention (`os error 32`).
     if !crate::process_capture::primary_proxy::is_secondary() {
+        match crate::wrappers::launcher::ensure_launcher_installed() {
+            Ok(path) => tracing::info!("wrappers: launcher installed at {}", path.display()),
+            Err(e) => tracing::warn!("wrappers: launcher install failed: {}", e),
+        }
         let cell = app_state.wrapper_state.clone();
         tokio::spawn(async move {
             let ws = crate::wrappers::WrapperState::new_default().await;
@@ -1068,6 +1072,33 @@ pub fn create_router(
         });
     }
 
+    // Productivity Coordinator (Rust) scheduler — Phase 1b of
+    // `productivity-coordinator-rust-promotion.md`, with Phase 1.5
+    // (`productivity-stack-product-readiness.md`) runtime toggle.
+    //
+    // The scheduler ALWAYS starts at boot now. Whether it does work each
+    // tick is governed by an Arc<AtomicBool> flag wrapped in
+    // `CoordinatorSchedulerHandle`. The flag's initial value still comes
+    // from the env var (`QONTINUI_COORDINATOR_RUST_SCHEDULER`) for first
+    // boot, but the `launch_coordinator_session` /
+    // `stop_coordinator_session` Tauri commands flip it at runtime via
+    // the handle stashed in Tauri state — no process restart needed.
+    {
+        let coord_config = crate::coordinator::config::CoordinatorSchedulerConfig::from_env();
+        tracing::info!(
+            "Coordinator (Rust) scheduler starting: initial_enabled={} interval={}s",
+            coord_config.rust_scheduler_enabled,
+            coord_config.interval_secs,
+        );
+        let scheduler_handle = crate::coordinator::scheduler::start_coordinator_scheduler(
+            api_state.clone(),
+            coord_config,
+        );
+        // Stash the runtime-toggle handle so launch_coordinator_session
+        // can flip the flag without a process restart.
+        app_handle.manage(scheduler_handle);
+    }
+
     // Physical device USB scanner (30-second interval)
     // Discovers ADB-attached Android devices and registers them with PhysicalDeviceRegistry.
     {
@@ -1478,7 +1509,7 @@ pub fn create_router(
         )
         .layer(tower::limit::ConcurrencyLimitLayer::new(20));
 
-    Router::new()
+    let base_router = Router::new()
         // GraphQL endpoints (typed API alongside REST)
         .merge(graphql_routes)
         .route_service(
@@ -1509,6 +1540,8 @@ pub fn create_router(
         .merge(crate::mcp::physical_device_api::routes())
         .merge(crate::mcp::plans::routes())
         .merge(crate::mcp::coordinator::routes())
+        .merge(crate::mcp::completion_reports::routes())
+        .merge(crate::mcp::completion_sources::routes())
         .merge(crate::mcp::reflection::routes())
         .merge(crate::mcp::sessions::routes())
         .merge(crate::mcp::tunnel_api::routes())
@@ -1630,7 +1663,18 @@ pub fn create_router(
             crate::trace_api::routes()
         } else {
             axum::Router::new()
-        })
+        });
+
+    // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:
+    // debug-only `/ui-bridge/test/inject-session` + `/ui-bridge/test/clear-sessions`
+    // for SessionCard manual-render tests. The cfg gate matches the one on
+    // the `mcp::test_fixtures` module declaration in `mcp/mod.rs`, so
+    // production release builds without the `test-fixtures` feature compile
+    // away both the module and the merge call entirely.
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    let base_router = base_router.merge(crate::mcp::test_fixtures::routes());
+
+    base_router
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))

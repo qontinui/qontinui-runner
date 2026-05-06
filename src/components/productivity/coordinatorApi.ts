@@ -79,3 +79,79 @@ export async function getEscalations(): Promise<Escalation[]> {
 export async function resolveEscalation(decisionId: string, resolution: string): Promise<boolean> {
   return invoke<boolean>("resolve_escalation", { decisionId, resolution });
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 — Coordinator launch controls (header buttons + lease status pill)
+// ---------------------------------------------------------------------------
+
+/** A single `coordinator_leader` lease row. Timestamps are RFC3339 UTC
+ *  strings (the Rust side serializes them via `::text` from PG). */
+export interface CoordinatorLeaderRow {
+  instanceId: string;
+  leasedUntil: string;
+  acquiredAt: string;
+  renewedAt: string;
+}
+
+/** Result of `get_coordinator_leader`. `leaseStatus` is computed Rust-side
+ *  off `leased_until` vs `NOW()` and `renewed_at` heartbeat freshness:
+ *  - `active`  — lease holder is alive (renewed within ~90s).
+ *  - `stale`   — lease still owned but heartbeat older than ~90s.
+ *  - `vacant`  — no row, or `leased_until` already in the past. */
+export interface LeaderResponse {
+  leader: CoordinatorLeaderRow | null;
+  leaseStatus: "active" | "stale" | "vacant";
+}
+
+/** Result of `launch_coordinator_session` / `spawn_worker_session`.
+ *
+ *  - `mode` echoes back which path ran. For `launch_coordinator_session`
+ *    it's `"rust"` (in-process scheduler — Phase 1.5 default) or
+ *    `"claude_skill"` (legacy pty spawn). `spawn_worker_session` returns
+ *    `"worker"`.
+ *  - `terminalId` is `null` for `mode === "rust"` (no pty was opened);
+ *    for the other modes it identifies the new tab so the sidebar
+ *    state-machine can focus it. */
+export interface LaunchResult {
+  mode: string;
+  terminalId: string | null;
+}
+
+/** Read the current `coordinator_leader` row + derived lease status. */
+export async function getCoordinatorLeader(): Promise<LeaderResponse> {
+  return invoke<LeaderResponse>("get_coordinator_leader");
+}
+
+/** Coordinator launch modes. `"rust"` (the Phase 1.5 default) flips the
+ *  in-process Rust scheduler's runtime-toggle flag — no pty, no Claude
+ *  CLI dependency. `"claude_skill"` keeps the legacy pty-spawn path for
+ *  Joshua's debug use. */
+export type CoordinatorLaunchMode = "rust" | "claude_skill";
+
+/** Start the Coordinator. Defaults to `mode = "rust"` (in-process Rust
+ *  scheduler). When `mode === "claude_skill"`, spawns a Claude pty in a
+ *  fresh Terminal tab — the legacy debug path. */
+export async function launchCoordinatorSession(args: {
+  mode?: CoordinatorLaunchMode | null;
+  planPath?: string | null;
+  titleHint?: string | null;
+}): Promise<LaunchResult> {
+  return invoke<LaunchResult>("launch_coordinator_session", args);
+}
+
+/** Stop the in-process Rust coordinator scheduler — flips the
+ *  `rust_scheduler_enabled` flag back to `false`. Returns the previous
+ *  flag value (true ⇒ scheduler was running, false ⇒ already stopped).
+ *
+ *  Has no effect on `claude_skill`-mode pty sessions; the user closes
+ *  those via the terminal UI. */
+export async function stopCoordinatorSession(): Promise<boolean> {
+  return invoke<boolean>("stop_coordinator_session");
+}
+
+/** Spawn an idle worker Claude session in a fresh Terminal tab. */
+export async function spawnWorkerSession(args: {
+  titleHint?: string | null;
+}): Promise<LaunchResult> {
+  return invoke<LaunchResult>("spawn_worker_session", args);
+}

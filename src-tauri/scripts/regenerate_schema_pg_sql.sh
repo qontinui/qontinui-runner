@@ -26,11 +26,14 @@
 #
 # Output: src-tauri/schema.pg.sql.generated.
 #
-# Determinism: pg_dump headers that contain timestamps or runtime info
-# (Started on / Completed on) are stripped post-dump so two consecutive
-# runs produce byte-equal output. The pg_dump version line is kept (it
-# changes only when the container is rebuilt with a newer Postgres,
-# which is a reviewable event).
+# Determinism: pg_dump headers that contain timestamps, runtime info,
+# and the pg_dump-build version are stripped post-dump so two consecutive
+# runs produce byte-equal output regardless of pg_dump build origin
+# (apt-installed Ubuntu vs docker-exec'd Debian — these embed different
+# distro tags in the `-- Dumped by pg_dump version ...` header even at
+# the same Postgres patch level). Stripping the Dumped-version lines is
+# necessary for the CI gate, where the workflow uses Ubuntu's apt
+# postgresql-client-16 but `pg_dump`s a Debian-based pgvector container.
 #
 # Environment overrides:
 #   CLORINDE_PG_CONTAINER (default: qontinui-canonical-postgres)
@@ -151,6 +154,8 @@ if [[ -n "$CONTAINER" ]]; then
     docker exec "$CONTAINER" pg_dump -U "$PG_USER" -d "$DUMP_DB" "${PG_DUMP_ARGS[@]}" \
         | sed -e '/^-- Started on /d' \
               -e '/^-- Completed on /d' \
+              -e '/^-- Dumped from database version /d' \
+              -e '/^-- Dumped by pg_dump version /d' \
               -e '/^\\restrict /d' \
               -e '/^\\unrestrict /d' \
         >> "$TMP"
@@ -158,6 +163,8 @@ else
     pg_dump -h "$HOST" -p "$PORT" -U "$PG_USER" -d "$DUMP_DB" "${PG_DUMP_ARGS[@]}" \
         | sed -e '/^-- Started on /d' \
               -e '/^-- Completed on /d' \
+              -e '/^-- Dumped from database version /d' \
+              -e '/^-- Dumped by pg_dump version /d' \
               -e '/^\\restrict /d' \
               -e '/^\\unrestrict /d' \
         >> "$TMP"

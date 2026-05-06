@@ -1,4 +1,4 @@
-import { useCallback, useReducer, useRef, useEffect, type RefObject } from "react";
+import { useCallback, useMemo, useReducer, useRef, useEffect, type RefObject } from "react";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import { instanceStorage } from "@/lib/instance-storage";
@@ -116,6 +116,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
     terminalRefs: terminalRefsRef,
     pageId,
     markReconnected,
+    renameTab,
   } = useTerminalCore();
   // terminalRefsRef holds a stable Map<tabId, ref> — it's a per-tab ref cache
   // that's written by TerminalInstance's ref callbacks, not state that drives
@@ -137,6 +138,24 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
   const activityData = stateTracking.activityData;
   const onOutput = stateTracking.handleOutput;
   const onReconnected = markReconnected;
+  /**
+   * Layer 4 polish (OSC 0/2 title): plumb the latest title from the Rust
+   * grid up to the tab title via `renameTab`. The title field is already
+   * surfaced in `GridSnapshot` (parsed by `vte::Perform::osc_dispatch` in
+   * `src-tauri/src/terminal/grid.rs`); this is the wire-up.
+   *
+   * Skip empty / whitespace-only titles defensively. The TerminalInstance
+   * de-dupes against its last-reported value, so this fires at most once
+   * per real title change despite the 200ms idle repaint cadence.
+   */
+  const onTitleChange = useCallback(
+    (tabId: string, title: string) => {
+      const trimmed = title.trim();
+      if (!trimmed) return;
+      renameTab(tabId, trimmed);
+    },
+    [renameTab],
+  );
   const { labelsAndTags, incrementMetric: _incrementMetric } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;
   const onSetZoneLabel = labelsAndTags.setZoneLabel;
@@ -241,8 +260,29 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
     [onZoneClick],
   );
 
-  const unassignedTabs = tabs.filter((t) => !Object.values(assignments).includes(t.id));
-  const unassignedTerminals = unassignedTabs.filter((t) => t.type !== "plan");
+  // Layer 1 of plans/terminal-grid-bootstrap-redesign.md — exclusive
+  // classification per render. Without this, a tab can briefly satisfy
+  // BOTH the unassigned (HiddenTerminal) and assigned (inline visible)
+  // mount paths during a single React render pass — two TerminalInstance
+  // subtrees mount, both register the same terminal-input-<id> with the
+  // UI Bridge and listen on the same terminal-output Tauri event, and
+  // their lifecycle effects evict each other. Centralizing classification
+  // in one Map keyed off `assignments` guarantees that for any tab.id,
+  // exactly one of {visible inline, hidden} renders per render pass.
+  const tabClassification = useMemo(() => {
+    const m = new Map<string, "assigned" | "hidden">();
+    const assignedIds = new Set(
+      Object.values(assignments).filter((id): id is string => id != null),
+    );
+    for (const t of tabs) {
+      m.set(t.id, assignedIds.has(t.id) ? "assigned" : "hidden");
+    }
+    return m;
+  }, [tabs, assignments]);
+
+  const unassignedTerminals = tabs.filter(
+    (t) => tabClassification.get(t.id) === "hidden" && t.type !== "plan",
+  );
 
   const renderHiddenTabs = (extraTabs: TerminalTab[]) =>
     extraTabs.map((tab) => (
@@ -255,6 +295,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
         onShellIntegration={onShellIntegration}
         onOutput={onOutput}
         onReconnected={onReconnected}
+        onTitleChange={onTitleChange}
       />
     ));
 
@@ -282,6 +323,12 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
           const zoneTabId = assignments[zoneIdx];
           const zoneTab = tabs.find((t) => t.id === zoneTabId);
           if (!zoneTab) return null;
+          // Layer 1 invariant: only render the visible inline TerminalInstance
+          // when the centralized classification agrees this tab is "assigned".
+          // If classification still says "hidden" (e.g. assignments updated mid
+          // render before the memo recomputed for this tab), defer the visible
+          // mount so the hidden mount stays the sole owner this render pass.
+          if (tabClassification.get(zoneTab.id) !== "assigned") return null;
 
           const isVisible = zoneIdx === singleViewZone;
           const ref = terminalRefs.get(zoneTab.id);
@@ -305,6 +352,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
                   onFirstInput={(input) => onFirstInput(zoneTab.id, input)}
                   onShellIntegration={(event) => onShellIntegration(zoneTab.id, event)}
                   onOutput={(text) => onOutput(zoneTab.id, text)}
+                  onTitleChange={(title) => onTitleChange(zoneTab.id, title)}
                 />
               )}
             </div>
@@ -337,6 +385,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
           zoneIdx={zoneIdx}
           tabs={tabs}
           assignments={assignments}
+          tabClassification={tabClassification}
           focusedZone={focusedZone}
           sessionStates={sessionStates}
           lastOutputLines={lastOutputLines}
@@ -348,6 +397,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
           onShellIntegration={onShellIntegration}
           onOutput={onOutput}
           onReconnected={onReconnected}
+          onTitleChange={onTitleChange}
           onAssignTab={onAssignTab}
           flashingTabs={flashingTabs}
           stateDurations={stateDurations}
@@ -555,6 +605,7 @@ function ZoneCell({
   zoneIdx,
   tabs,
   assignments,
+  tabClassification,
   focusedZone,
   sessionStates,
   lastOutputLines,
@@ -566,6 +617,7 @@ function ZoneCell({
   onShellIntegration,
   onOutput,
   onReconnected,
+  onTitleChange,
   onAssignTab,
   flashingTabs,
   stateDurations,
@@ -606,6 +658,7 @@ function ZoneCell({
   zoneIdx: number;
   tabs: TerminalTab[];
   assignments: ZoneAssignments;
+  tabClassification: Map<string, "assigned" | "hidden">;
   focusedZone: number;
   sessionStates: Record<string, SessionState>;
   lastOutputLines: Record<string, string[]>;
@@ -617,6 +670,7 @@ function ZoneCell({
   onShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
   onOutput: (tabId: string, text: string) => void;
   onReconnected: (tabId: string) => void;
+  onTitleChange: (tabId: string, title: string) => void;
   onAssignTab?: (zoneIndex: number, tabId: string) => void;
   flashingTabs?: Set<string>;
   stateDurations?: Record<string, string>;
@@ -969,17 +1023,25 @@ function ZoneCell({
                       : undefined,
               }}
             >
-              <TerminalInstance
-                ref={terminalRefs.get(tab.id)}
-                terminalId={tab.id}
-                visible={!useCompact}
-                isReconnecting={tab.isReconnecting}
-                onReconnected={() => onReconnected(tab.id)}
-                onExit={(code) => onExit(tab.id, code)}
-                onFirstInput={(input) => onFirstInput(tab.id, input)}
-                onShellIntegration={(event) => onShellIntegration(tab.id, event)}
-                onOutput={(text) => onOutput(tab.id, text)}
-              />
+              {/* Layer 1 invariant: only mount the inline visible TerminalInstance
+                  when the centralized classification agrees this tab is "assigned".
+                  Otherwise the hidden mount (rendered by renderHiddenTabs) is the
+                  sole owner this render pass — preventing the dual-mount race that
+                  evicts UI Bridge registrations and leaves blank panes. */}
+              {tabClassification.get(tab.id) === "assigned" && (
+                <TerminalInstance
+                  ref={terminalRefs.get(tab.id)}
+                  terminalId={tab.id}
+                  visible={!useCompact}
+                  isReconnecting={tab.isReconnecting}
+                  onReconnected={() => onReconnected(tab.id)}
+                  onExit={(code) => onExit(tab.id, code)}
+                  onFirstInput={(input) => onFirstInput(tab.id, input)}
+                  onShellIntegration={(event) => onShellIntegration(tab.id, event)}
+                  onOutput={(text) => onOutput(tab.id, text)}
+                  onTitleChange={(title) => onTitleChange(tab.id, title)}
+                />
+              )}
             </div>
           )}
         </>
