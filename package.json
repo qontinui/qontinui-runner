@@ -7,7 +7,7 @@
     "@qontinui/navigation": "^0.1.0",
     "@qontinui/shared-types": "^0.2.3",
     "@qontinui/ui-bridge": "^0.3.2",
-    "@qontinui/ui-bridge-auto": "^0.1.4",
+    "@qontinui/ui-bridge-auto": "^0.1.5",
     "@qontinui/workflow-ui": "^0.1.0",
     "@qontinui/workflow-utils": "^0.1.0",
     "@radix-ui/react-dialog": "^1.1.15",

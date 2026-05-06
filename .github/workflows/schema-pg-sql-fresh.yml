@@ -51,21 +51,16 @@ jobs:
       - name: Checkout qontinui-web (sibling)
         uses: actions/checkout@v4
         with:
-          # Hardcoded to jspinak/qontinui-web because the repo was
-          # transferred from the qontinui org to the jspinak account.
-          # `${{ github.repository_owner }}/qontinui-web` resolved to
-          # `qontinui/qontinui-web` (since this repo lives in the
-          # qontinui org) and the HTTPS clone returns 404 — GitHub's
-          # repo-rename redirect doesn't help when the cross-repo token
-          # only has access to jspinak/*.
-          repository: jspinak/qontinui-web
+          repository: qontinui/qontinui-web
           path: qontinui-web
           # Use the same branch name if it exists in qontinui-web,
           # otherwise main. Avoids drift when both repos move together.
-          ref: ${{ github.head_ref || github.ref_name }}
-          # CROSS_REPO_TOKEN must have Contents:Read on jspinak/qontinui-web
-          # (qontinui-web is private). Falling back to github.token will fail.
-          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          # The `|| 'main'` fallback is required: if the PR's branch
+          # name doesn't exist on qontinui-web, actions/checkout's
+          # bare `head_ref` resolves to a 404 before alembic ever runs
+          # (the workflow's own comment promised the main fallback but
+          # didn't implement it).
+          ref: ${{ github.head_ref || github.ref_name || 'main' }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -76,7 +71,14 @@ jobs:
         working-directory: qontinui-web/backend
         run: |
           python -m pip install --upgrade pip
-          pip install alembic sqlalchemy psycopg2-binary python-dotenv
+          # `pgvector` is required because three migrations
+          # (05a366f58455_initial_schema_squashed.py,
+          # a84bf9dcb2dc_add_text_embedding_to_project_embeddings.py,
+          # b5c6d7e8f9a0_add_semantic_search_embeddings.py) do
+          # `from pgvector.sqlalchemy import Vector` at module
+          # import time. Without it, `alembic upgrade head` blows
+          # up with `ImportError` before the schema-diff step.
+          pip install alembic sqlalchemy psycopg2-binary pgvector python-dotenv
 
       - name: Apply alembic chain
         working-directory: qontinui-web/backend

@@ -184,17 +184,24 @@ A PR is ready to merge when every required workflow is green on the PR's HEAD co
 
 ### What "main is green" means here
 
-This repo has six workflows. They split into two tiers by trigger type:
+This repo has five workflows in `.github/workflows/`. They split into two tiers by trigger type:
 
 **Merge gates** (must be green on your PR before merge):
 
-- `ci.yml` — runs on PR + push to `main`. The big one: build frontend, format/lint Rust, run Rust tests, build Tauri app. Each platform leg (`ubuntu-22.04`, `windows-latest`, `macos-latest`) must be either green **or** linked to a tracked open issue documenting an upstream-runner block (see "Platform escape valve" below). The escape valve is for hosted-runner pathologies you can't fix in the PR (e.g. rustc crashing on the GitHub `windows-latest` image), not for "tests are flaky, ignore."
-- `forbid-runner-schema.yml` — runs on PR + push to `main`. Cheap, fast, no excuse for letting it go red.
-- `spec-pairing.yml` — PR-only with a paths filter. Required when your PR touches the paths it watches (`*.spec.uibridge.json` and friends); otherwise it doesn't run and isn't a gate for that PR.
+- `ci.yml` — runs on PR + push to `main` and `develop` (`.github/workflows/ci.yml:3-7`). Two jobs:
+  - `test` matrix (`ci.yml:13-189`) on `ubuntu-22.04`, `macos-latest`, `windows-latest`: clones sibling repos (`qontinui-schemas`, `jspinak/qontinui-web`), `pnpm install` + `pnpm run lint` + `pnpm run build`, then `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, and finally `pnpm run tauri build --debug --no-bundle`. Each platform leg must be either green **or** linked to a tracked open issue documenting an upstream-runner block (see "Platform escape valve" below). The escape valve is for hosted-runner pathologies you can't fix in the PR (e.g. rustc-LLVM crashing on the GitHub `windows-latest` image), not for "tests are flaky, ignore."
+  - `security` job (`ci.yml:191-228`) on `ubuntu-latest` only: `cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071` + `pnpm audit --audit-level=moderate`. Runs in parallel with the matrix; treated as part of the same `ci.yml` gate. Don't ignore it just because it's separate from the platform legs.
+- `forbid-runner-schema.yml` — runs on PR + push to `main` and `develop` (`.github/workflows/forbid-runner-schema.yml:21-25`). Cheap, fast, no excuse for letting it go red.
+
+> **Note on `spec-pairing.yml`**: a previous draft of this section claimed `spec-pairing.yml` is a path-triggered gate in this repo. It isn't — `spec-pairing.yml` lives in `jspinak/qontinui-web`, not in `qontinui-runner`. Don't expect to see it in this repo's PR checks.
 
 **Conditional gate** (currently being repaired):
 
-- `schema-pg-sql-fresh.yml` — PR-only with a paths filter. **Not a hard gate yet:** the workflow itself has open infra bugs (missing `pgvector` pip dep in its install step; `Checkout qontinui-web (sibling)` has no `main` fallback when the PR branch doesn't exist on the sibling repo). The schema-diff step has not actually executed in the recent runs that show "failed." Once those two infra fixes land, promote it to a hard gate. Until then, treat its red status as "workflow is broken, not your code."
+- `schema-pg-sql-fresh.yml` — `pull_request: [main]` + `workflow_dispatch`, paths-filtered to `src-tauri/queries/**` and `src-tauri/schema.pg.sql.generated` (`.github/workflows/schema-pg-sql-fresh.yml:18-25`). **Not a hard gate yet:** the workflow itself has open infra bugs:
+  - The `Install alembic dependencies` step (`schema-pg-sql-fresh.yml:75-79`) installs `alembic sqlalchemy psycopg2-binary python-dotenv` but **not `pgvector`** — and three alembic migrations in `qontinui-web/backend/alembic/versions/` (`05a366f58455_initial_schema_squashed.py:13`, `a84bf9dcb2dc_add_text_embedding_to_project_embeddings.py:13`, `b5c6d7e8f9a0_add_semantic_search_embeddings.py:27`) `from pgvector.sqlalchemy import Vector`. `alembic upgrade head` blows up with `ImportError` before reaching the schema-diff step.
+  - `Checkout qontinui-web (sibling)` (`schema-pg-sql-fresh.yml:51-68`) uses `ref: ${{ github.head_ref || github.ref_name }}` with no `|| 'main'` fallback. If the PR branch name doesn't exist on `jspinak/qontinui-web`, the checkout 404s before alembic ever runs.
+
+  The schema-diff step has not actually executed in the recent runs that show "failed." Once those two infra fixes land, promote it to a hard gate. Until then, treat its red status as "workflow is broken, not your code."
 
 **Not merge gates** (validated at release time, not PR time):
 
@@ -222,11 +229,11 @@ Don't add new exemptions casually. The escape valve exists so known-tracked bloc
 For the platforms you can run locally, run the relevant test before pushing — the feedback loop is much faster than waiting on CI, and a local failure means CI failure too. The reverse isn't always true: local can pass while CI fails on something CI-environment-specific (smaller memory budget on the hosted runner, runner-image regression, action vendor break — see "Platform escape valve"). So local-first is a productivity practice, not a CI replacement.
 
 ```bash
-# Frontend typecheck + build
-npm run build
+# Frontend lint + build (CI uses pnpm — match the lockfile, don't mix npm/pnpm)
+pnpm install --frozen-lockfile && pnpm run lint && pnpm run build
 
-# Rust format + check
-cd src-tauri && cargo fmt --check && cargo check --bin qontinui-runner
+# Rust format + clippy + check (clippy is gated with `-D warnings` in CI)
+cd src-tauri && cargo fmt -- --check && cargo clippy -- -D warnings && cargo check --bin qontinui-runner
 
 # Rust tests (the slow one — only when relevant)
 cd src-tauri && cargo test --bin qontinui-runner
@@ -270,10 +277,10 @@ Ideally, GitHub branch protection on `main` would mirror the merge-gate set abov
 
 ### Quick checklist before clicking merge
 
-- [ ] Local build / test passed on whatever platform you're authoring on (frontend build, `cargo fmt --check`, `cargo check`, relevant `cargo test`)
-- [ ] `ci.yml` green on each platform leg, OR red leg has a tracked exemption per "Platform escape valve" linked in the PR description
+- [ ] Local build / test passed on whatever platform you're authoring on (`pnpm install && pnpm run lint && pnpm run build`, `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo check`, relevant `cargo test`)
+- [ ] `ci.yml` `test` matrix green on each platform leg, OR red leg has a tracked exemption per "Platform escape valve" linked in the PR description
+- [ ] `ci.yml` `security` job green (cargo-audit + pnpm audit on ubuntu-latest)
 - [ ] `forbid-runner-schema.yml` green
-- [ ] `spec-pairing.yml` green if it ran (or didn't run because no paths matched)
 - [ ] `schema-pg-sql-fresh.yml` is not a hard gate yet — workflow itself is broken; ignore its red until the infra fixes land
 - [ ] Any new red compared against current `main` and either confirmed-not-yours-with-link or fixed
 - [ ] No open `ci/...` branch is doing the same work
