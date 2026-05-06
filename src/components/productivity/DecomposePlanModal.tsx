@@ -66,20 +66,31 @@ export function DecomposePlanModal({
   const [state, setState] = useState<FormState>(INITIAL);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  // Seed the path field whenever the modal opens — picks up parent's
-  // suggestion (e.g. most-recently-modified plan). Reset busy/result/
-  // error so a re-open after a previous run starts fresh.
-  useEffect(() => {
-    if (!open) return;
+  // Reset all form state on every closed → open transition so a re-open
+  // after a previous run starts fresh and picks up the parent's latest
+  // suggested plan path. Render-phase update guarded by a previous-open
+  // ref — React's recommended pattern for "reset state when a prop
+  // changes" (https://react.dev/learn/you-might-not-need-an-effect#resetting-all-state-when-a-prop-changes).
+  const prevOpenRef = useRef(open);
+  if (open && !prevOpenRef.current) {
+    prevOpenRef.current = true;
     setState({
       planPath: initialPlanPath ?? "",
       busy: false,
       result: null,
       error: null,
     });
+  } else if (!open && prevOpenRef.current) {
+    prevOpenRef.current = false;
+  }
+
+  // Focus the path input shortly after open. setTimeout defers past the
+  // initial render so the ref is attached before focus() runs.
+  useEffect(() => {
+    if (!open) return;
     const t = setTimeout(() => inputRef.current?.focus(), 50);
     return () => clearTimeout(t);
-  }, [open, initialPlanPath]);
+  }, [open]);
 
   // Esc-to-close.
   useEffect(() => {
