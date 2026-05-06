@@ -151,18 +151,33 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 mod tests {
     use super::*;
 
+    // These assertions all touch the same process-global env var
+    // (`QONTINUI_DEV_ENDPOINTS`), so they cannot run as separate
+    // `#[test]` functions — cargo's default thread pool would let them
+    // race against each other and against any other env-touching test
+    // in the suite. CI Windows hit exactly this race on PR #48 run
+    // 25424040391: `gate_off_returns_false` saw the var as `1` because a
+    // sibling test had set it concurrently. Bundling the assertions in
+    // one test and clearing the var at start + finally serializes them
+    // by construction.
     #[test]
-    fn gate_off_returns_false() {
-        // Ensure the gate is off for this test (no setter — we rely on the
-        // default test env not having QONTINUI_DEV_ENDPOINTS=1).
+    fn gate_reads_env_var() {
         std::env::remove_var(DEV_ENV_VAR);
-        assert!(!is_dev_endpoints_enabled());
-    }
+        assert!(
+            !is_dev_endpoints_enabled(),
+            "gate must be off when var unset"
+        );
 
-    #[test]
-    fn gate_on_returns_true() {
         std::env::set_var(DEV_ENV_VAR, "1");
-        assert!(is_dev_endpoints_enabled());
+        assert!(is_dev_endpoints_enabled(), "gate must be on when var=1");
+
+        std::env::set_var(DEV_ENV_VAR, "0");
+        assert!(!is_dev_endpoints_enabled(), "gate must be off when var!=1");
+
         std::env::remove_var(DEV_ENV_VAR);
+        assert!(
+            !is_dev_endpoints_enabled(),
+            "gate must be off when var unset (final)"
+        );
     }
 }

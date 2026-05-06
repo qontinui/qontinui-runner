@@ -1,4 +1,5 @@
 --- Canary rollout operations: rollouts, run records, prompt template canaries.
+--- Edited to trigger schema-pg-sql-fresh.yml (path filter is src-tauri/queries/**); see PR #44 + #46 for the gate that this validates.
 
 --! start_canary
 INSERT INTO canary_rollouts (
