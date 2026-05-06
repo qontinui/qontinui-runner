@@ -163,7 +163,10 @@ mod tests {
     #[test]
     fn gate_reads_env_var() {
         std::env::remove_var(DEV_ENV_VAR);
-        assert!(!is_dev_endpoints_enabled(), "gate must be off when var unset");
+        assert!(
+            !is_dev_endpoints_enabled(),
+            "gate must be off when var unset"
+        );
 
         std::env::set_var(DEV_ENV_VAR, "1");
         assert!(is_dev_endpoints_enabled(), "gate must be on when var=1");
@@ -172,6 +175,9 @@ mod tests {
         assert!(!is_dev_endpoints_enabled(), "gate must be off when var!=1");
 
         std::env::remove_var(DEV_ENV_VAR);
-        assert!(!is_dev_endpoints_enabled(), "gate must be off when var unset (final)");
+        assert!(
+            !is_dev_endpoints_enabled(),
+            "gate must be off when var unset (final)"
+        );
     }
 }
