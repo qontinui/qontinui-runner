@@ -435,8 +435,12 @@ mod manifest_drift_tests {
         // (axum allows chaining like get(h).delete(h2) on the same route).
         // Two passes: find each .route call, then within its body grep for
         // method-constructor calls.
+        // Allow `// ...` line comments between `.route(` and the URL literal
+        // (some entries annotate which plan phase introduced them — see e.g.
+        // `elements.rs::routes()` for the `state-summary` and `expect` routes).
         let route_open_re =
-            regex::Regex::new(r#"(?s)\.route\(\s*"(/ui-bridge/[^"]+)"\s*,"#).unwrap();
+            regex::Regex::new(r#"(?s)\.route\(\s*(?://[^\n]*\n\s*)*"(/ui-bridge/[^"]+)"\s*,"#)
+                .unwrap();
         let method_re = regex::Regex::new(r#"\b(get|post|put|delete|patch)\("#).unwrap();
 
         let mut source_routes: HashSet<(String, String)> = HashSet::new();
