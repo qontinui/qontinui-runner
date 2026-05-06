@@ -39,6 +39,8 @@ pub mod cascade;
 pub mod checks;
 pub mod command_relay;
 pub mod comparison_api;
+pub mod completion_reports;
+pub mod completion_sources;
 pub mod configs;
 pub mod constraints_api;
 pub mod container_status;
@@ -105,6 +107,7 @@ pub mod reviews;
 pub mod saved_api_requests;
 pub mod scheduler;
 pub mod sdk_client;
+pub mod sdk_terminal_buffer;
 pub mod security_audit;
 pub mod server;
 pub mod session_recap;
@@ -128,6 +131,13 @@ pub mod task_runs;
 pub mod tauri_proxy;
 pub mod terminals;
 pub mod testing;
+// Phase 5.1 of the UI Bridge discoverability/effectiveness plan:
+// debug-only `/ui-bridge/test/inject-session` + `/ui-bridge/test/clear-sessions`
+// for manual SessionCard-rendering tests. The cfg gate keeps the module
+// (and its routes) out of production release builds unless `test-fixtures`
+// is explicitly enabled.
+#[cfg(any(debug_assertions, feature = "test-fixtures"))]
+pub mod test_fixtures;
 pub mod token_analytics;
 pub mod trace_verification;
 pub mod transport;

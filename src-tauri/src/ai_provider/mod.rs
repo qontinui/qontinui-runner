@@ -22,6 +22,7 @@ pub(crate) mod gemma_local_warm;
 pub mod middleware;
 pub mod multimodal;
 pub(crate) mod oauth_refresh;
+pub mod oneshot;
 mod process;
 pub mod retry;
 pub(crate) mod routing;
@@ -34,6 +35,11 @@ pub use config::{
     rotate_account_on_rate_limit, set_resolved_config_dir, switch_to_account,
 };
 pub use multimodal::{ContentBlock, ImageSource, MultimodalPrompt};
+pub use oneshot::{
+    oneshot_for_settings, snapshot_oneshot_stats, OneshotClaudeApi, OneshotClaudeApiWarm,
+    OneshotDisabled, OneshotError, OneshotGeminiApi, OneshotLlm, OneshotLlmExt, OneshotLocal,
+    OneshotStats,
+};
 pub use routing::{
     run_prompt_multimodal, run_prompt_sync, run_prompt_with_middleware,
     run_prompt_with_model_override, run_prompt_with_model_override_multimodal,

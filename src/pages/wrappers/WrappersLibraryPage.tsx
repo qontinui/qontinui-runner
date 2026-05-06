@@ -16,9 +16,10 @@ import { listWrappers } from "@/lib/wrappers/api";
 import type { InstalledWrapper } from "@/lib/wrappers/types";
 import { InstalledTab } from "./InstalledTab";
 import { BrowseTab } from "./BrowseTab";
+import { AiClientsTab } from "./AiClientsTab";
 import { WrapperDetailPage } from "./WrapperDetailPage";
 
-type LibraryTab = "installed" | "browse";
+type LibraryTab = "installed" | "browse" | "clients";
 
 export function WrappersLibraryPage() {
   const [activeTab, setActiveTab] = useState<LibraryTab>("installed");
@@ -85,6 +86,9 @@ export function WrappersLibraryPage() {
             >
               Installed
             </TabButton>
+            <TabButton active={activeTab === "clients"} onClick={() => setActiveTab("clients")}>
+              AI Clients
+            </TabButton>
             <TabButton active={activeTab === "browse"} onClick={() => setActiveTab("browse")}>
               Browse
             </TabButton>
@@ -98,6 +102,8 @@ export function WrappersLibraryPage() {
             highlightedWrapperId={highlightedId}
             refreshKey={refreshKey}
           />
+        ) : activeTab === "clients" ? (
+          <AiClientsTab />
         ) : (
           <BrowseTab installedIds={installedIds} onInstalled={handleInstalled} />
         )}

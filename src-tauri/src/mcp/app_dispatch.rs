@@ -464,6 +464,7 @@ mod tests {
                 None,
                 AppTransport::Websocket,
                 Some(1),
+                None,
             )
             .await;
         let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
@@ -550,6 +551,7 @@ mod tests {
                 None,
                 AppTransport::Websocket,
                 Some(1),
+                None,
             )
             .await;
         let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
@@ -595,6 +597,7 @@ mod tests {
                 sample_app("happ", "http://127.0.0.1:0"),
                 None,
                 AppTransport::Http,
+                None,
                 None,
             )
             .await;

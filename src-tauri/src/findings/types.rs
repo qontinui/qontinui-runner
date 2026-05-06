@@ -6,12 +6,22 @@
 //! emits always exist in the generated types the backend consumes (and in
 //! the corresponding PG ENUMs), so drift is impossible at compile time.
 //!
+//! The Tauri event payload structs (`Finding`, `FindingCodeContext`,
+//! `FindingUserInput`) are re-exported from `qontinui_runner_lib::tauri_event_payloads`
+//! so the JSON-Schema → TypeScript pipeline (`schema_export::export_all_schemas`)
+//! sees the same Rust types the binary emits over the `finding_detected` /
+//! `finding_resolved` channels.
+//!
 //! The `as_str` / `from_str` / `is_terminal` helpers that runner code
 //! depends on are provided as an extension trait below, so callers keep
 //! calling `finding.category.as_str()` etc. unchanged. Free-function
 //! wrappers are also exposed for explicit call sites.
 
 use serde::{Deserialize, Serialize};
+
+pub use qontinui_runner_lib::tauri_event_payloads::{
+    Finding, FindingCodeContext, FindingUserInput,
+};
 
 pub use qontinui_types::task_run::{
     TaskRunFindingActionType as FindingActionType, TaskRunFindingCategory as FindingCategory,
@@ -159,61 +169,23 @@ impl FindingActionTypeExt for FindingActionType {
     }
 }
 
-/// Code context for a finding
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FindingCodeContext {
-    pub file: Option<String>,
-    pub line: Option<u32>,
-    pub column: Option<u32>,
-    pub snippet: Option<String>,
+// `Finding`, `FindingCodeContext`, `FindingUserInput` are re-exported above
+// from `qontinui_runner_lib::tauri_event_payloads`. That module is the wire-
+// format source of truth and is what the schema export pipeline binds.
+
+/// Inherent helpers for the [`Finding`] payload type.
+///
+/// Provided as an extension trait because the `Finding` struct lives in the
+/// library crate (`qontinui_runner_lib::tauri_event_payloads`) and these
+/// helpers depend on the runner-local `FindingCategoryExt` trait below.
+/// Call sites are unaffected: `finding.compute_signature_hash()` works as
+/// long as `FindingExt` is in scope.
+pub trait FindingExt {
+    fn compute_signature_hash(&self) -> String;
 }
 
-/// User input request for a finding
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FindingUserInput {
-    pub question: String,
-    #[serde(default = "default_input_type")]
-    pub input_type: String,
-    pub options: Option<Vec<String>>,
-}
-
-fn default_input_type() -> String {
-    "text".to_string()
-}
-
-/// A finding detected by AI analysis
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Finding {
-    pub id: String,
-    pub task_run_id: String,
-    pub session_num: u32,
-
-    #[serde(rename = "categoryId")]
-    pub category: FindingCategory,
-    pub severity: FindingSeverity,
-    pub status: FindingStatus,
-    pub action_type: FindingActionType,
-
-    pub title: String,
-    pub description: String,
-    pub resolution: Option<String>,
-
-    pub code_context: Option<FindingCodeContext>,
-    pub signature_hash: String,
-
-    pub user_input: Option<FindingUserInput>,
-    pub user_response: Option<String>,
-
-    pub detected_at: String,
-    pub resolved_at: Option<String>,
-    pub resolved_in_session: Option<u32>,
-    pub updated_at: String,
-}
-
-impl Finding {
-    /// Generate a signature hash for deduplication
-    pub fn compute_signature_hash(&self) -> String {
+impl FindingExt for Finding {
+    fn compute_signature_hash(&self) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 

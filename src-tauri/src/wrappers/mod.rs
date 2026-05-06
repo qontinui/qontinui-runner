@@ -24,9 +24,11 @@
 //! context so application bootstrap can construct it once and stash it on
 //! `commands::AppState`.
 
+pub mod clients;
 pub mod credentials;
 pub mod dispatch;
 pub mod install;
+pub mod launcher;
 pub mod manager;
 pub mod manifest;
 pub mod primary_proxy;

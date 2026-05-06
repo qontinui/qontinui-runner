@@ -25,6 +25,7 @@ import {
   VolumeOff,
   Wand2,
 } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
 import { DocFinderModal } from "./DocFinderModal";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
@@ -224,6 +225,17 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
   const isMultiZone = tabs.length > 1;
   const busy = isAnalyzing || isGenerating;
 
+  // UI Bridge: register the Sessions sidebar toggle so external clients can
+  // discover "what control unhides session-card-* / promote-to-worktree-* /
+  // commit-progress-*" via `GET /control/elements?revealsAny=session-card-*`
+  // without grepping source. See ui-bridge plan 2026-05-03 Phase 3.2.
+  const { ref: sessionsToggleRef } = useUIElement({
+    id: "button-browse-claude-code-sessions",
+    type: "button",
+    label: showSidebar ? "Hide session browser" : "Browse Claude Code sessions",
+    reveals: ["session-card-*", "promote-to-worktree-*", "commit-progress-*"],
+  });
+
   return (
     <div className="flex items-center gap-2 px-3 h-8 bg-[#13141f] border-b border-[#2a2d3d] shrink-0">
       {/* ── Left group (always visible) ─────────────────────────────── */}
@@ -235,6 +247,7 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
 
       {/* Sessions sidebar toggle */}
       <button
+        ref={sessionsToggleRef}
         onClick={onToggleSidebar}
         className={`
           flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors shrink-0
@@ -1023,20 +1036,29 @@ function MetricsPopover({
               </div>
             )}
             <div className="h-px bg-[#2a2d3d] my-1" />
+            <div
+              className="text-[9px] uppercase tracking-wider text-[#565f89] mb-1"
+              title="Live count of sessions currently in each state — does not indicate sessions have terminated"
+            >
+              Current state
+            </div>
             <div className="flex justify-between">
-              <span className="text-[#a9b1d6]">Currently working</span>
+              <span className="text-[#a9b1d6]">Working</span>
               <span className="text-[#7aa2f7] font-mono">{stateCounts.working}</span>
             </div>
             <div className="flex justify-between">
-              <span className="text-[#a9b1d6]">Currently waiting</span>
+              <span className="text-[#a9b1d6]">Waiting for input</span>
               <span className="text-[#e0af68] font-mono">{stateCounts["needs-input"]}</span>
             </div>
-            <div className="flex justify-between">
-              <span className="text-[#a9b1d6]">Completed</span>
+            <div
+              className="flex justify-between"
+              title="Session is alive and awaiting the next prompt (last response finished). Does not mean the session has terminated."
+            >
+              <span className="text-[#a9b1d6]">Idle (done responding)</span>
               <span className="text-[#9ece6a] font-mono">{stateCounts.completed}</span>
             </div>
             <div className="flex justify-between">
-              <span className="text-[#a9b1d6]">Errors</span>
+              <span className="text-[#a9b1d6]">Errored</span>
               <span className="text-[#f7768e] font-mono">{stateCounts.error}</span>
             </div>
             {stateTimeAccum &&

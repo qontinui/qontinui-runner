@@ -34,3 +34,74 @@ export async function getUpcomingClaims(planId: string | null = null): Promise<U
 export async function checkPathClaims(paths: string[]): Promise<Record<string, UpcomingClaim[]>> {
   return invoke<Record<string, UpcomingClaim[]>>("check_path_claims", { paths });
 }
+
+// ----------------------------------------------------------------------------
+// Decompose Plan — Phase 3 (in-product /decompose-plan replacement)
+// ----------------------------------------------------------------------------
+
+/**
+ * Result returned by the `decompose_plan` Tauri command. `idempotentSkip`
+ * is true when the plan was already decomposed at this hash; `stamped` is
+ * true when a fresh `<!-- decomposed: -->` marker was appended to the
+ * markdown.
+ */
+export interface DecomposeResult {
+  planId: string;
+  taskCount: number;
+  versionHash: string;
+  idempotentSkip: boolean;
+  stamped: boolean;
+}
+
+/**
+ * Decompose a plan markdown file into the in-product task graph. Reads
+ * the file, asks the active LLM provider to identify phases/tasks/
+ * claims/dependencies, then POSTs the structured payload to the runner's
+ * `/plans/decompose` endpoint. Throws on any failure — callers should
+ * catch and inspect the message for the "Configure an LLM provider…"
+ * affordance string.
+ */
+export async function decomposePlan(planPath: string): Promise<DecomposeResult> {
+  return invoke<DecomposeResult>("decompose_plan", { planPath });
+}
+
+// ----------------------------------------------------------------------------
+// Auto-Review — Phase 4 (in-product /auto-review replacement)
+// ----------------------------------------------------------------------------
+
+/** Result returned by the `auto_review_task` Tauri command. */
+export interface ReviewResult {
+  reviewId: string;
+  verdict: string;
+  confidence: number;
+}
+
+/**
+ * Run an auto-review against `taskId`. Persists a `reviews` row and emits
+ * the `review-completed` Tauri event so ReviewBadge updates.
+ *
+ * Throws when the LLM provider isn't configured — the error message is
+ * prefixed with "LLM provider not configured" so the caller can render a
+ * link to Settings → AI rather than a generic failure toast.
+ */
+export async function autoReviewTask(taskId: string): Promise<ReviewResult> {
+  return invoke<ReviewResult>("auto_review_task", { taskId });
+}
+
+// ----------------------------------------------------------------------------
+// Briefing preview — Phase 4 of productivity-coordinator-completion-reports.
+// ----------------------------------------------------------------------------
+
+/**
+ * Server-side rendered preview of the assignment-brief Markdown that Rule B
+ * will inject into the worker's first message for `taskId`. Returns the
+ * empty string when no brief would be composed (no upstreams stashed and no
+ * resume-from-pause audit row).
+ *
+ * The Rust handler calls `coordinator::act::build_assignment_brief`, the
+ * exact function used by the `AssignTask` apply branch — so the preview is,
+ * by construction, identical to what the worker will see.
+ */
+export async function previewAssignmentBrief(taskId: string): Promise<string> {
+  return invoke<string>("preview_assignment_brief", { taskId });
+}

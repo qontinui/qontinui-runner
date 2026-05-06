@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { AppEvent } from "@qontinui/shared-types/tauri-events";
 import type {
   WorkflowTrigger,
   TriggerHistoryEntry,
@@ -8,6 +9,19 @@ import type {
   UpdateTriggerRequest,
 } from "../types/triggers";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+
+/**
+ * Narrow `AppEvent` to a single variant by `event_type` discriminator.
+ *
+ * Wire shape: `AppEvent` is serialized via
+ * `#[serde(tag = "event_type", content = "data")]`, so each variant is
+ * `{ event_type: "<Name>", data: {...} }`. This helper picks the variant
+ * by name so `event.payload.data.<field>` is type-safe at the call site.
+ */
+type AppEventOf<T extends AppEvent["event_type"]> = Extract<
+  AppEvent,
+  { event_type: T }
+>;
 
 interface ApiResponse<T> {
   success: boolean;
@@ -279,8 +293,15 @@ export function useTriggers(autoRefreshMs = 30000): UseTriggersReturn {
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
 
-    listen<{ task_run_id: string; status: string }>("task-run-update", (event) => {
-      const { status: taskStatus } = event.payload;
+    // `AppEvent::TaskRunUpdate` is serialized via
+    //   #[serde(tag = "event_type", content = "data")]
+    // so the wire payload is `{ event_type: "TaskRunUpdate", data: {...} }`.
+    // Reading `event.payload.status` directly silently evaluates to undefined.
+    // The generated `AppEvent` type encodes that envelope; narrowing with
+    // `AppEventOf<"TaskRunUpdate">` makes `event.payload.data.status`
+    // type-safe and breaks the build if the Rust shape drifts.
+    listen<AppEventOf<"TaskRunUpdate">>("task-run-update", (event) => {
+      const taskStatus = event.payload.data?.status;
       // Refresh triggers when a task run completes/fails (could update trigger_count, last_triggered_at)
       if (taskStatus === "completed" || taskStatus === "failed") {
         refreshRef.current();

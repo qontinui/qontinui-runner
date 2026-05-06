@@ -25,6 +25,19 @@ pub struct TranscriptSession {
     pub first_message_preview: Option<String>, // first ~80 chars of first user message
     pub has_plans: bool,                       // true if any message has planContent
     pub display_name: String,                  // human-readable title derived from content
+    /// Optional override for the frontend's computed `liveStatus`.
+    ///
+    /// `None` for real on-disk transcripts (the field is omitted from the
+    /// serialized JSON via `skip_serializing_if`, preserving the legacy wire
+    /// shape for every existing consumer). `Some(...)` is set only by the
+    /// debug-gated test-fixtures path (`mcp::test_fixtures`) when an injected
+    /// fake session is projected into this struct so that
+    /// `useSessionManager` can render Promote / Commit buttons without a
+    /// real PTY tab. Accepted values mirror the
+    /// `SessionLiveStatus` enum on the frontend
+    /// (`active-in-zone | needs-input | frozen | …`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injected_live_status: Option<String>,
 }
 
 /// A single parsed message from a Claude Code transcript.
@@ -274,6 +287,9 @@ pub fn list_sessions(
             first_message_preview,
             has_plans,
             display_name,
+            // Real on-disk sessions never carry a status override; the
+            // frontend computes `liveStatus` from tab/digest correlation.
+            injected_live_status: None,
         };
 
         if let Some(mt) = mtime {
@@ -556,6 +572,8 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                         first_message_preview,
                         has_plans,
                         display_name,
+                        // Real on-disk session — no override.
+                        injected_live_status: None,
                     });
                 }
             }

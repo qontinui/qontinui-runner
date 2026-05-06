@@ -137,4 +137,5 @@ target-validate/
 target-run/
 .build-state/
 target-rebuild/
+target-types-task/
 *.log.err

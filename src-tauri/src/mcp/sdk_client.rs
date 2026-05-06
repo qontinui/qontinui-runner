@@ -302,6 +302,50 @@ pub async fn sdk_request(
         .map_err(dispatch_err_to_string)
 }
 
+/// Pick the right payload for a per-app-id dispatch based on the registered
+/// transport. Extracted so unit tests can verify the WS-vs-HTTP decision
+/// without building a full `ApiState`.
+async fn select_app_payload(
+    registry: &super::app_registry::AppRegistry,
+    app_id: &str,
+    ws_payload: serde_json::Value,
+    http_body: Option<serde_json::Value>,
+) -> serde_json::Value {
+    match registry.get(app_id).await.map(|e| e.transport) {
+        Some(AppTransport::Websocket) => ws_payload,
+        _ => http_body.unwrap_or(serde_json::Value::Null),
+    }
+}
+
+/// Dispatch directly to a specific registered app by `app_id`, bypassing the
+/// active-SDK-connection probe.
+///
+/// Used by handlers that accept a `?app_id=<...>` query param so callers can
+/// drive a wrapper without first making it the active SDK connection — the
+/// per-app-id half of Item A of the wrapper-framework Phase 1.5 plan. Picks
+/// the right payload (`ws_payload` for WS-transport apps, `http_body` for
+/// HTTP-transport apps) based on the registry's transport entry, then
+/// delegates to `AppDispatcher::dispatch`.
+///
+/// `http_body` falls back to `serde_json::Value::Null` when `None` to match
+/// the existing convention in `dispatch_app_request`.
+pub async fn dispatch_app_request_by_id(
+    state: &Arc<ApiState>,
+    app_id: &str,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let payload = select_app_payload(&state.app_registry, app_id, ws_payload, http_body).await;
+    state
+        .app_dispatcher
+        .dispatch(app_id, action, http_method, http_path, payload)
+        .await
+        .map_err(dispatch_err_to_string)
+}
+
 // =============================================================================
 // Handlers
 // =============================================================================
@@ -1099,6 +1143,11 @@ async fn handle_element_action(
 /// GET /ui-bridge/sdk/snapshot — Full UI snapshot
 ///
 /// Falls back to the runner's own control endpoint when no SDK app is connected.
+///
+/// When `?app_id=<...>` is present, snapshot the named registered app
+/// directly (via `AppDispatcher::dispatch`) instead of relying on the
+/// active SDK connection. Mirrors the per-app-id query param accepted by
+/// `handle_component_action`.
 async fn handle_snapshot(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<HashMap<String, String>>,
@@ -1115,6 +1164,32 @@ async fn handle_snapshot(
     } else {
         "/control/snapshot".to_string()
     };
+
+    // Per-app-id dispatch: route to the named registered app and skip
+    // both the active-SDK-connection probe and the IPC fallback (the
+    // caller asked for a specific app — silently falling back would mask
+    // the real failure mode).
+    if let Some(app_id) = query.get("app_id").map(|s| s.as_str()) {
+        return match dispatch_app_request_by_id(
+            &state,
+            app_id,
+            "getControlSnapshot",
+            ws_payload,
+            Method::GET,
+            &path,
+            None,
+        )
+        .await
+        {
+            Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "success": false, "error": e })),
+            )
+                .into_response(),
+        };
+    }
+
     match dispatch_app_request(
         &state,
         "getControlSnapshot",
@@ -1276,7 +1351,7 @@ async fn handle_component(
                 Some(c) => Json(serde_json::json!({ "success": true, "data": c })),
                 None => Json(serde_json::json!({
                     "success": false,
-                    "error": format!("Component '{}' not found", id),
+                    "error": build_component_not_found_message(&id, &snapshot),
                 })),
             };
         }
@@ -1289,6 +1364,13 @@ async fn handle_component(
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
 }
+
+// Phase 1.1 (plan 2026-05-03) — `build_component_not_found_message` was
+// extracted to `mcp::ui_bridge::component_errors` so the runner's two
+// component-not-found code paths (this `/ui-bridge/sdk/component/:id`
+// wrapper and the inner `/ui-bridge/control/component/:id` handler in
+// `mcp/ui_bridge/elements.rs`) emit byte-identical error bodies.
+use crate::mcp::ui_bridge::component_errors::build_component_not_found_message;
 
 /// GET /ui-bridge/sdk/console-errors — Get console errors from SDK app
 async fn handle_console_errors(
@@ -3615,9 +3697,16 @@ async fn handle_component_state(
 }
 
 /// POST /ui-bridge/sdk/component/:id/action/:actionId — Execute component action
+///
+/// When `?app_id=<...>` is present, dispatch directly to that registered app
+/// (via `AppDispatcher::dispatch`, which routes by the registered transport)
+/// instead of going through the active SDK connection. This is the
+/// per-app-id entry point the wrapper framework uses to talk to a specific
+/// wrapper without making it the active SDK connection.
 async fn handle_component_action(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: if the active app registered via WebSocket,
@@ -3630,6 +3719,26 @@ async fn handle_component_action(
     });
 
     let path = format!("/control/component/{}/action/{}", id, action_id);
+
+    // Per-app-id dispatch: skip the active-SDK-connection probe and route
+    // straight to the named registered app.
+    if let Some(app_id) = query.get("app_id").map(|s| s.as_str()) {
+        return match dispatch_app_request_by_id(
+            &state,
+            app_id,
+            "executeComponentAction",
+            ws_payload,
+            Method::POST,
+            &path,
+            Some(body),
+        )
+        .await
+        {
+            Ok(data) => Json(data),
+            Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        };
+    }
+
     match dispatch_app_request(
         &state,
         "executeComponentAction",
@@ -4783,6 +4892,41 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Screenshot (monitor capture for SDK apps that can't self-screenshot)
         .route("/ui-bridge/sdk/screenshot", get(handle_screenshot))
+        // Terminal buffer readback — returns the rendered text rows from
+        // the server-side cell grid, so callers can verify content of
+        // canvas-rendered terminals without taking a screenshot.
+        .route(
+            "/ui-bridge/sdk/terminal/sessions/{session_id}/buffer",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_buffer),
+        )
+        // Terminal grid snapshot — full cell-level state for callers that
+        // want fg/bg/attrs alongside the rendered text.
+        .route(
+            "/ui-bridge/sdk/terminal/sessions/{session_id}/grid",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_grid),
+        )
+        // Terminal text snapshot — compact text-only view for verifiers
+        // (the agentic verification module's primary terminal-state
+        // input) and external tools that don't need cell colors.
+        .route(
+            "/ui-bridge/sdk/terminal/sessions/{session_id}/text",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_text),
+        )
+        // Terminal grid search — substring or regex match across one
+        // session (?session_id=...) or all active sessions (omit it).
+        // Powers cell-content assertions in UI Bridge specs and any
+        // automated test that needs to find rendered text.
+        .route(
+            "/ui-bridge/sdk/terminal/search",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_search),
+        )
+        // Cross-session terminal diff — row-by-row added/removed/modified
+        // between two grids. Use case: split-pane parity assertions,
+        // before/after action snapshots in agentic verification.
+        .route(
+            "/ui-bridge/sdk/terminal/sessions/{a_id}/diff/{b_id}",
+            get(crate::mcp::sdk_terminal_buffer::handle_terminal_diff),
+        )
         // Components
         .route("/ui-bridge/sdk/components", get(handle_components))
         .route("/ui-bridge/sdk/component/{id}", get(handle_component))
@@ -6198,5 +6342,111 @@ mod tests {
                 name
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Per-app-id payload selection (Item A — `?app_id=` query param)
+    // ------------------------------------------------------------------
+
+    use crate::mcp::app_discovery::DiscoveredApp;
+    use crate::mcp::app_registry::{AppRegistry, AppTransport};
+
+    fn sample_discovered(app_id: &str) -> DiscoveredApp {
+        DiscoveredApp {
+            app_id: app_id.to_string(),
+            app_name: "T".into(),
+            app_type: "web".into(),
+            framework: None,
+            url: "http://127.0.0.1:0".into(),
+            port: 0,
+            base_path: "".into(),
+            version: None,
+            capabilities: vec![],
+            element_count: None,
+            component_count: None,
+            discovered_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn select_app_payload_ws_transport_uses_ws_payload() {
+        let registry = AppRegistry::new();
+        registry
+            .upsert(
+                sample_discovered("wapp"),
+                None,
+                AppTransport::Websocket,
+                Some(1),
+                None,
+            )
+            .await;
+
+        let ws_payload = serde_json::json!({"componentId": "btn", "actionId": "click"});
+        let http_body = serde_json::json!({"raw": "body"});
+        let chosen = select_app_payload(
+            &registry,
+            "wapp",
+            ws_payload.clone(),
+            Some(http_body.clone()),
+        )
+        .await;
+        assert_eq!(
+            chosen, ws_payload,
+            "WS-transport apps must receive ws_payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_app_payload_http_transport_uses_http_body() {
+        let registry = AppRegistry::new();
+        registry
+            .upsert(
+                sample_discovered("happ"),
+                None,
+                AppTransport::Http,
+                None,
+                None,
+            )
+            .await;
+
+        let ws_payload = serde_json::json!({"componentId": "btn", "actionId": "click"});
+        let http_body = serde_json::json!({"raw": "body"});
+        let chosen = select_app_payload(
+            &registry,
+            "happ",
+            ws_payload.clone(),
+            Some(http_body.clone()),
+        )
+        .await;
+        assert_eq!(
+            chosen, http_body,
+            "HTTP-transport apps must receive http_body"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_app_payload_missing_app_falls_back_to_http_body_or_null() {
+        let registry = AppRegistry::new();
+
+        // Caller passed Some(http_body) — use it.
+        let http_body = serde_json::json!({"raw": "body"});
+        let chosen = select_app_payload(
+            &registry,
+            "nope",
+            serde_json::json!({"never": "used"}),
+            Some(http_body.clone()),
+        )
+        .await;
+        assert_eq!(chosen, http_body);
+
+        // Caller passed None — fall back to Null (matches dispatch_app_request).
+        let chosen = select_app_payload(
+            &registry,
+            "nope",
+            serde_json::json!({"never": "used"}),
+            None,
+        )
+        .await;
+        assert_eq!(chosen, serde_json::Value::Null);
     }
 }

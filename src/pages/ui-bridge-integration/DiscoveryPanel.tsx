@@ -31,7 +31,7 @@ import {
   type DiscoveredApp as RegisteredDiscoveredApp,
   type RegisterAppPayload,
 } from "@/hooks/useAppDiscovery";
-import { emitToast } from "@qontinui/ui-bridge";
+import { emitToast, useUIComponent } from "@qontinui/ui-bridge";
 
 // =============================================================================
 // ProcessConfig type (from process manager)
@@ -686,6 +686,29 @@ function RegisteredAppCard({
   const hasRealUrl = !!app.url && !app.url.startsWith("ws://runner/");
   const selectTarget = isWrapper ? "" : app.url;
   const clickable = !isWrapper && !!onSelect && !!selectTarget;
+
+  // Expose registered-app metadata via the UI Bridge component registry so
+  // /control/component/registered-app:<appId> returns the full state without
+  // requiring DOM scrapes. Mirrors the existing data-ui-bridge-content content-
+  // element registration (kept below) — the two are complementary: the content
+  // attribute carries the visible card text, this hook carries the structured
+  // metadata.
+  useUIComponent({
+    id: `registered-app:${app.appId}`,
+    name: app.appName,
+    description: `Registered ${app.appType} app discovered by the UI Bridge integration panel`,
+    state: () => ({
+      appId: app.appId,
+      appName: app.appName,
+      framework: app.framework ?? null,
+      appType: app.appType,
+      transport: app.transport ?? "http",
+      url: app.url,
+      version: app.version ?? null,
+      isWrapper,
+      hasRealUrl,
+    }),
+  });
 
   const handleDeregister = useCallback(
     async (e: ReactMouseEvent) => {

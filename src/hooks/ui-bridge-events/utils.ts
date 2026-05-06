@@ -82,7 +82,14 @@ export function serializeElement(element: RegisteredElement): SerializedElement 
 }
 
 /**
- * Serialize a RegisteredComponent to a plain object
+ * Serialize a RegisteredComponent to a plain object.
+ *
+ * Phase 3.1 (plan 2026-05-03): forward the `scope` annotation so component
+ * listings on the runner carry the same discoverability hint the SDK
+ * documents. `undefined` is the documented default for `'route'` (see
+ * `RegisteredComponent.scope` JSDoc), so we materialize that default here
+ * rather than dropping the key. This guarantees clients can always read
+ * `component.scope` without ad-hoc `??= 'route'` plumbing.
  */
 export function serializeComponent(component: RegisteredComponent): SerializedComponent {
   return {
@@ -100,6 +107,7 @@ export function serializeComponent(component: RegisteredComponent): SerializedCo
     elementIds: component.elementIds,
     registeredAt: component.registeredAt,
     mounted: component.mounted,
+    scope: component.scope ?? "route",
   };
 }
 

@@ -22,6 +22,7 @@ import { TaskRunCostTable } from "./TaskRunCostTable";
 import { CostByTargetAppChart } from "./CostByTargetAppChart";
 import { AccountUsageCard } from "./AccountUsageCard";
 import { ScriptedOutputPanel } from "./ScriptedOutputPanel";
+import { OneshotPanel } from "./OneshotPanel";
 import { EmitterProviderControl } from "./EmitterProviderControl";
 
 const TIME_RANGE_OPTIONS: LlmTimeRange[] = ["1d", "7d", "30d", "all"];
@@ -193,6 +194,10 @@ export default function LlmObservabilityDashboard() {
             think-in-code path can record fallback/attempted events even when
             no LLM call has succeeded yet. */}
         <ScriptedOutputPanel />
+        {/* Sibling tile: one-shot LLM activity (productivity stack).
+            Empty until Phases 3/4/5 of productivity-stack-product-readiness
+            land — surfaces decompose-plan / auto-review / etc. activity. */}
+        <OneshotPanel />
       </div>
     );
   } else {
@@ -226,6 +231,8 @@ export default function LlmObservabilityDashboard() {
         <EmitterProviderControl />
         {/* Scripted-output (think-in-code) aggregates — Phase C of script-emitter-wiring */}
         <ScriptedOutputPanel />
+        {/* One-shot LLM aggregates — Phase 0 of productivity-stack-product-readiness */}
+        <OneshotPanel />
 
         {/* Charts Row 2 */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

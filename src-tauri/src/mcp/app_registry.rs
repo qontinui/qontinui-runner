@@ -54,6 +54,13 @@ pub struct RegisteredApp {
     /// If `transport == Websocket`, the `conn_id` of the active
     /// `/ui-bridge/ws` connection. `None` for HTTP apps.
     pub websocket_conn_id: Option<u64>,
+    /// Optional per-entry TTL override (in ms). When `Some(ms)`, the registry's
+    /// freshness check compares against `ms` instead of the global
+    /// `REGISTRATION_TTL_MS`. Useful for tests, scripts, and synthetic
+    /// injections that need entries to stay alive longer than the default
+    /// 30-second heartbeat window without sending heartbeats. `None` means
+    /// "use the global default."
+    pub keep_alive_ms: Option<i64>,
 }
 
 pub struct AppRegistry {
@@ -71,12 +78,16 @@ impl AppRegistry {
     /// must be consistent: `Websocket` requires `Some(conn_id)`, `Http`
     /// requires `None`. The caller (register handler / WS relay) is
     /// responsible for this invariant.
+    ///
+    /// `keep_alive_ms` is an optional per-entry TTL override (in ms). `None`
+    /// means "use the global `REGISTRATION_TTL_MS`."
     pub async fn upsert(
         &self,
         app: DiscoveredApp,
         origin: Option<String>,
         transport: AppTransport,
         websocket_conn_id: Option<u64>,
+        keep_alive_ms: Option<i64>,
     ) {
         let now = chrono::Utc::now().timestamp_millis();
         let mut w = self.inner.write().await;
@@ -88,6 +99,7 @@ impl AppRegistry {
                 last_seen_ms: now,
                 transport,
                 websocket_conn_id,
+                keep_alive_ms,
             },
         );
     }
@@ -120,23 +132,42 @@ impl AppRegistry {
         r.get(app_id).cloned()
     }
 
-    /// Returns entries that haven't been stale-evicted (last_seen_ms within TTL).
+    /// Returns entries that haven't been stale-evicted (last_seen_ms within
+    /// each entry's TTL — per-entry `keep_alive_ms` if set, else
+    /// `REGISTRATION_TTL_MS`).
     pub async fn list_live(&self) -> Vec<RegisteredApp> {
         let now = chrono::Utc::now().timestamp_millis();
         let r = self.inner.read().await;
         r.values()
-            .filter(|e| now - e.last_seen_ms <= REGISTRATION_TTL_MS)
+            .filter(|e| now - e.last_seen_ms <= e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS))
             .cloned()
             .collect()
     }
 
-    /// Evict entries older than TTL. Returns the number of evicted entries.
+    /// Evict entries older than each entry's TTL (per-entry `keep_alive_ms`
+    /// if set, else `REGISTRATION_TTL_MS`). Returns the number of evicted
+    /// entries.
     pub async fn sweep(&self) -> usize {
         let now = chrono::Utc::now().timestamp_millis();
         let mut w = self.inner.write().await;
         let before = w.len();
-        w.retain(|_, e| now - e.last_seen_ms <= REGISTRATION_TTL_MS);
+        w.retain(|_, e| now - e.last_seen_ms <= e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS));
         before - w.len()
+    }
+
+    /// Test-only helper that subtracts `delta_ms` from an entry's
+    /// `last_seen_ms` to simulate the passage of time. Returns `true` if the
+    /// entry exists. Used by integration tests in sibling modules
+    /// (`app_discovery`) to drive freshness math without sleeping.
+    #[cfg(test)]
+    pub async fn test_age_entry(&self, app_id: &str, delta_ms: i64) -> bool {
+        let mut w = self.inner.write().await;
+        if let Some(entry) = w.get_mut(app_id) {
+            entry.last_seen_ms -= delta_ms;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -209,14 +240,20 @@ mod tests {
     #[tokio::test]
     async fn upsert_http_then_upgrade_to_websocket() {
         let reg = AppRegistry::new();
-        reg.upsert(sample_app("a1"), None, AppTransport::Http, None)
+        reg.upsert(sample_app("a1"), None, AppTransport::Http, None, None)
             .await;
         let entry = reg.get("a1").await.unwrap();
         assert_eq!(entry.transport, AppTransport::Http);
         assert_eq!(entry.websocket_conn_id, None);
 
-        reg.upsert(sample_app("a1"), None, AppTransport::Websocket, Some(42))
-            .await;
+        reg.upsert(
+            sample_app("a1"),
+            None,
+            AppTransport::Websocket,
+            Some(42),
+            None,
+        )
+        .await;
         let entry = reg.get("a1").await.unwrap();
         assert_eq!(entry.transport, AppTransport::Websocket);
         assert_eq!(entry.websocket_conn_id, Some(42));
@@ -225,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn remove_returns_true_when_present() {
         let reg = AppRegistry::new();
-        reg.upsert(sample_app("a1"), None, AppTransport::Http, None)
+        reg.upsert(sample_app("a1"), None, AppTransport::Http, None, None)
             .await;
         assert!(reg.remove("a1").await);
         assert!(!reg.remove("a1").await);
@@ -234,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn list_live_filters_stale() {
         let reg = AppRegistry::new();
-        reg.upsert(sample_app("a1"), None, AppTransport::Http, None)
+        reg.upsert(sample_app("a1"), None, AppTransport::Http, None, None)
             .await;
         // Manually backdate the entry.
         {
@@ -247,8 +284,14 @@ mod tests {
     #[tokio::test]
     async fn touch_refreshes_last_seen_ms() {
         let reg = AppRegistry::new();
-        reg.upsert(sample_app("a1"), None, AppTransport::Websocket, Some(1))
-            .await;
+        reg.upsert(
+            sample_app("a1"),
+            None,
+            AppTransport::Websocket,
+            Some(1),
+            None,
+        )
+        .await;
         // Backdate so the entry is "stale" and would be filtered by list_live().
         {
             let mut w = reg.inner.write().await;
@@ -284,5 +327,85 @@ mod tests {
         );
         // Sanity: registry is still empty (touch doesn't create entries).
         assert!(reg.list_live().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn keep_alive_extends_freshness_beyond_default_ttl() {
+        let reg = AppRegistry::new();
+        // Register with a 5-minute keep-alive (300_000ms).
+        reg.upsert(
+            sample_app("long-lived"),
+            None,
+            AppTransport::Http,
+            None,
+            Some(300_000),
+        )
+        .await;
+
+        // Advance "synthetic time" past the global 30s TTL but well within
+        // the per-entry 5-minute override. The entry MUST still be live.
+        {
+            let mut w = reg.inner.write().await;
+            w.get_mut("long-lived").unwrap().last_seen_ms -= REGISTRATION_TTL_MS + 5_000;
+        }
+
+        let live = reg.list_live().await;
+        assert_eq!(
+            live.len(),
+            1,
+            "entry with 5min keep_alive must still be live after default TTL elapses"
+        );
+        assert_eq!(live[0].app.app_id, "long-lived");
+        assert_eq!(live[0].keep_alive_ms, Some(300_000));
+
+        // Sweep must NOT evict the entry either.
+        let evicted = reg.sweep().await;
+        assert_eq!(evicted, 0, "sweep must respect per-entry keep_alive_ms");
+        assert!(reg.get("long-lived").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn keep_alive_still_evicted_once_its_own_window_elapses() {
+        let reg = AppRegistry::new();
+        // Short 2s keep-alive.
+        reg.upsert(
+            sample_app("brief"),
+            None,
+            AppTransport::Http,
+            None,
+            Some(2_000),
+        )
+        .await;
+
+        // Push past 2s.
+        {
+            let mut w = reg.inner.write().await;
+            w.get_mut("brief").unwrap().last_seen_ms -= 2_500;
+        }
+
+        assert!(
+            reg.list_live().await.is_empty(),
+            "entry past its own keep_alive_ms must be filtered"
+        );
+        let evicted = reg.sweep().await;
+        assert_eq!(evicted, 1, "sweep must evict per-entry-stale entries");
+    }
+
+    #[tokio::test]
+    async fn keep_alive_none_uses_global_default() {
+        let reg = AppRegistry::new();
+        reg.upsert(sample_app("default"), None, AppTransport::Http, None, None)
+            .await;
+
+        // Backdate past the global TTL.
+        {
+            let mut w = reg.inner.write().await;
+            w.get_mut("default").unwrap().last_seen_ms -= REGISTRATION_TTL_MS + 1;
+        }
+
+        assert!(
+            reg.list_live().await.is_empty(),
+            "None keep_alive_ms must fall through to global default"
+        );
     }
 }

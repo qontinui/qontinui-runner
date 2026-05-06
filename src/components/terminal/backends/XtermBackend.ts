@@ -69,6 +69,10 @@ export class XtermBackend implements ITerminalBackend {
     this.term.dispose();
   }
 
+  reset(): void {
+    this.term.reset();
+  }
+
   focus(): void {
     this.term.focus();
   }

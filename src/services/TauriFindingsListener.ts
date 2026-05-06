@@ -11,6 +11,7 @@
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
+import type { RunnerFinding } from "@qontinui/shared-types/tauri-events";
 import type {
   Finding,
   FindingSeverity,
@@ -21,41 +22,17 @@ import type {
 import { findingsTracker } from "./FindingsTracker";
 
 /**
- * Payload from Rust for finding_detected event
+ * Wire payload for `finding_detected` / `finding_resolved` events.
+ *
+ * `RunnerFinding` is generated from the canonical Rust struct in
+ * `qontinui-runner/src-tauri/src/tauri_event_payloads.rs::Finding`. Future
+ * serde renames or shape changes break the TypeScript build at the call
+ * site instead of silently dropping events. The same wire shape covers
+ * both event channels (the Rust emit hands the entire `Finding` struct to
+ * both); the resolved listener only reads `id` / `resolution`.
  */
-interface FindingDetectedPayload {
-  id: string;
-  task_run_id: string;
-  session_num: number;
-  category: string;
-  severity: string;
-  status: string;
-  action_type: string;
-  title: string;
-  description: string;
-  resolution?: string;
-  file_path?: string;
-  line_number?: number;
-  column_number?: number;
-  code_snippet?: string;
-  signature_hash: string;
-  needs_input: boolean;
-  question?: string;
-  input_options?: string[];
-  user_response?: string;
-  detected_at: string;
-  resolved_at?: string;
-  resolved_in_session?: number;
-}
-
-/**
- * Payload from Rust for finding_resolved event
- */
-interface FindingResolvedPayload {
-  id: string;
-  task_run_id: string;
-  resolution?: string;
-}
+type FindingDetectedPayload = RunnerFinding;
+type FindingResolvedPayload = RunnerFinding;
 
 /**
  * Payload emitted by the dev-only `dev_seed_finding` Tauri command.
@@ -96,47 +73,55 @@ function seedPayloadToFinding(payload: DevSeedFindingPayload): Finding {
 }
 
 /**
- * Convert Rust payload to TypeScript Finding
+ * Convert Rust payload to TypeScript Finding.
+ *
+ * Rust ships `codeContext` and `userInput` as nested objects (not flattened
+ * snake_case fields) — see the Wire shape comment on `FindingDetectedPayload`.
  */
 function payloadToFinding(payload: FindingDetectedPayload): Finding {
-  // Note: Rust payload has column_number but frontend CodeContext doesn't use it
+  // Note: Rust payload exposes column on codeContext but frontend CodeContext doesn't use it.
+  // Generated `RunnerFindingCodeContext` uses `string | null | undefined` for nullable
+  // fields (Rust `Option<T>` with `skip_serializing_if`); coerce nulls to undefined to
+  // match the frontend `CodeContext` shape.
   const codeContext: CodeContext | undefined =
-    payload.file_path || payload.line_number
+    payload.codeContext && (payload.codeContext.file || payload.codeContext.line)
       ? {
-          file: payload.file_path,
-          line: payload.line_number,
-          snippet: payload.code_snippet,
+          file: payload.codeContext.file ?? undefined,
+          line: payload.codeContext.line ?? undefined,
+          snippet: payload.codeContext.snippet ?? undefined,
         }
       : undefined;
 
-  const actionType = payload.action_type as ActionType;
+  const actionType = payload.actionType as ActionType;
   const status = payload.status as FindingStatus;
   const severity = payload.severity as FindingSeverity;
 
   const finding: Finding = {
     id: payload.id,
-    categoryId: payload.category,
+    categoryId: payload.categoryId,
     severity,
     status,
     title: payload.title,
     description: payload.description,
-    sourceSessionId: payload.task_run_id,
-    detectedAt: new Date(payload.detected_at).getTime(),
+    sourceSessionId: payload.taskRunId,
+    detectedAt: new Date(payload.detectedAt).getTime(),
     actionType,
     actionable: actionType !== "informational",
     codeContext,
-    resolution: payload.resolution,
-    userResponse: payload.user_response,
+    resolution: payload.resolution ?? undefined,
+    userResponse: payload.userResponse ?? undefined,
   };
 
-  // Create pending question if needs_input
-  if (payload.needs_input && payload.question) {
+  // Create pending question if user_input is present (the Rust `Finding`
+  // sets `user_input: Some(_)` whenever a question is required; absence
+  // means no input requested).
+  if (payload.userInput && payload.userInput.question) {
     finding.pendingQuestion = {
       id: `q-${payload.id}`,
       findingId: payload.id,
-      question: payload.question,
-      inputType: payload.input_options ? "choice" : "text",
-      options: payload.input_options?.map((opt) => ({
+      question: payload.userInput.question,
+      inputType: payload.userInput.options ? "choice" : "text",
+      options: payload.userInput.options?.map((opt) => ({
         value: opt,
         label: opt,
       })),
@@ -144,8 +129,8 @@ function payloadToFinding(payload: FindingDetectedPayload): Finding {
     };
   }
 
-  if (payload.resolved_at) {
-    finding.resolvedAt = new Date(payload.resolved_at).getTime();
+  if (payload.resolvedAt) {
+    finding.resolvedAt = new Date(payload.resolvedAt).getTime();
   }
 
   return finding;

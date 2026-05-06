@@ -395,6 +395,7 @@ async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
             register.origin.clone(),
             AppTransport::Websocket,
             Some(conn_id),
+            None,
         )
         .await;
 

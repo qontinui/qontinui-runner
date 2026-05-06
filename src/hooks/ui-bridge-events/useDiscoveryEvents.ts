@@ -84,6 +84,19 @@ export function useDiscoveryEvents(
               discoverOptions[mappedKey] = discoverSource[key];
             }
           }
+
+          // Force-rescan path: useAutoRegister listens for `ui-bridge-route-change`
+          // and on receipt clears the registry, bbox trackers, and the local
+          // element refs before re-running scanAndRegister. Re-using the route-change
+          // event (rather than inventing a new one) keeps the scanner's clear+rescan
+          // logic in one place. The 150ms wait covers the 100ms registration debounce
+          // plus a small slack so the freshly-scanned labels are committed before
+          // bridge.discover() reads them back.
+          if (payload.force === true) {
+            window.dispatchEvent(new Event("ui-bridge-route-change"));
+            await new Promise((resolve) => setTimeout(resolve, 150));
+          }
+
           const result = await currentBridge.discover(discoverOptions);
 
           // Enrich elements with stableRef if createStableRef is available

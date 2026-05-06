@@ -14,6 +14,7 @@ export function HiddenTerminal({
   onShellIntegration,
   onOutput,
   onReconnected,
+  onTitleChange,
 }: {
   tab: TerminalTab;
   terminalRef: RefObject<TerminalInstanceHandle | null> | undefined;
@@ -22,6 +23,7 @@ export function HiddenTerminal({
   onShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
   onOutput: (tabId: string, text: string) => void;
   onReconnected: (tabId: string) => void;
+  onTitleChange?: (tabId: string, title: string) => void;
 }) {
   return (
     <div className="hidden">
@@ -35,6 +37,7 @@ export function HiddenTerminal({
         onFirstInput={(input) => onFirstInput(tab.id, input)}
         onShellIntegration={(event) => onShellIntegration(tab.id, event)}
         onOutput={(text) => onOutput(tab.id, text)}
+        onTitleChange={onTitleChange ? (title) => onTitleChange(tab.id, title) : undefined}
       />
     </div>
   );

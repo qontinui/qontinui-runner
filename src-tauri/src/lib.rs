@@ -5,7 +5,9 @@ use tauri::Manager;
 
 pub mod accessibility;
 pub mod profiles;
+pub mod relay_envelopes;
 pub mod schema_export;
+pub mod tauri_event_payloads;
 
 // ============================================================================
 // Main window label abstraction

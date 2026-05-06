@@ -250,10 +250,16 @@ pub enum AppEvent {
     // Canvas Events
     // ========================================================================
     /// Canvas panel created, updated, or removed.
+    ///
+    /// The `panel` field carries a fully-typed [`crate::mcp::canvas::StoredPanel`]
+    /// — wire-format identical to the previous `serde_json::Value` shape
+    /// (snake_case field names) but now visible at compile time so future
+    /// renames break the build instead of silently dropping data at the
+    /// listener guard.
     CanvasUpdate {
         action: String,
         panel_id: String,
-        panel: Option<serde_json::Value>,
+        panel: Option<crate::mcp::canvas::StoredPanel>,
         task_run_id: Option<String>,
     },
 
