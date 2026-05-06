@@ -111,6 +111,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # qontinui-schemas is a workspace path-dep
+      # (`qontinui-types = { path = "../../qontinui-schemas/rust" }`
+      # in src-tauri/Cargo.toml). Without the sibling clone,
+      # `cargo build` (invoked by `tauri build` below) fails to
+      # resolve the path. Public org-owned repo, default github.token.
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+        shell: bash
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
