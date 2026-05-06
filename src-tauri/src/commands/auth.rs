@@ -615,13 +615,13 @@ pub struct TestAutoLoginCreds {
 /// This is safe to expose: it only reveals credentials the process already has
 /// in its own environment — no privilege escalation.
 #[tauri::command]
-pub fn get_test_auto_login() -> Option<TestAutoLoginCreds> {
-    let email = std::env::var("QONTINUI_TEST_AUTO_LOGIN_EMAIL").ok()?;
-    let password = std::env::var("QONTINUI_TEST_AUTO_LOGIN_PASSWORD").ok()?;
-    if email.is_empty() || password.is_empty() {
-        return None;
-    }
-    Some(TestAutoLoginCreds { email, password })
+pub fn get_test_auto_login(
+    launch_env: tauri::State<'_, crate::launch_env::SharedLaunchEnv>,
+) -> Option<TestAutoLoginCreds> {
+    launch_env.auto_login.as_ref().map(|c| TestAutoLoginCreds {
+        email: c.email.clone(),
+        password: c.password.clone(),
+    })
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.

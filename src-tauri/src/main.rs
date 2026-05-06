@@ -68,6 +68,7 @@ mod iteration_bundle;
 mod job_object;
 mod knowledge_acquisition;
 mod known_issues;
+mod launch_env;
 mod log_consolidation;
 mod logging;
 mod macros;
@@ -162,6 +163,7 @@ mod vga;
 mod video_recorder;
 mod vision;
 mod wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
+mod win32_compat;
 mod window_manager;
 mod window_placement;
 mod workflow;
@@ -227,6 +229,12 @@ fn main() {
 }
 
 fn run_app() -> Result<(), Box<dyn std::error::Error>> {
+    // Read every QONTINUI_* / WEBVIEW2_* env var that influences startup
+    // exactly once. All downstream code reads from this snapshot via the
+    // Tauri-managed `Arc<RunnerLaunchEnv>` instead of re-parsing env vars.
+    // See `launch_env.rs` for the full list and rationale.
+    let launch_env: launch_env::SharedLaunchEnv = Arc::new(launch_env::RunnerLaunchEnv::read());
+
     // Read persisted OTel settings so the tracing pipeline uses saved config
     let otel_config = crate::settings::get_otel_settings();
     let logging_result = init_logging(LoggingConfig {
@@ -419,9 +427,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // via the Settings UI; a headless deploy can set
     // `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN` and get the same
     // behavior without touching settings.
-    let server_mode_is_on = std::env::var("QONTINUI_SERVER_MODE")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
+    let server_mode_is_on = launch_env.server_mode;
     let web_integration_settings = crate::settings::load_settings().web_integration.clone();
     let initial_server_mode_state: Option<crate::server_mode::ServerModeState> =
         crate::server_mode::ServerModeConfig::from_settings(&web_integration_settings).map(|cfg| {
@@ -525,7 +531,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Secondary instances (spawned by InstanceManager) must NOT use single-instance
     // plugin — it would prevent them from starting since they share the same binary.
-    let is_secondary_instance = std::env::var("QONTINUI_INSTANCE_NAME").is_ok();
+    let is_secondary_instance = instance::is_secondary();
 
     let mut builder = tauri::Builder::default();
 
@@ -1450,6 +1456,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::worktrees::merge_worktree_force
         ])
         .manage(shared_app_state)
+        .manage(launch_env.clone()) // Item 3: typed startup env snapshot, read once in run_app()
         .manage(bridge_compartment)
         .manage(execution_compartment)
         .manage(integration_compartment)
@@ -1494,9 +1501,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            let server_mode = std::env::var("QONTINUI_SERVER_MODE")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false);
+            // Pull the typed startup-env snapshot (managed onto state above)
+            // so this closure can read launch env vars without re-parsing.
+            let setup_launch_env: tauri::State<launch_env::SharedLaunchEnv> = app.state();
+            let setup_launch_env = setup_launch_env.inner().clone();
+
+            let server_mode = setup_launch_env.server_mode;
             if server_mode {
                 info!("QONTINUI_SERVER_MODE is set - running as headless server (no window, Restate forced on)");
             }
@@ -1519,14 +1529,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             {
                 use tauri::Manager;
 
-                let data_dir = std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok();
-                let is_secondary = std::env::var("QONTINUI_INSTANCE_NAME").is_ok();
+                // Resolve via launch_env so a runner launched standalone
+                // (no supervisor setting WEBVIEW2_USER_DATA_FOLDER) still
+                // gets the same per-runner profile layout. The launch_env
+                // field delegates to crate::instance::webview2_data_dir(),
+                // which prefers the env var and falls back to the shared
+                // qontinui_types helper. Returns None on non-Windows.
+                let data_dir: Option<std::path::PathBuf> =
+                    setup_launch_env.webview2_user_data_dir.clone();
+                let is_secondary = instance::is_secondary();
 
                 if let Some(ref dir) = data_dir {
                     let _ = std::fs::create_dir_all(dir);
                     info!(
                         "Creating window with isolated WebView2 profile (WEBVIEW2_USER_DATA_FOLDER={})",
-                        dir
+                        dir.display()
                     );
                 }
 
@@ -1547,40 +1564,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     //
                     // Three input paths funnel into one `WindowPlacement`:
                     //   1. Supervisor env vars (QONTINUI_WINDOW_X/Y/W/H/DECORATIONS)
-                    //      — set for temp runners (test-*).
+                    //      — set for temp runners (test-*). Read once via
+                    //      RunnerLaunchEnv (Item 3) and surfaced as
+                    //      typed `window_hints`.
                     //   2. Named-instance config (settings.json
                     //      `runner_instances[name].spawn_placement`) — used
                     //      when QONTINUI_INSTANCE_NAME is set without env-var
                     //      coords.
                     //   3. Default — primary maximizes; bare secondary uses
                     //      the (100, 100) fallback so the window is on-screen.
-                    let env_pos: Option<(f64, f64)> = {
-                        let x = std::env::var("QONTINUI_WINDOW_X")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        let y = std::env::var("QONTINUI_WINDOW_Y")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        match (x, y) {
-                            (Some(x), Some(y)) => Some((x, y)),
-                            _ => None,
-                        }
+                    let window_hints = &setup_launch_env.window;
+                    let env_pos: Option<(f64, f64)> = match (window_hints.x, window_hints.y) {
+                        (Some(x), Some(y)) => Some((x as f64, y as f64)),
+                        _ => None,
                     };
-                    let env_size: Option<(f64, f64)> = {
-                        let w = std::env::var("QONTINUI_WINDOW_WIDTH")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        let h = std::env::var("QONTINUI_WINDOW_HEIGHT")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        match (w, h) {
-                            (Some(w), Some(h)) => Some((w, h)),
+                    let env_size: Option<(f64, f64)> =
+                        match (window_hints.width, window_hints.height) {
+                            (Some(w), Some(h)) => Some((w as f64, h as f64)),
                             _ => None,
-                        }
-                    };
-                    let env_decorations = std::env::var("QONTINUI_WINDOW_DECORATIONS")
-                        .ok()
-                        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")));
+                        };
+                    // QONTINUI_WINDOW_DECORATIONS=0 forces a borderless
+                    // window; default is true (Tauri's default chrome).
+                    // Borderless lets a placement land flush with the
+                    // monitor's edge — the few-pixel right-of-edge inset
+                    // people see with chrome on is the OS window border.
+                    let env_decorations = window_hints.decorations;
 
                     // Named-instance fallback: only kicks in when the
                     // supervisor didn't push a placement via env vars.
@@ -1666,7 +1674,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         .on_web_resource_request(asset_headers::stamp_no_store_on_index);
 
                     if let Some(ref dir) = data_dir {
-                        builder = builder.data_directory(std::path::PathBuf::from(dir));
+                        builder = builder.data_directory(dir.clone());
                     }
 
                     builder = placement.configure_builder(builder);
@@ -1862,7 +1870,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Start scheduler service in background (skip for secondary instances to avoid duplicate executions)
-            if std::env::var("QONTINUI_INSTANCE_NAME").is_ok() {
+            if instance::is_secondary() {
                 info!("Secondary instance — skipping scheduler service");
             } else {
                 info!("Starting scheduler service");
@@ -2057,7 +2065,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Auto-start processes (skip for secondary instances to avoid port conflicts)
-                let is_secondary = std::env::var("QONTINUI_INSTANCE_NAME").is_ok();
+                let is_secondary = instance::is_secondary();
                 if is_secondary {
                     info!("Secondary instance — skipping managed process auto-start");
                 } else {
@@ -2274,7 +2282,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Restore previously-running instances (primary instance only).
             // The session file only exists if the previous process was killed
             // (e.g. by a rebuild) rather than closed intentionally by the user.
-            if std::env::var("QONTINUI_INSTANCE_NAME").is_err() {
+            if !instance::is_secondary() {
                 let restore_ids = instance_manager::load_and_clear_active_instances();
                 if !restore_ids.is_empty() {
                     info!(

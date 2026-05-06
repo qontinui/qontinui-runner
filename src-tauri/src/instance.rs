@@ -30,6 +30,22 @@ pub fn is_secondary() -> bool {
     instance_name().is_some()
 }
 
+/// Classify this runner from the env it was launched with.
+///
+/// Asymmetry note: `QONTINUI_INSTANCE_NAME` is set for both temp and named
+/// runners by the supervisor, so the runner alone cannot distinguish them.
+/// This helper returns `RunnerKind::Named { name }` for any secondary; the
+/// supervisor uses `RunnerKind::from_id` (with the runner id, not env) to
+/// produce the precise variant. Callers in the runner that need the
+/// secondary/primary split should still prefer `is_secondary()` for clarity.
+pub fn runner_kind() -> qontinui_types::wire::runner_kind::RunnerKind {
+    use qontinui_types::wire::runner_kind::RunnerKind;
+    match instance_name() {
+        Some(name) => RunnerKind::Named { name },
+        None => RunnerKind::Primary,
+    }
+}
+
 /// Returns the per-instance path segment, or `None` for the primary runner.
 ///
 /// Primary:   `None`                            → callers leave paths alone
@@ -52,6 +68,47 @@ pub fn primary_port() -> Option<u16> {
     std::env::var("QONTINUI_PRIMARY_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
+}
+
+/// Resolve the WebView2 user-data folder for this runner.
+///
+/// Resolution order:
+///
+/// 1. `WEBVIEW2_USER_DATA_FOLDER` env var (set by qontinui-supervisor on the
+///    spawn command). This is the supervisor-blessed canonical path.
+/// 2. Fallback: derive from `RunnerKind` using
+///    `qontinui_types::wire::webview2::webview2_data_dir`. This kicks in
+///    when the runner is launched standalone (no supervisor) — typically
+///    only the primary, but secondaries launched manually for debugging
+///    work too.
+///
+/// Windows-only — returns `None` on every other platform (the env var is
+/// also unused off-Windows; non-Windows webview backends ignore it).
+///
+/// The fallback uses `instance_name()` as the runner-id substitute because
+/// the runner doesn't otherwise know its supervisor-assigned id. For named
+/// secondaries that matches the on-disk folder layout exactly (the
+/// supervisor's id for a named runner is `named-{port}-{uuid}`, which
+/// equals the `QONTINUI_INSTANCE_NAME` env value). For temp runners
+/// launched without a supervisor (an unusual case) we fall back to
+/// `"primary"` because the runner has no id to differentiate itself —
+/// callers should rely on the env var path in supervised setups.
+#[cfg(target_os = "windows")]
+pub fn webview2_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var("WEBVIEW2_USER_DATA_FOLDER")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let kind = runner_kind();
+    let id = instance_name().unwrap_or_else(|| "primary".into());
+    qontinui_types::wire::webview2_data_dir(&kind, &id)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn webview2_data_dir() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// Register this secondary instance with the primary runner.

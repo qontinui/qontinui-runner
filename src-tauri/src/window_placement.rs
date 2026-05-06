@@ -117,28 +117,16 @@ fn apply_via_setwindowpos<R: tauri::Runtime>(
     w: u32,
     h: u32,
 ) {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::HiDpi::{
-        GetThreadDpiAwarenessContext, SetThreadDpiAwarenessContext,
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
     };
 
-    let tauri_hwnd = match win.hwnd() {
-        Ok(h) => h,
-        Err(e) => {
-            warn!(
-                "placement: hwnd() failed, falling back to set_position: {}",
-                e
-            );
-            let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
-            let _ = win.set_size(tauri::PhysicalSize::new(w, h));
-            return;
-        }
+    let Some(hwnd) = crate::win32_compat::hwnd_from_tauri(win) else {
+        warn!("placement: hwnd() failed, falling back to set_position");
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+        let _ = win.set_size(tauri::PhysicalSize::new(w, h));
+        return;
     };
-    let hwnd: HWND = tauri_hwnd.0 as HWND;
 
     // Force per-monitor-v2 DPI context for this thread for the duration
     // of our SetWindowPos calls. With v2, the X/Y/W/H args are absolute
@@ -146,134 +134,58 @@ fn apply_via_setwindowpos<R: tauri::Runtime>(
     // this, a thread inheriting a different awareness mode (e.g. system
     // DPI aware) would have the OS divide our coords by the system DPI
     // scale, sending the window to the wrong monitor.
-    let prev_ctx =
-        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    let _restore_guard = ThreadDpiContextGuard {
-        prev: prev_ctx,
-        active: !prev_ctx.is_null(),
-    };
-    if prev_ctx.is_null() {
-        warn!("placement: SetThreadDpiAwarenessContext returned NULL (Win10 1607+ required)");
-    } else {
-        let current = unsafe { GetThreadDpiAwarenessContext() };
-        info!(
-            "placement: thread DPI context now {:?} (was {:?})",
-            current, prev_ctx
-        );
-    }
-
-    // First pass: place the outer rect at exactly (x, y) with size (w, h).
-    // SWP_NOACTIVATE keeps focus where it was; we'll show/focus afterward.
-    let result = unsafe {
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            x,
-            y,
-            w as i32,
-            h as i32,
-            SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
-        )
-    };
-    if result == 0 {
-        warn!("placement: SetWindowPos (1st pass) failed");
-    }
-
-    // Compensate for the DWM extended-frame (invisible drop-shadow ring).
-    // We measure it AFTER the move so the values reflect the target
-    // monitor's DWM state.
-    let (inset_x, inset_y) = windows_frame_inset(win);
-    if inset_x != 0 || inset_y != 0 {
+    crate::win32_compat::with_v2_dpi(|| {
+        // First pass: place the outer rect at exactly (x, y) with size (w, h).
+        // SWP_NOACTIVATE keeps focus where it was; we'll show/focus afterward.
         let result = unsafe {
             SetWindowPos(
                 hwnd,
                 std::ptr::null_mut(),
-                x - inset_x,
-                y - inset_y,
-                w as i32 + 2 * inset_x,
-                h as i32 + 2 * inset_y,
+                x,
+                y,
+                w as i32,
+                h as i32,
                 SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
             )
         };
         if result == 0 {
-            warn!("placement: SetWindowPos (DWM compensation) failed");
+            warn!("placement: SetWindowPos (1st pass) failed");
+        }
+
+        // Compensate for the DWM extended-frame (invisible drop-shadow ring).
+        // We measure it AFTER the move so the values reflect the target
+        // monitor's DWM state.
+        let (inset_x, inset_y) = crate::win32_compat::frame_inset(hwnd);
+        if inset_x != 0 || inset_y != 0 {
+            let result = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    x - inset_x,
+                    y - inset_y,
+                    w as i32 + 2 * inset_x,
+                    h as i32 + 2 * inset_y,
+                    SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
+                )
+            };
+            if result == 0 {
+                warn!("placement: SetWindowPos (DWM compensation) failed");
+            } else {
+                info!(
+                    "placement: compensated DWM frame inset by ({}, {}); outer rect → ({}, {}) {}x{}",
+                    inset_x,
+                    inset_y,
+                    x - inset_x,
+                    y - inset_y,
+                    w as i32 + 2 * inset_x,
+                    h as i32 + 2 * inset_y,
+                );
+            }
         } else {
             info!(
-                "placement: compensated DWM frame inset by ({}, {}); outer rect → ({}, {}) {}x{}",
-                inset_x,
-                inset_y,
-                x - inset_x,
-                y - inset_y,
-                w as i32 + 2 * inset_x,
-                h as i32 + 2 * inset_y,
+                "placement: outer rect at ({}, {}) {}x{} (no DWM inset detected)",
+                x, y, w, h
             );
         }
-    } else {
-        info!(
-            "placement: outer rect at ({}, {}) {}x{} (no DWM inset detected)",
-            x, y, w, h
-        );
-    }
-}
-
-/// RAII guard that restores the previous thread DPI awareness context
-/// when dropped. Avoids leaking the per-monitor-v2 override into other
-/// Tauri/tao code that may rely on the inherited context.
-#[cfg(windows)]
-struct ThreadDpiContextGuard {
-    prev: windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT,
-    active: bool,
-}
-
-#[cfg(windows)]
-impl Drop for ThreadDpiContextGuard {
-    fn drop(&mut self) {
-        if self.active {
-            unsafe {
-                windows_sys::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.prev);
-            }
-        }
-    }
-}
-
-/// On Windows, return `(visible_left - outer_left, visible_top - outer_top)`
-/// — the offset from the OS-reported outer window rect to the visible
-/// content edge. Always non-negative in practice; `(0, 0)` on failure.
-#[cfg(windows)]
-fn windows_frame_inset<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) -> (i32, i32) {
-    use windows_sys::Win32::Foundation::{HWND, RECT};
-    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
-
-    // Tauri's `hwnd()` returns its own crate's `HWND` newtype around
-    // `*mut c_void`. Convert via raw pointer for FFI compatibility with
-    // windows-sys' raw `HWND = *mut c_void`.
-    let tauri_hwnd = match win.hwnd() {
-        Ok(h) => h,
-        Err(_) => return (0, 0),
-    };
-    let hwnd: HWND = tauri_hwnd.0 as HWND;
-
-    unsafe {
-        let mut frame_bounds: RECT = std::mem::zeroed();
-        let hr = DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
-            &mut frame_bounds as *mut RECT as *mut std::ffi::c_void,
-            std::mem::size_of::<RECT>() as u32,
-        );
-        if hr != 0 {
-            return (0, 0);
-        }
-
-        let mut window_rect: RECT = std::mem::zeroed();
-        if GetWindowRect(hwnd, &mut window_rect) == 0 {
-            return (0, 0);
-        }
-
-        (
-            frame_bounds.left - window_rect.left,
-            frame_bounds.top - window_rect.top,
-        )
-    }
+    });
 }
