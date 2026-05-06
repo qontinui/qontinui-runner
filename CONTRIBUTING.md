@@ -192,16 +192,9 @@ This repo has five workflows in `.github/workflows/`. They split into two tiers 
   - `test` matrix (`ci.yml:13-189`) on `ubuntu-22.04`, `macos-latest`, `windows-latest`: clones sibling repos (`qontinui-schemas`, `jspinak/qontinui-web`), `pnpm install` + `pnpm run lint` + `pnpm run build`, then `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, and finally `pnpm run tauri build --debug --no-bundle`. Each platform leg must be either green **or** linked to a tracked open issue documenting an upstream-runner block (see "Platform escape valve" below). The escape valve is for hosted-runner pathologies you can't fix in the PR (e.g. rustc-LLVM crashing on the GitHub `windows-latest` image), not for "tests are flaky, ignore."
   - `security` job (`ci.yml:191-228`) on `ubuntu-latest` only: `cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071` + `pnpm audit --audit-level=moderate`. Runs in parallel with the matrix; treated as part of the same `ci.yml` gate. Don't ignore it just because it's separate from the platform legs.
 - `forbid-runner-schema.yml` — runs on PR + push to `main` and `develop` (`.github/workflows/forbid-runner-schema.yml:21-25`). Cheap, fast, no excuse for letting it go red.
+- `schema-pg-sql-fresh.yml` — `pull_request: [main]` + `workflow_dispatch`, paths-filtered to `src-tauri/queries/**` and `src-tauri/schema.pg.sql.generated` (`.github/workflows/schema-pg-sql-fresh.yml:18-25`). Required when your PR touches those paths; otherwise it doesn't run and isn't a gate for that PR. Confirms the checked-in `schema.pg.sql.generated` matches a fresh `alembic upgrade head + pg_dump` against the current `qontinui-web` alembic chain. If it goes red, regenerate locally via `bash src-tauri/scripts/regenerate_schema_pg_sql.sh` and commit the result.
 
 > **Note on `spec-pairing.yml`**: a previous draft of this section claimed `spec-pairing.yml` is a path-triggered gate in this repo. It isn't — `spec-pairing.yml` lives in `jspinak/qontinui-web`, not in `qontinui-runner`. Don't expect to see it in this repo's PR checks.
-
-**Conditional gate** (currently being repaired):
-
-- `schema-pg-sql-fresh.yml` — `pull_request: [main]` + `workflow_dispatch`, paths-filtered to `src-tauri/queries/**` and `src-tauri/schema.pg.sql.generated` (`.github/workflows/schema-pg-sql-fresh.yml:18-25`). **Not a hard gate yet:** the workflow itself has open infra bugs:
-  - The `Install alembic dependencies` step (`schema-pg-sql-fresh.yml:75-79`) installs `alembic sqlalchemy psycopg2-binary python-dotenv` but **not `pgvector`** — and three alembic migrations in `qontinui-web/backend/alembic/versions/` (`05a366f58455_initial_schema_squashed.py:13`, `a84bf9dcb2dc_add_text_embedding_to_project_embeddings.py:13`, `b5c6d7e8f9a0_add_semantic_search_embeddings.py:27`) `from pgvector.sqlalchemy import Vector`. `alembic upgrade head` blows up with `ImportError` before reaching the schema-diff step.
-  - `Checkout qontinui-web (sibling)` (`schema-pg-sql-fresh.yml:51-68`) uses `ref: ${{ github.head_ref || github.ref_name }}` with no `|| 'main'` fallback. If the PR branch name doesn't exist on `jspinak/qontinui-web`, the checkout 404s before alembic ever runs.
-
-  The schema-diff step has not actually executed in the recent runs that show "failed." Once those two infra fixes land, promote it to a hard gate. Until then, treat its red status as "workflow is broken, not your code."
 
 **Not merge gates** (validated at release time, not PR time):
 
@@ -281,7 +274,7 @@ Ideally, GitHub branch protection on `main` would mirror the merge-gate set abov
 - [ ] `ci.yml` `test` matrix green on each platform leg, OR red leg has a tracked exemption per "Platform escape valve" linked in the PR description
 - [ ] `ci.yml` `security` job green (cargo-audit + pnpm audit on ubuntu-latest)
 - [ ] `forbid-runner-schema.yml` green
-- [ ] `schema-pg-sql-fresh.yml` is not a hard gate yet — workflow itself is broken; ignore its red until the infra fixes land
+- [ ] `schema-pg-sql-fresh.yml` green if it ran (or didn't run because no paths matched)
 - [ ] Any new red compared against current `main` and either confirmed-not-yours-with-link or fixed
 - [ ] No open `ci/...` branch is doing the same work
 
