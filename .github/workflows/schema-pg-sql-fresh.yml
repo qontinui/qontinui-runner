@@ -138,15 +138,40 @@ jobs:
         run: bash src-tauri/scripts/regenerate_schema_pg_sql.sh
 
       - name: Diff against checked-in
+        id: diff_check
         working-directory: qontinui-runner/src-tauri
         run: |
-          if ! diff -q /tmp/schema.checked-in.sql schema.pg.sql.generated; then
+          # Strip the `-- Dumped by pg_dump version ...` header comment
+          # before comparison. That line records the OS vendor string of
+          # whichever pg_dump produced the file (e.g. "Debian 16.13-1..."
+          # vs "Ubuntu 16.13-1..."), which differs between a contributor's
+          # local Docker setup and CI's apt-installed client. It's pure
+          # environmental noise — not real schema drift — and ratchets
+          # the artifact between regen environments if not filtered.
+          grep -v '^-- Dumped by pg_dump version' /tmp/schema.checked-in.sql > /tmp/schema.checked-in.normalized.sql
+          grep -v '^-- Dumped by pg_dump version' schema.pg.sql.generated > /tmp/schema.generated.normalized.sql
+          if ! diff -q /tmp/schema.checked-in.normalized.sql /tmp/schema.generated.normalized.sql; then
             echo "::error::schema.pg.sql.generated is stale relative to a fresh alembic upgrade head + pg_dump."
             echo "::error::Regenerate locally via:"
             echo "::error::  bash src-tauri/scripts/regenerate_schema_pg_sql.sh"
+            echo "::error::Or download the fresh artifact uploaded by this job (see Artifacts tab) and commit it directly."
             echo ""
             echo "Diff:"
             diff -u /tmp/schema.checked-in.sql schema.pg.sql.generated | head -80
             exit 1
           fi
           echo "schema.pg.sql.generated is up to date."
+
+      # If the diff step failed (drift detected), upload the freshly
+      # regenerated file so a contributor can download + commit it
+      # without spinning up Postgres + alembic locally. The drift
+      # signal has been red since at least 2026-05-06; this turns
+      # "the workflow is mad at you" into "click Artifacts, commit
+      # the file, push."
+      - name: Upload regenerated schema (on diff failure)
+        if: failure() && steps.diff_check.conclusion == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema.pg.sql.generated-fresh
+          path: qontinui-runner/src-tauri/schema.pg.sql.generated
+          if-no-files-found: error
