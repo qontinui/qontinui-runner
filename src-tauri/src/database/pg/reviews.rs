@@ -17,6 +17,7 @@
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// One row from `reviews`. The TS contract in productivity-stack §8 lists
 /// this as `ReviewRow` with `camelCase` fields; the `serde(rename_all)`
@@ -145,6 +146,8 @@ impl PgDb {
             .await
             .map_err(|e| InsertReviewError::Db(format!("PG pool error: {}", e)))?;
 
+        let task_uuid = Uuid::parse_str(input.task_id)
+            .map_err(|e| InsertReviewError::Db(format!("invalid task_id uuid: {}", e)))?;
         let row = conn
             .query_one(
                 &format!(
@@ -162,7 +165,7 @@ impl PgDb {
                     SELECT_COLS
                 ),
                 &[
-                    &input.task_id,
+                    &task_uuid,
                     &input.reviewer_session_id,
                     &input.reviewed_session_id,
                     &input.verdict,
@@ -186,13 +189,15 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let review_uuid =
+            Uuid::parse_str(review_id).map_err(|e| format!("invalid review_id uuid: {}", e))?;
         let row = conn
             .query_opt(
                 &format!(
                     "SELECT {} FROM coord.reviews WHERE id = $1::uuid",
                     SELECT_COLS
                 ),
-                &[&review_id],
+                &[&review_uuid],
             )
             .await
             .map_err(|e| format!("Failed to get review: {}", e))?;
@@ -242,6 +247,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let rows = conn
             .query(
                 &format!(
@@ -253,7 +260,7 @@ impl PgDb {
                     "#,
                     SELECT_COLS
                 ),
-                &[&task_id],
+                &[&task_uuid],
             )
             .await
             .map_err(|e| format!("Failed to list reviews for task: {}", e))?;
@@ -304,6 +311,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let row = conn
             .query_one(
                 r#"
@@ -311,7 +320,7 @@ impl PgDb {
                 FROM coord.reviews
                 WHERE task_id = $1::uuid AND verdict = 'needs_fix'
                 "#,
-                &[&task_id],
+                &[&task_uuid],
             )
             .await
             .map_err(|e| format!("Failed to count needs_fix reviews: {}", e))?;
@@ -371,6 +380,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let review_uuid =
+            Uuid::parse_str(review_id).map_err(|e| format!("invalid review_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
@@ -380,7 +391,7 @@ impl PgDb {
                 WHERE id = $1::uuid
                   AND user_decision IS NULL
                 "#,
-                &[&review_id, &decision],
+                &[&review_uuid, &decision],
             )
             .await
             .map_err(|e| format!("Failed to record review decision: {}", e))?;

@@ -27,6 +27,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::Instant;
+use tracing::debug;
+use uuid::Uuid;
 
 // ============================================================================
 // Wire types — match the §2 "Rust schema" exactly.
@@ -368,6 +371,8 @@ impl PgDb {
         let report_json =
             serde_json::to_value(report).map_err(|e| format!("serialize report: {}", e))?;
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
@@ -377,7 +382,7 @@ impl PgDb {
                     updated_at = NOW()
                 WHERE id = $3::uuid
                 "#,
-                &[&report_json, &source.as_str(), &task_id],
+                &[&report_json, &source.as_str(), &task_uuid],
             )
             .await
             .map_err(|e| format!("write_completion_report: {}", e))?;
@@ -401,6 +406,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let row = conn
             .query_opt(
                 r#"
@@ -408,7 +415,7 @@ impl PgDb {
                 FROM coord.tasks
                 WHERE id = $1::uuid
                 "#,
-                &[&task_id],
+                &[&task_uuid],
             )
             .await
             .map_err(|e| format!("get_completion_report: {}", e))?;
@@ -465,6 +472,10 @@ impl PgDb {
         // does not enable `with-uuid-1`, so we cast the array element-wise
         // to text in the SELECT and decode as Vec<String> — same convention
         // as `tasks.depends_on` in `database/pg/tasks.rs`.
+        let proposed_upstream_uuid = Uuid::parse_str(proposed_upstream_id)
+            .map_err(|e| format!("invalid proposed_upstream_id uuid: {}", e))?;
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let row_opt = conn
             .query_opt(
                 r#"
@@ -497,7 +508,7 @@ impl PgDb {
                 WHERE upstream_id = $2::uuid
                 LIMIT 1
                 "#,
-                &[&proposed_upstream_id, &task_id],
+                &[&proposed_upstream_uuid, &task_uuid],
             )
             .await
             .map_err(|e| format!("detect_dependency_cycle: {}", e))?;
@@ -525,6 +536,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let upstream_uuid = Uuid::parse_str(upstream_task_id)
+            .map_err(|e| format!("invalid upstream_task_id uuid: {}", e))?;
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
@@ -533,7 +548,7 @@ impl PgDb {
                     updated_at = NOW()
                 WHERE id = $2::uuid
                 "#,
-                &[&upstream_task_id, &task_id],
+                &[&upstream_uuid, &task_uuid],
             )
             .await
             .map_err(|e| format!("add_task_dependency: {}", e))?;
@@ -558,6 +573,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
@@ -566,7 +583,7 @@ impl PgDb {
                     updated_at = NOW()
                 WHERE id = $2::uuid
                 "#,
-                &[&extras, &task_id],
+                &[&extras, &task_uuid],
             )
             .await
             .map_err(|e| format!("write_assignment_brief_extras: {}", e))?;
@@ -587,6 +604,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         conn.execute(
             r#"
             UPDATE coord.tasks
@@ -594,7 +613,7 @@ impl PgDb {
                 updated_at = NOW()
             WHERE id = $1::uuid
             "#,
-            &[&task_id],
+            &[&task_uuid],
         )
         .await
         .map_err(|e| format!("clear_assignment_brief_extras: {}", e))?;
@@ -616,6 +635,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let row = conn
             .query_opt(
                 r#"
@@ -623,7 +644,7 @@ impl PgDb {
                 FROM coord.tasks
                 WHERE id = $1::uuid
                 "#,
-                &[&task_id],
+                &[&task_uuid],
             )
             .await
             .map_err(|e| format!("get_assignment_brief_extras: {}", e))?;
@@ -644,13 +665,37 @@ impl PgDb {
         &self,
         task_id: &str,
     ) -> Result<UnblockEvaluation, String> {
+        // Per-tick telemetry — see `flip_telemetry` block at the function
+        // exit. Plan §9 explicitly accepted the N+1 round-trip cost as
+        // "fine at current scale; flag for telemetry"; this debug! emits
+        // the counts so the cost is observable in logs once N grows.
+        let started_at = Instant::now();
+
         // Reload the task row inside this call so we have a fresh snapshot of
         // depends_on. The scheduler's observation could be 10s stale.
         let task = match self.get_task_by_id(task_id).await? {
             Some(t) => t,
             None => return Err(format!("no task with id {}", task_id)),
         };
+        let upstream_count = task.depends_on.len();
+        let log_telemetry = |outcome: &'static str, upstream_loads: usize, report_loads: usize| {
+            // Round-trip count is the load-candidate (1) + per-upstream
+            // task loads + per-upstream report loads + (Flipped only) the
+            // final UPDATE (1). Caller can derive total from the fields.
+            debug!(
+                target: "qontinui_runner::coord::rule_e",
+                task_id = %task_id,
+                upstream_count,
+                upstream_loads,
+                report_loads,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                outcome,
+                "evaluate_and_flip_unblocked_task: per-task telemetry"
+            );
+        };
+
         if task.status != "pending" {
+            log_telemetry("skipped_not_pending", 0, 0);
             return Ok(UnblockEvaluation::Skipped {
                 reason: format!("task status is {}, not pending", task.status),
             });
@@ -658,19 +703,28 @@ impl PgDb {
 
         // Gather every upstream's status + completion_report in one fan-out.
         // depends_on can legitimately be empty — empty deps are trivially
-        // unblocked, no upstream reports to attach.
+        // unblocked, no upstream reports to attach. Each iteration costs 2
+        // PG round-trips (task row + completion report) — the N+1 the
+        // telemetry exposes.
         let mut upstream_pairs: Vec<(String, Option<CompletionReport>)> =
-            Vec::with_capacity(task.depends_on.len());
+            Vec::with_capacity(upstream_count);
+        let mut upstream_loads = 0usize;
+        let mut report_loads = 0usize;
         for dep_id in &task.depends_on {
             let dep = match self.get_task_by_id(dep_id).await? {
-                Some(d) => d,
+                Some(d) => {
+                    upstream_loads += 1;
+                    d
+                }
                 None => {
+                    log_telemetry("skipped_upstream_missing", upstream_loads, report_loads);
                     return Ok(UnblockEvaluation::Skipped {
                         reason: format!("upstream {} not found", dep_id),
                     });
                 }
             };
             if dep.status != "done" {
+                log_telemetry("skipped_upstream_not_done", upstream_loads, report_loads);
                 return Ok(UnblockEvaluation::Skipped {
                     reason: format!("upstream {} is {}", dep.id, dep.status),
                 });
@@ -679,6 +733,7 @@ impl PgDb {
                 .get_completion_report(&dep.id)
                 .await?
                 .map(|(r, _src)| r);
+            report_loads += 1;
             upstream_pairs.push((dep.id.clone(), report));
         }
 
@@ -691,6 +746,7 @@ impl PgDb {
             .map(|(id, _)| id.clone())
             .collect();
         if !missing.is_empty() {
+            log_telemetry("missing_report", upstream_loads, report_loads);
             return Ok(UnblockEvaluation::MissingReport {
                 upstream_ids: missing,
             });
@@ -714,6 +770,7 @@ impl PgDb {
             }
         }
         if !blockers.is_empty() {
+            log_telemetry("blocked_followups", upstream_loads, report_loads);
             return Ok(UnblockEvaluation::Blocked { blockers });
         }
 
@@ -741,6 +798,8 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
@@ -751,15 +810,17 @@ impl PgDb {
                 WHERE id = $1::uuid
                   AND status = 'pending'
                 "#,
-                &[&task_id, &extras],
+                &[&task_uuid, &extras],
             )
             .await
             .map_err(|e| format!("evaluate_and_flip_unblocked_task: {}", e))?;
         if n == 0 {
+            log_telemetry("skipped_concurrent_flip", upstream_loads, report_loads);
             return Ok(UnblockEvaluation::Skipped {
                 reason: "row was flipped concurrently".to_string(),
             });
         }
+        log_telemetry("flipped", upstream_loads, report_loads);
         Ok(UnblockEvaluation::Flipped)
     }
 
@@ -782,6 +843,8 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        let plan_uuid =
+            Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let rows = conn
             .query(
                 r#"
@@ -797,7 +860,7 @@ impl PgDb {
                       )
                   )
                 "#,
-                &[&plan_id],
+                &[&plan_uuid],
             )
             .await
             .map_err(|e| format!("mark_ready_for_unblocked_with_briefs select: {}", e))?;
@@ -914,8 +977,10 @@ impl PgDb {
             "#
         };
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let n = conn
-            .execute(sql, &[&task_id, &from, &to])
+            .execute(sql, &[&task_uuid, &from, &to])
             .await
             .map_err(|e| format!("transition_task_status_unchecked: {}", e))?;
 
@@ -953,6 +1018,8 @@ impl PgDb {
         // text[] parameter. completion_report itself must be non-null —
         // the WHERE clause guards against that case.
         let path: Vec<String> = vec!["artifacts".to_string(), key.to_string()];
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
@@ -966,7 +1033,7 @@ impl PgDb {
                     updated_at = NOW()
                 WHERE id = $1::uuid AND completion_report IS NOT NULL
                 "#,
-                &[&task_id, &path, &value],
+                &[&task_uuid, &path, &value],
             )
             .await
             .map_err(|e| format!("write_completion_report_artifact: {}", e))?;
@@ -1037,10 +1104,12 @@ impl PgDb {
 
         // First confirm the row exists. Avoids a silent no-op on a typo'd
         // task_id that would mask a bug at the call site.
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let exists = conn
             .query_opt(
                 r#"SELECT 1 FROM coord.tasks WHERE id = $1::uuid"#,
-                &[&task_id],
+                &[&task_uuid],
             )
             .await
             .map_err(|e| format!("force_task_status_to_done lookup: {}", e))?;
@@ -1057,7 +1126,7 @@ impl PgDb {
                     updated_at = NOW()
                 WHERE id = $1::uuid AND status <> 'done'
                 "#,
-                &[&task_id],
+                &[&task_uuid],
             )
             .await
             .map_err(|e| format!("force_task_status_to_done: {}", e))?;
@@ -1518,8 +1587,12 @@ mod tests {
         assert!(!path.is_empty(), "cycle path must contain at least 1 step");
 
         // Cleanup so re-runs don't accumulate.
+        let plan_cleanup_uuid = Uuid::parse_str(&plan_id).expect("test plan_id must be uuid");
         let _ = conn
-            .execute("DELETE FROM coord.plans WHERE id = $1::uuid", &[&plan_id])
+            .execute(
+                "DELETE FROM coord.plans WHERE id = $1::uuid",
+                &[&plan_cleanup_uuid],
+            )
             .await;
     }
 
@@ -1579,8 +1652,12 @@ mod tests {
             .expect("detect_dependency_cycle");
         assert!(cycle.is_none(), "A -> D must be safe (D is a leaf)");
 
+        let plan_cleanup_uuid = Uuid::parse_str(&plan_id).expect("test plan_id must be uuid");
         let _ = conn
-            .execute("DELETE FROM coord.plans WHERE id = $1::uuid", &[&plan_id])
+            .execute(
+                "DELETE FROM coord.plans WHERE id = $1::uuid",
+                &[&plan_cleanup_uuid],
+            )
             .await;
     }
 }
