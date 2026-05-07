@@ -220,7 +220,15 @@ export type UIBridgeRequestType =
   // Toast ring buffer (GET /control/toasts)
   | "get_toast_buffer"
   // Spec execution (POST /control/spec/{id}/run)
-  | "run_spec";
+  | "run_spec"
+  // Bucket C follow-up (plan 2026-05-07): 5 of 7 handlers wired here.
+  // get_changes_since and get_element_history are deferred pending an
+  // upstream SDK PR adding ChangeTracker.peekBuffer().
+  | "receive_heartbeat"
+  | "delete_intent"
+  | "rank_elements"
+  | "set_viewport_constraints"
+  | "get_element_react_state";
 
 // ============================================================
 // N1 — Compile-time exhaustiveness registry for the chained
@@ -252,7 +260,8 @@ export type ControlEventTypes =
   | "navigate_tab"
   | "assert_element"
   | "resolve_stable_ref"
-  | "clear_storage";
+  | "clear_storage"
+  | "receive_heartbeat";
 
 export type DiscoveryEventTypes =
   | "discover"
@@ -311,7 +320,8 @@ export type DesignEventTypes =
   | "design_evaluate"
   | "design_evaluate_baseline"
   | "design_evaluate_contexts"
-  | "design_evaluate_diff";
+  | "design_evaluate_diff"
+  | "set_viewport_constraints";
 
 export type ChangeTrackingEventTypes =
   | "wait_for_route_change"
@@ -363,7 +373,8 @@ export type DebugInspectEventTypes =
   | "get_element_dom_tree"
   | "highlight_element"
   | "get_toast_buffer"
-  | "run_spec";
+  | "run_spec"
+  | "get_element_react_state";
 
 export type NetworkIdleEventTypes =
   | "get_network_requests"
@@ -400,7 +411,9 @@ export type AISearchEventTypes =
   | "register_intent"
   | "find_intent"
   | "execute_intent"
-  | "execute_intent_from_query";
+  | "execute_intent_from_query"
+  | "delete_intent"
+  | "rank_elements";
 
 export type WorkflowEventTypes = "get_workflows" | "run_workflow" | "get_workflow_status";
 

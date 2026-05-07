@@ -158,6 +158,34 @@ export function useAISearchEvents(
           return true;
         }
 
+        case "rank_elements": {
+          const { findElements } = await import("@qontinui/ui-bridge");
+          const registry = (
+            currentBridge as unknown as {
+              registry?: { getAllElements: () => Array<unknown> } | null;
+            }
+          ).registry;
+          const elements = (registry?.getAllElements?.() ?? []) as Parameters<
+            typeof findElements
+          >[0];
+          const query = (payload.params || {}) as Parameters<typeof findElements>[1];
+          const matches = findElements(elements, query);
+          const ranked = matches.map((m) => ({
+            id: m.id,
+            score: m.score,
+            reasons: m.reasons,
+            element: m.element,
+          }));
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: ranked,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "wait_for_element_registered": {
           // SDK-shape wait-for-element: body carries a `predicate` object
           // (id, label, testId, selector) plus optional `requirement` and
@@ -1164,6 +1192,40 @@ export function useAISearchEvents(
               timestamp: Date.now(),
             });
           }
+          return true;
+        }
+
+        case "delete_intent": {
+          const { name } = (payload.params || {}) as { name?: string };
+          if (!name) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "name is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const uiBridgeGlobal = getUIBridgeGlobal();
+          const intentRegistry = uiBridgeGlobal?.intentRegistry as
+            | { delete?: (name: string) => boolean; remove?: (name: string) => boolean }
+            | undefined;
+          const removedFromRegistry =
+            intentRegistry?.delete?.(name) ?? intentRegistry?.remove?.(name) ?? false;
+          const beforeLen = localIntentStore.length;
+          for (let i = localIntentStore.length - 1; i >= 0; i--) {
+            const entry = localIntentStore[i] as { name?: string; id?: string };
+            if (entry.name === name || entry.id === name) localIntentStore.splice(i, 1);
+          }
+          const removedFromLocal = localIntentStore.length < beforeLen;
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { deleted: removedFromRegistry || removedFromLocal },
+            timestamp: Date.now(),
+          });
           return true;
         }
 

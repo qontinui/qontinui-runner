@@ -446,6 +446,39 @@ export function useDesignEvents(
           return true;
         }
 
+        case "set_viewport_constraints": {
+          const { width, restore } = (payload.params || {}) as {
+            width?: number;
+            restore?: boolean;
+          };
+          const docEl = document.documentElement;
+          if (restore) {
+            docEl.style.removeProperty("width");
+            docEl.style.removeProperty("min-width");
+            docEl.style.removeProperty("max-width");
+            docEl.style.removeProperty("overflow");
+          } else if (typeof width === "number") {
+            docEl.style.width = `${width}px`;
+            docEl.style.minWidth = `${width}px`;
+            docEl.style.maxWidth = `${width}px`;
+            docEl.style.overflow = "hidden";
+          }
+          void docEl.offsetHeight;
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: {
+              success: true,
+              viewportWidth: window.innerWidth,
+              constrainedWidth: width ?? window.innerWidth,
+              timestamp: Date.now(),
+            },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         default:
           return false;
       }
