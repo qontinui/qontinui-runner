@@ -17,6 +17,7 @@
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// A row from the `tasks` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +114,11 @@ impl PgDb {
 
         // Deps come in as Vec<String>; cast to UUID[] inside the query.
         let depends_on_owned: Vec<String> = input.depends_on.to_vec();
+        // Parse plan_id to Uuid for binding ($1::uuid). tokio-postgres infers
+        // Type::UUID for `$1::uuid` and rejects `&str` with
+        // "error serializing parameter 0".
+        let plan_uuid =
+            Uuid::parse_str(input.plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let row = conn
             .query_one(
                 &format!(
@@ -132,7 +138,7 @@ impl PgDb {
                     SELECT_TASK_COLUMNS
                 ),
                 &[
-                    &input.plan_id,
+                    &plan_uuid,
                     &input.plan_version_hash,
                     &input.phase_name,
                     &input.sequence_in_phase,
@@ -158,13 +164,15 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let row = conn
             .query_opt(
                 &format!(
                     "SELECT {} FROM coord.tasks WHERE id = $1::uuid",
                     SELECT_TASK_COLUMNS
                 ),
-                &[&task_id],
+                &[&task_uuid],
             )
             .await
             .map_err(|e| format!("Failed to get task: {}", e))?;
@@ -180,6 +188,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let plan_uuid =
+            Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let rows = conn
             .query(
                 &format!(
@@ -191,7 +201,7 @@ impl PgDb {
                     "#,
                     SELECT_TASK_COLUMNS
                 ),
-                &[&plan_id],
+                &[&plan_uuid],
             )
             .await
             .map_err(|e| format!("Failed to list tasks for plan: {}", e))?;
@@ -208,6 +218,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let plan_uuid =
+            Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let rows = conn
             .query(
                 &format!(
@@ -220,7 +232,7 @@ impl PgDb {
                     "#,
                     SELECT_TASK_COLUMNS
                 ),
-                &[&plan_id, &NON_TERMINAL_STATUSES],
+                &[&plan_uuid, &NON_TERMINAL_STATUSES],
             )
             .await
             .map_err(|e| format!("Failed to list active tasks: {}", e))?;
@@ -268,6 +280,8 @@ impl PgDb {
         // A pending task is unblocked when every dep id is present in the
         // set of done-tasks in the same plan. Empty depends_on counts as
         // unblocked too.
+        let plan_uuid =
+            Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let rows = conn
             .query(
                 r#"
@@ -284,7 +298,7 @@ impl PgDb {
                   )
                 RETURNING id::text
                 "#,
-                &[&plan_id],
+                &[&plan_uuid],
             )
             .await
             .map_err(|e| format!("Failed to mark tasks ready: {}", e))?;
@@ -309,6 +323,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
@@ -319,7 +335,7 @@ impl PgDb {
                     updated_at = NOW()
                 WHERE id = $1::uuid
                 "#,
-                &[&task_id, &session_id],
+                &[&task_uuid, &session_id],
             )
             .await
             .map_err(|e| format!("Failed to assign task: {}", e))?;
@@ -381,8 +397,10 @@ impl PgDb {
             }
         };
 
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
         let n = conn
-            .execute(sql, &[&task_id, &from, &to])
+            .execute(sql, &[&task_uuid, &from, &to])
             .await
             .map_err(|e| format!("Failed to transition task status: {}", e))?;
 
@@ -448,5 +466,87 @@ mod tests {
         // Illegal — skipping states
         assert!(!is_valid_transition("pending", "running"));
         assert!(!is_valid_transition("ready", "running"));
+    }
+
+    /// Regression test for the "error serializing parameter 0" bug — passing a
+    /// `&str` to `WHERE id = $1::uuid` fails because tokio-postgres infers
+    /// Type::UUID for `$1::uuid` and rejects `String::to_sql` for that type.
+    /// The fix parses the string to `uuid::Uuid` before binding. This test
+    /// proves a real round-trip insert→get→list exercises the fixed path.
+    ///
+    /// Marked `#[ignore]` because it needs a live PG fixture; run manually
+    /// with `cargo test -p qontinui-runner database::pg::tasks::tests::uuid_param_round_trip -- --ignored --nocapture`
+    /// against a temp DB whose alembic head includes v28+.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL with v28+ tasks/plans applied)"]
+    async fn uuid_param_round_trip() {
+        let pg = PgDb::new_blocking_for_test();
+        let conn = pg.pool().get().await.expect("conn");
+
+        // Insert a synthetic plan we can clean up after.
+        let plan_row = conn
+            .query_one(
+                r#"
+                INSERT INTO coord.plans (markdown_path, plan_version_hash, status)
+                VALUES ($1, $2, $3)
+                RETURNING id::text, plan_version_hash
+                "#,
+                &[&"/tmp/uuid-param-round-trip.md", &"deadbe11", &"decomposed"],
+            )
+            .await
+            .expect("insert plan");
+        let plan_id: String = plan_row.get(0);
+        let plan_version_hash: String = plan_row.get(1);
+
+        // 1. insert_task — exercises the $1::uuid bind in INSERT.
+        let task = pg
+            .insert_task(&InsertTaskInput {
+                plan_id: &plan_id,
+                plan_version_hash: &plan_version_hash,
+                phase_name: "P",
+                sequence_in_phase: 1,
+                description: "round-trip-uuid",
+                expected_file_claims: &[],
+                expected_dirs: &[],
+                depends_on: &[],
+                status: "pending",
+                notes: None,
+            })
+            .await
+            .expect("insert_task should round-trip plan_id uuid");
+
+        // 2. get_task_by_id — exercises the WHERE id = $1::uuid bind in SELECT.
+        let fetched = pg
+            .get_task_by_id(&task.id)
+            .await
+            .expect("get_task_by_id should round-trip task_id uuid")
+            .expect("row exists");
+        assert_eq!(fetched.id, task.id);
+        assert_eq!(fetched.plan_id, plan_id);
+
+        // 3. list_tasks_for_plan — the smoke-test path that surfaced the bug.
+        let listed = pg
+            .list_tasks_for_plan(&plan_id)
+            .await
+            .expect("list_tasks_for_plan should round-trip plan_id uuid");
+        assert!(listed.iter().any(|r| r.id == task.id));
+
+        // Sanity: an obviously-bogus uuid string should now error early at the
+        // parse step, not silently submit a malformed query.
+        let bogus = pg.get_task_by_id("not-a-uuid").await;
+        assert!(
+            bogus.is_err(),
+            "non-uuid task_id must error at parse, got {:?}",
+            bogus
+        );
+
+        // Cleanup so re-runs don't accumulate.
+        let plan_cleanup_uuid = uuid::Uuid::parse_str(&plan_id).expect("test plan_id must be uuid");
+        let _ = conn
+            .execute(
+                "DELETE FROM coord.plans WHERE id = $1::uuid",
+                &[&plan_cleanup_uuid],
+            )
+            .await;
     }
 }

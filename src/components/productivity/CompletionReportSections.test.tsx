@@ -11,6 +11,29 @@
  * `productivity.spec.uibridge.json` element-presence assertions.
  */
 
+/**
+ * TEST COVERAGE NOTE — accepted test-only debt.
+ *
+ * This file covers ONLY pure helpers exported from `CompletionReportSections.tsx`
+ * (completionSourceLabel, deliverableHref, truncatePreview, validateManualFireDraft,
+ * buildReportFromDraft, etc.). The four subcomponents themselves —
+ * <CompletionReportSection>, <UpstreamReportsPreview>, <BriefingPreview>,
+ * <ManualFireForm> — are NOT exercised by render-and-assert tests.
+ *
+ * Reason: the runner's Vitest config uses `environment: "node"` (no jsdom),
+ * so `@testing-library/react` and `render(<Component />)` aren't viable here.
+ * The matching pattern in this repo is the `WebIntegrationAuthBanner.test.ts`
+ * precedent: extract pure helpers, test those, leave JSX gating to manual-test
+ * + Playwright passes.
+ *
+ * If a render-test environment is added later (e.g. a separate vitest project
+ * with `environment: "jsdom"`), the gating logic worth covering is:
+ *   - <CompletionReportSection> returns null when `report` is null.
+ *   - <UpstreamReportsPreview> requires status === "pending" AND deps.length > 0.
+ *   - <BriefingPreview> renders when `detail.hasAssignmentBriefExtras` is true.
+ *   - <ManualFireForm> hides for status === "done".
+ */
+
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
   buildReportFromDraft,

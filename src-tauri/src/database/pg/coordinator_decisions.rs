@@ -15,6 +15,7 @@
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// One row from `coordinator_decisions`. The TS contract in
 /// productivity-stack §8 lists this as `CoordinatorDecision` with
@@ -127,13 +128,15 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let decision_uuid =
+            Uuid::parse_str(decision_id).map_err(|e| format!("invalid decision_id uuid: {}", e))?;
         let row = conn
             .query_opt(
                 &format!(
                     "SELECT {} FROM coord.coordinator_decisions WHERE id = $1::uuid",
                     SELECT_COLS
                 ),
-                &[&decision_id],
+                &[&decision_uuid],
             )
             .await
             .map_err(|e| format!("Failed to load coordinator decision: {}", e))?;
@@ -256,6 +259,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let decision_uuid =
+            Uuid::parse_str(decision_id).map_err(|e| format!("invalid decision_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
@@ -266,7 +271,7 @@ impl PgDb {
                 WHERE id = $1::uuid
                   AND resolved = FALSE
                 "#,
-                &[&decision_id, &resolution],
+                &[&decision_uuid, &resolution],
             )
             .await
             .map_err(|e| format!("Failed to resolve coordinator decision: {}", e))?;

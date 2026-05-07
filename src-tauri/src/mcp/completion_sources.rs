@@ -862,12 +862,16 @@ mod tests {
         assert_eq!(ids[0], task.id);
 
         // Cleanup.
+        let plan_cleanup_uuid = Uuid::parse_str(&plan_id).expect("plan_id must be uuid");
         let _ = pg
             .pool()
             .get()
             .await
             .expect("conn")
-            .execute("DELETE FROM coord.plans WHERE id = $1::uuid", &[&plan_id])
+            .execute(
+                "DELETE FROM coord.plans WHERE id = $1::uuid",
+                &[&plan_cleanup_uuid],
+            )
             .await;
     }
 }
