@@ -36,13 +36,20 @@ jobs:
       #     qontinui-web/frontend/src/app at typecheck/build time. These are
       #     cross-repo file imports rather than npm deps, so the redesign
       #     doesn't migrate them.
-      # qontinui-schemas and qontinui-web are both public org-owned repos;
-      # the default github.token authenticates the clone, no PAT needed.
+      #   - ui-bridge: the SDK↔runner manifest diff test
+      #     (`sdk_manifest_routes_are_exposed_by_runner` in
+      #     `mcp/ui_bridge/mod.rs`) reads `UI_BRIDGE_ROUTES` from
+      #     `ui-bridge/packages/ui-bridge/src/server/types.ts`. Without this
+      #     clone the test hits its "file unreadable, skip" branch and
+      #     silently passes, so SDK-vs-runner drift would not be flagged.
+      # qontinui-schemas, qontinui-web, and ui-bridge are public org-owned
+      # repos; the default github.token authenticates the clone, no PAT needed.
       - name: Checkout sibling repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
           git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
           git clone --depth 1 https://github.com/qontinui/qontinui-web.git
+          git clone --depth 1 https://github.com/qontinui/ui-bridge.git
         shell: bash
 
       - name: Setup pnpm
