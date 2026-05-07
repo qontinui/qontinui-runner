@@ -6,25 +6,68 @@ name: schema.pg.sql.generated freshness
 # (D:/qontinui-root/tmp_migration_consolidation_plan.md §"Phase 5"
 # verification gate).
 #
-# Trigger posture
-# ---------------
-# Active on every PR (post-transplant). The consolidation chain now lives
-# in `qontinui-web/backend/alembic/versions/` and the workflow checks out
-# both repos; the gate ensures `schema.pg.sql.generated` doesn't drift
-# from a fresh `alembic upgrade head + pg_dump`. `workflow_dispatch` is
-# kept for manual reruns. Paths are repo-relative (no `qontinui-runner/`
-# prefix — the trigger filter operates on changed files in this repo).
+# Trigger / required-check posture
+# --------------------------------
+# Active on every PR (post-transplant). The `schema-fresh` job is
+# registered as a required check in branch protection, so it MUST
+# always report a status — otherwise PRs that don't touch
+# schema-relevant paths would sit perpetually pending on a
+# "skipped but required" check (the "ghost required check" trap).
+#
+# Layout:
+#   - `detect`               : lightweight; computes whether the PR
+#                              touches src-tauri/queries/** or
+#                              schema.pg.sql.generated.
+#   - `schema-fresh-verify`  : heavy; spins up Postgres + alembic +
+#                              pg_dump + diff. Gated on detect.
+#   - `schema-fresh`         : required-check shim; always runs;
+#                              reflects verify result, or trivially
+#                              passes on no-relevant-changes PRs.
+#
+# We don't use a trigger-level `paths:` filter, because that would
+# skip the entire workflow (including the `schema-fresh` required
+# check) on non-relevant PRs and trigger the ghost-check deadlock.
+# `workflow_dispatch` is kept for manual reruns.
 
 on:
   workflow_dispatch:
   pull_request:
     branches: [main]
-    paths:
-      - "src-tauri/queries/**"
-      - "src-tauri/schema.pg.sql.generated"
 
 jobs:
-  schema-fresh:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      schema_changed: ${{ steps.changes.outputs.schema_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect schema-relevant changes
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "schema_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Non-PR trigger (${{ github.event_name }}); running full verification."
+            exit 0
+          fi
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          if git diff --name-only "$base_sha" "$head_sha" -- \
+              'src-tauri/queries/' 'src-tauri/schema.pg.sql.generated' \
+              | grep -q .; then
+            echo "schema_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Schema-relevant paths changed; will run full verification."
+          else
+            echo "schema_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes to src-tauri/queries/** or schema.pg.sql.generated; verification will be skipped (required check satisfied trivially)."
+          fi
+
+  schema-fresh-verify:
+    needs: detect
+    if: needs.detect.outputs.schema_changed == 'true'
     runs-on: ubuntu-latest
 
     services:
@@ -175,3 +218,35 @@ jobs:
           name: schema.pg.sql.generated-fresh
           path: qontinui-runner/src-tauri/schema.pg.sql.generated
           if-no-files-found: error
+
+  # Required-status-check shim. The job name `schema-fresh` is what
+  # branch protection requires; this aggregator always runs and
+  # reflects the verify outcome.
+  #   - schema_changed == true   -> exit reflects schema-fresh-verify
+  #   - schema_changed == false  -> pass trivially (no relevant diff)
+  schema-fresh:
+    needs: [detect, schema-fresh-verify]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate verification result
+        shell: bash
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          VERIFY_RESULT: ${{ needs.schema-fresh-verify.result }}
+          SCHEMA_CHANGED: ${{ needs.detect.outputs.schema_changed }}
+        run: |
+          if [ "$DETECT_RESULT" != "success" ]; then
+            echo "::error::detect job did not succeed (result=$DETECT_RESULT); cannot determine path-change scope."
+            exit 1
+          fi
+          if [ "$SCHEMA_CHANGED" = "true" ]; then
+            if [ "$VERIFY_RESULT" = "success" ]; then
+              echo "Schema verification succeeded."
+              exit 0
+            fi
+            echo "::error::schema-fresh-verify result=$VERIFY_RESULT"
+            exit 1
+          fi
+          echo "::notice::No changes to src-tauri/queries/** or schema.pg.sql.generated. Required check satisfied trivially."
+          exit 0
