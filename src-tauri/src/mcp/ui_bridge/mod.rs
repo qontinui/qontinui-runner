@@ -666,8 +666,11 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/circuit-breaker/reset"),
             // /control/ai/* aliases mirroring SDK /ai/* (runner-side dual mount)
             ("DELETE", "/ui-bridge/control/ai/bookmark/{}"),
+            ("DELETE", "/ui-bridge/control/ai/bookmarks/{}"),
             ("GET", "/ui-bridge/control/ai/bookmark/{}"),
             ("GET", "/ui-bridge/control/ai/bookmark/{}/diff"),
+            ("GET", "/ui-bridge/control/ai/bookmarks/{}"),
+            ("GET", "/ui-bridge/control/ai/bookmarks/{}/diff"),
             ("GET", "/ui-bridge/control/ai/bookmarks"),
             ("GET", "/ui-bridge/control/ai/categorize-last-diff"),
             ("GET", "/ui-bridge/control/ai/change-buffer/size"),
@@ -829,10 +832,6 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/design/responsive"),
             ("POST", "/ui-bridge/design/snapshot"),
             ("POST", "/ui-bridge/design/style-guide/load"),
-            // Bookmark singular form (runner only exposes /ai/bookmark/{}, not /ai/bookmarks/{})
-            ("DELETE", "/ui-bridge/ai/bookmarks/{}"),
-            ("GET", "/ui-bridge/ai/bookmarks/{}"),
-            ("GET", "/ui-bridge/ai/bookmarks/{}/diff"),
             // /ai/intents — runner exposes /ai/intents/* and /control/intents/*; SDK declares both shapes
             ("GET", "/ui-bridge/ai/intents"),
             ("POST", "/ui-bridge/ai/intents/execute"),
