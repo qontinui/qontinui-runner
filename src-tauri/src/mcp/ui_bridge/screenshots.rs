@@ -1588,11 +1588,29 @@ pub async fn ui_bridge_capture_element_images_handler(
     // Use a longer timeout for element capture — html2canvas rendering 30+ elements
     // can take 30-60 seconds. The default 10s UI Bridge IPC timeout is too short.
     let request_id = uuid::Uuid::new_v4().to_string();
-    let event_payload = serde_json::json!({
-        "requestId": request_id,
-        "type": "capture_element_images",
-        "params": body,
-    });
+    // Stage 1 of the ui-bridge-request envelope concretization (deferral note
+    // in commit ea5d9a61f). Wire shape: `{ requestId, type, params: body }` —
+    // identical to the legacy `serde_json::json!` literal modulo key order
+    // (Value::Object is BTreeMap-sorted; the typed struct emits in declaration
+    // order). JSON object key order is unordered per RFC 8259; consumers
+    // (`useUIBridgeEventHandler` / runner-side dispatch) are order-insensitive.
+    let envelope = qontinui_types::app_events::UiBridgeRequestEnvelope {
+        request_id: request_id.clone(),
+        request_type: "capture_element_images".to_string(),
+        data: serde_json::json!({ "params": body }),
+    };
+    let event_payload = match serde_json::to_value(&envelope) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to serialize UiBridgeRequestEnvelope: {}",
+                    e
+                ))),
+            ));
+        }
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
     {

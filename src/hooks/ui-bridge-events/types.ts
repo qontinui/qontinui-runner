@@ -5,6 +5,10 @@ import type {
   ElementState,
   StyleGuideConfig,
 } from "@qontinui/ui-bridge";
+import type {
+  UiBridgeRequestEnvelope,
+  UiBridgeResponseEnvelope,
+} from "@qontinui/shared-types/tauri-events";
 
 /**
  * Request types that can come from the Rust backend
@@ -470,10 +474,19 @@ const _handledCoversUnion: AssertEqual<AllHandledTypes, UIBridgeRequestType> = t
 void _handledCoversUnion;
 
 /**
- * Payload structure for UI Bridge requests from Rust
+ * Payload structure for UI Bridge requests from Rust.
+ *
+ * The envelope head (`requestId`, `type`) is sourced from the generated
+ * `UiBridgeRequestEnvelope` (Stage 1 of the ui-bridge-request envelope
+ * concretization, deferral note in commit ea5d9a61f) so future Rust serde
+ * renames break the TS build instead of silently dropping fields. The Rust
+ * struct types `type` as a free-form `string` (Stage 2 — per-payload tagged
+ * union of all 171 request_types — is deferred indefinitely); we narrow it
+ * here to the locally-defined `UIBridgeRequestType` exhaustive union, which
+ * the AssertEqual<AllHandledTypes, UIBridgeRequestType> check above already
+ * locks down against the runner's chained sub-hook dispatcher.
  */
-export interface UIBridgeRequestPayload {
-  requestId: string;
+export interface UIBridgeRequestPayload extends Pick<UiBridgeRequestEnvelope, "requestId"> {
   type: UIBridgeRequestType;
   elementId?: string;
   componentId?: string;
@@ -551,12 +564,20 @@ export interface UIBridgeRequestPayload {
 }
 
 /**
- * Response structure sent back to Rust
+ * Response structure sent back to Rust.
+ *
+ * Mirrors the request envelope's pattern: the head (`requestId`, `success`,
+ * `timestamp`) is sourced from the generated `UiBridgeResponseEnvelope`, and
+ * the discriminator `type` is narrowed to the local exhaustive
+ * `UIBridgeRequestType`. `data`, `error`, and `hint` are intentionally
+ * relaxed to the local payload shapes (the generated `data`/`hint` fields
+ * resolve to `{ [k: string]: unknown }` because schemars emits open-object
+ * wire shapes; consumers of the response need a freer `unknown` for
+ * payload-specific narrowing).
  */
-export interface UIBridgeResponsePayload {
-  requestId: string;
+export interface UIBridgeResponsePayload
+  extends Pick<UiBridgeResponseEnvelope, "requestId" | "success" | "timestamp"> {
   type: UIBridgeRequestType;
-  success: boolean;
   data?: unknown;
   error?: string;
   /**
@@ -571,7 +592,6 @@ export interface UIBridgeResponsePayload {
    * - Eval-rejected (Rust page.rs): `string` workaround guidance.
    */
   hint?: unknown;
-  timestamp: number;
 }
 
 /**

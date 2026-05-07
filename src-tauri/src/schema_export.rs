@@ -63,6 +63,17 @@ pub fn export_all_schemas() -> Value {
     // Wire-format canvas panel struct carried inside AppEvent::CanvasUpdate's
     // `data.panel` field. Mirrors the runner's `mcp::canvas::StoredPanel`.
     add!("CanvasPanel", qae::CanvasPanel);
+    // UI Bridge IPC envelopes — Stage 1 of the ui-bridge-request envelope
+    // concretization (deferral note in commit ea5d9a61f). Wire shape:
+    //   request:  { requestId, type, ...flattened payload fields }
+    //   response: { requestId, type, success, data?, error?, hint?, timestamp }
+    // The discriminator is `type` (Rust field is `request_type` for ergonomics,
+    // serialized via `#[serde(rename = "type")]`). Stage 2 (per-payload tagged
+    // union of all 171 request_types) is deferred indefinitely — the TS-side
+    // AssertEqual<AllHandledTypes, UIBridgeRequestType> already enforces
+    // dispatch exhaustiveness from the right end of the pipeline.
+    add!("UiBridgeRequestEnvelope", qae::UiBridgeRequestEnvelope);
+    add!("UiBridgeResponseEnvelope", qae::UiBridgeResponseEnvelope);
 
     // ── qontinui-types: ai_workflows ──
     add!("ExecutionStep", qaw::ExecutionStep);
@@ -667,7 +678,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 429, "Expected 429 schema entries");
+        assert_eq!(obj.len(), 431, "Expected 431 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
