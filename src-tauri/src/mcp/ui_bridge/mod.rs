@@ -666,8 +666,11 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/circuit-breaker/reset"),
             // /control/ai/* aliases mirroring SDK /ai/* (runner-side dual mount)
             ("DELETE", "/ui-bridge/control/ai/bookmark/{}"),
+            ("DELETE", "/ui-bridge/control/ai/bookmarks/{}"),
             ("GET", "/ui-bridge/control/ai/bookmark/{}"),
             ("GET", "/ui-bridge/control/ai/bookmark/{}/diff"),
+            ("GET", "/ui-bridge/control/ai/bookmarks/{}"),
+            ("GET", "/ui-bridge/control/ai/bookmarks/{}/diff"),
             ("GET", "/ui-bridge/control/ai/bookmarks"),
             ("GET", "/ui-bridge/control/ai/categorize-last-diff"),
             ("GET", "/ui-bridge/control/ai/change-buffer/size"),
@@ -803,73 +806,53 @@ mod manifest_drift_tests {
         // delete the line below. The test will then assert end-to-end
         // wiring forever after.
         let sdk_only_baseline: HashSet<(&str, &str)> = [
-            // Render log file ops
+            // Render log file ops — no runner handler (clearRenderLog,
+            // getRenderLogPath, captureSnapshot are SDK-only today).
             ("DELETE", "/ui-bridge/render-log"),
             ("GET", "/ui-bridge/render-log/path"),
             ("POST", "/ui-bridge/render-log/snapshot"),
-            // Annotations top-level surface (runner exposes /control/annotations only)
-            ("DELETE", "/ui-bridge/annotations/{}"),
-            ("GET", "/ui-bridge/annotations"),
-            ("GET", "/ui-bridge/annotations/coverage"),
-            ("GET", "/ui-bridge/annotations/export"),
-            ("GET", "/ui-bridge/annotations/{}"),
-            ("POST", "/ui-bridge/annotations/import"),
-            ("PUT", "/ui-bridge/annotations/{}"),
-            ("POST", "/ui-bridge/control/annotation/{}"),
-            // Design top-level surface (runner exposes /control/design/* aliases only)
-            ("DELETE", "/ui-bridge/design/style-guide"),
-            ("GET", "/ui-bridge/design/element/{}/styles"),
-            ("GET", "/ui-bridge/design/evaluate/contexts"),
-            ("GET", "/ui-bridge/design/style-guide"),
-            ("POST", "/ui-bridge/design/audit"),
-            ("POST", "/ui-bridge/design/element/{}/state-styles"),
-            ("POST", "/ui-bridge/design/evaluate"),
-            ("POST", "/ui-bridge/design/evaluate/baseline"),
-            ("POST", "/ui-bridge/design/evaluate/diff"),
-            ("POST", "/ui-bridge/design/responsive"),
-            ("POST", "/ui-bridge/design/snapshot"),
-            ("POST", "/ui-bridge/design/style-guide/load"),
-            // Bookmark singular form (runner only exposes /ai/bookmark/{}, not /ai/bookmarks/{})
-            ("DELETE", "/ui-bridge/ai/bookmarks/{}"),
-            ("GET", "/ui-bridge/ai/bookmarks/{}"),
-            ("GET", "/ui-bridge/ai/bookmarks/{}/diff"),
-            // /ai/intents — runner exposes /ai/intents/* and /control/intents/*; SDK declares both shapes
-            ("GET", "/ui-bridge/ai/intents"),
-            ("POST", "/ui-bridge/ai/intents/execute"),
-            ("POST", "/ui-bridge/ai/intents/execute-from-query"),
-            ("POST", "/ui-bridge/ai/intents/find"),
-            ("POST", "/ui-bridge/ai/intents/register"),
+            // Intent name-in-URL forms — runner's /control/intents/execute
+            // takes the name in the JSON body (different shape from SDK's
+            // /control/intent/:name/execute). DELETE has no runner handler.
             ("DELETE", "/ui-bridge/control/intent/{}"),
             ("POST", "/ui-bridge/control/intent/{}/execute"),
-            // Cross-app analyze GET form (runner exposes POST form only)
+            // Cross-app analyze GET form — runner's analyze handlers are
+            // POST-only (they accept a request body); SDK declares a GET
+            // shape with query-string args. Different shape, not a simple alias.
             ("GET", "/ui-bridge/ai/analyze/data"),
             ("GET", "/ui-bridge/ai/analyze/regions"),
             ("GET", "/ui-bridge/ai/analyze/structured-data"),
-            // Media audit named subpaths (runner exposes /ai/media/audit/{} param form)
+            // Media audit named subpaths — runner exposes the parameterised
+            // /ai/media/audit/{audit_type} form which routes via Path<String>.
+            // SDK declares concrete subpaths; aliasing them would require
+            // wrapper handlers that hardcode the audit-type string.
             ("POST", "/ui-bridge/ai/media/audit/accessibility"),
             ("POST", "/ui-bridge/ai/media/audit/performance"),
-            // Misc /control/* the runner hasn't plumbed
+            // Misc /control/* the runner hasn't plumbed — each needs a real
+            // handler (no existing handler matches the SDK contract):
+            //   - getChangesSince (push-based change observation)
+            //   - getElementHistory / getElementReactState (per-element)
+            //   - getRoutes (page-route enumeration)
+            //   - executeBatchAction (different from /control/batch-actions
+            //     which is already runner-only)
+            //   - rankElements (element ranking)
+            //   - navigateByAdapter (adapter-based navigation)
+            //   - spawnHeadless (Phase 4.1 of plan; not yet wired)
+            //   - setViewportConstraints (viewport adjustment)
             ("GET", "/ui-bridge/control/changes/since"),
-            ("GET", "/ui-bridge/control/clipboard/read"),
             ("GET", "/ui-bridge/control/element/{}/history"),
             ("GET", "/ui-bridge/control/element/{}/react-state"),
-            ("GET", "/ui-bridge/control/history"),
-            ("GET", "/ui-bridge/control/interaction-metrics"),
             ("GET", "/ui-bridge/control/page/routes"),
             ("POST", "/ui-bridge/control/actions/batch"),
-            ("POST", "/ui-bridge/control/clipboard/write"),
             ("POST", "/ui-bridge/control/elements/rank"),
             ("POST", "/ui-bridge/control/page/navigate-to"),
             ("POST", "/ui-bridge/control/sdk/spawn-headless"),
             ("POST", "/ui-bridge/control/viewport-constraints"),
-            // Debug top-level surface (runner exposes /control/* equivalents)
-            ("GET", "/ui-bridge/debug/action-history"),
+            // Per-element debug history — needs a getElementHistory handler.
             ("GET", "/ui-bridge/debug/element-history/{}"),
-            ("GET", "/ui-bridge/debug/metrics"),
-            // Heartbeat — runner uses /pong/IPC plumbing instead
+            // Heartbeat — runner uses /pong + IPC plumbing for liveness; the
+            // SDK's receiveHeartbeat handler has no runner counterpart.
             ("POST", "/ui-bridge/heartbeat"),
-            // /ai/assert/batch slash form (runner exposes /ai/assert-batch hyphen form)
-            ("POST", "/ui-bridge/ai/assert/batch"),
         ]
         .into_iter()
         .collect();

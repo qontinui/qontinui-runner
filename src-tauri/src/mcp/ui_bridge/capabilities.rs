@@ -1282,6 +1282,26 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/metrics",
             get(ui_bridge_get_interaction_metrics_handler),
         )
+        // SDK aliases — `/control/history` and `/control/interaction-metrics`
+        // resolve to the same getActionHistory / getMetrics handlers as the
+        // canonical paths above. `/debug/*` mirrors round out the cross-app
+        // debug namespace declared by UI_BRIDGE_ROUTES.
+        .route(
+            "/ui-bridge/control/history",
+            get(ui_bridge_get_action_history_handler),
+        )
+        .route(
+            "/ui-bridge/control/interaction-metrics",
+            get(ui_bridge_get_interaction_metrics_handler),
+        )
+        .route(
+            "/ui-bridge/debug/action-history",
+            get(ui_bridge_get_action_history_handler),
+        )
+        .route(
+            "/ui-bridge/debug/metrics",
+            get(ui_bridge_get_interaction_metrics_handler),
+        )
         // Workflows
         .route(
             "/ui-bridge/control/workflows",
@@ -1334,6 +1354,11 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/capabilities"),
         ("GET", "/ui-bridge/control/action-history"),
         ("GET", "/ui-bridge/control/metrics"),
+        // SDK aliases for the same handlers.
+        ("GET", "/ui-bridge/control/history"),
+        ("GET", "/ui-bridge/control/interaction-metrics"),
+        ("GET", "/ui-bridge/debug/action-history"),
+        ("GET", "/ui-bridge/debug/metrics"),
         ("GET", "/ui-bridge/control/workflows"),
         ("POST", "/ui-bridge/control/workflow/{id}/run"),
         ("GET", "/ui-bridge/control/workflow/{run_id}/status"),

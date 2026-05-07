@@ -42,6 +42,30 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/intents/execute-from-query",
             post(ui_bridge_execute_intent_from_query_handler),
         )
+        // SDK /ai/intents/* aliases — same handlers as the /control/intents/*
+        // family above. /ai/intents GET = listIntents, /ai/intents/register POST
+        // = registerIntent (the SDK splits register out into its own path; the
+        // runner's /control/intents POST does the same job).
+        .route(
+            "/ui-bridge/ai/intents",
+            get(ui_bridge_get_intents_handler),
+        )
+        .route(
+            "/ui-bridge/ai/intents/register",
+            post(ui_bridge_register_intent_handler),
+        )
+        .route(
+            "/ui-bridge/ai/intents/find",
+            post(ui_bridge_find_intent_handler),
+        )
+        .route(
+            "/ui-bridge/ai/intents/execute",
+            post(ui_bridge_execute_intent_handler),
+        )
+        .route(
+            "/ui-bridge/ai/intents/execute-from-query",
+            post(ui_bridge_execute_intent_from_query_handler),
+        )
 }
 
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
@@ -51,5 +75,11 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/intents/find"),
         ("POST", "/ui-bridge/control/intents/execute"),
         ("POST", "/ui-bridge/control/intents/execute-from-query"),
+        // SDK /ai/intents/* aliases
+        ("GET", "/ui-bridge/ai/intents"),
+        ("POST", "/ui-bridge/ai/intents/register"),
+        ("POST", "/ui-bridge/ai/intents/find"),
+        ("POST", "/ui-bridge/ai/intents/execute"),
+        ("POST", "/ui-bridge/ai/intents/execute-from-query"),
     ]
 }
