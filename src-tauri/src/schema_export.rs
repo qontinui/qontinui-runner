@@ -1,11 +1,19 @@
 //! Schema Export Module
 //!
-//! Pure re-export aggregator — contains **zero** local type definitions.
-//! All types come from `qontinui-types` (`qontinui-schemas/rust/`).
+//! Aggregator over the cross-repo type registry. Most types come from
+//! `qontinui-types` (`qontinui-schemas/rust/`); a handful of runner-local
+//! payload + relay envelope types are also registered from
+//! `crate::tauri_event_payloads` and `crate::relay_envelopes`.
 //!
 //! Used by the `export_schemas` binary to produce a single JSON object
 //! mapping type names to their JSON Schemas for cross-language type
 //! generation (TypeScript, Python).
+//!
+//! Drift between this registry and qontinui-schemas's checked-in TS /
+//! Python artifacts is caught by two CI workflows: schemas-side
+//! `schema-drift.yml` fires on `rust/src/**` changes; runner-side
+//! `qontinui-types-drift.yml` fires on changes to this file (and the
+//! three other runner-side schema files).
 
 use schemars::schema_for;
 use serde_json::{Map, Value};
