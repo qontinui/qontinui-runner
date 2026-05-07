@@ -46,10 +46,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         // family above. /ai/intents GET = listIntents, /ai/intents/register POST
         // = registerIntent (the SDK splits register out into its own path; the
         // runner's /control/intents POST does the same job).
-        .route(
-            "/ui-bridge/ai/intents",
-            get(ui_bridge_get_intents_handler),
-        )
+        .route("/ui-bridge/ai/intents", get(ui_bridge_get_intents_handler))
         .route(
             "/ui-bridge/ai/intents/register",
             post(ui_bridge_register_intent_handler),
