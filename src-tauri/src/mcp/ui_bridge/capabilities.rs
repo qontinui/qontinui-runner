@@ -22,6 +22,7 @@ use tracing::{debug, error, info};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 use super::helpers::compute_snapshot_diff;
+use super::ipc_handler_post;
 use super::request::{handle_ui_bridge_response, ui_bridge_request_sync};
 use super::types::{classify_transport_error, UiBridgeError};
 
@@ -886,6 +887,13 @@ pub async fn ui_bridge_pong_handler(
     )))
 }
 
+// SDK relay liveness ping. Distinct from `/ui-bridge/pong` (which is the
+// runner's response to its own ping). The relay-side SDK contract returns
+// `{ received: true }`; the React-side `receive_heartbeat` IPC handler is not
+// yet implemented — until then, callers will get the standard
+// "no IPC handler" error from `ui_bridge_request_sync`.
+ipc_handler_post!(ui_bridge_heartbeat_handler, "receive_heartbeat");
+
 /// Accept an IPC response via HTTP (fallback when Tauri event system is unavailable).
 pub async fn ui_bridge_ipc_response_handler(
     State(state): State<Arc<ApiState>>,
@@ -1245,7 +1253,10 @@ pub async fn ui_bridge_routes_manifest_handler(
 // ============================================================================
 
 pub fn routes() -> axum::Router<Arc<ApiState>> {
-    use axum::routing::{get, post};
+    use crate::mcp::sdk_client::{
+        handle_clear_render_log, handle_render_log_path, handle_render_log_snapshot,
+    };
+    use axum::routing::{delete, get, post};
     axum::Router::new()
         // Endpoint discovery. `_help` is a cross-platform alias that works on
         // both runner and mobile UI Bridge.
@@ -1326,8 +1337,17 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         )
         .route(
             "/ui-bridge/render-log",
-            get(ui_bridge_get_render_log_handler).post(ui_bridge_append_render_log_handler),
+            get(ui_bridge_get_render_log_handler)
+                .post(ui_bridge_append_render_log_handler)
+                .delete(handle_clear_render_log),
         )
+        .route(
+            "/ui-bridge/render-log/snapshot",
+            post(handle_render_log_snapshot),
+        )
+        .route("/ui-bridge/render-log/path", get(handle_render_log_path))
+        // SDK relay liveness ping (distinct from `/ui-bridge/pong`)
+        .route("/ui-bridge/heartbeat", post(ui_bridge_heartbeat_handler))
         // Pong + IPC response
         .route("/ui-bridge/pong", post(ui_bridge_pong_handler))
         .route(
@@ -1367,6 +1387,10 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/render-log"),
         ("GET", "/ui-bridge/render-log"),
         ("POST", "/ui-bridge/render-log"),
+        ("DELETE", "/ui-bridge/render-log"),
+        ("POST", "/ui-bridge/render-log/snapshot"),
+        ("GET", "/ui-bridge/render-log/path"),
+        ("POST", "/ui-bridge/heartbeat"),
         ("POST", "/ui-bridge/pong"),
         ("POST", "/ui-bridge/ipc-response"),
         ("POST", "/ui-bridge/batch"),

@@ -793,28 +793,21 @@ mod manifest_drift_tests {
 
         // ── SDK-only baseline ───────────────────────────────────────────
         //
-        // Routes the SDK declares but the runner does not currently expose.
-        // These are real wire-through gaps captured as a *baseline snapshot*
-        // — none of them are the 5 friction-table entries from the
-        // 2026-05-03 plan (those have all been wired). They're long-tail
-        // SDK surface (annotations, design eval, intent registry, render-log
-        // file ops, etc.) that the runner has never plumbed through. Listed
-        // here so this test passes today and flags only NEW drift.
+        // Routes the SDK declares but the runner does not expose. The
+        // 2026-05-07 Bucket C plan wired through the 14 entries that were
+        // genuinely missing handlers — what remains here is intentional
+        // shape divergence (Bucket D) plus one deferred subsystem
+        // (spawn-headless, Bucket C7). Each remaining line documents the
+        // reason it's NOT a simple alias.
         //
-        // To remove an entry: implement the runner handler in the matching
-        // `mcp/ui_bridge/<family>.rs`, register in `route_entries()`, then
-        // delete the line below. The test will then assert end-to-end
-        // wiring forever after.
+        // To remove a future entry: implement the runner handler in the
+        // matching `mcp/ui_bridge/<family>.rs`, register in `routes()`
+        // AND `route_entries()`, then delete the line below. The test
+        // will then assert end-to-end wiring forever after.
         let sdk_only_baseline: HashSet<(&str, &str)> = [
-            // Render log file ops — no runner handler (clearRenderLog,
-            // getRenderLogPath, captureSnapshot are SDK-only today).
-            ("DELETE", "/ui-bridge/render-log"),
-            ("GET", "/ui-bridge/render-log/path"),
-            ("POST", "/ui-bridge/render-log/snapshot"),
-            // Intent name-in-URL forms — runner's /control/intents/execute
+            // Intent name-in-URL execute — runner's /control/intents/execute
             // takes the name in the JSON body (different shape from SDK's
-            // /control/intent/:name/execute). DELETE has no runner handler.
-            ("DELETE", "/ui-bridge/control/intent/{}"),
+            // /control/intent/:name/execute).
             ("POST", "/ui-bridge/control/intent/{}/execute"),
             // Cross-app analyze GET form — runner's analyze handlers are
             // POST-only (they accept a request body); SDK declares a GET
@@ -828,31 +821,10 @@ mod manifest_drift_tests {
             // wrapper handlers that hardcode the audit-type string.
             ("POST", "/ui-bridge/ai/media/audit/accessibility"),
             ("POST", "/ui-bridge/ai/media/audit/performance"),
-            // Misc /control/* the runner hasn't plumbed — each needs a real
-            // handler (no existing handler matches the SDK contract):
-            //   - getChangesSince (push-based change observation)
-            //   - getElementHistory / getElementReactState (per-element)
-            //   - getRoutes (page-route enumeration)
-            //   - executeBatchAction (different from /control/batch-actions
-            //     which is already runner-only)
-            //   - rankElements (element ranking)
-            //   - navigateByAdapter (adapter-based navigation)
-            //   - spawnHeadless (Phase 4.1 of plan; not yet wired)
-            //   - setViewportConstraints (viewport adjustment)
-            ("GET", "/ui-bridge/control/changes/since"),
-            ("GET", "/ui-bridge/control/element/{}/history"),
-            ("GET", "/ui-bridge/control/element/{}/react-state"),
-            ("GET", "/ui-bridge/control/page/routes"),
-            ("POST", "/ui-bridge/control/actions/batch"),
-            ("POST", "/ui-bridge/control/elements/rank"),
-            ("POST", "/ui-bridge/control/page/navigate-to"),
+            // Spawn-headless — deferred (Bucket C7 of the 2026-05-07 plan).
+            // Real subsystem (CLI subprocess orchestration), not a handler;
+            // tracked separately.
             ("POST", "/ui-bridge/control/sdk/spawn-headless"),
-            ("POST", "/ui-bridge/control/viewport-constraints"),
-            // Per-element debug history — needs a getElementHistory handler.
-            ("GET", "/ui-bridge/debug/element-history/{}"),
-            // Heartbeat — runner uses /pong + IPC plumbing for liveness; the
-            // SDK's receiveHeartbeat handler has no runner counterpart.
-            ("POST", "/ui-bridge/heartbeat"),
         ]
         .into_iter()
         .collect();
