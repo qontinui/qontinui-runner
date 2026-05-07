@@ -1720,7 +1720,11 @@ CREATE TABLE coord.tasks (
     completed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    notes text
+    notes text,
+    completion_report jsonb,
+    completion_source text,
+    assignment_brief_extras jsonb,
+    CONSTRAINT tasks_done_requires_report CHECK (((status <> 'done'::text) OR ((completion_report IS NOT NULL) AND (completion_source IS NOT NULL))))
 );
 
 
@@ -8433,7 +8437,8 @@ CREATE TABLE project.task_runs (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
-    project_id uuid
+    project_id uuid,
+    created_by_user_id uuid
 );
 
 
@@ -11321,14 +11326,6 @@ ALTER TABLE ONLY coord.coordinator_leader
 
 
 --
--- Name: correlation_topics correlation_topics_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
---
-
-ALTER TABLE ONLY coord.correlation_topics
-    ADD CONSTRAINT correlation_topics_pkey PRIMARY KEY (topic);
-
-
---
 -- Name: events events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -11358,6 +11355,14 @@ ALTER TABLE ONLY coord.machine_status
 
 ALTER TABLE ONLY coord.machines
     ADD CONSTRAINT machines_pkey PRIMARY KEY (machine_id);
+
+
+--
+-- Name: correlation_topics pk_correlation_topics; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.correlation_topics
+    ADD CONSTRAINT pk_correlation_topics PRIMARY KEY (topic);
 
 
 --
@@ -15029,6 +15034,20 @@ CREATE INDEX idx_tasks_assigned_session ON coord.tasks USING btree (assigned_ses
 
 
 --
+-- Name: idx_tasks_completion_report_gin; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_tasks_completion_report_gin ON coord.tasks USING gin (completion_report jsonb_path_ops) WHERE (completion_report IS NOT NULL);
+
+
+--
+-- Name: idx_tasks_completion_source; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_tasks_completion_source ON coord.tasks USING btree (completion_source) WHERE (completion_source IS NOT NULL);
+
+
+--
 -- Name: idx_tasks_phase; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -17819,6 +17838,13 @@ CREATE INDEX idx_tr_config_id ON project.task_runs USING btree (config_id);
 --
 
 CREATE INDEX idx_tr_created_at ON project.task_runs USING btree (created_at);
+
+
+--
+-- Name: idx_tr_created_by_user_id; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX idx_tr_created_by_user_id ON project.task_runs USING btree (created_by_user_id);
 
 
 --
@@ -23578,6 +23604,14 @@ ALTER TABLE ONLY project.task_run_screenshots
 
 ALTER TABLE ONLY project.task_run_screenshots
     ADD CONSTRAINT task_run_screenshots_task_run_id_fkey FOREIGN KEY (task_run_id) REFERENCES project.task_runs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: task_runs task_runs_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.task_runs
+    ADD CONSTRAINT task_runs_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES auth.users(id) ON DELETE SET NULL;
 
 
 --
