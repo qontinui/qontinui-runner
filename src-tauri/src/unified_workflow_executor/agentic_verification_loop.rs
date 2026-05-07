@@ -509,10 +509,16 @@ impl LoopController {
                         // Stash the pair for the canvas panel builder.
                         wsm_pre_for_panel = Some(pre.clone());
                         wsm_post_for_panel = Some(post.clone());
+                        // `terminal_context: None` for now — when an action
+                        // targets a terminal/TUI, future code can populate
+                        // this from the relevant `Grid::text_snapshot()`
+                        // PRE/POST pair to give the WSM judge an authoritative
+                        // text view that screenshots can't deliver. See
+                        // `verification::TerminalContext`.
                         let result = wsm
                             .as_ref()
                             .unwrap()
-                            .verify(pre, &post, &prev_worker_intent, Some(&goal))
+                            .verify(pre, &post, &prev_worker_intent, Some(&goal), None)
                             .await;
                         let dur = wsm_start.elapsed().as_millis() as u64;
                         match result {
