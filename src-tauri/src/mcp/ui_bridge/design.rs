@@ -176,6 +176,38 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/ai/design-audit",
             post(ui_bridge_design_audit_handler),
         )
+        // SDK top-level /design/* aliases — same handlers as the
+        // /control/design/* family above. Mounted here for symmetry with
+        // the SDK contract (see UI_BRIDGE_ROUTES `path: '/design/...'`).
+        .route(
+            "/ui-bridge/design/element/{id}/styles",
+            get(ui_bridge_design_element_styles_handler),
+        )
+        .route(
+            "/ui-bridge/design/element/{id}/state-styles",
+            post(ui_bridge_design_state_styles_handler),
+        )
+        .route(
+            "/ui-bridge/design/snapshot",
+            post(ui_bridge_design_snapshot_handler),
+        )
+        .route(
+            "/ui-bridge/design/responsive",
+            post(ui_bridge_design_responsive_handler),
+        )
+        .route(
+            "/ui-bridge/design/audit",
+            post(ui_bridge_design_audit_handler),
+        )
+        .route(
+            "/ui-bridge/design/style-guide/load",
+            post(ui_bridge_design_load_style_guide_handler),
+        )
+        .route(
+            "/ui-bridge/design/style-guide",
+            get(ui_bridge_design_get_style_guide_handler)
+                .delete(ui_bridge_design_clear_style_guide_handler),
+        )
 }
 
 /// Static (method, path) tuples corresponding to every route registered
@@ -195,6 +227,15 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/design/style-guide"),
         ("POST", "/ui-bridge/control/design/style-guide/clear"),
         ("POST", "/ui-bridge/ai/design-audit"),
+        // SDK top-level /design/* aliases
+        ("GET", "/ui-bridge/design/element/{id}/styles"),
+        ("POST", "/ui-bridge/design/element/{id}/state-styles"),
+        ("POST", "/ui-bridge/design/snapshot"),
+        ("POST", "/ui-bridge/design/responsive"),
+        ("POST", "/ui-bridge/design/audit"),
+        ("POST", "/ui-bridge/design/style-guide/load"),
+        ("GET", "/ui-bridge/design/style-guide"),
+        ("DELETE", "/ui-bridge/design/style-guide"),
     ]
 }
 

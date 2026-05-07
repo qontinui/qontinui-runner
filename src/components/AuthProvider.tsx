@@ -38,6 +38,13 @@ interface AuthProviderProps {
 
 const TOKEN_REFRESH_INTERVAL = 14 * 60 * 1000; // 14 minutes (tokens expire in 15 minutes)
 
+// Disarming window for the devAutoLoginPending failsafe. Re-armed on every
+// retry attempt; fires only when the retry chain has gone idle without
+// success. Must be strictly greater than the longest single retry interval
+// (10s for transient non-network errors) so an in-flight scheduled retry is
+// never pre-empted.
+const DEV_AUTO_LOGIN_PENDING_FAILSAFE_MS = 15000;
+
 // Development auto-login credentials (loaded from environment variables at
 // Vite build time). For temp test runners spawned by the supervisor, the
 // credentials are instead loaded at runtime from process env via the
@@ -72,6 +79,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const devLoginRetryTimer = useRef<number | null>(null);
   const devLoginRetryCount = useRef(0);
   const devLoginFailed = useRef(false);
+  // Bump on each retry attempt so the devAutoLoginPending failsafe effect
+  // re-arms its disarming timeout — without this, the failsafe fires after
+  // the first 10s window even though the retry chain is still in flight.
+  const [devLoginRetryTick, setDevLoginRetryTick] = useState(0);
   const MAX_DEV_LOGIN_RETRIES = 10;
 
   // Log mount/unmount
@@ -248,6 +259,75 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, []);
 
   /**
+   * Attempt the dev auto-login once, scheduling a retry on transient failure.
+   *
+   * The retry-timer must be able to re-invoke this function directly: relying
+   * on the auto-login useEffect to re-run does NOT work, because that effect's
+   * deps include `authStatus?.authenticated` as a boolean. A failed re-check
+   * that yields the same `false` value does not change the dep, so the effect
+   * does not fire — historically this meant the very first retry timer fired
+   * but never produced a second login attempt.
+   *
+   * To avoid a useCallback self-reference (which the react-hooks lint rule
+   * forbids), we route the recursive call through `attemptRef`.
+   */
+  const attemptRef = useRef<((email: string, password: string) => void) | null>(null);
+  const attemptDevAutoLogin = useCallback(
+    (email: string, password: string) => {
+      log.debug("Dev mode: Not authenticated, attempting auto-login...");
+      // Set pending flag BEFORE starting login so UI shows "Signing in..."
+      setDevAutoLoginPending(true);
+      // Bump the retry tick so the devAutoLoginPending failsafe effect
+      // re-arms its disarming timeout window for this attempt.
+      setDevLoginRetryTick((t) => t + 1);
+      login(email, password)
+        .then(() => {
+          // Login successful - the authStatus effect will clear devAutoLoginPending
+          log.debug("Dev mode auto-login succeeded");
+        })
+        .catch((err) => {
+          const errStr = String(err);
+          const isNetworkError =
+            errStr.includes("Network error") || errStr.includes("Failed to fetch");
+          const isTransientError =
+            isNetworkError || errStr.includes("Server error") || errStr.includes("Rate limit");
+          if (isTransientError && devLoginRetryCount.current < MAX_DEV_LOGIN_RETRIES) {
+            // Transient error (network, server, rate limit) — retry with backoff
+            devLoginRetryCount.current += 1;
+            const delay = isNetworkError ? 5000 : 10000;
+            log.warn(
+              `Dev mode auto-login failed (${isNetworkError ? "backend unavailable" : "transient error"}), retry ${devLoginRetryCount.current}/${MAX_DEV_LOGIN_RETRIES} in ${delay / 1000}s...`,
+            );
+            devLoginRetryTimer.current = window.setTimeout(() => {
+              devLoginRetryTimer.current = null;
+              // Re-invoke the attempt directly via the ref. Calling
+              // checkAuthStatus() alone would not retry: the auto-login
+              // effect bails when authStatus?.authenticated is unchanged
+              // (still false).
+              attemptRef.current?.(email, password);
+            }, delay);
+          } else {
+            if (isTransientError) {
+              log.error("Dev mode auto-login failed: max retries exceeded");
+            } else {
+              log.error("Dev mode auto-login failed (auth error):", err);
+            }
+            // Clear pending flag on non-retryable failure so user can see login screen
+            devLoginFailed.current = true;
+            setDevAutoLoginPending(false);
+          }
+        });
+    },
+    [login],
+  );
+  // Keep the ref pointing at the latest stable callback so timer-driven
+  // retries always invoke the current closure (which has the current
+  // `login` dep). Updated via effect so we never write the ref during render.
+  useEffect(() => {
+    attemptRef.current = attemptDevAutoLogin;
+  }, [attemptDevAutoLogin]);
+
+  /**
    * Auto-login with configured credentials
    * Automatically logs in when VITE_DEV_EMAIL/VITE_DEV_PASSWORD are set in .env
    * Works in both dev mode (Vite) and exe mode (embedded build)
@@ -304,50 +384,15 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return;
     }
 
-    // Auto-login in development
-    log.debug("Dev mode: Not authenticated, attempting auto-login...");
-    // Set pending flag BEFORE starting login so UI shows "Signing in..."
-    setDevAutoLoginPending(true);
-    login(autoLoginCreds.email, autoLoginCreds.password)
-      .then(() => {
-        // Login successful - the authStatus effect will clear devAutoLoginPending
-        log.debug("Dev mode auto-login succeeded");
-      })
-      .catch((err) => {
-        const errStr = String(err);
-        const isNetworkError =
-          errStr.includes("Network error") || errStr.includes("Failed to fetch");
-        const isTransientError =
-          isNetworkError || errStr.includes("Server error") || errStr.includes("Rate limit");
-        if (isTransientError && devLoginRetryCount.current < MAX_DEV_LOGIN_RETRIES) {
-          // Transient error (network, server, rate limit) — retry with backoff
-          devLoginRetryCount.current += 1;
-          const delay = isNetworkError ? 5000 : 10000;
-          log.warn(
-            `Dev mode auto-login failed (${isNetworkError ? "backend unavailable" : "transient error"}), retry ${devLoginRetryCount.current}/${MAX_DEV_LOGIN_RETRIES} in ${delay / 1000}s...`,
-          );
-          devLoginRetryTimer.current = window.setTimeout(() => {
-            devLoginRetryTimer.current = null;
-            checkAuthStatus();
-          }, delay);
-        } else {
-          if (isTransientError) {
-            log.error("Dev mode auto-login failed: max retries exceeded");
-          } else {
-            log.error("Dev mode auto-login failed (auth error):", err);
-          }
-          // Clear pending flag on non-retryable failure so user can see login screen
-          devLoginFailed.current = true;
-          setDevAutoLoginPending(false);
-        }
-      });
+    // First attempt — subsequent retries are driven by the retry timer
+    // re-invoking attemptDevAutoLogin directly (not by this effect re-running).
+    attemptDevAutoLogin(autoLoginCreds.email, autoLoginCreds.password);
   }, [
     loading,
     authStatus?.authenticated,
-    login,
-    checkAuthStatus,
     testAutoLoginProbed,
     autoLoginCreds,
+    attemptDevAutoLogin,
   ]);
 
   /**
@@ -368,9 +413,20 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [loading]);
 
   /**
-   * Failsafe timeout for devAutoLoginPending
-   * Covers the case where login() resolves quickly (clearing loading)
-   * but devAutoLoginPending stays stuck true due to a race condition
+   * Failsafe timeout for devAutoLoginPending.
+   *
+   * Contract: this timer is re-armed on every retry attempt (via the
+   * `devLoginRetryTick` dependency, which is bumped by `attemptDevAutoLogin`).
+   * It therefore fires only when the retry chain has gone idle without
+   * success — i.e., no fresh attempt has happened in the past
+   * DEV_AUTO_LOGIN_PENDING_FAILSAFE_MS milliseconds.
+   *
+   * The window must be strictly greater than the longest single retry
+   * interval (10s for non-network transient errors, 5s for network errors)
+   * so a still-scheduled retry attempt is never pre-empted by the failsafe.
+   * We do not want to remove the failsafe entirely: it covers the rare case
+   * where login() resolves but pending stays stuck due to a race or unmount
+   * during the retry chain.
    */
   useEffect(() => {
     if (!devAutoLoginPending) return;
@@ -378,10 +434,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const timeout = setTimeout(() => {
       log.warn("devAutoLoginPending timeout - forcing to false");
       setDevAutoLoginPending(false);
-    }, 10000);
+    }, DEV_AUTO_LOGIN_PENDING_FAILSAFE_MS);
 
     return () => clearTimeout(timeout);
-  }, [devAutoLoginPending]);
+  }, [devAutoLoginPending, devLoginRetryTick]);
 
   /**
    * Set up auto-refresh timer when authenticated

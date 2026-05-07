@@ -23,6 +23,21 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 use super::helpers::{direct_webview_evaluate_with_result, evaluate_js_expression, safe_evaluate};
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
+use super::{ipc_handler_get, ipc_handler_post};
+
+// Macro-generated IPC forwarders for SDK-relayed page-control routes.
+// These forward `params` to the webview via `ui_bridge_request_sync` using the
+// IPC `kind` shown in each macro invocation. The matching React command
+// handlers live in
+// `D:\qontinui-root\ui-bridge\packages\ui-bridge\src\react\commandHandlers.ts`
+// (only `setViewportConstraints` is currently registered there; the other two
+// kinds will return "handler not found" until added).
+ipc_handler_post!(
+    ui_bridge_set_viewport_constraints_handler,
+    "set_viewport_constraints"
+);
+ipc_handler_get!(ui_bridge_page_get_routes_handler, "get_routes");
+ipc_handler_post!(ui_bridge_page_navigate_to_handler, "navigate_by_adapter");
 
 // ============================================================================
 // Request / response types
@@ -1357,6 +1372,18 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_page_navigate_handler),
         )
         .route(
+            "/ui-bridge/control/page/navigate-to",
+            post(ui_bridge_page_navigate_to_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/routes",
+            get(ui_bridge_page_get_routes_handler),
+        )
+        .route(
+            "/ui-bridge/control/viewport-constraints",
+            post(ui_bridge_set_viewport_constraints_handler),
+        )
+        .route(
             "/ui-bridge/control/page/back",
             post(ui_bridge_page_go_back_handler),
         )
@@ -1540,6 +1567,9 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/page/hard-refresh"),
         ("POST", "/ui-bridge/control/page/close-request"),
         ("POST", "/ui-bridge/control/page/navigate"),
+        ("POST", "/ui-bridge/control/page/navigate-to"),
+        ("GET", "/ui-bridge/control/page/routes"),
+        ("POST", "/ui-bridge/control/viewport-constraints"),
         ("POST", "/ui-bridge/control/page/back"),
         ("POST", "/ui-bridge/control/page/forward"),
         ("POST", "/ui-bridge/control/query-selector"),
