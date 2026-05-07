@@ -13,6 +13,7 @@
 
 use super::PgDb;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// A row from the `plans` table.
 ///
@@ -125,6 +126,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let plan_uuid =
+            Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let row = conn
             .query_opt(
                 r#"
@@ -133,7 +136,7 @@ impl PgDb {
                 FROM coord.plans
                 WHERE id = $1::uuid
                 "#,
-                &[&plan_id],
+                &[&plan_uuid],
             )
             .await
             .map_err(|e| format!("Failed to load plan by id: {}", e))?;
@@ -225,10 +228,12 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let plan_uuid =
+            Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let task_count: i64 = conn
             .query_one(
                 "SELECT COUNT(*)::bigint FROM coord.tasks WHERE plan_id = $1::uuid",
-                &[&plan_id],
+                &[&plan_uuid],
             )
             .await
             .map_err(|e| format!("Failed to count tasks for plan: {}", e))?
@@ -250,6 +255,8 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let plan_uuid =
+            Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
@@ -257,7 +264,7 @@ impl PgDb {
                 SET status = $2, updated_at = NOW()
                 WHERE id = $1::uuid
                 "#,
-                &[&plan_id, &status],
+                &[&plan_uuid, &status],
             )
             .await
             .map_err(|e| format!("Failed to update plan status: {}", e))?;
@@ -274,12 +281,14 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let plan_uuid =
+            Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let n = conn
             .execute(
                 r#"
                 DELETE FROM coord.plans WHERE id = $1::uuid
                 "#,
-                &[&plan_id],
+                &[&plan_uuid],
             )
             .await
             .map_err(|e| format!("Failed to delete plan: {}", e))?;

@@ -22,6 +22,7 @@ use crate::database::embeddings::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+use uuid::Uuid;
 
 /// A row from the `productivity_knowledge` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,13 +139,15 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        let id_uuid =
+            Uuid::parse_str(id).map_err(|e| format!("invalid knowledge id uuid: {}", e))?;
         let row = conn
             .query_opt(
                 &format!(
                     "SELECT {} FROM productivity_knowledge WHERE id = $1::uuid",
                     SELECT_COLUMNS
                 ),
-                &[&id],
+                &[&id_uuid],
             )
             .await
             .map_err(|e| format!("Failed to get knowledge: {}", e))?;

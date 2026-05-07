@@ -233,6 +233,22 @@ async fn github_merge(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    // Dashboard's task-detail listener subscribes to
+    // `completion-report-written` (Phase 1 contract); emit it AND the
+    // `coordinator-wakeup` so the panel re-fetches the task and the
+    // scheduler observes the state change without waiting for its tick.
+    if let Err(e) = state.app_handle.emit(
+        "completion-report-written",
+        serde_json::json!({
+            "taskId": task.id,
+            "source": CompletionSource::GithubMerge.as_str(),
+        }),
+    ) {
+        warn!(
+            "emit completion-report-written (github-merge) failed: {}",
+            e
+        );
+    }
     if let Err(e) = state.app_handle.emit(
         "coordinator-wakeup",
         serde_json::json!({
@@ -342,6 +358,22 @@ async fn manual_user_fire(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    // Dashboard's task-detail listener subscribes to
+    // `completion-report-written` (Phase 1 contract); emit it AND the
+    // `coordinator-wakeup` so the panel re-fetches the task and the
+    // scheduler observes the state change without waiting for its tick.
+    if let Err(e) = state.app_handle.emit(
+        "completion-report-written",
+        serde_json::json!({
+            "taskId": task.id,
+            "source": CompletionSource::ManualUserFire.as_str(),
+        }),
+    ) {
+        warn!(
+            "emit completion-report-written (manual-user-fire) failed: {}",
+            e
+        );
+    }
     if let Err(e) = state.app_handle.emit(
         "coordinator-wakeup",
         serde_json::json!({
@@ -862,12 +894,16 @@ mod tests {
         assert_eq!(ids[0], task.id);
 
         // Cleanup.
+        let plan_cleanup_uuid = Uuid::parse_str(&plan_id).expect("plan_id must be uuid");
         let _ = pg
             .pool()
             .get()
             .await
             .expect("conn")
-            .execute("DELETE FROM coord.plans WHERE id = $1::uuid", &[&plan_id])
+            .execute(
+                "DELETE FROM coord.plans WHERE id = $1::uuid",
+                &[&plan_cleanup_uuid],
+            )
             .await;
     }
 }

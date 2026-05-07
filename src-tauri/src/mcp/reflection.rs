@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tauri::Manager;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::commands::AppState;
 use crate::mcp::types::ApiState;
@@ -94,6 +95,10 @@ pub async fn compute_reflection(
         .await
         .map_err(|e| format!("PG pool error: {}", e))?;
 
+    // tokio-postgres infers Type::UUID for `$1::uuid` and rejects `&str`. Parse
+    // once and reuse for every WHERE plan_id = $1::uuid below.
+    let plan_uuid = Uuid::parse_str(plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
+
     let task_counts_row = conn
         .query_one(
             r#"
@@ -104,7 +109,7 @@ pub async fn compute_reflection(
             FROM coord.tasks
             WHERE plan_id = $1::uuid
             "#,
-            &[&plan_id],
+            &[&plan_uuid],
         )
         .await
         .map_err(|e| format!("Failed to compute task tallies: {}", e))?;
@@ -123,7 +128,7 @@ pub async fn compute_reflection(
             JOIN coord.tasks  t ON t.id = r.task_id
             WHERE t.plan_id = $1::uuid
             "#,
-            &[&plan_id],
+            &[&plan_uuid],
         )
         .await
         .map_err(|e| format!("Failed to compute avg confidence: {}", e))?;
@@ -140,7 +145,7 @@ pub async fn compute_reflection(
             JOIN coord.tasks t ON t.id = k.task_id
             WHERE t.plan_id = $1::uuid
             "#,
-            &[&plan_id],
+            &[&plan_uuid],
         )
         .await
         .map_err(|e| format!("Failed to count knowledge: {}", e))?;
@@ -158,7 +163,7 @@ pub async fn compute_reflection(
             ORDER BY k.created_at DESC
             LIMIT 5
             "#,
-            &[&plan_id],
+            &[&plan_uuid],
         )
         .await
         .map_err(|e| format!("Failed to list top knowledge: {}", e))?;
@@ -182,7 +187,7 @@ pub async fn compute_reflection(
             WHERE t.plan_id = $1::uuid
             ORDER BY r.created_at DESC
             "#,
-            &[&plan_id],
+            &[&plan_uuid],
         )
         .await
         .map_err(|e| format!("Failed to list review trail: {}", e))?;
@@ -298,6 +303,8 @@ pub async fn compute_plan_recommendations(
     let mut candidates: Vec<PlanRecommendation> = Vec::new();
     for plan in plans {
         // Ready / not-yet-assigned tasks on this plan.
+        let plan_uuid =
+            Uuid::parse_str(&plan.id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
         let ready_row = conn
             .query_one(
                 r#"
@@ -307,7 +314,7 @@ pub async fn compute_plan_recommendations(
                   AND status IN ('ready', 'pending')
                   AND assigned_session_id IS NULL
                 "#,
-                &[&plan.id],
+                &[&plan_uuid],
             )
             .await
             .map_err(|e| format!("Failed to count ready tasks: {}", e))?;

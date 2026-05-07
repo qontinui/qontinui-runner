@@ -291,7 +291,9 @@ export function useChangeTrackingEvents(
         case "enable_change_buffer":
         case "disable_change_buffer":
         case "drain_change_buffer":
-        case "get_change_buffer_size": {
+        case "get_change_buffer_size":
+        case "get_changes_since":
+        case "get_element_history": {
           const {
             ChangeTracker,
             createSnapshotManager,

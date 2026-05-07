@@ -361,6 +361,120 @@ describe("handleChangeTrackingCommand (runner/snake_case)", () => {
       const result = await handleChangeTrackingCommand(ct, "get_change_buffer_size", {}, deps);
       expect(result).toEqual({ size: 5, enabled: true });
     });
+
+    // -----------------------------------------------------------------------
+    // Phase E (plan 2026-05-07): get_changes_since + get_element_history
+    // back ChangeTracker.changeBuffer via peekBuffer().
+    // -----------------------------------------------------------------------
+
+    it("get_changes_since filters by recordedAt and respects limit", async () => {
+      const fixture = [
+        { recordedAt: 1, sequence: 0 },
+        { recordedAt: 5, sequence: 1 },
+        { recordedAt: 10, sequence: 2 },
+        { recordedAt: 15, sequence: 3 },
+      ];
+      ct.peekBuffer = vi.fn().mockReturnValue(fixture);
+
+      const result = (await handleChangeTrackingCommand(
+        ct,
+        "get_changes_since",
+        { params: { since: "5", limit: "10" } },
+        deps,
+      )) as { events: Array<{ recordedAt: number }>; count: number };
+
+      expect(result.count).toBe(2);
+      expect(result.events.map((e) => e.recordedAt)).toEqual([10, 15]);
+    });
+
+    it("get_changes_since defaults to since=0, limit=100 when params missing", async () => {
+      const fixture = [
+        { recordedAt: 1, sequence: 0 },
+        { recordedAt: 2, sequence: 1 },
+      ];
+      ct.peekBuffer = vi.fn().mockReturnValue(fixture);
+
+      const result = (await handleChangeTrackingCommand(
+        ct,
+        "get_changes_since",
+        {},
+        deps,
+      )) as { events: unknown[]; count: number };
+
+      expect(result.count).toBe(2);
+    });
+
+    it("get_changes_since returns empty when peekBuffer is unavailable", async () => {
+      // Older SDK builds — peekBuffer not on the tracker. The handler
+      // falls back to [] and never throws.
+      delete (ct as { peekBuffer?: unknown }).peekBuffer;
+
+      const result = (await handleChangeTrackingCommand(
+        ct,
+        "get_changes_since",
+        { params: { since: 0, limit: 50 } },
+        deps,
+      )) as { events: unknown[]; count: number };
+
+      expect(result).toEqual({ events: [], count: 0 });
+    });
+
+    it("get_element_history returns BufferedChange entries that mention the element id", async () => {
+      const target = "btn-save";
+      const fixture = [
+        // Matches via diff.changes.modified
+        {
+          recordedAt: 100,
+          diff: {
+            changes: { modified: [{ elementId: target }], appeared: [], disappeared: [] },
+          },
+        },
+        // Matches via diff.contentChanges.textChanges
+        {
+          recordedAt: 200,
+          diff: {
+            changes: {},
+            contentChanges: {
+              textChanges: [{ elementId: target }],
+              metricChanges: [],
+              statusChanges: [],
+            },
+          },
+        },
+        // Different element — must be excluded
+        {
+          recordedAt: 300,
+          diff: {
+            changes: { modified: [{ elementId: "other-id" }] },
+          },
+        },
+        // Route-change — must be excluded by type discriminator
+        {
+          recordedAt: 400,
+          type: "route-change",
+          from: "/a",
+          to: "/b",
+        },
+      ];
+      ct.peekBuffer = vi.fn().mockReturnValue(fixture);
+
+      const result = (await handleChangeTrackingCommand(
+        ct,
+        "get_element_history",
+        { params: { id: target } },
+        deps,
+      )) as Array<{ recordedAt: number }>;
+
+      expect(result).toHaveLength(2);
+      expect(result.map((e) => e.recordedAt)).toEqual([100, 200]);
+    });
+
+    it("get_element_history throws when id is missing", async () => {
+      ct.peekBuffer = vi.fn().mockReturnValue([]);
+      await expect(
+        handleChangeTrackingCommand(ct, "get_element_history", {}, deps),
+      ).rejects.toThrow(/requires an 'id' parameter/);
+    });
   });
 
   // =========================================================================

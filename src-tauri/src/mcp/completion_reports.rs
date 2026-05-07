@@ -43,6 +43,13 @@ use crate::mcp::types::ApiState;
 
 /// Extract the calling session's `task_run_id` from the `task_run_id` header.
 /// Returns 400 on missing/malformed header.
+///
+/// Per plan §9.5 hygiene rules, the value is UUID-parsed before being
+/// returned: the field stores `coord.tasks.assigned_session_id`, which is a
+/// `uuid` column. A non-UUID header value can never match the column and used
+/// to silently fall through to the 403 ownership check, masking the actual
+/// "garbage header" failure mode. We now reject with 400 + a descriptive
+/// message so callers see why their request was rejected.
 fn extract_task_run_id(headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
     let raw = headers.get("task_run_id").ok_or((
         StatusCode::BAD_REQUEST,
@@ -63,6 +70,13 @@ fn extract_task_run_id(headers: &HeaderMap) -> Result<String, (StatusCode, Strin
             "empty task_run_id header".to_string(),
         ));
     }
+    // UUID-validate: a malformed header is a 400, not a 403.
+    Uuid::parse_str(s).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid task_run_id header uuid: {}", e),
+        )
+    })?;
     Ok(s.to_string())
 }
 
@@ -443,9 +457,41 @@ mod tests {
     #[test]
     fn extract_task_run_id_ok() {
         let mut h = HeaderMap::new();
-        h.insert("task_run_id", "abc-123".parse().unwrap());
+        let valid = "11111111-2222-3333-4444-555555555555";
+        h.insert("task_run_id", valid.parse().unwrap());
         let s = extract_task_run_id(&h).unwrap();
-        assert_eq!(s, "abc-123");
+        assert_eq!(s, valid);
+    }
+
+    #[test]
+    fn extract_task_run_id_rejects_garbage_non_uuid() {
+        let mut h = HeaderMap::new();
+        h.insert("task_run_id", "abc-123".parse().unwrap());
+        let err = extract_task_run_id(&h).expect_err("garbage non-uuid header");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.starts_with("invalid task_run_id header uuid:"),
+            "got: {}",
+            err.1
+        );
+    }
+
+    #[test]
+    fn extract_task_run_id_rejects_uuid_with_trailing_garbage() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "task_run_id",
+            "11111111-2222-3333-4444-555555555555-extra"
+                .parse()
+                .unwrap(),
+        );
+        let err = extract_task_run_id(&h).expect_err("malformed uuid");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.starts_with("invalid task_run_id header uuid:"),
+            "got: {}",
+            err.1
+        );
     }
 
     /// Validation surface: oversize summary should reject. Exercises the

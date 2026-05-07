@@ -2,10 +2,27 @@
   "version": "1.0",
   "id": "wrappers",
   "name": "WrappersLibraryPage",
+  "description": "The Wrappers Library page lists installed wrapper extensions, lets users discover and install new ones from the public registry, and registers the qontinui-wrappers MCP server with installed AI clients. Three tabs: Installed (default), AI Clients, Browse.",
+  "metadata": {
+    "tags": [
+      "ai-clients",
+      "connect",
+      "extensions",
+      "install",
+      "library",
+      "mcp",
+      "registry",
+      "wrappers"
+    ]
+  },
+  "provenance": {
+    "source": "migrated"
+  },
   "states": [
     {
       "id": "page-structure",
       "name": "Page Structure & Layout",
+      "description": "The page uses a centered max-width container with a header, tab bar, and content area. Layout is consistent with other refined runner pages (UI Bridge, etc.) — max-w-[1024px] container, padded content, dark theme.",
       "requiredElements": [
         {
           "attributes": {
@@ -20,7 +37,6 @@
           "textContains": "Install wrapper extensions to give the runner"
         }
       ],
-      "description": "The page uses a centered max-width container with a header, tab bar, and content area. Layout is consistent with other refined runner pages (UI Bridge, etc.) — max-w-[1024px] container, padded content, dark theme.",
       "provenance": {
         "source": "migrated"
       }
@@ -28,13 +44,13 @@
     {
       "id": "header-icon-tile",
       "name": "Header Icon Tile",
+      "description": "The header includes a 36×36 cyan-tinted icon tile holding a Package icon — this matches the 'icon-tile' visual pattern established on the UI Bridge integration page.",
       "requiredElements": [
         {
           "role": "heading",
           "text": "Wrappers"
         }
       ],
-      "description": "The header includes a 36×36 cyan-tinted icon tile holding a Package icon — this matches the 'icon-tile' visual pattern established on the UI Bridge integration page.",
       "precondition": "The Wrappers page is active",
       "provenance": {
         "source": "migrated"
@@ -42,7 +58,8 @@
     },
     {
       "id": "tab-navigation",
-      "name": "Tab Navigation (Installed / Browse)",
+      "name": "Tab Navigation (Installed / AI Clients / Browse)",
+      "description": "The wrappers page has three tabs in this order: Installed (default), AI Clients, and Browse. The active tab is highlighted with a cyan underline and cyan-400 text; inactive tabs use muted-foreground.",
       "requiredElements": [
         {
           "tagName": "button",
@@ -59,9 +76,12 @@
         {
           "tagName": "button",
           "text": "Installed"
+        },
+        {
+          "tagName": "button",
+          "text": "AI Clients"
         }
       ],
-      "description": "Two tabs at the top of the content area let users switch between viewing installed wrappers and browsing the public registry. The active tab is indicated by a cyan-400 underline and cyan-400 text color. The Installed tab also shows a count badge of installed wrappers when > 0.",
       "precondition": "At least one wrapper is installed",
       "provenance": {
         "source": "migrated"
@@ -70,6 +90,7 @@
     {
       "id": "installed-tab-empty-state",
       "name": "Installed Tab — Empty State",
+      "description": "When no wrappers are installed, the Installed tab renders an empty-state card with a dashed border, a Package icon-tile, the heading 'No wrappers installed yet', and a hint pointing the user to the Browse tab.",
       "requiredElements": [
         {
           "role": "heading",
@@ -79,7 +100,6 @@
           "textContains": "Switch to the Browse tab to discover wrappers"
         }
       ],
-      "description": "When no wrappers are installed, the Installed tab renders an empty-state card with a dashed border, a Package icon-tile, the heading 'No wrappers installed yet', and a hint pointing the user to the Browse tab.",
       "precondition": "No wrappers are installed and the Installed tab is active",
       "provenance": {
         "source": "migrated"
@@ -88,6 +108,7 @@
     {
       "id": "installed-tab-loading-error",
       "name": "Installed Tab — Loading & Error States",
+      "description": "While the wrapper list is being fetched from GET /wrappers, a centered spinner with the text 'Loading installed wrappers…' is shown. If the fetch fails, an error card is shown with a Retry button that re-runs the fetch.",
       "requiredElements": [
         {
           "textContains": "Loading installed wrappers"
@@ -100,7 +121,6 @@
           "text": "Retry"
         }
       ],
-      "description": "While the wrapper list is being fetched from GET /wrappers, a centered spinner with the text 'Loading installed wrappers…' is shown. If the fetch fails, an error card is shown with a Retry button that re-runs the fetch.",
       "precondition": "GET /wrappers is in flight",
       "provenance": {
         "source": "migrated"
@@ -109,6 +129,7 @@
     {
       "id": "installed-tab-card-grid",
       "name": "Installed Tab — Wrapper Card Grid",
+      "description": "When wrappers are installed, the Installed tab renders a 1- or 2-column grid (responsive on md+) of wrapper cards. Each card displays the wrapper's display name, package name + version, description (line-clamped to 2 lines), transport badge, status badge, action count, a three-dot menu for lifecycle actions, and an Open button.",
       "requiredElements": [
         {
           "role": "heading",
@@ -137,7 +158,6 @@
           "text": "Wrappers"
         }
       ],
-      "description": "When wrappers are installed, the Installed tab renders a 1- or 2-column grid (responsive on md+) of wrapper cards. Each card displays the wrapper's display name, package name + version, description (line-clamped to 2 lines), transport badge, status badge, action count, a three-dot menu for lifecycle actions, and an Open button.",
       "precondition": "At least one wrapper is installed and the Installed tab is active",
       "provenance": {
         "source": "migrated"
@@ -146,6 +166,7 @@
     {
       "id": "browse-tab-search",
       "name": "Browse Tab — Search & Refresh",
+      "description": "The Browse tab has a search input (with a Search icon prefix) and a Refresh button next to it. Search filters the registry entries by id, package, displayName, description, categories, or author name (case-insensitive substring match). Refresh forces a re-fetch of the registry, bypassing the 24h cache.",
       "requiredElements": [
         {},
         {},
@@ -154,7 +175,6 @@
           "text": "Refresh"
         }
       ],
-      "description": "The Browse tab has a search input (with a Search icon prefix) and a Refresh button next to it. Search filters the registry entries by id, package, displayName, description, categories, or author name (case-insensitive substring match). Refresh forces a re-fetch of the registry, bypassing the 24h cache.",
       "precondition": "The Browse tab is active",
       "provenance": {
         "source": "migrated"
@@ -163,6 +183,7 @@
     {
       "id": "browse-tab-states",
       "name": "Browse Tab — Loading / Error / Empty States",
+      "description": "The Browse tab handles three non-populated states: a loading spinner while fetching the registry, an error card if the fetch fails, and an empty/no-results state when the registry is empty or the search query matches nothing.",
       "requiredElements": [
         {
           "textContains": "Loading registry"
@@ -174,7 +195,6 @@
           "textContains": "registry is empty"
         }
       ],
-      "description": "The Browse tab handles three non-populated states: a loading spinner while fetching the registry, an error card if the fetch fails, and an empty/no-results state when the registry is empty or the search query matches nothing.",
       "precondition": "Registry fetch is in flight",
       "provenance": {
         "source": "migrated"
@@ -183,6 +203,7 @@
     {
       "id": "browse-tab-entries",
       "name": "Browse Tab — Registry Entries",
+      "description": "Each registry entry is rendered as a list item showing the wrapper's displayName, an optional 'verified' badge (with ShieldCheck icon, emerald-tinted), the author name, the npm package name + version (monospace), description, category chips, an optional repo link (with ExternalLink icon), a TransportBadge, and an Install button.",
       "requiredElements": [
         {
           "tagName": "li"
@@ -208,7 +229,6 @@
           "text": "repo"
         }
       ],
-      "description": "Each registry entry is rendered as a list item showing the wrapper's displayName, an optional 'verified' badge (with ShieldCheck icon, emerald-tinted), the author name, the npm package name + version (monospace), description, category chips, an optional repo link (with ExternalLink icon), a TransportBadge, and an Install button.",
       "precondition": "The Browse tab is active and at least one registry entry is loaded",
       "provenance": {
         "source": "migrated"
@@ -217,6 +237,7 @@
     {
       "id": "visual-typography",
       "name": "Visual Design — Typography",
+      "description": "Heading hierarchy: h1 'Wrappers' is text-2xl + font-bold + tracking-tight. Section headings (e.g., 'No wrappers installed yet') are h3 + text-sm + font-semibold. Body text is text-xs muted. Package names are font-mono.",
       "requiredElements": [
         {
           "role": "heading",
@@ -226,7 +247,6 @@
           "textContains": "Install wrapper extensions"
         }
       ],
-      "description": "Heading hierarchy: h1 'Wrappers' is text-2xl + font-bold + tracking-tight. Section headings (e.g., 'No wrappers installed yet') are h3 + text-sm + font-semibold. Body text is text-xs muted. Package names are font-mono.",
       "provenance": {
         "source": "migrated"
       }
@@ -234,6 +254,7 @@
     {
       "id": "visual-color-scheme",
       "name": "Visual Design — Color Scheme",
+      "description": "Cyan-400 is the primary accent (active tab, icon-tile borders, links, ring highlights). Cyan-to-purple gradient is reserved for primary action buttons (Install). Status badges use semantic colors: green for running, red for error, yellow for degraded.",
       "requiredElements": [
         {
           "tagName": "button",
@@ -244,7 +265,6 @@
           "text": "Install"
         }
       ],
-      "description": "Cyan-400 is the primary accent (active tab, icon-tile borders, links, ring highlights). Cyan-to-purple gradient is reserved for primary action buttons (Install). Status badges use semantic colors: green for running, red for error, yellow for degraded.",
       "precondition": "The Installed tab is active",
       "provenance": {
         "source": "migrated"
@@ -253,6 +273,7 @@
     {
       "id": "visual-spacing-layout",
       "name": "Visual Design — Spacing & Layout",
+      "description": "The content is constrained to a centered max-w-[1024px] container with px-4/sm:px-6 horizontal padding and py-8 vertical padding. Inside the container, a flex column with gap-4 spaces the header / tab bar / content. Wrapper cards in the Installed grid use gap-4 and switch from 1 column to 2 columns at md+.",
       "requiredElements": [
         {
           "role": "heading",
@@ -263,7 +284,6 @@
           "text": "Wrappers"
         }
       ],
-      "description": "The content is constrained to a centered max-w-[1024px] container with px-4/sm:px-6 horizontal padding and py-8 vertical padding. Inside the container, a flex column with gap-4 spaces the header / tab bar / content. Wrapper cards in the Installed grid use gap-4 and switch from 1 column to 2 columns at md+.",
       "precondition": "At least 2 wrappers are installed",
       "provenance": {
         "source": "migrated"
@@ -272,6 +292,7 @@
     {
       "id": "data-correctness",
       "name": "Data Correctness — Installed list reflects backend",
+      "description": "The Installed tab is the user's window into the runner's wrapper subsystem. What the page shows MUST match what the backend reports. These assertions specify the contract between the UI and GET /wrappers / GET /wrappers/:id/status.",
       "requiredElements": [
         {
           "role": "heading",
@@ -290,25 +311,88 @@
           "text": "Browse"
         }
       ],
-      "description": "The Installed tab is the user's window into the runner's wrapper subsystem. What the page shows MUST match what the backend reports. These assertions specify the contract between the UI and GET /wrappers / GET /wrappers/:id/status.",
       "precondition": "The Installed tab is active and the runner is reachable",
       "provenance": {
         "source": "migrated"
       }
+    },
+    {
+      "id": "ai-clients-tab-structure",
+      "name": "AI Clients Tab — Structure & Cards",
+      "description": "When the AI Clients tab is active, the page renders a vertical stack of one card per supported client: Claude CLI, Claude Desktop, Cursor, Continue, Cline. Each card has a heading with the client's display name, a status pill, an action button (Connect / Disconnect / Reconnect), and a Details disclosure button. Detection (GET /wrappers/clients) marks a client installed if EITHER its config file exists OR its launcher binary is on PATH.",
+      "requiredElements": [
+        {
+          "role": "heading",
+          "text": "Claude CLI"
+        },
+        {
+          "role": "heading",
+          "text": "Claude Desktop"
+        },
+        {
+          "role": "heading",
+          "text": "Cursor"
+        },
+        {
+          "role": "heading",
+          "text": "Continue"
+        },
+        {
+          "role": "heading",
+          "text": "Cline"
+        }
+      ],
+      "precondition": "AI Clients tab is active",
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "ai-clients-status-pills",
+      "name": "AI Clients Tab — Status Pills",
+      "description": "The status pill on each card reflects the connection state returned by GET /wrappers/clients. Five visual variants exist: 'Connected' (emerald, kind=Connected), 'Connected (out of date)' (amber, kind=Drifted — entry exists but command path or env.QONTINUI_PRIMARY_PORT differs from the runner's current values), 'Not connected' (muted, kind=NotConnected), 'Invalid JSON' (red, kind=ConfigParseError — config file exists but doesn't parse), and 'Not detected' (muted, client not installed). Pill text is uppercase tracking-wider 10px font with a 1px border in the matching accent color and a 10% transparent fill.",
+      "requiredElements": [
+        {
+          "role": "button",
+          "textContains": "onnect"
+        }
+      ],
+      "precondition": "AI Clients tab is active and at least one card is rendered",
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "ai-clients-action-buttons",
+      "name": "AI Clients Tab — Action Buttons",
+      "description": "The action button on each card reflects connection state and drives POST /wrappers/clients/{id}/{connect|disconnect}. Possible labels: 'Connect' (kind=NotConnected, enabled, cyan-to-purple gradient), 'Disconnect' (kind=Connected, enabled, neutral border), 'Reconnect' (kind=Drifted, enabled, amber-to-orange gradient), 'Connect' disabled with hover title (installed=false OR kind=ConfigParseError). Mid-request the label transitions to 'Connecting…' / 'Disconnecting…' / 'Reconnecting…' with a spinner. After Connect, the button transitions to 'Disconnect' on the next list refresh; after Disconnect, returns to 'Connect'. After every action the page calls listAiClients() and re-renders. POST /wrappers/clients/{id}/connect writes the qontinui-wrappers entry into the client's config via atomic temp-file-then-rename, with a single .qontinui-backup.<ts> backup the first time the file is written this session.",
+      "requiredElements": [
+        {
+          "role": "button"
+        },
+        {
+          "role": "button"
+        }
+      ],
+      "precondition": "AI Clients tab is active",
+      "provenance": {
+        "source": "ai-generated"
+      }
+    },
+    {
+      "id": "ai-clients-details-disclosure",
+      "name": "AI Clients Tab — Details Disclosure",
+      "description": "Each card has a 'Details' disclosure button (chevron icon) that expands to reveal: (1) the absolute config file path under 'Config file:'; (2) for ConfigParseError state, a red 'Config error:' block with the path and the message 'Open this file and fix the JSON, or delete it to start fresh.'; (3) the JSON snippet that will be written or removed under the mcpServers key, with placeholders '<launcher path>' and '<port>' since the live values aren't fetched into the UI; (4) for Drifted state, the current (stale) command path and port shown alongside the new values that Reconnect will write. The note 'The runner fills in its own stable launcher path and current port.' is rendered below the JSON snippet.",
+      "requiredElements": [
+        {
+          "role": "button"
+        }
+      ],
+      "precondition": "AI Clients tab is active and a Details disclosure has been expanded",
+      "provenance": {
+        "source": "ai-generated"
+      }
     }
   ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "The Wrappers Library page lists installed wrapper extensions and lets users discover/install new ones from the public registry. Wrappers are first-class extensions that add typed actions to the runner — think MCP servers, but native. The page has two tabs (Installed / Browse) and is the entry point to per-wrapper detail views (Actions, Settings, Logs, About). Backed by the runner's HTTP endpoints under /wrappers/* (registry, install, lifecycle, dispatch).",
-  "metadata": {
-    "tags": [
-      "wrappers",
-      "extensions",
-      "registry",
-      "install",
-      "library"
-    ]
-  }
+  "transitions": []
 }

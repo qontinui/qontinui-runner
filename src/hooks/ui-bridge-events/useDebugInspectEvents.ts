@@ -506,6 +506,57 @@ export function useDebugInspectEvents(
           return true;
         }
 
+        case "get_element_react_state": {
+          const { id } = (payload.params || {}) as { id?: string };
+          if (!id) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "id is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const stateEl = currentBridge.getElement(id);
+          if (!stateEl) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Element not found: ${id}`,
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const node = (stateEl as { element?: HTMLElement }).element ?? null;
+          if (!node) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Element ${id} has no DOM node`,
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const { extractReactState } = await import("@qontinui/ui-bridge");
+          const reactState = extractReactState(node);
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: reactState ?? {
+              props: {},
+              fiberState: [],
+              componentName: undefined,
+              note: "No React internals found on this element",
+            },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "get_forms": {
           const formsResult = await discoverBridgeForms(currentBridge);
           await sendResponse({

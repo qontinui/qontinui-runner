@@ -502,6 +502,17 @@ export function useControlEvents(
           return true;
         }
 
+        case "receive_heartbeat": {
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { received: true },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "clear_storage": {
           // Clear all localStorage keys for the current instance port namespace
           const port = getApiPort();
