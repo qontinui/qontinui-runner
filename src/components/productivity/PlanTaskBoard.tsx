@@ -20,6 +20,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   RefreshCw,
   ChevronDown,
@@ -1134,6 +1135,45 @@ export function PlanTaskBoard() {
     window.addEventListener("productivity-select-task", onSelectTask);
     return () => window.removeEventListener("productivity-select-task", onSelectTask);
   }, []);
+
+  // Listen for `completion-report-written` Tauri events emitted by
+  // mcp/completion_reports.rs (worker self-report) and
+  // mcp/completion_sources.rs (github-merge / manual-user-fire). Refreshes
+  // both the task list and the currently-selected task's detail. Without
+  // this, external triggers (manual-user-fire from the dashboard form,
+  // a github-merge webhook, etc.) wrote the report but the panel kept
+  // showing stale "Ready" state until the user clicked refresh.
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const u = await listen<{ taskId?: string; source?: string }>(
+          "completion-report-written",
+          (event) => {
+            if (cancelled) return;
+            if (selectedPlanId) void fetchTasks(selectedPlanId);
+            const eventTaskId = event.payload?.taskId;
+            if (eventTaskId && eventTaskId === selectedTaskId) {
+              void fetchDetail(selectedTaskId);
+            }
+          },
+        );
+        if (cancelled) {
+          u();
+        } else {
+          unlisten = u;
+        }
+      } catch {
+        // listen() can fail in non-Tauri contexts (storybook, vitest);
+        // ignore — the form-driven onReloadDetail path still works.
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [selectedPlanId, fetchTasks, selectedTaskId, fetchDetail]);
 
   const selectedPlan = useMemo(
     () => plans.find((p) => p.id === selectedPlanId) ?? null,
