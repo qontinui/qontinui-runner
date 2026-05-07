@@ -11,4 +11,4 @@ pub mod world_state_verifier;
 
 pub use mode::{parse_mode, WsvConfig, WsvMode};
 pub use retry_policy::{RefusalRetryTracker, RetryDecision};
-pub use world_state_verifier::{VerifierError, WorldStateVerifier};
+pub use world_state_verifier::{TerminalContext, VerifierError, WorldStateVerifier};

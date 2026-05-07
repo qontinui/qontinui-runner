@@ -297,7 +297,21 @@ pub async fn handle_terminal_diff(
             Json(api_error(format!("terminal session '{}' not found", b_id))),
         )
     })?;
-    let diff = {
+    // Self-diff would deadlock if we naively locked `a.grid()` and
+    // `b.grid()` separately when they point to the same Mutex. Detect
+    // that case via Arc::ptr_eq and take a single lock — diff against
+    // itself is a no-op (always 0 changes), useful as a smoke check
+    // from automated tests.
+    let diff = if Arc::ptr_eq(&a.grid(), &b.grid()) {
+        let g = a.grid();
+        let grid = g.lock().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Grid lock poisoned: {}", e))),
+            )
+        })?;
+        grid.diff_lines(&grid)
+    } else {
         let a_grid = a.grid();
         let b_grid = b.grid();
         let ag = a_grid.lock().map_err(|e| {

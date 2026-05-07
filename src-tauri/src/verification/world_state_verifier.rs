@@ -22,6 +22,28 @@ use tracing::{debug, warn};
 
 use crate::agentic_verification::{VerificationIssue, VerificationStatus, VerificationVerdict};
 
+/// Optional terminal context for actions that target a TUI / PTY rather than
+/// (or in addition to) a screenshot-able GUI surface. When provided, the WSM
+/// judge prompt includes the rendered text of the terminal *before* and
+/// *after* the action — sourced from `Grid::text_snapshot().text` per the
+/// terminal grid snapshot architecture.
+///
+/// The text is rendered cell content, not raw bytes — TUI apps that scroll,
+/// use alt-screen, or DEC 2026 sync output produce coherent text here that
+/// they would NOT produce from a wholesale byte-stream replay. See
+/// `memory/proj_terminal_grid_snapshot.md`.
+#[derive(Clone, Debug)]
+pub struct TerminalContext {
+    /// Stable identifier of the terminal session (UUID). Helps the judge
+    /// disambiguate when the agent has multiple terminals open.
+    pub session_id: String,
+    /// `\n`-joined rendered grid text BEFORE the action. Empty string is
+    /// allowed for "nothing in the terminal yet."
+    pub pre_text: String,
+    /// `\n`-joined rendered grid text AFTER the action.
+    pub post_text: String,
+}
+
 /// Errors returned by the WorldStateVerifier. Callers should fall back
 /// to the existing text-based verifier agent on any error.
 #[derive(Debug, Error)]
@@ -104,12 +126,14 @@ impl WorldStateVerifier {
         post_screenshot_b64: &str,
         intent: &str,
         goal_context: Option<&str>,
+        terminal_context: Option<&TerminalContext>,
     ) -> Result<VerificationVerdict, VerifierError> {
         let payload = self.build_payload(
             pre_screenshot_b64,
             post_screenshot_b64,
             intent,
             goal_context,
+            terminal_context,
         );
 
         let url = format!(
@@ -138,9 +162,10 @@ impl WorldStateVerifier {
         post_b64: &str,
         intent: &str,
         goal_context: Option<&str>,
+        terminal_context: Option<&TerminalContext>,
     ) -> serde_json::Value {
         let system_prompt = WSM_SYSTEM_PROMPT;
-        let user_text = build_user_text(intent, goal_context);
+        let user_text = build_user_text(intent, goal_context, terminal_context);
 
         json!({
             "model": self.model,
@@ -173,8 +198,10 @@ impl WorldStateVerifier {
 
 const WSM_SYSTEM_PROMPT: &str = "You are a GUI world-state verifier. You receive two screenshots \
 (PRE and POST) of an application and a text intent describing what action the agent attempted. \
-Your job is to judge, by comparing the two screenshots, whether the POST state reflects that the \
-intended action was actually performed on the correct target.\n\n\
+For terminal-based actions you may also receive PRE and POST blocks of rendered terminal text — \
+treat that text as authoritative for terminal content (it's sourced from a server-side VT parser, \
+not a screenshot). Your job is to judge whether the POST state reflects that the intended action \
+was actually performed on the correct target.\n\n\
 Output STRICT JSON matching this schema — no prose before or after:\n\
 ```json\n\
 {\n\
@@ -196,7 +223,11 @@ use refused when the agent appears to have acted on the wrong element.\n\n\
 Confidence must be calibrated: use high values (>0.8) only when you can clearly see the \
 intended change or the clear absence of it. Use middle values (0.5-0.7) when you are unsure.";
 
-fn build_user_text(intent: &str, goal_context: Option<&str>) -> String {
+fn build_user_text(
+    intent: &str,
+    goal_context: Option<&str>,
+    terminal_context: Option<&TerminalContext>,
+) -> String {
     let mut s = String::new();
     if let Some(goal) = goal_context {
         if !goal.is_empty() {
@@ -207,7 +238,30 @@ fn build_user_text(intent: &str, goal_context: Option<&str>) -> String {
     }
     s.push_str("## Action Intent (what the worker just attempted)\n");
     s.push_str(intent);
-    s.push_str("\n\nThe first image is PRE (before the action). The second image is POST (after the action). Compare them and return the JSON verdict.");
+    s.push_str("\n\n");
+    if let Some(tc) = terminal_context {
+        s.push_str(
+            "## Terminal output\n\
+            The action targeted a terminal/TUI session. The text below is the \
+            **rendered cell content** of that terminal (sourced from a server-\
+            side VT parser, so cursor positioning, alt-screen, and synchronized \
+            output are already resolved). Use it as additional evidence \
+            alongside the screenshots.\n\n",
+        );
+        s.push_str(&format!("Terminal session: `{}`\n\n", tc.session_id));
+        s.push_str("### PRE (terminal contents before the action)\n```\n");
+        s.push_str(&tc.pre_text);
+        if !tc.pre_text.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str("```\n\n### POST (terminal contents after the action)\n```\n");
+        s.push_str(&tc.post_text);
+        if !tc.post_text.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str("```\n\n");
+    }
+    s.push_str("The first image is PRE (before the action). The second image is POST (after the action). Compare them and return the JSON verdict.");
     s
 }
 
@@ -419,5 +473,46 @@ mod tests {
     fn parse_judgement_rejects_empty() {
         assert!(parse_judgement("").is_err());
         assert!(parse_judgement("no json here at all").is_err());
+    }
+
+    #[test]
+    fn build_user_text_omits_terminal_block_when_none() {
+        let s = build_user_text("click submit", Some("complete the form"), None);
+        assert!(s.contains("Action Intent"));
+        assert!(s.contains("complete the form"));
+        assert!(!s.contains("Terminal output"));
+        assert!(!s.contains("Terminal session"));
+    }
+
+    #[test]
+    fn build_user_text_includes_terminal_block_when_provided() {
+        let tc = TerminalContext {
+            session_id: "abc-123".into(),
+            pre_text: "PS D:\\repo>".into(),
+            post_text: "PS D:\\repo>\nWelcome to Claude Code".into(),
+        };
+        let s = build_user_text(
+            "type 'claude' and press Enter",
+            Some("launch claude"),
+            Some(&tc),
+        );
+        assert!(s.contains("Terminal output"));
+        assert!(s.contains("Terminal session: `abc-123`"));
+        assert!(s.contains("PS D:\\repo>"));
+        assert!(s.contains("Welcome to Claude Code"));
+        assert!(s.contains("PRE"));
+        assert!(s.contains("POST"));
+    }
+
+    #[test]
+    fn build_user_text_handles_empty_terminal_text() {
+        let tc = TerminalContext {
+            session_id: "fresh".into(),
+            pre_text: String::new(),
+            post_text: "first line".into(),
+        };
+        let s = build_user_text("spawn", None, Some(&tc));
+        assert!(s.contains("Terminal output"));
+        assert!(s.contains("first line"));
     }
 }

@@ -43,17 +43,22 @@ curl -s -X POST "$RUNNER/ui-bridge/control/element/button-launch-menu/action" \
   -H "Content-Type: application/json" \
   -d '{"action": "click"}' > /dev/null
 sleep 1
-curl -s -X POST "$RUNNER/ui-bridge/control/element/button-1-0/action" \
+# `button-open-1-terminal-0` opens a single terminal from the launch menu.
+# (Previous attempt used `button-1-0` which doesn't match the runner's
+# generated ID scheme.)
+curl -s -X POST "$RUNNER/ui-bridge/control/element/button-open-1-terminal-0/action" \
   -H "Content-Type: application/json" \
   -d '{"action": "click"}' > /dev/null || true
 # Give PowerShell time to print its prompt.
 sleep 5
 
 # 2. Find a session id via React-fiber walk through page/evaluate.
+# `page/evaluate` wraps complex return types in `{value: ...}` and returns
+# bare values for primitives — handle both.
 SID=$(curl -s -X POST "$RUNNER/ui-bridge/control/page/evaluate" \
   -H "Content-Type: application/json" \
   -d '{"expression": "(()=>{const s=new Set();for(const el of document.querySelectorAll(\"*\")){for(const k of Object.keys(el)){if(k.startsWith(\"__reactFiber\")){let f=el[k],d=0;while(f&&d<5){if(f.memoizedProps&&f.memoizedProps.terminalId)s.add(f.memoizedProps.terminalId);f=f.return;d++;}break;}}}return [...s][0]||\"\";})()"}' \
-  | python -c "import sys,json; print(json.load(sys.stdin)['data']['result'])")
+  | python -c "import sys,json; r=json.load(sys.stdin)['data']['result']; print(r['value'] if isinstance(r,dict) and 'value' in r else r)")
 
 if [[ -z "$SID" ]]; then
   echo "FAIL: no terminal session found after launch"; exit 1
@@ -78,10 +83,15 @@ TEXT=$(curl -s "$RUNNER/ui-bridge/sdk/terminal/sessions/$SID/text" \
   | python -c "import sys,json; print(json.load(sys.stdin)['data']['text'])")
 echo "OK /text: $(echo \"$TEXT\" | head -c 80)"
 
-# 6. /search — substring match for any printable run of characters.
-NEEDLE=$(echo "$TEXT" | tr -d '[:space:]' | head -c 4)
+# 6. /search — substring match for any printable run of characters
+# from the rendered text. We extract the first contiguous non-whitespace
+# token from /text so the needle is guaranteed to exist verbatim in the
+# grid (with the same byte sequence — no whitespace stripping that would
+# desync needle vs. haystack).
+NEEDLE=$(echo "$TEXT" | python -c "import sys; t=sys.stdin.read(); import re; m=re.search(r'\S{2,}', t); sys.stdout.write(m.group(0) if m else '')")
 if [[ -n "$NEEDLE" ]]; then
-  SEARCH_HITS=$(curl -s "$RUNNER/ui-bridge/sdk/terminal/search?q=$NEEDLE&session_id=$SID" \
+  ENC_NEEDLE=$(python -c "import sys,urllib.parse; sys.stdout.write(urllib.parse.quote(sys.argv[1]))" "$NEEDLE")
+  SEARCH_HITS=$(curl -s "$RUNNER/ui-bridge/sdk/terminal/search?q=$ENC_NEEDLE&session_id=$SID" \
     | python -c "import sys,json; print(json.load(sys.stdin)['data']['totalHits'])")
   if [[ "$SEARCH_HITS" -lt 1 ]]; then
     echo "FAIL: /search returned 0 hits for needle '$NEEDLE' that exists in /text"; exit 1

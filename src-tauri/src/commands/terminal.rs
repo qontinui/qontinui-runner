@@ -236,7 +236,14 @@ pub fn terminal_grid_diff(
         .ok_or_else(|| format!("Terminal not found: {}", b_terminal_id))?;
     let a_grid_handle = a.grid();
     let b_grid_handle = b.grid();
-    let diff = {
+    // Self-diff would deadlock on a single-mutex re-lock — detect via
+    // Arc::ptr_eq and take one lock instead.
+    let diff = if Arc::ptr_eq(&a_grid_handle, &b_grid_handle) {
+        let grid = a_grid_handle
+            .lock()
+            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
+        grid.diff_lines(&grid)
+    } else {
         let ag = a_grid_handle
             .lock()
             .map_err(|e| format!("Grid A lock poisoned: {}", e))?;
