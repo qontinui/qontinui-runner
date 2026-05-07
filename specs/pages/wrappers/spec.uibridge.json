@@ -1,5 +1,5 @@
 {
-  "description": "The Wrappers Library page lists installed wrapper extensions and lets users discover/install new ones from the public registry. Wrappers are first-class extensions that add typed actions to the runner — think MCP servers, but native. The page has two tabs (Installed / Browse) and is the entry point to per-wrapper detail views (Actions, Settings, Logs, About). Backed by the runner's HTTP endpoints under /wrappers/* (registry, install, lifecycle, dispatch).",
+  "description": "The Wrappers Library page lists installed wrapper extensions, lets users discover and install new ones from the public registry, and registers the qontinui-wrappers MCP server with installed AI clients. Three tabs: Installed (default), AI Clients, Browse.\n\n# WrappersLibraryPage\n\n_(notes)_",
   "groups": [
     {
       "assertions": [
@@ -97,7 +97,7 @@
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Required element 0 for state Tab Navigation (Installed / Browse)",
+          "description": "Required element 0 for state Tab Navigation (Installed / AI Clients / Browse)",
           "enabled": true,
           "id": "tab-navigation-elem-0",
           "precondition": "At least one wrapper is installed",
@@ -109,14 +109,14 @@
               "tagName": "button",
               "textContent": "Installed"
             },
-            "label": "Required element for Tab Navigation (Installed / Browse)",
+            "label": "Required element for Tab Navigation (Installed / AI Clients / Browse)",
             "type": "search"
           }
         },
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Required element 1 for state Tab Navigation (Installed / Browse)",
+          "description": "Required element 1 for state Tab Navigation (Installed / AI Clients / Browse)",
           "enabled": true,
           "id": "tab-navigation-elem-1",
           "precondition": "At least one wrapper is installed",
@@ -128,14 +128,14 @@
               "tagName": "button",
               "textContent": "Browse"
             },
-            "label": "Required element for Tab Navigation (Installed / Browse)",
+            "label": "Required element for Tab Navigation (Installed / AI Clients / Browse)",
             "type": "search"
           }
         },
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Required element 2 for state Tab Navigation (Installed / Browse)",
+          "description": "Required element 2 for state Tab Navigation (Installed / AI Clients / Browse)",
           "enabled": true,
           "id": "tab-navigation-elem-2",
           "precondition": "At least one wrapper is installed",
@@ -147,14 +147,14 @@
               "tagName": "button",
               "textContent": "Browse"
             },
-            "label": "Required element for Tab Navigation (Installed / Browse)",
+            "label": "Required element for Tab Navigation (Installed / AI Clients / Browse)",
             "type": "search"
           }
         },
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Required element 3 for state Tab Navigation (Installed / Browse)",
+          "description": "Required element 3 for state Tab Navigation (Installed / AI Clients / Browse)",
           "enabled": true,
           "id": "tab-navigation-elem-3",
           "precondition": "At least one wrapper is installed",
@@ -166,15 +166,34 @@
               "tagName": "button",
               "textContent": "Installed"
             },
-            "label": "Required element for Tab Navigation (Installed / Browse)",
+            "label": "Required element for Tab Navigation (Installed / AI Clients / Browse)",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state Tab Navigation (Installed / AI Clients / Browse)",
+          "enabled": true,
+          "id": "tab-navigation-elem-4",
+          "precondition": "At least one wrapper is installed",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "tagName": "button",
+              "textContent": "AI Clients"
+            },
+            "label": "Required element for Tab Navigation (Installed / AI Clients / Browse)",
             "type": "search"
           }
         }
       ],
       "category": "element-presence",
-      "description": "Two tabs at the top of the content area let users switch between viewing installed wrappers and browsing the public registry. The active tab is indicated by a cyan-400 underline and cyan-400 text color. The Installed tab also shows a count badge of installed wrappers when > 0.",
+      "description": "The wrappers page has three tabs in this order: Installed (default), AI Clients, and Browse. The active tab is highlighted with a cyan underline and cyan-400 text; inactive tabs use muted-foreground.",
       "id": "tab-navigation",
-      "name": "Tab Navigation (Installed / Browse)",
+      "name": "Tab Navigation (Installed / AI Clients / Browse)",
       "source": "migrated"
     },
     {
@@ -909,16 +928,223 @@
       "id": "data-correctness",
       "name": "Data Correctness — Installed list reflects backend",
       "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state AI Clients Tab — Structure & Cards",
+          "enabled": true,
+          "id": "ai-clients-tab-structure-elem-0",
+          "precondition": "AI Clients tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContent": "Claude CLI"
+            },
+            "label": "Required element for AI Clients Tab — Structure & Cards",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state AI Clients Tab — Structure & Cards",
+          "enabled": true,
+          "id": "ai-clients-tab-structure-elem-1",
+          "precondition": "AI Clients tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContent": "Claude Desktop"
+            },
+            "label": "Required element for AI Clients Tab — Structure & Cards",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 2 for state AI Clients Tab — Structure & Cards",
+          "enabled": true,
+          "id": "ai-clients-tab-structure-elem-2",
+          "precondition": "AI Clients tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContent": "Cursor"
+            },
+            "label": "Required element for AI Clients Tab — Structure & Cards",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 3 for state AI Clients Tab — Structure & Cards",
+          "enabled": true,
+          "id": "ai-clients-tab-structure-elem-3",
+          "precondition": "AI Clients tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContent": "Continue"
+            },
+            "label": "Required element for AI Clients Tab — Structure & Cards",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 4 for state AI Clients Tab — Structure & Cards",
+          "enabled": true,
+          "id": "ai-clients-tab-structure-elem-4",
+          "precondition": "AI Clients tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "heading",
+              "textContent": "Cline"
+            },
+            "label": "Required element for AI Clients Tab — Structure & Cards",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When the AI Clients tab is active, the page renders a vertical stack of one card per supported client: Claude CLI, Claude Desktop, Cursor, Continue, Cline. Each card has a heading with the client's display name, a status pill, an action button (Connect / Disconnect / Reconnect), and a Details disclosure button. Detection (GET /wrappers/clients) marks a client installed if EITHER its config file exists OR its launcher binary is on PATH.",
+      "id": "ai-clients-tab-structure",
+      "name": "AI Clients Tab — Structure & Cards",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state AI Clients Tab — Status Pills",
+          "enabled": true,
+          "id": "ai-clients-status-pills-elem-0",
+          "precondition": "AI Clients tab is active and at least one card is rendered",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button",
+              "textContains": "onnect"
+            },
+            "label": "Required element for AI Clients Tab — Status Pills",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The status pill on each card reflects the connection state returned by GET /wrappers/clients. Five visual variants exist: 'Connected' (emerald, kind=Connected), 'Connected (out of date)' (amber, kind=Drifted — entry exists but command path or env.QONTINUI_PRIMARY_PORT differs from the runner's current values), 'Not connected' (muted, kind=NotConnected), 'Invalid JSON' (red, kind=ConfigParseError — config file exists but doesn't parse), and 'Not detected' (muted, client not installed). Pill text is uppercase tracking-wider 10px font with a 1px border in the matching accent color and a 10% transparent fill.",
+      "id": "ai-clients-status-pills",
+      "name": "AI Clients Tab — Status Pills",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state AI Clients Tab — Action Buttons",
+          "enabled": true,
+          "id": "ai-clients-action-buttons-elem-0",
+          "precondition": "AI Clients tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for AI Clients Tab — Action Buttons",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 1 for state AI Clients Tab — Action Buttons",
+          "enabled": true,
+          "id": "ai-clients-action-buttons-elem-1",
+          "precondition": "AI Clients tab is active",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for AI Clients Tab — Action Buttons",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The action button on each card reflects connection state and drives POST /wrappers/clients/{id}/{connect|disconnect}. Possible labels: 'Connect' (kind=NotConnected, enabled, cyan-to-purple gradient), 'Disconnect' (kind=Connected, enabled, neutral border), 'Reconnect' (kind=Drifted, enabled, amber-to-orange gradient), 'Connect' disabled with hover title (installed=false OR kind=ConfigParseError). Mid-request the label transitions to 'Connecting…' / 'Disconnecting…' / 'Reconnecting…' with a spinner. After Connect, the button transitions to 'Disconnect' on the next list refresh; after Disconnect, returns to 'Connect'. After every action the page calls listAiClients() and re-renders. POST /wrappers/clients/{id}/connect writes the qontinui-wrappers entry into the client's config via atomic temp-file-then-rename, with a single .qontinui-backup.<ts> backup the first time the file is written this session.",
+      "id": "ai-clients-action-buttons",
+      "name": "AI Clients Tab — Action Buttons",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state AI Clients Tab — Details Disclosure",
+          "enabled": true,
+          "id": "ai-clients-details-disclosure-elem-0",
+          "precondition": "AI Clients tab is active and a Details disclosure has been expanded",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for AI Clients Tab — Details Disclosure",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Each card has a 'Details' disclosure button (chevron icon) that expands to reveal: (1) the absolute config file path under 'Config file:'; (2) for ConfigParseError state, a red 'Config error:' block with the path and the message 'Open this file and fix the JSON, or delete it to start fresh.'; (3) the JSON snippet that will be written or removed under the mcpServers key, with placeholders '<launcher path>' and '<port>' since the live values aren't fetched into the UI; (4) for Drifted state, the current (stale) command path and port shown alongside the new values that Reconnect will write. The note 'The runner fills in its own stable launcher path and current port.' is rendered below the JSON snippet.",
+      "id": "ai-clients-details-disclosure",
+      "name": "AI Clients Tab — Details Disclosure",
+      "source": "ai-generated"
     }
   ],
   "metadata": {
     "component": "wrappers",
     "tags": [
-      "wrappers",
+      "ai-clients",
+      "connect",
       "extensions",
-      "registry",
       "install",
-      "library"
+      "library",
+      "mcp",
+      "registry",
+      "wrappers"
     ]
   },
   "stateMachine": {
@@ -958,7 +1184,7 @@
         "transitions": []
       },
       {
-        "description": "Two tabs at the top of the content area let users switch between viewing installed wrappers and browsing the public registry. The active tab is indicated by a cyan-400 underline and cyan-400 text color. The Installed tab also shows a count badge of installed wrappers when > 0.",
+        "description": "The wrappers page has three tabs in this order: Installed (default), AI Clients, and Browse. The active tab is highlighted with a cyan underline and cyan-400 text; inactive tabs use muted-foreground.",
         "elements": [
           {
             "tagName": "button",
@@ -975,11 +1201,15 @@
           {
             "tagName": "button",
             "textContent": "Installed"
+          },
+          {
+            "tagName": "button",
+            "textContent": "AI Clients"
           }
         ],
         "id": "tab-navigation",
         "isInitial": false,
-        "name": "Tab Navigation (Installed / Browse)",
+        "name": "Tab Navigation (Installed / AI Clients / Browse)",
         "transitions": []
       },
       {
@@ -1190,6 +1420,75 @@
         "id": "data-correctness",
         "isInitial": false,
         "name": "Data Correctness — Installed list reflects backend",
+        "transitions": []
+      },
+      {
+        "description": "When the AI Clients tab is active, the page renders a vertical stack of one card per supported client: Claude CLI, Claude Desktop, Cursor, Continue, Cline. Each card has a heading with the client's display name, a status pill, an action button (Connect / Disconnect / Reconnect), and a Details disclosure button. Detection (GET /wrappers/clients) marks a client installed if EITHER its config file exists OR its launcher binary is on PATH.",
+        "elements": [
+          {
+            "role": "heading",
+            "textContent": "Claude CLI"
+          },
+          {
+            "role": "heading",
+            "textContent": "Claude Desktop"
+          },
+          {
+            "role": "heading",
+            "textContent": "Cursor"
+          },
+          {
+            "role": "heading",
+            "textContent": "Continue"
+          },
+          {
+            "role": "heading",
+            "textContent": "Cline"
+          }
+        ],
+        "id": "ai-clients-tab-structure",
+        "isInitial": false,
+        "name": "AI Clients Tab — Structure & Cards",
+        "transitions": []
+      },
+      {
+        "description": "The status pill on each card reflects the connection state returned by GET /wrappers/clients. Five visual variants exist: 'Connected' (emerald, kind=Connected), 'Connected (out of date)' (amber, kind=Drifted — entry exists but command path or env.QONTINUI_PRIMARY_PORT differs from the runner's current values), 'Not connected' (muted, kind=NotConnected), 'Invalid JSON' (red, kind=ConfigParseError — config file exists but doesn't parse), and 'Not detected' (muted, client not installed). Pill text is uppercase tracking-wider 10px font with a 1px border in the matching accent color and a 10% transparent fill.",
+        "elements": [
+          {
+            "role": "button",
+            "textContains": "onnect"
+          }
+        ],
+        "id": "ai-clients-status-pills",
+        "isInitial": false,
+        "name": "AI Clients Tab — Status Pills",
+        "transitions": []
+      },
+      {
+        "description": "The action button on each card reflects connection state and drives POST /wrappers/clients/{id}/{connect|disconnect}. Possible labels: 'Connect' (kind=NotConnected, enabled, cyan-to-purple gradient), 'Disconnect' (kind=Connected, enabled, neutral border), 'Reconnect' (kind=Drifted, enabled, amber-to-orange gradient), 'Connect' disabled with hover title (installed=false OR kind=ConfigParseError). Mid-request the label transitions to 'Connecting…' / 'Disconnecting…' / 'Reconnecting…' with a spinner. After Connect, the button transitions to 'Disconnect' on the next list refresh; after Disconnect, returns to 'Connect'. After every action the page calls listAiClients() and re-renders. POST /wrappers/clients/{id}/connect writes the qontinui-wrappers entry into the client's config via atomic temp-file-then-rename, with a single .qontinui-backup.<ts> backup the first time the file is written this session.",
+        "elements": [
+          {
+            "role": "button"
+          },
+          {
+            "role": "button"
+          }
+        ],
+        "id": "ai-clients-action-buttons",
+        "isInitial": false,
+        "name": "AI Clients Tab — Action Buttons",
+        "transitions": []
+      },
+      {
+        "description": "Each card has a 'Details' disclosure button (chevron icon) that expands to reveal: (1) the absolute config file path under 'Config file:'; (2) for ConfigParseError state, a red 'Config error:' block with the path and the message 'Open this file and fix the JSON, or delete it to start fresh.'; (3) the JSON snippet that will be written or removed under the mcpServers key, with placeholders '<launcher path>' and '<port>' since the live values aren't fetched into the UI; (4) for Drifted state, the current (stale) command path and port shown alongside the new values that Reconnect will write. The note 'The runner fills in its own stable launcher path and current port.' is rendered below the JSON snippet.",
+        "elements": [
+          {
+            "role": "button"
+          }
+        ],
+        "id": "ai-clients-details-disclosure",
+        "isInitial": false,
+        "name": "AI Clients Tab — Details Disclosure",
         "transitions": []
       }
     ]
