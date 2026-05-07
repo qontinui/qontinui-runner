@@ -222,13 +222,16 @@ export type UIBridgeRequestType =
   // Spec execution (POST /control/spec/{id}/run)
   | "run_spec"
   // Bucket C follow-up (plan 2026-05-07): 5 of 7 handlers wired here.
-  // get_changes_since and get_element_history are deferred pending an
-  // upstream SDK PR adding ChangeTracker.peekBuffer().
   | "receive_heartbeat"
   | "delete_intent"
   | "rank_elements"
   | "set_viewport_constraints"
-  | "get_element_react_state";
+  | "get_element_react_state"
+  // Bucket C deferred (plan 2026-05-07-ui-bridge-change-buffer-peek):
+  // both back the runner's view of ChangeTracker.changeBuffer via
+  // peekBuffer() (SDK 0.3.5).
+  | "get_changes_since"
+  | "get_element_history";
 
 // ============================================================
 // N1 — Compile-time exhaustiveness registry for the chained
@@ -340,7 +343,9 @@ export type ChangeTrackingEventTypes =
   | "enable_change_buffer"
   | "disable_change_buffer"
   | "drain_change_buffer"
-  | "get_change_buffer_size";
+  | "get_change_buffer_size"
+  | "get_changes_since"
+  | "get_element_history";
 
 export type DebugInspectEventTypes =
   | "get_console_errors"
