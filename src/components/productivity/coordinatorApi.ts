@@ -111,10 +111,14 @@ export interface LeaderResponse {
  *    `"worker"`.
  *  - `terminalId` is `null` for `mode === "rust"` (no pty was opened);
  *    for the other modes it identifies the new tab so the sidebar
- *    state-machine can focus it. */
+ *    state-machine can focus it.
+ *  - `taskRunId` is the `task_run_id` under which a worker is registered
+ *    with `SessionManager` (Phase 6). Populated only for `mode ===
+ *    "worker"`; `null` for the other modes. */
 export interface LaunchResult {
   mode: string;
   terminalId: string | null;
+  taskRunId: string | null;
 }
 
 /** Read the current `coordinator_leader` row + derived lease status. */

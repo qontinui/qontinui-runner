@@ -6,6 +6,7 @@ use tracing::{debug, info};
 
 use super::session::ClaudeSession;
 use super::state::SessionState;
+use super::worker_session::WorkerSession;
 
 /// Manages active Claude CLI sessions, keyed by task_run_id.
 pub struct SessionManager {
@@ -14,6 +15,14 @@ pub struct SessionManager {
     /// These sessions don't have a full ClaudeSession object but still need to be
     /// visible to the stale task sweep so it can check process liveness.
     inline_pids: Mutex<HashMap<String, u32>>,
+    /// Pty-backed worker sessions, keyed by task_run_id. Sibling map to
+    /// `sessions` (Option B′ from productivity-coordinator-workers-phase6).
+    /// Workers do NOT share `ClaudeSession`'s strict state machine — they
+    /// carry their own state on `WorkerSession`. They appear in
+    /// `list_active`, `get_state`, `cleanup_closed`, and `close_all_sessions`
+    /// alongside ClaudeSessions; the keyspace (UUIDv4 task_run_ids) is
+    /// disjoint, so callers don't need to disambiguate.
+    worker_sessions: Mutex<HashMap<String, Arc<WorkerSession>>>,
     /// Pending context to prepend to the next user message for a given task_run_id.
     /// Used for system notes that should be delivered with the next user message
     /// rather than sent as standalone messages (which would trigger unwanted response turns).
@@ -25,6 +34,7 @@ impl SessionManager {
         Self {
             sessions: Mutex::new(HashMap::new()),
             inline_pids: Mutex::new(HashMap::new()),
+            worker_sessions: Mutex::new(HashMap::new()),
             pending_context: Mutex::new(HashMap::new()),
         }
     }
@@ -76,9 +86,54 @@ impl SessionManager {
         removed
     }
 
-    /// Get the current state of a session.
+    /// Get the current state of a session. Looks first in the
+    /// ClaudeSession map, then falls back to the worker map (Phase 6).
     pub fn get_state(&self, task_run_id: &str) -> Option<SessionState> {
-        self.get(task_run_id).map(|s| s.state())
+        if let Some(s) = self.get(task_run_id) {
+            return Some(s.state());
+        }
+        self.get_worker(task_run_id).map(|w| w.state())
+    }
+
+    /// Register a pty-backed worker session. Returns Err on duplicate key
+    /// — mirrors `register` for ClaudeSessions.
+    pub fn register_worker(&self, session: Arc<WorkerSession>) -> Result<(), String> {
+        let task_run_id = session.task_run_id().to_string();
+        let mut guard = self
+            .worker_sessions
+            .lock()
+            .map_err(|e| format!("SessionManager worker lock poisoned: {}", e))?;
+        if guard.contains_key(&task_run_id) {
+            return Err(format!(
+                "Worker already registered for task_run_id: {}",
+                task_run_id
+            ));
+        }
+        info!("SessionManager: registered worker for {}", task_run_id);
+        guard.insert(task_run_id, session);
+        Ok(())
+    }
+
+    /// Get a registered worker by task_run_id.
+    pub fn get_worker(&self, task_run_id: &str) -> Option<Arc<WorkerSession>> {
+        self.worker_sessions
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(task_run_id).cloned())
+    }
+
+    /// Remove and return a worker registration. Does NOT close the
+    /// underlying pty (TerminalManager owns those lifetimes).
+    pub fn remove_worker(&self, task_run_id: &str) -> Option<Arc<WorkerSession>> {
+        let removed = self
+            .worker_sessions
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(task_run_id));
+        if removed.is_some() {
+            info!("SessionManager: removed worker for {}", task_run_id);
+        }
+        removed
     }
 
     /// Register an inline (non-interactive) session's PID for stale task sweep visibility.
@@ -103,7 +158,7 @@ impl SessionManager {
     }
 
     /// List all sessions with their task_run_id, current state, and PID.
-    /// Includes both interactive sessions and inline PID registrations.
+    /// Includes ClaudeSessions, inline PID registrations, and pty Workers.
     /// Used by the stale task sweep to check session liveness.
     pub fn list_all_with_state(&self) -> Vec<(String, SessionState, u32)> {
         let mut results: Vec<(String, SessionState, u32)> = self
@@ -127,12 +182,26 @@ impl SessionManager {
             }
         }
 
+        // Include workers. Their pid is best-effort — `0` means unknown
+        // (pty was already removed from TerminalManager); the sweep
+        // tolerates 0 by treating it as "process liveness unknown".
+        if let Ok(guard) = self.worker_sessions.lock() {
+            for (id, w) in guard.iter() {
+                if !results.iter().any(|(k, _, _)| k == id) {
+                    results.push((id.clone(), w.state(), w.pid()));
+                }
+            }
+        }
+
         results
     }
 
-    /// List all active session task_run_ids.
+    /// List all active session task_run_ids — union of ClaudeSessions and
+    /// Workers whose state is non-Closed. Phase 6: workers participate in
+    /// `Observation.live_sessions` so Rule B can assign them tasks.
     pub fn list_active(&self) -> Vec<String> {
-        self.sessions
+        let mut active: Vec<String> = self
+            .sessions
             .lock()
             .map(|guard| {
                 guard
@@ -141,10 +210,20 @@ impl SessionManager {
                     .map(|(k, _)| k.clone())
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        if let Ok(guard) = self.worker_sessions.lock() {
+            for (id, w) in guard.iter() {
+                if w.state().is_active() && !active.contains(id) {
+                    active.push(id.clone());
+                }
+            }
+        }
+
+        active
     }
 
-    /// Clean up any closed sessions.
+    /// Clean up any closed sessions and workers.
     pub fn cleanup_closed(&self) {
         if let Ok(mut guard) = self.sessions.lock() {
             let before = guard.len();
@@ -152,6 +231,14 @@ impl SessionManager {
             let removed = before - guard.len();
             if removed > 0 {
                 info!("SessionManager: cleaned up {} closed sessions", removed);
+            }
+        }
+        if let Ok(mut guard) = self.worker_sessions.lock() {
+            let before = guard.len();
+            guard.retain(|_, w| w.state().is_active());
+            let removed = before - guard.len();
+            if removed > 0 {
+                info!("SessionManager: cleaned up {} closed workers", removed);
             }
         }
     }
@@ -218,6 +305,19 @@ impl SessionManager {
                     "SessionManager: clearing {} inline PID registrations",
                     count
                 );
+                guard.clear();
+            }
+        }
+        // Drop worker registrations. The pty TerminalSessions are owned
+        // by TerminalManager (its own shutdown path closes them); we just
+        // forget the worker handles here.
+        if let Ok(mut guard) = self.worker_sessions.lock() {
+            let count = guard.len();
+            if count > 0 {
+                info!("SessionManager: clearing {} worker registrations", count);
+                for (_, w) in guard.iter() {
+                    w.close();
+                }
                 guard.clear();
             }
         }

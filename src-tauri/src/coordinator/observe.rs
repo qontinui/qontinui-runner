@@ -103,6 +103,20 @@ pub(crate) async fn observe(state: &Arc<ApiState>) -> Result<Observation, String
         })
         .collect();
 
+    // Phase 6 / Plan §Task 2 / Option 2c:
+    // Workers go Ready → Processing on assign-task delivery
+    // (`WorkerSession::send_user_message`). They go back to Ready when the
+    // assigned task transitions to a terminal status (`done` | `cancelled`).
+    // Walk the worker registry, look up each Processing worker's currently-
+    // assigned task, and flip back to Ready when the task is in a terminal
+    // state. Workers without an assigned task (never received assign-task)
+    // are also flipped to Ready as a safety net so a stale Processing flag
+    // doesn't strand a worker. Idempotent — runs once per observe tick
+    // before the live_sessions snapshot is built.
+    if let Some(sm) = session_manager.as_ref() {
+        flip_idle_workers(sm, &tasks, &assigned_task_by_session);
+    }
+
     let live_sessions = match session_manager {
         Some(sm) => sm
             .list_active()
@@ -169,4 +183,51 @@ pub(crate) async fn observe(state: &Arc<ApiState>) -> Result<Observation, String
         session_touched_files,
         recent_decisions,
     })
+}
+
+/// Walk every registered worker; for each Processing worker decide whether
+/// its assigned task has reached a terminal state and flip back to Ready.
+/// See the call site for the full rationale (Phase 6 / Option 2c).
+fn flip_idle_workers(
+    sm: &SessionManager,
+    tasks: &[TaskRow],
+    assigned_task_by_session: &HashMap<String, String>,
+) {
+    // Build a quick lookup so we don't scan `tasks` twice per worker.
+    let task_status_by_id: HashMap<&str, &str> = tasks
+        .iter()
+        .map(|t| (t.id.as_str(), t.status.as_str()))
+        .collect();
+
+    for task_run_id in sm.list_active() {
+        let Some(worker) = sm.get_worker(&task_run_id) else {
+            continue;
+        };
+        if worker.state() != SessionState::Processing {
+            continue;
+        }
+        match assigned_task_by_session.get(&task_run_id) {
+            Some(task_id) => {
+                let status = task_status_by_id.get(task_id.as_str()).copied();
+                let terminal = matches!(status, Some("done") | Some("cancelled") | None);
+                if terminal {
+                    tracing::debug!(
+                        "observe: flipping worker {} Processing → Ready (task {} status={:?})",
+                        task_run_id,
+                        task_id,
+                        status
+                    );
+                    worker.set_state(SessionState::Ready);
+                }
+            }
+            None => {
+                // Processing worker with no assigned task — safety net.
+                tracing::debug!(
+                    "observe: flipping orphaned Processing worker {} → Ready",
+                    task_run_id
+                );
+                worker.set_state(SessionState::Ready);
+            }
+        }
+    }
 }
