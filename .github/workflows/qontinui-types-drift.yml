@@ -1,0 +1,133 @@
+name: qontinui-types drift
+
+# Mirror of qontinui-schemas/.github/workflows/schema-drift.yml, but
+# triggered from the runner side. Catches the case where a runner-side
+# change to schema_export.rs / tauri_event_payloads.rs / relay_envelopes.rs
+# / generate_types.sh would change the codegen output and stale
+# qontinui-schemas's checked-in TS/Python artifacts.
+#
+# Without this gate, runner-side schema changes silently break the
+# qontinui-schemas drift signal — the schemas-side workflow only fires
+# on `rust/src/**` changes, so a runner-only change wouldn't surface
+# until someone next touched a schemas-side Rust file. By then the
+# blame trail is muddied.
+#
+# The two workflows together form a two-sided contract:
+#   - schemas-side fires on rust/src/** changes
+#   - runner-side fires on the four runner schema files
+#   - both run the same generate_types.sh + git diff -I '^#   timestamp:'
+#
+# A red signal here means: regenerate qontinui-schemas's artifacts and
+# coordinate the merge (qontinui-schemas PR before/with this runner PR).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src-tauri/src/schema_export.rs"
+      - "src-tauri/src/tauri_event_payloads.rs"
+      - "src-tauri/src/relay_envelopes.rs"
+      - "src-tauri/scripts/generate_types.sh"
+  push:
+    branches: [main]
+    paths:
+      - "src-tauri/src/schema_export.rs"
+      - "src-tauri/src/tauri_event_payloads.rs"
+      - "src-tauri/src/relay_envelopes.rs"
+      - "src-tauri/scripts/generate_types.sh"
+
+jobs:
+  check-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout qontinui-runner
+        uses: actions/checkout@v4
+        with:
+          path: qontinui-runner
+
+      - name: Checkout qontinui-schemas (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: qontinui/qontinui-schemas
+          path: qontinui-schemas
+
+      # generate_types.sh runs `cargo build --bin export_schemas` which
+      # links the runner lib (Tauri-dependent). Tauri 2.x on Linux probes
+      # for libwebkit2gtk-4.1, libsoup, libgtk etc. via pkg-config in
+      # build scripts. Mirrors the canonical apt-get list from
+      # .github/workflows/ci.yml.
+      - name: Install Tauri Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # compile_typescript.mjs does `import { compile } from
+      # 'json-schema-to-typescript'` from qontinui-schemas/scripts/.
+      # Node ESM resolution walks up to qontinui-schemas/node_modules/,
+      # so the package must be installed locally. package-lock.json is
+      # gitignored in qontinui-schemas, so `npm install` (not `npm ci`).
+      - name: Install qontinui-schemas npm deps
+        working-directory: qontinui-schemas
+        run: npm install
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Pin must match qontinui-schemas/.github/workflows/schema-drift.yml.
+      # If you bump one side, bump the other in the same release window.
+      - name: Install datamodel-code-generator
+        run: pip install 'datamodel-code-generator==0.57.0'
+
+      # tauri_build::build() in src-tauri/build.rs reads tauri.conf.json's
+      # `frontendDist: "../dist"` and panics if the path doesn't exist.
+      # We don't need a real frontend build — export_schemas only touches
+      # Rust schemar registries — so stub an empty dist/ with a placeholder.
+      - name: Stub qontinui-runner frontend dist
+        run: |
+          mkdir -p qontinui-runner/dist
+          printf '<!DOCTYPE html><html><head></head><body>qontinui-types-drift CI stub</body></html>\n' > qontinui-runner/dist/index.html
+
+      # CARGO_TARGET_DIR override: qontinui-runner is a workspace, so
+      # cargo's default target-dir is qontinui-runner/target/. But
+      # generate_types.sh hardcodes per-package target. Force agreement.
+      - name: Regenerate types
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/qontinui-runner/src-tauri/target
+        run: bash qontinui-runner/src-tauri/scripts/generate_types.sh
+
+      # `-I '^#   timestamp:'` ignores hunks whose only changed lines
+      # are the datamodel-codegen timestamp header (rewritten every
+      # run regardless of schema content). Same trick the schemas-side
+      # workflow uses.
+      - name: Check for drift
+        working-directory: qontinui-schemas
+        run: |
+          if ! git diff --exit-code -I '^#   timestamp:' \
+              ts/src/generated \
+              src/qontinui_schemas/generated; then
+            echo "::error::This runner-side change would cause drift in qontinui-schemas's checked-in TS/Python artifacts."
+            echo "Coordinate the schemas update: open a qontinui-schemas PR with regenerated artifacts and merge it before/with this PR."
+            echo "Local regen: bash src-tauri/scripts/generate_types.sh"
+            exit 1
+          fi
