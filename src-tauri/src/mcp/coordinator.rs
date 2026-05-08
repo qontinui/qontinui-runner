@@ -62,6 +62,16 @@ pub struct LiveSessionSummary {
     pub task_run_id: String,
     pub state: String,
     pub is_active: bool,
+    /// Pty terminal id when this session is a pty-backed Worker (Phase 6).
+    /// `None` for ClaudeSessions which run their own subprocess directly.
+    /// The dashboard's Workers panel uses this to wire up the
+    /// "View terminal" button without re-querying `/terminals` and
+    /// title-prefix-matching against pty tabs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// User-facing title (e.g. "Worker 3"). `None` for ClaudeSessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Composite payload returned by `GET /coordinator/state`. Field shape
@@ -115,17 +125,35 @@ async fn get_coordinator_state(
             manager
                 .list_active()
                 .into_iter()
-                .map(|task_run_id| match manager.get_state(&task_run_id) {
-                    Some(s) => LiveSessionSummary {
-                        task_run_id,
-                        state: s.as_event_str().to_string(),
-                        is_active: s.is_active(),
-                    },
-                    None => LiveSessionSummary {
-                        task_run_id,
-                        state: "closed".to_string(),
-                        is_active: false,
-                    },
+                .map(|task_run_id| {
+                    // Pty-backed workers expose `title()` and
+                    // `terminal_id()` so the dashboard can map a
+                    // liveSessions row to its terminal tab. ClaudeSessions
+                    // (subprocess-backed) have neither — leave both fields
+                    // `None` so the JSON omits them.
+                    let (terminal_id, title) = match manager.get_worker(&task_run_id) {
+                        Some(w) => (
+                            Some(w.terminal_id().to_string()),
+                            Some(w.title().to_string()),
+                        ),
+                        None => (None, None),
+                    };
+                    match manager.get_state(&task_run_id) {
+                        Some(s) => LiveSessionSummary {
+                            task_run_id,
+                            state: s.as_event_str().to_string(),
+                            is_active: s.is_active(),
+                            terminal_id,
+                            title,
+                        },
+                        None => LiveSessionSummary {
+                            task_run_id,
+                            state: "closed".to_string(),
+                            is_active: false,
+                            terminal_id,
+                            title,
+                        },
+                    }
                 })
                 .collect()
         }
@@ -364,6 +392,178 @@ async fn coordinator_act(
 }
 
 // =============================================================================
+// /coordinator/tasks/reset-stale
+// =============================================================================
+
+/// Query string for `POST /coordinator/tasks/reset-stale`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetStaleTasksQuery {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// One task that was examined but not flipped back to `ready`. The
+/// `reason` strings are stable so callers (the Productivity dashboard, the
+/// `/coordinate` slash command) can group/render them without matching on
+/// free-form text.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedTask {
+    pub task_id: String,
+    pub status: String,
+    pub assigned_session_id: Option<String>,
+    pub reason: String,
+}
+
+/// Response for `POST /coordinator/tasks/reset-stale`. `reset` is the set
+/// of task ids that were (or, in dry-run mode, would be) flipped back to
+/// `ready`; `skipped` is the audit trail of tasks that were inspected but
+/// not eligible.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetStaleTasksResponse {
+    pub reset: Vec<String>,
+    pub skipped: Vec<SkippedTask>,
+    pub dry_run: bool,
+}
+
+/// Flip stale `assigned`/`needs_fix` tasks back to `ready` when their
+/// `assigned_session_id` is no longer present in the live SessionManager
+/// set. Useful between test runs against pre-decomposed plan fixtures —
+/// the prior runner's worker session ids are dead weight in
+/// `coord.tasks.assigned_session_id` and prevent the next coordinator
+/// iteration from picking the task back up.
+///
+/// Idempotent: a second concurrent call will see the task already in
+/// `ready` and skip it with reason `status not assigned/needs_fix`.
+async fn reset_stale_tasks(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ResetStaleTasksQuery>,
+) -> Result<Json<ResetStaleTasksResponse>, (StatusCode, String)> {
+    let dry_run = query.dry_run;
+    let app = state.app_state.clone();
+
+    // 1. Pull every non-terminal task — same source the dashboard uses.
+    let tasks = app
+        .pg_db
+        .list_tasks_by_status(NON_TERMINAL_STATUSES)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list_tasks_by_status: {}", e),
+            )
+        })?;
+
+    // 2. Resolve the live session set. If SessionManager isn't registered
+    //    (test harness, or runner shutting down), treat the live set as
+    //    empty — every assigned task counts as stale.
+    let live: std::collections::HashSet<String> = match state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+    {
+        Some(sm) => sm.inner().list_active().into_iter().collect(),
+        None => std::collections::HashSet::new(),
+    };
+
+    // 3. Classify each task into eligible vs skipped.
+    let mut eligible: Vec<(String, String)> = Vec::new(); // (task_id, current_status)
+    let mut skipped: Vec<SkippedTask> = Vec::new();
+    for task in &tasks {
+        let status = task.status.as_str();
+        if status != "assigned" && status != "needs_fix" {
+            skipped.push(SkippedTask {
+                task_id: task.id.clone(),
+                status: task.status.clone(),
+                assigned_session_id: task.assigned_session_id.clone(),
+                reason: "status not assigned/needs_fix".to_string(),
+            });
+            continue;
+        }
+        match &task.assigned_session_id {
+            None => {
+                // Defensive: shouldn't happen for assigned/needs_fix in
+                // normal operation, but possible after a manual DB poke.
+                skipped.push(SkippedTask {
+                    task_id: task.id.clone(),
+                    status: task.status.clone(),
+                    assigned_session_id: None,
+                    reason: "no assigned_session_id".to_string(),
+                });
+            }
+            Some(sid) if live.contains(sid) => {
+                skipped.push(SkippedTask {
+                    task_id: task.id.clone(),
+                    status: task.status.clone(),
+                    assigned_session_id: Some(sid.clone()),
+                    reason: "session still alive".to_string(),
+                });
+            }
+            Some(_) => {
+                eligible.push((task.id.clone(), task.status.clone()));
+            }
+        }
+    }
+
+    // 4. In non-dry-run mode, apply the flip. We use the validated
+    //    `transition_task_status` primitive so a concurrent caller can't
+    //    cause a lost-update; if the row already moved, our update is a
+    //    no-op and we still report the id as `reset` because the requested
+    //    end state holds. (Surfacing an extra "raced concurrent call"
+    //    bucket would just confuse the caller.)
+    let mut reset_ids: Vec<String> = Vec::new();
+    if !dry_run {
+        for (task_id, from_status) in &eligible {
+            // Best-effort: log on failure but keep going so one bad row
+            // doesn't strand the rest. The caller can re-run the endpoint
+            // to retry.
+            match app
+                .pg_db
+                .transition_task_status(task_id, from_status, "ready")
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        "reset_stale_tasks: transition_task_status({}, {}, ready) failed: {}",
+                        task_id, from_status, e
+                    );
+                    continue;
+                }
+            }
+            if let Err(e) = app.pg_db.clear_task_assignment(task_id).await {
+                warn!(
+                    "reset_stale_tasks: clear_task_assignment({}) failed: {}",
+                    task_id, e
+                );
+                continue;
+            }
+            reset_ids.push(task_id.clone());
+        }
+        info!(
+            "reset_stale_tasks: flipped {} stale task(s) back to ready (skipped={})",
+            reset_ids.len(),
+            skipped.len()
+        );
+    } else {
+        // Dry-run: report what we *would* flip without touching PG.
+        reset_ids = eligible.iter().map(|(id, _)| id.clone()).collect();
+        info!(
+            "reset_stale_tasks (dry-run): would flip {} stale task(s); skipped={}",
+            reset_ids.len(),
+            skipped.len()
+        );
+    }
+
+    Ok(Json(ResetStaleTasksResponse {
+        reset: reset_ids,
+        skipped,
+        dry_run,
+    }))
+}
+
+// =============================================================================
 // /coordinator/leader
 // =============================================================================
 
@@ -523,4 +723,5 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/coordinator/leader/break-lease",
             post(break_coordinator_lease),
         )
+        .route("/coordinator/tasks/reset-stale", post(reset_stale_tasks))
 }

@@ -159,3 +159,105 @@ export async function spawnWorkerSession(args: {
 }): Promise<LaunchResult> {
   return invoke<LaunchResult>("spawn_worker_session", args);
 }
+
+// ---------------------------------------------------------------------------
+// POST /coordinator/tasks/reset-stale — flip stale assigned/needs_fix tasks
+// back to `ready` when their `assigned_session_id` no longer exists in
+// SessionManager. Useful between test runs against pre-decomposed plan
+// fixtures. Idempotent — second call sees the rows already in `ready` and
+// reports them under `skipped`.
+// ---------------------------------------------------------------------------
+
+/** One task examined by the reset-stale sweep that was NOT flipped, with
+ *  the stable reason string (`"status not assigned/needs_fix"`,
+ *  `"session still alive"`, `"no assigned_session_id"`). */
+export interface ResetStaleSkippedTask {
+  taskId: string;
+  status: string;
+  assignedSessionId: string | null;
+  reason: string;
+}
+
+/** Response shape for `POST /coordinator/tasks/reset-stale`. `reset` is the
+ *  set of task ids that were (or, in `dryRun` mode, would be) flipped back
+ *  to `ready`. `skipped` is the audit trail. */
+export interface ResetStaleTasksResponse {
+  reset: string[];
+  skipped: ResetStaleSkippedTask[];
+  dryRun: boolean;
+}
+
+/** Flip stale `assigned`/`needs_fix` tasks back to `ready` when the worker
+ *  they're pinned to is no longer alive in SessionManager. Pass
+ *  `{ dryRun: true }` to preview without writing. Mirrors the runner-port
+ *  fetch pattern used by the manual-user-fire form (calls
+ *  `get_api_port` then POSTs to the resolved port). */
+export async function resetStaleTasks(
+  args: { dryRun?: boolean } = {},
+): Promise<ResetStaleTasksResponse> {
+  const port = await invoke<number>("get_api_port");
+  if (!port || port <= 0) throw new Error(`invalid runner port: ${port}`);
+  const qs = args.dryRun ? "?dryRun=true" : "";
+  const res = await fetch(`http://localhost:${port}/coordinator/tasks/reset-stale${qs}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+  }
+  return (await res.json()) as ResetStaleTasksResponse;
+}
+
+// ---------------------------------------------------------------------------
+// GET /coordinator/state — snapshot of live sessions + non-terminal tasks.
+// Used by the Workers panel so the dashboard can show users the workers they
+// just spawned without auto-revealing the terminal tab. Mirrors the runner-
+// port fetch pattern (no dedicated Tauri command exists for this endpoint).
+// ---------------------------------------------------------------------------
+
+/** A single live session row from `GET /coordinator/state`. `terminalId`
+ *  and `title` are populated only for pty-backed Workers (Phase 6); for
+ *  ClaudeSessions both are absent (the Rust side uses
+ *  `skip_serializing_if = "Option::is_none"`). */
+export interface LiveSession {
+  taskRunId: string;
+  state: string;
+  isActive: boolean;
+  terminalId?: string | null;
+  title?: string | null;
+}
+
+/** Subset of the `/coordinator/state` payload the Workers panel consumes.
+ *  The endpoint returns more fields (file registries, escalations, etc.)
+ *  but the panel only needs `liveSessions` + `tasks` (for the
+ *  assigned-task lookup that surfaces "task X — description" on
+ *  Processing rows). Extra fields are ignored. */
+export interface CoordinatorState {
+  liveSessions: LiveSession[];
+  tasks: Array<{
+    id: string;
+    status: string;
+    assignedSessionId: string | null;
+    updatedAt: string;
+    description: string;
+  }>;
+}
+
+/** Fetch the composite coordinator state snapshot. Mirrors
+ *  `resetStaleTasks` — calls `get_api_port` then GETs the HTTP endpoint
+ *  on the runner's API server. */
+export async function getCoordinatorState(): Promise<CoordinatorState> {
+  const port = await invoke<number>("get_api_port");
+  if (!port || port <= 0) throw new Error(`invalid runner port: ${port}`);
+  const res = await fetch(`http://localhost:${port}/coordinator/state`, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+  }
+  return (await res.json()) as CoordinatorState;
+}

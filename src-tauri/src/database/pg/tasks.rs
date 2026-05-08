@@ -343,6 +343,36 @@ impl PgDb {
         Ok(n > 0)
     }
 
+    /// Clear the `assigned_session_id` of a task back to NULL. Used by the
+    /// stale-task reset endpoint (`POST /coordinator/tasks/reset-stale`)
+    /// when a task is flipped from `assigned`/`needs_fix` back to `ready`
+    /// because its assigned session is no longer alive in `SessionManager`.
+    /// Returns `true` when a row was updated.
+    pub async fn clear_task_assignment(&self, task_id: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
+        let n = conn
+            .execute(
+                r#"
+                UPDATE coord.tasks
+                SET assigned_session_id = NULL,
+                    updated_at = NOW()
+                WHERE id = $1::uuid
+                "#,
+                &[&task_uuid],
+            )
+            .await
+            .map_err(|e| format!("Failed to clear task assignment: {}", e))?;
+
+        Ok(n > 0)
+    }
+
     /// Atomic status transition with from→to validation.
     ///
     /// Refuses (returns `Ok(false)`) if the row's current `status` is not
