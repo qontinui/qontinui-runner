@@ -37,147 +37,73 @@ import type { UnifiedWorkflow, PromptStep, VerificationStep } from "../../types/
 import type { KnownIssue } from "@qontinui/shared-types";
 import { createSummaryStep } from "../../types/unified-workflow";
 import { DEFAULT_WORKFLOW_FLAGS } from "./workflowDefaults";
+import type {
+  SpecConfig,
+  SpecAssertion,
+  SpecGroup,
+  SetupAction,
+  SpecState,
+  SpecStateShape,
+  SpecStateMachine,
+  SpecStateMachineShape,
+  SpecTransition,
+  SpecTransitionAction,
+  TestScenario,
+  TestStep,
+  TestFixture,
+  SpecGroupTesting,
+  SpecTestingConfig,
+  SpecTarget,
+} from "@qontinui/ui-bridge/specs";
 
-// Re-export SpecConfig type shape for consumers that don't import ui-bridge directly
-export interface SpecAssertion {
-  id: string;
-  description: string;
-  severity: string;
-  enabled: boolean;
-  assertionType?: string;
-  target?: {
-    type?: string;
-    criteria?: Record<string, unknown>;
-    label?: string;
-  };
-  relatedTarget?: {
-    type?: string;
-    criteria?: Record<string, unknown>;
-    label?: string;
-  };
-  expected?: string;
-  minGap?: number;
-  [key: string]: unknown;
+// Re-export the canonical types so existing relative imports keep working.
+export type {
+  SpecConfig,
+  SpecAssertion,
+  SpecGroup,
+  SetupAction,
+  SpecState,
+  SpecStateShape,
+  SpecStateMachine,
+  SpecStateMachineShape,
+  SpecTransition,
+  SpecTransitionAction,
+  TestScenario,
+  TestStep,
+  TestFixture,
+  SpecGroupTesting,
+  SpecTestingConfig,
+  SpecTarget,
+};
+
+// ─────────────────────────────────────────────────────────────────────────
+// Local helpers for working with on-disk JSON shapes that may not strictly
+// conform to the canonical discriminated unions (e.g. `target.criteria`
+// access without narrowing). These helpers keep the rest of the file
+// readable while preserving type safety at the public surface.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Extract `target.criteria` from any spec target shape, returning null if
+ * the shape doesn't supply criteria. Tolerates both the strict `SpecTarget`
+ * discriminated union and loose JSON shapes loaded from disk.
+ */
+function getTargetCriteria(target: unknown): Record<string, unknown> | null {
+  if (!target || typeof target !== "object") return null;
+  const t = target as Record<string, unknown>;
+  const criteria = t.criteria;
+  if (criteria && typeof criteria === "object") {
+    return criteria as Record<string, unknown>;
+  }
+  return null;
 }
 
-export interface SetupAction {
-  type: "click" | "type" | "navigate" | "waitForElement" | "wait";
-  target?: {
-    type?: string;
-    criteria?: Record<string, unknown>;
-    elementId?: string;
-    label?: string;
-  };
-  value?: string;
-  clear?: boolean;
-  url?: string;
-  ms?: number;
-  timeout?: number;
-}
-
-export interface SpecGroup {
-  id: string;
-  name: string;
-  description: string;
-  category: string;
-  assertions: SpecAssertion[];
-  setupActions?: SetupAction[];
-  [key: string]: unknown;
-}
-
-/** Minimal shape of a state in the spec stateMachine. Kept structurally compatible
- *  with `SpecState` in `../spec-prompt-builder.ts` so callers can pass either. */
-export interface SpecStateShape {
-  id: string;
-  name: string;
-  description?: string;
-  elements?: Record<string, unknown>[];
-  isInitial?: boolean;
-  transitions?: unknown[];
-}
-
-export interface SpecStateMachineShape {
-  states: SpecStateShape[];
-}
-
-export interface TestFixture {
-  type: "localStorage" | "apiMock" | "tauriEvent" | string;
-  key?: string;
-  value?: unknown;
-  endpoint?: string;
-  method?: string;
-  response?: unknown;
-  event?: string;
-  payload?: unknown;
-  delayMs?: number;
-}
-
-export interface TestScenarioStep {
-  type: "navigate" | "componentAction" | "wait" | "assert" | "sendKeys" | string;
-  url?: string;
-  componentId?: string;
-  actionId?: string;
-  params?: Record<string, unknown>;
-  condition?: string;
-  target?: { type?: string; criteria?: Record<string, unknown> };
-  timeoutMs?: number;
-  assertionId?: string;
-  keys?: string[];
-}
-
-export interface TestScenario {
-  id: string;
-  name: string;
-  description?: string;
-  groupIds?: string[];
-  difficulty?: "easy" | "medium" | "hard" | string;
-  hardnessReason?: string;
-  fixtures?: TestFixture[];
-  steps?: TestScenarioStep[];
-  teardown?: TestScenarioStep[];
-  requiresRealBackend?: boolean;
-  hasTiming?: boolean;
-  retryStrategy?: { maxAttempts: number; delayMs: number };
-}
-
-export interface TestingGroupConfig {
-  scenarios?: TestScenario[];
-  asyncStrategies?: Record<
-    string,
-    { timeoutMs: number; pollIntervalMs: number; description: string }
-  >;
-  beforeEach?: TestScenarioStep[];
-  afterEach?: TestScenarioStep[];
-  requiresInfrastructure?: {
-    pty?: boolean;
-    fileSystem?: boolean;
-    claudeAPI?: boolean;
-    llmBackend?: boolean;
-    runnerBackend?: boolean;
-    tauriEvents?: boolean;
-  };
-  automationCoverage?: number;
-  manualAssertions?: string[];
-  flakyAssertions?: string[];
-  notes?: string;
-}
-
-export interface SpecTesting {
-  defaultTimeoutMs?: number;
-  defaultPollIntervalMs?: number;
-  groups?: Record<string, TestingGroupConfig>;
-}
-
-export interface SpecConfig {
-  version: string;
-  description?: string;
-  groups: SpecGroup[];
-  assertions?: unknown[];
-  metadata?: Record<string, unknown>;
-  /** Optional state machine section — when present, buildSpecBrief will map
-   *  group preconditions to state IDs for one-step navigation. */
-  stateMachine?: SpecStateMachineShape;
-  testing?: SpecTesting;
+/**
+ * Read `assertion.relatedTarget.criteria` if present.
+ */
+function getRelatedTargetCriteria(assertion: SpecAssertion): Record<string, unknown> | null {
+  const related = (assertion as { relatedTarget?: unknown }).relatedTarget;
+  return getTargetCriteria(related);
 }
 
 export interface BuildSpecWorkflowInput {
@@ -216,9 +142,9 @@ const SPATIAL_TYPES = new Set(["noOverlap", "minSpacing"]);
 export function isDeterministic(assertion: SpecAssertion): boolean {
   const aType = assertion.assertionType || "exists";
   if (SPATIAL_TYPES.has(aType)) {
-    return assertion.target?.criteria != null && assertion.relatedTarget?.criteria != null;
+    return getTargetCriteria(assertion.target) != null && getRelatedTargetCriteria(assertion) != null;
   }
-  return DETERMINISTIC_TYPES.has(aType) && assertion.target?.criteria != null;
+  return DETERMINISTIC_TYPES.has(aType) && getTargetCriteria(assertion.target) != null;
 }
 
 /** Build a batched UiBridge snapshot_assert step from a list of deterministic assertions. */
@@ -234,11 +160,12 @@ function buildSnapshotAssertStep(
       description: a.description,
       severity: a.severity,
       assertionType: a.assertionType || "exists",
-      criteria: a.target?.criteria ?? {},
+      criteria: getTargetCriteria(a.target) ?? {},
       expected: a.expected,
     };
-    if (a.relatedTarget?.criteria) {
-      spec.relatedCriteria = a.relatedTarget.criteria;
+    const relatedCriteria = getRelatedTargetCriteria(a);
+    if (relatedCriteria) {
+      spec.relatedCriteria = relatedCriteria;
     }
     if (a.minGap !== undefined) {
       spec.minGap = a.minGap;
@@ -309,7 +236,7 @@ function buildSetupActionStep(
         ui_bridge_action: "element_action",
         ui_bridge_target: JSON.stringify({
           action: "click",
-          criteria: action.target?.criteria ?? {},
+          criteria: getTargetCriteria(action.target) ?? {},
         }),
         ui_bridge_snapshot_target: snapshotTarget,
       } as unknown as VerificationStep;
@@ -323,7 +250,7 @@ function buildSetupActionStep(
         ui_bridge_action: "element_action",
         ui_bridge_target: JSON.stringify({
           action: "type",
-          criteria: action.target?.criteria ?? {},
+          criteria: getTargetCriteria(action.target) ?? {},
           params: { text: action.value, clear: action.clear },
         }),
         ui_bridge_snapshot_target: snapshotTarget,
@@ -337,7 +264,7 @@ function buildSetupActionStep(
         name: `${groupName}: Wait for element`,
         ui_bridge_action: "wait_for_element",
         ui_bridge_target: JSON.stringify({
-          criteria: action.target?.criteria ?? {},
+          criteria: getTargetCriteria(action.target) ?? {},
           timeout: action.timeout ?? 5000,
         }),
         ui_bridge_snapshot_target: snapshotTarget,
@@ -356,10 +283,14 @@ function buildSetupActionStep(
   }
 }
 
-/** Convert a TestScenarioStep into a UI Bridge setup step, or null for non-actionable types. */
+/**
+ * Convert a TestStep or SetupAction into a UI Bridge setup step, or null for
+ * non-actionable types. Accepts both because spec.testing.beforeEach uses
+ * SetupAction[] while scenarios use TestStep[].
+ */
 function buildTestActionStep(
   groupName: string,
-  step: TestScenarioStep,
+  step: TestStep | SetupAction,
   elementSource: string,
 ): VerificationStep | null {
   const snapshotTarget = elementSource === "external" ? "sdk" : "control";
@@ -393,11 +324,11 @@ function buildTestActionStep(
         id: crypto.randomUUID(),
         type: "ui_bridge",
         phase: "setup",
-        name: `${groupName}: Wait for ${step.condition ?? "element"}`,
+        name: `${groupName}: Wait for ${"condition" in step ? (step.condition ?? "element") : "duration"}`,
         ui_bridge_action: "wait_for_element",
         ui_bridge_target: JSON.stringify({
-          criteria: step.target?.criteria ?? {},
-          timeout: step.timeoutMs ?? 5000,
+          criteria: "target" in step ? (getTargetCriteria(step.target) ?? {}) : {},
+          timeout: "timeoutMs" in step ? (step.timeoutMs ?? 5000) : 5000,
         }),
         ui_bridge_snapshot_target: snapshotTarget,
       } as unknown as VerificationStep;
@@ -410,7 +341,7 @@ function buildTestActionStep(
         ui_bridge_action: "element_action",
         ui_bridge_target: JSON.stringify({
           action: "sendKeys",
-          criteria: step.target?.criteria ?? {},
+          criteria: getTargetCriteria(step.target) ?? {},
           params: { keys: step.keys ?? [] },
         }),
         ui_bridge_snapshot_target: snapshotTarget,
@@ -423,7 +354,7 @@ function buildTestActionStep(
 /** Build a prompt step summarising a test scenario so the AI executor knows the test intent. */
 function buildTestScenarioPromptStep(
   scenario: TestScenario,
-  groupTestingConfig: TestingGroupConfig,
+  groupTestingConfig: SpecGroupTesting,
 ): PromptStep {
   const stepLines = (scenario.steps ?? []).map((s, i) => {
     switch (s.type) {

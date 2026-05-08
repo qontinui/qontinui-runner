@@ -45,6 +45,7 @@ use super::types::{
     classify_transport_error, UIBridgeActionRequest, UIBridgeComponentActionRequest,
     UIBridgeDiscoveryRequest, UiBridgeError,
 };
+use super::{ipc_handler_path_get, ipc_handler_post};
 
 /// Phase 3.2b (plan 2026-05-03) — bidirectional simple-glob match between
 /// a query value and a single `reveals` entry. Mirrors the canonical SDK
@@ -2944,6 +2945,43 @@ pub async fn ui_bridge_expect_element_handler(
     }
 }
 
+// =========================================================================
+// Macro-generated IPC proxies — react-state, history, rank
+// =========================================================================
+ipc_handler_path_get!(
+    ui_bridge_get_element_react_state_handler,
+    "get_element_react_state",
+    "id"
+);
+ipc_handler_path_get!(
+    ui_bridge_get_element_history_handler,
+    "get_element_history",
+    "id"
+);
+ipc_handler_post!(ui_bridge_rank_elements_handler, "rank_elements");
+
+/// `GET /ui-bridge/control/changes/since?since=<i64>&limit=<usize>` — proxy
+/// for the SDK's mutation-buffer query. Custom (not macro-generated) because
+/// the macros don't accept query params.
+///
+/// Forwards to the frontend's `get_changes_since` IPC handler with payload
+/// `{ params: { since, limit } }`. Defaults: `since=0`, `limit=100`. Matches
+/// the SDK shape from `relay-handlers.ts:1609-1614`.
+pub async fn ui_bridge_get_changes_since_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let since: i64 = query.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let limit: usize = query
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let payload = serde_json::json!({ "params": { "since": since, "limit": limit } });
+    super::request::wrap_ipc_result(
+        ui_bridge_request_sync(&state, "get_changes_since", payload).await,
+    )
+}
+
 /// Primary element operations, components, discovery/snapshot, wait-for-element,
 /// and the DOM-convenience family (find / find-by-text / click-by-text /
 /// click-by-selector / read-value / type-into).
@@ -2983,7 +3021,33 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_execute_action_handler),
         )
         .route(
+            "/ui-bridge/control/element/{id}/react-state",
+            get(ui_bridge_get_element_react_state_handler),
+        )
+        .route(
+            "/ui-bridge/control/element/{id}/history",
+            get(ui_bridge_get_element_history_handler),
+        )
+        // Alias for /control/element/{id}/history — same handler, debug path
+        .route(
+            "/ui-bridge/debug/element-history/{id}",
+            get(ui_bridge_get_element_history_handler),
+        )
+        .route(
+            "/ui-bridge/control/elements/rank",
+            post(ui_bridge_rank_elements_handler),
+        )
+        .route(
+            "/ui-bridge/control/changes/since",
+            get(ui_bridge_get_changes_since_handler),
+        )
+        .route(
             "/ui-bridge/control/batch-actions",
+            post(ui_bridge_batch_actions_handler),
+        )
+        // Alias for /control/batch-actions — same handler, plural path
+        .route(
+            "/ui-bridge/control/actions/batch",
             post(ui_bridge_batch_actions_handler),
         )
         .route(
@@ -3055,7 +3119,13 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/element/{id}/assert"),
         ("POST", "/ui-bridge/control/element/{id}/expect"),
         ("POST", "/ui-bridge/control/element/{id}/action"),
+        ("GET", "/ui-bridge/control/element/{id}/react-state"),
+        ("GET", "/ui-bridge/control/element/{id}/history"),
+        ("GET", "/ui-bridge/debug/element-history/{id}"),
+        ("POST", "/ui-bridge/control/elements/rank"),
+        ("GET", "/ui-bridge/control/changes/since"),
         ("POST", "/ui-bridge/control/batch-actions"),
+        ("POST", "/ui-bridge/control/actions/batch"),
         ("GET", "/ui-bridge/control/components"),
         ("GET", "/ui-bridge/control/component/{id}"),
         (

@@ -5,82 +5,28 @@
  * Used by AiGeneratePanel to create spec-driven workflow generation requests.
  */
 
-// =============================================================================
-// Types (mirrors the spec JSON structure)
-// =============================================================================
+import type {
+  SpecConfig,
+  SpecAssertion,
+  SpecGroup,
+  SpecState,
+  SpecTransition,
+  SpecTransitionAction,
+  SpecStateMachine,
+  DiscoveredSpec,
+} from "@qontinui/ui-bridge/specs";
 
-export interface SpecAssertion {
-  id: string;
-  description: string;
-  category: string;
-  severity: "critical" | "warning" | "info";
-  enabled: boolean;
-  target?: Record<string, unknown>;
-  assertionType?: string;
-  expected?: unknown;
-  condition?: Record<string, unknown>;
-  precondition?: string;
-}
-
-export interface SpecGroup {
-  id: string;
-  name: string;
-  description: string;
-  category: string;
-  assertions: SpecAssertion[];
-  source?: string;
-}
-
-export interface SpecTransitionAction {
-  action: string;
-  target: Record<string, unknown>;
-  params?: Record<string, unknown>;
-  waitAfter?: { type: string; timeout?: number };
-}
-
-export interface SpecTransition {
-  id: string;
-  name: string;
-  description?: string;
-  activateStates: string[];
-  deactivateStates: string[];
-  staysVisible?: boolean;
-  process: SpecTransitionAction[];
-}
-
-export interface SpecState {
-  id: string;
-  name: string;
-  description?: string;
-  elements: Record<string, unknown>[];
-  isInitial?: boolean;
-  transitions: SpecTransition[];
-}
-
-export interface SpecStateMachine {
-  states: SpecState[];
-}
-
-export interface SpecConfig {
-  version: string;
-  description?: string;
-  groups: SpecGroup[];
-  metadata?: {
-    component?: string;
-    pageUrl?: string;
-    tags?: string[];
-    [key: string]: unknown;
-  };
-  stateMachine?: SpecStateMachine;
-  testing?: unknown;
-}
-
-export interface DiscoveredSpec {
-  specId: string;
-  config: SpecConfig;
-  /** The application this spec belongs to (e.g. "Qontinui Web", "Qontinui Runner") */
-  appName?: string;
-}
+// Re-export the canonical types so existing relative imports keep working.
+export type {
+  SpecConfig,
+  SpecAssertion,
+  SpecGroup,
+  SpecState,
+  SpecTransition,
+  SpecTransitionAction,
+  SpecStateMachine,
+  DiscoveredSpec,
+};
 
 // =============================================================================
 // Prompt builder
@@ -807,7 +753,7 @@ export function buildDetailedSpecContext(spec: {
       const severity = assertion.severity || "info";
       const type = assertion.assertionType || "exists";
       const status = assertion.enabled ? "" : " [DISABLED]";
-      const targetStr = formatTarget(assertion.target);
+      const targetStr = formatTarget(assertion.target as unknown as Record<string, unknown>);
       const expectedStr =
         assertion.expected !== undefined && assertion.expected !== null
           ? ` | expected: ${JSON.stringify(assertion.expected)}`

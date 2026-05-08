@@ -47,6 +47,24 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/design/evaluate/diff",
             post(ui_bridge_design_evaluate_diff_handler),
         )
+        // SDK top-level /design/evaluate/* aliases — same handlers as the
+        // /control/design/evaluate/* family above.
+        .route(
+            "/ui-bridge/design/evaluate",
+            post(ui_bridge_design_evaluate_handler),
+        )
+        .route(
+            "/ui-bridge/design/evaluate/baseline",
+            post(ui_bridge_design_evaluate_baseline_handler),
+        )
+        .route(
+            "/ui-bridge/design/evaluate/contexts",
+            get(ui_bridge_design_evaluate_contexts_handler),
+        )
+        .route(
+            "/ui-bridge/design/evaluate/diff",
+            post(ui_bridge_design_evaluate_diff_handler),
+        )
 }
 
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
@@ -55,5 +73,10 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/design/evaluate/baseline"),
         ("GET", "/ui-bridge/control/design/evaluate/contexts"),
         ("POST", "/ui-bridge/control/design/evaluate/diff"),
+        // SDK top-level /design/evaluate/* aliases
+        ("POST", "/ui-bridge/design/evaluate"),
+        ("POST", "/ui-bridge/design/evaluate/baseline"),
+        ("GET", "/ui-bridge/design/evaluate/contexts"),
+        ("POST", "/ui-bridge/design/evaluate/diff"),
     ]
 }

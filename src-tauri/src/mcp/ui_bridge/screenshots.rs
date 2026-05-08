@@ -2069,9 +2069,13 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/annotations",
             get(ui_bridge_annotations_list_handler).post(ui_bridge_annotations_create_handler),
         )
+        // SDK declares POST /control/annotation/:id as setAnnotation
+        // (same action as PUT). Mounted alongside PUT so SDK callers
+        // using either method hit the same update handler.
         .route(
             "/ui-bridge/control/annotation/{id}",
             get(ui_bridge_annotations_get_handler)
+                .post(ui_bridge_annotations_update_handler)
                 .put(ui_bridge_annotations_update_handler)
                 .delete(ui_bridge_annotations_delete_handler),
         )
@@ -2082,6 +2086,27 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/control/annotations/export",
             get(ui_bridge_annotations_export_handler),
+        )
+        // SDK top-level /annotations/* aliases — same handlers as the
+        // /control/annotation* family above. Mounted here for symmetry with
+        // the SDK contract (see UI_BRIDGE_ROUTES `path: '/annotations/...'`).
+        .route(
+            "/ui-bridge/annotations",
+            get(ui_bridge_annotations_list_handler),
+        )
+        .route(
+            "/ui-bridge/annotations/coverage",
+            get(ui_bridge_annotations_coverage_handler),
+        )
+        .route(
+            "/ui-bridge/annotations/export",
+            get(ui_bridge_annotations_export_handler),
+        )
+        .route(
+            "/ui-bridge/annotations/{id}",
+            get(ui_bridge_annotations_get_handler)
+                .put(ui_bridge_annotations_update_handler)
+                .delete(ui_bridge_annotations_delete_handler),
         )
         // Media routes
         .route(
@@ -2123,10 +2148,18 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/annotations"),
         ("POST", "/ui-bridge/control/annotations"),
         ("GET", "/ui-bridge/control/annotation/{id}"),
+        ("POST", "/ui-bridge/control/annotation/{id}"),
         ("PUT", "/ui-bridge/control/annotation/{id}"),
         ("DELETE", "/ui-bridge/control/annotation/{id}"),
         ("GET", "/ui-bridge/control/annotations/coverage"),
         ("GET", "/ui-bridge/control/annotations/export"),
+        // SDK top-level /annotations/* aliases
+        ("GET", "/ui-bridge/annotations"),
+        ("GET", "/ui-bridge/annotations/coverage"),
+        ("GET", "/ui-bridge/annotations/export"),
+        ("GET", "/ui-bridge/annotations/{id}"),
+        ("PUT", "/ui-bridge/annotations/{id}"),
+        ("DELETE", "/ui-bridge/annotations/{id}"),
         ("POST", "/ui-bridge/ai/media/find"),
         ("POST", "/ui-bridge/ai/media/audit/{audit_type}"),
         ("POST", "/ui-bridge/ai/media/snapshot"),

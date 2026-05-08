@@ -738,6 +738,12 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/ai/assert-batch",
             post(ui_bridge_ai_assert_batch_handler),
         )
+        // SDK declares the slash-form /ai/assert/batch — same handler as the
+        // hyphen-form above, mounted as an alias for symmetry with the contract.
+        .route(
+            "/ui-bridge/ai/assert/batch",
+            post(ui_bridge_ai_assert_batch_handler),
+        )
         .route("/ui-bridge/ai/snapshot", get(ui_bridge_ai_snapshot_handler))
         .route("/ui-bridge/ai/summary", get(ui_bridge_ai_summary_handler))
         // Action plan execution & caching
@@ -764,6 +770,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/ai/execute"),
         ("POST", "/ui-bridge/ai/assert"),
         ("POST", "/ui-bridge/ai/assert-batch"),
+        ("POST", "/ui-bridge/ai/assert/batch"),
         ("GET", "/ui-bridge/ai/snapshot"),
         ("GET", "/ui-bridge/ai/summary"),
         ("POST", "/ui-bridge/control/action-plan"),

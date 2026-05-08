@@ -1754,7 +1754,7 @@ pub async fn start_server(
 
                 // Update window title if using non-default port or instance name
                 let default_port = crate::mcp::types::MCP_API_PORT;
-                let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+                let instance_name = crate::instance::instance_name();
                 let needs_title_update = try_port != default_port || instance_name.is_some();
                 if needs_title_update {
                     let title = match instance_name {

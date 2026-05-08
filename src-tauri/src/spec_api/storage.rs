@@ -216,30 +216,6 @@ fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
     })
 }
 
-/// Write a projection (bundled-page) JSON value directly to
-/// `<root>/pages/<page_id>/spec.uibridge.json`.
-///
-/// This is a narrow helper for migration callers (e.g.
-/// `workflow_generation::spec_synthesis`) that mutate the projection without
-/// going through the IR. The IR remains untouched, so callers should be aware
-/// that subsequent `write_ir_and_regenerate` calls will overwrite changes
-/// written through this helper. Documented as a known IR/projection desync
-/// caveat in ADR-013.5 — the IR has no `groups` shape yet.
-pub fn write_projection(
-    root: &Path,
-    page_id: &str,
-    value: &serde_json::Value,
-) -> Result<PathBuf, String> {
-    let paths = PagePaths::for_page(root, page_id);
-    let pretty = serde_json::to_string_pretty(value)
-        .map_err(|e| format!("serialize projection failed: {}", e))?;
-    let mut buf = pretty.into_bytes();
-    buf.push(b'\n');
-    atomic_write(&paths.projection_path, &buf)
-        .map_err(|e| format!("write {} failed: {}", paths.projection_path.display(), e))?;
-    Ok(paths.projection_path)
-}
-
 /// Write an IR document and regenerate its projection. Returns the absolute
 /// path to the projection file on success.
 ///

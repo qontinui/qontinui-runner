@@ -19,8 +19,12 @@ pub fn primary_port() -> Option<u16> {
 }
 
 /// Check if this runner is a secondary instance that should proxy process requests.
+///
+/// Stronger predicate than `crate::instance::is_secondary()`: requires both
+/// the instance name AND a primary port so that secondaries with no primary
+/// to proxy to (e.g. orphaned named runners) fall back to local handling.
 pub fn is_secondary() -> bool {
-    std::env::var("QONTINUI_INSTANCE_NAME").is_ok() && primary_port().is_some()
+    crate::instance::is_secondary() && primary_port().is_some()
 }
 
 /// Response wrapper matching the primary runner's ApiResponse<T> format.

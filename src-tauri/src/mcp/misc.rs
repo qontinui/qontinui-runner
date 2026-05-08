@@ -653,7 +653,7 @@ pub async fn get_status(
         .unwrap_or_default()
         .is_empty();
 
-    let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+    let instance_name = crate::instance::instance_name();
     let api_port = state
         .app_state
         .api_port
@@ -699,7 +699,7 @@ pub async fn get_instances(
         .app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
-    let self_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+    let self_name = crate::instance::instance_name();
 
     let mut instances = vec![DiscoveredInstance {
         name: self_name,
@@ -1849,9 +1849,7 @@ async fn list_runners(State(state): State<Arc<ApiState>>) -> Json<serde_json::Va
         .app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
-    let self_name = std::env::var("QONTINUI_INSTANCE_NAME")
-        .ok()
-        .unwrap_or_else(|| "primary".to_string());
+    let self_name = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
     let is_primary = !crate::instance::is_secondary();
 
     let mut runners = Vec::new();
@@ -1926,39 +1924,14 @@ async fn purge_stale_instances(
 }
 
 // ─── Spawn-placement preview endpoint ───────────────────────────────────────
+//
+// Wire types live in `qontinui_types::wire::placement` so the supervisor
+// parses the exact shape the runner emits — no hand-maintained duplicate.
 
-#[derive(serde::Deserialize)]
-struct SpawnPlacementPreviewQuery {
-    /// Slot index. 0 = primary, 1.. = configured `runner_instances`
-    /// in saved order.
-    slot: usize,
-    /// Behavior when `slot` is past the end of the list. `wrap` rotates
-    /// `slot % count` over slots that have placements; default = 404.
-    #[serde(default)]
-    overflow: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-struct SpawnPlacementPreviewResponse {
-    global_x: i32,
-    global_y: i32,
-    width: u32,
-    height: u32,
-    monitor_label: String,
-    slot_index: usize,
-    /// Either the resolved instance name or `"primary"`.
-    slot_label: String,
-    /// Always `"configured"` for now — kept as a discriminator for
-    /// future supervisor-side fallback sources.
-    source: &'static str,
-    /// Per-placement window decorations toggle. `None` means "use the
-    /// runner's default" (chrome on). Forwarded by the supervisor as
-    /// `QONTINUI_WINDOW_DECORATIONS=0|1` so a borderless placement
-    /// lands flush with the configured rect (no OS window border
-    /// inset).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    decorations: Option<bool>,
-}
+use qontinui_types::wire::placement::{
+    SpawnPlacementPreviewQuery, SpawnPlacementResponse, TempPlacementLookupQuery,
+    TempPlacementsListResponse,
+};
 
 /// `GET /spawn-placement/preview?slot=N[&overflow=wrap|default]`
 ///
@@ -1970,7 +1943,7 @@ async fn preview_spawn_placement_route(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(q): axum::extract::Query<SpawnPlacementPreviewQuery>,
 ) -> Result<
-    Json<ApiResponse<SpawnPlacementPreviewResponse>>,
+    Json<ApiResponse<SpawnPlacementResponse>>,
     (axum::http::StatusCode, Json<serde_json::Value>),
 > {
     let configs = crate::settings::get_runner_instances();
@@ -2106,26 +2079,22 @@ async fn preview_spawn_placement_route(
             },
         )?;
 
-    Ok(Json(ApiResponse::success(SpawnPlacementPreviewResponse {
-        global_x: resolved.global_x,
-        global_y: resolved.global_y,
-        width: resolved.width,
-        height: resolved.height,
-        monitor_label: resolved.monitor_label,
-        slot_index: effective_slot,
-        slot_label,
-        source: "configured",
-        decorations: placement.decorations,
-    })))
+    Ok(Json(ApiResponse::success(
+        SpawnPlacementResponse::new(
+            resolved.global_x,
+            resolved.global_y,
+            resolved.width,
+            resolved.height,
+            resolved.monitor_label,
+            effective_slot,
+            slot_label,
+            "configured".to_string(),
+        )
+        .with_decorations(placement.decorations),
+    )))
 }
 
 // ─── Temp spawn-placement endpoints ─────────────────────────────────────────
-
-#[derive(serde::Serialize)]
-struct TempPlacementsListResponse {
-    placements: Vec<crate::settings::SpawnPlacement>,
-    count: usize,
-}
 
 #[derive(serde::Deserialize)]
 struct TempPlacementsReplaceRequest {
@@ -2136,13 +2105,12 @@ struct TempPlacementsReplaceRequest {
 ///
 /// List the currently-configured temp-runner spawn placements. Used by the
 /// supervisor's spawn-test path and the runner's own settings UI.
-async fn list_temp_spawn_placements() -> Json<ApiResponse<TempPlacementsListResponse>> {
+async fn list_temp_spawn_placements(
+) -> Json<ApiResponse<TempPlacementsListResponse<crate::settings::SpawnPlacement>>> {
     let placements = crate::settings::get_temp_spawn_placements();
-    let count = placements.len();
-    Json(ApiResponse::success(TempPlacementsListResponse {
+    Json(ApiResponse::success(TempPlacementsListResponse::new(
         placements,
-        count,
-    }))
+    )))
 }
 
 /// `PUT /spawn-placement/temps`
@@ -2152,7 +2120,7 @@ async fn list_temp_spawn_placements() -> Json<ApiResponse<TempPlacementsListResp
 async fn replace_temp_spawn_placements(
     Json(body): Json<TempPlacementsReplaceRequest>,
 ) -> Result<
-    Json<ApiResponse<TempPlacementsListResponse>>,
+    Json<ApiResponse<TempPlacementsListResponse<crate::settings::SpawnPlacement>>>,
     (axum::http::StatusCode, Json<serde_json::Value>),
 > {
     crate::settings::save_temp_spawn_placements(body.placements.clone()).map_err(|e| {
@@ -2164,22 +2132,9 @@ async fn replace_temp_spawn_placements(
         )
     })?;
     let placements = crate::settings::get_temp_spawn_placements();
-    let count = placements.len();
-    Ok(Json(ApiResponse::success(TempPlacementsListResponse {
+    Ok(Json(ApiResponse::success(TempPlacementsListResponse::new(
         placements,
-        count,
-    })))
-}
-
-#[derive(serde::Deserialize)]
-struct TempPlacementLookupQuery {
-    /// 0-based index into the temp placement list. Round-robin'd via
-    /// `index % len` when `overflow=wrap`.
-    index: usize,
-    /// Behavior when `index >= len`. `wrap` (default if missing) rotates;
-    /// `default` (or anything else) returns 404.
-    #[serde(default)]
-    overflow: Option<String>,
+    ))))
 }
 
 /// `GET /spawn-placement/temp?index=N&overflow=wrap`
@@ -2191,7 +2146,7 @@ async fn lookup_temp_spawn_placement(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(q): axum::extract::Query<TempPlacementLookupQuery>,
 ) -> Result<
-    Json<ApiResponse<SpawnPlacementPreviewResponse>>,
+    Json<ApiResponse<SpawnPlacementResponse>>,
     (axum::http::StatusCode, Json<serde_json::Value>),
 > {
     let placements = crate::settings::get_temp_spawn_placements();
@@ -2239,17 +2194,19 @@ async fn lookup_temp_spawn_placement(
             },
         )?;
 
-    Ok(Json(ApiResponse::success(SpawnPlacementPreviewResponse {
-        global_x: resolved.global_x,
-        global_y: resolved.global_y,
-        width: resolved.width,
-        height: resolved.height,
-        monitor_label: resolved.monitor_label,
-        slot_index: resolved_index,
-        slot_label: format!("temp[{}]", resolved_index),
-        source: "temp",
-        decorations: placement.decorations,
-    })))
+    Ok(Json(ApiResponse::success(
+        SpawnPlacementResponse::new(
+            resolved.global_x,
+            resolved.global_y,
+            resolved.width,
+            resolved.height,
+            resolved.monitor_label,
+            resolved_index,
+            format!("temp[{}]", resolved_index),
+            "temp".to_string(),
+        )
+        .with_decorations(placement.decorations),
+    )))
 }
 
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {

@@ -160,14 +160,19 @@ export function useAISearchEvents(
 
         case "rank_elements": {
           const { findElements } = await import("@qontinui/ui-bridge");
-          const registry = (
-            currentBridge as unknown as {
-              registry?: { getAllElements: () => Array<unknown> } | null;
-            }
-          ).registry;
-          const elements = (registry?.getAllElements?.() ?? []) as Parameters<
-            typeof findElements
-          >[0];
+          // Source elements from `createSnapshot()` — NOT `registry.getAllElements()`.
+          // `findElements()` echoes each input back as `m.element`; if we
+          // pass live `RegisteredElement[]` (which carry an
+          // `element: HTMLElement` field), the response contains DOM nodes
+          // that can't be JSON-serialized through the IPC boundary, the
+          // React handler never `sendResponse`s, and the Rust side hits the
+          // 10s `ui_bridge_request_sync` timeout on every non-empty result.
+          // `BridgeSnapshot.elements` is the same set as the registry but
+          // pre-serialized to flat FindableElement-shaped POJOs, matching
+          // the SDK relay-handlers.ts:472-491 pattern (which uses
+          // `latestControlSnapshot.elements`).
+          const snapshot = currentBridge.createSnapshot();
+          const elements = snapshot.elements as Parameters<typeof findElements>[0];
           const query = (payload.params || {}) as Parameters<typeof findElements>[1];
           const matches = findElements(elements, query);
           const ranked = matches.map((m) => ({

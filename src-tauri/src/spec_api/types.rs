@@ -224,8 +224,81 @@ pub struct IrDocument {
     pub states: Vec<IrState>,
     pub transitions: Vec<IrTransition>,
 
+    /// Groups produced by workflow-criteria synthesis (NOT derived from
+    /// `IRState` annotations). Mirror of TS `IRDocument.synthesizedGroups`.
+    /// The `rename = "synthesizedGroups"` is explicit (rather than relying on
+    /// `rename_all = "camelCase"`) so the serialized name is unambiguous in
+    /// snapshot tests + cross-language fixtures.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "synthesizedGroups"
+    )]
+    pub synthesized_groups: Option<Vec<IrGroup>>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_state: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// IR-side groups + assertions (mirror of `qontinui-schemas/ts/src/ui-bridge-ir/group.ts`).
+//
+// These are NOT the legacy `*.spec.uibridge.json` shapes — those live below
+// (`LegacyGroup`, `LegacyAssertion`). The IR carries a free-form group channel
+// for synthesis output that the projection appends after state-derived groups.
+// ---------------------------------------------------------------------------
+
+/// Mirror of TS `IRAssertionTarget`. Always `type: "search"` for synthesis-
+/// emitted assertions; the wider legacy schema also supports point/region
+/// targets but the IR doesn't express those today.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IrAssertionTarget {
+    /// Always `"search"` for synthesis-emitted assertions.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Free-form criteria object — kept as `Value` so synthesis can emit
+    /// partially-populated criteria without tripping the schema and so the
+    /// projection can pass the bytes through verbatim.
+    pub criteria: serde_json::Value,
+    pub label: String,
+}
+
+/// Mirror of TS `IRAssertion`. Field shape matches `LegacyAssertion` one-to-one
+/// (modulo the `target.criteria` looseness).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IrAssertion {
+    pub id: String,
+    pub description: String,
+    pub category: String,
+    pub severity: String,
+    pub assertion_type: String,
+    pub target: IrAssertionTarget,
+    pub source: String,
+    pub reviewed: bool,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precondition: Option<String>,
+}
+
+/// Mirror of TS `IRGroup`. Synthesis-produced groups (NOT derived from IR
+/// states). Mirrors the legacy `SpecGroup` shape so the projection can pass
+/// it through to legacy `groups[]` without loss.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IrGroup {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub assertions: Vec<IrAssertion>,
+    /// Provenance of the group itself (typically `"ai-generated"` for
+    /// synthesis output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Free-form tags. Synthesis emits e.g.
+    /// `["workflow-generated", "acceptance-criteria"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------

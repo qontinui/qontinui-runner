@@ -5,10 +5,6 @@ import type {
   ElementState,
   StyleGuideConfig,
 } from "@qontinui/ui-bridge";
-import type {
-  UiBridgeRequestEnvelope,
-  UiBridgeResponseEnvelope,
-} from "@qontinui/shared-types/tauri-events";
 
 /**
  * Request types that can come from the Rust backend
@@ -226,13 +222,16 @@ export type UIBridgeRequestType =
   // Spec execution (POST /control/spec/{id}/run)
   | "run_spec"
   // Bucket C follow-up (plan 2026-05-07): 5 of 7 handlers wired here.
-  // get_changes_since and get_element_history are deferred pending an
-  // upstream SDK PR adding ChangeTracker.peekBuffer().
   | "receive_heartbeat"
   | "delete_intent"
   | "rank_elements"
   | "set_viewport_constraints"
-  | "get_element_react_state";
+  | "get_element_react_state"
+  // Bucket C deferred (plan 2026-05-07-ui-bridge-change-buffer-peek):
+  // both back the runner's view of ChangeTracker.changeBuffer via
+  // peekBuffer() (SDK 0.3.5).
+  | "get_changes_since"
+  | "get_element_history";
 
 // ============================================================
 // N1 — Compile-time exhaustiveness registry for the chained
@@ -344,7 +343,9 @@ export type ChangeTrackingEventTypes =
   | "enable_change_buffer"
   | "disable_change_buffer"
   | "drain_change_buffer"
-  | "get_change_buffer_size";
+  | "get_change_buffer_size"
+  | "get_changes_since"
+  | "get_element_history";
 
 export type DebugInspectEventTypes =
   | "get_console_errors"
@@ -474,19 +475,10 @@ const _handledCoversUnion: AssertEqual<AllHandledTypes, UIBridgeRequestType> = t
 void _handledCoversUnion;
 
 /**
- * Payload structure for UI Bridge requests from Rust.
- *
- * The envelope head (`requestId`, `type`) is sourced from the generated
- * `UiBridgeRequestEnvelope` (Stage 1 of the ui-bridge-request envelope
- * concretization, deferral note in commit ea5d9a61f) so future Rust serde
- * renames break the TS build instead of silently dropping fields. The Rust
- * struct types `type` as a free-form `string` (Stage 2 — per-payload tagged
- * union of all 171 request_types — is deferred indefinitely); we narrow it
- * here to the locally-defined `UIBridgeRequestType` exhaustive union, which
- * the AssertEqual<AllHandledTypes, UIBridgeRequestType> check above already
- * locks down against the runner's chained sub-hook dispatcher.
+ * Payload structure for UI Bridge requests from Rust
  */
-export interface UIBridgeRequestPayload extends Pick<UiBridgeRequestEnvelope, "requestId"> {
+export interface UIBridgeRequestPayload {
+  requestId: string;
   type: UIBridgeRequestType;
   elementId?: string;
   componentId?: string;
@@ -564,20 +556,12 @@ export interface UIBridgeRequestPayload extends Pick<UiBridgeRequestEnvelope, "r
 }
 
 /**
- * Response structure sent back to Rust.
- *
- * Mirrors the request envelope's pattern: the head (`requestId`, `success`,
- * `timestamp`) is sourced from the generated `UiBridgeResponseEnvelope`, and
- * the discriminator `type` is narrowed to the local exhaustive
- * `UIBridgeRequestType`. `data`, `error`, and `hint` are intentionally
- * relaxed to the local payload shapes (the generated `data`/`hint` fields
- * resolve to `{ [k: string]: unknown }` because schemars emits open-object
- * wire shapes; consumers of the response need a freer `unknown` for
- * payload-specific narrowing).
+ * Response structure sent back to Rust
  */
-export interface UIBridgeResponsePayload
-  extends Pick<UiBridgeResponseEnvelope, "requestId" | "success" | "timestamp"> {
+export interface UIBridgeResponsePayload {
+  requestId: string;
   type: UIBridgeRequestType;
+  success: boolean;
   data?: unknown;
   error?: string;
   /**
@@ -592,6 +576,7 @@ export interface UIBridgeResponsePayload
    * - Eval-rejected (Rust page.rs): `string` workaround guidance.
    */
   hint?: unknown;
+  timestamp: number;
 }
 
 /**

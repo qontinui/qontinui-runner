@@ -194,6 +194,11 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/annotations/import",
             post(ui_bridge_annotations_import_handler),
         )
+        // SDK top-level alias — `/annotations/import` (SDK's importAnnotations).
+        .route(
+            "/ui-bridge/annotations/import",
+            post(ui_bridge_annotations_import_handler),
+        )
         // Debug
         .route(
             "/ui-bridge/debug/element-tree",
@@ -227,6 +232,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/control/performance-entries"),
         ("POST", "/ui-bridge/control/performance-entries/clear"),
         ("POST", "/ui-bridge/control/annotations/import"),
+        ("POST", "/ui-bridge/annotations/import"),
         ("GET", "/ui-bridge/debug/element-tree"),
         ("POST", "/ui-bridge/debug/highlight/{id}"),
         ("POST", "/ui-bridge/control/navigate-tab"),

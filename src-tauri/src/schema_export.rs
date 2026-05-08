@@ -1,11 +1,19 @@
 //! Schema Export Module
 //!
-//! Pure re-export aggregator — contains **zero** local type definitions.
-//! All types come from `qontinui-types` (`qontinui-schemas/rust/`).
+//! Aggregator over the cross-repo type registry. Most types come from
+//! `qontinui-types` (`qontinui-schemas/rust/`); a handful of runner-local
+//! payload + relay envelope types are also registered from
+//! `crate::tauri_event_payloads` and `crate::relay_envelopes`.
 //!
 //! Used by the `export_schemas` binary to produce a single JSON object
 //! mapping type names to their JSON Schemas for cross-language type
 //! generation (TypeScript, Python).
+//!
+//! Drift between this registry and qontinui-schemas's checked-in TS /
+//! Python artifacts is caught by two CI workflows: schemas-side
+//! `schema-drift.yml` fires on `rust/src/**` changes; runner-side
+//! `qontinui-types-drift.yml` fires on changes to this file (and the
+//! three other runner-side schema files).
 
 use schemars::schema_for;
 use serde_json::{Map, Value};
@@ -63,17 +71,6 @@ pub fn export_all_schemas() -> Value {
     // Wire-format canvas panel struct carried inside AppEvent::CanvasUpdate's
     // `data.panel` field. Mirrors the runner's `mcp::canvas::StoredPanel`.
     add!("CanvasPanel", qae::CanvasPanel);
-    // UI Bridge IPC envelopes — Stage 1 of the ui-bridge-request envelope
-    // concretization (deferral note in commit ea5d9a61f). Wire shape:
-    //   request:  { requestId, type, ...flattened payload fields }
-    //   response: { requestId, type, success, data?, error?, hint?, timestamp }
-    // The discriminator is `type` (Rust field is `request_type` for ergonomics,
-    // serialized via `#[serde(rename = "type")]`). Stage 2 (per-payload tagged
-    // union of all 171 request_types) is deferred indefinitely — the TS-side
-    // AssertEqual<AllHandledTypes, UIBridgeRequestType> already enforces
-    // dispatch exhaustiveness from the right end of the pipeline.
-    add!("UiBridgeRequestEnvelope", qae::UiBridgeRequestEnvelope);
-    add!("UiBridgeResponseEnvelope", qae::UiBridgeResponseEnvelope);
 
     // ── qontinui-types: ai_workflows ──
     add!("ExecutionStep", qaw::ExecutionStep);
@@ -678,7 +675,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 431, "Expected 431 schema entries");
+        assert_eq!(obj.len(), 429, "Expected 429 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

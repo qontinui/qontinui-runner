@@ -3594,7 +3594,9 @@ async fn handle_render_log(State(state): State<Arc<ApiState>>) -> Json<serde_jso
 }
 
 /// DELETE /ui-bridge/sdk/render-log — Clear render log
-async fn handle_clear_render_log(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+pub(crate) async fn handle_clear_render_log(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
     match dispatch_app_request(
         &state,
         "clearRenderLog",
@@ -3611,7 +3613,9 @@ async fn handle_clear_render_log(State(state): State<Arc<ApiState>>) -> Json<ser
 }
 
 /// POST /ui-bridge/sdk/render-log/snapshot — Capture render log snapshot
-async fn handle_render_log_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+pub(crate) async fn handle_render_log_snapshot(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
     match dispatch_app_request(
         &state,
         "captureSnapshot",
@@ -3628,7 +3632,9 @@ async fn handle_render_log_snapshot(State(state): State<Arc<ApiState>>) -> Json<
 }
 
 /// GET /ui-bridge/sdk/render-log/path — Get render log path
-async fn handle_render_log_path(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+pub(crate) async fn handle_render_log_path(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/render-log/path", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),

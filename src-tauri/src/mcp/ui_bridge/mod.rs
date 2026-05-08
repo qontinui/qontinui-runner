@@ -793,82 +793,38 @@ mod manifest_drift_tests {
 
         // ── SDK-only baseline ───────────────────────────────────────────
         //
-        // Routes the SDK declares but the runner does not currently expose.
-        // These are real wire-through gaps captured as a *baseline snapshot*
-        // — none of them are the 5 friction-table entries from the
-        // 2026-05-03 plan (those have all been wired). They're long-tail
-        // SDK surface (annotations, design eval, intent registry, render-log
-        // file ops, etc.) that the runner has never plumbed through. Listed
-        // here so this test passes today and flags only NEW drift.
+        // Routes the SDK declares but the runner does not expose. The
+        // 2026-05-07 Bucket C plan wired through the 14 entries that were
+        // genuinely missing handlers — what remains here is intentional
+        // shape divergence (Bucket D) plus one deferred subsystem
+        // (spawn-headless, Bucket C7). Each remaining line documents the
+        // reason it's NOT a simple alias.
         //
-        // To remove an entry: implement the runner handler in the matching
-        // `mcp/ui_bridge/<family>.rs`, register in `route_entries()`, then
-        // delete the line below. The test will then assert end-to-end
-        // wiring forever after.
+        // To remove a future entry: implement the runner handler in the
+        // matching `mcp/ui_bridge/<family>.rs`, register in `routes()`
+        // AND `route_entries()`, then delete the line below. The test
+        // will then assert end-to-end wiring forever after.
         let sdk_only_baseline: HashSet<(&str, &str)> = [
-            // Render log file ops
-            ("DELETE", "/ui-bridge/render-log"),
-            ("GET", "/ui-bridge/render-log/path"),
-            ("POST", "/ui-bridge/render-log/snapshot"),
-            // Annotations top-level surface (runner exposes /control/annotations only)
-            ("DELETE", "/ui-bridge/annotations/{}"),
-            ("GET", "/ui-bridge/annotations"),
-            ("GET", "/ui-bridge/annotations/coverage"),
-            ("GET", "/ui-bridge/annotations/export"),
-            ("GET", "/ui-bridge/annotations/{}"),
-            ("POST", "/ui-bridge/annotations/import"),
-            ("PUT", "/ui-bridge/annotations/{}"),
-            ("POST", "/ui-bridge/control/annotation/{}"),
-            // Design top-level surface (runner exposes /control/design/* aliases only)
-            ("DELETE", "/ui-bridge/design/style-guide"),
-            ("GET", "/ui-bridge/design/element/{}/styles"),
-            ("GET", "/ui-bridge/design/evaluate/contexts"),
-            ("GET", "/ui-bridge/design/style-guide"),
-            ("POST", "/ui-bridge/design/audit"),
-            ("POST", "/ui-bridge/design/element/{}/state-styles"),
-            ("POST", "/ui-bridge/design/evaluate"),
-            ("POST", "/ui-bridge/design/evaluate/baseline"),
-            ("POST", "/ui-bridge/design/evaluate/diff"),
-            ("POST", "/ui-bridge/design/responsive"),
-            ("POST", "/ui-bridge/design/snapshot"),
-            ("POST", "/ui-bridge/design/style-guide/load"),
-            // /ai/intents — runner exposes /ai/intents/* and /control/intents/*; SDK declares both shapes
-            ("GET", "/ui-bridge/ai/intents"),
-            ("POST", "/ui-bridge/ai/intents/execute"),
-            ("POST", "/ui-bridge/ai/intents/execute-from-query"),
-            ("POST", "/ui-bridge/ai/intents/find"),
-            ("POST", "/ui-bridge/ai/intents/register"),
-            ("DELETE", "/ui-bridge/control/intent/{}"),
+            // Intent name-in-URL execute — runner's /control/intents/execute
+            // takes the name in the JSON body (different shape from SDK's
+            // /control/intent/:name/execute).
             ("POST", "/ui-bridge/control/intent/{}/execute"),
-            // Cross-app analyze GET form (runner exposes POST form only)
+            // Cross-app analyze GET form — runner's analyze handlers are
+            // POST-only (they accept a request body); SDK declares a GET
+            // shape with query-string args. Different shape, not a simple alias.
             ("GET", "/ui-bridge/ai/analyze/data"),
             ("GET", "/ui-bridge/ai/analyze/regions"),
             ("GET", "/ui-bridge/ai/analyze/structured-data"),
-            // Media audit named subpaths (runner exposes /ai/media/audit/{} param form)
+            // Media audit named subpaths — runner exposes the parameterised
+            // /ai/media/audit/{audit_type} form which routes via Path<String>.
+            // SDK declares concrete subpaths; aliasing them would require
+            // wrapper handlers that hardcode the audit-type string.
             ("POST", "/ui-bridge/ai/media/audit/accessibility"),
             ("POST", "/ui-bridge/ai/media/audit/performance"),
-            // Misc /control/* the runner hasn't plumbed
-            ("GET", "/ui-bridge/control/changes/since"),
-            ("GET", "/ui-bridge/control/clipboard/read"),
-            ("GET", "/ui-bridge/control/element/{}/history"),
-            ("GET", "/ui-bridge/control/element/{}/react-state"),
-            ("GET", "/ui-bridge/control/history"),
-            ("GET", "/ui-bridge/control/interaction-metrics"),
-            ("GET", "/ui-bridge/control/page/routes"),
-            ("POST", "/ui-bridge/control/actions/batch"),
-            ("POST", "/ui-bridge/control/clipboard/write"),
-            ("POST", "/ui-bridge/control/elements/rank"),
-            ("POST", "/ui-bridge/control/page/navigate-to"),
+            // Spawn-headless — deferred (Bucket C7 of the 2026-05-07 plan).
+            // Real subsystem (CLI subprocess orchestration), not a handler;
+            // tracked separately.
             ("POST", "/ui-bridge/control/sdk/spawn-headless"),
-            ("POST", "/ui-bridge/control/viewport-constraints"),
-            // Debug top-level surface (runner exposes /control/* equivalents)
-            ("GET", "/ui-bridge/debug/action-history"),
-            ("GET", "/ui-bridge/debug/element-history/{}"),
-            ("GET", "/ui-bridge/debug/metrics"),
-            // Heartbeat — runner uses /pong/IPC plumbing instead
-            ("POST", "/ui-bridge/heartbeat"),
-            // /ai/assert/batch slash form (runner exposes /ai/assert-batch hyphen form)
-            ("POST", "/ui-bridge/ai/assert/batch"),
         ]
         .into_iter()
         .collect();

@@ -147,6 +147,17 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/clipboard",
             get(ui_bridge_clipboard_read_handler).post(ui_bridge_clipboard_write_handler),
         )
+        // SDK declares the read/write split form — same handlers as the
+        // /control/clipboard combined route above, mounted as aliases for
+        // symmetry with the contract.
+        .route(
+            "/ui-bridge/control/clipboard/read",
+            get(ui_bridge_clipboard_read_handler),
+        )
+        .route(
+            "/ui-bridge/control/clipboard/write",
+            post(ui_bridge_clipboard_write_handler),
+        )
 }
 
 /// Static (method, path) tuples corresponding to every route registered
@@ -161,5 +172,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/ai/fill-form"),
         ("GET", "/ui-bridge/control/clipboard"),
         ("POST", "/ui-bridge/control/clipboard"),
+        ("GET", "/ui-bridge/control/clipboard/read"),
+        ("POST", "/ui-bridge/control/clipboard/write"),
     ]
 }
