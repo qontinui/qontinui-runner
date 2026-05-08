@@ -218,8 +218,7 @@ export function WorkersPanel({ onRevealTerminal }: WorkersPanelProps) {
               <li
                 key={row.taskRunId}
                 className="rounded-md border border-border/40 bg-background/40 p-3"
-                data-ui-bridge-id="productivity.worker-row"
-                data-task-run-id={row.taskRunId}
+                data-ui-bridge-id={`productivity.worker-row[${row.taskRunId}]`}
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex flex-col gap-1 min-w-0">
@@ -256,8 +255,7 @@ export function WorkersPanel({ onRevealTerminal }: WorkersPanelProps) {
                         ? "Open the Terminals tab"
                         : "This session is not pty-backed"
                     }
-                    data-ui-bridge-id="productivity.worker-view-terminal"
-                    data-task-run-id={row.taskRunId}
+                    data-ui-bridge-id={`productivity.worker-view-terminal[${row.taskRunId}]`}
                     className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/20 px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/40 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
                   >
                     <ExternalLink className="w-3 h-3" /> View terminal

@@ -468,7 +468,16 @@ async fn reset_stale_tasks(
     };
 
     // 3. Classify each task into eligible vs skipped.
-    let mut eligible: Vec<(String, String)> = Vec::new(); // (task_id, current_status)
+    //    Carry the original status + assigned_session_id alongside the id
+    //    so the non-dry-run path can re-emit them into `skipped` if the
+    //    PG flip itself errors (R4 — without this, failed flips would
+    //    silently disappear from the response).
+    struct EligibleTask {
+        task_id: String,
+        status: String,
+        assigned_session_id: Option<String>,
+    }
+    let mut eligible: Vec<EligibleTask> = Vec::new();
     let mut skipped: Vec<SkippedTask> = Vec::new();
     for task in &tasks {
         let status = task.status.as_str();
@@ -500,46 +509,52 @@ async fn reset_stale_tasks(
                     reason: "session still alive".to_string(),
                 });
             }
-            Some(_) => {
-                eligible.push((task.id.clone(), task.status.clone()));
+            Some(sid) => {
+                eligible.push(EligibleTask {
+                    task_id: task.id.clone(),
+                    status: task.status.clone(),
+                    assigned_session_id: Some(sid.clone()),
+                });
             }
         }
     }
 
-    // 4. In non-dry-run mode, apply the flip. We use the validated
-    //    `transition_task_status` primitive so a concurrent caller can't
-    //    cause a lost-update; if the row already moved, our update is a
-    //    no-op and we still report the id as `reset` because the requested
-    //    end state holds. (Surfacing an extra "raced concurrent call"
-    //    bucket would just confuse the caller.)
+    // 4. In non-dry-run mode, apply the flip via `force_reset_task_to_ready`
+    //    — the recovery primitive that bypasses the canonical state-machine
+    //    guard (R3). The primitive's WHERE clause keeps the call race-safe:
+    //    if the row has already moved to `running`/`review`/etc., the UPDATE
+    //    affects zero rows and we surface that as a skip rather than a flip.
     let mut reset_ids: Vec<String> = Vec::new();
     if !dry_run {
-        for (task_id, from_status) in &eligible {
-            // Best-effort: log on failure but keep going so one bad row
-            // doesn't strand the rest. The caller can re-run the endpoint
-            // to retry.
-            match app
-                .pg_db
-                .transition_task_status(task_id, from_status, "ready")
-                .await
-            {
-                Ok(_) => {}
+        for et in &eligible {
+            match app.pg_db.force_reset_task_to_ready(&et.task_id).await {
+                Ok(true) => {
+                    reset_ids.push(et.task_id.clone());
+                }
+                Ok(false) => {
+                    // Row didn't match the WHERE guard — concurrent caller
+                    // already moved it past assigned/needs_fix. Surface so
+                    // the caller can audit instead of silently dropping.
+                    skipped.push(SkippedTask {
+                        task_id: et.task_id.clone(),
+                        status: et.status.clone(),
+                        assigned_session_id: et.assigned_session_id.clone(),
+                        reason: "concurrent transition (no row matched)".to_string(),
+                    });
+                }
                 Err(e) => {
                     warn!(
-                        "reset_stale_tasks: transition_task_status({}, {}, ready) failed: {}",
-                        task_id, from_status, e
+                        "reset_stale_tasks: force_reset_task_to_ready({}) failed: {}",
+                        et.task_id, e
                     );
-                    continue;
+                    skipped.push(SkippedTask {
+                        task_id: et.task_id.clone(),
+                        status: et.status.clone(),
+                        assigned_session_id: et.assigned_session_id.clone(),
+                        reason: format!("flip failed: {}", e),
+                    });
                 }
             }
-            if let Err(e) = app.pg_db.clear_task_assignment(task_id).await {
-                warn!(
-                    "reset_stale_tasks: clear_task_assignment({}) failed: {}",
-                    task_id, e
-                );
-                continue;
-            }
-            reset_ids.push(task_id.clone());
         }
         info!(
             "reset_stale_tasks: flipped {} stale task(s) back to ready (skipped={})",
@@ -548,7 +563,7 @@ async fn reset_stale_tasks(
         );
     } else {
         // Dry-run: report what we *would* flip without touching PG.
-        reset_ids = eligible.iter().map(|(id, _)| id.clone()).collect();
+        reset_ids = eligible.iter().map(|et| et.task_id.clone()).collect();
         info!(
             "reset_stale_tasks (dry-run): would flip {} stale task(s); skipped={}",
             reset_ids.len(),

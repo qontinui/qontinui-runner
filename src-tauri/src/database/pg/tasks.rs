@@ -343,12 +343,18 @@ impl PgDb {
         Ok(n > 0)
     }
 
-    /// Clear the `assigned_session_id` of a task back to NULL. Used by the
-    /// stale-task reset endpoint (`POST /coordinator/tasks/reset-stale`)
-    /// when a task is flipped from `assigned`/`needs_fix` back to `ready`
-    /// because its assigned session is no longer alive in `SessionManager`.
-    /// Returns `true` when a row was updated.
-    pub async fn clear_task_assignment(&self, task_id: &str) -> Result<bool, String> {
+    /// Recovery primitive: flip a task from `assigned`/`needs_fix` back to
+    /// `ready` and clear its `assigned_session_id`/timestamps. Bypasses the
+    /// canonical state-machine guard in `transition_task_status` because
+    /// `(assigned, ready)` and `(needs_fix, ready)` are recovery edges, not
+    /// happy-path transitions.
+    ///
+    /// Race-safe via the WHERE-clause guard — if another caller has already
+    /// transitioned the row to `running`/`review`/`done`/etc, the UPDATE
+    /// matches zero rows and returns `Ok(false)`. Used by
+    /// `POST /coordinator/tasks/reset-stale` and any future admin/test
+    /// fixtures that need to undo a stale assignment.
+    pub async fn force_reset_task_to_ready(&self, task_id: &str) -> Result<bool, String> {
         let conn = self
             .pool
             .get()
@@ -361,14 +367,18 @@ impl PgDb {
             .execute(
                 r#"
                 UPDATE coord.tasks
-                SET assigned_session_id = NULL,
+                SET status = 'ready',
+                    assigned_session_id = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
                     updated_at = NOW()
                 WHERE id = $1::uuid
+                  AND status IN ('assigned', 'needs_fix')
                 "#,
                 &[&task_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to clear task assignment: {}", e))?;
+            .map_err(|e| format!("Failed to force-reset task: {}", e))?;
 
         Ok(n > 0)
     }
