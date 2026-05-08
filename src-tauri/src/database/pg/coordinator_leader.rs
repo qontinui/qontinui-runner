@@ -111,6 +111,35 @@ impl PgDb {
         Ok(n > 0)
     }
 
+    /// Clear the leader-lease row only if the lease has been stale for at
+    /// least 60s (`leased_until <= NOW() - INTERVAL '60 seconds'`). Returns
+    /// `Ok(true)` when a stale row was cleared, `Ok(false)` if no row was
+    /// matched. The 60s grace prevents racing with normal renewal cadence
+    /// (lease TTL is 60s, renew interval is shorter) — calling this on a
+    /// healthy lease is therefore an idempotent no-op.
+    pub async fn release_stale_coordinator_lease(&self) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                r#"
+                DELETE FROM coord.coordinator_leader
+                WHERE id = TRUE
+                  AND leased_until <= NOW() - INTERVAL '60 seconds'
+                RETURNING instance_id
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("Failed to release stale coordinator lease: {}", e))?;
+
+        Ok(row.is_some())
+    }
+
     /// Return the current leader-lease row, or `None` if no instance has
     /// taken the lease yet. Read-only — intended for the dashboard's
     /// "current leader" badge.

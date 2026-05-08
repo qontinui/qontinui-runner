@@ -19,7 +19,7 @@
 //! `kill-session` or `force-promote-to-worktree`, the endpoint demotes it
 //! to advisory.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -31,6 +31,7 @@ use tracing::{info, warn};
 use crate::database::pg::coordinator_decisions::{
     CoordinatorDecisionRow, InsertCoordinatorDecisionInput,
 };
+use crate::database::pg::coordinator_leader::CoordinatorLeaderRow;
 use crate::database::pg::reviews::ReviewRow;
 use crate::database::pg::tasks::{TaskRow, NON_TERMINAL_STATUSES};
 use crate::executor::file_registry::FileRegistryInfo;
@@ -43,11 +44,24 @@ use crate::mcp::types::ApiState;
 
 /// Snapshot of one live session — what `/coordinate` Rule A and Rule B
 /// reason about.
+///
+/// `state` is the session's actual lifecycle discriminator
+/// (`created|initializing|ready|processing|interrupting|promoting|closing|closed`)
+/// looked up via `SessionManager::get_state`. If a session disappears
+/// between `list_active` and `get_state` (race), the entry is preserved
+/// with `state = "closed"` and `is_active = false` so consumers see the
+/// id rather than silently dropping it.
+///
+/// `is_active` mirrors `SessionState::is_active()` (true for any state
+/// other than `closing` / `closed`) — kept as a dedicated field so
+/// frontends that already discriminate on a boolean don't need to
+/// re-implement the predicate.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveSessionSummary {
     pub task_run_id: String,
     pub state: String,
+    pub is_active: bool,
 }
 
 /// Composite payload returned by `GET /coordinator/state`. Field shape
@@ -84,24 +98,37 @@ async fn get_coordinator_state(
     let active_file_registry = app.file_registry_manager.info().await;
     let upcoming_file_registry = app.upcoming_file_registry.snapshot().await;
 
-    // Pull live session ids from the SessionManager Tauri-state. The
-    // Coordinator dashboard renders state per session; we surface only the
-    // `Processing|Ready|Closed` discriminator string here so the JSON is
-    // small. Detailed per-session metadata stays on the dashboard via the
-    // dedicated terminal endpoints.
+    // Pull live session ids from the SessionManager Tauri-state and
+    // resolve each id back to its actual lifecycle state. `get_state`
+    // walks both the ClaudeSession and worker_sessions maps (post-Phase-6
+    // worker registration), so this works uniformly for skill sessions
+    // and pty workers. If a session disappears between `list_active` and
+    // `get_state` (race), surface it as `closed`/`is_active = false`
+    // rather than dropping the entry — the consumer can decide whether
+    // to filter.
     let live_sessions = match state
         .app_handle
         .try_state::<Arc<crate::claude_session::SessionManager>>()
     {
-        Some(sm) => sm
-            .inner()
-            .list_active()
-            .into_iter()
-            .map(|task_run_id| LiveSessionSummary {
-                task_run_id,
-                state: "active".to_string(),
-            })
-            .collect(),
+        Some(sm) => {
+            let manager = sm.inner();
+            manager
+                .list_active()
+                .into_iter()
+                .map(|task_run_id| match manager.get_state(&task_run_id) {
+                    Some(s) => LiveSessionSummary {
+                        task_run_id,
+                        state: s.as_event_str().to_string(),
+                        is_active: s.is_active(),
+                    },
+                    None => LiveSessionSummary {
+                        task_run_id,
+                        state: "closed".to_string(),
+                        is_active: false,
+                    },
+                })
+                .collect()
+        }
         None => Vec::new(),
     };
 
@@ -365,6 +392,124 @@ async fn get_coordinator_leader(
 }
 
 // =============================================================================
+// /coordinator/decisions
+// =============================================================================
+
+/// Query string for `GET /coordinator/decisions`. `limit` defaults to 50
+/// and is clamped to `[1, 200]` to match the Decision Log's pagination
+/// budget. `rule` and `action` are optional exact-match filters passed
+/// through verbatim to `list_recent_coordinator_decisions`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorDecisionsQuery {
+    #[serde(default = "default_decisions_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub rule: Option<String>,
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+fn default_decisions_limit() -> i64 {
+    50
+}
+
+/// Response shape for `GET /coordinator/decisions`. `total` is a
+/// convenience for clients that don't want to compute `decisions.len()`
+/// themselves; it always equals `decisions.len()` because the helper
+/// returns the full result set (no separate count query).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorDecisionsResponse {
+    pub decisions: Vec<CoordinatorDecisionRow>,
+    pub total: usize,
+}
+
+async fn get_coordinator_decisions(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<CoordinatorDecisionsQuery>,
+) -> Result<Json<CoordinatorDecisionsResponse>, (StatusCode, String)> {
+    let limit = query.limit.clamp(1, 200);
+    let rule_filter = query.rule.as_deref().filter(|s| !s.is_empty());
+    let action_filter = query.action.as_deref().filter(|s| !s.is_empty());
+
+    let decisions = state
+        .app_state
+        .pg_db
+        .list_recent_coordinator_decisions(limit, rule_filter, action_filter)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list_recent_coordinator_decisions: {}", e),
+            )
+        })?;
+
+    let total = decisions.len();
+    Ok(Json(CoordinatorDecisionsResponse { decisions, total }))
+}
+
+// =============================================================================
+// /coordinator/leader/break-lease
+// =============================================================================
+
+/// Response for `POST /coordinator/leader/break-lease`. The endpoint is
+/// idempotent + race-safe: the underlying `release_stale_coordinator_lease`
+/// helper only deletes a row whose `leased_until` is at least 60s in the
+/// past, so calling it on a healthy lease is a no-op (`broken = false`).
+/// `current` and `lease_status` reflect the post-action state so the UI
+/// can refresh the "current leader" badge from one round-trip.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BreakLeaseResponse {
+    pub broken: bool,
+    pub current: Option<CoordinatorLeaderRow>,
+    pub lease_status: String,
+}
+
+async fn break_coordinator_lease(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<BreakLeaseResponse>, (StatusCode, String)> {
+    let broken = state
+        .app_state
+        .pg_db
+        .release_stale_coordinator_lease()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("release_stale_coordinator_lease: {}", e),
+            )
+        })?;
+
+    let current = state
+        .app_state
+        .pg_db
+        .current_coordinator_leader()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("current_coordinator_leader: {}", e),
+            )
+        })?;
+    let lease_status = crate::commands::productivity::compute_lease_status_for_http(&current);
+
+    if broken {
+        info!(
+            "Coordinator stale lease cleared; post-action lease_status={}",
+            lease_status
+        );
+    }
+
+    Ok(Json(BreakLeaseResponse {
+        broken,
+        current,
+        lease_status,
+    }))
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -373,4 +518,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/coordinator/state", get(get_coordinator_state))
         .route("/coordinator/act", post(coordinator_act))
         .route("/coordinator/leader", get(get_coordinator_leader))
+        .route("/coordinator/decisions", get(get_coordinator_decisions))
+        .route(
+            "/coordinator/leader/break-lease",
+            post(break_coordinator_lease),
+        )
 }

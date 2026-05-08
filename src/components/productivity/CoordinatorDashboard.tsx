@@ -996,13 +996,12 @@ export function CoordinatorDashboard() {
     try {
       await spawnWorkerSession({ titleHint: null });
       await loadLease();
-      revealTerminalTab();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("Failed to spawn worker:", err);
       setLaunchError(`Failed to spawn worker: ${msg}`);
     }
-  }, [loadLease, revealTerminalTab]);
+  }, [loadLease]);
 
   const handleAcknowledgeAdvisory = useCallback(
     async (decisionId: string) => {
