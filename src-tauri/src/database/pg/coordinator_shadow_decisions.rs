@@ -340,12 +340,16 @@ impl PgDb {
                     ORDER BY s.taken_at DESC
                     LIMIT $2
                     "#,
-                    select_shadow = SELECT_COLS.replace("id::text,", "s.id::text,")
+                    select_shadow = SELECT_COLS
+                        .replace("id::text,", "s.id::text,")
                         .replace("instance_id,", "s.instance_id,")
                         .replace("iteration,", "s.iteration,")
                         .replace("observation_hash,", "s.observation_hash,")
                         .replace("rule, action,", "s.rule, s.action,")
-                        .replace("target_id, reasoning, would_have_acted,", "s.target_id, s.reasoning, s.would_have_acted,")
+                        .replace(
+                            "target_id, reasoning, would_have_acted,",
+                            "s.target_id, s.reasoning, s.would_have_acted,"
+                        )
                         .replace("taken_at::text", "s.taken_at::text"),
                 ),
                 &[&(window_seconds as f64), &limit],
