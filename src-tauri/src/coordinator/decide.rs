@@ -692,6 +692,7 @@ mod tests {
             resolution: None,
             resolved_at: None,
             created_at: "2026-05-01T00:00:00Z".to_string(),
+            observation_hash: String::new(),
         }
     }
 
