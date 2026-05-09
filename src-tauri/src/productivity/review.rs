@@ -421,6 +421,7 @@ pub async fn auto_review_in_product(
                     target_id: Some(task_id),
                     reasoning: &reasoning,
                     auto_acted: false,
+                    observation_hash: "",
                 };
                 if let Err(audit_err) = pg.insert_coordinator_decision(&audit).await {
                     warn!(

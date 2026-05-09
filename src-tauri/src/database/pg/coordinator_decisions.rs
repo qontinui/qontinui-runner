@@ -21,6 +21,12 @@ use uuid::Uuid;
 /// productivity-stack §8 lists this as `CoordinatorDecision` with
 /// `camelCase` fields; the `serde(rename_all)` attribute lets Tauri
 /// commands return this type directly to the React frontend.
+///
+/// `observation_hash` is added by the shadow-decisions migration
+/// (`sd01_coord_coordinator_shadow_decisions`). Empty string for legacy
+/// rows and any callers that don't pass a hash; the Rust scheduler
+/// stamps real SHA-256 hex digests so the diff endpoint can join shadow
+/// vs live by observation snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoordinatorDecisionRow {
@@ -36,12 +42,20 @@ pub struct CoordinatorDecisionRow {
     pub resolution: Option<String>,
     pub resolved_at: Option<String>,
     pub created_at: String,
+    /// SHA-256 hex of the observation snapshot the decision was based on.
+    /// Empty string for legacy rows or HTTP callers (`POST /coordinator/act`)
+    /// that don't supply one.
+    #[serde(default)]
+    pub observation_hash: String,
 }
 
 /// Input shape for `insert_coordinator_decision`. The DB allocates the UUID;
 /// `created_at` defaults to NOW(). `resolved`/`resolution`/`resolved_at`
 /// are not settable on insert — they're updated later via
 /// [`PgDb::resolve_coordinator_decision`].
+///
+/// `observation_hash` defaults to empty when callers don't observe state
+/// (HTTP-driven actions). The Rust scheduler always stamps a real hash.
 #[derive(Debug, Clone)]
 pub struct InsertCoordinatorDecisionInput<'a> {
     pub session_id: &'a str,
@@ -51,12 +65,18 @@ pub struct InsertCoordinatorDecisionInput<'a> {
     pub target_id: Option<&'a str>,
     pub reasoning: &'a str,
     pub auto_acted: bool,
+    /// SHA-256 hex of the observation snapshot. Pass `""` from callers
+    /// that don't observe (HTTP `POST /coordinator/act`, manual user-fire
+    /// audit rows, etc.). The Rust scheduler always passes a real hash
+    /// so the diff endpoint can join shadow ↔ live.
+    pub observation_hash: &'a str,
 }
 
 const SELECT_COLS: &str = r#"
     id::text, session_id, iteration, rule, action, target_id,
     reasoning, auto_acted, resolved, resolution,
-    resolved_at::text, created_at::text
+    resolved_at::text, created_at::text,
+    COALESCE(observation_hash, '')
 "#;
 
 fn row_to_decision(r: &tokio_postgres::Row) -> CoordinatorDecisionRow {
@@ -73,6 +93,7 @@ fn row_to_decision(r: &tokio_postgres::Row) -> CoordinatorDecisionRow {
         resolution: r.get(9),
         resolved_at: r.get(10),
         created_at: r.get(11),
+        observation_hash: r.get(12),
     }
 }
 
@@ -95,8 +116,8 @@ impl PgDb {
                     r#"
                     INSERT INTO coord.coordinator_decisions
                         (session_id, iteration, rule, action, target_id,
-                         reasoning, auto_acted)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                         reasoning, auto_acted, observation_hash)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     RETURNING {}
                     "#,
                     SELECT_COLS
@@ -109,6 +130,7 @@ impl PgDb {
                     &input.target_id,
                     &input.reasoning,
                     &input.auto_acted,
+                    &input.observation_hash,
                 ],
             )
             .await

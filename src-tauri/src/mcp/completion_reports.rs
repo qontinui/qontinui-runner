@@ -342,6 +342,7 @@ pub(crate) async fn add_dependency_inner(
             target_id: Some(task_id),
             reasoning: reason,
             auto_acted: true,
+            observation_hash: "",
         })
         .await
     {
