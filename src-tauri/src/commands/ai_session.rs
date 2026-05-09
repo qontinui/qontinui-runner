@@ -1036,6 +1036,37 @@ pub async fn commit_session_progress(
     }
 }
 
+/// Probe the per-session "ready-to-commit" state for the traffic-light UI.
+///
+/// Frontend equivalent of an HTTP GET — runs the §1 dirty-subset query against
+/// the `session_touched_files` rows for `task_run_id` and returns a
+/// `CommitState` describing whether the tracker is empty / clean / dirty /
+/// mid-merge. Called by `useCommitState` on mount and on a 30 s interval per
+/// tab.
+///
+/// All errors collapse to `success: false` with the inner status code +
+/// message in `message`. The `data` field carries the `CommitState` JSON
+/// blob.
+#[tauri::command]
+pub async fn get_session_commit_state(
+    app: tauri::AppHandle,
+    task_run_id: String,
+) -> Result<CommandResponse, String> {
+    use crate::mcp::ai_session::session_commit_state_inner;
+    match session_commit_state_inner(&app, &task_run_id).await {
+        Ok(state) => Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(serde_json::to_value(&state).unwrap_or_default()),
+        }),
+        Err((_status, msg)) => Ok(CommandResponse {
+            success: false,
+            message: Some(msg),
+            data: None,
+        }),
+    }
+}
+
 /// Resume interrupted AI sessions on startup.
 ///
 /// Queries for task runs with status='running' and workflow_type='chat'

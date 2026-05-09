@@ -83,7 +83,7 @@ futures = "0.3"
 futures-util = "0.3"
 async-stream = "0.3"
 tower = { version = "0.5", features = ["limit"] }
-tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "trace", "catch-panic"] }
 urlencoding = "2.1"
 zip = "8"
 sha2 = "0.10"
@@ -268,6 +268,7 @@ regex_creation_in_loops = "allow"
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 
 ## Profile overrides moved to the workspace root Cargo.toml — cargo
 ## ignores [profile.*] in package manifests when a workspace exists.

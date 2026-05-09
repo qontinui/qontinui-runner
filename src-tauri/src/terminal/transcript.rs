@@ -494,6 +494,170 @@ fn parse_assistant_record(record: &serde_json::Value) -> Option<TranscriptMessag
     })
 }
 
+// ── Touched-File Extraction (Phase 1.5 — transcript-tail populator) ──────────
+//
+// These helpers walk an `{type:"assistant"}` JSONL record and emit a
+// `TouchedFile` for each `Edit` / `Write` / `MultiEdit` `tool_use` block. They
+// are pure (no I/O) and live next to `parse_assistant_record` because they
+// share the same `serde_json::Value` walking style and timestamp field.
+//
+// Consumed by `terminal::transcript_watcher` to populate
+// `coord.session_touched_files` for PTY-launched AI tabs (the SDK
+// `auto_register_file` path covers SDK chat sessions).
+
+/// One file-edit observation extracted from a single tool-use block in a
+/// transcript record. The runtime tail task converts these into
+/// `pg.record_file_touched` calls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TouchedFile {
+    /// The CLI-side session id (the JSONL file's stem). Carried through so
+    /// the consumer doesn't have to thread it separately.
+    pub session_id: String,
+    /// Absolute file path as the tool reported it. NOT canonicalized — the
+    /// downstream dirty-subset query buckets by git toplevel, which handles
+    /// path-normalization there.
+    pub file_path: String,
+    /// Which tool produced the touch.
+    pub tool: ToolKind,
+    /// Wall-clock ms when the record was written, parsed from the record's
+    /// top-level `timestamp` field (ISO-8601). Falls back to "now" when
+    /// missing or unparseable.
+    pub recorded_at_ms: u64,
+}
+
+/// Tool that wrote to a file. Match arm is intentionally explicit so adding a
+/// new tool (NotebookEdit, etc.) is a deliberate extension, not a guess.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolKind {
+    Edit,
+    Write,
+    MultiEdit,
+}
+
+/// Errors from `parse_line_for_touched_files`. Malformed JSON is the only
+/// case — the caller logs and continues, never panics.
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    #[error("malformed JSON: {0}")]
+    MalformedJson(String),
+}
+
+/// Parse the record's top-level `timestamp` field (ISO-8601) into wall-clock
+/// ms. Falls back to `SystemTime::now()` when absent or unparseable.
+fn record_timestamp_ms(record: &serde_json::Value) -> u64 {
+    if let Some(ts) = record.get("timestamp").and_then(|t| t.as_str()) {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+            let ms = dt.timestamp_millis();
+            if ms >= 0 {
+                return ms as u64;
+            }
+        }
+    }
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Walk `content[]` of an `{type:"assistant"}` record and emit a TouchedFile
+/// for each Edit/Write/MultiEdit `tool_use` block. Returns 0..N entries (a
+/// single record can carry multiple tool_use blocks). Skips non-touching
+/// blocks, unknown tools, and blocks with missing/non-string `input.file_path`
+/// silently — never fails.
+///
+/// The input shape is identical to what `parse_assistant_record:444` already
+/// consumes; reuse that mental model.
+pub fn extract_touched_files_from_assistant_record(
+    session_id: &str,
+    record: &serde_json::Value,
+) -> Vec<TouchedFile> {
+    let recorded_at_ms = record_timestamp_ms(record);
+
+    let Some(message) = record.get("message") else {
+        return Vec::new();
+    };
+    let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for block in content {
+        let block_type = block
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+        if block_type != "tool_use" {
+            continue;
+        }
+        let name = match block.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let tool = match name {
+            "Edit" => ToolKind::Edit,
+            "Write" => ToolKind::Write,
+            "MultiEdit" => ToolKind::MultiEdit,
+            // Future tools (NotebookEdit, etc.) need an explicit arm — don't
+            // guess. Read/Bash/Grep/Glob/etc. fall through silently.
+            _ => continue,
+        };
+
+        // All three tools key the path on `input.file_path` (string). Skip
+        // blocks that are missing/non-string rather than failing; the parser
+        // is intentionally tolerant of upstream shape drift.
+        let Some(file_path) = block
+            .get("input")
+            .and_then(|i| i.get("file_path"))
+            .and_then(|p| p.as_str())
+        else {
+            continue;
+        };
+
+        out.push(TouchedFile {
+            session_id: session_id.to_string(),
+            file_path: file_path.to_string(),
+            tool,
+            recorded_at_ms,
+        });
+    }
+    out
+}
+
+/// Convenience wrapper: parse one JSONL line, dispatch by `type`, and return
+/// touched files (empty for non-assistant records). Wraps `serde_json::from_str`
+/// + `extract_touched_files_from_assistant_record`. Malformed JSON →
+/// `Err(ParseError)`; the caller logs and continues — never panics.
+pub fn parse_line_for_touched_files(
+    session_id: &str,
+    line: &str,
+) -> Result<Vec<TouchedFile>, ParseError> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let record: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|e| ParseError::MalformedJson(e.to_string()))?;
+
+    let record_type = record
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    if record_type != "assistant" {
+        return Ok(Vec::new());
+    }
+    Ok(extract_touched_files_from_assistant_record(
+        session_id, &record,
+    ))
+}
+
+/// Test-only re-export of `is_workflow_session` so the `transcript_watcher`
+/// module can apply the same first-5-lines filter without duplicating the
+/// logic. The function itself stays private to this module.
+pub(crate) fn is_workflow_session_marker(content: &str) -> bool {
+    is_workflow_session(content)
+}
+
 // ── Text Extraction ──────────────────────────────────────────────────────────
 
 /// Format messages as readable conversation text suitable for `inline_context`.
@@ -1284,5 +1448,210 @@ mod tests {
         // On the dev machine, we should find at least one
         // (but don't assert that in CI)
         let _ = dirs;
+    }
+
+    // ── Touched-File Extraction tests (Phase 1.5) ────────────────────────────
+
+    #[test]
+    fn test_extract_touched_files_single_edit() {
+        // Real-shape JSONL fixture with one `Edit` tool_use.
+        let record = serde_json::json!({
+            "type": "assistant",
+            "uuid": "asst-1",
+            "timestamp": "2026-05-09T12:34:56.789Z",
+            "message": {
+                "model": "claude-opus-4-7",
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I'll edit the file."},
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "D:/qontinui-root/foo.rs",
+                            "old_string": "fn old()",
+                            "new_string": "fn new()"
+                        }
+                    }
+                ]
+            }
+        });
+        let touched = extract_touched_files_from_assistant_record("sess-A", &record);
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].session_id, "sess-A");
+        assert_eq!(touched[0].file_path, "D:/qontinui-root/foo.rs");
+        assert_eq!(touched[0].tool, ToolKind::Edit);
+        // Timestamp parsed from ISO-8601 is non-zero and matches what
+        // chrono produces — exact value is brittle across leap-second
+        // tables, so just bound it. The fixture is mid-2026.
+        let ms = touched[0].recorded_at_ms;
+        let approx_2026_min = 1_700_000_000_000u64; // late 2023
+        let approx_2030_max = 1_900_000_000_000u64; // 2030
+        assert!(
+            ms > approx_2026_min && ms < approx_2030_max,
+            "expected mid-2020s timestamp ms, got {}",
+            ms
+        );
+    }
+
+    #[test]
+    fn test_extract_touched_files_unknown_tool_skipped() {
+        let record = serde_json::json!({
+            "type": "assistant",
+            "uuid": "asst-2",
+            "timestamp": "2026-05-09T12:34:56Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-2",
+                        "name": "Read",
+                        "input": {"file_path": "/should/not/track.rs"}
+                    }
+                ]
+            }
+        });
+        let touched = extract_touched_files_from_assistant_record("sess-B", &record);
+        assert!(
+            touched.is_empty(),
+            "Read tool must NOT produce a TouchedFile"
+        );
+    }
+
+    #[test]
+    fn test_extract_touched_files_missing_file_path_silent() {
+        let record = serde_json::json!({
+            "type": "assistant",
+            "uuid": "asst-3",
+            "timestamp": "2026-05-09T12:34:56Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-3",
+                        "name": "Edit",
+                        "input": {
+                            "old_string": "x",
+                            "new_string": "y"
+                            // file_path missing
+                        }
+                    }
+                ]
+            }
+        });
+        let touched = extract_touched_files_from_assistant_record("sess-C", &record);
+        assert!(
+            touched.is_empty(),
+            "Missing file_path must produce empty result, not error"
+        );
+    }
+
+    #[test]
+    fn test_parse_line_malformed_json_returns_err() {
+        let bad = r#"{"type": "assistant", "broken": "#;
+        let result = parse_line_for_touched_files("sess-D", bad);
+        assert!(matches!(result, Err(ParseError::MalformedJson(_))));
+    }
+
+    #[test]
+    fn test_extract_touched_files_multiedit_one_per_call() {
+        // MultiEdit with 5 inner edits to the same file → 1 TouchedFile.
+        let record = serde_json::json!({
+            "type": "assistant",
+            "uuid": "asst-4",
+            "timestamp": "2026-05-09T12:34:56Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-4",
+                        "name": "MultiEdit",
+                        "input": {
+                            "file_path": "/tmp/multi.rs",
+                            "edits": [
+                                {"old_string": "a", "new_string": "1"},
+                                {"old_string": "b", "new_string": "2"},
+                                {"old_string": "c", "new_string": "3"},
+                                {"old_string": "d", "new_string": "4"},
+                                {"old_string": "e", "new_string": "5"}
+                            ]
+                        }
+                    }
+                ]
+            }
+        });
+        let touched = extract_touched_files_from_assistant_record("sess-E", &record);
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].file_path, "/tmp/multi.rs");
+        assert_eq!(touched[0].tool, ToolKind::MultiEdit);
+    }
+
+    #[test]
+    fn test_extract_touched_files_mixed_blocks() {
+        // Read + Edit blocks → exactly 1 TouchedFile (the Edit).
+        let record = serde_json::json!({
+            "type": "assistant",
+            "uuid": "asst-5",
+            "timestamp": "2026-05-09T12:34:56Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-5a",
+                        "name": "Read",
+                        "input": {"file_path": "/skip/me.rs"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tool-5b",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "/keep/me.rs",
+                            "old_string": "x",
+                            "new_string": "y"
+                        }
+                    }
+                ]
+            }
+        });
+        let touched = extract_touched_files_from_assistant_record("sess-F", &record);
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].file_path, "/keep/me.rs");
+        assert_eq!(touched[0].tool, ToolKind::Edit);
+    }
+
+    #[test]
+    fn test_parse_line_for_touched_files_non_assistant_returns_empty() {
+        // user records produce no touched files even if they reference paths.
+        let line = r#"{"type":"user","uuid":"u1","timestamp":"2026-05-09T00:00:00Z","message":{"role":"user","content":"please edit foo.rs"}}"#;
+        let result = parse_line_for_touched_files("sess-G", line).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_line_for_touched_files_empty_line_ok() {
+        // Trailing/empty lines must not error.
+        assert!(parse_line_for_touched_files("sess-H", "")
+            .unwrap()
+            .is_empty());
+        assert!(parse_line_for_touched_files("sess-H", "   ")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_parse_line_for_touched_files_full_pipeline_write() {
+        // End-to-end: full JSONL line → TouchedFile.
+        let line = r#"{"type":"assistant","uuid":"a-9","timestamp":"2026-05-09T01:02:03Z","message":{"model":"claude-opus-4-7","role":"assistant","content":[{"type":"tool_use","id":"t","name":"Write","input":{"file_path":"/new/file.rs","content":"fn main(){}"}}]}}"#;
+        let touched = parse_line_for_touched_files("sess-I", line).unwrap();
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].tool, ToolKind::Write);
+        assert_eq!(touched[0].file_path, "/new/file.rs");
+        assert_eq!(touched[0].session_id, "sess-I");
     }
 }

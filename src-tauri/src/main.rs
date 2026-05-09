@@ -57,6 +57,7 @@ mod fixer;
 mod flow_control;
 mod follow_up;
 mod fs_atomic;
+mod git_status_subset;
 mod graphql;
 mod health_monitor;
 mod heartbeat;
@@ -678,6 +679,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_session::generate_workflow_from_session,
             commands::ai_session::get_ai_output,
             commands::ai_session::get_ai_session_state,
+            commands::ai_session::get_session_commit_state,
             commands::ai_session::interrupt_ai_session,
             commands::ai_session::list_ai_sessions,
             commands::ai_session::promote_session_to_worktree,
@@ -1883,6 +1885,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     scheduler_service::start_scheduler_service(scheduler_pg, scheduler_app_state)
                         .await;
                 });
+            }
+
+            // Phase 1.5 — transcript-tail populator. Watches Claude CLI's
+            // per-session JSONL transcripts and writes Edit/Write/MultiEdit
+            // touches into `coord.session_touched_files` so the per-terminal
+            // commit traffic light has rows to read for PTY-launched AI tabs
+            // (the dominant launch path; SDK chat sessions populate via
+            // `auto_register_file` and don't need this watcher).
+            {
+                let tw_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                let tw_app_handle = app.handle().clone();
+                // Resolve the runner-tracked workspace root (best-effort).
+                let workspace_paths: Vec<String> =
+                    match crate::mcp::shared::get_workspace_paths_internal() {
+                        Ok((root, _, _)) => vec![root.to_string_lossy().to_string()],
+                        Err(e) => {
+                            tracing::warn!(
+                                "transcript_watcher: get_workspace_paths_internal failed: {}",
+                                e
+                            );
+                            Vec::new()
+                        }
+                    };
+                if let Err(e) = crate::terminal::transcript_watcher::start_transcript_watcher(
+                    tw_app_handle,
+                    tw_pg,
+                    workspace_paths,
+                ) {
+                    tracing::warn!("transcript watcher failed to start: {}", e);
+                }
             }
 
             // Auto-load the default state machine into the Python bridge so

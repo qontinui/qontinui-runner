@@ -1,5 +1,5 @@
 {
-  "description": "Terminal page -- an integrated multi-page, multi-tab PTY terminal with workflow generation, session transcript browsing, terminal output analysis, findings tracking, and concurrent session file conflict detection. Users can create multiple terminal pages (e.g., Development, Testing, Monitoring), each with its own independent zone layout, terminals, and saved configurations. Within each page, users execute shell commands in multiple concurrent terminal sessions organized in configurable zone layouts. The terminal supports session persistence across restarts (Claude Code session IDs are saved and auto-resumed), zone profiles that capture session assignments, shell integration for structured command history, keyboard shortcuts for efficient tab management, and an advisory file registry that auto-detects file conflicts across sessions, and plan implementation workflow execution from both the UI (Implement/Verify buttons) and CLI (run-plan-implementation.ts script).",
+  "description": "Terminal page -- an integrated multi-page, multi-tab PTY terminal with workflow generation, session transcript browsing, terminal output analysis, findings tracking, and concurrent session file conflict detection. Users can create multiple terminal pages (e.g., Development, Testing, Monitoring), each with its own independent zone layout, terminals, and saved configurations. Within each page, users execute shell commands in multiple concurrent terminal sessions organized in configurable zone layouts. The terminal supports session persistence across restarts (Claude Code session IDs are saved and auto-resumed), zone profiles that capture session assignments, shell integration for structured command history, keyboard shortcuts for efficient tab management, and an advisory file registry that auto-detects file conflicts across sessions, and plan implementation workflow execution from both the UI (Implement/Verify buttons) and CLI (run-plan-implementation.ts script).\n\n# TerminalPage\n\n## Asserting on terminal cell content (Claude Code, vim, htop, etc.)\n\nDOM-search assertions in this spec (`assertionType: \"exists\"` with a\n`textContent` criterion) **only see the runner's own UI chrome** — tab\nbars, buttons, status indicators. They do **not** see what a TUI app\ndraws inside an xterm pane, because xterm.js renders to a canvas /\nWebGL surface that's not in the DOM.\n\nTo assert on terminal cell content, query the server-side cell grid:\n\n| Use case | Endpoint |\n|---|---|\n| Is text \"Welcome\" visible in any terminal? | `GET /ui-bridge/sdk/terminal/search?q=Welcome` |\n| Is text \"Welcome\" in this specific session? | `GET /ui-bridge/sdk/terminal/search?q=Welcome&session_id=<id>` |\n| Get the rendered text rows of a session | `GET /ui-bridge/sdk/terminal/sessions/<id>/buffer` |\n| Get full cell-level grid (fg/bg/attrs/cursor) | `GET /ui-bridge/sdk/terminal/sessions/<id>/grid` |\n| Compact text view for verifier prompts | `GET /ui-bridge/sdk/terminal/sessions/<id>/text` |\n| Diff two sessions row-by-row | `GET /ui-bridge/sdk/terminal/sessions/<a>/diff/<b>` |\n\nFull reference + worked examples:\n[`src/components/terminal/GRID_TESTING.md`](../../../src/components/terminal/GRID_TESTING.md).\nEnd-to-end smoke at `scripts/test-grid-endpoints.sh`.\n\nThe assertions in `spec.uibridge.json` below cover the runner UI\nshell. Cell content lives on the HTTP side because the spec runner's\nDOM-search primitive can't reach it.",
   "groups": [
     {
       "assertions": [
@@ -1097,6 +1097,34 @@
       "id": "term-plan-cli-script",
       "name": "Plan Implementation CLI Script",
       "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Per-Tab Commit Traffic Light",
+          "enabled": true,
+          "id": "term-commit-traffic-light-elem-0",
+          "precondition": "At least one terminal tab has an active Claude Code AI session (tab.claudeSessionId is populated, either from a resumed session or the post-spawn transcript_get_latest polling)",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "accessibleName": "Commit progress",
+              "role": "button"
+            },
+            "label": "Required element for Per-Tab Commit Traffic Light",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Each terminal tab that hosts an active Claude Code AI session displays a per-tab git \"commit traffic light\" + commit-progress button beside the existing file-lock icon (TerminalTabBar.tsx:~493). The traffic light is a small colored dot rendered by `<CommitTrafficLight>` (qontinui-runner/src/components/terminal/CommitTrafficLight.tsx) reflecting the session's git working-tree state restricted to the files THAT session has touched. Five states: `empty` (gray, default — tracker has no rows yet), `clean` (green — every touched file matches HEAD), `dirty` (yellow — at least one touched file differs from HEAD), `merging` (red — at least one touched repo has MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase-merge/rebase-apply), and `unknown` (no dot rendered — backend probe failed or generated_at_ms is older than 5 minutes). Beside the dot, a GitCommit-icon button labeled \"Commit progress\" (button-commit-progress) is enabled only when status is `dirty`; on click, PTY tabs receive a multi-line `COMMIT_PROMPT_TEMPLATE` typed via `writeToTerminal` that asks the AI to verify-and-commit only its own writes (cross-references its tool-call transcript, runs `git status --porcelain` / `git diff --stat` against the touched paths only, refuses to commit during in-progress merges, omits the Co-Authored-By trailer per the runner pre-commit hook). SDK chat sessions take the equivalent `send_user_message` Tauri invoke path. State source: the Tauri command `get_session_commit_state(taskRunId)` returns `{status, touched_count, dirty_count, repo_roots[], merging_repos[], generated_at_ms}` with lowercase status enum and snake_case fields. The `useCommitState` hook (qontinui-runner/src/components/terminal/useCommitState.ts) listens for `commit-state-changed` Tauri events `{type, task_run_id, state}` keyed by tab.claudeSessionId and additionally polls every 30 seconds. Events are emitted from three sites with a 500 ms per-session debounce: dispatcher.rs after every Edit/Write the SDK reports, mcp/ai_session.rs::commit_session_progress_inner success/no-op branches, and terminal/transcript_watcher.rs after the JSONL watcher records a new TouchedFile via pg.record_file_touched. The watcher backend (terminal/transcript_watcher.rs + extended terminal/transcript.rs parser) populates `coord.session_touched_files` for PTY-launched tabs, since `auto_register_file` in dispatcher.rs only fires for SDK-driven sessions; the watcher tails ~/.claude/projects/<encoded>/<session_id>.jsonl and parses Edit/Write/MultiEdit `tool_use` blocks. Workflow-spawned bypassPermissions sessions are filtered out via `is_workflow_session` so they never pollute the tracker. The `useTabSessionIdCapture` hook (qontinui-runner/src/components/terminal/useTabSessionIdCapture.ts) populates `tab.claudeSessionId` post-spawn by polling the existing `transcript_get_latest` Tauri command for ~15 s after `writeWhenReady` fires (PTY launches don't carry a session-id OSC — verified at `useShellIntegration.ts:67-118` and `TerminalInstance.tsx:699-704`; resumed sessions already have it set via `useShellIntegration.ts:135`). Without `claudeSessionId`, the traffic light wrapper still mounts but the state is treated as `unknown` and the button stays disabled.",
+      "id": "term-commit-traffic-light",
+      "name": "Per-Tab Commit Traffic Light",
+      "source": "ai-generated"
     }
   ],
   "metadata": {
@@ -1115,7 +1143,10 @@
       "file-conflicts",
       "concurrent-sessions",
       "run-group",
-      "tier-1"
+      "tier-1",
+      "commit-traffic-light",
+      "git-status",
+      "session-touched-files"
     ]
   },
   "stateMachine": {
@@ -1416,6 +1447,19 @@
         "id": "term-plan-cli-script",
         "isInitial": false,
         "name": "Plan Implementation CLI Script",
+        "transitions": []
+      },
+      {
+        "description": "Each terminal tab that hosts an active Claude Code AI session displays a per-tab git \"commit traffic light\" + commit-progress button beside the existing file-lock icon (TerminalTabBar.tsx:~493). The traffic light is a small colored dot rendered by `<CommitTrafficLight>` (qontinui-runner/src/components/terminal/CommitTrafficLight.tsx) reflecting the session's git working-tree state restricted to the files THAT session has touched. Five states: `empty` (gray, default — tracker has no rows yet), `clean` (green — every touched file matches HEAD), `dirty` (yellow — at least one touched file differs from HEAD), `merging` (red — at least one touched repo has MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase-merge/rebase-apply), and `unknown` (no dot rendered — backend probe failed or generated_at_ms is older than 5 minutes). Beside the dot, a GitCommit-icon button labeled \"Commit progress\" (button-commit-progress) is enabled only when status is `dirty`; on click, PTY tabs receive a multi-line `COMMIT_PROMPT_TEMPLATE` typed via `writeToTerminal` that asks the AI to verify-and-commit only its own writes (cross-references its tool-call transcript, runs `git status --porcelain` / `git diff --stat` against the touched paths only, refuses to commit during in-progress merges, omits the Co-Authored-By trailer per the runner pre-commit hook). SDK chat sessions take the equivalent `send_user_message` Tauri invoke path. State source: the Tauri command `get_session_commit_state(taskRunId)` returns `{status, touched_count, dirty_count, repo_roots[], merging_repos[], generated_at_ms}` with lowercase status enum and snake_case fields. The `useCommitState` hook (qontinui-runner/src/components/terminal/useCommitState.ts) listens for `commit-state-changed` Tauri events `{type, task_run_id, state}` keyed by tab.claudeSessionId and additionally polls every 30 seconds. Events are emitted from three sites with a 500 ms per-session debounce: dispatcher.rs after every Edit/Write the SDK reports, mcp/ai_session.rs::commit_session_progress_inner success/no-op branches, and terminal/transcript_watcher.rs after the JSONL watcher records a new TouchedFile via pg.record_file_touched. The watcher backend (terminal/transcript_watcher.rs + extended terminal/transcript.rs parser) populates `coord.session_touched_files` for PTY-launched tabs, since `auto_register_file` in dispatcher.rs only fires for SDK-driven sessions; the watcher tails ~/.claude/projects/<encoded>/<session_id>.jsonl and parses Edit/Write/MultiEdit `tool_use` blocks. Workflow-spawned bypassPermissions sessions are filtered out via `is_workflow_session` so they never pollute the tracker. The `useTabSessionIdCapture` hook (qontinui-runner/src/components/terminal/useTabSessionIdCapture.ts) populates `tab.claudeSessionId` post-spawn by polling the existing `transcript_get_latest` Tauri command for ~15 s after `writeWhenReady` fires (PTY launches don't carry a session-id OSC — verified at `useShellIntegration.ts:67-118` and `TerminalInstance.tsx:699-704`; resumed sessions already have it set via `useShellIntegration.ts:135`). Without `claudeSessionId`, the traffic light wrapper still mounts but the state is treated as `unknown` and the button stays disabled.",
+        "elements": [
+          {
+            "accessibleName": "Commit progress",
+            "role": "button"
+          }
+        ],
+        "id": "term-commit-traffic-light",
+        "isInitial": false,
+        "name": "Per-Tab Commit Traffic Light",
         "transitions": []
       }
     ]
