@@ -686,7 +686,7 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
-        assert_eq!(obj.len(), 429, "Expected 429 schema entries");
+        assert_eq!(obj.len(), 431, "Expected 431 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
