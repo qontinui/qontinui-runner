@@ -901,7 +901,8 @@ impl PgDb {
                 SELECT
                     id::text, session_id, iteration, rule, action, target_id,
                     reasoning, auto_acted, resolved, resolution,
-                    resolved_at::text, created_at::text
+                    resolved_at::text, created_at::text,
+                    COALESCE(observation_hash, '')
                 FROM coord.coordinator_decisions
                 WHERE rule = 'WORKER_ADDED_DEPENDENCY'
                   AND target_id = $1
@@ -927,6 +928,7 @@ impl PgDb {
                 resolution: r.get(9),
                 resolved_at: r.get(10),
                 created_at: r.get(11),
+                observation_hash: r.get(12),
             },
         ))
     }

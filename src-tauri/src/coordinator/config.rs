@@ -34,6 +34,17 @@ pub struct CoordinatorSchedulerConfig {
     /// returns a non-disabled provider so the loop can't spam the
     /// dashboard with stub rows when no LLM is configured.
     pub auto_review_enabled: bool,
+    /// Shadow mode (sd01 migration). When `true`, the scheduler runs
+    /// observe→decide on every tick but does NOT acquire the lease and
+    /// does NOT call `act::apply`. Decisions are written to
+    /// `coord.coordinator_shadow_decisions` instead, tagged with the
+    /// observation hash so the diff endpoint can join shadow ↔ live
+    /// rows produced by the live `/coordinate` skill in the same window.
+    /// `rust_scheduler_enabled` is independent — both can be true (rare:
+    /// runs the scheduler twice, once acting + once shadowing) but the
+    /// usual soak config is `RUST_SCHEDULER=0 SHADOW=1` so the live
+    /// skill stays in charge.
+    pub shadow_mode_enabled: bool,
 }
 
 impl Default for CoordinatorSchedulerConfig {
@@ -44,6 +55,7 @@ impl Default for CoordinatorSchedulerConfig {
             max_llm_calls_per_hour: 10,
             rust_scheduler_enabled: false,
             auto_review_enabled: true,
+            shadow_mode_enabled: false,
         }
     }
 }
@@ -78,6 +90,9 @@ impl CoordinatorSchedulerConfig {
         }
         if let Ok(v) = std::env::var("QONTINUI_COORDINATOR_AUTO_REVIEW_ENABLED") {
             cfg.auto_review_enabled = parse_bool_flag(&v);
+        }
+        if let Ok(v) = std::env::var("QONTINUI_COORDINATOR_SHADOW") {
+            cfg.shadow_mode_enabled = parse_bool_flag(&v);
         }
 
         cfg

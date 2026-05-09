@@ -43,6 +43,7 @@ use uuid::Uuid;
 use crate::claude_session::state::SessionState;
 use crate::database::pg::completion_reports::{UnblockEvaluation, UnblockOutcome};
 use crate::database::pg::coordinator_decisions::InsertCoordinatorDecisionInput;
+use crate::database::pg::coordinator_shadow_decisions::InsertShadowDecisionInput;
 use crate::mcp::coordinator::CoordinatorAction;
 use crate::mcp::types::ApiState;
 use crate::productivity::review::{auto_review_in_product, ReviewError};
@@ -103,6 +104,7 @@ pub fn start_coordinator_scheduler(
     let initial_enabled = config.rust_scheduler_enabled;
 
     let auto_review_enabled = config.auto_review_enabled;
+    let shadow_mode_enabled = config.shadow_mode_enabled;
 
     async_runtime::spawn(async move {
         // Initial delay matches the memory scheduler — let the runner
@@ -110,13 +112,29 @@ pub fn start_coordinator_scheduler(
         tokio::time::sleep(Duration::from_secs(config.initial_delay_secs)).await;
 
         let instance_id = format!("rust-{}", Uuid::new_v4());
+
+        // Self-heal the shadow-decisions table on PG instances where the
+        // alembic migration hasn't been applied. Idempotent. Logs but
+        // doesn't fail the scheduler — when shadow mode IS enabled and
+        // the table is missing, individual inserts will surface the
+        // error via the warn! line in `log_shadow_decision`.
+        if shadow_mode_enabled {
+            if let Err(e) = state.app_state.pg_db.ensure_shadow_decisions_table().await {
+                warn!(
+                    "Coordinator scheduler: ensure_shadow_decisions_table failed: {} — shadow inserts may fail until alembic upgrade",
+                    e
+                );
+            }
+        }
+
         info!(
-            "Coordinator (Rust) scheduler started: instance_id={} interval={}s rule_version={} max_llm_calls_per_hour={} auto_review_enabled={} initial_enabled={}",
+            "Coordinator (Rust) scheduler started: instance_id={} interval={}s rule_version={} max_llm_calls_per_hour={} auto_review_enabled={} shadow_mode_enabled={} initial_enabled={}",
             instance_id,
             config.interval_secs,
             RULE_VERSION,
             config.max_llm_calls_per_hour,
             auto_review_enabled,
+            shadow_mode_enabled,
             initial_enabled,
         );
 
@@ -137,18 +155,37 @@ pub fn start_coordinator_scheduler(
             tick.tick().await;
             iteration = iteration.wrapping_add(1);
 
-            // Phase 1.5 runtime toggle: when disabled, skip the entire
-            // tick body (no lease acquire, no log spam — just a debug
-            // line so the loop's heartbeat is visible). When the user
-            // flips the Start button, the next tick proceeds.
-            if !should_run_tick(&enabled) {
+            // Phase 1.5 runtime toggle: when BOTH normal mode and shadow
+            // mode are disabled, skip the entire tick body. Either flag
+            // enables the loop body — shadow mode runs even when the
+            // normal scheduler is off (that's the whole point of shadow:
+            // observe + decide without acting while /coordinate skill
+            // owns the lease).
+            if !should_run_tick(&enabled) && !shadow_mode_enabled {
                 debug!(
-                    "Coordinator scheduler: rust_scheduler_enabled=false, skipping tick (iter={})",
+                    "Coordinator scheduler: rust_scheduler_enabled=false and shadow_mode_enabled=false, skipping tick (iter={})",
                     iteration
                 );
                 // Reset lease-takeover bookkeeping while disabled so the
                 // first tick after re-enable counts as a takeover.
                 held_lease_last_tick = false;
+                continue;
+            }
+
+            // Shadow-only mode: never acquire the lease (live /coordinate
+            // skill is in charge of acting), just observe→decide→shadow-log.
+            // Falls through here when shadow_mode_enabled and the runtime
+            // toggle is off; when both are on, the lease branch below runs
+            // AND the shadow path runs from inside `run_one_iteration` via
+            // `log_decision_pair`.
+            if shadow_mode_enabled && !should_run_tick(&enabled) {
+                info!(
+                    "coordinator.shadow_iterations_total instance_id={} iteration={}",
+                    instance_id, iteration
+                );
+                if let Err(e) = run_shadow_iteration(&state, &instance_id, iteration).await {
+                    error!("Coordinator shadow iteration failed: {}", e);
+                }
                 continue;
             }
 
@@ -166,6 +203,19 @@ pub fn start_coordinator_scheduler(
                 Ok(false) => {
                     held_lease_last_tick = false;
                     debug!("Coordinator scheduler: lease held by another instance, skipping tick");
+                    // When shadow mode is co-enabled with normal mode, run
+                    // the shadow tick anyway — the lease holder may be a
+                    // sibling process or another machine; we still want
+                    // to record what the local rust-scheduler would do.
+                    if shadow_mode_enabled {
+                        info!(
+                            "coordinator.shadow_iterations_total instance_id={} iteration={} (lease held elsewhere)",
+                            instance_id, iteration
+                        );
+                        if let Err(e) = run_shadow_iteration(&state, &instance_id, iteration).await {
+                            error!("Coordinator shadow iteration failed: {}", e);
+                        }
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -220,6 +270,10 @@ pub(crate) async fn run_one_iteration(
     max_llm_calls_per_hour: u32,
 ) -> Result<(), String> {
     let obs = observe(state).await?;
+    // Compute the observation hash once per iteration. Stamped on every
+    // decision row this iteration produces so the shadow-diff endpoint
+    // can join shadow ↔ live by snapshot identity.
+    let obs_hash = obs.observation_hash();
 
     // Update the Rule-A tracker before evaluating rules — sessions that
     // dropped out of Processing should be evicted, and new Processing
@@ -277,12 +331,12 @@ pub(crate) async fn run_one_iteration(
             match llm_outcome {
                 Some(outcome) => {
                     info!("coordinator.llm_callouts_total instance_id={}", instance_id);
-                    apply_and_log(state, instance_id, iteration, outcome).await?;
+                    apply_and_log(state, instance_id, iteration, outcome, &obs_hash).await?;
                     return Ok(());
                 }
                 None => {
                     let outcome = advise_no_plan(&obs);
-                    apply_and_log(state, instance_id, iteration, outcome).await?;
+                    apply_and_log(state, instance_id, iteration, outcome, &obs_hash).await?;
                     return Ok(());
                 }
             }
@@ -291,7 +345,7 @@ pub(crate) async fn run_one_iteration(
         // No cheap rule fired and nothing to do at all — log idle row to
         // keep the audit trail dense (per `coordinate.md` line 86).
         let body = decide::stamp_reasoning("idle", "no cheap rule fired this iteration");
-        log_decision(
+        log_decision_with_hash(
             state,
             instance_id,
             iteration,
@@ -300,6 +354,7 @@ pub(crate) async fn run_one_iteration(
             None,
             &body,
             true,
+            &obs_hash,
         )
         .await?;
         return Ok(());
@@ -326,7 +381,7 @@ pub(crate) async fn run_one_iteration(
             }
         }
 
-        log_decision(
+        log_decision_with_hash(
             state,
             instance_id,
             iteration,
@@ -335,6 +390,7 @@ pub(crate) async fn run_one_iteration(
             target.as_deref(),
             &reasoning,
             auto_acted,
+            &obs_hash,
         )
         .await?;
 
@@ -526,6 +582,7 @@ async fn apply_and_log(
     instance_id: &str,
     iteration: i64,
     outcome: DecideOutcome,
+    observation_hash: &str,
 ) -> Result<(), String> {
     let action_name = act::action_name(&outcome.action);
     let target = act::action_target(&outcome.action);
@@ -542,7 +599,7 @@ async fn apply_and_log(
         }
     }
 
-    log_decision(
+    log_decision_with_hash(
         state,
         instance_id,
         iteration,
@@ -551,6 +608,7 @@ async fn apply_and_log(
         target.as_deref(),
         &reasoning,
         auto_acted,
+        observation_hash,
     )
     .await
 }
@@ -576,6 +634,11 @@ fn advise_no_plan(obs: &crate::coordinator::observe::Observation) -> DecideOutco
 }
 
 /// Persist the decision row. Errors propagate so the caller logs them.
+///
+/// `observation_hash` defaults to empty for callers that don't observe
+/// (HTTP `POST /coordinator/act`). The Rust scheduler's `run_one_iteration`
+/// path always passes a real SHA-256 hex via `LIVE_OBSERVATION_HASH` so
+/// the diff endpoint can join shadow ↔ live.
 async fn log_decision(
     state: &Arc<ApiState>,
     instance_id: &str,
@@ -585,6 +648,24 @@ async fn log_decision(
     target_id: Option<&str>,
     reasoning: &str,
     auto_acted: bool,
+) -> Result<(), String> {
+    log_decision_with_hash(
+        state, instance_id, iteration, rule, action, target_id, reasoning, auto_acted, "",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_decision_with_hash(
+    state: &Arc<ApiState>,
+    instance_id: &str,
+    iteration: i64,
+    rule: &str,
+    action: &str,
+    target_id: Option<&str>,
+    reasoning: &str,
+    auto_acted: bool,
+    observation_hash: &str,
 ) -> Result<(), String> {
     state
         .app_state
@@ -597,9 +678,116 @@ async fn log_decision(
             target_id,
             reasoning,
             auto_acted,
+            observation_hash,
         })
         .await
         .map(|_| ())
+}
+
+/// Shadow-mode tick. Runs observe→decide but does NOT call `act::apply`;
+/// instead writes the chosen action into `coord.coordinator_shadow_decisions`
+/// tagged with the same observation_hash the live scheduler would use, so
+/// the diff endpoint can join shadow vs live decisions over the soak window.
+///
+/// Mirrors `run_one_iteration`'s rule walk minus the side effects. LLM
+/// callout is intentionally OMITTED in shadow mode — the budget and the
+/// API spend belong to the live owner. If no cheap rule fires, we log a
+/// shadow `idle-no-action` row so the soak audit trail stays dense.
+async fn run_shadow_iteration(
+    state: &Arc<ApiState>,
+    instance_id: &str,
+    iteration: i64,
+) -> Result<(), String> {
+    use crate::coordinator::decide;
+
+    let obs = observe(state).await?;
+    let obs_hash = obs.observation_hash();
+
+    // Walk the same rule order as live. No PG side effects.
+    let mut processing_seen: HashMap<String, ProcessingSeenSince> = HashMap::new();
+    let now_ms = current_unix_millis();
+    refresh_processing_tracker(&mut processing_seen, &obs.live_sessions, now_ms);
+
+    let outcome = if let Some(o) = decide::rule_a(&obs, &processing_seen, now_ms) {
+        Some(o)
+    } else if let Some(o) = decide::rule_b(&obs) {
+        Some(o)
+    } else if let Some(o) = decide::rule_c(&obs) {
+        Some(o)
+    } else if let Some(o) = decide::rule_d(&obs) {
+        Some(o)
+    } else {
+        decide::rule_e(&obs)
+    };
+
+    let (rule, action_name, target, reasoning, would_have_acted) = match outcome {
+        Some(o) => {
+            let name = act::action_name(&o.action).to_string();
+            let target = act::action_target(&o.action);
+            let reasoning = act::action_reasoning(&o.action);
+            let advise_only = act::must_advise_only(&o.action);
+            (
+                o.rule.to_string(),
+                name,
+                target,
+                reasoning,
+                !advise_only,
+            )
+        }
+        None => (
+            "idle".to_string(),
+            "idle-no-action".to_string(),
+            None,
+            decide::stamp_reasoning("idle", "no cheap rule fired this iteration (shadow)"),
+            true, // idle-no-action would have been logged in live mode too
+        ),
+    };
+
+    log_shadow_decision(
+        state,
+        instance_id,
+        iteration,
+        &obs_hash,
+        &rule,
+        &action_name,
+        target.as_deref(),
+        &reasoning,
+        would_have_acted,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_shadow_decision(
+    state: &Arc<ApiState>,
+    instance_id: &str,
+    iteration: i64,
+    observation_hash: &str,
+    rule: &str,
+    action: &str,
+    target_id: Option<&str>,
+    reasoning: &str,
+    would_have_acted: bool,
+) -> Result<(), String> {
+    state
+        .app_state
+        .pg_db
+        .insert_coordinator_shadow_decision(&InsertShadowDecisionInput {
+            instance_id,
+            iteration,
+            observation_hash,
+            rule,
+            action,
+            target_id,
+            reasoning,
+            would_have_acted,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            warn!("shadow decision insert failed: {}", e);
+            e
+        })
 }
 
 /// Update the per-tick `(task_run_id, since_ms)` tracker so Rule A can
