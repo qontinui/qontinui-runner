@@ -80,7 +80,12 @@ cargo run --bin export_schemas --release -- --pretty > "$SCHEMAS_JSON"
 DISCR_SCRIPT="$PROJECT_ROOT/../../qontinui-schemas/scripts/add_discriminators.py"
 if [ -f "$DISCR_SCRIPT" ] && command -v python >/dev/null 2>&1; then
     echo "==> Annotating oneOf unions with discriminator keyword..."
-    python "$DISCR_SCRIPT" "$SCHEMAS_JSON"
+    # Convert MSYS paths to Windows form for native python.exe — same
+    # rationale as the node + datamodel-codegen calls below.
+    # Without this the pre-push gen-events-drift hook fails on Windows
+    # worktrees with FileNotFoundError on the /d/... path. See
+    # `proj_runner_gen_events_drift_windows_bug` for the symptom history.
+    python "$(to_native_path "$DISCR_SCRIPT")" "$(to_native_path "$SCHEMAS_JSON")"
 fi
 
 if [ "$DRY_RUN" = true ]; then
