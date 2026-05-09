@@ -19,3 +19,7 @@ export { KeyboardShortcutsOverlay } from "./KeyboardShortcutsOverlay";
 export { ZoneControlPanel } from "./ZoneControlPanel";
 export { useSessionPersistence } from "./useSessionPersistence";
 export type { SavedSessionConfig, SavedSessionLayout } from "./useSessionPersistence";
+export { useCommitState } from "./useCommitState";
+export type { CommitState } from "./useCommitState";
+export { CommitTrafficLight, COMMIT_PROMPT_TEMPLATE } from "./CommitTrafficLight";
+export { useTabSessionIdCapture } from "./useTabSessionIdCapture";

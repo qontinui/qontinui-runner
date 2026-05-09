@@ -9,6 +9,7 @@ pub mod interceptor;
 pub mod manager;
 pub mod session;
 pub mod transcript;
+pub mod transcript_watcher;
 pub mod types;
 
 pub use manager::TerminalManager;

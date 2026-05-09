@@ -7,6 +7,10 @@ import { LaunchMenu } from "./LaunchMenu";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { WrapperToolsBadge } from "@/components/wrappers/WrapperToolsBadge";
 import { ReviewBadge } from "./ReviewBadge";
+import { CommitTrafficLight } from "./CommitTrafficLight";
+import type { CommitState } from "./useCommitState";
+import type { TerminalInstanceHandle } from "./TerminalInstance";
+import type { RefObject } from "react";
 
 interface TerminalTabBarProps {
   tabs: TerminalTab[];
@@ -24,6 +28,17 @@ interface TerminalTabBarProps {
   launchCommands?: Record<string, string>;
   fileLocks?: import("./useSessionManager").FileLockInfo[];
   fileLockStates?: Record<string, import("./useFileLockTracking").FileLockState>;
+  /** Per-tab commit-readiness state (populated by `useCommitState`). */
+  commitStates?: Record<string, CommitState>;
+  /**
+   * Map of tab.id → ref to the live TerminalInstance handle. Sourced
+   * from `terminalRefs.current` in TerminalPage; the commit traffic
+   * light reads `.current?.writeToTerminal` from the matching ref to
+   * inject the commit prompt into the PTY. Optional — when omitted the
+   * SDK-chat injection path runs instead, but no SDK chat tab type
+   * currently routes through this component.
+   */
+  terminalRefs?: Map<string, RefObject<TerminalInstanceHandle | null>>;
   // Zone monitoring enrichments
   activityData?: Record<string, number[]>;
   stateDurations?: Record<string, string>;
@@ -163,6 +178,8 @@ export function TerminalTabBar({
   launchCommands,
   fileLocks,
   fileLockStates,
+  commitStates,
+  terminalRefs,
   activityData,
   stateDurations,
   unreadTabs,
@@ -442,6 +459,7 @@ export function TerminalTabBar({
           const showSparkline =
             isMultiZone && isTabAssigned(tab.id) && tabActivity && tabActivity.length > 0;
           const lockState = fileLockStates?.[tab.id];
+          const commitState = commitStates?.[tab.id];
 
           return (
             <button
@@ -490,6 +508,33 @@ export function TerminalTabBar({
               )}
               {lockState === "holding" && (
                 <Lock className="w-2.5 h-2.5 shrink-0 text-[#7aa2f7] opacity-60" />
+              )}
+
+              {/*
+                Commit-readiness traffic light. Renders nothing visible when
+                state.status is "unknown" but always slots in the GitCommit
+                button (disabled) so the tab layout stays stable.
+
+                isPtyTab decision: every tab that reaches `TerminalTabBar`
+                today is a PTY-launched terminal. SDK chat sessions live in
+                a separate component path (`useAiSession.ts` →
+                `MessagesPanel`-style surfaces) and never render here. We
+                pass `isPtyTab={true}` unconditionally; if a future SDK-chat
+                surface starts routing through this component the toggle
+                can flip per-tab. Tracked at plan §0 caveat.
+              */}
+              {tab.type !== "plan" && (
+                <span onClick={(e) => e.stopPropagation()}>
+                  <CommitTrafficLight
+                    state={commitState}
+                    sessionId={tab.claudeSessionId}
+                    isPtyTab={true}
+                    onWriteToTerminal={(text) => {
+                      const ref = terminalRefs?.get(tab.id);
+                      ref?.current?.writeToTerminal(text);
+                    }}
+                  />
+                </span>
               )}
 
               <span className="flex flex-col items-start min-w-0">
