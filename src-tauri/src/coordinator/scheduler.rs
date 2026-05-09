@@ -212,7 +212,8 @@ pub fn start_coordinator_scheduler(
                             "coordinator.shadow_iterations_total instance_id={} iteration={} (lease held elsewhere)",
                             instance_id, iteration
                         );
-                        if let Err(e) = run_shadow_iteration(&state, &instance_id, iteration).await {
+                        if let Err(e) = run_shadow_iteration(&state, &instance_id, iteration).await
+                        {
                             error!("Coordinator shadow iteration failed: {}", e);
                         }
                     }
@@ -650,7 +651,15 @@ async fn log_decision(
     auto_acted: bool,
 ) -> Result<(), String> {
     log_decision_with_hash(
-        state, instance_id, iteration, rule, action, target_id, reasoning, auto_acted, "",
+        state,
+        instance_id,
+        iteration,
+        rule,
+        action,
+        target_id,
+        reasoning,
+        auto_acted,
+        "",
     )
     .await
 }
@@ -726,13 +735,7 @@ async fn run_shadow_iteration(
             let target = act::action_target(&o.action);
             let reasoning = act::action_reasoning(&o.action);
             let advise_only = act::must_advise_only(&o.action);
-            (
-                o.rule.to_string(),
-                name,
-                target,
-                reasoning,
-                !advise_only,
-            )
+            (o.rule.to_string(), name, target, reasoning, !advise_only)
         }
         None => (
             "idle".to_string(),

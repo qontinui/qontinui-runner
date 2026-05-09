@@ -760,8 +760,7 @@ pub struct ShadowDiffResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShadowDisagreementSample {
-    pub shadow:
-        crate::database::pg::coordinator_shadow_decisions::CoordinatorShadowDecisionRow,
+    pub shadow: crate::database::pg::coordinator_shadow_decisions::CoordinatorShadowDecisionRow,
     pub live_rule: String,
     pub live_action: String,
 }
@@ -798,11 +797,13 @@ async fn shadow_diff(
 
     let disagreement_samples = disagreements
         .into_iter()
-        .map(|(shadow, live_rule, live_action)| ShadowDisagreementSample {
-            shadow,
-            live_rule,
-            live_action,
-        })
+        .map(
+            |(shadow, live_rule, live_action)| ShadowDisagreementSample {
+                shadow,
+                live_rule,
+                live_action,
+            },
+        )
         .collect();
 
     Ok(Json(ShadowDiffResponse {
