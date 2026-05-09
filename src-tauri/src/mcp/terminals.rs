@@ -6,7 +6,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::StatusCode,
     response::{IntoResponse, Json},
@@ -19,7 +19,7 @@ use tauri::Manager;
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
-use crate::terminal::TerminalManager;
+use crate::terminal::{strip_ansi, TerminalManager};
 
 // ============================================================================
 // Request Types
@@ -57,6 +57,18 @@ pub struct WriteTerminalRequest {
 pub struct ResizeTerminalRequest {
     pub cols: u16,
     pub rows: u16,
+}
+
+/// Query params for `GET /terminals/{id}/buffer` (and its `/output` alias).
+///
+/// `format=text` returns the buffer pre-decoded and ANSI-stripped, so callers
+/// don't have to base64-decode + strip-ANSI client-side. Default (no query)
+/// preserves the base64 envelope for byte-fidelity callers (e.g., the WS
+/// scrollback path or reproducible terminal replays).
+#[derive(Debug, Default, Deserialize)]
+pub struct BufferQuery {
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 // ============================================================================
@@ -173,9 +185,18 @@ pub async fn write_terminal_handler(
 }
 
 /// Get the scrollback buffer for a terminal session.
+///
+/// Routes:
+/// - `GET /terminals/{id}/buffer` (canonical)
+/// - `GET /terminals/{id}/output` (alias — same handler)
+///
+/// Query: `?format=text` returns `{ data: { text: "<utf8, ANSI-stripped>" } }`
+/// for ergonomic consumption. Without `format`, returns the original base64
+/// envelope `{ data, start_offset, total_bytes_produced }` for byte fidelity.
 pub async fn get_buffer_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    Query(query): Query<BufferQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
 
@@ -189,6 +210,20 @@ pub async fn get_buffer_handler(
     let (data, start_offset) = session.get_scrollback_buffer();
     let total_bytes_produced = session.info().total_bytes_produced;
     session.reset_flow_control();
+
+    if matches!(query.format.as_deref(), Some("text")) {
+        // UTF-8 lossy decode tolerates partial multi-byte sequences at chunk
+        // boundaries (a real risk on PTY scrollback). Then strip ANSI escapes
+        // via the shared helper used by the Tauri command surface.
+        let lossy = String::from_utf8_lossy(&data);
+        let text = strip_ansi(&lossy);
+        return Ok(Json(ApiResponse::success(serde_json::json!({
+            "data": { "text": text },
+            "start_offset": start_offset,
+            "total_bytes_produced": total_bytes_produced,
+        }))));
+    }
+
     let encoded = STANDARD.encode(&data);
 
     Ok(Json(ApiResponse::success(serde_json::json!({
@@ -429,6 +464,9 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         )
         .route("/terminals/{id}/write", post(write_terminal_handler))
         .route("/terminals/{id}/buffer", get(get_buffer_handler))
+        // Alias — the cheatsheet and intuition both reach for `/output`.
+        // Same handler, no behavior difference.
+        .route("/terminals/{id}/output", get(get_buffer_handler))
         .route("/terminals/{id}/resize", post(resize_terminal_handler))
         .route("/terminals/{id}/ws", get(ws_terminal_handler))
         .route("/terminals/{id}", delete(close_terminal_handler))

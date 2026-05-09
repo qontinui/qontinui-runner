@@ -41,7 +41,7 @@ pub struct UIBridgeComponentActionRequest {
 }
 
 /// Discovery options request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UIBridgeDiscoveryRequest {
     #[serde(default)]

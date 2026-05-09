@@ -5,6 +5,7 @@ import { useApiReady, useRenderPerformance } from "@/hooks";
 import { getApiPort } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { MainTabId } from "./tab-types";
+import type { ProductivityView } from "@/components/productivity/types";
 import {
   ACTIVE_TAB_STORAGE_KEY,
   migrateTabId,
@@ -13,7 +14,7 @@ import {
 } from "./tab-types";
 import { useNavigation } from "./NavigationContext";
 
-const PAGE_TO_TAB: Record<string, MainTabId> = {
+export const PAGE_TO_TAB: Record<string, MainTabId> = {
   // Prompt Home
   "prompt-home": "prompt-home",
   home: "prompt-home",
@@ -186,18 +187,54 @@ export function useAppNavigation(): UseAppNavigationReturn {
   // Productivity page. Dispatch a window event the page listens for. Pattern
   // mirrors the Settings `defaultTab` flow but goes via an event because the
   // PAGE_TO_TAB map collapses all three aliases into a single tab id.
+  //
+  // Timing: we just called `setActiveTabAndPersist`, but React hasn't mounted
+  // the ProductivityPage yet, so its `productivity-set-view` listener isn't
+  // attached. Dispatching synchronously drops the event. Instead we await
+  // ProductivityPage's mount-promise: it sets `__qontinuiProductivityReady`
+  // and dispatches `productivity-page-mounted` from inside its mount effect.
+  // A 250ms timeout fires the dispatch anyway as a defensive guard against
+  // the page never mounting (e.g. user navigated to a different tab right
+  // after this call).
   const dispatchProductivitySubView = useCallback((page: string) => {
+    let view: ProductivityView | null = null;
     if (page === "productivity-plans" || page === "productivity") {
-      window.dispatchEvent(new CustomEvent("productivity-set-view", { detail: { view: "plans" } }));
+      view = "plans";
     } else if (page === "productivity-coordinator") {
-      window.dispatchEvent(
-        new CustomEvent("productivity-set-view", { detail: { view: "coordinator" } }),
-      );
+      view = "coordinator";
     } else if (page === "productivity-knowledge") {
-      window.dispatchEvent(
-        new CustomEvent("productivity-set-view", { detail: { view: "knowledge" } }),
-      );
+      view = "knowledge";
     }
+    if (!view) return;
+    const targetView = view;
+    const fire = () => {
+      window.dispatchEvent(
+        new CustomEvent("productivity-set-view", { detail: { view: targetView } }),
+      );
+    };
+    const ready = (window as unknown as Record<string, unknown>).__qontinuiProductivityReady;
+    if (ready === true) {
+      fire();
+      return;
+    }
+    let fired = false;
+    const onMounted = () => {
+      if (fired) return;
+      fired = true;
+      window.removeEventListener("productivity-page-mounted", onMounted);
+      clearTimeout(timeoutId);
+      fire();
+    };
+    window.addEventListener("productivity-page-mounted", onMounted);
+    const timeoutId = window.setTimeout(() => {
+      if (fired) return;
+      fired = true;
+      window.removeEventListener("productivity-page-mounted", onMounted);
+      console.warn(
+        `[useAppNavigation] productivity-page-mounted timeout (250ms) for view="${targetView}"; firing dispatch anyway`,
+      );
+      fire();
+    }, 250);
   }, []);
 
   useEffect(() => {
