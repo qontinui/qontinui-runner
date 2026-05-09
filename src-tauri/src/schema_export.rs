@@ -686,6 +686,14 @@ mod tests {
         );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
+        assert!(
+            obj.contains_key("UiBridgeRequestEnvelope"),
+            "Missing UiBridgeRequestEnvelope schema"
+        );
+        assert!(
+            obj.contains_key("UiBridgeResponseEnvelope"),
+            "Missing UiBridgeResponseEnvelope schema"
+        );
         assert_eq!(obj.len(), 431, "Expected 431 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
