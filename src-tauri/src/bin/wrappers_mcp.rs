@@ -23,6 +23,18 @@
 //! the action id are replaced with underscores so the name is a legal MCP
 //! tool identifier (the canonical action id with original dashes is kept in
 //! the reverse map for the dispatch call).
+//!
+//! Tool catalog is refreshed:
+//!   - Once at startup, so `initialize` returns sane capabilities even when
+//!     the first request after handshake is `tools/call`.
+//!   - On every `tools/list`, so a wrapper installed mid-session appears
+//!     without restarting the MCP bin (which is the AI client's lifetime).
+//!   - On a `tools/call` for an unknown tool name (one retry), covering
+//!     clients that don't re-list before calling.
+//!
+//! If a refresh returns empty while we previously had tools, the existing
+//! cache is preserved — almost always a transient runner-down blip rather
+//! than the user truly uninstalling every wrapper.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -223,6 +235,26 @@ fn build_reverse_map(tools: &[ToolEntry]) -> HashMap<String, (String, String)> {
         .collect()
 }
 
+/// Refresh `tools` and `reverse_map` in place from the runner. Cheap (~5ms
+/// loopback HTTP). If the fetch returns empty while we previously had
+/// tools, the existing cache is preserved — see the module docstring.
+fn refresh_tools(
+    base: &str,
+    tools: &mut Vec<ToolEntry>,
+    reverse_map: &mut HashMap<String, (String, String)>,
+) {
+    let fresh = fetch_tools(base);
+    if fresh.is_empty() && !tools.is_empty() {
+        eprintln!(
+            "[wrappers-mcp] refresh returned 0 tools — keeping previous {} cached",
+            tools.len()
+        );
+        return;
+    }
+    *reverse_map = build_reverse_map(&fresh);
+    *tools = fresh;
+}
+
 fn tools_list_payload(tools: &[ToolEntry]) -> Value {
     let arr: Vec<Value> = tools
         .iter()
@@ -346,8 +378,8 @@ fn write_response(stdout: &mut impl Write, value: &Value) {
 
 fn handle_request(
     base: &str,
-    tools: &[ToolEntry],
-    reverse_map: &HashMap<String, (String, String)>,
+    tools: &mut Vec<ToolEntry>,
+    reverse_map: &mut HashMap<String, (String, String)>,
     req: JsonRpcRequest,
 ) -> Option<Value> {
     let id = req.id.clone();
@@ -364,7 +396,10 @@ fn handle_request(
             // Notifications don't get a response.
             None
         }
-        "tools/list" => Some(rpc_success(id, tools_list_payload(tools))),
+        "tools/list" => {
+            refresh_tools(base, tools, reverse_map);
+            Some(rpc_success(id, tools_list_payload(tools)))
+        }
         "tools/call" => {
             let parsed: ToolsCallParams = match serde_json::from_value(req.params) {
                 Ok(p) => p,
@@ -376,6 +411,12 @@ fn handle_request(
                     ));
                 }
             };
+            // If the client never re-listed, a wrapper installed since
+            // startup is invisible to our cache. Refresh once before
+            // surfacing "unknown tool" so the call still resolves.
+            if !reverse_map.contains_key(&parsed.name) {
+                refresh_tools(base, tools, reverse_map);
+            }
             let result = dispatch_tool_call(base, reverse_map, parsed);
             Some(rpc_success(id, result))
         }
@@ -453,8 +494,8 @@ fn main() {
     let base = primary_base_url();
     eprintln!("[wrappers-mcp] runner base: {}", base);
 
-    let tools = fetch_tools(&base);
-    let reverse_map = build_reverse_map(&tools);
+    let mut tools = fetch_tools(&base);
+    let mut reverse_map = build_reverse_map(&tools);
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -486,7 +527,7 @@ fn main() {
             write_response(&mut stdout, &err);
             continue;
         }
-        if let Some(response) = handle_request(&base, &tools, &reverse_map, req) {
+        if let Some(response) = handle_request(&base, &mut tools, &mut reverse_map, req) {
             write_response(&mut stdout, &response);
         }
     }
@@ -553,6 +594,40 @@ mod tests {
         assert!(!validate_loopback_http_url("http://127.0.0.1"));
         assert!(!validate_loopback_http_url("http://127.0.0.1:99999"));
         assert!(!validate_loopback_http_url(""));
+    }
+
+    #[test]
+    fn refresh_preserves_cache_when_runner_is_down() {
+        // Point at a port that nothing's listening on. fetch_tools logs to
+        // stderr and returns empty; refresh_tools should keep the existing
+        // cache rather than zap it.
+        let mut tools = vec![ToolEntry {
+            name: "wrapper_v0__do_thing".to_string(),
+            wrapper_id: "v0".to_string(),
+            action_id: "do-thing".to_string(),
+            description: "x".to_string(),
+            input_schema: json!({}),
+        }];
+        let mut reverse_map = build_reverse_map(&tools);
+
+        refresh_tools("http://127.0.0.1:1", &mut tools, &mut reverse_map);
+
+        assert_eq!(tools.len(), 1, "cache should be preserved on empty refresh");
+        assert!(reverse_map.contains_key("wrapper_v0__do_thing"));
+    }
+
+    #[test]
+    fn refresh_replaces_empty_cache_with_empty_when_runner_is_down() {
+        // Empty -> empty is the only allowed transition through the
+        // "preserve cache" guard, so the no-op should still leave both
+        // structures empty (and not panic).
+        let mut tools: Vec<ToolEntry> = Vec::new();
+        let mut reverse_map: HashMap<String, (String, String)> = HashMap::new();
+
+        refresh_tools("http://127.0.0.1:1", &mut tools, &mut reverse_map);
+
+        assert!(tools.is_empty());
+        assert!(reverse_map.is_empty());
     }
 
     #[test]
