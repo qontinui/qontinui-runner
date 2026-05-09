@@ -21,6 +21,7 @@
  */
 
 import { Cpu, RefreshCw } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 import { MetricCard } from "../performance-dashboard/MetricCard";
 import { useScriptedOutputStats } from "../../hooks/useScriptedOutputStats";
 
@@ -68,6 +69,29 @@ function formatRate(numerator: number, denominator: number): string {
 export function ScriptedOutputPanel({ taskRunId }: ScriptedOutputPanelProps) {
   const { stats, loading, error, refresh } = useScriptedOutputStats(taskRunId);
 
+  // --- UI Bridge registrations ---
+  // Plan 2 (ui-bridge-friction-2026-04-21) Phase C: surface panel root,
+  // refresh button, and metric-tile cluster in currentRouteOnly snapshots
+  // so callers can see and drive this child of the LLM Analytics page.
+  // Naming convention matches LlmObservabilityDashboard.tsx (flat
+  // kebab-case prefixes, type: "generic" for non-interactive elements).
+  const { ref: panelRootRef } = useUIElement({
+    id: "scripted-output-root",
+    type: "generic",
+    label: "Scripted Output panel root",
+  });
+  const { ref: refreshButtonRef } = useUIElement({
+    id: "scripted-output-refresh",
+    type: "button",
+    label: "Refresh scripted-output stats",
+    actions: ["click"],
+  });
+  const { ref: metricTilesRef } = useUIElement({
+    id: "scripted-output-tiles",
+    type: "generic",
+    label: "Scripted Output metric tiles",
+  });
+
   const empty =
     !stats ||
     (stats.attempted === 0 &&
@@ -110,7 +134,7 @@ export function ScriptedOutputPanel({ taskRunId }: ScriptedOutputPanelProps) {
   const fallbackRows = stats ? Object.entries(stats.fallbacks).sort((a, b) => b[1] - a[1]) : [];
 
   return (
-    <div className="bg-card rounded-lg border border-border p-4">
+    <div ref={panelRootRef} className="bg-card rounded-lg border border-border p-4">
       <div className="flex items-center justify-between mb-4">
         <h3 className="font-semibold flex items-center gap-2">
           <Cpu className="w-4 h-4" />
@@ -122,6 +146,7 @@ export function ScriptedOutputPanel({ taskRunId }: ScriptedOutputPanelProps) {
           )}
         </h3>
         <button
+          ref={refreshButtonRef}
           onClick={refresh}
           className="p-1.5 rounded-md hover:bg-muted transition-colors"
           title="Refresh scripted-output stats"
@@ -150,7 +175,7 @@ export function ScriptedOutputPanel({ taskRunId }: ScriptedOutputPanelProps) {
 
       {!empty && stats && (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div ref={metricTilesRef} className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <MetricCard
               title="Attempts"
               value={emitterCalls.toLocaleString()}
