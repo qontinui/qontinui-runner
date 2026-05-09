@@ -343,6 +343,46 @@ impl PgDb {
         Ok(n > 0)
     }
 
+    /// Recovery primitive: flip a task from `assigned`/`needs_fix` back to
+    /// `ready` and clear its `assigned_session_id`/timestamps. Bypasses the
+    /// canonical state-machine guard in `transition_task_status` because
+    /// `(assigned, ready)` and `(needs_fix, ready)` are recovery edges, not
+    /// happy-path transitions.
+    ///
+    /// Race-safe via the WHERE-clause guard — if another caller has already
+    /// transitioned the row to `running`/`review`/`done`/etc, the UPDATE
+    /// matches zero rows and returns `Ok(false)`. Used by
+    /// `POST /coordinator/tasks/reset-stale` and any future admin/test
+    /// fixtures that need to undo a stale assignment.
+    pub async fn force_reset_task_to_ready(&self, task_id: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let task_uuid =
+            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
+        let n = conn
+            .execute(
+                r#"
+                UPDATE coord.tasks
+                SET status = 'ready',
+                    assigned_session_id = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    updated_at = NOW()
+                WHERE id = $1::uuid
+                  AND status IN ('assigned', 'needs_fix')
+                "#,
+                &[&task_uuid],
+            )
+            .await
+            .map_err(|e| format!("Failed to force-reset task: {}", e))?;
+
+        Ok(n > 0)
+    }
+
     /// Atomic status transition with from→to validation.
     ///
     /// Refuses (returns `Ok(false)`) if the row's current `status` is not

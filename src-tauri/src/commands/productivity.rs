@@ -546,6 +546,10 @@ pub struct LeaderResponse {
 pub struct LaunchResult {
     pub mode: String,
     pub terminal_id: Option<String>,
+    /// Phase 6: the `task_run_id` under which a worker is registered with
+    /// `SessionManager`. `None` for `mode = "rust"` and `mode =
+    /// "claude_skill"` paths (which don't allocate a worker).
+    pub task_run_id: Option<String>,
 }
 
 /// Compute the `lease_status` discriminator for a `CoordinatorLeaderRow`.
@@ -889,6 +893,7 @@ pub async fn launch_coordinator_session(
         return Ok(LaunchResult {
             mode,
             terminal_id: None,
+            task_run_id: None,
         });
     }
 
@@ -919,6 +924,7 @@ pub async fn launch_coordinator_session(
     Ok(LaunchResult {
         mode,
         terminal_id: Some(info.id),
+        task_run_id: None,
     })
 }
 
@@ -951,6 +957,11 @@ pub async fn stop_coordinator_session(app_handle: tauri::AppHandle) -> Result<bo
 /// Spawn a fresh "Worker N" terminal tab running plain `claude` (no slash
 /// command). Workers sit idle at the prompt until the Coordinator
 /// dispatches an `assign-task` action.
+///
+/// Phase 6 wires the worker into `SessionManager.worker_sessions` under a
+/// fresh `task_run_id`. Rule B picks the worker up via
+/// `Observation.live_sessions`, and `coordinator/act.rs::send_message_to_worker`
+/// dispatches assign-task briefs to the pty via `WorkerSession::send_user_message`.
 #[tauri::command]
 pub async fn spawn_worker_session(
     app_handle: tauri::AppHandle,
@@ -967,6 +978,26 @@ pub async fn spawn_worker_session(
         .inner()
         .clone();
 
+    let session_manager = app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+        .ok_or_else(|| "SessionManager not initialised".to_string())?
+        .inner()
+        .clone();
+
+    // Refresh Claude credentials before spawning so the worker pty doesn't
+    // hit an expired-token prompt mid-brief. Mirrors `ClaudeSession::spawn`
+    // at session.rs:187.
+    {
+        let ai_settings = crate::settings::get_ai_settings();
+        let effective_config_dir =
+            crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+        crate::ai_provider::oauth_refresh::try_ensure_valid_credentials(
+            effective_config_dir.as_deref(),
+        );
+    }
+
+    let task_run_id = Uuid::new_v4().to_string();
+
     let title = title_hint.unwrap_or_else(|| next_worker_title(&terminal_manager));
     // PowerShell 5.1 doesn't accept `&&`, and the pty already starts
     // with `working_dir = Some(repo_path)` — no `cd` needed. Worker tabs
@@ -978,7 +1009,7 @@ pub async fn spawn_worker_session(
     let initial_command = "claude --dangerously-skip-permissions".to_string();
 
     let info = terminal_manager.create(
-        Some(title),
+        Some(title.clone()),
         Some(repo_path),
         None,
         None,
@@ -986,11 +1017,22 @@ pub async fn spawn_worker_session(
         app_handle.clone(),
     )?;
 
+    let worker = crate::claude_session::WorkerSession::new(
+        task_run_id.clone(),
+        info.id.clone(),
+        title,
+        terminal_manager.clone(),
+    );
+    if let Err(e) = session_manager.register_worker(Arc::new(worker)) {
+        warn!("spawn_worker_session: register_worker failed: {}", e);
+    }
+
     schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
 
     Ok(LaunchResult {
         mode: "worker".to_string(),
         terminal_id: Some(info.id),
+        task_run_id: Some(task_run_id),
     })
 }
 

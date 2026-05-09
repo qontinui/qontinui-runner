@@ -68,14 +68,9 @@ export function DecomposePlanModal({
 
   // Seed the path field whenever the modal opens — picks up parent's
   // suggestion (e.g. most-recently-modified plan). Reset busy/result/
-  // error so a re-open after a previous run starts fresh. setState fires
-  // once per closed→open transition (guarded by !open early return), not
-  // on every render — so the cascading-render concern the rule guards
-  // against doesn't apply here. The render-phase prevOpenRef alternative
-  // trips react-hooks/refs, which is worse for the same outcome.
+  // error so a re-open after a previous run starts fresh.
   useEffect(() => {
     if (!open) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setState({
       planPath: initialPlanPath ?? "",
       busy: false,

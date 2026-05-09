@@ -16,8 +16,10 @@ pub mod resume;
 pub mod runner;
 pub mod session;
 pub mod state;
+pub mod worker_session;
 pub mod writer;
 
 pub use manager::SessionManager;
 pub use session::ClaudeSession;
 pub use state::SessionState;
+pub use worker_session::WorkerSession;

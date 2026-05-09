@@ -276,21 +276,26 @@ async fn ui_bridge_request_inner(
 ) -> Result<serde_json::Value, String> {
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // Create the full event payload
-    let mut event_payload = serde_json::json!({
-        "requestId": request_id,
-        "type": request_type
-    });
-
-    // Merge additional payload fields
-    if let (Some(base), Some(additional)) = (
-        event_payload.as_object_mut(),
-        additional_payload.as_object(),
-    ) {
-        for (key, value) in additional {
-            base.insert(key.clone(), value.clone());
-        }
-    }
+    // Build the typed envelope (Stage 1 of the ui-bridge-request envelope
+    // concretization — see commit ea5d9a61f deferral note). Wire shape:
+    // `{ requestId, type, ...additional_payload }`. Empty `Value::Object`
+    // (the `json!({})` no-extra-payload case) flattens to nothing, so the
+    // emitted payload is `{ requestId, type }` exactly as before.
+    //
+    // Non-Object additional_payload values would be silently dropped by the
+    // legacy merge loop too (which short-circuited on `as_object()` =
+    // `None`). All current call sites pass `Value::Object`, verified at
+    // task time; if a caller starts passing `Value::String`/`Value::Null`,
+    // the envelope will emit `requestId` + `type` only — matching the
+    // legacy behavior — but the signal that something's off should surface
+    // via the empty payload reaching the frontend handler.
+    let envelope = qontinui_types::app_events::UiBridgeRequestEnvelope {
+        request_id: request_id.clone(),
+        request_type: request_type.to_string(),
+        data: additional_payload,
+    };
+    let event_payload = serde_json::to_value(&envelope)
+        .map_err(|e| format!("Failed to serialize UiBridgeRequestEnvelope: {}", e))?;
 
     // Create oneshot channel for the response
     let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();

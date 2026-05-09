@@ -53,6 +53,7 @@ import {
 } from "./reviewsApi";
 import { acknowledgeAdvisory } from "./reflectionApi";
 import { PlanRecommendations } from "./PlanRecommendations";
+import { WorkersPanel } from "./WorkersPanel";
 
 const DECISION_LOG_LIMIT = 200;
 
@@ -943,6 +944,21 @@ export function CoordinatorDashboard() {
     handler?.("terminal");
   }, []);
 
+  // Workers panel uses this to navigate the user to the Terminals tab
+  // when they click "View terminal" on a worker row. Per-pty focus is
+  // best-effort: we navigate to the Terminals route and the user picks
+  // their worker tab from there. A future iteration could thread
+  // `terminalId` through the sidebar SM to auto-activate the matching
+  // pty tab; the current target slug `"terminal"` doesn't carry one.
+  // Marking the parameter as `_` keeps the contract honest while
+  // documenting the intentional drop.
+  const handleRevealWorkerTerminal = useCallback(
+    (_terminalId: string) => {
+      revealTerminalTab();
+    },
+    [revealTerminalTab],
+  );
+
   // Phase 1.5: launch the Rust scheduler by default. The "rust" mode
   // flips an in-process AtomicBool flag — no pty, no terminal tab to
   // reveal. The legacy "claude_skill" mode (Joshua's debug surface) still
@@ -996,13 +1012,12 @@ export function CoordinatorDashboard() {
     try {
       await spawnWorkerSession({ titleHint: null });
       await loadLease();
-      revealTerminalTab();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("Failed to spawn worker:", err);
       setLaunchError(`Failed to spawn worker: ${msg}`);
     }
-  }, [loadLease, revealTerminalTab]);
+  }, [loadLease]);
 
   const handleAcknowledgeAdvisory = useCallback(
     async (decisionId: string) => {
@@ -1094,6 +1109,18 @@ export function CoordinatorDashboard() {
             {launchError}
           </div>
         ) : null}
+
+        {/*
+         * Workers panel — Phase 6 follow-up R2.
+         *
+         * Lives ABOVE the productivity-stack-spec-locked panel order
+         * block (PlanRecommendations -> Recommendations -> Advisories ->
+         * Escalations -> Decision Log) because it's a status display,
+         * not a productivity-stack-spec panel. Sits right after the
+         * launch buttons so the user gets immediate visual feedback
+         * that a freshly-spawned worker is alive.
+         */}
+        <WorkersPanel onRevealTerminal={handleRevealWorkerTerminal} />
 
         <header>
           <h1 className="text-lg font-semibold text-foreground">Coordinator dashboard</h1>

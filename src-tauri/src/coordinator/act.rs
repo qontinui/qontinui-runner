@@ -848,22 +848,33 @@ pub(crate) async fn send_message_to_worker(state: &Arc<ApiState>, session_id: &s
         }
     };
 
-    match session_manager.get(session_id) {
-        Some(session) => {
-            if let Err(e) = session.send_user_message(message) {
-                warn!(
-                    "send_message_to_worker: send_user_message failed for {}: {}",
-                    session_id, e
-                );
-            }
-        }
-        None => {
+    if let Some(session) = session_manager.get(session_id) {
+        if let Err(e) = session.send_user_message(message) {
             warn!(
-                "send_message_to_worker: no active session for task_run_id {}",
-                session_id
+                "send_message_to_worker: send_user_message failed for {}: {}",
+                session_id, e
             );
         }
+        return;
     }
+
+    // Phase 6: pty-backed Workers live in `worker_sessions`, not `sessions`.
+    // Fall through and dispatch via WorkerSession::send_user_message, which
+    // writes raw stdin keystrokes (CR-LF appended) to the pty.
+    if let Some(worker) = session_manager.get_worker(session_id) {
+        if let Err(e) = worker.send_user_message(message) {
+            warn!(
+                "send_message_to_worker: worker send_user_message failed for {}: {}",
+                session_id, e
+            );
+        }
+        return;
+    }
+
+    warn!(
+        "send_message_to_worker: no active session for task_run_id {}",
+        session_id
+    );
 }
 
 #[cfg(test)]
