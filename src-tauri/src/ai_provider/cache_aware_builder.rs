@@ -10,8 +10,12 @@
 //! - Header: `anthropic-beta: prompt-caching-2024-07-31`
 //! - Place `"cache_control": {"type": "ephemeral"}` on content blocks in the
 //!   `system` array or in `messages[].content[]`.
-//! - Minimum block size: 1024 tokens (Haiku), 2048 tokens (Sonnet/Opus).
-//! - Cache TTL: 5 minutes (extended on each hit).
+//! - Minimum block size depends on the model — see [`min_cacheable_chars`].
+//!   Haiku 4.5: 4096 tokens. Haiku 3.5: 2048 tokens. Sonnet/Opus: 1024 tokens.
+//!   Sub-threshold blocks are silently NOT cached (Anthropic returns 0 cache
+//!   reads with no error). Source:
+//!   <https://docs.claude.com/en/docs/build-with-claude/prompt-caching>
+//! - Cache TTL: 5 minutes default; 1-hour ephemeral tier available at 2x cost.
 //! - Pricing: write = 1.25x base input; read = 0.1x base input.
 
 use serde::Serialize;
@@ -121,9 +125,29 @@ pub struct CacheAwareRequestBuilder {
     system_blocks: Vec<SystemBlock>,
 }
 
-/// Minimum character length for a block to be worth caching.
-/// Roughly maps to ~256 tokens. Blocks smaller than this are merged or left uncached.
-pub(super) const MIN_CACHEABLE_CHARS: usize = 1024;
+/// Minimum cacheable block size in characters, per Claude model family.
+///
+/// Anthropic silently returns 0 cache reads for blocks smaller than the
+/// model's documented token minimum; the `cache_control` marker is parsed
+/// and discarded. We work in characters (not tokens) because the builder
+/// operates on `String::len()`. Threshold = documented_token_min × 4
+/// chars-per-token (English/code average; Claude's tokenizer trends ~3.5
+/// chars/token, so a block at the char threshold is typically ≥ the token
+/// threshold).
+///
+/// - Haiku 4.x (e.g. `claude-haiku-4-5-*`): 4096 tokens → 16384 chars
+/// - Haiku 3.x (e.g. `claude-haiku-3-5-*`): 2048 tokens → 8192 chars
+/// - Sonnet / Opus / unknown: 1024 tokens → 4096 chars
+pub(super) fn min_cacheable_chars(model: &str) -> usize {
+    let m = model.to_lowercase();
+    if m.contains("haiku-4") {
+        16384
+    } else if m.contains("haiku") {
+        8192
+    } else {
+        4096
+    }
+}
 
 impl CacheAwareRequestBuilder {
     /// Create a new builder for the given model.
@@ -150,7 +174,7 @@ impl CacheAwareRequestBuilder {
         if text.is_empty() {
             return;
         }
-        let should_cache = text.len() >= MIN_CACHEABLE_CHARS;
+        let should_cache = text.len() >= min_cacheable_chars(&self.model);
         self.system_blocks.push(SystemBlock {
             block_type: "text".to_string(),
             text,
@@ -179,8 +203,9 @@ impl CacheAwareRequestBuilder {
         let mut builder = Self::new(model, max_tokens);
 
         // Merge small cached blocks together for more efficient caching.
-        // Anthropic requires minimum 1024-2048 tokens per cached block.
-        let merged_cached = merge_small_blocks(&prompt.cached_system_blocks);
+        // Per-model thresholds: Sonnet/Opus 1024 tokens, Haiku 3.5 2048,
+        // Haiku 4.5 4096 — see `min_cacheable_chars`.
+        let merged_cached = merge_small_blocks(&prompt.cached_system_blocks, model);
         for block in merged_cached {
             builder.add_cached_system_block(block);
         }
@@ -276,11 +301,13 @@ impl CacheAwareRequestBuilder {
 ///
 /// Adjacent blocks that are individually too small to cache are concatenated
 /// with `\n\n---\n\n` separators until the merged result is large enough.
-fn merge_small_blocks(blocks: &[String]) -> Vec<String> {
+/// The threshold is per-model — see [`min_cacheable_chars`].
+fn merge_small_blocks(blocks: &[String], model: &str) -> Vec<String> {
     if blocks.is_empty() {
         return Vec::new();
     }
 
+    let threshold = min_cacheable_chars(model);
     let mut result = Vec::new();
     let mut accumulator = String::new();
 
@@ -298,7 +325,7 @@ fn merge_small_blocks(blocks: &[String]) -> Vec<String> {
         // Blocks already large enough to cache on their own are passed
         // through unchanged — merging them with unrelated small blocks
         // would invalidate cache keys whenever the small blocks change.
-        if block.len() >= MIN_CACHEABLE_CHARS {
+        if block.len() >= threshold {
             flush_accumulator(&mut accumulator, &mut result);
             result.push(block.clone());
             continue;
@@ -312,7 +339,7 @@ fn merge_small_blocks(blocks: &[String]) -> Vec<String> {
         }
 
         // Flush once the merged small blocks cross the cache threshold.
-        if accumulator.len() >= MIN_CACHEABLE_CHARS {
+        if accumulator.len() >= threshold {
             flush_accumulator(&mut accumulator, &mut result);
         }
     }
@@ -373,7 +400,8 @@ mod tests {
     #[test]
     fn test_builder_basic() {
         let mut builder = CacheAwareRequestBuilder::new("claude-sonnet-4-20250514", 4096);
-        builder.add_cached_system_block("x".repeat(2000));
+        // 5000 chars passes Sonnet's 4096-char threshold.
+        builder.add_cached_system_block("x".repeat(5000));
         builder.add_dynamic_system_block("dynamic context".to_string());
         let body = builder.build("Hello");
 
@@ -419,13 +447,13 @@ mod tests {
 
     #[test]
     fn test_merge_small_blocks() {
-        let blocks = vec!["small1".to_string(), "small2".to_string(), "x".repeat(2000)];
-        let merged = merge_small_blocks(&blocks);
-        // First two should be merged, third stands alone
+        let blocks = vec!["small1".to_string(), "small2".to_string(), "x".repeat(5000)];
+        let merged = merge_small_blocks(&blocks, "claude-sonnet-4-20250514");
+        // First two should be merged, third stands alone (5000 ≥ Sonnet's 4096-char threshold).
         assert_eq!(merged.len(), 2);
         assert!(merged[0].contains("small1"));
         assert!(merged[0].contains("small2"));
-        assert_eq!(merged[1].len(), 2000);
+        assert_eq!(merged[1].len(), 5000);
     }
 
     #[test]
@@ -459,7 +487,7 @@ mod tests {
     #[test]
     fn test_from_structured_prompt() {
         let prompt = StructuredPrompt {
-            cached_system_blocks: vec!["x".repeat(3000), "y".repeat(3000)],
+            cached_system_blocks: vec!["x".repeat(5000), "y".repeat(5000)],
             dynamic_system_blocks: vec!["dynamic".to_string()],
             user_message: "task".to_string(),
         };
@@ -476,6 +504,29 @@ mod tests {
         assert!(system[0]["cache_control"].is_object());
         assert!(system[1]["cache_control"].is_object());
         assert!(system[2]["cache_control"].is_null());
+    }
+
+    #[test]
+    fn test_builder_haiku_4_higher_threshold() {
+        // 5000 chars passes Sonnet's 4096-char threshold but NOT Haiku 4.5's 16384.
+        let mut b = CacheAwareRequestBuilder::new("claude-haiku-4-5-20251001", 4096);
+        b.add_cached_system_block("x".repeat(5000));
+        let body = b.build("Hello");
+        assert!(body["system"][0]["cache_control"].is_null());
+
+        let mut big = CacheAwareRequestBuilder::new("claude-haiku-4-5-20251001", 4096);
+        big.add_cached_system_block("y".repeat(20000));
+        assert!(big.build("Hello")["system"][0]["cache_control"].is_object());
+    }
+
+    #[test]
+    fn test_min_cacheable_chars_per_model() {
+        assert_eq!(min_cacheable_chars("claude-sonnet-4-20250514"), 4096);
+        assert_eq!(min_cacheable_chars("claude-opus-4-5-20251101"), 4096);
+        assert_eq!(min_cacheable_chars("claude-haiku-3-5-20241022"), 8192);
+        assert_eq!(min_cacheable_chars("claude-haiku-4-5-20251001"), 16384);
+        assert_eq!(min_cacheable_chars("Claude-Haiku-4-5"), 16384);
+        assert_eq!(min_cacheable_chars("some-other-model"), 4096);
     }
 
     #[test]
