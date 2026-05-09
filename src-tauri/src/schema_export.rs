@@ -71,6 +71,17 @@ pub fn export_all_schemas() -> Value {
     // Wire-format canvas panel struct carried inside AppEvent::CanvasUpdate's
     // `data.panel` field. Mirrors the runner's `mcp::canvas::StoredPanel`.
     add!("CanvasPanel", qae::CanvasPanel);
+    // Typed UI Bridge IPC envelopes. The structs live in
+    // `qontinui-schemas/rust/src/app_events.rs` (added by schemas commit
+    // `2aca16e feat(events): typed UI Bridge request/response envelopes`)
+    // and are serialized live by the runner at
+    // `mcp/ui_bridge/request.rs:292` and `mcp/ui_bridge/screenshots.rs:1597`.
+    // Registering them here keeps the `.d.ts` bindings already checked in at
+    // `qontinui-schemas/ts/src/generated/` matching the runner's regen
+    // output — without these, the gen-events-drift hook reports a
+    // delete-only diff against the checked-in TS files.
+    add!("UiBridgeRequestEnvelope", qae::UiBridgeRequestEnvelope);
+    add!("UiBridgeResponseEnvelope", qae::UiBridgeResponseEnvelope);
 
     // ── qontinui-types: ai_workflows ──
     add!("ExecutionStep", qaw::ExecutionStep);
