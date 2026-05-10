@@ -393,6 +393,124 @@ async fn coordinator_act(
 }
 
 // =============================================================================
+// /coordinator/dispatch-action
+// =============================================================================
+
+/// Body for `POST /coordinator/dispatch-action`. Strips the iteration /
+/// rule / session metadata that the cheap-rules path on `/coordinator/act`
+/// requires — manual dispatch synthesises those fields server-side so the
+/// caller only has to supply the action itself.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DispatchActionRequest {
+    pub action: CoordinatorAction,
+    /// Override for the persisted reasoning column. Defaults to the
+    /// per-action default reasoning from
+    /// `coordinator::act::action_reasoning` prefixed with `[manual] `.
+    /// Callers that want to record a custom note (e.g. "user fired this
+    /// from the dashboard's Workers panel after the agent stalled")
+    /// pass it here.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+}
+
+/// User-driven action dispatch — bypasses the cheap-rule scheduler /
+/// agentic-loop framing of `/coordinator/act` so a UI button or external
+/// tool can fire any action without synthesising fake `session_id` /
+/// `iteration` / `rule` fields.
+///
+/// **Security note:** unlike `/coordinator/act`, this handler intentionally
+/// skips the `must_advise_only` gate. The inbound POST IS the user's
+/// confirmation that the action should run — anything that lands here came
+/// from a UI action the user clicked or an external tool the user is
+/// driving. The audit row is stamped with `rule = "manual"` so the
+/// Decision Log panel can distinguish these from cheap-rule fires. Do NOT
+/// re-introduce the `must_advise_only` check here without first wiring an
+/// alternate confirmation surface — destructive actions like `kill-session`
+/// would otherwise become unfireable from the dashboard.
+async fn coordinator_dispatch_action(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<DispatchActionRequest>,
+) -> Result<Json<CoordinatorActResponse>, (StatusCode, String)> {
+    let session_id = format!("manual-{}", uuid::Uuid::new_v4());
+    let iteration: i64 = 0;
+    let rule = "manual";
+
+    let action_name_str = crate::coordinator::act::action_name(&req.action);
+    let target_id = crate::coordinator::act::action_target(&req.action);
+    let default_reasoning = crate::coordinator::act::action_reasoning(&req.action);
+    let reasoning = req
+        .reasoning
+        .clone()
+        .unwrap_or_else(|| format!("[manual] {}", default_reasoning));
+
+    // Skip `must_advise_only` deliberately — see the doc-comment above.
+    crate::coordinator::act::apply(&state, &req.action).await?;
+
+    let row = state
+        .app_state
+        .pg_db
+        .insert_coordinator_decision(&InsertCoordinatorDecisionInput {
+            session_id: &session_id,
+            iteration,
+            rule,
+            action: action_name_str,
+            target_id: target_id.as_deref(),
+            reasoning: &reasoning,
+            auto_acted: true,
+            observation_hash: "",
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    info!(
+        "Coordinator manual dispatch: action={} target={:?}",
+        row.action, row.target_id
+    );
+
+    Ok(Json(CoordinatorActResponse {
+        decision: row,
+        auto_acted: true,
+    }))
+}
+
+// =============================================================================
+// /workers
+// =============================================================================
+
+/// Read-only HTTP mirror of the `list_workers` Tauri command. Resolves the
+/// SessionManager + TerminalManager from Tauri-managed state (they aren't
+/// fields on `ApiState`) and joins them with the coordinator's view of
+/// each worker's currently-assigned task via
+/// `productivity::workers::build_worker_infos`.
+async fn list_workers_http(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<Vec<crate::productivity::workers::WorkerInfo>>, (StatusCode, String)> {
+    let session_manager = match state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+    {
+        Some(sm) => sm.inner().clone(),
+        None => return Ok(Json(Vec::new())),
+    };
+    let terminal_manager = match state
+        .app_handle
+        .try_state::<Arc<crate::terminal::TerminalManager>>()
+    {
+        Some(tm) => tm.inner().clone(),
+        None => return Ok(Json(Vec::new())),
+    };
+
+    Ok(Json(
+        crate::productivity::workers::build_worker_infos(
+            &session_manager,
+            &terminal_manager,
+            &state.app_state.pg_db,
+        )
+        .await,
+    ))
+}
+
+// =============================================================================
 // /coordinator/tasks/reset-stale
 // =============================================================================
 
@@ -824,6 +942,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/coordinator/state", get(get_coordinator_state))
         .route("/coordinator/act", post(coordinator_act))
+        .route(
+            "/coordinator/dispatch-action",
+            post(coordinator_dispatch_action),
+        )
         .route("/coordinator/leader", get(get_coordinator_leader))
         .route("/coordinator/decisions", get(get_coordinator_decisions))
         .route("/coordinator/shadow-diff", get(shadow_diff))
@@ -832,4 +954,5 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(break_coordinator_lease),
         )
         .route("/coordinator/tasks/reset-stale", post(reset_stale_tasks))
+        .route("/workers", get(list_workers_http))
 }

@@ -1177,6 +1177,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::launch_coordinator_session,
             commands::productivity::list_plans,
             commands::productivity::list_plans_filtered,
+            commands::productivity::list_workers,
             commands::productivity::preview_assignment_brief,
             commands::productivity::reject_recommendation,
             commands::productivity::resolve_escalation,

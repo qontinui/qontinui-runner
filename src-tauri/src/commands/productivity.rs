@@ -1036,6 +1036,36 @@ pub async fn spawn_worker_session(
     })
 }
 
+/// Read-only observability for the Workers panel: joins the SessionManager
+/// worker registry with TerminalManager titles and the coordinator's view
+/// of each worker's currently-assigned task. Mirrors
+/// `mcp::coordinator::get_workers_http`. Empty list when no workers are
+/// registered or when SessionManager / TerminalManager aren't initialised
+/// yet (matches the "graceful degrade" pattern of the rest of this file).
+#[tauri::command]
+pub async fn list_workers(
+    app_handle: tauri::AppHandle,
+) -> Result<Vec<crate::productivity::workers::WorkerInfo>, String> {
+    let app_state = require_app_state(&app_handle)?;
+
+    let session_manager = match app_handle.try_state::<Arc<crate::claude_session::SessionManager>>()
+    {
+        Some(sm) => sm.inner().clone(),
+        None => return Ok(Vec::new()),
+    };
+    let terminal_manager = match app_handle.try_state::<Arc<TerminalManager>>() {
+        Some(tm) => tm.inner().clone(),
+        None => return Ok(Vec::new()),
+    };
+
+    Ok(crate::productivity::workers::build_worker_infos(
+        &session_manager,
+        &terminal_manager,
+        &app_state.pg_db,
+    )
+    .await)
+}
+
 // ============================================================================
 // Decompose Plan — Phase 3 (in-product replacement for /decompose-plan)
 // ============================================================================

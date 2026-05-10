@@ -156,6 +156,45 @@ impl PgDb {
         Ok(task_row_from_pg(&row))
     }
 
+    /// Look up the most-recent non-terminal task assigned to the given
+    /// session id. `assigned_session_id` is a `text` column (workers use
+    /// UUID v4 strings, but the column type itself is text — no
+    /// `Uuid::parse_str` round-trip needed). Tasks already in `done`,
+    /// `cancelled`, or `abandoned` are excluded so the worker observability
+    /// view shows only live assignments. Tie-break is `started_at DESC` —
+    /// the freshest assignment wins when multiple non-terminal rows share
+    /// the same session id (shouldn't happen, but defends the query).
+    pub async fn find_task_by_assigned_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<TaskRow>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                &format!(
+                    r#"
+                    SELECT {}
+                    FROM coord.tasks
+                    WHERE assigned_session_id = $1::text
+                      AND status NOT IN ('done', 'cancelled', 'abandoned')
+                    ORDER BY started_at DESC NULLS LAST
+                    LIMIT 1
+                    "#,
+                    SELECT_TASK_COLUMNS
+                ),
+                &[&session_id],
+            )
+            .await
+            .map_err(|e| format!("Failed to find task by assigned session: {}", e))?;
+
+        Ok(row.as_ref().map(task_row_from_pg))
+    }
+
     /// Look up a single task by id.
     pub async fn get_task_by_id(&self, task_id: &str) -> Result<Option<TaskRow>, String> {
         let conn = self

@@ -1105,7 +1105,11 @@ export function CoordinatorDashboard() {
           </div>
         </div>
         {launchError ? (
-          <div className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400">
+          <div
+            className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400"
+            data-ui-bridge-id="productivity.launch-error"
+            data-error-message={launchError}
+          >
             {launchError}
           </div>
         ) : null}

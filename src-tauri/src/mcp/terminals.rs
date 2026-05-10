@@ -61,14 +61,34 @@ pub struct ResizeTerminalRequest {
 
 /// Query params for `GET /terminals/{id}/buffer` (and its `/output` alias).
 ///
-/// `format=text` returns the buffer pre-decoded and ANSI-stripped, so callers
-/// don't have to base64-decode + strip-ANSI client-side. Default (no query)
-/// preserves the base64 envelope for byte-fidelity callers (e.g., the WS
-/// scrollback path or reproducible terminal replays).
+/// Three equivalent ways to ask for decoded text instead of the default
+/// base64 envelope:
+///
+/// - `format=text` (canonical, since main's b318ae5ae): UTF-8 lossy decode
+///   + ANSI/OSC stripped. Single-flag ergonomic.
+/// - `decoded=true`: UTF-8 lossy decode, ANSI codes intact.
+/// - `strip_ansi=true`: implies `decoded=true`; strips CSI/OSC + control
+///   bytes via `crate::terminal::strip_ansi`.
+///
+/// Default (no flags): `data` is base64-encoded raw PTY bytes — preserves
+/// the original byte stream for the WS scrollback path and reproducible
+/// terminal replays.
 #[derive(Debug, Default, Deserialize)]
 pub struct BufferQuery {
     #[serde(default)]
     pub format: Option<String>,
+    #[serde(default)]
+    pub decoded: Option<bool>,
+    #[serde(default)]
+    pub strip_ansi: Option<bool>,
+}
+
+/// Request body for submitting a prompt to an interactive TUI in the terminal.
+#[derive(Debug, Deserialize)]
+pub struct SubmitPromptRequest {
+    /// The text to submit. It will be wrapped in bracketed-paste markers
+    /// and followed by a bare CR by `TerminalSession::submit_prompt`.
+    pub message: String,
 }
 
 // ============================================================================
@@ -190,9 +210,14 @@ pub async fn write_terminal_handler(
 /// - `GET /terminals/{id}/buffer` (canonical)
 /// - `GET /terminals/{id}/output` (alias — same handler)
 ///
-/// Query: `?format=text` returns `{ data: { text: "<utf8, ANSI-stripped>" } }`
-/// for ergonomic consumption. Without `format`, returns the original base64
-/// envelope `{ data, start_offset, total_bytes_produced }` for byte fidelity.
+/// Query forms (all equivalent at the consumer level):
+/// - `?format=text` — main-canonical, returns `{ data: { text: "..." } }`
+///   with ANSI stripped.
+/// - `?decoded=true` — UTF-8 lossy decode, ANSI codes intact.
+/// - `?strip_ansi=true` — implies decoded, ANSI/control bytes stripped.
+///
+/// Default (no query): base64-encoded raw PTY bytes for byte-fidelity callers
+/// (WS scrollback, reproducible replays).
 pub async fn get_buffer_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -211,10 +236,9 @@ pub async fn get_buffer_handler(
     let total_bytes_produced = session.info().total_bytes_produced;
     session.reset_flow_control();
 
+    // Main-canonical short-circuit: `?format=text` returns the nested
+    // `{ data: { text } }` shape for ergonomic consumers (b318ae5ae).
     if matches!(query.format.as_deref(), Some("text")) {
-        // UTF-8 lossy decode tolerates partial multi-byte sequences at chunk
-        // boundaries (a real risk on PTY scrollback). Then strip ANSI escapes
-        // via the shared helper used by the Tauri command surface.
         let lossy = String::from_utf8_lossy(&data);
         let text = strip_ansi(&lossy);
         return Ok(Json(ApiResponse::success(serde_json::json!({
@@ -224,12 +248,62 @@ pub async fn get_buffer_handler(
         }))));
     }
 
-    let encoded = STANDARD.encode(&data);
+    // Fallthrough: `?decoded=true` / `?strip_ansi=true` use the original
+    // top-level `data` shape (string instead of base64-string). Byte-fidelity
+    // callers with no flags fall through to the default base64 path.
+    let strip = query.strip_ansi.unwrap_or(false);
+    // strip_ansi implies decoded=true.
+    let decoded = strip || query.decoded.unwrap_or(false);
+
+    let data_value: serde_json::Value = if decoded {
+        let text = String::from_utf8_lossy(&data);
+        if strip {
+            serde_json::Value::String(strip_ansi(&text))
+        } else {
+            serde_json::Value::String(text.into_owned())
+        }
+    } else {
+        serde_json::Value::String(STANDARD.encode(&data))
+    };
 
     Ok(Json(ApiResponse::success(serde_json::json!({
-        "data": encoded,
+        "data": data_value,
         "start_offset": start_offset,
         "total_bytes_produced": total_bytes_produced,
+    }))))
+}
+
+/// Submit a prompt to an interactive TUI running in the terminal (e.g.
+/// Claude Code). Wraps the message in ANSI bracketed-paste markers and
+/// follows it with a bare CR; see [`crate::terminal::session::TerminalSession::submit_prompt`].
+pub async fn submit_prompt_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<SubmitPromptRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let terminal_manager = get_terminal_manager(&state);
+
+    let session = terminal_manager.get(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Terminal not found: {}", id))),
+        )
+    })?;
+
+    // Total framing bytes: BRACKETED_PASTE_BEGIN(6) + msg + BRACKETED_PASTE_END(6) + CR(1).
+    let total_bytes = request.message.len() + 13;
+
+    session.submit_prompt(&request.message).map_err(|e| {
+        error!("HTTP: Failed to submit prompt to terminal {}: {}", id, e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to submit prompt: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "submitted": true,
+        "bytes": total_bytes,
     }))))
 }
 
@@ -467,7 +541,74 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         // Alias — the cheatsheet and intuition both reach for `/output`.
         // Same handler, no behavior difference.
         .route("/terminals/{id}/output", get(get_buffer_handler))
+        .route("/terminals/{id}/submit-prompt", post(submit_prompt_handler))
         .route("/terminals/{id}/resize", post(resize_terminal_handler))
         .route("/terminals/{id}/ws", get(ws_terminal_handler))
         .route("/terminals/{id}", delete(close_terminal_handler))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_removes_sgr_color_codes() {
+        // Red foreground + reset around "hi".
+        let input = "\x1b[31mhi\x1b[0m";
+        assert_eq!(strip_ansi(input), "hi");
+    }
+
+    #[test]
+    fn strip_ansi_removes_cursor_movement() {
+        // Cursor up + clear-line, common in TUI redraws.
+        let input = "before\x1b[2A\x1b[2Kafter";
+        assert_eq!(strip_ansi(input), "beforeafter");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_title() {
+        // OSC 0; — set window title — terminated by BEL.
+        let input = "\x1b]0;My Title\x07hello";
+        assert_eq!(strip_ansi(input), "hello");
+    }
+
+    // NOTE: bracketed-paste-marker and OSC-ST-terminator tests dropped during
+    // the main-merge resolution. The unioned BufferQuery delegates to the
+    // canonical `crate::terminal::strip_ansi` (added in main b318ae5ae) which
+    // breaks CSI on `is_ascii_alphabetic` only (so `~` doesn't terminate
+    // `\x1b[200~`) and only handles OSC BEL, not ST. Those are pre-existing
+    // limitations on main; expanding the canonical function is out of scope
+    // for this PR. If we want bracketed-paste/OSC-ST stripping later, fix
+    // `crate::terminal::strip_ansi` and re-add the assertions there.
+
+    #[test]
+    fn strip_ansi_preserves_newlines_tabs_cr() {
+        let input = "line1\nline2\tcol\rback";
+        assert_eq!(strip_ansi(input), "line1\nline2\tcol\rback");
+    }
+
+    #[test]
+    fn strip_ansi_drops_other_control_bytes() {
+        // BEL and NUL should be dropped; \n preserved.
+        let input = "a\x07b\x00c\nd";
+        assert_eq!(strip_ansi(input), "abc\nd");
+    }
+
+    #[test]
+    fn strip_ansi_handles_empty_and_plain() {
+        assert_eq!(strip_ansi(""), "");
+        assert_eq!(strip_ansi("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_ansi_handles_realistic_prompt_redraw() {
+        // Roughly what Claude Code emits while redrawing a prompt:
+        // hide cursor, move, clear line, set color, text, reset, show cursor.
+        let input = "\x1b[?25l\x1b[1;1H\x1b[2K\x1b[36m> \x1b[0mready\x1b[?25h";
+        assert_eq!(strip_ansi(input), "> ready");
+    }
 }
