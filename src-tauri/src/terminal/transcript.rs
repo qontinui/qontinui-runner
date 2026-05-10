@@ -1762,10 +1762,8 @@ mod tests {
 
         // Preserve sub-second precision — the clock-skew boundary test needs
         // mtime resolution finer than 1 second.
-        let ft = filetime::FileTime::from_unix_time(
-            mtime.timestamp(),
-            mtime.timestamp_subsec_nanos(),
-        );
+        let ft =
+            filetime::FileTime::from_unix_time(mtime.timestamp(), mtime.timestamp_subsec_nanos());
         filetime::set_file_mtime(&file_path, ft).unwrap();
         file_path
     }
@@ -1787,7 +1785,11 @@ mod tests {
         // Use a project path that won't have a real .claude.json sitting on
         // disk — the lookup below would otherwise read the user's actual
         // workspace `.claude.json` and pick a foreign session.
-        let project_path = temp.path().join("fake_project").to_string_lossy().to_string();
+        let project_path = temp
+            .path()
+            .join("fake_project")
+            .to_string_lossy()
+            .to_string();
         std::fs::create_dir_all(temp.path().join("fake_project")).unwrap();
 
         let before = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
@@ -1845,8 +1847,7 @@ mod tests {
 
         // With `since` past old-session's mtime → shortcut falls through,
         // mtime fallback returns new-session.
-        let filtered =
-            get_latest_session_id(&config_dir, &project_path, Some(since)).unwrap();
+        let filtered = get_latest_session_id(&config_dir, &project_path, Some(since)).unwrap();
         assert_eq!(
             filtered.session_id, "new-session",
             ".claude.json shortcut must NOT shadow a fresher session when stale"
@@ -1871,10 +1872,10 @@ mod tests {
         let project_path = project_dir.to_string_lossy().to_string();
 
         // Spawn at .345s, JSONL mtime at .789s of the same wall-clock second.
-        let spawn = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_700_000_000_345)
-            .unwrap();
-        let mtime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_700_000_000_789)
-            .unwrap();
+        let spawn =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_700_000_000_345).unwrap();
+        let mtime =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_700_000_000_789).unwrap();
 
         let _ = write_session_with_mtime(&config_dir, &project_path, "fresh-session", mtime);
         clear_cache_under(temp.path());
