@@ -219,8 +219,12 @@ pub fn list_sessions(
         let session_id = stem.to_string();
         let last_modified = mtime
             .map(|t| {
+                // Millisecond precision so `get_latest_session_id`'s `since` filter
+                // can compare against `Date.now()`-derived spawn timestamps without
+                // a second-boundary truncation race that drops fresh sessions whose
+                // mtime falls in the same wall-clock second as the spawn.
                 chrono::DateTime::<chrono::Utc>::from(t)
-                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                     .to_string()
             })
             .unwrap_or_default();
@@ -684,8 +688,42 @@ pub fn extract_text_from_messages(messages: &[TranscriptMessage]) -> String {
     parts.join("\n\n---\n\n")
 }
 
+/// Parse a `last_modified` string back into a `DateTime<Utc>`.
+///
+/// Accepts both RFC 3339 (the format produced by Claude Code's own JSONL
+/// records) and the `"%Y-%m-%dT%H:%M:%SZ"` shape this module emits via
+/// `chrono::DateTime::format`. Returns `None` for unparseable input — the
+/// caller decides whether that is "stale" or "drop".
+fn parse_session_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            // Fallback for the "%Y-%m-%dT%H:%M:%SZ" format used in this module.
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ")
+                .ok()
+                .map(|ndt| {
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc)
+                })
+        })
+}
+
 /// Get the most recent session ID from `.claude.json` or by file modification time.
-pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<TranscriptSession> {
+///
+/// `since` (optional) filters out sessions whose `last_modified` is at or
+/// before the supplied threshold. Both branches honour the filter:
+///
+/// - The `.claude.json` `lastSessionId` shortcut falls through (instead of
+///   early-returning) when its session's mtime is `<= since`. Records with
+///   unparseable timestamps are also treated as stale so the mtime fallback
+///   can still find a fresher session.
+/// - The mtime-sorted fallback drops sessions whose `last_modified` is `<=
+///   since` (or unparseable when `since` is `Some`).
+pub fn get_latest_session_id(
+    config_dir: &Path,
+    project_path: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<TranscriptSession> {
     // Try reading .claude.json for lastSessionId
     let claude_json = PathBuf::from(project_path).join(".claude.json");
     if let Ok(content) = fs::read_to_string(&claude_json) {
@@ -704,49 +742,82 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                         .as_ref()
                         .and_then(|m| m.modified().ok())
                         .map(|t| {
+                            // Millisecond precision: see comment in `list_sessions`.
                             chrono::DateTime::<chrono::Utc>::from(t)
-                                .format("%Y-%m-%dT%H:%M:%SZ")
+                                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                                 .to_string()
                         })
                         .unwrap_or_default();
 
-                    let content = fs::read_to_string(&session_file).unwrap_or_default();
-                    let message_count = content
-                        .lines()
-                        .filter(|l| {
-                            l.contains("\"type\":\"user\"")
-                                || l.contains("\"type\": \"user\"")
-                                || l.contains("\"type\":\"assistant\"")
-                                || l.contains("\"type\": \"assistant\"")
-                        })
-                        .count();
-                    let has_plans = content.contains("\"planContent\"");
-                    let first_message_preview = extract_first_user_preview(&content);
-                    let started_at = extract_first_timestamp(&content);
-                    let display_name =
-                        generate_display_name(&first_message_preview, &last_modified);
+                    // Honour `since`: if the shortcut record is not strictly
+                    // newer than the threshold (or its timestamp is
+                    // unparseable), fall through to the mtime fallback so
+                    // it can find a fresher session. Treating unparseable
+                    // timestamps as "stale enough to fall through" is safer
+                    // than binding the wrong session.
+                    let shortcut_is_stale = match since {
+                        Some(threshold) => match parse_session_timestamp(&last_modified) {
+                            Some(parsed) => parsed <= threshold,
+                            None => true,
+                        },
+                        None => false,
+                    };
 
-                    return Some(TranscriptSession {
-                        session_id: session_id.to_string(),
-                        project_path: project_path.to_string(),
-                        config_dir: config_dir.to_string_lossy().to_string(),
-                        message_count,
-                        last_modified,
-                        started_at,
-                        first_message_preview,
-                        has_plans,
-                        display_name,
-                        // Real on-disk session — no override.
-                        injected_live_status: None,
-                    });
+                    if !shortcut_is_stale {
+                        let content = fs::read_to_string(&session_file).unwrap_or_default();
+                        let message_count = content
+                            .lines()
+                            .filter(|l| {
+                                l.contains("\"type\":\"user\"")
+                                    || l.contains("\"type\": \"user\"")
+                                    || l.contains("\"type\":\"assistant\"")
+                                    || l.contains("\"type\": \"assistant\"")
+                            })
+                            .count();
+                        let has_plans = content.contains("\"planContent\"");
+                        let first_message_preview = extract_first_user_preview(&content);
+                        let started_at = extract_first_timestamp(&content);
+                        let display_name =
+                            generate_display_name(&first_message_preview, &last_modified);
+
+                        return Some(TranscriptSession {
+                            session_id: session_id.to_string(),
+                            project_path: project_path.to_string(),
+                            config_dir: config_dir.to_string_lossy().to_string(),
+                            message_count,
+                            last_modified,
+                            started_at,
+                            first_message_preview,
+                            has_plans,
+                            display_name,
+                            // Real on-disk session — no override.
+                            injected_live_status: None,
+                        });
+                    }
                 }
             }
         }
     }
 
-    // Fallback: return the most recently modified session
+    // Fallback: return the most recently modified session that satisfies
+    // the `since` filter. `list_sessions` already sorts newest-first, so
+    // the first surviving entry is the freshest post-`since` session.
     match list_sessions(config_dir, project_path) {
-        Ok(sessions) if !sessions.is_empty() => Some(sessions[0].clone()),
+        Ok(sessions) => {
+            for session in sessions {
+                if let Some(threshold) = since {
+                    match parse_session_timestamp(&session.last_modified) {
+                        Some(parsed) if parsed > threshold => return Some(session),
+                        // Drop entries that don't parse — better to miss
+                        // than to bind the wrong session.
+                        _ => continue,
+                    }
+                } else {
+                    return Some(session);
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -857,10 +928,14 @@ fn generate_display_name(first_preview: &Option<String>, last_modified: &str) ->
         }
     }
 
-    // Fallback: date-based name
+    // Fallback: date-based name. Accepts both the legacy second-precision
+    // and the current millisecond-precision (`%.3f`) formats — see the
+    // formatter comment in `list_sessions`.
     if !last_modified.is_empty() {
         let iso = last_modified.trim_end_matches('Z');
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%S") {
+        let parsed = chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%S%.3f")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%S"));
+        if let Ok(dt) = parsed {
             return format!("Session {}", dt.format("%b %-d, %H:%M"));
         }
     }
@@ -1017,8 +1092,9 @@ pub fn session_digest(
         .ok()
         .and_then(|m| m.modified().ok())
         .map(|t| {
+            // Millisecond precision: see comment in `list_sessions`.
             chrono::DateTime::<chrono::Utc>::from(t)
-                .format("%Y-%m-%dT%H:%M:%SZ")
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                 .to_string()
         })
         .unwrap_or_default();
@@ -1653,5 +1729,162 @@ mod tests {
         assert_eq!(touched[0].tool, ToolKind::Write);
         assert_eq!(touched[0].file_path, "/new/file.rs");
         assert_eq!(touched[0].session_id, "sess-I");
+    }
+
+    // ── get_latest_session_id `since` filter (Phase 1.5) ─────────────────────
+    //
+    // These cover the two new behaviours added by
+    // `plans/traffic-light-session-id-followups.md` Phase 1:
+    // - the mtime-sorted fallback drops sessions whose mtime is `<= since`
+    // - the `.claude.json` shortcut falls through (instead of early-returning)
+    //   when its session's mtime is `<= since`
+
+    /// One JSONL record with a single user message — enough for `list_sessions`
+    /// to consider the session non-empty (`message_count == 1`) and produce a
+    /// real `TranscriptSession`. Workflow-marker free.
+    fn minimal_user_jsonl() -> &'static str {
+        r#"{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#
+    }
+
+    /// Write a synthetic JSONL session at `<config_dir>/projects/<encoded>/<id>.jsonl`
+    /// and force its mtime via `filetime::set_file_mtime`. Returns the file path.
+    fn write_session_with_mtime(
+        config_dir: &Path,
+        project_path: &str,
+        session_id: &str,
+        mtime: chrono::DateTime<chrono::Utc>,
+    ) -> PathBuf {
+        let encoded = encode_project_path(project_path);
+        let project_dir = config_dir.join("projects").join(&encoded);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let file_path = project_dir.join(format!("{}.jsonl", session_id));
+        std::fs::write(&file_path, minimal_user_jsonl()).unwrap();
+
+        // Preserve sub-second precision — the clock-skew boundary test needs
+        // mtime resolution finer than 1 second.
+        let ft = filetime::FileTime::from_unix_time(
+            mtime.timestamp(),
+            mtime.timestamp_subsec_nanos(),
+        );
+        filetime::set_file_mtime(&file_path, ft).unwrap();
+        file_path
+    }
+
+    /// Clear cached entries that may shadow our fixture mtimes. The shared
+    /// `SESSION_CACHE` is process-wide and other tests in this binary touch
+    /// it; if a stale entry lingers under our tempdir's prefix, `list_sessions`
+    /// can return a cached `TranscriptSession` whose `last_modified` doesn't
+    /// match the freshly-set fixture mtime.
+    fn clear_cache_under(prefix: &Path) {
+        let mut cache = SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|p, _| !p.starts_with(prefix));
+    }
+
+    #[test]
+    fn get_latest_session_id_filters_by_since() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().to_path_buf();
+        // Use a project path that won't have a real .claude.json sitting on
+        // disk — the lookup below would otherwise read the user's actual
+        // workspace `.claude.json` and pick a foreign session.
+        let project_path = temp.path().join("fake_project").to_string_lossy().to_string();
+        std::fs::create_dir_all(temp.path().join("fake_project")).unwrap();
+
+        let before = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let after = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_001_000, 0).unwrap();
+        let since = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_500, 0).unwrap();
+
+        let _ = write_session_with_mtime(&config_dir, &project_path, "old-session", before);
+        let _ = write_session_with_mtime(&config_dir, &project_path, "new-session", after);
+        clear_cache_under(temp.path());
+
+        // No filter → freshest wins.
+        let latest = get_latest_session_id(&config_dir, &project_path, None).unwrap();
+        assert_eq!(latest.session_id, "new-session");
+
+        // Filter excludes old-session, keeps new-session.
+        let filtered = get_latest_session_id(&config_dir, &project_path, Some(since)).unwrap();
+        assert_eq!(filtered.session_id, "new-session");
+
+        // Filter excludes BOTH → None.
+        let strict = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_002_000, 0).unwrap();
+        assert!(get_latest_session_id(&config_dir, &project_path, Some(strict)).is_none());
+    }
+
+    #[test]
+    fn get_latest_session_id_skips_claude_json_when_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().to_path_buf();
+        let project_dir = temp.path().join("fake_project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        let before = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let after = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_001_000, 0).unwrap();
+        let since = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_500, 0).unwrap();
+
+        let _ = write_session_with_mtime(&config_dir, &project_path, "old-session", before);
+        let _ = write_session_with_mtime(&config_dir, &project_path, "new-session", after);
+        clear_cache_under(temp.path());
+
+        // Point .claude.json's lastSessionId at the OLDER (pre-since) session
+        // — this is the shadowing case the plan calls out.
+        let claude_json = project_dir.join(".claude.json");
+        std::fs::write(
+            &claude_json,
+            serde_json::json!({ "lastSessionId": "old-session" }).to_string(),
+        )
+        .unwrap();
+
+        // Without `since` → shortcut wins, returns old-session as-is.
+        let no_filter = get_latest_session_id(&config_dir, &project_path, None).unwrap();
+        assert_eq!(
+            no_filter.session_id, "old-session",
+            "without `since`, .claude.json shortcut should win"
+        );
+
+        // With `since` past old-session's mtime → shortcut falls through,
+        // mtime fallback returns new-session.
+        let filtered =
+            get_latest_session_id(&config_dir, &project_path, Some(since)).unwrap();
+        assert_eq!(
+            filtered.session_id, "new-session",
+            ".claude.json shortcut must NOT shadow a fresher session when stale"
+        );
+    }
+
+    /// Regression: a hook spawn at `t = T.345` (millis) and a Claude write at
+    /// `t = T.789` BOTH truncate to the same wall-clock second `T`. With
+    /// second-precision timestamps, the strict `parsed > since` filter would
+    /// drop the legitimate fresh session. With millisecond-precision
+    /// timestamps the filter accepts it.
+    ///
+    /// Verifies the formatter at `list_sessions` emits `%.3fZ` so that the
+    /// JSONL mtime, parsed back, retains enough precision to win the strict
+    /// `>` comparison against `Date.now()`-derived spawn timestamps.
+    #[test]
+    fn get_latest_session_id_clock_skew_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().to_path_buf();
+        let project_dir = temp.path().join("fake_project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project_path = project_dir.to_string_lossy().to_string();
+
+        // Spawn at .345s, JSONL mtime at .789s of the same wall-clock second.
+        let spawn = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_700_000_000_345)
+            .unwrap();
+        let mtime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_700_000_000_789)
+            .unwrap();
+
+        let _ = write_session_with_mtime(&config_dir, &project_path, "fresh-session", mtime);
+        clear_cache_under(temp.path());
+
+        let result = get_latest_session_id(&config_dir, &project_path, Some(spawn));
+        assert!(
+            result.is_some(),
+            "session whose mtime is in the same second as `since` (789ms vs 345ms) \
+             must NOT be dropped — that's the common hook-spawn case"
+        );
+        assert_eq!(result.unwrap().session_id, "fresh-session");
     }
 }
