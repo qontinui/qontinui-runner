@@ -21,20 +21,28 @@
 //! | PUT    | `/wrappers/:id/credentials/:name`               | set_credential     |
 //! | DELETE | `/wrappers/:id/credentials/:name`               | delete_credential  |
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path as AxumPath, State},
     http::StatusCode,
-    response::Json,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Json,
+    },
     routing::{get, post, put},
     Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::BroadcastStream;
 
 use super::clients::{self, AiClientId, ClientError, ClientInfo};
 use super::credentials::CredentialStore;
 use super::dispatch::dispatch_handler;
+use super::events;
 use super::install::{install, uninstall, update, InstallError, InstallRequest, InstallResponse};
 use super::manager::WrapperStatus;
 use super::primary_proxy::{self, into_http as proxy_error_to_http};
@@ -81,6 +89,45 @@ pub fn router() -> Router<Arc<ApiState>> {
         .route("/wrappers/clients", get(list_clients))
         .route("/wrappers/clients/{id}/connect", post(connect_client))
         .route("/wrappers/clients/{id}/disconnect", post(disconnect_client))
+        // Change-event SSE stream — consumed by `bin/wrappers_mcp.rs` so
+        // newly-installed wrappers surface as MCP tools without an AI
+        // session restart.
+        .route("/wrappers/events", get(events_stream))
+}
+
+// ---------------------------------------------------------------------------
+// Change-event stream
+// ---------------------------------------------------------------------------
+
+/// `GET /wrappers/events` — SSE stream of `wrapper.changed` events.
+///
+/// Each registry mutation (`rescan`, `rescan_all`, `remove`) emits one
+/// event. Subscribers refetch `GET /wrappers` after a wakeup; the event
+/// payload itself only carries an `atMs` timestamp.
+///
+/// Primary-only: secondaries never own a wrapper registry, so there's
+/// no event source for them to forward. The MCP bin always points at
+/// the primary's port, so this is fine. (We don't proxy this in
+/// `primary_proxy.rs` — secondaries that hit `/wrappers/events` get an
+/// empty stream; explicit reject would log noise per AI-session
+/// reconnect.)
+async fn events_stream(
+    State(_state): State<Arc<ApiState>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let rx = events::subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|res| async move {
+        match res {
+            Ok(ev) => match Event::default().event("wrapper.changed").json_data(&ev) {
+                Ok(e) => Some(Ok::<Event, Infallible>(e)),
+                Err(_) => None,
+            },
+            // Lag means a slow subscriber fell behind. Drop the lag
+            // marker silently — the next genuine event still triggers a
+            // refresh, which catches up.
+            Err(_) => None,
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
 }
 
 // ---------------------------------------------------------------------------

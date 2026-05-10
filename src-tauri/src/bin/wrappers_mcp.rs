@@ -31,6 +31,10 @@
 //!     without restarting the MCP bin (which is the AI client's lifetime).
 //!   - On a `tools/call` for an unknown tool name (one retry), covering
 //!     clients that don't re-list before calling.
+//!   - On a push from the runner's `GET /wrappers/events` SSE stream — a
+//!     background thread long-polls that endpoint, refreshes the cache on
+//!     every event, and emits `notifications/tools/list_changed` upstream
+//!     so AI clients update their tool palettes without re-listing.
 //!
 //! If a refresh returns empty while we previously had tools, the existing
 //! cache is preserved — almost always a transient runner-down blip rather
@@ -38,6 +42,8 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -376,12 +382,22 @@ fn write_response(stdout: &mut impl Write, value: &Value) {
     let _ = stdout.flush();
 }
 
-fn handle_request(
-    base: &str,
-    tools: &mut Vec<ToolEntry>,
-    reverse_map: &mut HashMap<String, (String, String)>,
-    req: JsonRpcRequest,
-) -> Option<Value> {
+/// Bundles the mutable tool catalog so it can travel through an
+/// `Arc<Mutex<...>>` and be touched by both the stdin loop and the SSE
+/// consumer thread without manual two-field locking.
+struct ToolCache {
+    tools: Vec<ToolEntry>,
+    reverse_map: HashMap<String, (String, String)>,
+}
+
+impl ToolCache {
+    fn from_tools(tools: Vec<ToolEntry>) -> Self {
+        let reverse_map = build_reverse_map(&tools);
+        Self { tools, reverse_map }
+    }
+}
+
+fn handle_request(base: &str, cache: &Arc<Mutex<ToolCache>>, req: JsonRpcRequest) -> Option<Value> {
     let id = req.id.clone();
     match req.method.as_str() {
         "initialize" => Some(rpc_success(
@@ -389,7 +405,11 @@ fn handle_request(
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-                "capabilities": { "tools": {} },
+                // `tools.listChanged: true` advertises that we will push
+                // `notifications/tools/list_changed` when the catalog
+                // changes. The SSE consumer thread is the source of those
+                // pushes.
+                "capabilities": { "tools": { "listChanged": true } },
             }),
         )),
         "notifications/initialized" | "notifications/cancelled" => {
@@ -397,6 +417,8 @@ fn handle_request(
             None
         }
         "tools/list" => {
+            let mut guard = cache.lock().expect("tool cache mutex poisoned");
+            let ToolCache { tools, reverse_map } = &mut *guard;
             refresh_tools(base, tools, reverse_map);
             Some(rpc_success(id, tools_list_payload(tools)))
         }
@@ -411,6 +433,8 @@ fn handle_request(
                     ));
                 }
             };
+            let mut guard = cache.lock().expect("tool cache mutex poisoned");
+            let ToolCache { tools, reverse_map } = &mut *guard;
             // If the client never re-listed, a wrapper installed since
             // startup is invisible to our cache. Refresh once before
             // surfacing "unknown tool" so the call still resolves.
@@ -494,13 +518,21 @@ fn main() {
     let base = primary_base_url();
     eprintln!("[wrappers-mcp] runner base: {}", base);
 
-    let mut tools = fetch_tools(&base);
-    let mut reverse_map = build_reverse_map(&tools);
+    let cache = Arc::new(Mutex::new(ToolCache::from_tools(fetch_tools(&base))));
+    // Wrap stdout so the stdin loop and the SSE thread can both write
+    // without interleaving JSON-RPC frames.
+    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+
+    // Spawn the SSE consumer. It loops forever, reconnecting with backoff
+    // on disconnect; the only way it stops is the process exiting.
+    {
+        let cache = Arc::clone(&cache);
+        let stdout = Arc::clone(&stdout);
+        let base = base.clone();
+        thread::spawn(move || sse_consumer_loop(&base, cache, stdout));
+    }
 
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
@@ -518,21 +550,149 @@ fn main() {
             Err(e) => {
                 eprintln!("[wrappers-mcp] parse error: {} (line: {})", e, trimmed);
                 let err = rpc_error(None, ERR_PARSE, format!("parse error: {}", e));
-                write_response(&mut stdout, &err);
+                let mut out = stdout.lock().expect("stdout mutex poisoned");
+                write_response(&mut *out, &err);
                 continue;
             }
         };
         if req.method.is_empty() {
             let err = rpc_error(req.id, ERR_INVALID_REQUEST, "method is required");
-            write_response(&mut stdout, &err);
+            let mut out = stdout.lock().expect("stdout mutex poisoned");
+            write_response(&mut *out, &err);
             continue;
         }
-        if let Some(response) = handle_request(&base, &mut tools, &mut reverse_map, req) {
-            write_response(&mut stdout, &response);
+        if let Some(response) = handle_request(&base, &cache, req) {
+            let mut out = stdout.lock().expect("stdout mutex poisoned");
+            write_response(&mut *out, &response);
         }
     }
 
     eprintln!("[wrappers-mcp] stdin closed, shutting down");
+}
+
+// ---------------------------------------------------------------------------
+// SSE consumer
+// ---------------------------------------------------------------------------
+
+const SSE_BACKOFF_INITIAL_SECS: u64 = 1;
+const SSE_BACKOFF_MAX_SECS: u64 = 30;
+
+fn next_backoff(current: u64) -> u64 {
+    (current.saturating_mul(2)).min(SSE_BACKOFF_MAX_SECS)
+}
+
+/// Long-polls `<base>/wrappers/events`. On every `data:` line received,
+/// refreshes the tool cache and emits `notifications/tools/list_changed`
+/// to stdout. Reconnects with exponential backoff (1s → 2s → 4s → ... →
+/// 30s) on any disconnect or non-2xx response. Logs go to stderr.
+///
+/// We deliberately don't fight to stay connected during the AI client's
+/// initialize handshake: clients typically open a single MCP session
+/// per conversation, so a 1–2s delay before the first SSE attempt is
+/// invisible. If the runner is genuinely down we'll keep retrying at
+/// 30s intervals — cheap and the user gets a working push the moment
+/// the runner comes back up.
+fn sse_consumer_loop(
+    base: &str,
+    cache: Arc<Mutex<ToolCache>>,
+    stdout: Arc<Mutex<std::io::Stdout>>,
+) {
+    let url = format!("{}/wrappers/events", base);
+    let mut backoff = SSE_BACKOFF_INITIAL_SECS;
+
+    loop {
+        // SSE is a long-lived stream — disable per-request timeout. The
+        // server's keep-alive comments will keep TCP healthy; we only
+        // detect disconnect via stream EOF / read error.
+        let client = match reqwest::blocking::Client::builder().timeout(None).build() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "[wrappers-mcp] sse client init failed: {} (retrying in {}s)",
+                    e, backoff
+                );
+                thread::sleep(Duration::from_secs(backoff));
+                backoff = next_backoff(backoff);
+                continue;
+            }
+        };
+
+        let resp = match client
+            .get(&url)
+            .header("Accept", "text/event-stream")
+            .send()
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                eprintln!(
+                    "[wrappers-mcp] sse {} returned {} (retrying in {}s)",
+                    url,
+                    r.status(),
+                    backoff
+                );
+                thread::sleep(Duration::from_secs(backoff));
+                backoff = next_backoff(backoff);
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[wrappers-mcp] sse connect failed: {} (retrying in {}s)",
+                    e, backoff
+                );
+                thread::sleep(Duration::from_secs(backoff));
+                backoff = next_backoff(backoff);
+                continue;
+            }
+        };
+
+        eprintln!("[wrappers-mcp] sse connected to {}", url);
+        backoff = SSE_BACKOFF_INITIAL_SECS;
+
+        let reader = std::io::BufReader::new(resp);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if is_sse_data_line(&l) => {
+                    handle_sse_event(base, &cache, &stdout);
+                }
+                Ok(_) => {
+                    // Comment (`:keep-alive`), `event:`, `id:`, blank — ignore.
+                }
+                Err(e) => {
+                    eprintln!("[wrappers-mcp] sse stream read error: {} (reconnecting)", e);
+                    break;
+                }
+            }
+        }
+
+        eprintln!(
+            "[wrappers-mcp] sse stream closed; reconnecting in {}s",
+            backoff
+        );
+        thread::sleep(Duration::from_secs(backoff));
+        backoff = next_backoff(backoff);
+    }
+}
+
+fn is_sse_data_line(line: &str) -> bool {
+    line.starts_with("data:")
+}
+
+fn handle_sse_event(
+    base: &str,
+    cache: &Arc<Mutex<ToolCache>>,
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+) {
+    {
+        let mut guard = cache.lock().expect("tool cache mutex poisoned");
+        let ToolCache { tools, reverse_map } = &mut *guard;
+        refresh_tools(base, tools, reverse_map);
+    }
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed",
+    });
+    let mut out = stdout.lock().expect("stdout mutex poisoned");
+    write_response(&mut *out, &notification);
 }
 
 #[cfg(test)]
@@ -628,6 +788,43 @@ mod tests {
 
         assert!(tools.is_empty());
         assert!(reverse_map.is_empty());
+    }
+
+    #[test]
+    fn is_sse_data_line_matches_only_data_prefix() {
+        assert!(is_sse_data_line("data: {\"atMs\":1}"));
+        assert!(is_sse_data_line("data:nospace"));
+        assert!(!is_sse_data_line(":keep-alive"));
+        assert!(!is_sse_data_line("event: wrapper.changed"));
+        assert!(!is_sse_data_line("id: 42"));
+        assert!(!is_sse_data_line(""));
+        assert!(!is_sse_data_line("retry: 1000"));
+    }
+
+    #[test]
+    fn next_backoff_doubles_then_caps() {
+        assert_eq!(next_backoff(1), 2);
+        assert_eq!(next_backoff(2), 4);
+        assert_eq!(next_backoff(8), 16);
+        assert_eq!(next_backoff(16), SSE_BACKOFF_MAX_SECS);
+        assert_eq!(next_backoff(SSE_BACKOFF_MAX_SECS), SSE_BACKOFF_MAX_SECS);
+        // Saturating: u64::MAX shouldn't panic.
+        assert_eq!(next_backoff(u64::MAX), SSE_BACKOFF_MAX_SECS);
+    }
+
+    #[test]
+    fn tool_cache_from_tools_builds_reverse_map() {
+        let cache = ToolCache::from_tools(vec![ToolEntry {
+            name: "wrapper_v0__do_thing".to_string(),
+            wrapper_id: "v0".to_string(),
+            action_id: "do-thing".to_string(),
+            description: "x".to_string(),
+            input_schema: json!({}),
+        }]);
+        assert_eq!(cache.tools.len(), 1);
+        let (w, a) = cache.reverse_map.get("wrapper_v0__do_thing").unwrap();
+        assert_eq!(w, "v0");
+        assert_eq!(a, "do-thing");
     }
 
     #[test]
