@@ -199,6 +199,22 @@ export function ScriptedOutputPanel({ taskRunId }: ScriptedOutputPanelProps) {
               subtitle={`${stats.llmOk.toLocaleString()} calls`}
             />
             <MetricCard
+              title="Tier 1 miss rate"
+              value={
+                workerCalls > 0
+                  ? formatRate(stats.llmOk, workerCalls)
+                  : "—"
+              }
+              subtitle={
+                workerCalls === 0
+                  ? "no completed emits yet"
+                  : "llm_ok / (cache_hit + llm_ok)"
+              }
+              variant={
+                workerCalls > 0 && stats.llmOk / workerCalls >= 0.4 ? "warning" : "default"
+              }
+            />
+            <MetricCard
               title="Worker-OK rate"
               value={workerCalls > 0 ? formatRate(stats.workerOk, workerCalls) : "—"}
               subtitle={
