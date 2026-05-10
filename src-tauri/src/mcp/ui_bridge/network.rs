@@ -221,10 +221,7 @@ pub async fn ui_bridge_get_console_errors_handler(
                     unknown.join(", "),
                     valid
                 );
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::<()>::error(msg)),
-                ));
+                return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::error(msg))));
             }
         },
     };
@@ -587,9 +584,7 @@ mod console_level_filter_tests {
         assert!(parse_level_filter("*").expect("valid").is_none());
         // Mixing `all` with other tokens still disables filtering — the
         // caller asked to see everything.
-        assert!(parse_level_filter("error,all")
-            .expect("valid")
-            .is_none());
+        assert!(parse_level_filter("error,all").expect("valid").is_none());
     }
 
     #[test]
