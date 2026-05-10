@@ -538,7 +538,6 @@ pub fn routes() -> Router<Arc<ApiState>> {
 // `#[ignore = "requires PG via DATABASE_URL"]` matches the convention
 // established in `database/pg/session_touched_files.rs::tests`.
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
