@@ -36,6 +36,31 @@ fn write_integration_script(content: &str, name: &str) -> Option<std::path::Path
 /// Maximum scrollback buffer capacity (1 MB).
 const SCROLLBACK_CAPACITY: usize = 1_048_576;
 
+/// ANSI bracketed-paste begin marker.
+const BRACKETED_PASTE_BEGIN: &[u8] = b"\x1b[200~";
+/// ANSI bracketed-paste end marker.
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+/// Bare CR — the submit keystroke after the paste window closes.
+/// Intentionally NOT `\r\n` (see [`TerminalSession::submit_prompt`]).
+const SUBMIT_ENTER: &[u8] = b"\r";
+
+/// Build the exact byte sequence [`TerminalSession::submit_prompt`] writes.
+/// Exposed so tests (and the worker_session unit test) can assert the
+/// submit framing without spinning up a real PTY.
+pub(crate) fn build_submit_payload(message: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        BRACKETED_PASTE_BEGIN.len()
+            + message.len()
+            + BRACKETED_PASTE_END.len()
+            + SUBMIT_ENTER.len(),
+    );
+    out.extend_from_slice(BRACKETED_PASTE_BEGIN);
+    out.extend_from_slice(message.as_bytes());
+    out.extend_from_slice(BRACKETED_PASTE_END);
+    out.extend_from_slice(SUBMIT_ENTER);
+    out
+}
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -436,6 +461,43 @@ impl TerminalSession {
         Ok(())
     }
 
+    /// Submit `message` to a Claude-style interactive prompt running in
+    /// the PTY. The bytes are wrapped in ANSI bracketed-paste markers
+    /// (`\x1b[200~` ... `\x1b[201~`) so the TUI treats the content as a
+    /// single paste block, then a bare `\r` is written **outside** the
+    /// paste window so the prompt actually submits.
+    ///
+    /// CR-LF (`\r\n`) is intentionally NOT used: bracketed-paste TUIs
+    /// like Claude Code consume the `\n` as the closing newline of the
+    /// paste rather than as the submit keystroke. Sending only `\r`
+    /// after the end marker reliably triggers send. See Phase 6 §6
+    /// remediation plan, Issue 1.
+    pub fn submit_prompt(&self, message: &str) -> Result<(), String> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|e| format!("Writer lock poisoned: {}", e))?;
+        // Each chunk is a separate write so the PTY consumer sees the
+        // boundary between the paste block and the trailing submit
+        // keystroke.
+        writer
+            .write_all(BRACKETED_PASTE_BEGIN)
+            .map_err(|e| format!("Failed to write paste begin: {}", e))?;
+        writer
+            .write_all(message.as_bytes())
+            .map_err(|e| format!("Failed to write paste body: {}", e))?;
+        writer
+            .write_all(BRACKETED_PASTE_END)
+            .map_err(|e| format!("Failed to write paste end: {}", e))?;
+        writer
+            .write_all(SUBMIT_ENTER)
+            .map_err(|e| format!("Failed to write submit enter: {}", e))?;
+        writer
+            .flush()
+            .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+        Ok(())
+    }
+
     /// Resize the PTY dimensions.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
         let master = self
@@ -629,5 +691,101 @@ impl Drop for TerminalSession {
         if self.is_alive.load(Ordering::Relaxed) {
             self.close();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-memory `Write` whose bytes can be inspected after the writes.
+    /// Backed by an `Arc<Mutex<Vec<u8>>>` so the test can read it after
+    /// the `TerminalSession` fakery has consumed the writer.
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut g = self.0.lock().unwrap();
+            g.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Construct a minimum-viable `TerminalSession` whose `writer` field
+    /// is a `CapturingWriter` and whose other fields are inert. The
+    /// reader/waiter threads are NOT spawned — `submit_prompt` only
+    /// touches `self.writer`, so this is enough.
+    fn make_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
+        let writer: Box<dyn Write + Send> = Box::new(CapturingWriter(buf));
+        let (output_tx, _) = broadcast::channel::<String>(1);
+        TerminalSession {
+            id: "test".to_string(),
+            title: "test".to_string(),
+            working_dir: ".".to_string(),
+            page_id: "default".to_string(),
+            writer: Arc::new(Mutex::new(writer)),
+            master: Arc::new(Mutex::new(create_noop_master())),
+            child_pid: None,
+            cols: AtomicU16::new(80),
+            rows: AtomicU16::new(24),
+            // Mark the session as already-dead so Drop doesn't try to
+            // join nonexistent reader/waiter threads.
+            is_alive: Arc::new(AtomicBool::new(false)),
+            exit_code: Arc::new(Mutex::new(None)),
+            reader_join: Mutex::new(None),
+            waiter_join: Mutex::new(None),
+            bytes_sent: Arc::new(AtomicU64::new(0)),
+            bytes_acked: Arc::new(AtomicU64::new(0)),
+            scrollback_buffer: Arc::new(Mutex::new(VecDeque::new())),
+            total_bytes_produced: Arc::new(AtomicU64::new(0)),
+            created_at: 0,
+            output_tx,
+            grid: Arc::new(Mutex::new(Grid::new(80, 24))),
+        }
+    }
+
+    #[test]
+    fn build_submit_payload_emits_paste_markers_and_bare_cr() {
+        let payload = build_submit_payload("hello");
+        assert_eq!(payload, b"\x1b[200~hello\x1b[201~\r");
+    }
+
+    #[test]
+    fn build_submit_payload_handles_empty_message() {
+        let payload = build_submit_payload("");
+        assert_eq!(payload, b"\x1b[200~\x1b[201~\r");
+    }
+
+    #[test]
+    fn submit_prompt_writes_bracketed_paste_then_bare_cr() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        session
+            .submit_prompt("hello")
+            .expect("submit_prompt failed");
+        let written = buf.lock().unwrap().clone();
+        assert_eq!(written, b"\x1b[200~hello\x1b[201~\r");
+    }
+
+    #[test]
+    fn submit_prompt_does_not_emit_lf() {
+        // Regression guard: the Phase 6 §6 bug was that send_user_message
+        // sent CR-LF, and Claude Code's bracketed-paste handler ate the
+        // LF as the paste-block terminator instead of submitting. The
+        // submit byte must be a bare CR; no LF anywhere in the output.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        session
+            .submit_prompt("line1 line2")
+            .expect("submit_prompt failed");
+        let written = buf.lock().unwrap().clone();
+        assert!(
+            !written.contains(&b'\n'),
+            "submit_prompt must not emit LF bytes; got {:?}",
+            written
+        );
     }
 }
