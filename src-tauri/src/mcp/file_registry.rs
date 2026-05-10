@@ -445,8 +445,7 @@ async fn probe_conflicts(
         .iter()
         .map(|p| crate::executor::file_registry::normalize_path(p))
         .collect();
-    let hinted_set: std::collections::HashSet<String> =
-        hinted_normalized.iter().cloned().collect();
+    let hinted_set: std::collections::HashSet<String> = hinted_normalized.iter().cloned().collect();
 
     // Union extracted ∪ hinted (preserving extracted-first order, then
     // appending any hints not already present).
@@ -784,7 +783,8 @@ mod tests {
             .iter()
             .map(|p| crate::executor::file_registry::normalize_path(p))
             .collect();
-        let hinted_set: std::collections::HashSet<String> = hinted_normalized.iter().cloned().collect();
+        let hinted_set: std::collections::HashSet<String> =
+            hinted_normalized.iter().cloned().collect();
 
         let mut candidates: Vec<String> = extracted.clone();
         let extracted_set: std::collections::HashSet<&String> = extracted.iter().collect();
@@ -805,7 +805,8 @@ mod tests {
         let predicted_collisions: Vec<PredictedCollision> = raw_collisions
             .into_iter()
             .map(|conflict| {
-                let confidence = confidence_for_conflict(&conflict.file_path, &candidates, &hinted_set);
+                let confidence =
+                    confidence_for_conflict(&conflict.file_path, &candidates, &hinted_set);
                 PredictedCollision {
                     conflict,
                     confidence,
