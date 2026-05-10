@@ -343,6 +343,7 @@ async fn coordinator_act(
             target_id: target_id.as_deref(),
             reasoning: &reasoning,
             auto_acted,
+            observation_hash: "",
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -725,6 +726,97 @@ async fn break_coordinator_lease(
 }
 
 // =============================================================================
+// Shadow diff (sd01_coord_coordinator_shadow_decisions)
+// =============================================================================
+
+/// Query string for `GET /coordinator/shadow-diff`. `window_seconds`
+/// defaults to 86400 (24 hours). `sample_limit` controls how many
+/// per-disagreement rows the response embeds for human inspection;
+/// defaults to 20, capped at 200.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShadowDiffQuery {
+    #[serde(default)]
+    pub window_seconds: Option<i64>,
+    #[serde(default)]
+    pub sample_limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShadowDiffResponse {
+    pub window_seconds: i64,
+    pub buckets: Vec<crate::database::pg::coordinator_shadow_decisions::ShadowDiffBucket>,
+    /// Aggregate agreement rate over rows where shadow + live both saw
+    /// the same observation_hash. `None` when no matched observations
+    /// exist in the window — e.g. when only the Rust shadow scheduler
+    /// is running (no live `/coordinate` invocations to compare against).
+    pub agreement_rate_overall: Option<f64>,
+    pub matched_observations_total: i64,
+    pub agreements_total: i64,
+    pub disagreement_samples: Vec<ShadowDisagreementSample>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShadowDisagreementSample {
+    pub shadow: crate::database::pg::coordinator_shadow_decisions::CoordinatorShadowDecisionRow,
+    pub live_rule: String,
+    pub live_action: String,
+}
+
+/// `GET /coordinator/shadow-diff?windowSeconds=86400&sampleLimit=20`
+async fn shadow_diff(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ShadowDiffQuery>,
+) -> Result<Json<ShadowDiffResponse>, (StatusCode, String)> {
+    let window_seconds = query.window_seconds.unwrap_or(86_400).max(60);
+    let sample_limit = query.sample_limit.unwrap_or(20).clamp(1, 200);
+
+    let buckets = state
+        .app_state
+        .pg_db
+        .shadow_diff_aggregate(window_seconds)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let matched_observations_total: i64 = buckets.iter().map(|b| b.matched_observations).sum();
+    let agreements_total: i64 = buckets.iter().map(|b| b.agreements_on_match).sum();
+    let agreement_rate_overall = if matched_observations_total > 0 {
+        Some(agreements_total as f64 / matched_observations_total as f64)
+    } else {
+        None
+    };
+
+    let disagreements = state
+        .app_state
+        .pg_db
+        .shadow_diff_disagreements(window_seconds, sample_limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let disagreement_samples = disagreements
+        .into_iter()
+        .map(
+            |(shadow, live_rule, live_action)| ShadowDisagreementSample {
+                shadow,
+                live_rule,
+                live_action,
+            },
+        )
+        .collect();
+
+    Ok(Json(ShadowDiffResponse {
+        window_seconds,
+        buckets,
+        agreement_rate_overall,
+        matched_observations_total,
+        agreements_total,
+        disagreement_samples,
+    }))
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -734,6 +826,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/coordinator/act", post(coordinator_act))
         .route("/coordinator/leader", get(get_coordinator_leader))
         .route("/coordinator/decisions", get(get_coordinator_decisions))
+        .route("/coordinator/shadow-diff", get(shadow_diff))
         .route(
             "/coordinator/leader/break-lease",
             post(break_coordinator_lease),

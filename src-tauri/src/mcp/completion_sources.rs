@@ -345,6 +345,7 @@ async fn manual_user_fire(
             target_id: Some(&task.id),
             reasoning: &reasoning_tail,
             auto_acted: false,
+            observation_hash: "",
         })
         .await
     {

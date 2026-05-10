@@ -54,6 +54,118 @@ pub(crate) struct Observation {
 }
 
 impl Observation {
+    /// Stable SHA-256 hex of the observation snapshot. Used by the
+    /// shadow-decisions feature to join shadow rows against live
+    /// coordinator_decisions rows by "did both schedulers see the same
+    /// world this tick?". Hash is over a deterministic, sorted
+    /// representation so two observations with logically-equal contents
+    /// produce identical hashes.
+    ///
+    /// Excludes `recent_decisions` and `recent_reviews` (audit trail —
+    /// changes between ticks even when world-state doesn't), and the
+    /// session ordering (sorted by task_run_id) so concurrent
+    /// `list_active` permutations don't perturb the digest.
+    pub fn observation_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+
+        // Tasks: id + status + assigned_session_id + phase_name + sequence_in_phase.
+        // Other columns can drift across reads (updated_at, error_message) without
+        // changing what the rules see.
+        let mut task_rows: Vec<(String, String, Option<String>, String, i32)> = self
+            .tasks
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.status.clone(),
+                    t.assigned_session_id.clone(),
+                    t.phase_name.clone(),
+                    t.sequence_in_phase,
+                )
+            })
+            .collect();
+        task_rows.sort_by(|a, b| a.0.cmp(&b.0));
+        hasher.update(b"tasks:");
+        for (id, status, sess, phase, seq) in &task_rows {
+            hasher.update(id.as_bytes());
+            hasher.update(b"|");
+            hasher.update(status.as_bytes());
+            hasher.update(b"|");
+            hasher.update(sess.as_deref().unwrap_or("").as_bytes());
+            hasher.update(b"|");
+            hasher.update(phase.as_bytes());
+            hasher.update(b"|");
+            hasher.update(seq.to_string().as_bytes());
+            hasher.update(b";");
+        }
+
+        // Live sessions: sort by task_run_id, hash (id, state, assigned_task_id).
+        let mut sess_rows: Vec<(String, Option<String>, Option<String>)> = self
+            .live_sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.task_run_id.clone(),
+                    s.state.as_ref().map(|st| format!("{:?}", st)),
+                    s.assigned_task_id.clone(),
+                )
+            })
+            .collect();
+        sess_rows.sort_by(|a, b| a.0.cmp(&b.0));
+        hasher.update(b"sessions:");
+        for (id, state, task) in &sess_rows {
+            hasher.update(id.as_bytes());
+            hasher.update(b"|");
+            hasher.update(state.as_deref().unwrap_or("").as_bytes());
+            hasher.update(b"|");
+            hasher.update(task.as_deref().unwrap_or("").as_bytes());
+            hasher.update(b";");
+        }
+
+        // Active file registry: sort by file_path. Hold by holder_task_run_id
+        // (the FileRegistryInfo struct's actual field names — `path`/
+        // `session_id` were earlier names that got renamed during the
+        // worktree-claims refactor).
+        let mut active: Vec<(String, String)> = self
+            .active_file_registry
+            .iter()
+            .map(|r| (r.file_path.clone(), r.holder_task_run_id.clone()))
+            .collect();
+        active.sort();
+        hasher.update(b"active_files:");
+        for (p, s) in &active {
+            hasher.update(p.as_bytes());
+            hasher.update(b"|");
+            hasher.update(s.as_bytes());
+            hasher.update(b";");
+        }
+
+        // Upcoming file registry: sort by (task_id, path).
+        let mut upcoming: Vec<(String, String)> = self
+            .upcoming_file_registry
+            .iter()
+            .map(|c| (c.task_id.clone(), c.path.clone()))
+            .collect();
+        upcoming.sort();
+        hasher.update(b"upcoming_files:");
+        for (t, p) in &upcoming {
+            hasher.update(t.as_bytes());
+            hasher.update(b"|");
+            hasher.update(p.as_bytes());
+            hasher.update(b";");
+        }
+
+        // Open escalations count alone — content varies but the count is
+        // what every rule consults.
+        hasher.update(b"open_escalations_count:");
+        hasher.update(self.open_escalations.len().to_string().as_bytes());
+
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+impl Observation {
     /// True when there's still pending/ready/escalated work that none of
     /// the cheap rules took care of this iteration. Drives the LLM
     /// fallback in `coordinator::scheduler::run_one_iteration` (Phase 2).

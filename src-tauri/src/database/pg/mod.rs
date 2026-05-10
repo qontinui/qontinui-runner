@@ -21,6 +21,7 @@ pub mod completion_reports;
 pub mod contradiction;
 pub mod coordinator_decisions;
 pub mod coordinator_leader;
+pub mod coordinator_shadow_decisions;
 pub mod decision_trail;
 pub mod deferred_questions;
 pub mod entailment_cache;
