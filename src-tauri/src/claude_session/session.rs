@@ -495,8 +495,7 @@ impl ClaudeSession {
                 use crate::commands::AppState;
                 use tauri::Manager;
                 if let Some(app_state) = app_handle_stdout.try_state::<std::sync::Arc<AppState>>() {
-                    let released_paths =
-                        app_state.file_lock_manager.release_all_sync(fallback_id);
+                    let released_paths = app_state.file_lock_manager.release_all_sync(fallback_id);
                     // Emit file-lock-released for each path so frontends
                     // can clear blocked-on indicators without waiting for
                     // the next /file-locks/info poll. Mirrors the

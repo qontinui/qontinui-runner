@@ -175,10 +175,7 @@ fn confidence_for_conflict(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    let conflict_parent = conflict_p
-        .parent()
-        .and_then(|p| p.to_str())
-        .unwrap_or("");
+    let conflict_parent = conflict_p.parent().and_then(|p| p.to_str()).unwrap_or("");
 
     let mut best: f32 = 0.0;
 
@@ -201,8 +198,7 @@ fn confidence_for_conflict(
         // 0.7 — substring match either direction (e.g. candidate
         // "src/foo.rs", conflict "/repo/src/foo.rs").
         if !candidate.is_empty()
-            && (conflict_path.contains(candidate.as_str())
-                || candidate.contains(conflict_path))
+            && (conflict_path.contains(candidate.as_str()) || candidate.contains(conflict_path))
         {
             best = best.max(0.7);
             continue;
@@ -210,10 +206,7 @@ fn confidence_for_conflict(
 
         // 0.4 — directory-level overlap (candidate's parent dir is a
         // prefix of the conflict path) but basenames did not match.
-        let candidate_parent = candidate_p
-            .parent()
-            .and_then(|p| p.to_str())
-            .unwrap_or("");
+        let candidate_parent = candidate_p.parent().and_then(|p| p.to_str()).unwrap_or("");
         if !candidate_parent.is_empty()
             && (conflict_path.starts_with(candidate_parent)
                 || conflict_parent.starts_with(candidate_parent))
@@ -482,8 +475,7 @@ async fn probe_conflicts(
     let predicted_collisions: Vec<PredictedCollision> = raw_collisions
         .into_iter()
         .map(|conflict| {
-            let confidence =
-                confidence_for_conflict(&conflict.file_path, &candidates, &hinted_set);
+            let confidence = confidence_for_conflict(&conflict.file_path, &candidates, &hinted_set);
             PredictedCollision {
                 conflict,
                 confidence,
@@ -792,8 +784,7 @@ mod tests {
             .iter()
             .map(|p| crate::executor::file_registry::normalize_path(p))
             .collect();
-        let hinted_set: std::collections::HashSet<String> =
-            hinted_normalized.iter().cloned().collect();
+        let hinted_set: std::collections::HashSet<String> = hinted_normalized.iter().cloned().collect();
 
         let mut candidates: Vec<String> = extracted.clone();
         let extracted_set: std::collections::HashSet<&String> = extracted.iter().collect();
@@ -814,8 +805,7 @@ mod tests {
         let predicted_collisions: Vec<PredictedCollision> = raw_collisions
             .into_iter()
             .map(|conflict| {
-                let confidence =
-                    confidence_for_conflict(&conflict.file_path, &candidates, &hinted_set);
+                let confidence = confidence_for_conflict(&conflict.file_path, &candidates, &hinted_set);
                 PredictedCollision {
                     conflict,
                     confidence,
