@@ -44,6 +44,24 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// Intentionally NOT `\r\n` (see [`TerminalSession::submit_prompt`]).
 const SUBMIT_ENTER: &[u8] = b"\r";
 
+/// Delay between the bracketed-paste block and the trailing submit keystroke.
+///
+/// **Why this exists:** the original `submit_prompt` wrote
+/// `\x1b[200~<msg>\x1b[201~\r` as four `write_all`s under a single locked
+/// writer with one final `flush`. From Claude Code's readline perspective
+/// these landed in one read cycle — its bracketed-paste handler consumed
+/// the begin/body/end and then ate the trailing `\r` as paste-tail bleed,
+/// never submitting. Empirically reproduced on §6 E2E 2026-05-10
+/// (`bracketed-paste-submit-doesnt-fully-submit.md`): brief visible in
+/// the input area, no `❯` cursor at the end, no working indicators, task
+/// stuck at `assigned`. A SEPARATE write of `\r` via `/terminals/{id}/write`
+/// did submit, confirming the issue is timing / single-read-cycle
+/// consumption, not the byte itself.
+///
+/// 150ms is enough for one Claude readline cycle on typical hardware.
+/// Tunable: bump if E2E shows submits still racing.
+const POST_PASTE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Build the exact byte sequence [`TerminalSession::submit_prompt`] writes.
 /// Exposed so tests (and the worker_session unit test) can assert the
 /// submit framing without spinning up a real PTY.
@@ -473,22 +491,45 @@ impl TerminalSession {
     /// after the end marker reliably triggers send. See Phase 6 §6
     /// remediation plan, Issue 1.
     pub fn submit_prompt(&self, message: &str) -> Result<(), String> {
+        // Phase 1: write the bracketed-paste block, flush, release the
+        // writer lock. The lock release lets concurrent reads on this
+        // pty (output drain) interleave during the post-paste delay.
+        {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|e| format!("Writer lock poisoned: {}", e))?;
+            writer
+                .write_all(BRACKETED_PASTE_BEGIN)
+                .map_err(|e| format!("Failed to write paste begin: {}", e))?;
+            writer
+                .write_all(message.as_bytes())
+                .map_err(|e| format!("Failed to write paste body: {}", e))?;
+            writer
+                .write_all(BRACKETED_PASTE_END)
+                .map_err(|e| format!("Failed to write paste end: {}", e))?;
+            writer
+                .flush()
+                .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+        } // writer lock released
+
+        // Sleep so Claude Code's readline can fully process the paste
+        // sequence BEFORE the submit byte arrives. Without this, the
+        // bracketed-paste handler consumes the trailing CR as paste-tail
+        // and never submits — see [`POST_PASTE_DELAY`] doc for the §6 E2E
+        // reproduction. Sync sleep is acceptable here; callers
+        // (`coordinator/act.rs::send_message_to_worker`) tolerate ~150ms
+        // blocking on the multi-threaded tokio runtime. Move to
+        // `tokio::task::spawn_blocking` if this ever goes hot-path.
+        std::thread::sleep(POST_PASTE_DELAY);
+
+        // Phase 2: bare CR (Enter) as a separate read cycle. Re-acquires
+        // the writer lock; if the worker pty has been closed in the
+        // meantime, this Err propagates cleanly.
         let mut writer = self
             .writer
             .lock()
             .map_err(|e| format!("Writer lock poisoned: {}", e))?;
-        // Each chunk is a separate write so the PTY consumer sees the
-        // boundary between the paste block and the trailing submit
-        // keystroke.
-        writer
-            .write_all(BRACKETED_PASTE_BEGIN)
-            .map_err(|e| format!("Failed to write paste begin: {}", e))?;
-        writer
-            .write_all(message.as_bytes())
-            .map_err(|e| format!("Failed to write paste body: {}", e))?;
-        writer
-            .write_all(BRACKETED_PASTE_END)
-            .map_err(|e| format!("Failed to write paste end: {}", e))?;
         writer
             .write_all(SUBMIT_ENTER)
             .map_err(|e| format!("Failed to write submit enter: {}", e))?;
