@@ -10,17 +10,21 @@ use serde::Serialize;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
 
-use crate::step_output::script_emitter::{self, EmitError, EmitResult};
+use crate::step_output::script_emitter::{self, DisabledReason, EmitError, EmitResult};
 
 /// Structured error shape returned to the TS shim on rejection. The shim
 /// maps any failure onto the truncation fallback; differentiating the
 /// reason lets the base handler emit the right `scripted_output.fallback`
-/// sub-event on the TS side.
+/// sub-event on the TS side, and lets manual-test agents see at a glance
+/// which gate is closed.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmitExtractionScriptError {
-    /// Short machine token: `cost_cap`, `token_budget`, `timeout`,
-    /// `breaker_open`, `disabled`, `llm_error`, `invalid_response`.
+    /// Short machine token. Stable values: `cost_cap`, `token_budget`,
+    /// `timeout`, `breaker_open`, `llm_error`, `invalid_response`, plus
+    /// the three flavours of disabled — `disabled_env` (env kill
+    /// switch), `disabled_settings` (`scripted_output.enabled = false`),
+    /// `disabled_no_credentials` (Auto cascade exhausted).
     pub kind: String,
     /// Human-readable message (already safe to log).
     pub message: String,
@@ -33,7 +37,7 @@ impl From<EmitError> for EmitExtractionScriptError {
             EmitError::TokenBudget { .. } => ("token_budget", err.to_string()),
             EmitError::Timeout { .. } => ("timeout", err.to_string()),
             EmitError::BreakerOpen => ("breaker_open", err.to_string()),
-            EmitError::Disabled => ("disabled", err.to_string()),
+            EmitError::Disabled { reason } => (disabled_kind(reason), err.to_string()),
             EmitError::LlmError(_) => ("llm_error", err.to_string()),
             EmitError::InvalidResponse(_) => ("invalid_response", err.to_string()),
         };
@@ -41,6 +45,17 @@ impl From<EmitError> for EmitExtractionScriptError {
             kind: kind.to_string(),
             message,
         }
+    }
+}
+
+/// Map a `DisabledReason` to the wire-level `kind` discriminator. Kept
+/// separate so callers grepping for the canonical token list above find
+/// the strings here too.
+fn disabled_kind(reason: &DisabledReason) -> &'static str {
+    match reason {
+        DisabledReason::EnvKillSwitch => "disabled_env",
+        DisabledReason::SettingsFlag => "disabled_settings",
+        DisabledReason::NoCredentials => "disabled_no_credentials",
     }
 }
 

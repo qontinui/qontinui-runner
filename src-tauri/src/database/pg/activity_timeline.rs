@@ -10,9 +10,31 @@ use super::PgDb;
 use crate::database::types::*;
 
 /// Compute normalized SHA-256 hash for consecutive-frame deduplication.
-fn content_hash(text: &str) -> String {
+///
+/// Hashes `(text_content, metadata_json)` together so events that share the
+/// same `text_content` but carry distinct metadata are NOT deduped.
+/// Screenshot-style callers (BackgroundObserver, Python bridge) pass
+/// `metadata_json: None` and so retain their original dedup behavior — two
+/// identical text captures within 30 s still collapse into one row.
+/// Event-stream callers (e.g. `scripted_output.llm_ok` from
+/// [`crate::step_output::script_emitter::spawn_activity_event`]) carry the
+/// real signal — token counts, cache stats — in `metadata_json`; including
+/// it here means three back-to-back emit events with different cache_read
+/// totals are stored as three distinct rows instead of being silently
+/// coalesced into one with an incremented `duplicate_count`.
+///
+/// `text_content` is normalized (trim + lowercase) to match the original
+/// screenshot dedup intent. `metadata_json` is hashed verbatim — JSON is
+/// case-sensitive and a re-emit produced by the same code path will be
+/// byte-identical (serde_json::to_string is deterministic for stable maps).
+fn content_hash(text: &str, metadata_json: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.trim().to_lowercase().as_bytes());
+    // Separator that can't appear in normalized text or in the metadata
+    // body — any 0x00 byte is invalid in JSON and the lowercase
+    // text_content is unicode-printable.
+    hasher.update(b"\0meta:");
+    hasher.update(metadata_json.unwrap_or("").as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -53,7 +75,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let hash = content_hash(&input.text_content);
+        let hash = content_hash(&input.text_content, input.metadata_json.as_deref());
 
         // Check for recent duplicate (30-second window)
         let dup = qontinui_db::queries::activity_timeline::find_recent_duplicate()
@@ -303,18 +325,28 @@ impl PgDb {
     }
 
     /// Return every `scripted_output` activity-timeline row's event name
-    /// (`text_content`) and `metadata_json`, optionally scoped to a single
-    /// `task_run_id`. Returns tuples `(text_content, metadata_json)` with
-    /// `metadata_json` as an optional JSON string.
+    /// (`text_content`), `metadata_json`, and `duplicate_count`, optionally
+    /// scoped to a single `task_run_id`. Returns tuples
+    /// `(text_content, metadata_json, occurrence_count)` where
+    /// `occurrence_count = 1 + duplicate_count` represents how many times the
+    /// row's event was emitted (one original + N suppressed dupes).
+    ///
+    /// `occurrence_count` is critical because [`insert_activity_entry`]
+    /// content-hash-dedups entries within a 30-s window: two identical
+    /// `(text, metadata)` events arrive as one row with `duplicate_count = 1`,
+    /// not as two separate rows. The aggregator must multiply per-row signals
+    /// by `occurrence_count` to recover accurate counts; otherwise rapid
+    /// emit calls with identical metadata (e.g. several
+    /// `scripted_output.llm_ok` events from the warm provider's cache-read
+    /// path) silently under-report.
     ///
     /// Used by the LLM-analytics scripted-output widget to aggregate per-run
-    /// counters. The query is a single indexed scan on `source_type`; the
-    /// caller aggregates in memory so we don't have to codegen a bespoke
-    /// clorinde query for a one-off dashboard surface.
+    /// counters. Single indexed scan on `source_type`; the caller aggregates
+    /// in memory.
     pub async fn get_scripted_output_rows(
         &self,
         task_run_id: Option<&str>,
-    ) -> Result<Vec<(String, Option<String>)>, String> {
+    ) -> Result<Vec<(String, Option<String>, u64)>, String> {
         let conn = self
             .pool
             .get()
@@ -323,7 +355,7 @@ impl PgDb {
 
         let rows = if let Some(tr) = task_run_id {
             conn.query(
-                "SELECT text_content, metadata_json \
+                "SELECT text_content, metadata_json, duplicate_count \
                  FROM activity_timeline \
                  WHERE source_type = 'scripted_output' \
                    AND NOT is_deleted \
@@ -334,7 +366,7 @@ impl PgDb {
             .map_err(|e| format!("PG get_scripted_output_rows(task_run): {}", e))?
         } else {
             conn.query(
-                "SELECT text_content, metadata_json \
+                "SELECT text_content, metadata_json, duplicate_count \
                  FROM activity_timeline \
                  WHERE source_type = 'scripted_output' \
                    AND NOT is_deleted",
@@ -349,7 +381,12 @@ impl PgDb {
             .map(|row| {
                 let text: String = row.get(0);
                 let meta: Option<String> = row.get(1);
-                (text, meta)
+                let dup: i32 = row.get(2);
+                // occurrence_count = 1 (the original) + N suppressed dupes.
+                // Saturate at i32::MAX cast — a row representing >2B emits
+                // is implausible but we don't want to panic on overflow.
+                let occurrences = 1u64.saturating_add(dup.max(0) as u64);
+                (text, meta, occurrences)
             })
             .collect())
     }
@@ -377,22 +414,82 @@ mod tests {
 
     #[test]
     fn test_content_hash_deterministic() {
-        let h1 = content_hash("Hello world");
-        let h2 = content_hash("Hello world");
+        let h1 = content_hash("Hello world", None);
+        let h2 = content_hash("Hello world", None);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn test_content_hash_normalized() {
-        let h1 = content_hash("  Hello World  ");
-        let h2 = content_hash("hello world");
+        let h1 = content_hash("  Hello World  ", None);
+        let h2 = content_hash("hello world", None);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn test_content_hash_different() {
-        let h1 = content_hash("Hello");
-        let h2 = content_hash("World");
+        let h1 = content_hash("Hello", None);
+        let h2 = content_hash("World", None);
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_content_hash_metadata_distinguishes_same_text() {
+        // The bug this fixes: three rapid `scripted_output.llm_ok` events
+        // share text_content but carry distinct cache_read_tokens in
+        // metadata_json. Pre-fix they collided on the 30-s dedup and
+        // calls 2..N were silently coalesced; post-fix they produce
+        // distinct hashes.
+        let text = "scripted_output.llm_ok";
+        let h_creation = content_hash(
+            text,
+            Some(r#"{"cache_creation_tokens":6697,"cache_read_tokens":0}"#),
+        );
+        let h_read = content_hash(
+            text,
+            Some(r#"{"cache_creation_tokens":0,"cache_read_tokens":6697}"#),
+        );
+        assert_ne!(
+            h_creation, h_read,
+            "events with same text but different metadata must NOT dedup"
+        );
+    }
+
+    #[test]
+    fn test_content_hash_identical_metadata_still_dedups() {
+        // Truly identical re-emits (same text, same metadata) still
+        // collapse — preserves the original 30-s screenshot-dedup intent.
+        let h1 = content_hash("scripted_output.cache_hit", Some(r#"{"tier":1}"#));
+        let h2 = content_hash("scripted_output.cache_hit", Some(r#"{"tier":1}"#));
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_content_hash_none_metadata_preserves_screenshot_dedup() {
+        // BackgroundObserver and the Python bridge both pass
+        // metadata_json: None — two identical text captures within 30 s
+        // must still produce the same hash so they dedup.
+        let h1 = content_hash("captured screen text", None);
+        let h2 = content_hash("captured screen text", None);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_content_hash_none_vs_empty_metadata_are_equivalent() {
+        // None and Some("") both represent "no metadata"; they must hash
+        // identically so a caller migrating from one to the other
+        // doesn't accidentally suppress dedup.
+        let h_none = content_hash("event", None);
+        let h_empty = content_hash("event", Some(""));
+        assert_eq!(h_none, h_empty);
+    }
+
+    #[test]
+    fn test_content_hash_separator_prevents_field_smushing() {
+        // Without a delimiter, ("ab", None) and ("a", Some("b"))
+        // could collide. The "\0meta:" separator prevents that.
+        let h_smushed = content_hash("ab", None);
+        let h_split = content_hash("a", Some("b"));
+        assert_ne!(h_smushed, h_split);
     }
 }

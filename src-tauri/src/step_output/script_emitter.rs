@@ -144,15 +144,59 @@ pub enum EmitError {
     /// The shared Claude API circuit breaker is Open.
     #[error("LLM circuit breaker is open")]
     BreakerOpen,
-    /// The global kill switch (env var or settings flag) is off.
-    #[error("scripted output path is disabled")]
-    Disabled,
+    /// The emitter cannot run for one of three reasons. Split out from a
+    /// single opaque `Disabled` so testing agents (and the panel) can
+    /// distinguish "feature off via env" from "feature off via settings"
+    /// from "Auto path tried every credential lane and found nothing
+    /// usable" — those have different remediations.
+    #[error("scripted output path is disabled: {reason}")]
+    Disabled {
+        /// Stable machine token; mirrored verbatim into the
+        /// `EmitExtractionScriptError.kind` wire field.
+        reason: DisabledReason,
+    },
     /// LLM returned an error response (network, auth, etc.).
     #[error("LLM error: {0}")]
     LlmError(String),
     /// LLM response didn't include a usable `expression` field.
     #[error("invalid LLM response: {0}")]
     InvalidResponse(String),
+}
+
+/// The specific reason an emitter call returned `EmitError::Disabled`.
+///
+/// `Display` gives the human-readable form (used in `error.message`);
+/// the serialized lowercase tag is the stable machine discriminator
+/// surfaced as `EmitExtractionScriptError.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisabledReason {
+    /// `QONTINUI_SCRIPTED_OUTPUT` env var is not `"1"`. Set the env var
+    /// at process spawn (e.g. `extra_env` on the supervisor's
+    /// `POST /runners/spawn-test`) and respawn — env vars are not
+    /// hot-reloadable.
+    EnvKillSwitch,
+    /// `scripted_output.enabled` setting is `false`. Flip it on via
+    /// Settings UI / `set_setting` Tauri command — no respawn needed.
+    SettingsFlag,
+    /// `Auto` provider mode tried every credential lane (warm Claude,
+    /// Gemma local) and found none usable. Provision an
+    /// `ANTHROPIC_API_KEY`, log into the Claude CLI to populate
+    /// `.credentials.json`, or start a local llama.cpp Gemma server.
+    NoCredentials,
+}
+
+impl std::fmt::Display for DisabledReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DisabledReason::EnvKillSwitch => "env kill switch QONTINUI_SCRIPTED_OUTPUT is not '1'",
+            DisabledReason::SettingsFlag => "scripted_output.enabled setting is false",
+            DisabledReason::NoCredentials => {
+                "no Claude credential or Gemma local endpoint available on the Auto cascade"
+            }
+        };
+        f.write_str(s)
+    }
 }
 
 // ============================================================================
@@ -211,12 +255,16 @@ pub async fn emit_extraction_script(
     if !env_kill_switch_on() {
         debug!("scripted-output emitter disabled via env kill switch");
         emit_fallback_event(&task_run_id, "disabled");
-        return Err(EmitError::Disabled);
+        return Err(EmitError::Disabled {
+            reason: DisabledReason::EnvKillSwitch,
+        });
     }
     if !settings_flag_on() {
         debug!("scripted-output emitter disabled via settings flag");
         emit_fallback_event(&task_run_id, "disabled");
-        return Err(EmitError::Disabled);
+        return Err(EmitError::Disabled {
+            reason: DisabledReason::SettingsFlag,
+        });
     }
 
     // -------------------------------------------------------- 2. Tier 1 cache
@@ -363,7 +411,9 @@ pub async fn emit_extraction_script(
                         }
                     );
                     emit_fallback_event(&task_run_id, "disabled");
-                    return Err(EmitError::Disabled);
+                    return Err(EmitError::Disabled {
+                        reason: DisabledReason::NoCredentials,
+                    });
                 }
                 ScriptedOutputProviderMode::ClaudeApiWarm => {
                     warn!(
@@ -797,30 +847,38 @@ fn response_schema() -> serde_json::Value {
 /// Compose the prompt as a `(system_prefix, user_message)` pair.
 ///
 /// The `system_prefix` is stable across emit calls and is deliberately
-/// fattened with worked examples so it crosses Anthropic's Haiku caching
-/// minimum. Haiku 3.x accepted ~1024 tokens (~4000 chars); Haiku 4.x
-/// raised the floor to ~2048 tokens (~8000 chars). Below that threshold
-/// `cache_control: ephemeral` is silently ignored and the warm provider
-/// pays the uncached rate on every call — confirmed empirically against
-/// `claude-haiku-4-5-20251001` on 2026-04-22 (cache_marker=true but
-/// `cache_read_input_tokens=0` on repeat calls).
+/// fattened with worked examples so it crosses Anthropic's per-model
+/// caching minimum on the warm emitter's pinned model (Haiku 4.x by
+/// default — see [`DEFAULT_MODEL`]). Per Anthropic's published table
+/// (<https://docs.claude.com/en/docs/build-with-claude/prompt-caching>),
+/// the per-model floors are: Sonnet/Opus 1024 tokens (~4096 chars),
+/// Haiku 3.x 2048 tokens (~8192 chars), Haiku 4.x 4096 tokens
+/// (~16384 chars). Below the floor, `cache_control: ephemeral` is
+/// silently ignored and the warm provider pays the uncached rate on
+/// every call — the threshold check itself lives in
+/// [`crate::ai_provider::cache_aware_builder::min_cacheable_chars`],
+/// and the test below pins the prefix length to that function so the
+/// prompt and the threshold can't drift apart.
 ///
 /// The `user_message` carries the per-call dynamic payload — goal,
 /// schema hint, output preview — which changes every call and must not
 /// be part of the cached prefix.
 ///
-/// **Versioning.** The trailing `Emitter system v2` line makes intentional
+/// **Versioning.** The trailing `Emitter system v3` line makes intentional
 /// preamble bumps invalidate the cache cleanly (distinct bytes → distinct
-/// cache key) instead of waiting for the 5-minute TTL.
+/// cache key) instead of waiting for the 5-minute TTL. v3 was the
+/// fattening pass that crossed Haiku 4.5's 16384-char floor.
 fn build_prompt_split(
     goal: &str,
     schema_hint: &serde_json::Value,
     output_preview: &str,
 ) -> (String, String) {
-    // The stable prefix. Fattened with 13 worked examples to cross the
-    // ~2048-token (~8000 char) Haiku 4.x caching minimum with margin.
-    // Counted once at write time and asserted in tests — don't shrink
-    // without rechecking the bound against current Haiku cache telemetry.
+    // The stable prefix. Fattened with 27 worked examples to cross
+    // Haiku 4.x's 16384-char (~4096-token) caching minimum with margin.
+    // Counted once at write time and asserted in `tests::
+    // build_prompt_split_meets_cache_threshold` against
+    // `min_cacheable_chars(DEFAULT_MODEL)` — don't shrink without
+    // rechecking that the bound still passes for the pinned model.
     let system_prefix = concat!(
         "You synthesize a single-line JavaScript expression that, given a ",
         "variable `output` (a string containing the raw stdout of a shell/step ",
@@ -911,6 +969,76 @@ fn build_prompt_split(
         "schemaHint: {\"keys\": {\"error_ips\": \"string[]\", \"error_ip_count\": \"number\"}}\n",
         "outputPreview: \"10.0.0.12 - - [21/Apr/2026:09:02:10] \\\"GET /api/a HTTP/1.1\\\" 200 1244\\n10.0.0.55 - - [21/Apr/2026:09:02:11] \\\"GET /api/b HTTP/1.1\\\" 502 41\\n10.0.0.12 - - [21/Apr/2026:09:02:13] \\\"GET /api/c HTTP/1.1\\\" 503 44\\n10.0.0.91 - - [21/Apr/2026:09:02:14] \\\"GET /api/d HTTP/1.1\\\" 200 1200\\n10.0.0.55 - - [21/Apr/2026:09:02:15] \\\"GET /api/b HTTP/1.1\\\" 500 47\\n\"\n",
         "expression: (((ips) => ({error_ips: ips, error_ip_count: ips.length}))(Array.from(new Set(output.split(/\\r?\\n/).filter(l => /\"\\s+5\\d{2}\\s/.test(l)).map(l => (l.match(/^(\\d+\\.\\d+\\.\\d+\\.\\d+)/) || [])[1]).filter(Boolean))).slice(0, 50)))\n\n",
+        "### Example 14 — extract sha256 hashes from a checksum file\n",
+        "goal: collect every sha256 digest, paired with its filename\n",
+        "schemaHint: {\"keys\": {\"sums\": \"Array<{file: string, sha256: string}>\"}}\n",
+        "outputPreview: \"5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8  README.md\\n2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae  build.sh\\n# blank lines and comments are tolerated\\n\\n9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7  dist/index.js\\n\"\n",
+        "expression: ({sums: output.split(/\\r?\\n/).map(l => l.match(/^([0-9a-f]{64})\\s+(.+)$/i)).filter(Boolean).map(m => ({file: m[2].trim(), sha256: m[1].toLowerCase()})).slice(0, 50)})\n\n",
+        "### Example 15 — CSV second-column values\n",
+        "goal: list every value in the `email` column from a CSV (header row first)\n",
+        "schemaHint: {\"keys\": {\"emails\": \"string[]\"}}\n",
+        "outputPreview: \"id,email,role\\n12,alice@example.com,admin\\n47,bob@example.com,member\\n91,carol@example.com,member\\n\"\n",
+        "expression: (((rows, hdr) => ({emails: (() => { const i = hdr.indexOf('email'); return i < 0 ? [] : rows.slice(1).map(r => (r.split(',')[i] || '').trim()).filter(Boolean).slice(0, 50); })()}))((output.split(/\\r?\\n/).filter(Boolean)), ((output.split(/\\r?\\n/)[0] || '').split(',').map(s => s.trim()))))\n\n",
+        "### Example 16 — total size from `du -sh *`\n",
+        "goal: sum the human-readable sizes (assume MB only) into a single number\n",
+        "schemaHint: {\"keys\": {\"total_mb\": \"number\"}}\n",
+        "outputPreview: \"12M\\tdist\\n4.2M\\tnode_modules\\n  812K\\tsrc\\n0\\ttmp\\n98M\\ttarget\\n\"\n",
+        "expression: ({total_mb: Number(output.split(/\\r?\\n/).map(l => l.trim().match(/^([\\d.]+)([KMG]?)/)).filter(Boolean).reduce((acc, m) => acc + (Number(m[1]) * (m[2] === 'G' ? 1024 : m[2] === 'K' ? 1/1024 : m[2] === 'M' ? 1 : 0)), 0).toFixed(2))})\n\n",
+        "### Example 17 — last N lines of output (tail emulation)\n",
+        "goal: return the last 5 non-empty lines as an array, oldest first\n",
+        "schemaHint: {\"keys\": {\"tail\": \"string[]\"}}\n",
+        "outputPreview: \"line a\\nline b\\nline c\\n\\nline d\\nline e\\nline f\\nline g\\nline h\\n\"\n",
+        "expression: ({tail: output.split(/\\r?\\n/).filter(l => l.length > 0).slice(-5)})\n\n",
+        "### Example 18 — strip ANSI color codes\n",
+        "goal: return the raw output with all ANSI escape sequences removed\n",
+        "schemaHint: {\"keys\": {\"plain\": \"string\"}}\n",
+        "outputPreview: \"\\u001b[32mPASS\\u001b[0m tests/api.test.ts\\n\\u001b[31mFAIL\\u001b[0m tests/db.test.ts\\n\"\n",
+        "expression: ({plain: output.replace(/\\u001b\\[[0-9;]*[A-Za-z]/g, '').slice(0, 4000)})\n\n",
+        "### Example 19 — service health from `systemctl status`\n",
+        "goal: report whether the Active line says `active (running)` and the loaded unit path\n",
+        "schemaHint: {\"keys\": {\"active\": \"boolean\", \"unit_path\": \"string\"}}\n",
+        "outputPreview: \"\\u25cf nginx.service - A high performance web server\\n     Loaded: loaded (/lib/systemd/system/nginx.service; enabled; preset: enabled)\\n     Active: active (running) since Mon 2026-04-21 09:00:11 UTC; 2h ago\\n\"\n",
+        "expression: ({active: /\\bActive:\\s*active\\s*\\(running\\)/i.test(output), unit_path: (((output.match(/Loaded:\\s+loaded\\s*\\(([^;]+);/) || [])[1]) || '').trim()})\n\n",
+        "### Example 20 — memory %used from `free -m`\n",
+        "goal: compute used / total memory as a 0-100 integer percent\n",
+        "schemaHint: {\"keys\": {\"used_pct\": \"number\"}}\n",
+        "outputPreview: \"               total        used        free      shared  buff/cache   available\\nMem:           15891        9234        1102         210        5555        6201\\nSwap:           2047           0        2047\\n\"\n",
+        "expression: ({used_pct: (((m) => m && m[2] && m[1] ? Math.round((Number(m[2]) / Number(m[1])) * 100) : 0))(output.split(/\\r?\\n/).find(l => /^Mem:/.test(l))?.match(/^Mem:\\s+(\\d+)\\s+(\\d+)/) || null)})\n\n",
+        "### Example 21 — sum a numeric column\n",
+        "goal: sum the third whitespace-delimited column across all data rows (skip header)\n",
+        "schemaHint: {\"keys\": {\"total\": \"number\"}}\n",
+        "outputPreview: \"name        kind   bytes\\nalpha       file   1024\\nbeta        file    512\\ngamma       dir       0\\ndelta       file   2048\\n\"\n",
+        "expression: ({total: output.split(/\\r?\\n/).slice(1).map(l => Number((l.trim().split(/\\s+/)[2] || '0'))).filter(n => Number.isFinite(n)).reduce((a, b) => a + b, 0)})\n\n",
+        "### Example 22 — top-3 most frequent log levels\n",
+        "goal: count occurrences of each log level and return the top 3 levels by count\n",
+        "schemaHint: {\"keys\": {\"top\": \"Array<{level: string, count: number}>\"}}\n",
+        "outputPreview: \"2026-04-21 INFO  ready\\n2026-04-21 WARN  slow\\n2026-04-21 INFO  ok\\n2026-04-21 ERROR fail\\n2026-04-21 INFO  ok\\n2026-04-21 WARN  slow\\n2026-04-21 INFO  ok\\n2026-04-21 DEBUG trace\\n\"\n",
+        "expression: ({top: Object.entries(output.split(/\\r?\\n/).map(l => (l.match(/\\b(DEBUG|INFO|WARN|ERROR|FATAL)\\b/) || [])[1]).filter(Boolean).reduce((acc, lvl) => { acc[lvl] = (acc[lvl] || 0) + 1; return acc; }, {})).map(([level, count]) => ({level, count})).sort((a, b) => b.count - a.count).slice(0, 3)})\n\n",
+        "### Example 23 — first ISO-8601 timestamp\n",
+        "goal: return the first ISO-8601 timestamp in the output (with or without timezone)\n",
+        "schemaHint: {\"keys\": {\"timestamp\": \"string\"}}\n",
+        "outputPreview: \"started job at 2026-04-21T09:02:10.451Z (took 1.2s)\\nfinished at 2026-04-21T09:02:11.701+00:00\\n\"\n",
+        "expression: ({timestamp: ((output.match(/\\b(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:?\\d{2})?)\\b/) || [])[1]) || ''})\n\n",
+        "### Example 24 — strip a fixed prefix from each line\n",
+        "goal: return every line with the leading `[runner] ` prefix removed (preserve other lines verbatim)\n",
+        "schemaHint: {\"keys\": {\"lines\": \"string[]\"}}\n",
+        "outputPreview: \"[runner] booting\\n[runner] connected\\n[supervisor] ok\\n[runner] ready\\n\"\n",
+        "expression: ({lines: output.split(/\\r?\\n/).filter(Boolean).map(l => l.startsWith('[runner] ') ? l.slice(9) : l).slice(0, 50)})\n\n",
+        "### Example 25 — tar listing (file paths only, no metadata)\n",
+        "goal: list the file paths from `tar -tvf` output (skip directories ending in `/`)\n",
+        "schemaHint: {\"keys\": {\"paths\": \"string[]\"}}\n",
+        "outputPreview: \"-rw-r--r-- jq/jq        1024 2026-04-21 09:00 dist/index.js\\ndrwxr-xr-x jq/jq           0 2026-04-21 09:00 dist/\\n-rw-r--r-- jq/jq         512 2026-04-21 09:00 dist/style.css\\n\"\n",
+        "expression: ({paths: output.split(/\\r?\\n/).filter(l => l.startsWith('-')).map(l => l.trim().split(/\\s+/).slice(5).join(' ')).filter(p => p && !p.endsWith('/')).slice(0, 50)})\n\n",
+        "### Example 26 — SQL EXPLAIN total cost\n",
+        "goal: extract the topmost `cost=...rows=...` totals from a Postgres EXPLAIN block\n",
+        "schemaHint: {\"keys\": {\"cost\": \"number\", \"rows\": \"number\"}}\n",
+        "outputPreview: \"Seq Scan on big_table  (cost=0.00..38421.50 rows=120000 width=64)\\n  Filter: (created_at > now() - '7 days'::interval)\\n\"\n",
+        "expression: ({cost: Number(((output.match(/cost=[\\d.]+\\.\\.([\\d.]+)\\s+rows=/) || [])[1]) || 0), rows: Number(((output.match(/cost=[^\\s]+\\s+rows=(\\d+)/) || [])[1]) || 0)})\n\n",
+        "### Example 27 — listening ports from `ss -tlnp`\n",
+        "goal: collect every TCP port the host is listening on, deduped and sorted ascending\n",
+        "schemaHint: {\"keys\": {\"ports\": \"number[]\"}}\n",
+        "outputPreview: \"State    Recv-Q Send-Q  Local Address:Port    Peer Address:Port\\nLISTEN   0      128            0.0.0.0:22             0.0.0.0:*\\nLISTEN   0      128                  *:443                  *:*\\nLISTEN   0      128          127.0.0.1:5432           0.0.0.0:*\\nLISTEN   0      128                  *:80                   *:*\\n\"\n",
+        "expression: ({ports: Array.from(new Set(output.split(/\\r?\\n/).slice(1).map(l => Number(((l.match(/[:.](\\d+)\\s+/) || [])[1]) || 0)).filter(n => n > 0))).sort((a, b) => a - b).slice(0, 50)})\n\n",
         "## Response format\n\n",
         "Respond ONLY with a single JSON object matching {\"expression\": \"<js>\"} via the supplied tool. Do not wrap in prose. Do not emit multiple tool calls. Keep the expression on a single line.\n\n",
         "## Anti-patterns to avoid\n\n",
@@ -918,8 +1046,12 @@ fn build_prompt_split(
         "- Do not use `eval`, `Function`, or dynamic code construction — the sandbox disallows them.\n",
         "- Do not access globals like `process`, `require`, `fetch`, `window`, `document` — they are not in scope.\n",
         "- Do not assume the preview is the full `output` at runtime — `output` may be longer.\n",
-        "- Do not rely on regex flags other than `g`, `i`, `m`, `s`, `u` — other flags are not guaranteed.\n\n",
-        "Emitter system v2"
+        "- Do not rely on regex flags other than `g`, `i`, `m`, `s`, `u` — other flags are not guaranteed.\n",
+        "- Do not return `undefined` or `null` for missing fields when the schema asks for a string — use `''`. Same for arrays — return `[]`, not `undefined`.\n",
+        "- Do not call `String.prototype.matchAll` without spreading the result — the sandbox returns an iterator that won't auto-serialise. Use `Array.from(s.matchAll(...))` if you need every match.\n",
+        "- Do not assume any specific locale for number parsing — `Number('1,234')` is `NaN`. Strip non-digits first if the source uses thousands separators.\n",
+        "- Do not call `output.match` then index without `||`-fallback — if the regex misses, `match` returns `null` and any `[1]` access throws.\n\n",
+        "Emitter system v3"
     );
 
     let user_message = format!(
@@ -1267,34 +1399,39 @@ mod tests {
     fn build_prompt_split_meets_cache_threshold() {
         let hint = serde_json::json!({"keys": {"a": "string"}});
         let (system_prefix, _user) = build_prompt_split("some goal", &hint, "some preview");
-        // Plan decision 4: the system_prefix must cross Anthropic's
-        // Haiku caching minimum or `cache_control: ephemeral` is a no-op.
-        // Haiku 3.x was ~1024 tokens (~4000 chars); Haiku 4.x raised the
-        // floor to ~2048 tokens (~8000 chars) — confirmed against
-        // `claude-haiku-4-5-20251001` on 2026-04-22 where a 5943-char
-        // prefix produced `cache_read_input_tokens=0` on repeat calls.
-        // If a future Haiku revision raises the minimum again and real
-        // telemetry shows a zero cache_read rate, bump examples further
-        // and update this bound.
+        // Decision 4 / Option A: the system_prefix must cross Anthropic's
+        // per-model caching minimum (per <https://docs.claude.com/en/docs/
+        // build-with-claude/prompt-caching>) for the model the warm
+        // emitter pins to, or `cache_control: ephemeral` is silently
+        // ignored and the warm provider pays the uncached rate every call.
+        //
+        // Pin the assertion to `min_cacheable_chars(DEFAULT_MODEL)` so the
+        // prefix length and the threshold check stay in sync — if anyone
+        // changes DEFAULT_MODEL to a family with a different floor, this
+        // test catches it without needing a manual edit.
+        let threshold = crate::ai_provider::cache_aware_builder::min_cacheable_chars(DEFAULT_MODEL);
         assert!(
-            system_prefix.len() >= 8000,
-            "system_prefix length {} is under the 8000-char Haiku 4.x cache threshold",
-            system_prefix.len()
+            system_prefix.len() >= threshold,
+            "system_prefix length {} is under the {}-char cache threshold for DEFAULT_MODEL={:?}",
+            system_prefix.len(),
+            threshold,
+            DEFAULT_MODEL
         );
     }
 
     #[test]
     fn build_prompt_split_contains_version_suffix() {
         let (system_prefix, _user) = build_prompt_split("g", &serde_json::json!({}), "p");
-        // The trailing `Emitter system v2` marker lets intentional
+        // The trailing `Emitter system v3` marker lets intentional
         // preamble bumps invalidate the cache cleanly instead of
-        // waiting for the 5-minute TTL.
+        // waiting for the 5-minute TTL. v3 = the fattening pass that
+        // crossed Haiku 4.5's 16384-char floor.
         assert!(
-            system_prefix.trim_end().ends_with("Emitter system v2"),
+            system_prefix.trim_end().ends_with("Emitter system v3"),
             "system_prefix should end with the version suffix; got tail: {:?}",
             &system_prefix[system_prefix.len().saturating_sub(64)..]
         );
-        assert!(system_prefix.contains("Emitter system v2"));
+        assert!(system_prefix.contains("Emitter system v3"));
     }
 
     #[test]

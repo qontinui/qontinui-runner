@@ -608,3 +608,223 @@ mod tests {
         let _ = pg_db.clear_files_touched(&prior_editor).await;
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
+//
+// `probe_conflicts` is the composition of three independently-testable
+// pieces: `FileRegistryManager.info()`, `extract_candidate_paths`, and
+// `PgDb.get_sessions_for_files()`. The handler itself is a fan-in — its
+// `Arc<ApiState>` argument is impractical to construct in a unit test
+// (30+ fields including `tauri::AppHandle`). These integration tests
+// instead drive the same composition the handler does, against a real
+// `FileRegistryManager` and a real `PgDb`. The result is the same
+// `ConflictReport` the handler would produce; gating on
+// `#[ignore = "requires PG via DATABASE_URL"]` matches the convention
+// established in `database/pg/session_touched_files.rs::tests`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::pg::PgDb;
+    use crate::executor::file_registry::FileRegistryManager;
+
+    /// Build the same `ConflictReport` the HTTP handler would build, using
+    /// real backing collaborators. Mirrors `probe_conflicts` exactly so any
+    /// drift would surface here first.
+    async fn build_report(
+        registry: &FileRegistryManager,
+        pg_db: &PgDb,
+        prompt: Option<&str>,
+        cwd: &str,
+    ) -> ConflictReport {
+        let live_holdings = registry.info().await;
+
+        let candidates = crate::util::path_extraction::extract_candidate_paths(prompt, cwd);
+
+        let predicted_collisions = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            registry
+                .check_conflicts_for_files(&candidates, "<probe>", None)
+                .await
+        };
+
+        let recent_editors = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            pg_db
+                .get_sessions_for_files(&candidates)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(file_path, task_run_id)| RecentEditor {
+                    file_path,
+                    task_run_id,
+                })
+                .collect()
+        };
+
+        ConflictReport {
+            live_holdings,
+            predicted_collisions,
+            recent_editors,
+            extracted_candidates: candidates,
+        }
+    }
+
+    fn unique_task_run_id(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!(
+            "test-probe-{}-{}-{:?}",
+            label,
+            nanos,
+            std::thread::current().id()
+        )
+    }
+
+    /// Connect to the test PG instance from inside an async test. We can't
+    /// reuse `PgDb::new_blocking_for_test()` here because it calls
+    /// `rt.block_on(...)` and `#[tokio::test]` is already inside a runtime,
+    /// which `tokio::Runtime::new().block_on(...)` rejects with
+    /// "Cannot start a runtime from within a runtime."
+    async fn pg_for_test() -> std::sync::Arc<PgDb> {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost:5432/qontinui_test".to_string());
+        std::sync::Arc::new(PgDb::new(&url).await.expect("PgDb connection for test"))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn probe_conflicts_empty_prompt_empty_registry() {
+        let registry = FileRegistryManager::new();
+        let pg_db = pg_for_test().await;
+
+        let report = build_report(&registry, &pg_db, None, "/repo").await;
+
+        assert!(report.live_holdings.is_empty());
+        assert!(report.predicted_collisions.is_empty());
+        assert!(report.recent_editors.is_empty());
+        assert!(report.extracted_candidates.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn probe_conflicts_predicts_live_collision() {
+        use crate::executor::file_registry::normalize_path;
+
+        let registry = FileRegistryManager::new();
+        let pg_db = pg_for_test().await;
+
+        let holder_task = unique_task_run_id("holder");
+        let probed_path = "/repo/src/lib.rs";
+
+        // One session holds the file under the registry. The probe should
+        // surface it under `predicted_collisions` once the prompt mentions
+        // the matching path.
+        let conflicts_at_register = registry
+            .register(
+                &[probed_path.to_string()],
+                &holder_task,
+                "Holder Workflow",
+                None,
+            )
+            .await;
+        assert!(
+            conflicts_at_register.is_empty(),
+            "first registration should be conflict-free"
+        );
+
+        let report = build_report(
+            &registry,
+            &pg_db,
+            Some("please edit /repo/src/lib.rs to add logging"),
+            "/repo",
+        )
+        .await;
+
+        let normalized = normalize_path(probed_path);
+
+        assert!(
+            report.extracted_candidates.contains(&normalized),
+            "extractor should have produced {:?}, got {:?}",
+            normalized,
+            report.extracted_candidates
+        );
+        assert_eq!(
+            report.predicted_collisions.len(),
+            1,
+            "expected one predicted collision, got {:?}",
+            report.predicted_collisions
+        );
+        assert_eq!(report.predicted_collisions[0].file_path, normalized);
+        assert_eq!(
+            report.predicted_collisions[0].other_holders.len(),
+            1,
+            "expected one other holder"
+        );
+        assert_eq!(
+            report.predicted_collisions[0].other_holders[0].task_run_id,
+            holder_task
+        );
+
+        // Cleanup so reruns are deterministic.
+        registry.release_all(&holder_task).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn probe_conflicts_surfaces_recent_editor_when_no_live_holder() {
+        use crate::executor::file_registry::normalize_path;
+
+        let registry = FileRegistryManager::new();
+        let pg_db = pg_for_test().await;
+
+        // Pick a path that's unique to this test run so we don't collide
+        // with leftover rows in `coord.session_touched_files`.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let probed_path = format!("/repo/src/feature_{}.rs", nanos);
+        let normalized = normalize_path(&probed_path);
+
+        let prior_editor = unique_task_run_id("prior-editor");
+
+        // Stage a row in session_touched_files but *do not* register the
+        // file in the live registry. The probe should report this under
+        // `recent_editors` while `predicted_collisions` stays empty.
+        pg_db
+            .record_file_touched(&prior_editor, &probed_path, None)
+            .await
+            .expect("record_file_touched");
+
+        // Avoid a Some(_) check that would also match unrelated rows: ask
+        // the probe with the unique path in the prompt.
+        let prompt = format!("please touch {} again", probed_path);
+        let report = build_report(&registry, &pg_db, Some(&prompt), "").await;
+
+        assert!(
+            report.predicted_collisions.is_empty(),
+            "no live holder → no predicted collisions, got {:?}",
+            report.predicted_collisions
+        );
+        assert!(
+            report
+                .recent_editors
+                .iter()
+                .any(|e| e.file_path == normalized && e.task_run_id == prior_editor),
+            "expected recent_editor for {} with task_run_id {}, got {:?}",
+            normalized,
+            prior_editor,
+            report.recent_editors
+        );
+
+        // Cleanup so reruns are deterministic.
+        let _ = pg_db.clear_files_touched(&prior_editor).await;
+    }
+}

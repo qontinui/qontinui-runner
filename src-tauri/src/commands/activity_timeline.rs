@@ -221,40 +221,69 @@ pub async fn get_scripted_output_stats(
         cache_read_tokens: 0,
     };
 
-    for (text_content, metadata_json) in rows {
+    for (text_content, metadata_json, occurrences) in rows {
         // Parse metadata lazily — many events have None or unparseable JSON.
         let meta: Option<serde_json::Value> = metadata_json
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
 
+        // Each row in activity_timeline can represent multiple emit
+        // occurrences when content-hash dedup collapsed identical
+        // events within the 30-s window (see
+        // `database::pg::activity_timeline::insert_activity_entry`). The
+        // `occurrences` field is `1 + duplicate_count`, i.e. how many
+        // emits this row stands for. Multiply per-row counts and per-row
+        // signals (token sums) by `occurrences` to recover the true
+        // total. Pre-fix this was 1 unconditionally — under rapid-fire
+        // emits with identical metadata (e.g. several
+        // `scripted_output.llm_ok` events from the warm provider's
+        // cache-read path) the panel under-reported by 60-90 %.
         match text_content.as_str() {
-            "scripted_output.attempted" => stats.attempted += 1,
-            "scripted_output.cache_hit" => stats.cache_hit += 1,
-            "scripted_output.worker_ok" => stats.worker_ok += 1,
+            "scripted_output.attempted" => {
+                stats.attempted = stats.attempted.saturating_add(occurrences)
+            }
+            "scripted_output.cache_hit" => {
+                stats.cache_hit = stats.cache_hit.saturating_add(occurrences)
+            }
+            "scripted_output.worker_ok" => {
+                stats.worker_ok = stats.worker_ok.saturating_add(occurrences)
+            }
             "scripted_output.bytes_avoided" => {
                 if let Some(n) = meta.as_ref().and_then(read_bytes_avoided) {
-                    stats.bytes_avoided = stats.bytes_avoided.saturating_add(n);
+                    stats.bytes_avoided = stats
+                        .bytes_avoided
+                        .saturating_add(n.saturating_mul(occurrences));
                 }
             }
             "scripted_output.llm_ok" => {
-                stats.llm_ok += 1;
+                stats.llm_ok = stats.llm_ok.saturating_add(occurrences);
                 if let Some(m) = meta.as_ref() {
                     if let Some(n) = m.get("tokens_in").and_then(|v| v.as_u64()) {
-                        stats.total_tokens_in = stats.total_tokens_in.saturating_add(n);
+                        stats.total_tokens_in = stats
+                            .total_tokens_in
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                     if let Some(n) = m.get("tokens_out").and_then(|v| v.as_u64()) {
-                        stats.total_tokens_out = stats.total_tokens_out.saturating_add(n);
+                        stats.total_tokens_out = stats
+                            .total_tokens_out
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                     if let Some(n) = m.get("cache_creation_tokens").and_then(|v| v.as_u64()) {
-                        stats.cache_creation_tokens = stats.cache_creation_tokens.saturating_add(n);
+                        stats.cache_creation_tokens = stats
+                            .cache_creation_tokens
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                     if let Some(n) = m.get("cache_read_tokens").and_then(|v| v.as_u64()) {
-                        stats.cache_read_tokens = stats.cache_read_tokens.saturating_add(n);
+                        stats.cache_read_tokens = stats
+                            .cache_read_tokens
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                     // Some Phase-B builds may roll `bytes_avoided` into the
                     // llm_ok event. Include it here defensively.
                     if let Some(n) = read_bytes_avoided(m) {
-                        stats.bytes_avoided = stats.bytes_avoided.saturating_add(n);
+                        stats.bytes_avoided = stats
+                            .bytes_avoided
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                 }
             }
@@ -265,7 +294,7 @@ pub async fn get_scripted_output_stats(
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                *stats.fallbacks.entry(reason).or_insert(0) += 1;
+                *stats.fallbacks.entry(reason).or_insert(0) += occurrences;
             }
             _ => {
                 // Ignore unknown `scripted_output.*` events — forward compat.
