@@ -27,6 +27,7 @@
 pub mod clients;
 pub mod credentials;
 pub mod dispatch;
+pub mod events;
 pub mod install;
 pub mod launcher;
 pub mod manager;

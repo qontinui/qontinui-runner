@@ -21,20 +21,28 @@
 //! | PUT    | `/wrappers/:id/credentials/:name`               | set_credential     |
 //! | DELETE | `/wrappers/:id/credentials/:name`               | delete_credential  |
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path as AxumPath, State},
     http::StatusCode,
-    response::Json,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Json,
+    },
     routing::{get, post, put},
     Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::BroadcastStream;
 
 use super::clients::{self, AiClientId, ClientError, ClientInfo};
 use super::credentials::CredentialStore;
 use super::dispatch::dispatch_handler;
+use super::events;
 use super::install::{install, uninstall, update, InstallError, InstallRequest, InstallResponse};
 use super::manager::WrapperStatus;
 use super::primary_proxy::{self, into_http as proxy_error_to_http};
@@ -81,6 +89,58 @@ pub fn router() -> Router<Arc<ApiState>> {
         .route("/wrappers/clients", get(list_clients))
         .route("/wrappers/clients/{id}/connect", post(connect_client))
         .route("/wrappers/clients/{id}/disconnect", post(disconnect_client))
+        // Change-event SSE stream — consumed by `bin/wrappers_mcp.rs` so
+        // newly-installed wrappers surface as MCP tools without an AI
+        // session restart.
+        .route("/wrappers/events", get(events_stream))
+}
+
+// ---------------------------------------------------------------------------
+// Change-event stream
+// ---------------------------------------------------------------------------
+
+/// `GET /wrappers/events` — SSE stream of `wrapper.changed` events.
+///
+/// Each registry mutation (`rescan`, `rescan_all`, `remove`) emits one
+/// event. Subscribers refetch `GET /wrappers` after a wakeup; the event
+/// payload itself only carries an `atMs` timestamp.
+///
+/// Primary-only. On a secondary the wrapper subsystem isn't initialized
+/// (see `mcp_api.rs` — `WrapperState::new_default()` is gated on
+/// `!is_secondary()`), and our broadcaster is a per-process `OnceLock`
+/// so a secondary's channel has no producer. Returning 503 here makes
+/// the bin's reconnect-with-backoff surface the misroute in stderr;
+/// silently serving an empty stream (older behavior) looked like a
+/// healthy connection but received no events. The bin should always
+/// point at the primary's port via `QONTINUI_PRIMARY_PORT`.
+async fn events_stream(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    if primary_proxy::is_secondary() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error(
+                "wrapper change-events are primary-only — point QONTINUI_PRIMARY_PORT at the primary",
+            )),
+        ));
+    }
+    let rx = events::subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|res| async move {
+        match res {
+            Ok(ev) => match Event::default().event("wrapper.changed").json_data(&ev) {
+                Ok(e) => Some(Ok::<Event, Infallible>(e)),
+                Err(_) => None,
+            },
+            // Lag means a slow subscriber fell behind. Drop the lag
+            // marker silently — the next genuine event still triggers a
+            // refresh, which catches up.
+            Err(_) => None,
+        }
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))))
 }
 
 // ---------------------------------------------------------------------------
