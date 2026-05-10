@@ -144,15 +144,59 @@ pub enum EmitError {
     /// The shared Claude API circuit breaker is Open.
     #[error("LLM circuit breaker is open")]
     BreakerOpen,
-    /// The global kill switch (env var or settings flag) is off.
-    #[error("scripted output path is disabled")]
-    Disabled,
+    /// The emitter cannot run for one of three reasons. Split out from a
+    /// single opaque `Disabled` so testing agents (and the panel) can
+    /// distinguish "feature off via env" from "feature off via settings"
+    /// from "Auto path tried every credential lane and found nothing
+    /// usable" — those have different remediations.
+    #[error("scripted output path is disabled: {reason}")]
+    Disabled {
+        /// Stable machine token; mirrored verbatim into the
+        /// `EmitExtractionScriptError.kind` wire field.
+        reason: DisabledReason,
+    },
     /// LLM returned an error response (network, auth, etc.).
     #[error("LLM error: {0}")]
     LlmError(String),
     /// LLM response didn't include a usable `expression` field.
     #[error("invalid LLM response: {0}")]
     InvalidResponse(String),
+}
+
+/// The specific reason an emitter call returned `EmitError::Disabled`.
+///
+/// `Display` gives the human-readable form (used in `error.message`);
+/// the serialized lowercase tag is the stable machine discriminator
+/// surfaced as `EmitExtractionScriptError.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisabledReason {
+    /// `QONTINUI_SCRIPTED_OUTPUT` env var is not `"1"`. Set the env var
+    /// at process spawn (e.g. `extra_env` on the supervisor's
+    /// `POST /runners/spawn-test`) and respawn — env vars are not
+    /// hot-reloadable.
+    EnvKillSwitch,
+    /// `scripted_output.enabled` setting is `false`. Flip it on via
+    /// Settings UI / `set_setting` Tauri command — no respawn needed.
+    SettingsFlag,
+    /// `Auto` provider mode tried every credential lane (warm Claude,
+    /// Gemma local) and found none usable. Provision an
+    /// `ANTHROPIC_API_KEY`, log into the Claude CLI to populate
+    /// `.credentials.json`, or start a local llama.cpp Gemma server.
+    NoCredentials,
+}
+
+impl std::fmt::Display for DisabledReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DisabledReason::EnvKillSwitch => "env kill switch QONTINUI_SCRIPTED_OUTPUT is not '1'",
+            DisabledReason::SettingsFlag => "scripted_output.enabled setting is false",
+            DisabledReason::NoCredentials => {
+                "no Claude credential or Gemma local endpoint available on the Auto cascade"
+            }
+        };
+        f.write_str(s)
+    }
 }
 
 // ============================================================================
@@ -211,12 +255,16 @@ pub async fn emit_extraction_script(
     if !env_kill_switch_on() {
         debug!("scripted-output emitter disabled via env kill switch");
         emit_fallback_event(&task_run_id, "disabled");
-        return Err(EmitError::Disabled);
+        return Err(EmitError::Disabled {
+            reason: DisabledReason::EnvKillSwitch,
+        });
     }
     if !settings_flag_on() {
         debug!("scripted-output emitter disabled via settings flag");
         emit_fallback_event(&task_run_id, "disabled");
-        return Err(EmitError::Disabled);
+        return Err(EmitError::Disabled {
+            reason: DisabledReason::SettingsFlag,
+        });
     }
 
     // -------------------------------------------------------- 2. Tier 1 cache
@@ -363,7 +411,9 @@ pub async fn emit_extraction_script(
                         }
                     );
                     emit_fallback_event(&task_run_id, "disabled");
-                    return Err(EmitError::Disabled);
+                    return Err(EmitError::Disabled {
+                        reason: DisabledReason::NoCredentials,
+                    });
                 }
                 ScriptedOutputProviderMode::ClaudeApiWarm => {
                     warn!(
