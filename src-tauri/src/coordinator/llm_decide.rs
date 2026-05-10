@@ -327,9 +327,9 @@ fn action_type_tag(action: &CoordinatorAction) -> &'static str {
 // ============================================================================
 
 /// Cache-friendly stable system prefix. Holds the role description, the
-/// 11-variant catalog, and disambiguation rules. Per the warm provider's
-/// MIN_CACHEABLE_CHARS heuristic this gets tagged as `cache_control:
-/// ephemeral` automatically when the body crosses the threshold.
+/// 11-variant catalog, and disambiguation rules. The warm provider's
+/// `min_cacheable_chars(model)` heuristic tags this with `cache_control:
+/// ephemeral` automatically when the body crosses the model's threshold.
 fn build_system_prefix() -> String {
     String::from(
         r#"You are the dispatch decider for the qontinui Coordinator. The Coordinator runs in-process inside a developer-tools runner and watches a small fleet of Claude Code worker sessions completing software-engineering tasks. Cheap deterministic rules (A through E) already ran this iteration and none fired. Your job: pick exactly one CoordinatorAction.

@@ -1400,9 +1400,22 @@ pub async fn ui_bridge_execute_component_action_handler(
 /// React registry occasionally pruning elements between calls.
 pub async fn ui_bridge_discover_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<UIBridgeDiscoveryRequest>,
+    request: Option<Json<UIBridgeDiscoveryRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Discovering elements");
+
+    // Empty / missing body → default to a force-rescan. Callers hitting this
+    // endpoint with no payload almost always want a fresh discovery; the
+    // axum default of 400'ing on `EOF while parsing a value` was needless
+    // friction for manual testers and MCP clients sending bare POSTs.
+    // Note: an explicit body (even `{"force": false}`) is preserved as-is.
+    let request = match request {
+        Some(Json(r)) => r,
+        None => UIBridgeDiscoveryRequest {
+            force: Some(true),
+            ..Default::default()
+        },
+    };
 
     let payload = serde_json::json!({
         "options": {

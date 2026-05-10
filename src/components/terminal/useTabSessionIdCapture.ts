@@ -1,0 +1,191 @@
+/**
+ * Post-spawn polling hook that fills in `tab.claudeSessionId` for
+ * PTY-launched AI tabs (the `onLaunchAiSession` path in TerminalPage).
+ *
+ * Today, `useShellIntegration.ts:135` only sets `claudeSessionId` on
+ * the resume path (`handleResumeSession`). For initial spawns, the
+ * field is never set — which means `useCommitState`'s per-tab probe has
+ * nothing to look up and the commit traffic light sits gray forever.
+ *
+ * This hook resolves §1.5 of the terminal-traffic-light plan: after a
+ * tab is created and `writeWhenReady(tabId, "...claude\r")` has been
+ * called, the consumer fires `startCapture(tabId, workingDir,
+ * spawnTimestamp)`. The hook polls the existing `transcript_get_latest`
+ * Tauri command (in `commands/transcript.rs:178`) every ~500 ms for up
+ * to ~15 s. When it finds a `TranscriptSession` whose `last_modified`
+ * is fresher than the spawn timestamp AND whose `session_id` isn't
+ * already claimed by another tab, it calls
+ * `updateTab(tabId, { claudeSessionId, claudeConfigDir })`.
+ *
+ * Concurrency defense: a `claimedSessionIds` ref tracks every session id
+ * we've already bound to a tab; the polling loop refuses to claim an
+ * already-claimed id. This prevents two concurrent spawns into the same
+ * working directory from latching onto the same JSONL.
+ *
+ * On timeout the tab simply stays without a session id — the user can
+ * still use the terminal, just no commit indicator.
+ */
+
+import { useCallback, useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import type { CommandResponse } from "./types";
+import type { TerminalTab } from "./useTerminalManager";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("TabSessionIdCapture");
+
+interface TranscriptSessionPayload {
+  session_id: string;
+  config_dir: string;
+  project_path: string;
+  last_modified: string; // ISO 8601
+}
+
+const POLL_INTERVAL_MS = 500;
+const POLL_TIMEOUT_MS = 15_000;
+
+interface CaptureParams {
+  updateTab: (
+    id: string,
+    updates: Partial<
+      Pick<TerminalTab, "isAlive" | "exitCode" | "workingDir" | "claudeSessionId" | "claudeConfigDir">
+    >,
+  ) => void;
+  /** Used to skip capture for tabs that already have a session id
+   *  (e.g. resume path beat us to it) and for diagnostics. */
+  tabs: TerminalTab[];
+}
+
+interface UseTabSessionIdCaptureResult {
+  /**
+   * Begin polling `transcript_get_latest` for `tabId`. Idempotent —
+   * a second call for the same tabId is a no-op while a poll is
+   * already in flight.
+   */
+  startCapture: (tabId: string, workingDir: string, spawnTimestamp: number) => void;
+}
+
+export function useTabSessionIdCapture({
+  updateTab,
+  tabs,
+}: CaptureParams): UseTabSessionIdCaptureResult {
+  // Tabs reference: kept fresh so `startCapture` can read the latest
+  // `claudeSessionId` and skip already-bound tabs.
+  const tabsRef = useRef(tabs);
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
+
+  // Session ids already bound to *some* tab — used to refuse a duplicate
+  // claim if two tabs spawn into the same workdir before the first
+  // JSONL hits disk.
+  const claimedSessionIds = useRef<Set<string>>(new Set());
+
+  // Hydrate the claimed set on mount and on every `tabs` change so we
+  // never re-claim a session id that's already bound to a tab (resume
+  // path, prior session, etc.).
+  useEffect(() => {
+    for (const tab of tabs) {
+      if (tab.claudeSessionId) {
+        claimedSessionIds.current.add(tab.claudeSessionId);
+      }
+    }
+  }, [tabs]);
+
+  // Active poll bookkeeping — keyed by tabId so a tab close cancels its
+  // own loop without affecting siblings, and a duplicate startCapture
+  // for the same tabId is a no-op.
+  const inFlight = useRef<Map<string, { cancelled: boolean }>>(new Map());
+
+  // Cancel all in-flight polls on unmount.
+  useEffect(() => {
+    const map = inFlight.current;
+    return () => {
+      for (const handle of map.values()) {
+        handle.cancelled = true;
+      }
+      map.clear();
+    };
+  }, []);
+
+  const startCapture = useCallback<UseTabSessionIdCaptureResult["startCapture"]>(
+    // workingDir is best-effort — the per-terminal cwd is set by the
+    // shell-integration `cwd` event, which may not have fired yet at
+    // capture-start time. Empty string is treated as "let the backend
+    // fall back to its workspace default".
+    (tabId, workingDir, spawnTimestamp) => {
+      // Already polling this tab? Don't double-up.
+      if (inFlight.current.has(tabId)) return;
+      const handle = { cancelled: false };
+      inFlight.current.set(tabId, handle);
+
+      const startedAt = Date.now();
+
+      const tick = async (): Promise<void> => {
+        if (handle.cancelled) return;
+
+        // Already-bound? Stop. (Resume path may have set it before us.)
+        const tab = tabsRef.current.find((t) => t.id === tabId);
+        if (!tab) {
+          // Tab was closed — stop.
+          handle.cancelled = true;
+          inFlight.current.delete(tabId);
+          return;
+        }
+        if (tab.claudeSessionId) {
+          handle.cancelled = true;
+          inFlight.current.delete(tabId);
+          return;
+        }
+
+        // Timed out?
+        if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+          handle.cancelled = true;
+          inFlight.current.delete(tabId);
+          return;
+        }
+
+        try {
+          // Pass workingDir if known; empty/undefined → backend falls
+          // back to the workspace project path (see
+          // `commands/transcript.rs::transcript_get_latest`).
+          const resp = await invoke<CommandResponse>(
+            "transcript_get_latest",
+            workingDir ? { projectPath: workingDir } : {},
+          );
+          if (handle.cancelled) return;
+
+          const data = resp.success ? (resp.data as TranscriptSessionPayload | null) : null;
+          if (data) {
+            const lastModifiedMs = Date.parse(data.last_modified);
+            const fresh = Number.isFinite(lastModifiedMs) && lastModifiedMs > spawnTimestamp;
+            const unclaimed = !claimedSessionIds.current.has(data.session_id);
+            if (fresh && unclaimed) {
+              claimedSessionIds.current.add(data.session_id);
+              updateTab(tabId, {
+                claudeSessionId: data.session_id,
+                claudeConfigDir: data.config_dir,
+              });
+              handle.cancelled = true;
+              inFlight.current.delete(tabId);
+              return;
+            }
+          }
+        } catch (err) {
+          // Probe error: keep trying; runner may be transiently busy.
+          logger.debug("transcript_get_latest probe failed:", err);
+        }
+
+        // Schedule next tick.
+        setTimeout(() => {
+          void tick();
+        }, POLL_INTERVAL_MS);
+      };
+
+      void tick();
+    },
+    [updateTab],
+  );
+
+  return { startCapture };
+}

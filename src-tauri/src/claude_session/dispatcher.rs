@@ -607,6 +607,17 @@ fn auto_register_file(
                 }
             });
 
+            // Phase 2 (terminal traffic-light plan §2): probe + emit
+            // `commit-state-changed` so the per-tab traffic light reflects the
+            // post-Edit/Write state. Best-effort, fire-and-forget — the helper
+            // spawns its own task and applies a 500 ms per-session debounce
+            // (so N consecutive Edit/Write hooks in the same turn don't
+            // trigger N probes).
+            crate::mcp::ai_session::emit_commit_state_for_session(
+                app_handle.clone(),
+                task_run_id.clone(),
+            );
+
             let _ = waited_for;
         } else {
             warn!(

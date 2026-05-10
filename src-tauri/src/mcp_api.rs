@@ -1682,7 +1682,45 @@ pub fn create_router(
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
         .layer(axum::Extension(graphql_schema))
+        // Outermost layer: catch panics from any handler/middleware below and
+        // convert them into a JSON 500 matching the runner's `ApiResponse<()>`
+        // shape. Without this, a handler panic surfaces to the client as
+        // "empty reply from server" — diagnostically indistinguishable from a
+        // legitimate empty success response. `.layer()` is bottom-up, so the
+        // LAST `.layer()` call wraps the rest. `with_state` must remain
+        // terminal.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            runner_panic_handler,
+        ))
         .with_state(api_state)
+}
+
+/// Convert a caught handler panic into a JSON 500 response that matches the
+/// runner's `ApiResponse<()>` shape. Wired onto the main API router via
+/// `tower_http::catch_panic::CatchPanicLayer::custom`.
+///
+/// The panic payload is `Box<dyn Any + Send>`; downcast to the two common
+/// concrete types (`&'static str` from `panic!("literal")` and `String` from
+/// `panic!("{}", x)`) and fall back to a generic message otherwise.
+fn runner_panic_handler(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let msg = if let Some(s) = err.downcast_ref::<&'static str>() {
+        s.to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    };
+
+    tracing::error!(handler_panic = true, message = %msg, "runner HTTP handler panicked");
+
+    let body = crate::mcp::types::api_error(format!("handler panicked: {}", msg));
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(body),
+    )
+        .into_response()
 }
 
 /// Try to bind to a port with SO_REUSEADDR
@@ -1785,4 +1823,33 @@ pub async fn start_server(
     Err(Box::new(last_error.unwrap_or_else(|| {
         std::io::Error::other("All ports failed")
     })))
+}
+
+#[cfg(test)]
+mod panic_catcher_tests {
+    use super::runner_panic_handler;
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    async fn panicking_handler() -> &'static str {
+        panic!("intentional test panic");
+    }
+
+    #[tokio::test]
+    async fn test_panic_caught_returns_500_json() {
+        let app = Router::new().route("/boom", get(panicking_handler)).layer(
+            tower_http::catch_panic::CatchPanicLayer::custom(runner_panic_handler),
+        );
+
+        let req = Request::builder().uri("/boom").body(Body::empty()).unwrap();
+        let response = app.oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), 500);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["success"], false);
+        assert!(body["error"].as_str().unwrap().contains("panicked"));
+    }
 }

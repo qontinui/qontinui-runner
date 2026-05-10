@@ -138,6 +138,13 @@ jobs:
       - name: Lint frontend code
         run: pnpm run lint
 
+      # Typecheck before the bundler runs. Fails fast on consumer-side
+      # camelCase / deny_unknown_fields drift from qontinui-schemas before
+      # paying for `vite build`. Closes Item 4 of the
+      # schemas-camelcase-cascade-2026-04-18 plan.
+      - name: Typecheck frontend code
+        run: pnpm run typecheck
+
       # Build the frontend before any cargo step. tauri::generate_context!()
       # in src-tauri/src/lib.rs reads tauri.conf.json at compile time and
       # panics if frontendDist (../dist) is missing — which broke `Clippy

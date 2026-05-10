@@ -38,6 +38,8 @@ import { useTerminalInitialization } from "./useTerminalInitialization";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
+import { useCommitState } from "./useCommitState";
+import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -131,6 +133,15 @@ function TerminalPageInner({
   }, [tabs.length, onSessionCountChange]);
 
   const { fileConflicts, fileLockStates, sessionPersistence } = useShellInfra();
+
+  // Per-tab commit-readiness state (Plan §3). Sibling to fileLockStates;
+  // both are passed through to TerminalTabBar for rendering.
+  const commitStates = useCommitState(tabs);
+  // Post-spawn polling hook that captures Claude CLI's session id from
+  // the on-disk transcript and updates `tab.claudeSessionId` so the
+  // commit traffic light has something to key on. Plan §1.5
+  // "Frontend session-id capture".
+  const { startCapture: startSessionIdCapture } = useTabSessionIdCapture({ updateTab, tabs });
   const {
     labelsAndTags,
     eventHistory,
@@ -407,9 +418,20 @@ function TerminalPageInner({
               if (tabId) createdTabIds.push(tabId);
             }
             if (createdTabIds.length > 0) {
+              const spawnAt = Date.now();
               // Type the launch command once the terminal ref is mounted
               for (const tabId of createdTabIds) {
                 writeWhenReady(tabId, `${cmd}\r`);
+                // Plan §1.5 — start polling transcript_get_latest so
+                // tab.claudeSessionId fills in once Claude CLI writes
+                // its first JSONL record. Best-effort; on timeout the
+                // tab just stays without a session id and the commit
+                // traffic light renders gray. workingDir may be empty
+                // until the cwd OSC event lands; the hook passes empty
+                // through and the backend falls back to the workspace
+                // project path.
+                const tab = tabs.find((t) => t.id === tabId);
+                startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt);
               }
               // Type the initial instructions after Claude starts
               if (context) {
@@ -431,6 +453,7 @@ function TerminalPageInner({
             const isWindows = navigator.platform.startsWith("Win");
             const cmds = sessionManager.launchCommands ?? {};
             const createdTabIds: string[] = [];
+            const spawnAt = Date.now();
             for (let i = 0; i < count; i++) {
               const customCmd = cmds[configDirs[i]];
               const dirName =
@@ -446,6 +469,11 @@ function TerminalPageInner({
                     : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
                 // Stagger launch commands across accounts
                 setTimeout(() => writeWhenReady(tabId, `${cmd}\r`), i * 300);
+                // Plan §1.5 — kick off transcript-id polling per tab.
+                // workingDir may not be set yet; pass empty and let the
+                // backend fall back to the workspace project path.
+                const tab = tabs.find((t) => t.id === tabId);
+                startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt);
               }
             }
             // Type initial instructions after Claude starts (stagger per session)
@@ -461,6 +489,8 @@ function TerminalPageInner({
           launchCommands={sessionManager.launchCommands}
           fileLocks={sessionManager.fileLocks}
           fileLockStates={fileLockStates}
+          commitStates={commitStates}
+          terminalRefs={terminalRefs.current}
         />
         <ZoneStatusBar
           onExport={handleExportOutput}

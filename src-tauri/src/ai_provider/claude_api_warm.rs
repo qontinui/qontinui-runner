@@ -24,7 +24,7 @@
 #![allow(dead_code)]
 
 use super::cache_aware_builder::{
-    parse_cache_tokens, MIN_CACHEABLE_CHARS, PROMPT_CACHING_BETA_HEADER,
+    min_cacheable_chars, parse_cache_tokens, PROMPT_CACHING_BETA_HEADER,
 };
 use super::retry::retry_with_backoff;
 use super::types::AiResponse;
@@ -210,15 +210,15 @@ fn sanitize_tool_name(schema_name: &str) -> String {
 /// Build the `system` array for the request body.
 ///
 /// Only attaches `cache_control: ephemeral` when `system_prefix.len() >=
-/// MIN_CACHEABLE_CHARS`. Below that threshold, Anthropic silently ignores the
-/// marker and sending it anyway would be misleading telemetry. If the prefix
-/// is empty we return an empty array — the caller will typically send the
-/// message-only body.
-fn build_system_array(system_prefix: &str) -> Value {
+/// min_cacheable_chars(model)`. Below that per-model threshold, Anthropic
+/// silently ignores the marker and sending it anyway would be misleading
+/// telemetry. If the prefix is empty we return an empty array — the caller
+/// will typically send the message-only body.
+fn build_system_array(system_prefix: &str, model: &str) -> Value {
     if system_prefix.is_empty() {
         return serde_json::json!([]);
     }
-    if system_prefix.len() >= MIN_CACHEABLE_CHARS {
+    if system_prefix.len() >= min_cacheable_chars(model) {
         serde_json::json!([{
             "type": "text",
             "text": system_prefix,
@@ -268,7 +268,7 @@ pub(crate) fn run_claude_api_warm(
         credential.kind_label(),
         system_prefix.len(),
         user_message.len(),
-        system_prefix.len() >= MIN_CACHEABLE_CHARS,
+        system_prefix.len() >= min_cacheable_chars(model),
     );
 
     let mut request_body = serde_json::json!({
@@ -277,7 +277,7 @@ pub(crate) fn run_claude_api_warm(
         "messages": [{"role": "user", "content": user_message}],
     });
     if !system_prefix.is_empty() {
-        request_body["system"] = build_system_array(system_prefix);
+        request_body["system"] = build_system_array(system_prefix, model);
     }
 
     if let Some(temp) = temperature_override {
@@ -358,8 +358,9 @@ pub(crate) fn run_claude_api_warm(
 /// - Authenticates with `WarmCredential` (API key or OAuth).
 /// - Takes a split `(system_prefix, user_message)` prompt. The stable
 ///   `system_prefix` is marked with `cache_control: ephemeral` *only when it
-///   crosses [`MIN_CACHEABLE_CHARS`]* — sub-threshold blocks skip the marker
-///   so telemetry doesn't lie about cache participation. The `user_message`
+///   crosses [`min_cacheable_chars`]* (per-model threshold) — sub-threshold
+///   blocks skip the marker so telemetry doesn't lie about cache
+///   participation. The `user_message`
 ///   carries per-call dynamic payload (goal, schemaHint, outputPreview) and
 ///   is never cached.
 pub(crate) fn run_claude_api_warm_with_structured_output(
@@ -393,7 +394,7 @@ pub(crate) fn run_claude_api_warm_with_structured_output(
         schema_name,
         system_prefix.len(),
         user_message.len(),
-        system_prefix.len() >= MIN_CACHEABLE_CHARS,
+        system_prefix.len() >= min_cacheable_chars(model),
     );
 
     let tool_name = sanitize_tool_name(schema_name);
@@ -414,7 +415,7 @@ pub(crate) fn run_claude_api_warm_with_structured_output(
         "tool_choice": {"type": "tool", "name": tool_name}
     });
     if !system_prefix.is_empty() {
-        request_body["system"] = build_system_array(system_prefix);
+        request_body["system"] = build_system_array(system_prefix, model);
     }
 
     if let Some(temp) = temperature_override {

@@ -36,6 +36,7 @@ import { loadDiscoveredSpecs } from "@/lib/ui-bridge/use-discovered-specs";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
 import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
 import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compilation";
+import { PAGE_TO_TAB } from "@/components/app/useAppNavigation";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 
 const SM_SELECTED_CONFIG_KEY = "qontinui-runner-sm-selected-config";
@@ -321,6 +322,55 @@ function buildEngineAdapter(
 }
 
 // ---------------------------------------------------------------------------
+// Navigation-only stub
+// ---------------------------------------------------------------------------
+
+/**
+ * Register a navigation-only stub on `__UI_BRIDGE__.stateMachine` for paths
+ * where the real engine is not available (auto-compile quarantine, missing
+ * config, load failure). Without this, callers that probe
+ * `typeof bridge.stateMachine?.navigateTo === "function"` see undefined and
+ * silently no-op via optional chaining — which burned us during launch
+ * controls testing.
+ *
+ * The stub forwards to `__UI_BRIDGE__.navigateHandler` (registered
+ * unconditionally by `useAppNavigation.ts`), which itself routes through
+ * `PAGE_TO_TAB`. Cast through `unknown` because the runtime stub only
+ * implements `navigateTo`; the full `StateMachineAPI` requires the real
+ * engine. Acceptable because every other method on `StateMachineAPI`
+ * requires engine state that doesn't exist here.
+ */
+function registerNavigationOnlyStub(): void {
+  const bridge = getUIBridgeGlobal();
+  if (!bridge) return;
+  const stub = {
+    navigateTo: async (slug: string): Promise<boolean> => {
+      // Strip "page-" prefix, leading slash, query/hash — match navigateHandler's
+      // own input shape so callers can pass either form.
+      const stripped = slug.startsWith("page-") ? slug.slice(5) : slug;
+      const normalized = (stripped.startsWith("/") ? stripped.slice(1) : stripped).split(/[?#]/)[0];
+      if (PAGE_TO_TAB[normalized]) {
+        const handler = (bridge as { navigateHandler?: (url: string) => void }).navigateHandler;
+        if (typeof handler === "function") {
+          handler(normalized);
+          return true;
+        }
+        // navigateHandler not yet registered — warn so silent no-op is audible.
+        console.warn(
+          `[StateMachine] navigateTo("${slug}"): navigation-only stub active but navigateHandler is not yet registered`,
+        );
+        return false;
+      }
+      console.warn(
+        `[StateMachine] navigateTo("${slug}"): unknown page slug (no PAGE_TO_TAB entry); engine not registered (auto-compile quarantined or no config selected)`,
+      );
+      return false;
+    },
+  };
+  bridge.stateMachine = stub as unknown as StateMachineAPI;
+}
+
+// ---------------------------------------------------------------------------
 // Engine lifecycle
 // ---------------------------------------------------------------------------
 
@@ -383,19 +433,17 @@ export function useStateMachineRegistration(): void {
   const engineRef = useRef<AutomationEngine | null>(null);
 
   const loadAndRegister = useCallback(async (configId: string | null) => {
-    const bridge = getUIBridgeGlobal();
-
     if (!configId) {
       if (engineRef.current) engineRef.current.stateDetector.dispose();
       engineRef.current = null;
-      if (bridge) delete bridge.stateMachine;
+      registerNavigationOnlyStub();
       return;
     }
 
     try {
       const config = await invoke<StateMachineConfigFull | null>("sm_get_config", { id: configId });
       if (!config) {
-        if (bridge) delete bridge.stateMachine;
+        registerNavigationOnlyStub();
         return;
       }
 
@@ -403,8 +451,8 @@ export function useStateMachineRegistration(): void {
       const transitionDefs = config.transitions.map(toTransitionDefinition);
       engineRef.current = createAndRegisterEngine(stateDefs, transitionDefs, engineRef.current);
     } catch {
-      if (bridge) delete bridge.stateMachine;
       engineRef.current = null;
+      registerNavigationOnlyStub();
     }
   }, []);
 
@@ -431,10 +479,14 @@ export function useStateMachineRegistration(): void {
           const result = compileStateMachineFromSpecs(inputs);
           if (!result.compiled) {
             // Quarantined — do NOT register a partial engine. Persist the
-            // record so the conflict can be inspected offline.
+            // record so the conflict can be inspected offline. Register a
+            // navigation-only stub so callers that probe
+            // `bridge.stateMachine?.navigateTo` get a working function instead
+            // of a silent no-op via optional chaining.
             console.warn(
               `[StateMachine] Auto-compile quarantined (${result.quarantine.conflicts.length} conflicts); engine not registered`,
             );
+            registerNavigationOnlyStub();
             void persistQuarantinedCompilation(result.quarantine);
           } else {
             const { stateMachine, stats } = result;
@@ -449,10 +501,15 @@ export function useStateMachineRegistration(): void {
               // Best-effort: also persist to the backend DB so the compiled machine
               // is available via the HTTP API (and survives runner restarts).
               void persistCompiledStateMachine(stateMachine);
+            } else {
+              // Compiled but produced zero states — no engine registered. Stub
+              // navigateTo so callers don't silently no-op.
+              registerNavigationOnlyStub();
             }
           }
         } catch (e) {
           console.warn("[StateMachine] Auto-compile from specs failed:", e);
+          registerNavigationOnlyStub();
         }
       })();
     }

@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing::{error, info, warn};
 
 use crate::context;
@@ -590,6 +590,8 @@ pub(crate) async fn commit_session_progress_inner(
                 files.len(),
                 branch
             );
+            // Tracker just got cleared → traffic light should flip to Empty.
+            emit_commit_state_for_session(app_handle.clone(), session_id.to_string());
             Ok(CommitProgressResponse {
                 commit_hash: Some(hash),
                 file_count: files.len(),
@@ -612,6 +614,9 @@ pub(crate) async fn commit_session_progress_inner(
                 session_id,
                 files.len()
             );
+            // Tracker cleared on the no-op path too (line above) — flip the
+            // light to Empty for parity with the success branch.
+            emit_commit_state_for_session(app_handle.clone(), session_id.to_string());
             Ok(CommitProgressResponse {
                 commit_hash: None,
                 file_count: files.len(),
@@ -632,6 +637,220 @@ pub(crate) async fn commit_session_progress_inner(
             ))
         }
     }
+}
+
+/// Probe the per-session "ready-to-commit" state without actually committing.
+///
+/// Sibling of `commit_session_progress_inner` — reuses its cwd-resolution +
+/// tracker-read sequence, then runs the §1 dirty-subset query against the
+/// touched-file set. Returns a `CommitState` describing whether the tracker
+/// is empty / clean / dirty / mid-merge across one or more enclosing repos.
+///
+/// Used by:
+/// 1. The Tauri command `get_session_commit_state` for frontend polling.
+/// 2. The `commit-state-changed` event emitter that fires from
+///    `auto_register_file`, the transcript-tail watcher, and post-commit
+///    paths — see `emit_commit_state_for_session` below.
+///
+/// Errors are surfaced as `(StatusCode, String)` so callers can map them onto
+/// the existing `CommandResponse { success: false, message }` shape used by
+/// `commit_session_progress`.
+pub(crate) async fn session_commit_state_inner(
+    app_handle: &tauri::AppHandle,
+    session_id: &str,
+) -> Result<crate::git_status_subset::CommitState, (StatusCode, String)> {
+    use crate::commands::AppState;
+    use crate::git_status_subset::{
+        bucket_by_repo, dirty_subset_in_repo, is_mid_merge, now_ms, CommitState, CommitStateStatus,
+    };
+
+    // 1. Resolve AppState (for pg_db). Same gating as
+    //    `commit_session_progress_inner` step 2.
+    let app_state: Arc<AppState> = app_handle
+        .try_state::<Arc<AppState>>()
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AppState not available".to_string(),
+            )
+        })?
+        .inner()
+        .clone();
+
+    // 2. Read the tracker. The session's session_id IS the task_run_id for
+    //    live PTYs (see `commit_session_progress_inner:527-528`). The PTY
+    //    transcript watcher writes rows under the same id.
+    let pg = app_state.pg_db.clone();
+    let files = pg.get_files_touched(session_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read touched-files tracker: {}", e),
+        )
+    })?;
+
+    if files.is_empty() {
+        return Ok(CommitState {
+            status: CommitStateStatus::Empty,
+            touched_count: 0,
+            dirty_count: 0,
+            repo_roots: Vec::new(),
+            merging_repos: Vec::new(),
+            generated_at_ms: now_ms(),
+        });
+    }
+
+    // 3. Bucket touched files by enclosing git toplevel. Files outside any
+    //    repo are dropped silently. Empty buckets → also `Empty` for UI
+    //    purposes (the user has nothing to commit).
+    let buckets = bucket_by_repo(&files);
+    if buckets.is_empty() {
+        return Ok(CommitState {
+            status: CommitStateStatus::Empty,
+            touched_count: files.len(),
+            dirty_count: 0,
+            repo_roots: Vec::new(),
+            merging_repos: Vec::new(),
+            generated_at_ms: now_ms(),
+        });
+    }
+
+    // 4. Probe each bucket for mid-merge state and dirty subset. Stable
+    //    iteration order doesn't matter — repo_roots/merging_repos are
+    //    advisory tooltip strings.
+    let mut repo_roots: Vec<String> = Vec::with_capacity(buckets.len());
+    let mut merging_repos: Vec<String> = Vec::new();
+    let mut dirty: Vec<String> = Vec::new();
+
+    for (repo, paths) in &buckets {
+        let repo_str = repo.to_string_lossy().into_owned();
+        repo_roots.push(repo_str.clone());
+
+        if is_mid_merge(repo) {
+            merging_repos.push(repo_str);
+        }
+
+        match dirty_subset_in_repo(repo, paths) {
+            Ok(mut subset) => dirty.append(&mut subset),
+            Err(e) => {
+                warn!(
+                    "session_commit_state: dirty_subset_in_repo failed for {}: {}",
+                    repo.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // 5. Resolve final status. Merging precedence over Dirty (a mid-merge repo
+    //    must be resolved manually — UI must disable the commit button).
+    let status = if !merging_repos.is_empty() {
+        CommitStateStatus::Merging
+    } else if dirty.is_empty() {
+        CommitStateStatus::Clean
+    } else {
+        CommitStateStatus::Dirty
+    };
+
+    Ok(CommitState {
+        status,
+        touched_count: files.len(),
+        dirty_count: dirty.len(),
+        repo_roots,
+        merging_repos,
+        generated_at_ms: now_ms(),
+    })
+}
+
+/// Per-session debounce store for `emit_commit_state_for_session`. 500 ms
+/// window prevents N consecutive `auto_register_file` hooks from firing N
+/// commit-state probes when one batch (e.g. a MultiEdit-equivalent loop in a
+/// single turn) just changed the same set.
+static COMMIT_STATE_DEBOUNCE: once_cell::sync::OnceCell<
+    dashmap::DashMap<String, std::time::Instant>,
+> = once_cell::sync::OnceCell::new();
+
+/// Per-session debounce window for commit-state-changed emits.
+const COMMIT_STATE_DEBOUNCE_MS: u128 = 500;
+
+/// Spawn a fire-and-forget task that probes `session_commit_state_inner` and
+/// emits a `commit-state-changed` event on success.
+///
+/// Called by:
+///   - `claude_session::dispatcher::auto_register_file` (after a successful
+///     Edit/Write file-lock acquire) — SDK chat sessions.
+///   - `terminal::transcript_watcher::tail_session` (after PG rows landed) —
+///     PTY-launched terminal AI tabs.
+///   - `commit_session_progress_inner` (after a commit / no-op return) — so
+///     the UI sees the post-commit `Empty` state immediately rather than
+///     waiting for the next 30 s frontend poll.
+///
+/// Per-session debounce of 500 ms applies — repeated calls within the window
+/// are dropped on the floor (the debounce store remembers each session
+/// independently).
+///
+/// Event payload shape (snake_case at the top level — must NOT be wrapped in
+/// a `#[serde(rename_all = "camelCase")]` struct, or the TS frontend will
+/// silently drop the event; see auto-memory entry
+/// `proj_tauri_event_payload_camelcase.md`):
+///
+/// ```json
+/// {
+///   "type": "commit-state-changed",
+///   "task_run_id": "<session_id>",
+///   "state": { /* CommitState */ }
+/// }
+/// ```
+///
+/// The same payload is also broadcast through `AppState.event_broadcast` so
+/// non-Tauri consumers (the MCP event channel, future remote dashboards) see
+/// it. Mirrors the file-lock event pattern at `dispatcher.rs:440-441` and
+/// `:460-461`.
+pub fn emit_commit_state_for_session(app_handle: tauri::AppHandle, session_id: String) {
+    use crate::commands::AppState;
+
+    // Debounce: if this session emitted within the last 500 ms, drop.
+    let store = COMMIT_STATE_DEBOUNCE.get_or_init(dashmap::DashMap::new);
+    let now = std::time::Instant::now();
+    if let Some(prev) = store.get(&session_id) {
+        if now.duration_since(*prev).as_millis() < COMMIT_STATE_DEBOUNCE_MS {
+            return;
+        }
+    }
+    store.insert(session_id.clone(), now);
+
+    tauri::async_runtime::spawn(async move {
+        let state = match session_commit_state_inner(&app_handle, &session_id).await {
+            Ok(s) => s,
+            Err((status, msg)) => {
+                warn!(
+                    "emit_commit_state_for_session: probe failed for session {} ([{}] {})",
+                    session_id, status, msg
+                );
+                return;
+            }
+        };
+
+        // Build the payload with explicit keys — never via a
+        // camelCase-renamed struct (see camelcase trap memo above).
+        let payload = serde_json::json!({
+            "type": "commit-state-changed",
+            "task_run_id": session_id,
+            "state": state,
+        });
+
+        if let Err(e) = app_handle.emit("commit-state-changed", &payload) {
+            warn!(
+                "emit_commit_state_for_session: app_handle.emit failed for {}: {}",
+                session_id, e
+            );
+        }
+
+        // Broadcast on the shared event channel so non-Tauri consumers see
+        // it. Best-effort — receivers may be empty.
+        if let Some(app_state) = app_handle.try_state::<Arc<AppState>>() {
+            let _ = app_state.event_broadcast.send(payload);
+        }
+    });
 }
 
 // ============================================================================
