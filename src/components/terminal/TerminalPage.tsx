@@ -270,7 +270,18 @@ function TerminalPageInner({
               ([, tabId]) => tabId === id,
             );
             if (zoneIdx) {
+              // Tab is already shown in a zone — focus that zone.
               zoneLayout.setFocusedZone(Number(zoneIdx[0]));
+            } else {
+              // Tab isn't in any zone (common in Single layout when there
+              // are more terminals than visible zones). Replace whatever
+              // the focused zone was showing with the clicked tab — that
+              // matches user expectation: clicking a tab makes it the
+              // visible terminal. Without this branch, setActiveId fires
+              // but the zone keeps rendering its old tab and the click
+              // appears to do nothing (per the soak run on 2026-05-10
+              // where Workers 2 + 3 tabs were unclickable).
+              zoneLayout.assignTabToZone(zoneLayout.focusedZone, id);
             }
           }}
           onClose={closeTerminal}

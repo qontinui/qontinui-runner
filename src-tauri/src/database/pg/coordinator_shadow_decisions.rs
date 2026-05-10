@@ -225,35 +225,64 @@ impl PgDb {
 
         // Build the union of (rule, action) pairs seen on either side over
         // the window, then count both sides per cell. The matched/agreed
-        // counts are computed via INNER JOIN on observation_hash with a
-        // non-empty hash filter so legacy rows (default '') don't
-        // contribute spurious matches.
+        // counts join shadow ↔ live by observation_hash AFTER deduping each
+        // side to one row per hash — without the dedupe, the prior
+        // implementation produced a cartesian product (N shadow rows ×
+        // M live rows for the same hash) and inflated matched_observations
+        // by 100×–1000× plus computed an artificial 1.0 agreement_rate.
+        //
+        // The dedupe rule: pick the FIRST decision per (side, observation_hash)
+        // by timestamp. The first decision is the one the rules emitted on
+        // the original observation; subsequent ticks on the same hash are
+        // re-fires of the same logical event, not new comparisons.
         let rows = conn
             .query(
                 r#"
                 WITH window_shadow AS (
-                    SELECT rule, action, observation_hash
+                    SELECT DISTINCT ON (observation_hash)
+                        observation_hash, rule, action
                     FROM coord.coordinator_shadow_decisions
                     WHERE taken_at > NOW() - make_interval(secs => $1::float)
                       AND observation_hash <> ''
+                    ORDER BY observation_hash, taken_at ASC
                 ),
                 window_live AS (
-                    SELECT rule, action, observation_hash
+                    SELECT DISTINCT ON (observation_hash)
+                        observation_hash, rule, action
                     FROM coord.coordinator_decisions
                     WHERE created_at > NOW() - make_interval(secs => $1::float)
                       AND observation_hash <> ''
+                    ORDER BY observation_hash, created_at ASC
+                ),
+                -- Raw counts use the un-deduped tables so the shadowCount /
+                -- liveCount reflect every decision (idle ticks included),
+                -- while the matched/agreement counts use the deduped CTEs.
+                window_shadow_raw AS (
+                    SELECT rule, action
+                    FROM coord.coordinator_shadow_decisions
+                    WHERE taken_at > NOW() - make_interval(secs => $1::float)
+                ),
+                window_live_raw AS (
+                    SELECT rule, action
+                    FROM coord.coordinator_decisions
+                    WHERE created_at > NOW() - make_interval(secs => $1::float)
                 ),
                 shadow_counts AS (
-                    SELECT rule, action, COUNT(*) AS n FROM window_shadow GROUP BY 1, 2
+                    SELECT rule, action, COUNT(*) AS n
+                    FROM window_shadow_raw GROUP BY 1, 2
                 ),
                 live_counts AS (
-                    SELECT rule, action, COUNT(*) AS n FROM window_live GROUP BY 1, 2
+                    SELECT rule, action, COUNT(*) AS n
+                    FROM window_live_raw GROUP BY 1, 2
                 ),
                 cells AS (
                     SELECT rule, action FROM shadow_counts
                     UNION
                     SELECT rule, action FROM live_counts
                 ),
+                -- Now a true 1:1 join on observation_hash — each hash appears
+                -- at most once on each side, so the join cardinality is the
+                -- count of observation_hashes that appear on BOTH sides.
                 matched AS (
                     SELECT
                         s.rule AS shadow_rule,

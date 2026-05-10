@@ -183,7 +183,14 @@ pub fn start_coordinator_scheduler(
                     "coordinator.shadow_iterations_total instance_id={} iteration={}",
                     instance_id, iteration
                 );
-                if let Err(e) = run_shadow_iteration(&state, &instance_id, iteration).await {
+                if let Err(e) = run_shadow_iteration(
+                    &state,
+                    &instance_id,
+                    iteration,
+                    &mut processing_seen,
+                )
+                .await
+                {
                     error!("Coordinator shadow iteration failed: {}", e);
                 }
                 continue;
@@ -212,7 +219,13 @@ pub fn start_coordinator_scheduler(
                             "coordinator.shadow_iterations_total instance_id={} iteration={} (lease held elsewhere)",
                             instance_id, iteration
                         );
-                        if let Err(e) = run_shadow_iteration(&state, &instance_id, iteration).await
+                        if let Err(e) = run_shadow_iteration(
+                            &state,
+                            &instance_id,
+                            iteration,
+                            &mut processing_seen,
+                        )
+                        .await
                         {
                             error!("Coordinator shadow iteration failed: {}", e);
                         }
@@ -706,6 +719,7 @@ async fn run_shadow_iteration(
     state: &Arc<ApiState>,
     instance_id: &str,
     iteration: i64,
+    processing_seen: &mut HashMap<String, ProcessingSeenSince>,
 ) -> Result<(), String> {
     use crate::coordinator::decide;
 
@@ -713,11 +727,16 @@ async fn run_shadow_iteration(
     let obs_hash = obs.observation_hash();
 
     // Walk the same rule order as live. No PG side effects.
-    let mut processing_seen: HashMap<String, ProcessingSeenSince> = HashMap::new();
+    // The processing_seen tracker is owned by the spawn closure and passed
+    // in by &mut so first-seen-as-Processing timestamps survive across
+    // ticks — Rule A only fires when a session has been Processing ≥ 5min,
+    // which requires the tracker to remember when each session ENTERED
+    // Processing. Resetting the map every tick (the prior bug) made Rule
+    // A's "older than 5 min" check always false and the rule never fired.
     let now_ms = current_unix_millis();
-    refresh_processing_tracker(&mut processing_seen, &obs.live_sessions, now_ms);
+    refresh_processing_tracker(processing_seen, &obs.live_sessions, now_ms);
 
-    let outcome = if let Some(o) = decide::rule_a(&obs, &processing_seen, now_ms) {
+    let outcome = if let Some(o) = decide::rule_a(&obs, processing_seen, now_ms) {
         Some(o)
     } else if let Some(o) = decide::rule_b(&obs) {
         Some(o)
