@@ -10,12 +10,14 @@
 //! - Header: `anthropic-beta: prompt-caching-2024-07-31`
 //! - Place `"cache_control": {"type": "ephemeral"}` on content blocks in the
 //!   `system` array or in `messages[].content[]`.
-//! - Minimum block size depends on the model — see [`min_cacheable_chars`].
-//!   Haiku 4.5: 4096 tokens. Haiku 3.5: 2048 tokens. Sonnet/Opus: 1024 tokens.
-//!   Sub-threshold blocks are silently NOT cached (Anthropic returns 0 cache
-//!   reads with no error). Source:
-//!   <https://docs.claude.com/en/docs/build-with-claude/prompt-caching>
-//! - Cache TTL: 5 minutes default; 1-hour ephemeral tier available at 2x cost.
+//! - Minimum cacheable block is per-model — see [`min_cacheable_chars`].
+//!   Sonnet/Opus floor at 1024 tokens (~4096 chars); Haiku 3.5 floors at
+//!   2048 tokens (~8192 chars); Haiku 4.5 floors at 4096 tokens
+//!   (~16384 chars). Sub-threshold `cache_control` markers are silently
+//!   ignored by Anthropic — they don't error, they just don't cache.
+//!   Source: <https://docs.claude.com/en/docs/build-with-claude/prompt-caching>.
+//! - Cache TTL: 5 minutes default (extended on each hit); 1-hour ephemeral
+//!   tier available at 2x cost on cache-creation tokens.
 //! - Pricing: write = 1.25x base input; read = 0.1x base input.
 
 use serde::Serialize;
@@ -125,24 +127,33 @@ pub struct CacheAwareRequestBuilder {
     system_blocks: Vec<SystemBlock>,
 }
 
-/// Minimum cacheable block size in characters, per Claude model family.
+/// Per-model minimum block size in characters for `cache_control: ephemeral`
+/// to actually fire. Blocks below the per-model threshold are silently
+/// passed through uncached by Anthropic — the marker is accepted but
+/// ignored, returning 0 cache reads with no error. We work in characters
+/// (not tokens) because the builder operates on `String::len()`. Threshold
+/// = documented_token_min × 4 chars/token (English/code average; Claude's
+/// tokenizer trends ~3.5 chars/token, so a block at the char threshold is
+/// typically ≥ the token threshold).
 ///
-/// Anthropic silently returns 0 cache reads for blocks smaller than the
-/// model's documented token minimum; the `cache_control` marker is parsed
-/// and discarded. We work in characters (not tokens) because the builder
-/// operates on `String::len()`. Threshold = documented_token_min × 4
-/// chars-per-token (English/code average; Claude's tokenizer trends ~3.5
-/// chars/token, so a block at the char threshold is typically ≥ the token
-/// threshold).
+/// Source: <https://docs.claude.com/en/docs/build-with-claude/prompt-caching>.
 ///
-/// - Haiku 4.x (e.g. `claude-haiku-4-5-*`): 4096 tokens → 16384 chars
-/// - Haiku 3.x (e.g. `claude-haiku-3-5-*`): 2048 tokens → 8192 chars
-/// - Sonnet / Opus / unknown: 1024 tokens → 4096 chars
-pub(super) fn min_cacheable_chars(model: &str) -> usize {
-    let m = model.to_lowercase();
+/// | Model family | Token floor | Char floor (this fn) |
+/// |---|---|---|
+/// | Haiku 4.x (e.g. `claude-haiku-4-5-*`) | 4096 | **16384** |
+/// | Haiku 3.x (e.g. `claude-haiku-3-5-*`) | 2048 | **8192** |
+/// | Sonnet / Opus / others | 1024 | **4096** |
+///
+/// Match is case-insensitive substring-style. The `haiku-4` check runs
+/// first so a `claude-haiku-4-9-*` future bump inherits the 16384-char
+/// floor rather than falling through to the haiku-3 case. Unknown future
+/// haiku families (e.g. `haiku-5`) fall to the 4096-char default — flag
+/// for review when that ships rather than guessing the floor.
+pub(crate) fn min_cacheable_chars(model: &str) -> usize {
+    let m = model.to_ascii_lowercase();
     if m.contains("haiku-4") {
         16384
-    } else if m.contains("haiku") {
+    } else if m.contains("haiku-3") {
         8192
     } else {
         4096
@@ -168,8 +179,11 @@ impl CacheAwareRequestBuilder {
 
     /// Add a system block that should be cached (stable across iterations).
     ///
-    /// Only applies `cache_control` if the block is large enough to benefit.
-    /// Small blocks are still added to the system prompt but without the marker.
+    /// Only applies `cache_control` if the block crosses the model's
+    /// per-model cacheable minimum (see [`min_cacheable_chars`]). Small
+    /// blocks are still added to the system prompt but without the
+    /// marker — sub-threshold markers are silently ignored by Anthropic
+    /// and would just produce misleading telemetry.
     pub fn add_cached_system_block(&mut self, text: String) {
         if text.is_empty() {
             return;
@@ -400,7 +414,7 @@ mod tests {
     #[test]
     fn test_builder_basic() {
         let mut builder = CacheAwareRequestBuilder::new("claude-sonnet-4-20250514", 4096);
-        // 5000 chars passes Sonnet's 4096-char threshold.
+        // 5000 chars > Sonnet's 4096 cacheable floor.
         builder.add_cached_system_block("x".repeat(5000));
         builder.add_dynamic_system_block("dynamic context".to_string());
         let body = builder.build("Hello");
@@ -487,6 +501,9 @@ mod tests {
     #[test]
     fn test_from_structured_prompt() {
         let prompt = StructuredPrompt {
+            // Each block 5000 chars > Sonnet's 4096 cacheable floor; they
+            // pass through merge_small_blocks unmerged (each is already
+            // big enough on its own).
             cached_system_blocks: vec!["x".repeat(5000), "y".repeat(5000)],
             dynamic_system_blocks: vec!["dynamic".to_string()],
             user_message: "task".to_string(),
@@ -508,7 +525,9 @@ mod tests {
 
     #[test]
     fn test_builder_haiku_4_higher_threshold() {
-        // 5000 chars passes Sonnet's 4096-char threshold but NOT Haiku 4.5's 16384.
+        // 5000 chars passes Sonnet's 4096-char threshold but NOT Haiku 4.5's
+        // 16384 — same builder, same input size, different model → different
+        // cache decision.
         let mut b = CacheAwareRequestBuilder::new("claude-haiku-4-5-20251001", 4096);
         b.add_cached_system_block("x".repeat(5000));
         let body = b.build("Hello");
@@ -521,12 +540,42 @@ mod tests {
 
     #[test]
     fn test_min_cacheable_chars_per_model() {
+        // Sonnet/Opus and unknown families: 4096 chars (~1024 tokens).
         assert_eq!(min_cacheable_chars("claude-sonnet-4-20250514"), 4096);
         assert_eq!(min_cacheable_chars("claude-opus-4-5-20251101"), 4096);
+        assert_eq!(min_cacheable_chars("claude-opus-4-7"), 4096);
+        assert_eq!(min_cacheable_chars("some-other-model"), 4096);
+        // Haiku 3.x family: 8192 chars (~2048 tokens).
         assert_eq!(min_cacheable_chars("claude-haiku-3-5-20241022"), 8192);
+        // Haiku 4.x family: 16384 chars (~4096 tokens). Match is
+        // case-insensitive substring-style so future bumps within the
+        // family inherit the floor without code changes.
         assert_eq!(min_cacheable_chars("claude-haiku-4-5-20251001"), 16384);
         assert_eq!(min_cacheable_chars("Claude-Haiku-4-5"), 16384);
-        assert_eq!(min_cacheable_chars("some-other-model"), 4096);
+        assert_eq!(min_cacheable_chars("claude-haiku-4-9-20260101"), 16384);
+    }
+
+    #[test]
+    fn test_haiku_4_blocks_below_floor_are_uncached() {
+        // 8192-char block is comfortably above Sonnet's 4096 floor and
+        // Haiku 3's 8192 floor, but BELOW Haiku 4's 16384 floor — so
+        // the same block crosses the threshold on Sonnet and Haiku 3
+        // but not on Haiku 4. Cross-checks `add_cached_system_block`
+        // is reading `self.model` at decision time, not at construction.
+        let block = "x".repeat(8192);
+
+        let mut sonnet = CacheAwareRequestBuilder::new("claude-sonnet-4-20250514", 4096);
+        sonnet.add_cached_system_block(block.clone());
+        let body = sonnet.build("hi");
+        assert!(body["system"][0]["cache_control"].is_object());
+
+        let mut haiku4 = CacheAwareRequestBuilder::new("claude-haiku-4-5-20251001", 4096);
+        haiku4.add_cached_system_block(block);
+        let body = haiku4.build("hi");
+        assert!(
+            body["system"][0]["cache_control"].is_null(),
+            "8192-char block should NOT receive cache_control on Haiku 4 (floor 16384)"
+        );
     }
 
     #[test]

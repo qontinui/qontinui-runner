@@ -209,11 +209,13 @@ fn sanitize_tool_name(schema_name: &str) -> String {
 
 /// Build the `system` array for the request body.
 ///
-/// Only attaches `cache_control: ephemeral` when `system_prefix.len() >=
-/// min_cacheable_chars(model)`. Below that per-model threshold, Anthropic
-/// silently ignores the marker and sending it anyway would be misleading
-/// telemetry. If the prefix is empty we return an empty array — the caller
-/// will typically send the message-only body.
+/// Only attaches `cache_control: ephemeral` when `system_prefix.len()
+/// >= min_cacheable_chars(model)` — see [`min_cacheable_chars`] for the
+/// per-model floors (Haiku 4.x: 16384, Haiku 3.x: 8192, else: 4096).
+/// Below that per-model threshold, Anthropic silently ignores the
+/// marker and sending it anyway would just produce misleading telemetry.
+/// If the prefix is empty we return an empty array — the caller will
+/// typically send the message-only body.
 fn build_system_array(system_prefix: &str, model: &str) -> Value {
     if system_prefix.is_empty() {
         return serde_json::json!([]);
@@ -358,9 +360,9 @@ pub(crate) fn run_claude_api_warm(
 /// - Authenticates with `WarmCredential` (API key or OAuth).
 /// - Takes a split `(system_prefix, user_message)` prompt. The stable
 ///   `system_prefix` is marked with `cache_control: ephemeral` *only when it
-///   crosses [`min_cacheable_chars`]* (per-model threshold) — sub-threshold
-///   blocks skip the marker so telemetry doesn't lie about cache
-///   participation. The `user_message`
+///   crosses [`min_cacheable_chars`]* (per-model floor — Haiku 4.x: 16384,
+///   Haiku 3.x: 8192, else: 4096) — sub-threshold blocks skip the marker so
+///   telemetry doesn't lie about cache participation. The `user_message`
 ///   carries per-call dynamic payload (goal, schemaHint, outputPreview) and
 ///   is never cached.
 pub(crate) fn run_claude_api_warm_with_structured_output(
