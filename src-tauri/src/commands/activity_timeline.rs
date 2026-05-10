@@ -239,33 +239,51 @@ pub async fn get_scripted_output_stats(
         // `scripted_output.llm_ok` events from the warm provider's
         // cache-read path) the panel under-reported by 60-90 %.
         match text_content.as_str() {
-            "scripted_output.attempted" => stats.attempted = stats.attempted.saturating_add(occurrences),
-            "scripted_output.cache_hit" => stats.cache_hit = stats.cache_hit.saturating_add(occurrences),
-            "scripted_output.worker_ok" => stats.worker_ok = stats.worker_ok.saturating_add(occurrences),
+            "scripted_output.attempted" => {
+                stats.attempted = stats.attempted.saturating_add(occurrences)
+            }
+            "scripted_output.cache_hit" => {
+                stats.cache_hit = stats.cache_hit.saturating_add(occurrences)
+            }
+            "scripted_output.worker_ok" => {
+                stats.worker_ok = stats.worker_ok.saturating_add(occurrences)
+            }
             "scripted_output.bytes_avoided" => {
                 if let Some(n) = meta.as_ref().and_then(read_bytes_avoided) {
-                    stats.bytes_avoided = stats.bytes_avoided.saturating_add(n.saturating_mul(occurrences));
+                    stats.bytes_avoided = stats
+                        .bytes_avoided
+                        .saturating_add(n.saturating_mul(occurrences));
                 }
             }
             "scripted_output.llm_ok" => {
                 stats.llm_ok = stats.llm_ok.saturating_add(occurrences);
                 if let Some(m) = meta.as_ref() {
                     if let Some(n) = m.get("tokens_in").and_then(|v| v.as_u64()) {
-                        stats.total_tokens_in = stats.total_tokens_in.saturating_add(n.saturating_mul(occurrences));
+                        stats.total_tokens_in = stats
+                            .total_tokens_in
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                     if let Some(n) = m.get("tokens_out").and_then(|v| v.as_u64()) {
-                        stats.total_tokens_out = stats.total_tokens_out.saturating_add(n.saturating_mul(occurrences));
+                        stats.total_tokens_out = stats
+                            .total_tokens_out
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                     if let Some(n) = m.get("cache_creation_tokens").and_then(|v| v.as_u64()) {
-                        stats.cache_creation_tokens = stats.cache_creation_tokens.saturating_add(n.saturating_mul(occurrences));
+                        stats.cache_creation_tokens = stats
+                            .cache_creation_tokens
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                     if let Some(n) = m.get("cache_read_tokens").and_then(|v| v.as_u64()) {
-                        stats.cache_read_tokens = stats.cache_read_tokens.saturating_add(n.saturating_mul(occurrences));
+                        stats.cache_read_tokens = stats
+                            .cache_read_tokens
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                     // Some Phase-B builds may roll `bytes_avoided` into the
                     // llm_ok event. Include it here defensively.
                     if let Some(n) = read_bytes_avoided(m) {
-                        stats.bytes_avoided = stats.bytes_avoided.saturating_add(n.saturating_mul(occurrences));
+                        stats.bytes_avoided = stats
+                            .bytes_avoided
+                            .saturating_add(n.saturating_mul(occurrences));
                     }
                 }
             }
