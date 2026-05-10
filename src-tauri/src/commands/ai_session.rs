@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{Emitter, Manager};
 use tracing::{error, info, warn};
@@ -1067,6 +1067,78 @@ pub async fn get_session_commit_state(
     }
 }
 
+/// One row of the file-ownership heatmap (Phase 3 of
+/// `conflict-tooling-pauses-aligned-plan.md`).
+///
+/// Mirrors a single `coord.session_touched_files` row, with `recorded_at`
+/// flattened to epoch milliseconds so the frontend can compute decay
+/// without a date-parsing detour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TouchedFileRow {
+    pub file_path: String,
+    pub task_run_id: String,
+    /// Epoch milliseconds (UTC).
+    pub recorded_at_ms: u64,
+}
+
+/// Recent rows from `coord.session_touched_files` for the file-ownership
+/// heatmap panel.
+///
+/// Returns up to 5000 most-recent rows whose `recorded_at` falls inside the
+/// last `window_secs` seconds. Rows are ordered most-recent first; the
+/// frontend groups by `file_path`, computes contention (>1 distinct
+/// `task_run_id` per file) and recency decay, and renders a sortable
+/// table. See `src/components/terminal/FileOwnershipHeatmap.tsx`.
+///
+/// Implementation is a slim inline PG query — by design, mirroring the
+/// vet-pass note in the plan ("Use `pg_db.pool().get()` for a connection").
+/// The 5000-row safety cap keeps the panel tractable on heavy
+/// multi-session days; the 30 s default window in the frontend keeps the
+/// typical row count well below the cap.
+#[tauri::command]
+pub async fn recent_session_touched_files(
+    app_state: tauri::State<'_, StorageCompartment>,
+    window_secs: u64,
+) -> Result<Vec<TouchedFileRow>, String> {
+    let conn = app_state
+        .pg_db()
+        .pool()
+        .get()
+        .await
+        .map_err(|e| format!("PG pool error: {}", e))?;
+
+    // tokio_postgres binds bigint as i64. Saturating cast guards against an
+    // i64-overflowing `window_secs` (would only happen on caller error).
+    let window_secs_i64: i64 = window_secs.try_into().unwrap_or(i64::MAX);
+
+    let rows = conn
+        .query(
+            r#"SELECT file_path,
+                      task_run_id,
+                      (EXTRACT(EPOCH FROM recorded_at) * 1000)::bigint AS recorded_at_ms
+               FROM coord.session_touched_files
+               WHERE recorded_at > NOW() - make_interval(secs => $1)
+               ORDER BY recorded_at DESC
+               LIMIT 5000"#,
+            &[&window_secs_i64],
+        )
+        .await
+        .map_err(|e| format!("PG recent_session_touched_files: {}", e))?;
+
+    Ok(rows
+        .iter()
+        .map(|r| TouchedFileRow {
+            file_path: r.get::<_, String>(0),
+            task_run_id: r.get::<_, String>(1),
+            // Saturating cast: `recorded_at_ms` is computed by PG as a
+            // bigint; pre-1970 timestamps would be negative, but
+            // `coord.session_touched_files` is append-only with NOW() so
+            // this is defensive only.
+            recorded_at_ms: r.get::<_, i64>(2).max(0) as u64,
+        })
+        .collect())
+}
+
 /// Resume interrupted AI sessions on startup.
 ///
 /// Queries for task runs with status='running' and workflow_type='chat'
@@ -1515,6 +1587,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             generate_workflow_from_session,
             promote_session_to_worktree,
             commit_session_progress,
+            recent_session_touched_files,
         ])
         .build()
 }

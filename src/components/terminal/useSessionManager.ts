@@ -99,6 +99,29 @@ export interface FileConflict {
 }
 
 /**
+ * Predicted-collision row carried in {@link ConflictReport.predicted_collisions}.
+ *
+ * The Rust side flattens `PredictedCollision { conflict: FileConflict,
+ * confidence: f32 }` via `#[serde(flatten)]`, so on the wire each row is
+ * a `FileConflict` shape with a `confidence: number` field appended:
+ *
+ * ```json
+ * { "file_path": "src/lib.rs", "worktree_id": null,
+ *   "other_holders": [ ... ], "confidence": 0.7 }
+ * ```
+ *
+ * Confidence buckets (Phase 1 plan delta gap §1):
+ * - `>= 0.9` — `extracted_candidates` contains the literal path (red "match")
+ * - `0.5..0.9` — substring/basename match against a `live_holdings` path
+ *   (orange "likely")
+ * - `< 0.5` — directory-level overlap only (gray "maybe")
+ */
+export interface PredictedCollision extends FileConflict {
+  /** 0.0..1.0 — see bucket reference above. */
+  confidence: number;
+}
+
+/**
  * The most recent prior editor of a candidate path, from
  * `session_touched_files`. Hint for "X knows this file" even when no
  * current holder.
@@ -115,9 +138,34 @@ export interface RecentEditor {
  */
 export interface ConflictReport {
   live_holdings: FileRegistryInfoEntry[];
-  predicted_collisions: FileConflict[];
+  /**
+   * Each row is a {@link PredictedCollision} — a {@link FileConflict}
+   * with a `confidence` number appended.
+   */
+  predicted_collisions: PredictedCollision[];
   recent_editors: RecentEditor[];
   extracted_candidates: string[];
+}
+
+/**
+ * Request body for `POST /file-registry/probe-conflicts`.
+ *
+ * `hinted_files` (Phase 1 plan delta gap §2) lets callers that already
+ * know paths (drag-and-drop into the launch sheet, plan-derived launch)
+ * skip the round-trip through prompt extraction. The runner unions
+ * these with the result of `extract_candidate_paths(prompt, cwd)`
+ * before consulting the registry / PG.
+ */
+export interface ProbeConflictsRequest {
+  /** Prompt text to extract candidate paths from. `null` → no extraction. */
+  prompt: string | null;
+  /** Optional working directory for relative-path resolution. */
+  cwd?: string;
+  /**
+   * Optional pre-known candidate paths. Unioned with the prompt-extracted
+   * set on the runner side; either input alone is sufficient.
+   */
+  hinted_files?: string[];
 }
 
 export interface UnifiedSession {

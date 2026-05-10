@@ -29,9 +29,11 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  CONFIDENCE_TIER_CLASS,
   COLLISION_DIM_THRESHOLD,
   PROBE_DEBOUNCE_MS,
   buildProbeUrl,
+  confidenceTier,
   formatHoldingAge,
   groupHoldingsByHolder,
   resolvePort,
@@ -41,6 +43,7 @@ import type {
   ConflictReport,
   FileLockInfo,
   FileRegistryInfoEntry,
+  PredictedCollision,
 } from "./useSessionManager";
 
 // ── Test fixtures ────────────────────────────────────────────────────────────
@@ -245,6 +248,7 @@ describe("predicted-collisions data derivation", () => {
           other_holders: [
             { task_run_id: "T1", holder_name: "session-A", registered_at: 1 },
           ],
+          confidence: 1.0,
         },
       ],
     });
@@ -287,6 +291,7 @@ describe("predicted-collisions data derivation", () => {
         file_path: "x",
         worktree_id: null as string | null,
         other_holders: [],
+        confidence: 0.5,
       })),
     });
     const at = makeReport({
@@ -294,6 +299,7 @@ describe("predicted-collisions data derivation", () => {
         file_path: "x",
         worktree_id: null as string | null,
         other_holders: [],
+        confidence: 0.5,
       })),
     });
     expect(below.predicted_collisions.length < COLLISION_DIM_THRESHOLD).toBe(true);
@@ -409,5 +415,143 @@ describe("probe fetch wire shape", () => {
     const [, init] = fetchMock.mock.calls[0]!;
     const sentBody = JSON.parse((init as RequestInit).body as string);
     expect(sentBody.prompt).toBeNull();
+  });
+});
+
+// ── Confidence tiering — Phase 1 plan delta gap §1 ─────────────────────────
+
+describe("confidenceTier", () => {
+  it("buckets >=0.9 as match", () => {
+    expect(confidenceTier(1.0)).toBe("match");
+    expect(confidenceTier(0.95)).toBe("match");
+    expect(confidenceTier(0.9)).toBe("match");
+  });
+
+  it("buckets 0.5..0.9 as likely", () => {
+    expect(confidenceTier(0.89)).toBe("likely");
+    expect(confidenceTier(0.7)).toBe("likely");
+    expect(confidenceTier(0.5)).toBe("likely");
+  });
+
+  it("buckets <0.5 as maybe", () => {
+    expect(confidenceTier(0.49)).toBe("maybe");
+    expect(confidenceTier(0.1)).toBe("maybe");
+    expect(confidenceTier(0)).toBe("maybe");
+  });
+
+  it("each tier has a distinct CONFIDENCE_TIER_CLASS entry", () => {
+    expect(CONFIDENCE_TIER_CLASS.match).toBeDefined();
+    expect(CONFIDENCE_TIER_CLASS.likely).toBeDefined();
+    expect(CONFIDENCE_TIER_CLASS.maybe).toBeDefined();
+    // Distinct colors per tier — locks the visual contract.
+    expect(CONFIDENCE_TIER_CLASS.match).not.toBe(CONFIDENCE_TIER_CLASS.likely);
+    expect(CONFIDENCE_TIER_CLASS.likely).not.toBe(CONFIDENCE_TIER_CLASS.maybe);
+  });
+});
+
+describe("predicted-collisions render with confidence", () => {
+  it("each row carries a confidence value the panel buckets into a tier", () => {
+    const rows: PredictedCollision[] = [
+      {
+        file_path: "src/exact.rs",
+        worktree_id: null,
+        other_holders: [{ task_run_id: "T1", holder_name: "A", registered_at: 1 }],
+        confidence: 1.0,
+      },
+      {
+        file_path: "src/likely.rs",
+        worktree_id: null,
+        other_holders: [{ task_run_id: "T2", holder_name: "B", registered_at: 1 }],
+        confidence: 0.7,
+      },
+      {
+        file_path: "src/maybe.rs",
+        worktree_id: null,
+        other_holders: [{ task_run_id: "T3", holder_name: "C", registered_at: 1 }],
+        confidence: 0.3,
+      },
+    ];
+    expect(rows.map((r) => confidenceTier(r.confidence))).toEqual([
+      "match",
+      "likely",
+      "maybe",
+    ]);
+  });
+
+  it("defaults missing confidence to maybe (back-compat for older runners)", () => {
+    // The panel uses `c.confidence ?? 0` so a runner that hasn't been
+    // upgraded to emit confidence yet still renders — every row shows
+    // as the lowest "maybe" tier instead of crashing.
+    const tier = confidenceTier(0);
+    expect(tier).toBe("maybe");
+  });
+});
+
+// ── Wait-for-release wire shape ────────────────────────────────────────────
+//
+// Verifies the documented behavior of the WaitForReleasePanel without
+// rendering the React component (no jsdom). The two contracts under
+// test are:
+//   1. The component subscribes to `file-lock-released` Tauri events
+//      for each conflict file path.
+//   2. When the pending set drains to zero, the launch handler fires.
+// We exercise the same logic the component uses (Set-based bookkeeping,
+// drop-on-release, fire-on-empty) by constructing a parallel reducer
+// and asserting the state trace.
+
+describe("wait-for-release pending-set logic", () => {
+  it("drops a path on release and fires onAllClear when empty", () => {
+    const onAllClear = vi.fn();
+    let pending = new Set<string>(["src/a.rs", "src/b.rs"]);
+
+    const onRelease = (filePath: string) => {
+      if (!pending.has(filePath)) return;
+      const next = new Set(pending);
+      next.delete(filePath);
+      if (next.size === 0) onAllClear();
+      pending = next;
+    };
+
+    onRelease("src/a.rs");
+    expect(pending.size).toBe(1);
+    expect(onAllClear).not.toHaveBeenCalled();
+
+    onRelease("src/b.rs");
+    expect(pending.size).toBe(0);
+    expect(onAllClear).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores releases for paths not in the pending set", () => {
+    const onAllClear = vi.fn();
+    let pending = new Set<string>(["src/a.rs"]);
+
+    const onRelease = (filePath: string) => {
+      if (!pending.has(filePath)) return;
+      const next = new Set(pending);
+      next.delete(filePath);
+      if (next.size === 0) onAllClear();
+      pending = next;
+    };
+
+    onRelease("src/UNRELATED.rs");
+    expect(pending.size).toBe(1);
+    expect(onAllClear).not.toHaveBeenCalled();
+  });
+
+  it("does not double-fire onAllClear if the same release arrives twice", () => {
+    const onAllClear = vi.fn();
+    let pending = new Set<string>(["src/a.rs"]);
+
+    const onRelease = (filePath: string) => {
+      if (!pending.has(filePath)) return;
+      const next = new Set(pending);
+      next.delete(filePath);
+      if (next.size === 0) onAllClear();
+      pending = next;
+    };
+
+    onRelease("src/a.rs");
+    onRelease("src/a.rs"); // duplicate event
+    expect(onAllClear).toHaveBeenCalledTimes(1);
   });
 });

@@ -495,7 +495,22 @@ impl ClaudeSession {
                 use crate::commands::AppState;
                 use tauri::Manager;
                 if let Some(app_state) = app_handle_stdout.try_state::<std::sync::Arc<AppState>>() {
-                    app_state.file_lock_manager.release_all_sync(fallback_id);
+                    let released_paths =
+                        app_state.file_lock_manager.release_all_sync(fallback_id);
+                    // Emit file-lock-released for each path so frontends
+                    // can clear blocked-on indicators without waiting for
+                    // the next /file-locks/info poll. Mirrors the
+                    // file-lock-acquired emit in
+                    // claude_session/dispatcher.rs.
+                    for released_path in &released_paths {
+                        let payload = serde_json::json!({
+                            "type": "file-lock-released",
+                            "file_path": released_path,
+                            "task_run_id": fallback_id,
+                            "holder_name": fallback_id,
+                        });
+                        let _ = app_handle_stdout.emit("file-lock-released", &payload);
+                    }
                     app_state
                         .file_registry_manager
                         .release_all_sync(fallback_id);

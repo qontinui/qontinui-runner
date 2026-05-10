@@ -27,7 +27,7 @@ interface TerminalTabBarProps {
   accountUsage?: AccountUsageInfo[];
   launchCommands?: Record<string, string>;
   fileLocks?: import("./useSessionManager").FileLockInfo[];
-  fileLockStates?: Record<string, import("./useFileLockTracking").FileLockState>;
+  fileLockStates?: Record<string, import("./useFileLockTracking").LockState>;
   /** Per-tab commit-readiness state (populated by `useCommitState`). */
   commitStates?: Record<string, CommitState>;
   /**
@@ -74,6 +74,22 @@ function formatTime(value?: string | number): string {
   } catch {
     return "";
   }
+}
+
+/**
+ * Format a "since" epoch-ms as a short relative-age string ("5s",
+ * "42s", "5m", "2h"). Mirrors `formatHoldingAge` from `LaunchMenu.tsx`
+ * but takes the "since" timestamp directly. Negative ages clamp to
+ * "0s". Returns the empty string when `ms` is undefined.
+ */
+function formatSince(ms?: number): string {
+  if (ms === undefined) return "";
+  const deltaSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (deltaSec < 60) return `${deltaSec}s`;
+  const deltaMin = Math.floor(deltaSec / 60);
+  if (deltaMin < 60) return `${deltaMin}m`;
+  const deltaHr = Math.floor(deltaMin / 60);
+  return `${deltaHr}h`;
 }
 
 // ── Activity Sparkline ─────────────────────────────────────────────────────
@@ -448,6 +464,16 @@ export function TerminalTabBar({
                     const tab = tabs.find((t) => t.title === holderName);
                     if (tab) onSelect(tab.id);
                   }}
+                  resolveSessionName={(taskRunId) => {
+                    // PG `recent_editors` rows carry only `task_run_id`.
+                    // Try claudeSessionId first (the canonical mapping for
+                    // live AI tabs); fall back to tab.title when the
+                    // upstream id happens to match an explicit title.
+                    const byClaude = tabs.find((t) => t.claudeSessionId === taskRunId);
+                    if (byClaude) return byClaude.title;
+                    const byTitle = tabs.find((t) => t.title === taskRunId);
+                    return byTitle?.title;
+                  }}
                   onClose={() => setShowQuickLaunch(false)}
                 />
               )}
@@ -514,12 +540,33 @@ export function TerminalTabBar({
                 <Terminal className="w-3 h-3 shrink-0" />
               )}
 
-              {/* File lock indicator */}
-              {lockState === "waiting" && (
-                <Lock className="w-2.5 h-2.5 shrink-0 text-[#e0af68] animate-pulse" />
+              {/* File lock indicator. Wrapped in a span so the native
+                  `title` tooltip reaches the user — Lucide icons render
+                  as <svg> and don't accept the React title attribute
+                  directly. */}
+              {lockState?.kind === "waiting" && (
+                <span
+                  data-testid="tab-lock-waiting"
+                  className="shrink-0 inline-flex"
+                  aria-label="waiting on file lock"
+                  title={`waiting on ${lockState.counterpartyName ?? "another session"}'s ${
+                    lockState.filePath ?? "edit"
+                  }${lockState.sinceMs ? ` since ${formatSince(lockState.sinceMs)}` : ""}`}
+                >
+                  <Lock className="w-2.5 h-2.5 text-[#e0af68] animate-pulse" />
+                </span>
               )}
-              {lockState === "holding" && (
-                <Lock className="w-2.5 h-2.5 shrink-0 text-[#7aa2f7] opacity-60" />
+              {lockState?.kind === "holding" && (
+                <span
+                  data-testid="tab-lock-holding"
+                  className="shrink-0 inline-flex"
+                  aria-label="holding file lock"
+                  title={`holding ${lockState.filePath ?? "file"} — ${lockState.waiterCount ?? 0} session${
+                    lockState.waiterCount === 1 ? "" : "s"
+                  } waiting`}
+                >
+                  <Lock className="w-2.5 h-2.5 text-[#7aa2f7] opacity-60" />
+                </span>
               )}
 
               {/*

@@ -52,7 +52,7 @@ interface UseKeyboardShortcutsParams {
     showSidebar: boolean;
     setShowSidebar: React.Dispatch<React.SetStateAction<boolean>>;
     setRightPanelMode: React.Dispatch<
-      React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | null>
+      React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
     >;
     setSelectedTranscriptSessionId: React.Dispatch<React.SetStateAction<string | null>>;
   };

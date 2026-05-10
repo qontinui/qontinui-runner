@@ -14,6 +14,7 @@ import {
   Keyboard,
   ListChecks,
   MessageSquare,
+  Network,
   Rocket,
   PanelLeft,
   RefreshCw,
@@ -131,6 +132,9 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
   const onBuildPlanImplementationFromFile = workflowGen.handleBuildPlanImplementationFromFile;
   const onToggleFindings = findingsActions.handleToggleFindings;
   const findingsActive = workflowGen.rightPanelMode === "findings";
+  const fileOwnershipActive = workflowGen.rightPanelMode === "file-ownership";
+  const onToggleFileOwnership = () =>
+    workflowGen.setRightPanelMode((prev) => (prev === "file-ownership" ? null : "file-ownership"));
   const findingsCount = activeFindings.length;
   const frozenSessionCount = sessionManager.frozenCount;
   const { state: uiState, dispatch, toggleFocusMode } = useUIStateCx();
@@ -359,6 +363,23 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
             {findingsCount}
           </span>
         )}
+      </button>
+
+      {/* File-Ownership button (Phase 3 of conflict-tooling-pauses-aligned-plan) */}
+      <button
+        onClick={onToggleFileOwnership}
+        title="Toggle file-ownership heatmap (recent session_touched_files)"
+        className={`
+          flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors shrink-0
+          ${
+            fileOwnershipActive
+              ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
+              : "text-[#565f89] hover:bg-[#2a2d3d] hover:text-[#a9b1d6]"
+          }
+        `}
+      >
+        <Network className="w-3 h-3" />
+        Files
       </button>
 
       <div className="w-px h-4 bg-[#2a2d3d]" />

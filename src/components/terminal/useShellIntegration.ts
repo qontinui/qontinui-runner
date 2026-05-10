@@ -32,7 +32,7 @@ interface UseShellIntegrationParams {
   setSessionStates: React.Dispatch<React.SetStateAction<Record<string, SessionState>>>;
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
   setRightPanelMode: React.Dispatch<
-    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | null>
+    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
   >;
   setSelectedTranscriptSessionId: React.Dispatch<React.SetStateAction<string | null>>;
 }

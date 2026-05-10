@@ -41,9 +41,9 @@ interface UseWorkflowGenerationResult {
   latestPlanContent: string;
   planFileName: string | null;
   isPlanLoading: boolean;
-  rightPanelMode: "transcript" | "workflow" | "analysis" | "findings" | null;
+  rightPanelMode: "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null;
   setRightPanelMode: React.Dispatch<
-    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | null>
+    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
   >;
   showSidebar: boolean;
   setShowSidebar: React.Dispatch<React.SetStateAction<boolean>>;
@@ -100,7 +100,7 @@ export function useWorkflowGeneration({
   const [transcriptMessages, setTranscriptMessages] = useState<TranscriptMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [rightPanelMode, setRightPanelMode] = useState<
-    "transcript" | "workflow" | "analysis" | "findings" | null
+    "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null
   >(null);
 
   // Plan content state
