@@ -333,6 +333,15 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // anyway, but mark explicit for safety.
         probe_with_empty_args: false,
     },
+    // Productivity Stack — Phase 6 follow-up (worker observability).
+    ProxyableCommand {
+        name: "list_workers",
+        description: "List every registered pty-backed Claude worker, joined with TerminalManager titles and the coordinator's view of each worker's currently-assigned task. Read-only observability for the Workers panel and external debugging tools. Returns an array of `{ taskRunId, terminalId, terminalTitle, state, assignedTaskId, createdAtMs }` ordered by worker creation time (oldest first). State is one of `\"ready\"`, `\"processing\"`, `\"closed\"`. Empty list when no workers are registered.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"array","items":{"type":"object","required":["taskRunId","terminalId","state","createdAtMs"],"properties":{"taskRunId":{"type":"string"},"terminalId":{"type":"string"},"terminalTitle":{"type":["string","null"]},"state":{"type":"string","enum":["ready","processing","closed"]},"assignedTaskId":{"type":["string","null"]},"createdAtMs":{"type":"integer"}}}}"#,
+        // Read-only — empty args is the canonical call shape.
+        probe_with_empty_args: true,
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.

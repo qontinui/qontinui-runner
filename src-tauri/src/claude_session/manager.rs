@@ -196,6 +196,23 @@ impl SessionManager {
         results
     }
 
+    /// List every registered worker, ordered by creation time (oldest first).
+    /// Returns `(task_run_id, worker)` tuples so callers can correlate the
+    /// registry key with the worker handle in one pass. Closed-but-not-yet-
+    /// removed workers are included (cleanup is owned by `cleanup_closed`).
+    /// Used by the `list_workers` Tauri command and `GET /workers` HTTP route.
+    pub fn list_workers(&self) -> Vec<(String, Arc<WorkerSession>)> {
+        self.worker_sessions
+            .lock()
+            .ok()
+            .map(|guard| {
+                let mut v: Vec<_> = guard.iter().map(|(k, w)| (k.clone(), w.clone())).collect();
+                v.sort_by_key(|(_, w)| w.created_at_unix());
+                v
+            })
+            .unwrap_or_default()
+    }
+
     /// List all active session task_run_ids — union of ClaudeSessions and
     /// Workers whose state is non-Closed. Phase 6: workers participate in
     /// `Observation.live_sessions` so Rule B can assign them tasks.
@@ -336,5 +353,64 @@ impl std::fmt::Debug for SessionManager {
         f.debug_struct("SessionManager")
             .field("session_count", &count)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::TerminalManager;
+    use std::thread;
+    use std::time::Duration;
+
+    fn make_worker(task_run_id: &str, terminal_id: &str, title: &str) -> Arc<WorkerSession> {
+        Arc::new(WorkerSession::new(
+            task_run_id.to_string(),
+            terminal_id.to_string(),
+            title.to_string(),
+            Arc::new(TerminalManager::new()),
+        ))
+    }
+
+    #[test]
+    fn list_workers_empty_returns_empty_vec() {
+        let mgr = SessionManager::new();
+        assert!(mgr.list_workers().is_empty());
+    }
+
+    #[test]
+    fn list_workers_orders_by_created_at_unix() {
+        let mgr = SessionManager::new();
+        // Build the older worker first, then sleep so the second one's
+        // `created_at_unix` is strictly greater. WorkerSession::new() uses
+        // `SystemTime::now()` at second precision, so a 1.1s gap is enough
+        // to guarantee distinct seconds even on coarse-clock platforms.
+        let older = make_worker("task-older", "term-A", "Worker A");
+        mgr.register_worker(older.clone()).expect("register older");
+        thread::sleep(Duration::from_millis(1100));
+        let newer = make_worker("task-newer", "term-B", "Worker B");
+        mgr.register_worker(newer.clone()).expect("register newer");
+
+        let listed = mgr.list_workers();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].0, "task-older");
+        assert_eq!(listed[1].0, "task-newer");
+        assert!(listed[0].1.created_at_unix() <= listed[1].1.created_at_unix());
+    }
+
+    #[test]
+    fn list_workers_includes_closed_until_cleanup() {
+        let mgr = SessionManager::new();
+        let w = make_worker("task-closed", "term-X", "Worker X");
+        mgr.register_worker(w.clone()).expect("register");
+        // Closing the worker flips its state to Closed but does NOT remove
+        // it from the registry — `list_workers` must still surface it so
+        // observability callers can render the closed state. Cleanup is the
+        // separate `cleanup_closed` path.
+        w.close();
+        let listed = mgr.list_workers();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "task-closed");
+        assert_eq!(listed[0].1.state(), SessionState::Closed);
     }
 }
