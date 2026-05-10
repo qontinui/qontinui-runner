@@ -174,9 +174,18 @@ pub async fn transcript_read_session(
 }
 
 /// Get the most recent Claude Code session for the current project.
+///
+/// `config_dir` filters to a specific Claude config directory (e.g.
+/// `C:\claude\.claude-hotmail`). When omitted, all known config dirs are
+/// scanned and the first hit wins. The filter is required for callers
+/// like `useTabSessionIdCapture` that launched a tab into a specific
+/// account — without it, a more-recently-touched JSONL in a *different*
+/// account for the same `project_path` would shadow the session we
+/// actually want.
 #[tauri::command]
 pub async fn transcript_get_latest(
     project_path: Option<String>,
+    config_dir: Option<String>,
 ) -> Result<CommandResponse, String> {
     let project = project_path.unwrap_or_else(|| {
         crate::mcp::shared::get_workspace_paths_internal()
@@ -184,7 +193,12 @@ pub async fn transcript_get_latest(
             .unwrap_or_default()
     });
 
-    let config_dirs = transcript::find_claude_config_dirs();
+    // If config_dir was supplied, scope to it; otherwise scan all known dirs.
+    let config_dirs: Vec<std::path::PathBuf> = if let Some(dir) = config_dir {
+        vec![std::path::PathBuf::from(dir)]
+    } else {
+        transcript::find_claude_config_dirs()
+    };
 
     // Try each config dir, return first match
     for dir in &config_dirs {
