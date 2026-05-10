@@ -158,6 +158,7 @@ mod ui_error;
 mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
+mod util;
 mod validation;
 mod verification;
 mod vga;

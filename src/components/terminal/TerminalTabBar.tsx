@@ -436,6 +436,18 @@ export function TerminalTabBar({
                   accountUsage={accountUsage ?? []}
                   launchCommands={launchCommands}
                   fileLocks={fileLocks}
+                  onJumpToHolder={(holderName) => {
+                    // Resolve holder_name → tab id with the same lookup as
+                    // `findTabByHolderName` in `useFileLockTracking.ts:44-49`
+                    // (tab.title === holder_name). Reusing the parent's
+                    // `onSelect` channel rather than calling `setActiveId`
+                    // directly so zone focus / layout side-effects in
+                    // `TerminalPage`'s onSelect handler still run. No-op
+                    // when no tab matches — the holder may be a workflow
+                    // session, not a terminal tab.
+                    const tab = tabs.find((t) => t.title === holderName);
+                    if (tab) onSelect(tab.id);
+                  }}
                   onClose={() => setShowQuickLaunch(false)}
                 />
               )}

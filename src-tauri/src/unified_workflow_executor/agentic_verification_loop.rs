@@ -279,8 +279,12 @@ fn extract_iteration_summary(
     let obs_truncated = truncate_with_ellipsis(&verdict.observations, 80);
     let result = format!("{}: {}", verdict.status, obs_truncated);
 
-    // Extract file paths from worker output
-    let files_touched = worker_summary.map(extract_file_paths).unwrap_or_default();
+    // Extract file paths from worker output. The verification loop passes
+    // `cwd=""` so behavior matches the original private helper that lived
+    // here before promotion to `crate::util::path_extraction`.
+    let files_touched = worker_summary
+        .map(|s| crate::util::path_extraction::extract_candidate_paths(Some(s), ""))
+        .unwrap_or_default();
 
     IterationSummary {
         iteration: iteration.to_string(),
@@ -289,46 +293,6 @@ fn extract_iteration_summary(
         files_touched,
         confidence_delta: verdict.confidence - prev_confidence,
     }
-}
-
-/// Extract file paths from text by looking for common path patterns.
-fn extract_file_paths(text: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    for word in text.split_whitespace() {
-        let cleaned = word.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ',');
-        // Match patterns like src/foo/bar.rs, ./components/App.tsx, etc.
-        if (cleaned.contains('/') || cleaned.contains('\\'))
-            && cleaned.contains('.')
-            && cleaned.len() > 4
-            && cleaned.len() < 200
-            && !cleaned.starts_with("http")
-            && !cleaned.starts_with("//")
-        {
-            // Normalize to forward slashes and take just the filename portion if too long
-            let normalized = cleaned.replace('\\', "/");
-            let path = if normalized.len() > 60 {
-                // Keep just the last path segments
-                normalized
-                    .rsplit('/')
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("/")
-            } else {
-                normalized
-            };
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-        // Cap at 10 files to prevent bloat
-        if paths.len() >= 10 {
-            break;
-        }
-    }
-    paths
 }
 
 impl LoopController {
@@ -1450,65 +1414,10 @@ mod tests {
     }
 
     // ── extract_file_paths ──────────────────────────────────────────
-
-    #[test]
-    fn test_extract_paths_basic() {
-        let text = "Modified src/main.rs and src/lib.rs successfully";
-        let paths = extract_file_paths(text);
-        assert!(paths.contains(&"src/main.rs".to_string()));
-        assert!(paths.contains(&"src/lib.rs".to_string()));
-    }
-
-    #[test]
-    fn test_extract_paths_backslash() {
-        let text = "Edited src\\components\\App.tsx";
-        let paths = extract_file_paths(text);
-        assert!(paths.contains(&"src/components/App.tsx".to_string()));
-    }
-
-    #[test]
-    fn test_extract_paths_ignores_urls() {
-        let text = "See https://example.com/foo/bar.html for details";
-        let paths = extract_file_paths(text);
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn test_extract_paths_ignores_comments() {
-        let text = "// this is a comment without any paths";
-        let paths = extract_file_paths(text);
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn test_extract_paths_empty() {
-        assert!(extract_file_paths("").is_empty());
-    }
-
-    #[test]
-    fn test_extract_paths_deduplicates() {
-        let text = "Edit src/main.rs then src/main.rs again";
-        let paths = extract_file_paths(text);
-        assert_eq!(paths.iter().filter(|p| *p == "src/main.rs").count(), 1);
-    }
-
-    #[test]
-    fn test_extract_paths_caps_at_10() {
-        let text = (0..20)
-            .map(|i| format!("src/file{}.rs", i))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let paths = extract_file_paths(&text);
-        assert!(paths.len() <= 10);
-    }
-
-    #[test]
-    fn test_extract_paths_strips_quotes() {
-        let text = r#"Changed `src/foo.rs` and "src/bar.rs""#;
-        let paths = extract_file_paths(text);
-        assert!(paths.contains(&"src/foo.rs".to_string()));
-        assert!(paths.contains(&"src/bar.rs".to_string()));
-    }
+    // Promoted to `crate::util::path_extraction::extract_candidate_paths`;
+    // tests moved alongside the helper. The verification-loop callsite
+    // now invokes the shared helper with `cwd=""` to preserve original
+    // behavior.
 
     // ── IterationHistory ────────────────────────────────────────────
 
