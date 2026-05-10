@@ -105,15 +105,28 @@ pub fn router() -> Router<Arc<ApiState>> {
 /// event. Subscribers refetch `GET /wrappers` after a wakeup; the event
 /// payload itself only carries an `atMs` timestamp.
 ///
-/// Primary-only: secondaries never own a wrapper registry, so there's
-/// no event source for them to forward. The MCP bin always points at
-/// the primary's port, so this is fine. (We don't proxy this in
-/// `primary_proxy.rs` — secondaries that hit `/wrappers/events` get an
-/// empty stream; explicit reject would log noise per AI-session
-/// reconnect.)
+/// Primary-only. On a secondary the wrapper subsystem isn't initialized
+/// (see `mcp_api.rs` — `WrapperState::new_default()` is gated on
+/// `!is_secondary()`), and our broadcaster is a per-process `OnceLock`
+/// so a secondary's channel has no producer. Returning 503 here makes
+/// the bin's reconnect-with-backoff surface the misroute in stderr;
+/// silently serving an empty stream (older behavior) looked like a
+/// healthy connection but received no events. The bin should always
+/// point at the primary's port via `QONTINUI_PRIMARY_PORT`.
 async fn events_stream(
     State(_state): State<Arc<ApiState>>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    if primary_proxy::is_secondary() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error(
+                "wrapper change-events are primary-only — point QONTINUI_PRIMARY_PORT at the primary",
+            )),
+        ));
+    }
     let rx = events::subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|res| async move {
         match res {
@@ -127,7 +140,7 @@ async fn events_stream(
             Err(_) => None,
         }
     });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))))
 }
 
 // ---------------------------------------------------------------------------
