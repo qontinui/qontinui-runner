@@ -211,4 +211,104 @@ describe("invoke contract", () => {
       projectPath: "D:/repo",
     });
   });
+
+  it("transcript_get_latest accepts configDir alongside projectPath", async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      data: {
+        session_id: "session-hotmail",
+        config_dir: "C:/claude/.claude-hotmail",
+        project_path: "D:/repo",
+        last_modified: new Date().toISOString(),
+      },
+    });
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("transcript_get_latest", {
+      projectPath: "D:/repo",
+      configDir: "C:/claude/.claude-hotmail",
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("transcript_get_latest", {
+      projectPath: "D:/repo",
+      configDir: "C:/claude/.claude-hotmail",
+    });
+  });
+});
+
+/**
+ * Cross-config-dir capture — the P0 silent-fail surfaced during live
+ * verification 2026-05-09.
+ *
+ * Setup: a hotmail-account PTY tab launches at T0. The same project_path
+ * has an actively-writing gmail-account session (a different developer
+ * Claude Code session). Without a `configDir` filter, the backend
+ * `transcript_get_latest` returns whichever JSONL has the freshest
+ * mtime — the gmail one — and the hotmail tab binds the wrong
+ * session_id. Every `commit-state-changed` event keyed on the *real*
+ * hotmail session_id then gets dropped by the listener filter and the
+ * commit traffic light stays gray forever.
+ *
+ * The fix scopes the probe to the launching account. These cases verify
+ * the hook's invoke contract: when configDir is supplied, it MUST be
+ * forwarded to the backend. The decision logic for "what payload do we
+ * accept" is unchanged — what matters is that the backend now returns
+ * the right payload because the wrong-account ones are filtered out.
+ */
+describe("decideClaim — cross-config-dir scope (P0 fix)", () => {
+  it("accepts a session whose config_dir matches the launching account", () => {
+    const spawnAt = 1_700_000_000_000;
+    // Backend was called with configDir filter, so it returns ONLY
+    // the hotmail session — even though gmail had a fresher mtime.
+    const result = decideClaim(
+      tab("hotmail-tab", "D:/repo"),
+      {
+        session_id: "session-hotmail",
+        config_dir: "C:/claude/.claude-hotmail",
+        project_path: "D:/repo",
+        last_modified: new Date(spawnAt + 500).toISOString(),
+      },
+      spawnAt,
+      new Set(),
+    );
+    expect(result).toEqual({
+      claudeSessionId: "session-hotmail",
+      claudeConfigDir: "C:/claude/.claude-hotmail",
+    });
+  });
+
+  it("two tabs in different accounts each bind their own session", () => {
+    const spawnAt = 1_700_000_000_000;
+    const claimed = new Set<string>();
+
+    // Hotmail tab: backend filtered to hotmail, returns hotmail session.
+    const hotmailClaim = decideClaim(
+      tab("hotmail-tab", "D:/repo"),
+      {
+        session_id: "session-hotmail",
+        config_dir: "C:/claude/.claude-hotmail",
+        project_path: "D:/repo",
+        last_modified: new Date(spawnAt + 500).toISOString(),
+      },
+      spawnAt,
+      claimed,
+    );
+    expect(hotmailClaim?.claudeSessionId).toBe("session-hotmail");
+    if (hotmailClaim) claimed.add(hotmailClaim.claudeSessionId);
+
+    // Gmail tab launched concurrently into the same workdir but a
+    // different account: backend filtered to gmail, returns its own
+    // session. The two never collide because the configDir filter
+    // narrowed each lookup to the right account.
+    const gmailClaim = decideClaim(
+      tab("gmail-tab", "D:/repo"),
+      {
+        session_id: "session-gmail",
+        config_dir: "C:/claude/.claude-gmail",
+        project_path: "D:/repo",
+        last_modified: new Date(spawnAt + 700).toISOString(),
+      },
+      spawnAt,
+      claimed,
+    );
+    expect(gmailClaim?.claudeSessionId).toBe("session-gmail");
+  });
 });

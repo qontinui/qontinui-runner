@@ -424,14 +424,14 @@ function TerminalPageInner({
                 writeWhenReady(tabId, `${cmd}\r`);
                 // Plan §1.5 — start polling transcript_get_latest so
                 // tab.claudeSessionId fills in once Claude CLI writes
-                // its first JSONL record. Best-effort; on timeout the
-                // tab just stays without a session id and the commit
-                // traffic light renders gray. workingDir may be empty
-                // until the cwd OSC event lands; the hook passes empty
-                // through and the backend falls back to the workspace
-                // project path.
+                // its first JSONL record. Pass `configDir` so the probe
+                // scopes to the account this tab launched into; without
+                // it, a concurrent session in another account writing
+                // to the same project_path can win the freshest-mtime
+                // race and the wrong session_id gets bound (P0 silent
+                // fail for multi-account users).
                 const tab = tabs.find((t) => t.id === tabId);
-                startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt);
+                startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
               }
               // Type the initial instructions after Claude starts
               if (context) {
@@ -470,10 +470,12 @@ function TerminalPageInner({
                 // Stagger launch commands across accounts
                 setTimeout(() => writeWhenReady(tabId, `${cmd}\r`), i * 300);
                 // Plan §1.5 — kick off transcript-id polling per tab.
-                // workingDir may not be set yet; pass empty and let the
-                // backend fall back to the workspace project path.
+                // Pass each tab's own `configDirs[i]` so the probe scopes
+                // to the account this tab is in; otherwise a faster-
+                // writing concurrent account would shadow the right
+                // session_id and silently break the commit traffic light.
                 const tab = tabs.find((t) => t.id === tabId);
-                startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt);
+                startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDirs[i]);
               }
             }
             // Type initial instructions after Claude starts (stagger per session)
