@@ -62,6 +62,64 @@ export interface FileLockInfo {
   acquired_at: number;
 }
 
+/**
+ * One file currently held in `FileRegistryManager`. Distinct from
+ * {@link FileLockInfo} above — different field names (`registered_at` vs
+ * `acquired_at`) and includes `worktree_id`. Sourced from the
+ * `/file-registry/probe-conflicts` endpoint's `live_holdings` array.
+ *
+ * See `qontinui-runner/src-tauri/src/executor/file_registry.rs:412`
+ * (`FileRegistryInfo`) for the canonical Rust shape.
+ */
+export interface FileRegistryInfoEntry {
+  file_path: string;
+  worktree_id?: string | null;
+  holder_task_run_id: string;
+  holder_name: string;
+  registered_at: number;
+}
+
+/** A non-self holder of a candidate file in a {@link FileConflict}. */
+export interface ConflictHolder {
+  task_run_id: string;
+  holder_name: string;
+  registered_at: number;
+}
+
+/**
+ * One file in `predicted_collisions`: a candidate path the user's prompt
+ * mentioned that's already held by one or more sessions. The current
+ * launch is NOT included in `other_holders` — the probe filters it out
+ * before serializing.
+ */
+export interface FileConflict {
+  file_path: string;
+  worktree_id?: string | null;
+  other_holders: ConflictHolder[];
+}
+
+/**
+ * The most recent prior editor of a candidate path, from
+ * `session_touched_files`. Hint for "X knows this file" even when no
+ * current holder.
+ */
+export interface RecentEditor {
+  file_path: string;
+  task_run_id: string;
+}
+
+/**
+ * Response from `POST /file-registry/probe-conflicts`. Drives the
+ * Currently-editing panel + predicted-collision warning in
+ * `LaunchMenu`.
+ */
+export interface ConflictReport {
+  live_holdings: FileRegistryInfoEntry[];
+  predicted_collisions: FileConflict[];
+  recent_editors: RecentEditor[];
+  extracted_candidates: string[];
+}
+
 export interface UnifiedSession {
   sessionId: string;
   accountLabel: string;
