@@ -1,10 +1,12 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { Star, Terminal, Play, Loader2, Lock } from "lucide-react";
 import type {
   AccountUsageInfo,
   ConflictReport,
   FileLockInfo,
   FileRegistryInfoEntry,
+  PredictedCollision,
 } from "./useSessionManager";
 
 interface LaunchMenuProps {
@@ -22,6 +24,14 @@ interface LaunchMenuProps {
    * `findTabByHolderName` from `useFileLockTracking.ts:44-49`.
    */
   onJumpToHolder?: (holderName: string) => void;
+  /**
+   * Resolves a `task_run_id` (e.g. from `report.recent_editors`) to a
+   * friendly display name. Returns `undefined` when no mapping exists
+   * — callers should fall back to a truncated id. Wired in the
+   * parent (`TerminalTabBar.tsx`) using the same tab-lookup pattern as
+   * `useFileLockTracking.ts:44-49`. See plan §1 gap 4.
+   */
+  resolveSessionName?: (taskRunId: string) => string | undefined;
   onClose: () => void;
 }
 
@@ -128,6 +138,35 @@ export function summarizeFileLocksByHolder(locks: readonly FileLockInfo[]): stri
     .join(", ");
 }
 
+// ── Confidence bucketing for predicted-collision badges ─────────────────────
+
+/**
+ * Confidence tiers for the {@link PredictedCollision.confidence} score
+ * (Phase 1 plan delta gap §1). Three discrete buckets keep the UI noise
+ * low — the underlying score is continuous but users only need a quick
+ * "how worried should I be" hint.
+ */
+export type ConfidenceTier = "match" | "likely" | "maybe";
+
+/**
+ * Bucket a confidence score into one of three tiers:
+ * - `>= 0.9` → `"match"` (extracted_candidates contains the literal path)
+ * - `0.5..0.9` → `"likely"` (substring/basename overlap)
+ * - `< 0.5` → `"maybe"` (directory-level overlap only)
+ */
+export function confidenceTier(confidence: number): ConfidenceTier {
+  if (confidence >= 0.9) return "match";
+  if (confidence >= 0.5) return "likely";
+  return "maybe";
+}
+
+/** Tailwind classes per tier — co-located with {@link confidenceTier}. */
+export const CONFIDENCE_TIER_CLASS: Record<ConfidenceTier, string> = {
+  match: "bg-[#f7768e]/15 text-[#f7768e]",
+  likely: "bg-[#e0af68]/15 text-[#e0af68]",
+  maybe: "bg-[#565f89]/15 text-[#a9b1d6]",
+};
+
 // ── UI subcomponents ─────────────────────────────────────────────────────────
 
 function CountButtons({
@@ -185,6 +224,127 @@ function SectionHeader({ children }: { children: React.ReactNode }) {
   );
 }
 
+/**
+ * "Wait for release" subcomponent.
+ *
+ * Subscribes to `file-lock-released` events (added in this plan
+ * iteration) for the captured set of conflict file paths. As each
+ * release arrives, drops the file from the pending set; when the set
+ * empties, fires {@link onAllClear} (the launch action the user picked).
+ *
+ * Rendered inline inside the existing predicted-collisions panel
+ * rather than as a separate top-level component — keeps the diff small
+ * and the UI focused on the panel that already shows the conflicts.
+ *
+ * Cancellation: the wrapping `LaunchMenu` re-mounts the panel each
+ * time `report.predicted_collisions` changes (parent key is
+ * `c.file_path`), so the user can also dismiss by clearing the
+ * relevant prompt or closing the menu — both unmount this component
+ * and run its cleanup.
+ */
+function WaitForReleasePanel({
+  filePaths,
+  onAllClear,
+}: {
+  filePaths: readonly string[];
+  onAllClear: () => void;
+}) {
+  // `idle` until the user clicks "Wait", then `waiting`. Cancelling
+  // returns to `idle` and clears the listener. `pending` only carries
+  // meaningful state while waiting — when idle, the displayed count
+  // (if any) reads off the live `filePaths` prop directly.
+  const [state, setState] = useState<"idle" | "waiting">("idle");
+  const [pending, setPending] = useState<ReadonlySet<string>>(() => new Set());
+  const allClearRef = useRef(onAllClear);
+  useEffect(() => {
+    allClearRef.current = onAllClear;
+  }, [onAllClear]);
+
+  // Keep a ref to the current file paths so the click handler captures
+  // the snapshot at click time without us needing a state mirror that
+  // updates every render (avoids the react-hooks/set-state-in-effect
+  // warning the prior implementation triggered).
+  const filePathsRef = useRef(filePaths);
+  useEffect(() => {
+    filePathsRef.current = filePaths;
+  }, [filePaths]);
+
+  // Subscribe / unsubscribe to file-lock-released while waiting.
+  useEffect(() => {
+    if (state !== "waiting") return;
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen<{
+      type: string;
+      file_path: string;
+      task_run_id: string;
+      holder_name: string;
+    }>("file-lock-released", (event) => {
+      if (cancelled) return;
+      const { file_path } = event.payload;
+      setPending((prev) => {
+        if (!prev.has(file_path)) return prev;
+        const next = new Set(prev);
+        next.delete(file_path);
+        if (next.size === 0) {
+          // Defer the launch until after this state update commits so
+          // React's setState batching doesn't get confused by a parent
+          // unmounting us mid-render.
+          queueMicrotask(() => allClearRef.current());
+        }
+        return next;
+      });
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [state]);
+
+  if (state === "idle") {
+    return (
+      <button
+        type="button"
+        data-testid="wait-for-release-button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setPending(new Set(filePathsRef.current));
+          setState("waiting");
+        }}
+        className="text-[10px] text-[#7aa2f7] hover:underline"
+      >
+        Wait for release
+      </button>
+    );
+  }
+
+  // waiting state
+  return (
+    <span
+      data-testid="waiting-for-release-indicator"
+      className="flex items-center gap-1 text-[10px] text-[#e0af68]"
+    >
+      <Loader2 className="w-3 h-3 animate-spin" />
+      <span>
+        waiting on {pending.size} file{pending.size === 1 ? "" : "s"}
+      </span>
+      <button
+        type="button"
+        data-testid="cancel-wait-button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setState("idle");
+        }}
+        className="ml-1 text-[#565f89] hover:text-[#c0caf5]"
+      >
+        cancel
+      </button>
+    </span>
+  );
+}
+
 export function LaunchMenu({
   onCreatePlain,
   onCreateAiSession,
@@ -194,6 +354,7 @@ export function LaunchMenu({
   launchCommands,
   fileLocks,
   onJumpToHolder,
+  resolveSessionName,
   onClose,
 }: LaunchMenuProps) {
   const [customCommand, setCustomCommand] = useState("");
@@ -431,15 +592,27 @@ export function LaunchMenu({
               <div className="text-[10px] uppercase tracking-wider text-[#e0af68]">
                 Possible conflicts
               </div>
-              {report.predicted_collisions.map((c) => {
+              {report.predicted_collisions.map((c: PredictedCollision) => {
                 const holders = c.other_holders.map((h) => h.holder_name).join(", ");
                 const firstHolder = c.other_holders[0]?.holder_name;
+                // confidence is part of the wire shape, but defensively
+                // default to 0 so older runner builds (pre-confidence)
+                // still render — they just won't show the high-tier badge.
+                const tier = confidenceTier(c.confidence ?? 0);
                 return (
                   <div
                     key={c.file_path}
                     data-testid="predicted-collision-row"
                     className="flex items-center gap-2 mt-1"
                   >
+                    <span
+                      data-testid="confidence-badge"
+                      data-tier={tier}
+                      className={`px-1 py-0 rounded text-[9px] font-medium uppercase tracking-wider shrink-0 ${CONFIDENCE_TIER_CLASS[tier]}`}
+                      title={`confidence ${(typeof c.confidence === "number" ? c.confidence : 0).toFixed(2)}`}
+                    >
+                      {tier}
+                    </span>
                     <span className="font-mono text-xs truncate">{c.file_path}</span>
                     <span className="text-[10px] text-[#a9b1d6] truncate">held by {holders}</span>
                     {firstHolder && onJumpToHolder && (
@@ -458,6 +631,62 @@ export function LaunchMenu({
                   </div>
                 );
               })}
+              {/* Wait-for-release: subscribes to file-lock-released for
+                  the current conflict file paths and auto-fires the
+                  Best Available launch when all clear. Shown only when
+                  we have at least one usable launch target — falling
+                  back to onCreatePlain doesn't make sense for an
+                  "after lock release" affordance. */}
+              {bestAccount && (
+                <div
+                  data-testid="wait-for-release-row"
+                  className="flex items-center justify-end mt-2"
+                >
+                  <WaitForReleasePanel
+                    filePaths={report.predicted_collisions.map((c) => c.file_path)}
+                    onAllClear={() => {
+                      // Fire the equivalent of "Best Available, count=1"
+                      // and close the menu — matches what a click on
+                      // that button would do. The user opted into the
+                      // wait, so the best-available pick is the
+                      // sensible default; if they wanted a different
+                      // account they could have just clicked it
+                      // (launch was never blocked, only dimmed).
+                      onCreateAiSession(1, bestAccount.config_dir, ctx);
+                      onClose();
+                    }}
+                  />
+                </div>
+              )}
+              {/* Recent editors hint — when the probe surfaced a
+                  prior editor of one of the candidate paths, show
+                  their friendly name (resolved via the parent's tab
+                  lookup). Falls back to a truncated task_run_id when
+                  no mapping is known (workflow runner, dormant
+                  session, etc). */}
+              {resolveSessionName && report.recent_editors.length > 0 && (
+                <div
+                  data-testid="recent-editors-list"
+                  className="mt-2 text-[10px] text-[#565f89]"
+                >
+                  Recent editors:{" "}
+                  {report.recent_editors.map((e, i) => {
+                    const name = resolveSessionName(e.task_run_id);
+                    return (
+                      <span key={`${e.task_run_id}:${e.file_path}:${i}`}>
+                        {i > 0 && ", "}
+                        <span
+                          data-testid="recent-editor-name"
+                          title={`${e.task_run_id} edited ${e.file_path}`}
+                          className={name ? "text-[#a9b1d6]" : "font-mono"}
+                        >
+                          {name ?? e.task_run_id.slice(0, 8)}
+                        </span>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 

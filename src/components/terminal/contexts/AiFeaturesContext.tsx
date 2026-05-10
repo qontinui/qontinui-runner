@@ -64,7 +64,7 @@ export function AiFeaturesProvider({
   // Cross-hook ref wiring: shellIntegration needs setRightPanelMode from workflowGen,
   // but workflowGen is defined after shellIntegration. Refs break the cycle.
   const rightPanelModeSetterRef = useRef<
-    React.Dispatch<React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | null>>
+    React.Dispatch<React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>>
   >(() => {});
   const selectedSessionSetterRef = useRef<React.Dispatch<React.SetStateAction<string | null>>>(
     () => {},

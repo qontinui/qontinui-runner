@@ -538,34 +538,59 @@ impl FileLockManager {
     }
 
     /// Release all file locks held by a session.
-    pub async fn release_all(&self, task_run_id: &str) {
+    ///
+    /// Returns the normalized paths whose locks were released. Callers
+    /// with access to a `tauri::AppHandle` use this to emit a
+    /// `file-lock-released` event per path so frontends can clear "X is
+    /// blocked on …" indicators without waiting on the next poll.
+    pub async fn release_all(&self, task_run_id: &str) -> Vec<String> {
         let mut state = self.state.write().await;
-        let before = state.len();
-        state.retain(|_, entry| entry.holder_task_run_id != task_run_id);
-        let released = before - state.len();
-        if released > 0 {
+        let mut released_paths: Vec<String> = Vec::new();
+        state.retain(|path, entry| {
+            if entry.holder_task_run_id == task_run_id {
+                released_paths.push(path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !released_paths.is_empty() {
             info!(
                 "Released {} file lock(s) for task {}",
-                released, task_run_id
+                released_paths.len(),
+                task_run_id
             );
             drop(state);
             self.notify.notify_waiters();
         }
+        released_paths
     }
 
     /// Synchronous version for Drop impls.
-    pub fn release_all_sync(&self, task_run_id: &str) {
+    ///
+    /// Returns the normalized paths whose locks were released (same shape
+    /// as the async `release_all`). Callers without access to a runtime
+    /// can still emit per-path events from the returned vec; sites that
+    /// don't have a `tauri::AppHandle` (e.g. `WorkflowDropGuard::drop`)
+    /// can drop the result — the event is best-effort.
+    pub fn release_all_sync(&self, task_run_id: &str) -> Vec<String> {
         for attempt in 0..10 {
             match self.state.try_write() {
                 Ok(mut state) => {
-                    let before = state.len();
-                    state.retain(|_, entry| entry.holder_task_run_id != task_run_id);
-                    let released = before - state.len();
-                    if released > 0 {
+                    let mut released_paths: Vec<String> = Vec::new();
+                    state.retain(|path, entry| {
+                        if entry.holder_task_run_id == task_run_id {
+                            released_paths.push(path.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if !released_paths.is_empty() {
                         drop(state);
                         self.notify.notify_waiters();
                     }
-                    return;
+                    return released_paths;
                 }
                 Err(_) => {
                     if attempt < 9 {
@@ -578,6 +603,7 @@ impl FileLockManager {
             "Could not acquire file lock state after 10 retries for sync release (task {})",
             task_run_id
         );
+        Vec::new()
     }
 
     /// Check if a file is held by a different session. Returns the holder name if so.
@@ -1128,5 +1154,84 @@ mod tests {
         let info = mgr.info().await;
         assert_eq!(info.len(), 1);
         assert_eq!(info[0].worktree_id, Some("wt-2".to_string()));
+    }
+
+    // =========================================================================
+    // FileLockManager: release_all returns released paths
+    //
+    // The async `release_all` and sync `release_all_sync` return the
+    // normalized paths whose locks were released, so callers with access
+    // to a `tauri::AppHandle` can emit a `file-lock-released` event per
+    // path (best-effort; sites without a handle drop the result).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_lock_release_all_returns_released_paths() {
+        let mgr = FileLockManager::new();
+
+        // Same task acquires three files
+        mgr.acquire("src/a.rs", "task-1", "Session A").await;
+        mgr.acquire("src/b.rs", "task-1", "Session A").await;
+        mgr.acquire("src/c.rs", "task-1", "Session A").await;
+
+        // A second task holds an unrelated file — must NOT be returned.
+        mgr.acquire("src/other.rs", "task-2", "Session B").await;
+
+        let mut released = mgr.release_all("task-1").await;
+        released.sort();
+
+        // Paths come back normalized (forward-slash, lowercased on Windows).
+        let mut expected: Vec<String> = vec!["src/a.rs", "src/b.rs", "src/c.rs"]
+            .into_iter()
+            .map(normalize_path)
+            .collect();
+        expected.sort();
+
+        assert_eq!(released, expected);
+
+        // Sanity: task-2's lock survives.
+        let info = mgr.info().await;
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].holder_task_run_id, "task-2");
+    }
+
+    #[tokio::test]
+    async fn test_lock_release_all_returns_empty_when_no_holdings() {
+        let mgr = FileLockManager::new();
+
+        // No locks held at all — empty Vec, no panic.
+        let released = mgr.release_all("never-held").await;
+        assert!(released.is_empty());
+
+        // Some other task holds a lock — still empty for the queried task.
+        mgr.acquire("src/x.rs", "task-other", "Other").await;
+        let released = mgr.release_all("never-held").await;
+        assert!(released.is_empty());
+    }
+
+    #[test]
+    fn test_lock_release_all_sync_returns_released_paths() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mgr = FileLockManager::new();
+
+        rt.block_on(async {
+            mgr.acquire("src/a.rs", "task-1", "Session A").await;
+            mgr.acquire("src/b.rs", "task-1", "Session A").await;
+        });
+
+        let mut released = mgr.release_all_sync("task-1");
+        released.sort();
+
+        let mut expected: Vec<String> = vec!["src/a.rs", "src/b.rs"]
+            .into_iter()
+            .map(normalize_path)
+            .collect();
+        expected.sort();
+
+        assert_eq!(released, expected);
+
+        rt.block_on(async {
+            assert!(mgr.info().await.is_empty());
+        });
     }
 }

@@ -962,11 +962,21 @@ pub async fn stop_ai_analysis(
             .file_registry_manager
             .release_all(&task.id)
             .await;
-        state
+        let released_paths = state
             .app_state
             .file_lock_manager
             .release_all(&task.id)
             .await;
+        for released_path in &released_paths {
+            use tauri::Emitter;
+            let payload = serde_json::json!({
+                "type": "file-lock-released",
+                "file_path": released_path,
+                "task_run_id": task.id,
+                "holder_name": task.id,
+            });
+            let _ = state.app_handle.emit("file-lock-released", &payload);
+        }
 
         info!("MCP API: Stopped task run: {}", task.id);
     }

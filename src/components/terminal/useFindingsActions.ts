@@ -11,7 +11,7 @@ interface UseFindingsActionsParams {
   pendingResumeRef: React.MutableRefObject<{ tabId: string; resumeCmd: string } | null>;
   runGeneration: (description: string, inlineContext: string) => Promise<void>;
   setRightPanelMode: React.Dispatch<
-    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | null>
+    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
   >;
 }
 

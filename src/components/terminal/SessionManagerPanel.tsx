@@ -7,12 +7,21 @@ import type {
   UnifiedSession,
   SessionLiveStatus,
 } from "./useSessionManager";
+import type { LockState } from "./useFileLockTracking";
 
 interface SessionManagerPanelProps {
   manager: UseSessionManagerReturn;
   selectedSessionId: string | null;
   /** Map of session task_run_id → number of conflicting files */
   sessionConflictCounts?: Map<string, number>;
+  /**
+   * Map of session id → current {@link LockState}. Sessions in
+   * `kind: "waiting"` get a "blocked on …" subtitle in their card.
+   * Key is `session.sessionId` (= the Claude transcript session id,
+   * which equals `tab.claudeSessionId` for live PTY tabs); the parent
+   * derives this from the per-tab `fileLockStates` keyed on `tab.id`.
+   */
+  sessionLockStates?: Map<string, LockState>;
 }
 
 /** Human-readable status group labels. */
@@ -85,6 +94,7 @@ export function SessionManagerPanel({
   manager,
   selectedSessionId,
   sessionConflictCounts,
+  sessionLockStates,
 }: SessionManagerPanelProps) {
   const {
     sessions,
@@ -223,6 +233,7 @@ export function SessionManagerPanel({
                   isPinned={pinnedIds.has(session.sessionId)}
                   sessionLabel={sessionLabels[session.sessionId] ?? null}
                   fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
+                  lockState={sessionLockStates?.get(session.sessionId)}
                   onResume={resumeSession}
                   onViewTranscript={viewTranscript}
                   onCopyId={copySessionId}

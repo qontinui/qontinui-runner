@@ -1,6 +1,7 @@
 import { TranscriptContentPanel } from "./TranscriptContentPanel";
 import { TerminalAnalysisPanel } from "./TerminalAnalysisPanel";
 import { TerminalFindingsPanel } from "./TerminalFindingsPanel";
+import { FileOwnershipHeatmap } from "./FileOwnershipHeatmap";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
 import { useAiFeatures, useSessionState } from "./contexts";
 
@@ -86,6 +87,10 @@ export function TerminalRightPanel() {
         onGenerateWorkflow={findingsActions.handleGenerateFromFindings}
       />
     );
+  }
+
+  if (rightPanelMode === "file-ownership") {
+    return <FileOwnershipHeatmap onClose={() => workflowGen.setRightPanelMode(null)} />;
   }
 
   return null;
