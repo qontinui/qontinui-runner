@@ -40,7 +40,7 @@ jobs:
       release_version: ${{ steps.get_version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Get version from tag
         id: get_version
@@ -109,7 +109,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # qontinui-schemas is a workspace path-dep
       # (`qontinui-types = { path = "../../qontinui-schemas/rust" }`
@@ -128,7 +128,7 @@ jobs:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: "pnpm"
@@ -299,7 +299,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Generate update manifest
         run: |
