@@ -61,8 +61,21 @@ interface UseTabSessionIdCaptureResult {
    * Begin polling `transcript_get_latest` for `tabId`. Idempotent —
    * a second call for the same tabId is a no-op while a poll is
    * already in flight.
+   *
+   * `configDir` (optional) — when the tab was launched into a
+   * specific Claude config dir (e.g. via `onLaunchAiSession`'s
+   * per-account config), pass it through so the backend filters
+   * to that account. Without it, a concurrent Claude session in a
+   * *different* account writing to the same `projectPath` can win
+   * the freshest-mtime race and the wrong session_id gets bound.
+   * P0 silent-fail if omitted; multi-account users are the common case.
    */
-  startCapture: (tabId: string, workingDir: string, spawnTimestamp: number) => void;
+  startCapture: (
+    tabId: string,
+    workingDir: string,
+    spawnTimestamp: number,
+    configDir?: string,
+  ) => void;
 }
 
 export function useTabSessionIdCapture({
@@ -113,7 +126,7 @@ export function useTabSessionIdCapture({
     // shell-integration `cwd` event, which may not have fired yet at
     // capture-start time. Empty string is treated as "let the backend
     // fall back to its workspace default".
-    (tabId, workingDir, spawnTimestamp) => {
+    (tabId, workingDir, spawnTimestamp, configDir) => {
       // Already polling this tab? Don't double-up.
       if (inFlight.current.has(tabId)) return;
       const handle = { cancelled: false };
@@ -146,13 +159,14 @@ export function useTabSessionIdCapture({
         }
 
         try {
-          // Pass workingDir if known; empty/undefined → backend falls
-          // back to the workspace project path (see
-          // `commands/transcript.rs::transcript_get_latest`).
-          const resp = await invoke<CommandResponse>(
-            "transcript_get_latest",
-            workingDir ? { projectPath: workingDir } : {},
-          );
+          // Pass workingDir + configDir when known. Both fall back
+          // server-side: empty workingDir → workspace project path;
+          // missing configDir → scan all known config dirs (the bug
+          // path that motivated adding configDir — see hook docstring).
+          const args: Record<string, string> = {};
+          if (workingDir) args.projectPath = workingDir;
+          if (configDir) args.configDir = configDir;
+          const resp = await invoke<CommandResponse>("transcript_get_latest", args);
           if (handle.cancelled) return;
 
           const data = resp.success ? (resp.data as TranscriptSessionPayload | null) : null;

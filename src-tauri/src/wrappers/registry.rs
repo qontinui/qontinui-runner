@@ -226,7 +226,8 @@ impl WrapperRegistry {
     pub async fn rescan(&self, id: &str) -> Result<(), RegistryError> {
         let wrapper_dir = self.root.join(id);
         if !wrapper_dir.is_dir() {
-            // Directory gone — treat as uninstall.
+            // Directory gone — treat as uninstall. `remove` already emits
+            // a change event so we don't emit again here.
             self.remove(id).await;
             return Ok(());
         }
@@ -244,13 +245,16 @@ impl WrapperRegistry {
                 idx.wrappers.insert(wrapper.id.clone(), wrapper);
                 drop(idx);
                 self.save_index().await?;
+                super::events::emit();
                 Ok(())
             }
             Err(e) => Err(e),
         }
     }
 
-    /// Re-scan every subdirectory of the wrappers root.
+    /// Re-scan every subdirectory of the wrappers root. Emits a single
+    /// change event after the scan completes if the cache contents
+    /// changed (added entries, removed entries, or updated_at moved).
     pub async fn rescan_all(&self) -> Result<(), RegistryError> {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(e) => e,
@@ -300,16 +304,20 @@ impl WrapperRegistry {
         idx.wrappers.retain(|id, _| seen.iter().any(|s| s == id));
         drop(idx);
         self.save_index().await?;
+        super::events::emit();
         Ok(())
     }
 
     /// Drop a wrapper from the cache (used by uninstall).
     pub async fn remove(&self, id: &str) {
         let mut idx = self.inner.write().await;
-        idx.wrappers.remove(id);
+        let was_present = idx.wrappers.remove(id).is_some();
         drop(idx);
         if let Err(e) = self.save_index().await {
             warn!("wrappers: save_index after remove('{}') failed: {}", id, e);
+        }
+        if was_present {
+            super::events::emit();
         }
     }
 

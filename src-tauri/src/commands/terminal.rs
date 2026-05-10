@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::commands::CommandResponse;
 use crate::error::AppError;
-use crate::terminal::TerminalManager;
+use crate::terminal::{strip_ansi, TerminalManager};
 
 /// Create a new terminal session.
 #[tauri::command]
@@ -497,41 +497,6 @@ pub fn terminal_collect_session_metadata(
             "page_ids": page_ids,
         })),
     })
-}
-
-/// Strip ANSI escape sequences from text for readable scrollback previews.
-fn strip_ansi(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Skip CSI sequences: ESC [ ... letter
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&c) = chars.peek() {
-                    chars.next();
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            // Skip OSC sequences: ESC ] ... BEL
-            } else if chars.peek() == Some(&']') {
-                chars.next();
-                while let Some(&c) = chars.peek() {
-                    chars.next();
-                    if c == '\x07' {
-                        break;
-                    }
-                }
-            } else {
-                // Skip next char (two-char escape)
-                chars.next();
-            }
-        } else if ch >= ' ' || ch == '\n' || ch == '\r' || ch == '\t' {
-            result.push(ch);
-        }
-    }
-    result
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.

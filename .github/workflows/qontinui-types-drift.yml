@@ -41,12 +41,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout qontinui-runner
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: qontinui-runner
 
       - name: Checkout qontinui-schemas (sibling)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: qontinui/qontinui-schemas
           path: qontinui-schemas
@@ -76,7 +76,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
 

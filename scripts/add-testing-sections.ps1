@@ -244,7 +244,7 @@ $specs = [ordered]@{
     "runner:product-tours"                = "runner_product-tours.json"
     "runner:project-explainer"            = "runner_project-explainer.json"
     "runner:session-recap"                = "runner_session-recap.json"
-    "runner:settings-backend-connection"  = "runner_settings-backend-connection.json"
+    "runner:settings-account"             = "runner_settings-account.json"
     "runner:settings-agentic"             = "runner_settings-agentic.json"
     "runner:settings-ai"                  = "runner_settings-ai.json"
     "runner:settings-backup"              = "runner_settings-backup.json"
@@ -260,6 +260,7 @@ $specs = [ordered]@{
     "runner:settings-updates"             = "runner_settings-updates.json"
     "runner:settings-world-state-verifier" = "runner_settings-world-state-verifier.json"
     "runner:specs"                        = "runner_specs.json"
+    "runner:terminal"                     = "runner_terminal.json"
     "runner:vga"                          = "runner_vga.json"
     "runner:visual-dashboard"             = "runner_visual-dashboard.json"
 }

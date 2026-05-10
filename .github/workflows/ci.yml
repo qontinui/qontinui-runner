@@ -23,7 +23,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # qontinui-runner's frontend cross-repo deps now resolve via npm
       # (see package.json: @qontinui/* moved from link: to ^x.y.z ranges).
@@ -58,7 +58,7 @@ jobs:
           version: 10.33.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: "pnpm"
@@ -167,14 +167,20 @@ jobs:
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
         env:
           # `CARGO_BUILD_JOBS` reduces the parallel-rustc memory peak.
-          # Empirically (run 25336049561):
-          #   - Windows passes at JOBS=2 with a 16 GB pagefile — Windows
-          #     pagefile commits lazily so peak fits.
+          # Empirically:
+          #   - Windows: was passing at JOBS=2 with a 16 GB pagefile (run
+          #     25336049561), but cumulative dep growth through PRs #59-#62
+          #     pushed peak past the threshold — runs 25612844640 +
+          #     75193978255 (PR #65) both OOM'd with `rustc-LLVM ERROR:
+          #     out of memory / Allocation failed`, exit `0xc000001d`
+          #     (STATUS_ILLEGAL_INSTRUCTION = the rustc allocator
+          #     aborting). Dropped to JOBS=1 for single-threaded compile,
+          #     matching Ubuntu's mitigation.
           #   - Ubuntu OOM-killer is harsher: even with a 12 GB swapfile,
           #     JOBS=2 still trips the runner-agent shutdown. Drop Ubuntu
           #     to JOBS=1 for a single-threaded compile.
           #   - macOS is on a fatter runner and stays at default 4.
-          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'ubuntu-22.04' && 1) || (matrix.platform == 'macos-latest' && 4) || 2 }}
+          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'macos-latest' && 4) || 1 }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
@@ -204,7 +210,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # cargo audit walks the workspace and resolves path: deps. The runner's
       # src-tauri/Cargo.toml depends on `qontinui-types` from a sibling repo.

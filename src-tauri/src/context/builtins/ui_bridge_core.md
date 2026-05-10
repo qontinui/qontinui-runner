@@ -206,7 +206,7 @@ Prefer these primitives over `sleep N && re-discover`; they all already exist. E
 
 **Console errors** — targeted retrieval, not "dump everything":
 
-- `GET /ui-bridge/control/console-errors?since=<epoch-ms-or-ISO>&limit=&group=true&groupBy=` — `since` accepts both epoch-ms numeric and ISO-8601 strings. Use `group=true` for fingerprint-rolled buckets on long runs.
+- `GET /ui-bridge/control/console-errors?since=<epoch-ms-or-ISO>&limit=&group=true&groupBy=&level=` — `since` accepts both epoch-ms numeric and ISO-8601 strings. Use `group=true` for fingerprint-rolled buckets on long runs. `level=` accepts a comma-separated allow-list (`error`, `warn`, `unhandledrejection`, `info`, `log`, `debug`, or `all`/`*`) to drop info-level entries the SDK captures via `console.warn`. Default unset returns everything (back-compat).
 
 **Side-effect detection on clicks** — read before re-discovering:
 

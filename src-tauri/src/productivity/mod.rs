@@ -14,3 +14,4 @@ pub mod decompose;
 pub mod review;
 pub mod rewind;
 pub mod summarize;
+pub mod workers;

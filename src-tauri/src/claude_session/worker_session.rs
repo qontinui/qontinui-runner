@@ -144,10 +144,12 @@ impl WorkerSession {
 
     /// Mirrors `ClaudeSession::send_user_message` — returns `Ok(true)` on
     /// successful immediate write. Workers do not queue (pty stdin is
-    /// always writable). Writes the brief wrapped in ANSI bracketed-paste
-    /// markers followed by `\r\n` (CR-LF for Windows PowerShell 5.1;
-    /// matches `schedule_initial_command` pattern). Flips state
-    /// `Ready → Processing` on success.
+    /// always writable). Delegates the entire submit framing to
+    /// [`TerminalSession::submit_prompt`], which wraps the brief in ANSI
+    /// bracketed-paste markers and follows it with a bare `\r` outside
+    /// the paste window so the Claude CLI prompt actually submits.
+    /// Flips state `Ready → Processing` on success. See Phase 6 §6
+    /// remediation plan, Issue 1 for why CR-LF was insufficient.
     pub fn send_user_message(&self, message: &str) -> Result<bool, String> {
         let session = self
             .terminal_manager
@@ -159,27 +161,11 @@ impl WorkerSession {
                 )
             })?;
 
-        let payload = build_paste_payload(message);
-        session.write(&payload)?;
+        session.submit_prompt(message)?;
 
         self.state.store(STATE_PROCESSING, Ordering::Release);
         Ok(true)
     }
-}
-
-/// Wrap `message` with ANSI bracketed-paste markers and append CR-LF.
-///
-/// Bracketed paste tells the worker's TUI (Claude CLI here) that the
-/// bytes between the markers are one paste block, not character-by-
-/// character keystrokes. Without this the pty's display renders the
-/// first ~100 chars with collapsed inter-word spaces (cosmetic bug;
-/// Claude still receives the bytes correctly). Modern TUIs enable
-/// bracketed-paste mode via `\e[?2004h` and recognize `\x1b[200~` ...
-/// `\x1b[201~` as the paste delimiters; the trailing `\r\n` after the
-/// end marker is the keystroke that actually submits the input. See
-/// Phase 6 remediation plan Issue 1.
-pub(crate) fn build_paste_payload(message: &str) -> Vec<u8> {
-    format!("\x1b[200~{}\x1b[201~\r\n", message).into_bytes()
 }
 
 impl std::fmt::Debug for WorkerSession {
@@ -219,33 +205,21 @@ mod tests {
     }
 
     #[test]
-    fn build_paste_payload_wraps_with_bracketed_paste_markers() {
-        let message = "Task 1: Add data-ui-bridge-id";
-        let payload = build_paste_payload(message);
-
-        // Start marker: ESC [ 200 ~
+    fn send_user_message_payload_matches_submit_prompt_framing() {
+        // The actual byte sequence written by `submit_prompt` is exercised
+        // in `terminal::session::tests`. This test guards the contract:
+        // for input "hello", the bytes that hit the pty must be exactly
+        // `\x1b[200~hello\x1b[201~\r` — paste begin, body, paste end,
+        // bare CR (NOT CR-LF; LF would be eaten by the paste block).
+        let payload = crate::terminal::session::build_submit_payload("hello");
+        assert_eq!(payload, b"\x1b[200~hello\x1b[201~\r");
+        // Regression guard: the Phase 6 §6 bug was that send_user_message
+        // sent CR-LF; Claude Code's bracketed-paste handler ate the LF
+        // and never submitted. The submit byte must be a bare CR.
         assert!(
-            payload.starts_with(b"\x1b[200~"),
-            "payload must start with bracketed-paste start marker"
+            !payload.contains(&b'\n'),
+            "submit framing must not contain LF bytes"
         );
-        // End marker followed by CR-LF (the CR-LF is the submit keystroke
-        // and stays AFTER the end marker so the TUI delimits the paste
-        // before the newline triggers send).
-        assert!(
-            payload.ends_with(b"\x1b[201~\r\n"),
-            "payload must end with bracketed-paste end marker + CR-LF"
-        );
-        // Original message bytes survive intact between the markers.
-        let inner = &payload[b"\x1b[200~".len()..payload.len() - b"\x1b[201~\r\n".len()];
-        assert_eq!(inner, message.as_bytes());
-    }
-
-    #[test]
-    fn build_paste_payload_handles_empty_message() {
-        // Defensive: an empty brief still gets the markers and the
-        // submit CR-LF. The TUI sees an empty paste followed by Enter.
-        let payload = build_paste_payload("");
-        assert_eq!(payload, b"\x1b[200~\x1b[201~\r\n");
     }
 
     #[test]

@@ -56,6 +56,12 @@ export function ProductivityPage() {
   // Listen for the "productivity-set-view" event dispatched by
   // useAppNavigation when an alias like `productivity-coordinator` is
   // requested via UI Bridge / pageNavigate.
+  //
+  // Also publish a mount-promise (window flag + one-shot event) so
+  // `dispatchProductivitySubView` in useAppNavigation can await mount
+  // before firing the event. Without this, dispatching synchronously
+  // after a tab switch races the just-mounted listener and the event
+  // is dropped, leaving the page on its default "plans" view.
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<{ view?: ProductivityView }>).detail;
@@ -64,7 +70,12 @@ export function ProductivityPage() {
       }
     };
     window.addEventListener("productivity-set-view", handler);
-    return () => window.removeEventListener("productivity-set-view", handler);
+    (window as unknown as Record<string, unknown>).__qontinuiProductivityReady = true;
+    window.dispatchEvent(new Event("productivity-page-mounted"));
+    return () => {
+      window.removeEventListener("productivity-set-view", handler);
+      delete (window as unknown as Record<string, unknown>).__qontinuiProductivityReady;
+    };
   }, []);
 
   return (

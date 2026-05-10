@@ -1154,15 +1154,39 @@ async fn handle_snapshot(
 ) -> impl IntoResponse {
     // Phase 1 wrapper framework: if the active app registered via WebSocket,
     // dispatch getControlSnapshot over its socket.
-    let ws_payload = match query.get("recency") {
-        Some(r) => serde_json::json!({ "recency": r }),
-        None => serde_json::json!({}),
+    //
+    // Manual-test remediation 2026-05-10 (Item 2): forward the
+    // `withDisabledOnly` filter to the SDK so the WS-transport snapshot path
+    // honours it. Without this the SDK app would receive an empty payload
+    // and silently return the unfiltered snapshot, while the runner-direct
+    // /ui-bridge/control/snapshot route (which applies the filter Rust-side)
+    // would honour it. We accept both camelCase and snake_case spellings to
+    // mirror the SDK's alias surface.
+    let truthy = |v: &String| {
+        let s = v.trim();
+        s == "1" || s.eq_ignore_ascii_case("true")
     };
-    // Forward recency query param to the SDK app for cache control
-    let path = if let Some(recency) = query.get("recency") {
-        format!("/control/snapshot?recency={}", urlencoding::encode(recency))
-    } else {
+    let want_disabled_only = query.get("withDisabledOnly").is_some_and(truthy)
+        || query.get("with_disabled_only").is_some_and(truthy);
+    let mut ws_payload = serde_json::json!({});
+    if let Some(r) = query.get("recency") {
+        ws_payload["recency"] = serde_json::Value::String(r.clone());
+    }
+    if want_disabled_only {
+        ws_payload["withDisabledOnly"] = serde_json::Value::Bool(true);
+    }
+    // Forward recency + withDisabledOnly query params to the SDK app
+    let mut query_parts: Vec<String> = Vec::new();
+    if let Some(recency) = query.get("recency") {
+        query_parts.push(format!("recency={}", urlencoding::encode(recency)));
+    }
+    if want_disabled_only {
+        query_parts.push("withDisabledOnly=true".to_string());
+    }
+    let path = if query_parts.is_empty() {
         "/control/snapshot".to_string()
+    } else {
+        format!("/control/snapshot?{}", query_parts.join("&"))
     };
 
     // Per-app-id dispatch: route to the named registered app and skip
