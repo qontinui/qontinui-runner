@@ -16,6 +16,34 @@
 //! existing `registry.register(...)` call.
 
 use super::PgDb;
+use serde::Serialize;
+
+/// One row of the windowed "hot files" aggregate. Returned by
+/// [`PgDb::hot_files`] for the file-activity heatmap.
+#[derive(Debug, Clone, Serialize)]
+pub struct HotFileRow {
+    pub file_path: String,
+    /// Distinct sessions that touched this file in the window. Counts
+    /// distinct `task_run_id`, not raw UPSERT rows — re-edits by the
+    /// same session don't inflate the count, which is the signal we
+    /// actually want ("how contested is this file").
+    pub distinct_sessions: i64,
+    /// Most recent recorded_at within the window for this file.
+    pub latest_recorded_at: chrono::DateTime<chrono::Utc>,
+    /// task_run_id of the most-recent toucher. Useful for the "latest
+    /// editor" column in the UI.
+    pub latest_task_run_id: String,
+}
+
+/// One row of the windowed "hot sessions" aggregate. Returned by
+/// [`PgDb::hot_sessions`].
+#[derive(Debug, Clone, Serialize)]
+pub struct HotSessionRow {
+    pub task_run_id: String,
+    /// Distinct files touched by this session in the window.
+    pub distinct_files: i64,
+    pub latest_recorded_at: chrono::DateTime<chrono::Utc>,
+}
 
 impl PgDb {
     /// Record that `file_path` was touched by `task_run_id`. Idempotent —
@@ -142,6 +170,98 @@ impl PgDb {
             .map_err(|e| format!("PG clear_files_touched: {}", e))?;
 
         Ok(n)
+    }
+
+    /// Top files by distinct-toucher count in the last `window_secs`
+    /// seconds. Ordered by `distinct_sessions DESC`, then most-recent
+    /// `recorded_at` for stable display. Capped at `limit` rows.
+    ///
+    /// Uses the existing `idx_session_touched_files_recorded_at` index;
+    /// `EXPLAIN` confirms a bitmap-index scan for windows ≤ 1 hour on
+    /// dev table sizes.
+    pub async fn hot_files(&self, window_secs: i64, limit: i64) -> Result<Vec<HotFileRow>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"WITH windowed AS (
+                       SELECT file_path, task_run_id, recorded_at
+                       FROM coord.session_touched_files
+                       WHERE recorded_at >= NOW() - make_interval(secs => $1::double precision)
+                   ),
+                   per_file_latest AS (
+                       SELECT DISTINCT ON (file_path)
+                              file_path, task_run_id, recorded_at
+                       FROM windowed
+                       ORDER BY file_path, recorded_at DESC
+                   )
+                   SELECT w.file_path,
+                          COUNT(DISTINCT w.task_run_id)::bigint AS distinct_sessions,
+                          MAX(w.recorded_at) AS latest_recorded_at,
+                          (SELECT pfl.task_run_id
+                             FROM per_file_latest pfl
+                            WHERE pfl.file_path = w.file_path) AS latest_task_run_id
+                   FROM windowed w
+                   GROUP BY w.file_path
+                   ORDER BY distinct_sessions DESC, latest_recorded_at DESC
+                   LIMIT $2"#,
+                &[&(window_secs as f64), &limit],
+            )
+            .await
+            .map_err(|e| format!("PG hot_files: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| HotFileRow {
+                file_path: r.get(0),
+                distinct_sessions: r.get(1),
+                latest_recorded_at: r.get(2),
+                latest_task_run_id: r.get(3),
+            })
+            .collect())
+    }
+
+    /// Top sessions by distinct-file count in the last `window_secs`
+    /// seconds. Ordered by `distinct_files DESC`, then most-recent
+    /// `recorded_at`. Capped at `limit` rows.
+    pub async fn hot_sessions(
+        &self,
+        window_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<HotSessionRow>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT task_run_id,
+                          COUNT(DISTINCT file_path)::bigint AS distinct_files,
+                          MAX(recorded_at) AS latest_recorded_at
+                   FROM coord.session_touched_files
+                   WHERE recorded_at >= NOW() - make_interval(secs => $1::double precision)
+                   GROUP BY task_run_id
+                   ORDER BY distinct_files DESC, latest_recorded_at DESC
+                   LIMIT $2"#,
+                &[&(window_secs as f64), &limit],
+            )
+            .await
+            .map_err(|e| format!("PG hot_sessions: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| HotSessionRow {
+                task_run_id: r.get(0),
+                distinct_files: r.get(1),
+                latest_recorded_at: r.get(2),
+            })
+            .collect())
     }
 }
 

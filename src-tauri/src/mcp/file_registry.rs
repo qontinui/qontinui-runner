@@ -4,13 +4,14 @@
 //! AI terminal sessions) use these to register files they're working on,
 //! check for conflicts, and release registrations.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::database::pg::session_touched_files::{HotFileRow, HotSessionRow};
 use crate::executor::file_registry::{FileConflict, FileLockInfo, FileRegistryInfo};
 use crate::mcp::types::ApiState;
 
@@ -181,6 +182,83 @@ async fn get_info(
     Ok(Json(info))
 }
 
+// =============================================================================
+// File Activity Heatmap
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct HeatmapQuery {
+    /// Time window for the windowed aggregates, in seconds. Defaults to
+    /// 3600 (1 hour). Clamped to a sane upper bound below.
+    #[serde(default)]
+    pub window_secs: Option<i64>,
+    /// Cap on the number of hot rows returned in each list. Defaults to
+    /// 25. Clamped to 100 to keep responses bounded.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HeatmapResponse {
+    /// Live `FileRegistryManager.info()` snapshot, pass-through. Always
+    /// reflects the current process; not affected by `window_secs`.
+    pub live: Vec<FileRegistryInfo>,
+    /// Top files by distinct-toucher count in the window.
+    pub hot_files: Vec<HotFileRow>,
+    /// Top sessions by distinct-file count in the window.
+    pub hot_sessions: Vec<HotSessionRow>,
+    /// Echo of the resolved window for the UI's selector.
+    pub window_secs: i64,
+    /// Echo of the resolved limit.
+    pub limit: i64,
+}
+
+/// GET /file-activity/heatmap?window_secs=3600&limit=25
+///
+/// Composes the live `FileRegistryManager.info()` snapshot with two
+/// windowed aggregates over `coord.session_touched_files`:
+///   - top files by distinct-toucher count
+///   - top sessions by distinct-file count
+///
+/// The aggregates use a >= NOW() - INTERVAL filter that exploits
+/// `idx_session_touched_files_recorded_at`. PG returns empty lists when
+/// no rows fall in the window — caller renders the empty-state copy.
+async fn get_heatmap(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<HeatmapQuery>,
+) -> Result<Json<HeatmapResponse>, (StatusCode, String)> {
+    let window_secs = q.window_secs.unwrap_or(3600).clamp(60, 86_400);
+    let limit = q.limit.unwrap_or(25).clamp(1, 100);
+
+    let live = state.app_state.file_registry_manager.info().await;
+
+    let hot_files = state
+        .app_state
+        .pg_db
+        .hot_files(window_secs, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("hot_files: {e}")))?;
+    let hot_sessions = state
+        .app_state
+        .pg_db
+        .hot_sessions(window_secs, limit)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("hot_sessions: {e}"),
+            )
+        })?;
+
+    Ok(Json(HeatmapResponse {
+        live,
+        hot_files,
+        hot_sessions,
+        window_secs,
+        limit,
+    }))
+}
+
 /// GET /file-locks/info
 ///
 /// Get a snapshot of all currently held exclusive file locks.
@@ -203,4 +281,5 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/file-registry/check-conflicts", post(check_conflicts))
         .route("/file-registry/info", get(get_info))
         .route("/file-locks/info", get(get_lock_info))
+        .route("/file-activity/heatmap", get(get_heatmap))
 }
