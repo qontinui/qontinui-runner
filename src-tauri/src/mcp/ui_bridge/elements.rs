@@ -1586,6 +1586,14 @@ pub async fn ui_bridge_get_last_discovered_handler(
 ///     standard SPA every registered element belongs to the current route, so
 ///     this is usually a no-op, but we forward it consistently for callers
 ///     that rely on the filter existing end-to-end.
+///   - `?withDisabledOnly=true` (manual-test remediation 2026-05-10
+///     Item 2) — keep only elements that report disabled by ANY signal in
+///     `state`: `disabled === true`, `ariaDisabled === "true"`, or
+///     `enabled === false`. Lets agents find a disabled target without
+///     walking the full snapshot. Companion to the SDK-side filter in
+///     `@qontinui/ui-bridge` (handlers.ts `getControlSnapshot`); both
+///     paths apply the same predicate so the runner-direct HTTP route and
+///     the SDK-WS route stay observationally identical.
 ///
 /// Filtering happens in this Rust handler (not via a special SDK code path),
 /// because `get_snapshot` participates in the dedup cache keyed by type, and
@@ -1600,10 +1608,14 @@ pub async fn ui_bridge_get_snapshot_handler(
     };
     let visible_only = query.get("visibleOnly").is_some_and(truthy);
     let current_route_only = query.get("currentRouteOnly").is_some_and(truthy);
+    // Manual-test remediation 2026-05-10 (Item 2). Both camelCase and
+    // snake_case spellings are accepted to match the SDK's alias surface.
+    let with_disabled_only = query.get("withDisabledOnly").is_some_and(truthy)
+        || query.get("with_disabled_only").is_some_and(truthy);
 
     info!(
-        "UI Bridge API: Getting snapshot (visibleOnly={}, currentRouteOnly={})",
-        visible_only, current_route_only
+        "UI Bridge API: Getting snapshot (visibleOnly={}, currentRouteOnly={}, withDisabledOnly={})",
+        visible_only, current_route_only, with_disabled_only
     );
 
     // Try to get snapshot; if elements are empty, auto-discover once and retry.
@@ -1647,7 +1659,7 @@ pub async fn ui_bridge_get_snapshot_handler(
             // disagrees with the snapshot's top-level `page.pathname`. This is
             // a no-op in SPAs where the registry only holds current-route
             // elements, but we forward it so the filter works end-to-end.
-            if visible_only || current_route_only {
+            if visible_only || current_route_only || with_disabled_only {
                 let snapshot_pathname = data
                     .get("page")
                     .and_then(|p| p.get("pathname"))
@@ -1682,12 +1694,41 @@ pub async fn ui_bridge_get_snapshot_handler(
                                         }
                                     }
                                 }
+                                if with_disabled_only {
+                                    // Manual-test remediation 2026-05-10
+                                    // (Item 2). Mirror the SDK predicate in
+                                    // `@qontinui/ui-bridge` handlers.ts:
+                                    // keep elements that report disabled by
+                                    // ANY of the three signals the SDK
+                                    // might emit. Today's
+                                    // `serializeRegisteredElement` writes
+                                    // `state.enabled` (not `state.disabled`),
+                                    // so checking only `disabled` would let
+                                    // the filter return zero rows on every
+                                    // current-shape snapshot.
+                                    let state = el.get("state");
+                                    let disabled_true = state
+                                        .and_then(|s| s.get("disabled"))
+                                        .and_then(|v| v.as_bool())
+                                        == Some(true);
+                                    let aria_disabled_true = state
+                                        .and_then(|s| s.get("ariaDisabled"))
+                                        .and_then(|v| v.as_str())
+                                        == Some("true");
+                                    let enabled_false = state
+                                        .and_then(|s| s.get("enabled"))
+                                        .and_then(|v| v.as_bool())
+                                        == Some(false);
+                                    if !(disabled_true || aria_disabled_true || enabled_false) {
+                                        return false;
+                                    }
+                                }
                                 true
                             });
                             let after = arr.len();
                             debug!(
-                                "UI Bridge snapshot filter: visibleOnly={} currentRouteOnly={} kept {}/{} elements",
-                                visible_only, current_route_only, after, before
+                                "UI Bridge snapshot filter: visibleOnly={} currentRouteOnly={} withDisabledOnly={} kept {}/{} elements",
+                                visible_only, current_route_only, with_disabled_only, after, before
                             );
                         }
                     }
