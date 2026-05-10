@@ -183,13 +183,9 @@ pub fn start_coordinator_scheduler(
                     "coordinator.shadow_iterations_total instance_id={} iteration={}",
                     instance_id, iteration
                 );
-                if let Err(e) = run_shadow_iteration(
-                    &state,
-                    &instance_id,
-                    iteration,
-                    &mut processing_seen,
-                )
-                .await
+                if let Err(e) =
+                    run_shadow_iteration(&state, &instance_id, iteration, &mut processing_seen)
+                        .await
                 {
                     error!("Coordinator shadow iteration failed: {}", e);
                 }
