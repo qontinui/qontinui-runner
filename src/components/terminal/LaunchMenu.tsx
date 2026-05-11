@@ -2,6 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import type { JSX } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Star, Terminal, Play, Loader2, Lock } from "lucide-react";
+import { getApiPort } from "@/lib/runner-api";
 import type {
   AccountUsageInfo,
   AiStatus,
@@ -65,14 +66,28 @@ export const PROBE_POLL_INTERVAL_MS = 2000;
 // ── Pure helpers (exported for tests) ────────────────────────────────────────
 
 /**
- * Resolve the runner HTTP port. Mirrors the pattern from
- * `useFileLockTracking.ts:90-95` so probe traffic lands on the same
- * port as the rest of the runner's local control surface.
+ * Resolve the runner HTTP port for local-control-surface traffic
+ * (`/file-registry/...`, `/file-locks/...`, etc.).
+ *
+ * Resolution order:
+ *   1. `window.__QONTINUI_PORT__` if explicitly set — manual-test
+ *      override and the historical fallback hatch.
+ *   2. `getApiPort()` from `@/lib/runner-api` — the centralized port
+ *      populated by `useApiReady` from Tauri's `api-ready` event and
+ *      the `get_api_port` IPC. Defaults to 9876 when the API isn't
+ *      bound yet, so first-poll on a secondary runner can still
+ *      briefly hit the primary; the next 2s poll cycle picks up the
+ *      correct port once `setApiPort` runs.
+ *
+ * The hardcoded `9876` fallback is intentionally absent here — it
+ * lives inside `getApiPort()`'s default state so it's a single source
+ * of truth for the entire frontend.
  */
 export function resolvePort(): number {
-  if (typeof window === "undefined") return 9876;
+  if (typeof window === "undefined") return getApiPort();
   const fromGlobal = (window as unknown as Record<string, unknown>).__QONTINUI_PORT__;
-  return fromGlobal ? Number(fromGlobal) : 9876;
+  if (fromGlobal) return Number(fromGlobal);
+  return getApiPort();
 }
 
 export function buildProbeUrl(port: number): string {

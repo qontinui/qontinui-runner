@@ -195,6 +195,8 @@ describe("summarizeFileLocksByHolder", () => {
 describe("resolvePort", () => {
   it("falls back to 9876 when __QONTINUI_PORT__ is absent", () => {
     // In Node test env, window may or may not exist; the helper handles both.
+    // `getApiPort()` from `@/lib/runner-api` defaults to 9876 in its
+    // initial state — the helper delegates here when the global is unset.
     const original = (globalThis as unknown as { window?: unknown }).window;
     (globalThis as unknown as { window?: unknown }).window = {};
     try {
@@ -212,6 +214,42 @@ describe("resolvePort", () => {
     try {
       expect(resolvePort()).toBe(9123);
     } finally {
+      (globalThis as unknown as { window?: unknown }).window = original;
+    }
+  });
+
+  it("falls through to setApiPort()'s value when the global is unset", async () => {
+    // Regression: secondary / temp runners on non-default ports never
+    // had `__QONTINUI_PORT__` set in the webview, so `resolvePort()`
+    // used to silently fall back to 9876 — routing all probes from
+    // the temp runner to the primary's registry and dropping the
+    // hook's own data. Fix: delegate to `getApiPort()`, which
+    // `useApiReady` populates from the `api-ready` Tauri event.
+    const { setApiPort } = await import("@/lib/runner-api");
+    const original = (globalThis as unknown as { window?: unknown }).window;
+    (globalThis as unknown as { window?: unknown }).window = {};
+    try {
+      setApiPort(9878);
+      expect(resolvePort()).toBe(9878);
+    } finally {
+      setApiPort(9876); // restore module-level default
+      (globalThis as unknown as { window?: unknown }).window = original;
+    }
+  });
+
+  it("prefers __QONTINUI_PORT__ over getApiPort() when both are set", async () => {
+    // The global override path is the manual-test escape hatch.
+    // Setting it must win regardless of what `useApiReady` populated.
+    const { setApiPort } = await import("@/lib/runner-api");
+    const original = (globalThis as unknown as { window?: unknown }).window;
+    (globalThis as unknown as { window?: { __QONTINUI_PORT__?: number } }).window = {
+      __QONTINUI_PORT__: 9123,
+    };
+    try {
+      setApiPort(9878);
+      expect(resolvePort()).toBe(9123);
+    } finally {
+      setApiPort(9876);
       (globalThis as unknown as { window?: unknown }).window = original;
     }
   });
