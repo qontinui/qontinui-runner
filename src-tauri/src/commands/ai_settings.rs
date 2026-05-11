@@ -160,6 +160,7 @@ pub fn save_ai_settings(
         routing: existing_settings.routing,
         interactive_sessions_enabled: interactive_sessions_enabled
             .unwrap_or(existing_settings.interactive_sessions_enabled),
+        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -249,6 +250,7 @@ pub fn save_gemini_settings(
         retry: existing_settings.retry,
         routing: existing_settings.routing,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
+        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -795,6 +797,7 @@ pub fn save_agentic_settings(
         retry: retry_config,
         routing: routing_config,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
+        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {

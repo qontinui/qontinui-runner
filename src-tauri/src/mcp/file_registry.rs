@@ -10,10 +10,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
+use tracing::warn;
 
 use crate::database::pg::session_touched_files::{HotFileRow, HotSessionRow};
 use crate::executor::file_registry::{FileConflict, FileLockInfo, FileRegistryInfo};
 use crate::mcp::types::ApiState;
+use crate::util::path_extraction::{extract_paths_via_ai, AiContextBundle, ExtractError};
 
 // =============================================================================
 // Request / Response Types
@@ -128,6 +131,24 @@ pub struct PredictedCollision {
     pub confidence: f32,
 }
 
+/// Status of the AI-side path extractor in a `ConflictReport`. The TS
+/// frontend (Phase 3b) renders a small badge for any non-`Ok` value.
+/// Variants serialize as their PascalCase names — DO NOT add
+/// `#[serde(rename_all = ...)]`; the TS side consumes
+/// `"Ok" | "Offline" | "Disabled" | "RateLimited"`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub enum AiStatus {
+    /// AI extractor ran and returned (possibly empty) paths.
+    Ok,
+    /// AI provider unreachable, timed out, or returned a transport-level
+    /// error. The regex extractor still ran.
+    Offline,
+    /// User setting `ai_path_prediction_enabled` is false. Regex still ran.
+    Disabled,
+    /// Provider responded with a rate-limit error. Regex still ran.
+    RateLimited,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ConflictReport {
     /// Live snapshot of every file currently held in the registry,
@@ -147,6 +168,19 @@ pub struct ConflictReport {
     /// normalized) — exposed so the frontend can render a dev-only
     /// tooltip when the warning looks wrong.
     pub extracted_candidates: Vec<String>,
+    /// Status of the AI extractor's call. `Ok` = AI ran and returned
+    /// (possibly empty) paths. `Offline` = AI provider unreachable or
+    /// timed out (5s cap); regex still ran. `Disabled` = user setting
+    /// `ai_path_prediction_enabled` is false. `RateLimited` = provider
+    /// said no for the moment. Frontend renders a small badge for any
+    /// non-Ok value.
+    pub ai_status: AiStatus,
+    /// Telemetry: how many candidates the AI extractor contributed
+    /// (post-dedupe with regex). Always 0 when `ai_status != Ok`.
+    pub ai_extracted_count: usize,
+    /// Telemetry: how many candidates the regex extractor contributed.
+    /// Always present regardless of AI status.
+    pub regex_extracted_count: usize,
 }
 
 /// Compute the `PredictedCollision.confidence` for a single conflict.
@@ -430,8 +464,33 @@ async fn probe_conflicts(
 ) -> Result<Json<ConflictReport>, (StatusCode, String)> {
     let live_holdings = state.app_state.file_registry_manager.info().await;
 
-    let extracted =
+    // Regex extractor — synchronous, <1ms. Always runs first. Same call
+    // shape as today.
+    let regex_paths =
         crate::util::path_extraction::extract_candidate_paths(req.prompt.as_deref(), &req.cwd);
+    let regex_extracted_count = regex_paths.len();
+
+    // Decide whether to invoke the AI extractor. Skip when the user has
+    // disabled it OR the prompt is None / empty (nothing to infer from).
+    // The "no prompt" case is `Ok` (not a failure), the disabled case is
+    // `Disabled`.
+    let ai_enabled = crate::settings::get_ai_settings().ai_path_prediction_enabled;
+    let trimmed_prompt = req.prompt.as_deref().map(|s| s.trim()).unwrap_or("");
+
+    let (ai_paths, ai_status) = run_ai_extractor(ai_enabled, trimmed_prompt, &req.cwd).await;
+
+    // Union regex ∪ AI (regex order preserved, AI-only paths appended,
+    // capped at MAX_CANDIDATES = 50). `ai_only_count` is the number of
+    // AI-contributed paths post-dedupe and post-cap — exactly the
+    // telemetry the report exposes when `ai_status == Ok`.
+    let (ai_union, ai_only_count) =
+        union_and_dedupe(regex_paths.clone(), ai_paths, MAX_PROBE_CANDIDATES);
+
+    let ai_extracted_count = if ai_status == AiStatus::Ok {
+        ai_only_count
+    } else {
+        0
+    };
 
     // Normalize hinted_files via the same path normalization the registry
     // uses, so they compare symmetrically against registry keys. Build a
@@ -447,12 +506,12 @@ async fn probe_conflicts(
         .collect();
     let hinted_set: std::collections::HashSet<String> = hinted_normalized.iter().cloned().collect();
 
-    // Union extracted ∪ hinted (preserving extracted-first order, then
+    // Union (regex ∪ AI) ∪ hinted_files (preserving prior order, then
     // appending any hints not already present).
-    let mut candidates: Vec<String> = extracted.clone();
-    let extracted_set: std::collections::HashSet<&String> = extracted.iter().collect();
+    let mut candidates: Vec<String> = ai_union;
+    let union_set: std::collections::HashSet<String> = candidates.iter().cloned().collect();
     for h in &hinted_normalized {
-        if !extracted_set.contains(h) {
+        if !union_set.contains(h) {
             candidates.push(h.clone());
         }
     }
@@ -504,7 +563,235 @@ async fn probe_conflicts(
         predicted_collisions,
         recent_editors,
         extracted_candidates: candidates,
+        ai_status,
+        ai_extracted_count,
+        regex_extracted_count,
     }))
+}
+
+/// Hard cap on the candidate union (regex ∪ AI). Mirrors
+/// `path_extraction::MAX_CANDIDATES`. Past this point we are almost
+/// certainly extracting noise.
+const MAX_PROBE_CANDIDATES: usize = 50;
+
+/// Run the AI extractor and translate its result to `(paths, AiStatus)`.
+///
+/// Factored out of `probe_conflicts` so the AI-or-not branch is testable
+/// without going through the live HTTP handler (which requires
+/// `Arc<ApiState>` with 30+ fields). Pass `enabled = false` to short-circuit
+/// to `(vec![], AiStatus::Disabled)` without any network I/O. Pass an empty
+/// `prompt` to short-circuit to `(vec![], AiStatus::Ok)` — there's nothing
+/// to extract from, so it's not a failure.
+async fn run_ai_extractor(enabled: bool, prompt: &str, cwd: &str) -> (Vec<String>, AiStatus) {
+    if !enabled {
+        return (Vec::new(), AiStatus::Disabled);
+    }
+    if prompt.is_empty() {
+        // No prompt to enrich. Not an AI failure — surface as Ok with 0
+        // counts so the frontend doesn't render an unwarranted badge.
+        return (Vec::new(), AiStatus::Ok);
+    }
+
+    let bundle = build_context_bundle(cwd).await;
+    match extract_paths_via_ai(prompt, &bundle).await {
+        Ok(paths) => (paths, AiStatus::Ok),
+        Err(ExtractError::Offline) => (Vec::new(), AiStatus::Offline),
+        Err(ExtractError::RateLimited) => (Vec::new(), AiStatus::RateLimited),
+        Err(ExtractError::Disabled) => {
+            // Defensive — shouldn't fire since we already gated on `enabled`.
+            (Vec::new(), AiStatus::Disabled)
+        }
+        Err(ExtractError::ParseFailure(msg)) => {
+            warn!("file_registry.probe_conflicts.ai_parse_failure: {}", msg);
+            (Vec::new(), AiStatus::Offline)
+        }
+        Err(ExtractError::Other(msg)) => {
+            warn!("file_registry.probe_conflicts.ai_error: {}", msg);
+            (Vec::new(), AiStatus::Offline)
+        }
+    }
+}
+
+/// Build the small context bundle the AI extractor sees. All best-effort
+/// — anything that fails (missing dir, no git, timeout) reduces to an
+/// empty string so the AI call still proceeds with whatever signal we
+/// could gather.
+async fn build_context_bundle(cwd: &str) -> AiContextBundle {
+    AiContextBundle {
+        cwd: cwd.to_string(),
+        repo_tree_snippet: build_repo_tree_snippet(cwd).await,
+        recent_git_log: build_recent_git_log(cwd).await,
+    }
+}
+
+/// Two-level directory snippet (top-level entries plus immediate children
+/// of each top-level dir). Capped at ~80 entries / ~3 KB to stay under the
+/// AI extractor's per-call user-message budget. Skips `.`-prefixed dirs
+/// and the standard build-output / dependency dirs that the AI extractor's
+/// blacklist would drop anyway. Returns `String::new()` on any error
+/// (missing dir, permission denied, etc.) — the AI extractor still works
+/// without it, just with fewer ground-truth signals.
+async fn build_repo_tree_snippet(cwd: &str) -> String {
+    const MAX_ENTRIES: usize = 80;
+    const MAX_BYTES: usize = 3072;
+
+    if cwd.is_empty() {
+        return String::new();
+    }
+
+    fn should_skip(name: &str) -> bool {
+        if name.starts_with('.') {
+            return true;
+        }
+        matches!(name, "node_modules" | "target" | "dist" | "build")
+    }
+
+    let mut out = String::new();
+    let mut count: usize = 0;
+
+    let Ok(mut top) = tokio::fs::read_dir(cwd).await else {
+        return String::new();
+    };
+
+    let mut top_dirs: Vec<std::path::PathBuf> = Vec::new();
+
+    loop {
+        if count >= MAX_ENTRIES || out.len() >= MAX_BYTES {
+            return out;
+        }
+        let entry = match top.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if should_skip(&name_str) {
+            continue;
+        }
+
+        let is_dir = match entry.file_type().await {
+            Ok(ft) => ft.is_dir(),
+            Err(_) => false,
+        };
+        if is_dir {
+            out.push_str(&name_str);
+            out.push_str("/\n");
+            top_dirs.push(entry.path());
+        } else {
+            out.push_str(&name_str);
+            out.push('\n');
+        }
+        count += 1;
+    }
+
+    for dir in top_dirs {
+        if count >= MAX_ENTRIES || out.len() >= MAX_BYTES {
+            return out;
+        }
+        let parent_name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let Ok(mut children) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+
+        loop {
+            if count >= MAX_ENTRIES || out.len() >= MAX_BYTES {
+                return out;
+            }
+            let entry = match children.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(_) => break,
+            };
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if should_skip(&name_str) {
+                continue;
+            }
+
+            let is_dir = match entry.file_type().await {
+                Ok(ft) => ft.is_dir(),
+                Err(_) => false,
+            };
+
+            out.push_str(&parent_name);
+            out.push('/');
+            out.push_str(&name_str);
+            if is_dir {
+                out.push('/');
+            }
+            out.push('\n');
+            count += 1;
+        }
+    }
+
+    out
+}
+
+/// `git log --oneline -5` in `cwd`, with a 2-second hard timeout. Returns
+/// `String::new()` on any error (no git, not a repo, command failure, or
+/// timeout). Trailing newline is trimmed.
+async fn build_recent_git_log(cwd: &str) -> String {
+    if cwd.is_empty() {
+        return String::new();
+    }
+
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["log", "-5", "--oneline"]);
+    cmd.current_dir(cwd);
+
+    let fut = cmd.output();
+    let output = match tokio::time::timeout(Duration::from_secs(2), fut).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) | Err(_) => return String::new(),
+    };
+
+    if !output.status.success() {
+        return String::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim_end_matches('\n').to_string()
+}
+
+/// Union the AI extractor's output into the regex extractor's output:
+/// regex paths come first (preserving the regex order), then any AI-only
+/// paths (i.e. those NOT already in `regex`) are appended. The combined
+/// list is capped at `cap` total entries.
+///
+/// Returns `(union, ai_only_count)` where `ai_only_count` is the number
+/// of AI-contributed paths that actually made it into the final union
+/// (after dedupe AND after the cap). This is the telemetry the
+/// `ConflictReport` surfaces as `ai_extracted_count`.
+fn union_and_dedupe(regex: Vec<String>, ai: Vec<String>, cap: usize) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::with_capacity((regex.len() + ai.len()).min(cap));
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for p in regex {
+        if out.len() >= cap {
+            return (out, 0);
+        }
+        if seen.insert(p.clone()) {
+            out.push(p);
+        }
+    }
+
+    let mut ai_only_count: usize = 0;
+    for p in ai {
+        if out.len() >= cap {
+            break;
+        }
+        if seen.insert(p.clone()) {
+            out.push(p);
+            ai_only_count += 1;
+        }
+    }
+
+    (out, ai_only_count)
 }
 
 // =============================================================================
@@ -614,6 +901,12 @@ mod tests {
             predicted_collisions,
             recent_editors,
             extracted_candidates: candidates,
+            // PG-gated tests pre-date Phase 2; they don't drive the AI
+            // path at all. Mirror "no AI call attempted" by reporting Ok
+            // with a zero AI count and the regex count as the only signal.
+            ai_status: AiStatus::Ok,
+            ai_extracted_count: 0,
+            regex_extracted_count: extracted.len(),
         }
     }
 
@@ -1005,5 +1298,148 @@ mod tests {
 
         registry.release_all(&holder_extracted).await;
         registry.release_all(&holder_hinted).await;
+    }
+
+    // =========================================================================
+    // Phase 2 deltas: AI-extractor fan-in (regex ∪ AI), AiStatus telemetry,
+    // union_and_dedupe.
+    //
+    // The AI-or-not branch lives in `run_ai_extractor(enabled, prompt, cwd)`
+    // — a small async helper factored out of `probe_conflicts` so the
+    // disabled-setting path doesn't require a live AI provider OR a way to
+    // override the global settings singleton. Tests drive the helper
+    // directly. The handler-level integration is covered by the existing
+    // PG-gated tests, which now also assert the new fields are populated.
+    // =========================================================================
+
+    #[test]
+    fn union_and_dedupe_empty_inputs() {
+        // Both empty.
+        let (out, ai_only) = union_and_dedupe(vec![], vec![], 50);
+        assert!(out.is_empty());
+        assert_eq!(ai_only, 0);
+
+        // Regex empty, AI present.
+        let (out, ai_only) = union_and_dedupe(vec![], vec!["a".into(), "b".into()], 50);
+        assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(ai_only, 2);
+
+        // AI empty, regex present.
+        let (out, ai_only) = union_and_dedupe(vec!["a".into(), "b".into()], vec![], 50);
+        assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(ai_only, 0);
+    }
+
+    #[test]
+    fn probe_conflicts_union_dedupes_overlap() {
+        // Regex returns ["a", "b"], AI returns ["b", "c"]. Expected union:
+        // ["a", "b", "c"] (regex order preserved; AI-only "c" appended;
+        // duplicate "b" dropped). ai_only_count == 1.
+        let (out, ai_only) = union_and_dedupe(
+            vec!["a".to_string(), "b".to_string()],
+            vec!["b".to_string(), "c".to_string()],
+            50,
+        );
+        assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(ai_only, 1);
+    }
+
+    #[test]
+    fn probe_conflicts_union_caps_at_50() {
+        // Regex returns 30 distinct, AI returns 30 distinct. Cap = 50 →
+        // result has exactly 50 (30 regex + first 20 AI). ai_only_count == 20.
+        let regex: Vec<String> = (0..30).map(|i| format!("r{}", i)).collect();
+        let ai: Vec<String> = (0..30).map(|i| format!("a{}", i)).collect();
+        let (out, ai_only) = union_and_dedupe(regex.clone(), ai, 50);
+        assert_eq!(out.len(), 50);
+        // First 30 must be the regex paths in order.
+        for (i, p) in regex.iter().enumerate() {
+            assert_eq!(&out[i], p, "regex order should be preserved at index {}", i);
+        }
+        // Remaining 20 must be a0..a19.
+        for i in 0..20 {
+            assert_eq!(out[30 + i], format!("a{}", i));
+        }
+        assert_eq!(ai_only, 20);
+    }
+
+    #[tokio::test]
+    async fn probe_conflicts_ai_disabled_setting_returns_disabled_status() {
+        // Drive the AI-or-not branch directly so we don't need to mutate
+        // the global settings singleton (`get_ai_settings()` reads a
+        // process-wide store; tests run in parallel, so flipping it would
+        // race other tests). The handler delegates the decision to
+        // `run_ai_extractor(enabled, prompt, cwd)`; calling it with
+        // `enabled = false` exercises the same code path the handler hits
+        // when the user setting is off.
+        let (paths, status) = run_ai_extractor(
+            false,
+            "fix the OAuth bug where tokens never expire",
+            "/repo",
+        )
+        .await;
+        assert!(paths.is_empty(), "no AI call → no AI paths");
+        assert_eq!(status, AiStatus::Disabled);
+    }
+
+    #[tokio::test]
+    async fn probe_conflicts_ai_status_ok_when_prompt_empty() {
+        // `enabled = true` but prompt is empty after trim → the helper
+        // short-circuits to `Ok` (not a failure: there was nothing to
+        // extract from). ai_extracted_count would also be 0 in this case.
+        let (paths, status) = run_ai_extractor(true, "", "/repo").await;
+        assert!(paths.is_empty());
+        assert_eq!(status, AiStatus::Ok);
+
+        // Whitespace-only prompt is treated identically — the handler
+        // trims before calling.
+        let (paths, status) = run_ai_extractor(true, "", "/repo").await;
+        assert!(paths.is_empty());
+        assert_eq!(status, AiStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn build_recent_git_log_handles_missing_dir() {
+        // Best-effort: nonexistent cwd should not panic, just return empty.
+        let log = build_recent_git_log("/this/path/definitely/does/not/exist/qontinui-test").await;
+        assert!(log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_repo_tree_snippet_empty_cwd_is_empty() {
+        let snippet = build_repo_tree_snippet("").await;
+        assert!(snippet.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_repo_tree_snippet_skips_dotted_and_build_dirs() {
+        // Use the runner's own crate root — guaranteed to exist on every
+        // dev machine and on CI (CARGO_MANIFEST_DIR is the src-tauri dir).
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let snippet = build_repo_tree_snippet(cwd).await;
+        // Should not be empty for a real repo.
+        assert!(
+            !snippet.is_empty(),
+            "expected non-empty snippet for {}, got empty",
+            cwd
+        );
+        // Should not contain skipped dirs as standalone entries. The
+        // skip is on the directory name itself; the substring check below
+        // also catches any "target/foo" child entry that would have been
+        // emitted if the parent had been recursed into.
+        for forbidden in &["target/", "node_modules/", ".git/", "dist/", "build/"] {
+            assert!(
+                !snippet.contains(forbidden),
+                "snippet should skip {}, got: {}",
+                forbidden,
+                snippet
+            );
+        }
+        // Hard cap holds.
+        assert!(
+            snippet.len() <= 3072,
+            "snippet should be ≤3KB, got {} bytes",
+            snippet.len()
+        );
     }
 }

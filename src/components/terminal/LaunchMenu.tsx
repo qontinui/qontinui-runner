@@ -1,8 +1,10 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import type { JSX } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Star, Terminal, Play, Loader2, Lock } from "lucide-react";
 import type {
   AccountUsageInfo,
+  AiStatus,
   ConflictReport,
   FileLockInfo,
   FileRegistryInfoEntry,
@@ -221,6 +223,50 @@ function SectionHeader({ children }: { children: React.ReactNode }) {
     <div className="px-3 py-1.5 text-[9px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d] select-none">
       {children}
     </div>
+  );
+}
+
+/**
+ * Small badge shown when the AI extractor's status is non-`"Ok"`. Tells
+ * the user the prediction pipeline degraded (offline, rate-limited,
+ * disabled in settings) so an empty `predicted_collisions` list isn't
+ * silently trusted.
+ *
+ * Two render paths:
+ *   - default: sits in the predicted-collisions panel header (right
+ *     side), next to the panel title.
+ *   - `compact`: rendered as a standalone muted line when there are no
+ *     predicted collisions but the AI is still degraded — the user
+ *     would otherwise see nothing.
+ */
+export function AiStatusBadge({
+  status,
+  compact = false,
+}: {
+  status: Exclude<AiStatus, "Ok">;
+  compact?: boolean;
+}): JSX.Element {
+  const label =
+    status === "Offline"
+      ? "AI offline — regex still running"
+      : status === "RateLimited"
+        ? "AI rate-limited — regex still running"
+        : /* Disabled */ "AI prediction off (Settings)";
+  // Gear for the user-actionable settings case, info glyph for the
+  // transient (offline / rate-limited) cases.
+  const icon = status === "Disabled" ? "⚙" : "ⓘ";
+  const baseCls = "inline-flex items-center gap-1 text-[10px] text-[#a9b1d6]";
+  return (
+    <span
+      data-testid="ai-status-badge"
+      data-status={status}
+      data-compact={compact ? "true" : "false"}
+      className={compact ? `${baseCls} px-2 py-0.5` : baseCls}
+      title={label}
+    >
+      <span aria-hidden>{icon}</span>
+      <span>{label}</span>
+    </span>
   );
 }
 
@@ -589,8 +635,11 @@ export function LaunchMenu({
               data-testid="predicted-collisions-panel"
               className="px-3 py-2 border-b border-[#e0af68]/30 bg-[#e0af68]/5"
             >
-              <div className="text-[10px] uppercase tracking-wider text-[#e0af68]">
-                Possible conflicts
+              <div className="flex items-center justify-between">
+                <div className="text-[10px] uppercase tracking-wider text-[#e0af68]">
+                  Possible conflicts
+                </div>
+                {report.ai_status !== "Ok" && <AiStatusBadge status={report.ai_status} />}
               </div>
               {report.predicted_collisions.map((c: PredictedCollision) => {
                 const holders = c.other_holders.map((h) => h.holder_name).join(", ");
@@ -702,6 +751,21 @@ export function LaunchMenu({
               className="w-full bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1 text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] transition-colors resize-none"
             />
           </div>
+
+          {/* AI-status compact line: surfaces a degraded extractor when
+              the predicted-collisions panel above is empty (and thus
+              hidden). Without this, the user might trust an empty
+              probe result that's actually missing the AI half. */}
+          {report &&
+            report.ai_status !== "Ok" &&
+            report.predicted_collisions.length === 0 && (
+              <div
+                data-testid="ai-status-compact-line"
+                className="px-3 py-1 border-b border-[#2a2d3d]"
+              >
+                <AiStatusBadge status={report.ai_status} compact />
+              </div>
+            )}
 
           {/* Best available - single */}
           {bestAccount && (
