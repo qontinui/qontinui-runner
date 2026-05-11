@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from "react";
+import { useEffect, useCallback, useMemo } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
@@ -133,6 +133,21 @@ function TerminalPageInner({
   }, [tabs.length, onSessionCountChange]);
 
   const { fileConflicts, fileLockStates, sessionPersistence } = useShellInfra();
+
+  // Re-key per-tab fileLockStates (keyed by tab.id) onto session ids so
+  // SessionCard can render a "blocked on …" subtitle. session.sessionId
+  // equals tab.claudeSessionId for live AI tabs; tabs without a Claude
+  // session id are skipped (their lock state still surfaces in the
+  // tab-bar via the original tab.id keying).
+  const sessionLockStates = useMemo(() => {
+    const map = new Map<string, import("./useFileLockTracking").LockState>();
+    for (const tab of tabs) {
+      if (!tab.claudeSessionId) continue;
+      const state = fileLockStates?.[tab.id];
+      if (state) map.set(tab.claudeSessionId, state);
+    }
+    return map;
+  }, [tabs, fileLockStates]);
 
   // Per-tab commit-readiness state (Plan §3). Sibling to fileLockStates;
   // both are passed through to TerminalTabBar for rendering.
@@ -535,6 +550,7 @@ function TerminalPageInner({
               manager={sessionManager}
               selectedSessionId={workflowGen.selectedTranscriptSessionId}
               sessionConflictCounts={fileConflicts.sessionConflictCounts}
+              sessionLockStates={sessionLockStates}
             />
           )}
 

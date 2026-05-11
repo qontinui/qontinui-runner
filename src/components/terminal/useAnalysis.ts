@@ -13,7 +13,7 @@ interface UseAnalysisParams {
   getActiveSelection: () => string;
   latestPlanContent: string;
   setRightPanelMode: React.Dispatch<
-    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | null>
+    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
   >;
 }
 

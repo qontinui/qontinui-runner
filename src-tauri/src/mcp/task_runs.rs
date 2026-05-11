@@ -233,7 +233,17 @@ pub async fn stop_task_run(
 
     // Release advisory file registry entries and exclusive file locks for this task
     state.app_state.file_registry_manager.release_all(&id).await;
-    state.app_state.file_lock_manager.release_all(&id).await;
+    let released_paths = state.app_state.file_lock_manager.release_all(&id).await;
+    for released_path in &released_paths {
+        use tauri::Emitter;
+        let payload = serde_json::json!({
+            "type": "file-lock-released",
+            "file_path": released_path,
+            "task_run_id": id,
+            "holder_name": id,
+        });
+        let _ = state.app_handle.emit("file-lock-released", &payload);
+    }
 
     // Emit status to frontend
     emit_ai_output(

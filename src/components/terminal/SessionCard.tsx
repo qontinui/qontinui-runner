@@ -12,8 +12,10 @@ import {
   GitCommit,
   Loader2,
   CheckCircle2,
+  Lock,
 } from "lucide-react";
 import type { UnifiedSession, SessionLiveStatus } from "./useSessionManager";
+import type { LockState } from "./useFileLockTracking";
 import type { CommandResponse } from "./types";
 
 interface PromoteToWorktreeData {
@@ -42,6 +44,12 @@ interface SessionCardProps {
   sessionLabel: string | null;
   /** Number of files this session shares with other sessions (0 = no conflicts) */
   fileConflictCount?: number;
+  /**
+   * Current per-session file-lock state (waiting / holding / idle).
+   * When `kind === "waiting"` the card renders a "blocked on …"
+   * subtitle. Sourced from `SessionManagerPanel.sessionLockStates`.
+   */
+  lockState?: LockState;
   onResume: (session: UnifiedSession) => void;
   onViewTranscript: (session: UnifiedSession) => void;
   onCopyId: (session: UnifiedSession) => void;
@@ -98,6 +106,22 @@ function formatDuration(ms: number | null): string | null {
   return `${days}d${hours % 24 > 0 ? `${hours % 24}h` : ""}`;
 }
 
+/**
+ * Format a "since" epoch-ms as a short relative-age string ("5s",
+ * "42s", "5m", "2h"). Mirrors the helper in `TerminalTabBar.tsx` and
+ * `formatHoldingAge` in `LaunchMenu.tsx`. Negative ages clamp to "0s";
+ * undefined returns the empty string.
+ */
+function formatLockSince(ms?: number): string {
+  if (ms === undefined) return "";
+  const deltaSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (deltaSec < 60) return `${deltaSec}s`;
+  const deltaMin = Math.floor(deltaSec / 60);
+  if (deltaMin < 60) return `${deltaMin}m`;
+  const deltaHr = Math.floor(deltaMin / 60);
+  return `${deltaHr}h`;
+}
+
 export function SessionCard({
   session,
   isSelected,
@@ -106,6 +130,7 @@ export function SessionCard({
   isPinned,
   sessionLabel,
   fileConflictCount = 0,
+  lockState,
   onResume,
   onViewTranscript,
   onCopyId,
@@ -376,6 +401,23 @@ export function SessionCard({
           <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#f7768e]/80">
             <AlertTriangle className="w-3 h-3" />
             <span>Session appears frozen — may need resume</span>
+          </div>
+        )}
+
+        {/* File-lock waiting subtitle — sourced from useFileLockTracking
+            via `sessionLockStates`. Same orange color convention as the
+            tab-bar lock icon (`text-[#e0af68]`). */}
+        {lockState?.kind === "waiting" && (
+          <div
+            data-testid="session-card-lock-subtitle"
+            className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#e0af68]"
+          >
+            <Lock className="w-3 h-3 shrink-0" />
+            <span className="truncate">
+              blocked on {lockState.counterpartyName ?? "another session"}
+              {lockState.filePath ? `'s ${lockState.filePath}` : ""}
+              {lockState.sinceMs ? ` since ${formatLockSince(lockState.sinceMs)}` : ""}
+            </span>
           </div>
         )}
 
