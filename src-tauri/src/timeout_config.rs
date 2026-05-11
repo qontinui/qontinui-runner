@@ -254,9 +254,30 @@ impl Timeouts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Tests in this module read or mutate process-wide `QONTINUI_TIMEOUT_*`
+    // env vars. Cargo runs tests within a binary in parallel by default, so
+    // without serialization `test_optional_timeout_disabled_by_default` can
+    // observe the env var set by `test_env_override` mid-run and assert
+    // against leaked state. Recover-from-poison so a panicking test doesn't
+    // cascade-fail the rest of the module.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard: removes the named env var on drop, including the panic
+    /// path. Without this, a future failing assertion inside
+    /// `test_env_override` after `set_var` would leak the var into the
+    /// process and break sibling tests once the mutex is released.
+    struct EnvVarGuard(&'static str);
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            env::remove_var(self.0);
+        }
+    }
 
     #[test]
     fn test_optional_timeout_disabled_by_default() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // User-facing operations should be disabled by default
         assert!(Timeouts::action_execution().is_none());
         assert!(Timeouts::python_command().is_none());
@@ -265,6 +286,7 @@ mod tests {
 
     #[test]
     fn test_required_timeout_has_default() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // System health operations should have defaults
         assert!(Timeouts::python_startup().as_secs() > 0);
         assert!(Timeouts::health_ping_interval().as_secs() > 0);
@@ -273,11 +295,13 @@ mod tests {
 
     #[test]
     fn test_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarGuard("QONTINUI_TIMEOUT_ACTION_EXECUTION");
         // Test that environment variables can override defaults
         env::set_var("QONTINUI_TIMEOUT_ACTION_EXECUTION", "300");
         let timeout = Timeouts::action_execution();
         assert!(timeout.is_some());
         assert_eq!(timeout.unwrap().as_secs(), 300);
-        env::remove_var("QONTINUI_TIMEOUT_ACTION_EXECUTION");
+        // env var auto-removed by EnvVarGuard on drop
     }
 }
