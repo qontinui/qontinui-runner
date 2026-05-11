@@ -28,6 +28,20 @@ interface TerminalTabBarProps {
   launchCommands?: Record<string, string>;
   fileLocks?: import("./useSessionManager").FileLockInfo[];
   fileLockStates?: Record<string, import("./useFileLockTracking").LockState>;
+  /**
+   * Per-tab count of files held by OTHER sessions that overlap with
+   * this tab's `workingDir`. Sourced from `useRegistryAwareness`.
+   * Renders a small yellow pill next to the lock indicator when > 0.
+   * Tabs without an entry (or with 0) render nothing.
+   */
+  registryAwareness?: Record<string, number>;
+  /**
+   * Active tab's `workingDir`, plumbed through to LaunchMenu's probe so
+   * relative-path tokens in the user's session-context prompt can
+   * resolve against the launching session's cwd. Undefined when no tab
+   * is active (first-tab case); LaunchMenu defaults to "" downstream.
+   */
+  activeTabCwd?: string;
   /** Per-tab commit-readiness state (populated by `useCommitState`). */
   commitStates?: Record<string, CommitState>;
   /**
@@ -194,6 +208,8 @@ export function TerminalTabBar({
   launchCommands,
   fileLocks,
   fileLockStates,
+  registryAwareness = {},
+  activeTabCwd,
   commitStates,
   terminalRefs,
   activityData,
@@ -452,6 +468,7 @@ export function TerminalTabBar({
                   accountUsage={accountUsage ?? []}
                   launchCommands={launchCommands}
                   fileLocks={fileLocks}
+                  cwd={activeTabCwd}
                   onJumpToHolder={(holderName) => {
                     // Resolve holder_name → tab id with the same lookup as
                     // `findTabByHolderName` in `useFileLockTracking.ts:44-49`
@@ -498,6 +515,7 @@ export function TerminalTabBar({
             isMultiZone && isTabAssigned(tab.id) && tabActivity && tabActivity.length > 0;
           const lockState = fileLockStates?.[tab.id];
           const commitState = commitStates?.[tab.id];
+          const overlapCount = registryAwareness[tab.id] ?? 0;
 
           return (
             <button
@@ -566,6 +584,21 @@ export function TerminalTabBar({
                   } waiting`}
                 >
                   <Lock className="w-2.5 h-2.5 text-[#7aa2f7] opacity-60" />
+                </span>
+              )}
+
+              {/* Registry-awareness badge — count of files held by OTHER
+                  sessions that overlap with this tab's cwd. Driven by
+                  `useRegistryAwareness` polling `/file-registry/probe-conflicts`
+                  (Phase 2 of pty-launched-ai-tabs-warning-plan). Silent
+                  tabs stay visually quiet — badge renders only when N > 0. */}
+              {overlapCount > 0 && (
+                <span
+                  data-testid="tab-registry-overlap"
+                  className="shrink-0 px-1 rounded text-[10px] leading-[14px] font-medium bg-[#e0af68]/20 text-[#e0af68]"
+                  title={`${overlapCount} file(s) held by other sessions overlap with this tab's cwd.`}
+                >
+                  {overlapCount}
                 </span>
               )}
 

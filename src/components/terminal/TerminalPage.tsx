@@ -40,6 +40,9 @@ import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
+import { useRegistryAwareness } from "./useRegistryAwareness";
+import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionProbe";
+import { MidSessionToast } from "./MidSessionToast";
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -152,6 +155,17 @@ function TerminalPageInner({
   // Per-tab commit-readiness state (Plan §3). Sibling to fileLockStates;
   // both are passed through to TerminalTabBar for rendering.
   const commitStates = useCommitState(tabs);
+  // Per-tab registry-awareness counts (pty-launched-ai-tabs-warning-plan
+  // Phase 2). Sibling to fileLockStates; polled from
+  // `/file-registry/probe-conflicts` every 2s per eligible tab.
+  const registryAwareness = useRegistryAwareness(tabs);
+  // Mid-session probe (Phase 3 of pty-launched-ai-tabs-warning-plan).
+  // Fires `/file-registry/probe-conflicts` 500ms after the user types a
+  // new turn into an active Claude CLI tab and surfaces predicted
+  // collisions via {@link MidSessionToast}. Gated behind the
+  // `enable_mid_session_path_prediction` localStorage flag.
+  const midSessionProbeEnabled = useMidSessionProbeEnabled();
+  const midSessionProbe = useMidSessionProbe(tabs, { enabled: midSessionProbeEnabled });
   // Post-spawn polling hook that captures Claude CLI's session id from
   // the on-disk transcript and updates `tab.claudeSessionId` so the
   // commit traffic light has something to key on. Plan §1.5
@@ -506,6 +520,8 @@ function TerminalPageInner({
           launchCommands={sessionManager.launchCommands}
           fileLocks={sessionManager.fileLocks}
           fileLockStates={fileLockStates}
+          registryAwareness={registryAwareness}
+          activeTabCwd={tabs.find((t) => t.id === activeId)?.workingDir}
           commitStates={commitStates}
           terminalRefs={terminalRefs.current}
         />
@@ -561,6 +577,7 @@ function TerminalPageInner({
                 onZoneDoubleClick={handleZoneDoubleClick}
                 onExit={handleExit}
                 onExportZone={handleExportZone}
+                onUserInputLine={(tabId, input) => midSessionProbe.feed(tabId, input)}
               />
             ) : (
               <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">
@@ -578,6 +595,23 @@ function TerminalPageInner({
 
             {zoneLayout.isMultiZone && !transitionEffects.batchBarDismissed && (
               <BatchOperationsBar />
+            )}
+
+            {/* Mid-session predicted-collision toast (Phase 3). Overlays
+                the active terminal — positioned top-right of the
+                flex-1 container so it sits over the zone grid, not
+                the chrome. Jump-to-holder: focus the tab whose title
+                matches the holder name, mirroring LaunchMenu's
+                `onJumpToHolder` semantics. */}
+            {activeId && midSessionProbe.states[activeId] && (
+              <MidSessionToast
+                state={midSessionProbe.states[activeId]}
+                onDismiss={() => midSessionProbe.dismiss(activeId)}
+                onJumpToHolder={(name) => {
+                  const target = tabs.find((t) => t.title === name);
+                  if (target) setActiveId(target.id);
+                }}
+              />
             )}
           </div>
 

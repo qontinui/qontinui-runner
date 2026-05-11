@@ -11,6 +11,7 @@ import { createTerminalBackend } from "./backends";
 import type { BackendType, ITerminalBackend } from "./backends";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { instanceStorage } from "@/lib/instance-storage";
+import { consumeInputChunk } from "./consumeInputChunk";
 
 export interface TerminalInstanceHandle {
   getSelection: () => string;
@@ -47,6 +48,13 @@ interface TerminalInstanceProps {
   onExit?: (exitCode: number | null) => void;
   onSelectionChange?: (hasSelection: boolean) => void;
   onFirstInput?: (input: string) => void;
+  /**
+   * Called for EVERY non-empty newline-terminated input line typed into
+   * the terminal. Unlike `onFirstInput`, this is ungated and fires on
+   * every subsequent line — the consumer (e.g. `useMidSessionProbe`)
+   * applies its own debouncing / rate-limiting / gating.
+   */
+  onUserInputLine?: (input: string) => void;
   /** Called when the shell emits an OSC 633 shell integration event. */
   onShellIntegration?: (event: ShellIntegrationEvent) => void;
   /** Called with decoded text whenever PTY output is received. */
@@ -123,6 +131,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       onExit,
       onSelectionChange,
       onFirstInput,
+      onUserInputLine,
       onShellIntegration,
       onOutput,
       onTitleChange,
@@ -145,6 +154,8 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     onSelectionChangeRef.current = onSelectionChange;
     const onFirstInputRef = useRef(onFirstInput);
     onFirstInputRef.current = onFirstInput;
+    const onUserInputLineRef = useRef(onUserInputLine);
+    onUserInputLineRef.current = onUserInputLine;
     const onReconnectedRef = useRef(onReconnected);
     onReconnectedRef.current = onReconnected;
     const onShellIntegrationRef = useRef(onShellIntegration);
@@ -473,23 +484,30 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         }
 
         // Forward user input to PTY + track first input line for auto-naming
+        // + emit every non-empty line to `onUserInputLine` for mid-session
+        // probes. The accumulator logic lives in the pure `consumeInputChunk`
+        // helper in `./consumeInputChunk.ts` (a leaf module — kept separate
+        // so vitest tests don't pull in xterm.js's canvas addon).
         disposables.push(
           backend.onData((data) => {
-            // Track first input line for auto-naming
-            if (!firstInputReportedRef.current) {
-              for (const ch of data) {
-                if (ch === "\r" || ch === "\n") {
-                  const line = inputAccumulatorRef.current.trim();
-                  if (line.length > 0) {
-                    firstInputReportedRef.current = true;
-                    onFirstInputRef.current?.(line);
-                  }
-                  inputAccumulatorRef.current = "";
-                  break;
-                } else if (ch.charCodeAt(0) >= 32) {
-                  // Only accumulate printable characters
-                  inputAccumulatorRef.current += ch;
-                }
+            const result = consumeInputChunk(
+              data,
+              inputAccumulatorRef.current,
+              firstInputReportedRef.current,
+            );
+            inputAccumulatorRef.current = result.accum;
+            // First-input gate: fires at most once per session.
+            if (result.firstInputLineIfAny !== undefined) {
+              firstInputReportedRef.current = true;
+              onFirstInputRef.current?.(result.firstInputLineIfAny);
+            }
+            // Per-line callback: fires for EVERY non-empty newline-terminated
+            // line, ungated. Consumer (e.g. useMidSessionProbe) applies its
+            // own gates.
+            const perLine = onUserInputLineRef.current;
+            if (perLine) {
+              for (const line of result.lines) {
+                perLine(line);
               }
             }
 
