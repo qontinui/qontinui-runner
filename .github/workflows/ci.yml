@@ -165,6 +165,14 @@ jobs:
       - name: Run Rust tests
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
+        #
+        # Step has a hard 45-minute timeout. Empirically Ubuntu finishes in
+        # ~30 min and Windows in ~50 min total job-time including this step;
+        # 45 min for the step alone is generous. Without the cap, macOS swap-
+        # thrash hangs ran for 80+ min before admin-cancel (PR #84 was the
+        # most recent — root-caused to CARGO_BUILD_JOBS=4 below). Fail fast
+        # is better than burning runner minutes on a known recurring pattern.
+        timeout-minutes: 45
         env:
           # `CARGO_BUILD_JOBS` reduces the parallel-rustc memory peak.
           # Empirically:
@@ -179,8 +187,17 @@ jobs:
           #   - Ubuntu OOM-killer is harsher: even with a 12 GB swapfile,
           #     JOBS=2 still trips the runner-agent shutdown. Drop Ubuntu
           #     to JOBS=1 for a single-threaded compile.
-          #   - macOS is on a fatter runner and stays at default 4.
-          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'macos-latest' && 4) || 1 }}
+          #   - macOS: GitHub-hosted M1/aarch64 runners ship with only
+          #     ~7 GB RAM (NOT 16 GB like ubuntu/windows — the older
+          #     "fatter runner" comment was wrong). With JOBS=4 the
+          #     peak from two parallel large-crate rustc invocations
+          #     (qontinui_runner_lib + wrappers_mcp) exceeds RAM and
+          #     macOS swap-thrashes indefinitely (no OOM-killer like
+          #     Linux). PR #84's macOS leg hung 80+ min mid-compile of
+          #     exactly that pair before admin-cancel. Drop to JOBS=2
+          #     — still parallel, half the peak. JOBS=1 would be safer
+          #     but ~2x slower.
+          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'macos-latest' && 2) || 1 }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
@@ -189,6 +206,11 @@ jobs:
           elif [ "$RUNNER_OS" = "Windows" ]; then
             echo "=== Windows memory state before cargo test ==="
             powershell -NoProfile -Command "Get-CimInstance Win32_PageFileUsage | Format-List *; Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory | Format-List"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            echo "=== macOS memory state before cargo test ==="
+            sysctl -n hw.memsize | awk '{print "physical RAM:", $1/1024/1024/1024, "GB"}'
+            vm_stat
+            df -h
           fi
           cd src-tauri
           cargo test --verbose
