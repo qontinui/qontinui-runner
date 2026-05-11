@@ -54,6 +54,7 @@ import {
 import { acknowledgeAdvisory } from "./reflectionApi";
 import { PlanRecommendations } from "./PlanRecommendations";
 import { WorkersPanel } from "./WorkersPanel";
+import { FileActivityPanel } from "./FileActivityPanel";
 
 const DECISION_LOG_LIMIT = 200;
 
@@ -1181,6 +1182,18 @@ export function CoordinatorDashboard() {
           onActionFilterChange={setActionFilter}
           onRefresh={loadDecisions}
         />
+
+        {/*
+         * File Activity panel — file-ownership-heatmap-plan Phase 2.
+         *
+         * Lives BELOW the productivity-stack spec-locked five-panel
+         * block (PlanRecommendations → Recommendations → Advisories →
+         * Escalations → Decision Log). The spec asserts existence of
+         * each, not relative order, so appending here is safe — the
+         * description in productivity/spec.uibridge.json is updated in
+         * the same PR to keep the human-readable narrative accurate.
+         */}
+        <FileActivityPanel />
       </div>
     </div>
   );
