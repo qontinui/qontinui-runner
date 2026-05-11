@@ -1693,7 +1693,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // remains the source of truth if the bound port differs from the
                     // intended one (port-fallback rare case).
                     let intended_api_port = crate::mcp::types::get_mcp_api_port();
-                    builder = builder.initialization_script(&format!(
+                    builder = builder.initialization_script(format!(
                         "window.__QONTINUI_PORT__ = {};",
                         intended_api_port
                     ));
