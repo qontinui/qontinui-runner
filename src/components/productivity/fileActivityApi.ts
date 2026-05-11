@@ -18,7 +18,7 @@
  *     state — keep the last good snapshot, just age it.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 /** Live entry from the in-process `FileRegistryManager.info()` snapshot. */
 export interface FileRegistryInfoEntry {
@@ -175,21 +175,21 @@ export function useFileActivity({
     return () => document.removeEventListener("visibilitychange", onVisChange);
   }, []);
 
-  // Stable ref for the currently in-flight request so we can abort it
-  // when the effect cleans up (component unmount, window change).
-  const abortRef = useRef<AbortController | null>(null);
-
   // Snapshot the most recent successful resolution time. Phase 3 spec:
   // stale flag flips on slow fetches, not just hard failures.
+  //
+  // Lifecycle: when any dep changes (or the component unmounts), React
+  // runs the cleanup below — `cancelled` blocks late `setState` calls
+  // and `ac.abort()` short-circuits the in-flight fetch. We don't need
+  // a ref-based abort because every controller is captured by its own
+  // effect-run closure.
   useEffect(() => {
     if (!enabled || !visible) return;
 
     let cancelled = false;
     const ac = new AbortController();
-    abortRef.current?.abort();
-    abortRef.current = ac;
 
-    const tick = async () => {
+    const poll = async () => {
       const start = performance.now();
       try {
         const payload = await fetchHeatmap(windowSecs, 25, ac.signal);
@@ -209,8 +209,8 @@ export function useFileActivity({
       }
     };
 
-    tick();
-    const id = window.setInterval(tick, pollIntervalMs);
+    poll();
+    const id = window.setInterval(poll, pollIntervalMs);
     return () => {
       cancelled = true;
       window.clearInterval(id);
