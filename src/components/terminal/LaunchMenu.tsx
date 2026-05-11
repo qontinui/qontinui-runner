@@ -18,6 +18,17 @@ interface LaunchMenuProps {
   launchCommands?: Record<string, string>;
   fileLocks?: FileLockInfo[];
   /**
+   * Active-tab working directory plumbed in by `TerminalTabBar`. The
+   * probe sends this in its JSON body so the runner's
+   * `path_extraction::extract_candidate_paths` can resolve relative-path
+   * tokens (e.g. "edit src/foo.rs") against the launching session's
+   * cwd, rather than degrading to bare-filename matching against the
+   * registry's normalized keys. Undefined / first-tab case falls back
+   * to "" — matches the legacy hardcoded behavior and the backend
+   * handler's documented "no relative-path resolution" mode.
+   */
+  cwd?: string;
+  /**
    * Resolves a holder name (matches a tab's `title`) to focus the
    * corresponding terminal tab. No-op when no tab matches — the holder
    * may be a non-terminal session (e.g. a workflow runner). Mirrors
@@ -64,6 +75,19 @@ export function resolvePort(): number {
 
 export function buildProbeUrl(port: number): string {
   return `http://127.0.0.1:${port}/file-registry/probe-conflicts`;
+}
+
+/**
+ * Build the JSON body for a probe request.
+ *
+ * `cwd` defaults to `""` when undefined — matches the legacy hardcoded
+ * behavior and the backend handler's documented "no relative-path
+ * resolution" mode. An explicit `""` from the caller is preserved
+ * (not coerced to undefined / dropped from the body) so the wire shape
+ * is stable regardless of which call site reached us.
+ */
+export function buildProbeBody(prompt: string | null, cwd: string | undefined): string {
+  return JSON.stringify({ prompt, cwd: cwd ?? "" });
 }
 
 /**
@@ -353,6 +377,7 @@ export function LaunchMenu({
   accountUsage,
   launchCommands,
   fileLocks,
+  cwd,
   onJumpToHolder,
   resolveSessionName,
   onClose,
@@ -390,13 +415,11 @@ export function LaunchMenu({
 
   // ── Probe: fetch ConflictReport on prompt change (debounced) ───────────────
   // The probe runs against the runner's local /file-registry/probe-conflicts
-  // endpoint. cwd is intentionally empty for now — the backend handles "" as
-  // "no relative-path resolution; only absolute paths and bare-filename
-  // matches." See plan §Open Q3.
-  // TODO(plan §Open Q3): plumb the active session's cwd through here so
-  // relative path tokens like "src/foo/bar.rs" can resolve against the
-  // launching session's working directory rather than degrading to
-  // bare-filename matching.
+  // endpoint. `cwd` is per-active-tab semantics — plumbed in by
+  // `TerminalTabBar` from the focused tab's `workingDir`. When undefined
+  // (e.g. first-tab case), buildProbeBody defaults it to "" so the backend
+  // falls back to its "no relative-path resolution; only absolute paths
+  // and bare-filename matches" mode.
 
   const runProbe = useCallback(
     async (prompt: string | null, signal?: AbortSignal): Promise<void> => {
@@ -405,7 +428,7 @@ export function LaunchMenu({
         const resp = await fetch(buildProbeUrl(port), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt, cwd: "" }),
+          body: buildProbeBody(prompt, cwd),
           signal,
         });
         if (!resp.ok) return;
@@ -418,10 +441,13 @@ export function LaunchMenu({
         // UI doesn't flicker when the runner is briefly busy.
       }
     },
-    [],
+    [cwd],
   );
 
-  // Debounced re-probe on prompt change.
+  // Debounced re-probe on prompt change. `runProbe` is included in the
+  // dep list — and `runProbe` itself depends on `cwd` — so a tab switch
+  // that changes the active workingDir re-fires the probe with the new
+  // cwd.
   useEffect(() => {
     const controller = new AbortController();
     const handle = setTimeout(() => {

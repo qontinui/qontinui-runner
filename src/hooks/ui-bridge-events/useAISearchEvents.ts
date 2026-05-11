@@ -117,6 +117,14 @@ export function useAISearchEvents(
           const query = (payload.params?.query as string) ?? "";
           const context = payload.params?.context as Record<string, unknown> | undefined;
           const confidenceThreshold = payload.params?.confidenceThreshold as number | undefined;
+          // B2 — literal-text precedence + strict mode. When the caller
+          // passes `strict: true` (forwarded by the Rust /ai/find handler
+          // from `?strict=true` / `"strict": true` in the JSON body), the
+          // SDK matcher returns ONLY exact-match candidates. Default
+          // behaviour (no flag) keeps the fuzzy path but exact matches
+          // still outrank alias-only candidates via the SearchEngine's
+          // literal-precedence pass.
+          const strict = payload.params?.strict === true;
 
           // Auto-detect active modal for context-aware scoring
           const uiBridgeGlobal = getUIBridgeGlobal();
@@ -146,6 +154,13 @@ export function useAISearchEvents(
           // Only pass confidenceThreshold if explicitly provided (undefined overrides defaults)
           if (typeof confidenceThreshold === "number" && !Number.isNaN(confidenceThreshold)) {
             findOpts.confidenceThreshold = confidenceThreshold;
+          }
+          if (strict) {
+            // `strict` is a Phase B2 addition on `FindOptions`; cast through
+            // an indexed-property type so we don't depend on the deployed
+            // @qontinui/ui-bridge typings carrying the new field yet. Once
+            // the SDK bump lands, the cast collapses to a no-op.
+            (findOpts as Record<string, unknown>).strict = true;
           }
           const result = aiFindFn(query, engine, findOpts);
           await sendResponse({

@@ -40,6 +40,13 @@ interface ZoneGridProps {
   onZoneDoubleClick: (zoneIndex: number) => void;
   onExit: (terminalId: string, exitCode: number | null) => void;
   onExportZone?: (zoneIndex: number, format: "text" | "markdown" | "json") => void;
+  /**
+   * Per-line input forwarder for mid-session probes (Phase 3 of
+   * `plans/pty-launched-ai-tabs-warning-plan.md`). Fires for every
+   * non-empty newline-terminated line typed into any terminal. Consumer
+   * applies its own debounce + gating.
+   */
+  onUserInputLine?: (terminalId: string, input: string) => void;
 }
 
 interface GridState {
@@ -108,7 +115,13 @@ function createInitialGridState(layout: LayoutPreset): GridState {
   };
 }
 
-export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone }: ZoneGridProps) {
+export function ZoneGrid({
+  onZoneClick,
+  onZoneDoubleClick,
+  onExit,
+  onExportZone,
+  onUserInputLine,
+}: ZoneGridProps) {
   // Read all data from contexts
   const {
     tabs,
@@ -292,6 +305,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
         terminalRef={terminalRefs.get(tab.id)}
         onExit={onExit}
         onFirstInput={onFirstInput}
+        onUserInputLine={onUserInputLine}
         onShellIntegration={onShellIntegration}
         onOutput={onOutput}
         onReconnected={onReconnected}
@@ -350,6 +364,9 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
                   onReconnected={() => onReconnected(zoneTab.id)}
                   onExit={(code) => onExit(zoneTab.id, code)}
                   onFirstInput={(input) => onFirstInput(zoneTab.id, input)}
+                  onUserInputLine={
+                    onUserInputLine ? (input) => onUserInputLine(zoneTab.id, input) : undefined
+                  }
                   onShellIntegration={(event) => onShellIntegration(zoneTab.id, event)}
                   onOutput={(text) => onOutput(zoneTab.id, text)}
                   onTitleChange={(title) => onTitleChange(zoneTab.id, title)}
@@ -394,6 +411,7 @@ export function ZoneGrid({ onZoneClick, onZoneDoubleClick, onExit, onExportZone 
           onZoneDoubleClick={onZoneDoubleClick}
           onExit={onExit}
           onFirstInput={onFirstInput}
+          onUserInputLine={onUserInputLine}
           onShellIntegration={onShellIntegration}
           onOutput={onOutput}
           onReconnected={onReconnected}
@@ -614,6 +632,7 @@ function ZoneCell({
   onZoneDoubleClick,
   onExit,
   onFirstInput,
+  onUserInputLine,
   onShellIntegration,
   onOutput,
   onReconnected,
@@ -667,6 +686,7 @@ function ZoneCell({
   onZoneDoubleClick: (zoneIndex: number) => void;
   onExit: (terminalId: string, exitCode: number | null) => void;
   onFirstInput: (terminalId: string, input: string) => void;
+  onUserInputLine?: (terminalId: string, input: string) => void;
   onShellIntegration: (tabId: string, event: ShellIntegrationEvent) => void;
   onOutput: (tabId: string, text: string) => void;
   onReconnected: (tabId: string) => void;
@@ -1037,6 +1057,9 @@ function ZoneCell({
                   onReconnected={() => onReconnected(tab.id)}
                   onExit={(code) => onExit(tab.id, code)}
                   onFirstInput={(input) => onFirstInput(tab.id, input)}
+                  onUserInputLine={
+                    onUserInputLine ? (input) => onUserInputLine(tab.id, input) : undefined
+                  }
                   onShellIntegration={(event) => onShellIntegration(tab.id, event)}
                   onOutput={(text) => onOutput(tab.id, text)}
                   onTitleChange={(title) => onTitleChange(tab.id, title)}

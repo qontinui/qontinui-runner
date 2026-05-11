@@ -101,7 +101,7 @@ export function startBackgroundObserver(): void {
   });
 
   observer.start();
-  console.warn("[BackgroundObserverService] Started");
+  console.info("[BackgroundObserverService] Started");
 }
 
 /**
@@ -111,7 +111,7 @@ export function stopBackgroundObserver(): void {
   if (observer) {
     observer.stop();
     observer = null;
-    console.warn("[BackgroundObserverService] Stopped");
+    console.info("[BackgroundObserverService] Stopped");
   }
 }
 

@@ -32,6 +32,7 @@ import {
   CONFIDENCE_TIER_CLASS,
   COLLISION_DIM_THRESHOLD,
   PROBE_DEBOUNCE_MS,
+  buildProbeBody,
   buildProbeUrl,
   confidenceTier,
   formatHoldingAge,
@@ -415,6 +416,72 @@ describe("probe fetch wire shape", () => {
     const [, init] = fetchMock.mock.calls[0]!;
     const sentBody = JSON.parse((init as RequestInit).body as string);
     expect(sentBody.prompt).toBeNull();
+  });
+
+  // ── cwd plumbing (Phase 1) ────────────────────────────────────────────────
+  //
+  // These three cases lock the `cwd?: string` prop's contract end-to-end:
+  // a provided cwd shows up in the wire body; an undefined prop defaults
+  // to ""; and an explicit "" survives unmodified (no coercion to
+  // undefined / no field-drop). Driven through the same `fetch` mock
+  // pattern as the wire-shape tests above, exercising the pure
+  // `buildProbeBody` helper that the component's runProbe uses.
+
+  it("posts the provided cwd in the JSON body when LaunchMenu has cwd='/repo'", async () => {
+    const port = resolvePort();
+    const url = buildProbeUrl(port);
+
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: buildProbeBody("edit src/foo.rs", "/repo"),
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0]!;
+    const sentBody = JSON.parse((init as RequestInit).body as string);
+    expect(sentBody.cwd).toBe("/repo");
+  });
+
+  it("defaults undefined cwd to empty string (first-tab / no-active case)", async () => {
+    // When TerminalPage's `tabs.find((t) => t.id === activeId)?.workingDir`
+    // returns undefined (no active tab, or tab has no workingDir yet),
+    // LaunchMenu's prop is undefined and the wire body must still carry
+    // cwd="" — the legacy hardcoded behavior the backend handler already
+    // expects.
+    const port = resolvePort();
+    const url = buildProbeUrl(port);
+
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: buildProbeBody("edit src/foo.rs", undefined),
+    });
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    const sentBody = JSON.parse((init as RequestInit).body as string);
+    // The field is present in the body (not dropped) and equals "".
+    expect(sentBody).toHaveProperty("cwd");
+    expect(sentBody.cwd).toBe("");
+  });
+
+  it("preserves an explicit empty-string cwd (does not drop or undefined-coerce)", async () => {
+    // A caller passing cwd="" explicitly must get cwd="" in the wire
+    // body — not dropped (which would risk a JSON-shape regression on
+    // the backend) and not coerced to undefined.
+    const port = resolvePort();
+    const url = buildProbeUrl(port);
+
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: buildProbeBody("edit src/foo.rs", ""),
+    });
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    const sentBody = JSON.parse((init as RequestInit).body as string);
+    expect(sentBody).toHaveProperty("cwd");
+    expect(sentBody.cwd).toBe("");
   });
 });
 
