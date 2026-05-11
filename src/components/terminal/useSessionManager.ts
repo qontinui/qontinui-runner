@@ -132,6 +132,13 @@ export interface RecentEditor {
 }
 
 /**
+ * Status of the AI extractor's call. Mirrors the Rust `AiStatus` enum
+ * (default `serde::Serialize` → PascalCase variant names). Frontend
+ * renders a small badge for any non-`"Ok"` value.
+ */
+export type AiStatus = "Ok" | "Offline" | "Disabled" | "RateLimited";
+
+/**
  * Response from `POST /file-registry/probe-conflicts`. Drives the
  * Currently-editing panel + predicted-collision warning in
  * `LaunchMenu`.
@@ -145,6 +152,18 @@ export interface ConflictReport {
   predicted_collisions: PredictedCollision[];
   recent_editors: RecentEditor[];
   extracted_candidates: string[];
+  /**
+   * Status of the AI extractor for this probe. When non-`"Ok"`, the
+   * UI surfaces an `AiStatusBadge` so the user knows the extractor
+   * fell back to regex-only (or is off entirely) — this avoids
+   * silently trusting an empty `predicted_collisions` list when the
+   * AI half of the pipeline degraded.
+   */
+  ai_status: AiStatus;
+  /** Number of candidates contributed by the AI extractor. */
+  ai_extracted_count: number;
+  /** Number of candidates contributed by the regex extractor. */
+  regex_extracted_count: number;
 }
 
 /**

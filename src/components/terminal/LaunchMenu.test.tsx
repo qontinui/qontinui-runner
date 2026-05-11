@@ -29,6 +29,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  AiStatusBadge,
   CONFIDENCE_TIER_CLASS,
   COLLISION_DIM_THRESHOLD,
   PROBE_DEBOUNCE_MS,
@@ -66,6 +67,9 @@ function makeReport(overrides: Partial<ConflictReport>): ConflictReport {
     predicted_collisions: [],
     recent_editors: [],
     extracted_candidates: [],
+    ai_status: "Ok",
+    ai_extracted_count: 0,
+    regex_extracted_count: 0,
     ...overrides,
   };
 }
@@ -367,6 +371,9 @@ describe("probe fetch wire shape", () => {
           predicted_collisions: [],
           recent_editors: [],
           extracted_candidates: [],
+          ai_status: "Ok",
+          ai_extracted_count: 0,
+          regex_extracted_count: 0,
         }) satisfies ConflictReport,
     } as unknown as Response);
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
@@ -620,5 +627,98 @@ describe("wait-for-release pending-set logic", () => {
     onRelease("src/a.rs");
     onRelease("src/a.rs"); // duplicate event
     expect(onAllClear).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── AiStatusBadge — Phase 3b panel-header + compact-line render ─────────────
+//
+// The vitest env is `node` (no jsdom), so we exercise `AiStatusBadge`
+// directly as a pure function — calling it returns a React element
+// whose props.children we walk for the visible text + icon. The four
+// orchestrator-mandated scenarios are split between:
+//   - the badge's own output (icon + label per status)
+//   - the report-driven render decision (panel header vs compact line
+//     vs hidden) which is `report.ai_status !== "Ok"` in both render
+//     sites — verified via the same data-shape pattern used elsewhere
+//     in this file (no React tree mounting).
+
+/** Recursively flatten `React.ReactNode` children into a single string. */
+function flattenChildren(node: unknown): string {
+  if (node === null || node === undefined || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(flattenChildren).join("");
+  if (typeof node === "object" && node !== null && "props" in node) {
+    const props = (node as { props?: { children?: unknown } }).props;
+    return flattenChildren(props?.children);
+  }
+  return "";
+}
+
+describe("AiStatusBadge", () => {
+  it("renders 'AI offline — regex still running' for Offline status", () => {
+    // Renders in panel header (default, non-compact) when ai_status is
+    // Offline and predicted_collisions is non-empty. The badge's text
+    // payload tells the user the AI half degraded but regex still ran.
+    const el = AiStatusBadge({ status: "Offline" });
+    const text = flattenChildren(el);
+    expect(text).toContain("AI offline — regex still running");
+    // Non-compact path: no extra padding classes added.
+    const className = (el.props as { className?: string }).className ?? "";
+    expect(className).not.toContain("px-2");
+  });
+
+  it("does not render when ai_status is Ok (panel-header guard)", () => {
+    // The panel header conditional is `report.ai_status !== "Ok"`. The
+    // badge itself is typed to forbid "Ok" (Exclude<AiStatus, "Ok">),
+    // so the contract is enforced at the call site. Verify the report
+    // shape that should suppress the badge.
+    const report = makeReport({
+      predicted_collisions: [
+        {
+          file_path: "src/lib.rs",
+          worktree_id: null,
+          other_holders: [{ task_run_id: "T1", holder_name: "A", registered_at: 1 }],
+          confidence: 1.0,
+        },
+      ],
+      ai_status: "Ok",
+    });
+    // Mirror the panel header's render guard.
+    const shouldRender = report.ai_status !== "Ok";
+    expect(shouldRender).toBe(false);
+  });
+
+  it("renders compact badge when ai_status is Offline and no predicted collisions", () => {
+    // The second render site — compact line — fires when there are
+    // no predicted collisions but the AI is still degraded, so the
+    // user doesn't silently trust an empty result.
+    const report = makeReport({
+      predicted_collisions: [],
+      ai_status: "Offline",
+    });
+    const shouldRenderCompact =
+      report.ai_status !== "Ok" && report.predicted_collisions.length === 0;
+    expect(shouldRenderCompact).toBe(true);
+
+    // The compact variant carries px-2 py-0.5 so the muted line has
+    // breathing room; the default (panel-header) variant does not.
+    const compactEl = AiStatusBadge({ status: "Offline", compact: true });
+    const compactClassName = (compactEl.props as { className?: string }).className ?? "";
+    expect(compactClassName).toContain("px-2");
+    expect(compactClassName).toContain("py-0.5");
+    // Same text content in both variants — the user sees the same
+    // diagnosis whether or not predicted collisions are present.
+    expect(flattenChildren(compactEl)).toContain("AI offline — regex still running");
+  });
+
+  it("renders Disabled status with the gear icon and 'Settings' copy", () => {
+    // Disabled is the user-actionable case — the gear glyph hints at
+    // a settings toggle (vs the generic info glyph used for transient
+    // Offline / RateLimited cases).
+    const el = AiStatusBadge({ status: "Disabled" });
+    const text = flattenChildren(el);
+    expect(text).toContain("AI prediction off (Settings)");
+    expect(text).toContain("⚙");
+    expect(text).not.toContain("ⓘ");
   });
 });

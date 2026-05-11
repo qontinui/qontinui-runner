@@ -165,9 +165,19 @@ pub struct AiSettings {
     /// When false, sessions always use the one-shot inline mode.
     #[serde(default = "default_interactive_sessions_enabled")]
     pub interactive_sessions_enabled: bool,
+    /// Send launch prompts to Claude (Haiku 4.5) for path inference in
+    /// the predictive-conflict-warning probe. When false, the AI extractor
+    /// is skipped and only the deterministic regex extractor runs. The
+    /// regex extractor is always on regardless of this flag.
+    #[serde(default = "default_ai_path_prediction_enabled")]
+    pub ai_path_prediction_enabled: bool,
 }
 
 fn default_interactive_sessions_enabled() -> bool {
+    true
+}
+
+fn default_ai_path_prediction_enabled() -> bool {
     true
 }
 
@@ -188,6 +198,7 @@ impl Default for AiSettings {
             retry: RetryConfig::default(),
             routing: RoutingConfig::default(),
             interactive_sessions_enabled: default_interactive_sessions_enabled(),
+            ai_path_prediction_enabled: default_ai_path_prediction_enabled(),
         }
     }
 }
