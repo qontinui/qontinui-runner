@@ -269,6 +269,9 @@ regex_creation_in_loops = "allow"
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+# Deterministic mtime control for tests (e.g. transcript::get_latest_session_id
+# `since` filter coverage). Cross-platform; on Windows wraps SetFileTime.
+filetime = "0.2"
 
 ## Profile overrides moved to the workspace root Cargo.toml — cargo
 ## ignores [profile.*] in package manifests when a workspace exists.

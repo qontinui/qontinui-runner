@@ -182,10 +182,18 @@ pub async fn transcript_read_session(
 /// account — without it, a more-recently-touched JSONL in a *different*
 /// account for the same `project_path` would shadow the session we
 /// actually want.
+///
+/// `since_ms` (epoch milliseconds, matches `Date.now()` on the JS side as
+/// camelCase `sinceMs`) filters out sessions whose `last_modified` is at
+/// or before the supplied threshold. This lets the frontend lift its
+/// freshness check into the backend so the `.claude.json` shortcut and
+/// mtime fallback are filtered consistently — see Phase 1 of
+/// `plans/traffic-light-session-id-followups.md`.
 #[tauri::command]
 pub async fn transcript_get_latest(
     project_path: Option<String>,
     config_dir: Option<String>,
+    since_ms: Option<i64>,
 ) -> Result<CommandResponse, String> {
     let project = project_path.unwrap_or_else(|| {
         crate::mcp::shared::get_workspace_paths_internal()
@@ -200,9 +208,14 @@ pub async fn transcript_get_latest(
         transcript::find_claude_config_dirs()
     };
 
+    // Convert the epoch-millis threshold to a UTC timestamp for the backend
+    // helper. `from_timestamp_millis` returns `None` for out-of-range
+    // values; in that case we behave as if no filter was supplied.
+    let since = since_ms.and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis);
+
     // Try each config dir, return first match
     for dir in &config_dirs {
-        if let Some(session) = transcript::get_latest_session_id(dir, &project) {
+        if let Some(session) = transcript::get_latest_session_id(dir, &project, since) {
             return Ok(CommandResponse {
                 success: true,
                 message: Some(format!("Latest session: {}", session.session_id)),

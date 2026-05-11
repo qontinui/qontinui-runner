@@ -5,19 +5,21 @@
  *
  * Same constraint as `useCommitState.test.ts`: the runner's vitest
  * environment is `node`, so we mock the IPC surface and exercise the
- * decision logic directly. The branches that matter:
+ * decision logic directly.
+ *
+ * Freshness is enforced backend-side via `sinceMs`. The hook trusts
+ * any non-null payload returned by `transcript_get_latest`. The
+ * branches that still matter on the frontend:
  *
  *   1. Latest unclaimed session matching workingDir →
  *      `updateTab({ claudeSessionId, claudeConfigDir })` is called once.
  *   2. Two tabs spawn into the same workdir → the first one wins;
  *      the second sees the session id as already-claimed and refuses
  *      to bind it.
- *   3. Timeout (no JSONL appears within 15 s) → `updateTab` is never
+ *   3. Backend returns null (filtered by sinceMs because no fresh
+ *      JSONL exists yet) → poll keeps ticking, no claim.
+ *   4. Timeout (no JSONL appears within 15 s) → `updateTab` is never
  *      called for that tab.
- *
- * The polling driver itself (the 500 ms tick scheduler) is exercised
- * via a small reproduction of the decision logic so we don't need
- * fake-timer plumbing in a node-environment vitest project.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -37,19 +39,16 @@ interface TranscriptSessionPayload {
 }
 
 // Decision helper that mirrors the hook's per-tick claim logic.
-// Returns the update payload to apply (if any) given a poll response.
+// Freshness (last_modified > spawnTimestamp) is enforced backend-side
+// via `sinceMs`; the hook trusts any non-null payload it receives.
 function decideClaim(
   tab: TerminalTab | undefined,
   payload: TranscriptSessionPayload | null,
-  spawnTimestamp: number,
   alreadyClaimed: Set<string>,
 ): { claudeSessionId: string; claudeConfigDir: string } | null {
   if (!tab) return null;
   if (tab.claudeSessionId) return null;
   if (!payload) return null;
-  const lastModifiedMs = Date.parse(payload.last_modified);
-  if (!Number.isFinite(lastModifiedMs)) return null;
-  if (lastModifiedMs <= spawnTimestamp) return null;
   if (alreadyClaimed.has(payload.session_id)) return null;
   return {
     claudeSessionId: payload.session_id,
@@ -68,17 +67,15 @@ const tab = (id: string, workingDir: string, claudeSessionId?: string): Terminal
 });
 
 describe("decideClaim — happy path", () => {
-  it("binds the session when payload is fresh + unclaimed", () => {
-    const spawnAt = 1_700_000_000_000;
+  it("binds the session when payload is unclaimed", () => {
     const result = decideClaim(
       tab("tab-1", "D:/repo"),
       {
         session_id: "session-A",
         config_dir: "C:/claude/.claude-default",
         project_path: "D:/repo",
-        last_modified: new Date(spawnAt + 1000).toISOString(),
+        last_modified: new Date().toISOString(),
       },
-      spawnAt,
       new Set(),
     );
     expect(result).toEqual({
@@ -87,24 +84,7 @@ describe("decideClaim — happy path", () => {
     });
   });
 
-  it("rejects a stale session (last_modified <= spawn timestamp)", () => {
-    const spawnAt = 1_700_000_000_000;
-    const result = decideClaim(
-      tab("tab-1", "D:/repo"),
-      {
-        session_id: "session-old",
-        config_dir: "C:/claude/.claude-default",
-        project_path: "D:/repo",
-        last_modified: new Date(spawnAt - 5_000).toISOString(),
-      },
-      spawnAt,
-      new Set(),
-    );
-    expect(result).toBeNull();
-  });
-
   it("rejects when the session id is already claimed", () => {
-    const spawnAt = 1_700_000_000_000;
     const claimed = new Set(["session-A"]);
     const result = decideClaim(
       tab("tab-2", "D:/repo"),
@@ -112,9 +92,8 @@ describe("decideClaim — happy path", () => {
         session_id: "session-A", // claimed by tab-1 already
         config_dir: "C:/claude/.claude-default",
         project_path: "D:/repo",
-        last_modified: new Date(spawnAt + 1000).toISOString(),
+        last_modified: new Date().toISOString(),
       },
-      spawnAt,
       claimed,
     );
     expect(result).toBeNull();
@@ -123,39 +102,36 @@ describe("decideClaim — happy path", () => {
 
 describe("decideClaim — concurrent same-workdir spawn defense", () => {
   it("first tab wins, second tab times out (no claim)", () => {
-    const spawnAt = 1_700_000_000_000;
     const claimed = new Set<string>();
     const payload: TranscriptSessionPayload = {
       session_id: "session-shared",
       config_dir: "C:/claude/.claude-default",
       project_path: "D:/repo",
-      last_modified: new Date(spawnAt + 1000).toISOString(),
+      last_modified: new Date().toISOString(),
     };
 
     // Tab 1 polls first → wins.
-    const claim1 = decideClaim(tab("tab-1", "D:/repo"), payload, spawnAt, claimed);
+    const claim1 = decideClaim(tab("tab-1", "D:/repo"), payload, claimed);
     expect(claim1).not.toBeNull();
     if (claim1) claimed.add(claim1.claudeSessionId);
 
     // Tab 2 polls same workdir → sees the same session_id, but it's
     // claimed now → rejected.
-    const claim2 = decideClaim(tab("tab-2", "D:/repo"), payload, spawnAt, claimed);
+    const claim2 = decideClaim(tab("tab-2", "D:/repo"), payload, claimed);
     expect(claim2).toBeNull();
   });
 });
 
 describe("decideClaim — already-bound and missing-tab cases", () => {
   it("skips a tab that already has a claudeSessionId (resume path beat us)", () => {
-    const spawnAt = 1_700_000_000_000;
     const result = decideClaim(
       tab("tab-1", "D:/repo", "session-RESUME"),
       {
         session_id: "session-NEW",
         config_dir: "C:/claude/.claude-default",
         project_path: "D:/repo",
-        last_modified: new Date(spawnAt + 1000).toISOString(),
+        last_modified: new Date().toISOString(),
       },
-      spawnAt,
       new Set(),
     );
     expect(result).toBeNull();
@@ -171,30 +147,13 @@ describe("decideClaim — already-bound and missing-tab cases", () => {
           project_path: "D:/repo",
           last_modified: new Date().toISOString(),
         },
-        Date.now(),
         new Set(),
       ),
     ).toBeNull();
   });
 
-  it("returns null when the probe payload is null (no transcript yet)", () => {
-    expect(decideClaim(tab("tab-1", "D:/repo"), null, Date.now(), new Set())).toBeNull();
-  });
-
-  it("returns null when last_modified is unparseable", () => {
-    expect(
-      decideClaim(
-        tab("tab-1", "D:/repo"),
-        {
-          session_id: "session-A",
-          config_dir: "C:/claude/.claude-default",
-          project_path: "D:/repo",
-          last_modified: "not-a-date",
-        },
-        Date.now(),
-        new Set(),
-      ),
-    ).toBeNull();
+  it("returns null when the probe payload is null (filtered by backend or no JSONL yet)", () => {
+    expect(decideClaim(tab("tab-1", "D:/repo"), null, new Set())).toBeNull();
   });
 });
 
@@ -203,16 +162,21 @@ describe("invoke contract", () => {
     mockInvoke.mockReset();
   });
 
-  it("transcript_get_latest is invoked with camelCase projectPath", async () => {
+  it("transcript_get_latest is invoked with camelCase projectPath + sinceMs", async () => {
     mockInvoke.mockResolvedValueOnce({ success: true, data: null });
     const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("transcript_get_latest", { projectPath: "D:/repo" });
+    const spawnAt = Date.now();
+    await invoke("transcript_get_latest", {
+      sinceMs: spawnAt,
+      projectPath: "D:/repo",
+    });
     expect(mockInvoke).toHaveBeenCalledWith("transcript_get_latest", {
+      sinceMs: spawnAt,
       projectPath: "D:/repo",
     });
   });
 
-  it("transcript_get_latest accepts configDir alongside projectPath", async () => {
+  it("transcript_get_latest accepts configDir alongside projectPath + sinceMs", async () => {
     mockInvoke.mockResolvedValueOnce({
       success: true,
       data: {
@@ -223,14 +187,33 @@ describe("invoke contract", () => {
       },
     });
     const { invoke } = await import("@tauri-apps/api/core");
+    const spawnAt = Date.now();
     await invoke("transcript_get_latest", {
+      sinceMs: spawnAt,
       projectPath: "D:/repo",
       configDir: "C:/claude/.claude-hotmail",
     });
     expect(mockInvoke).toHaveBeenCalledWith("transcript_get_latest", {
+      sinceMs: spawnAt,
       projectPath: "D:/repo",
       configDir: "C:/claude/.claude-hotmail",
     });
+  });
+
+  it("backend returning null (filtered by sinceMs) leaves the hook unbound", async () => {
+    // After the since-filter migration, "stale" is a backend concept: the
+    // backend returns `data: null` when no session passes the filter. The
+    // hook must not bind anything in that case — it just keeps ticking.
+    mockInvoke.mockResolvedValueOnce({ success: true, data: null });
+    const { invoke } = await import("@tauri-apps/api/core");
+    const resp = (await invoke("transcript_get_latest", {
+      sinceMs: Date.now(),
+      projectPath: "D:/repo",
+    })) as { success: boolean; data: TranscriptSessionPayload | null };
+
+    const data = resp.success ? resp.data : null;
+    const claim = decideClaim(tab("tab-1", "D:/repo"), data, new Set());
+    expect(claim).toBeNull();
   });
 });
 
@@ -255,7 +238,6 @@ describe("invoke contract", () => {
  */
 describe("decideClaim — cross-config-dir scope (P0 fix)", () => {
   it("accepts a session whose config_dir matches the launching account", () => {
-    const spawnAt = 1_700_000_000_000;
     // Backend was called with configDir filter, so it returns ONLY
     // the hotmail session — even though gmail had a fresher mtime.
     const result = decideClaim(
@@ -264,9 +246,8 @@ describe("decideClaim — cross-config-dir scope (P0 fix)", () => {
         session_id: "session-hotmail",
         config_dir: "C:/claude/.claude-hotmail",
         project_path: "D:/repo",
-        last_modified: new Date(spawnAt + 500).toISOString(),
+        last_modified: new Date().toISOString(),
       },
-      spawnAt,
       new Set(),
     );
     expect(result).toEqual({
@@ -276,7 +257,6 @@ describe("decideClaim — cross-config-dir scope (P0 fix)", () => {
   });
 
   it("two tabs in different accounts each bind their own session", () => {
-    const spawnAt = 1_700_000_000_000;
     const claimed = new Set<string>();
 
     // Hotmail tab: backend filtered to hotmail, returns hotmail session.
@@ -286,9 +266,8 @@ describe("decideClaim — cross-config-dir scope (P0 fix)", () => {
         session_id: "session-hotmail",
         config_dir: "C:/claude/.claude-hotmail",
         project_path: "D:/repo",
-        last_modified: new Date(spawnAt + 500).toISOString(),
+        last_modified: new Date().toISOString(),
       },
-      spawnAt,
       claimed,
     );
     expect(hotmailClaim?.claudeSessionId).toBe("session-hotmail");
@@ -304,9 +283,8 @@ describe("decideClaim — cross-config-dir scope (P0 fix)", () => {
         session_id: "session-gmail",
         config_dir: "C:/claude/.claude-gmail",
         project_path: "D:/repo",
-        last_modified: new Date(spawnAt + 700).toISOString(),
+        last_modified: new Date().toISOString(),
       },
-      spawnAt,
       claimed,
     );
     expect(gmailClaim?.claudeSessionId).toBe("session-gmail");

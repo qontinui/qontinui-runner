@@ -12,15 +12,25 @@
  * called, the consumer fires `startCapture(tabId, workingDir,
  * spawnTimestamp)`. The hook polls the existing `transcript_get_latest`
  * Tauri command (in `commands/transcript.rs:178`) every ~500 ms for up
- * to ~15 s. When it finds a `TranscriptSession` whose `last_modified`
- * is fresher than the spawn timestamp AND whose `session_id` isn't
- * already claimed by another tab, it calls
+ * to ~15 s. Freshness gating (last_modified > spawnTimestamp) is now
+ * enforced backend-side via the `sinceMs` argument; if the backend
+ * returns a non-null payload it's already known fresher than the
+ * spawn. The frontend just checks the session id isn't already claimed
+ * by another tab and then calls
  * `updateTab(tabId, { claudeSessionId, claudeConfigDir })`.
  *
  * Concurrency defense: a `claimedSessionIds` ref tracks every session id
  * we've already bound to a tab; the polling loop refuses to claim an
- * already-claimed id. This prevents two concurrent spawns into the same
- * working directory from latching onto the same JSONL.
+ * already-claimed id. This is the intra-tab dedup line of defense for
+ * the case where two concurrent spawns into the same working directory
+ * (and same config dir) race on a single JSONL — backend-side `sinceMs`
+ * cannot disambiguate them.
+ *
+ * Diagnostics: set `localStorage["debug:tabSidCapture"] = "1"` to emit
+ * `logger.debug("[tabSidCapture] <tag>", payload)` at every rejection
+ * branch (`tab-not-found`, `already-bound`, `timed-out`, `probe-null`,
+ * `already-claimed`, `probe-error`). Off by default; same affordance
+ * pattern as `UI_BRIDGE_DEBUG_FIND`.
  *
  * On timeout the tab simply stays without a session id — the user can
  * still use the terminal, just no commit indicator.
@@ -127,6 +137,17 @@ export function useTabSessionIdCapture({
     // capture-start time. Empty string is treated as "let the backend
     // fall back to its workspace default".
     (tabId, workingDir, spawnTimestamp, configDir) => {
+      // Re-read on every emission so tests that stub localStorage at
+      // arbitrary points still get the latest value. Production cost
+      // is a single getItem per debug call site.
+      const debug = (): boolean =>
+        typeof localStorage !== "undefined" &&
+        localStorage.getItem("debug:tabSidCapture") === "1";
+
+      if (debug()) {
+        logger.debug("[tabSidCapture] start", { tabId, workingDir, configDir, spawnTimestamp });
+      }
+
       // Already polling this tab? Don't double-up.
       if (inFlight.current.has(tabId)) return;
       const handle = { cancelled: false };
@@ -141,11 +162,18 @@ export function useTabSessionIdCapture({
         const tab = tabsRef.current.find((t) => t.id === tabId);
         if (!tab) {
           // Tab was closed — stop.
+          if (debug()) logger.debug("[tabSidCapture] tab-not-found", { tabId });
           handle.cancelled = true;
           inFlight.current.delete(tabId);
           return;
         }
         if (tab.claudeSessionId) {
+          if (debug()) {
+            logger.debug("[tabSidCapture] already-bound", {
+              tabId,
+              sessionId: tab.claudeSessionId,
+            });
+          }
           handle.cancelled = true;
           inFlight.current.delete(tabId);
           return;
@@ -153,41 +181,53 @@ export function useTabSessionIdCapture({
 
         // Timed out?
         if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+          if (debug()) {
+            logger.debug("[tabSidCapture] timed-out", {
+              tabId,
+              elapsedMs: Date.now() - startedAt,
+            });
+          }
           handle.cancelled = true;
           inFlight.current.delete(tabId);
           return;
         }
 
         try {
-          // Pass workingDir + configDir when known. Both fall back
-          // server-side: empty workingDir → workspace project path;
-          // missing configDir → scan all known config dirs (the bug
-          // path that motivated adding configDir — see hook docstring).
-          const args: Record<string, string> = {};
+          // Pass workingDir + configDir when known, plus sinceMs so the
+          // backend can drop pre-spawn JSONLs before answering. Both
+          // workingDir/configDir fall back server-side: empty workingDir
+          // → workspace project path; missing configDir → scan all known
+          // config dirs (the bug path that motivated adding configDir —
+          // see hook docstring).
+          const args: Record<string, string | number> = { sinceMs: spawnTimestamp };
           if (workingDir) args.projectPath = workingDir;
           if (configDir) args.configDir = configDir;
           const resp = await invoke<CommandResponse>("transcript_get_latest", args);
           if (handle.cancelled) return;
 
           const data = resp.success ? (resp.data as TranscriptSessionPayload | null) : null;
-          if (data) {
-            const lastModifiedMs = Date.parse(data.last_modified);
-            const fresh = Number.isFinite(lastModifiedMs) && lastModifiedMs > spawnTimestamp;
-            const unclaimed = !claimedSessionIds.current.has(data.session_id);
-            if (fresh && unclaimed) {
-              claimedSessionIds.current.add(data.session_id);
-              updateTab(tabId, {
-                claudeSessionId: data.session_id,
-                claudeConfigDir: data.config_dir,
+          if (!data) {
+            if (debug()) logger.debug("[tabSidCapture] probe-null", { tabId });
+          } else if (claimedSessionIds.current.has(data.session_id)) {
+            if (debug()) {
+              logger.debug("[tabSidCapture] already-claimed", {
+                tabId,
+                sessionId: data.session_id,
               });
-              handle.cancelled = true;
-              inFlight.current.delete(tabId);
-              return;
             }
+          } else {
+            claimedSessionIds.current.add(data.session_id);
+            updateTab(tabId, {
+              claudeSessionId: data.session_id,
+              claudeConfigDir: data.config_dir,
+            });
+            handle.cancelled = true;
+            inFlight.current.delete(tabId);
+            return;
           }
         } catch (err) {
           // Probe error: keep trying; runner may be transiently busy.
-          logger.debug("transcript_get_latest probe failed:", err);
+          if (debug()) logger.debug("[tabSidCapture] probe-error", { tabId, err });
         }
 
         // Schedule next tick.
