@@ -21,6 +21,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { resolvePort } from "./LaunchMenu";
 import type { TerminalTab } from "./useTerminalManager";
 
 // ── Pure helpers (exported for tests) ────────────────────────────────────────
@@ -263,11 +264,14 @@ export function useFileLockTracking(tabs: TerminalTab[]): Record<string, LockSta
 
     const poll = async () => {
       try {
-        const port =
-          typeof window !== "undefined" &&
-          (window as unknown as Record<string, unknown>).__QONTINUI_PORT__
-            ? Number((window as unknown as Record<string, unknown>).__QONTINUI_PORT__)
-            : 9876;
+        // Resolve the port at each poll (not once at mount): on secondary
+        // runners `useApiReady` populates `getApiPort()` asynchronously
+        // via the `api-ready` Tauri event, so a hook that mounted
+        // before the event fires would otherwise keep polling 9876
+        // (the primary) forever. Re-reading here lets us catch up by
+        // the second tick. `__QONTINUI_PORT__` still wins when set
+        // (manual-test override).
+        const port = resolvePort();
         const resp = await fetch(`http://127.0.0.1:${port}/file-locks/info`);
         if (!resp.ok || !active) return;
         const locks = (await resp.json()) as FileLockInfoEntry[];

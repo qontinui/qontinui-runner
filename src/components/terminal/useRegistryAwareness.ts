@@ -104,14 +104,18 @@ export function useRegistryAwareness(
 
   useEffect(() => {
     let active = true;
-    const port = resolvePort();
-    const url = `http://127.0.0.1:${port}/file-registry/probe-conflicts`;
 
     const probeTab = async (
       tab: TerminalTab,
     ): Promise<[string, number]> => {
       if (!tab.workingDir) return [tab.id, 0];
       try {
+        // Resolve the port per-poll (not once at mount): on secondary
+        // runners `useApiReady` populates the port asynchronously via
+        // the `api-ready` Tauri event, so a hook that mounted before
+        // the event would otherwise keep polling the primary forever.
+        // Re-reading here catches up by the second tick.
+        const url = `http://127.0.0.1:${resolvePort()}/file-registry/probe-conflicts`;
         const resp = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },

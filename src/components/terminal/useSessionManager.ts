@@ -12,6 +12,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
+import { resolvePort } from "./LaunchMenu";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState } from "./useZoneLayout";
@@ -517,11 +518,10 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   const fetchFileLocks = useCallback(async () => {
     try {
-      const port =
-        typeof window !== "undefined" &&
-        (window as unknown as Record<string, unknown>).__QONTINUI_PORT__
-          ? Number((window as unknown as Record<string, unknown>).__QONTINUI_PORT__)
-          : 9876;
+      // Resolve at call time so secondary runners pick up the
+      // actually-bound port once `useApiReady` populates it (the
+      // `api-ready` event may arrive after this hook mounts).
+      const port = resolvePort();
       const resp = await fetch(`http://127.0.0.1:${port}/file-locks/info`);
       if (resp.ok) {
         const data = (await resp.json()) as FileLockInfo[];

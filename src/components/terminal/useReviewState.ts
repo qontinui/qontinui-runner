@@ -14,6 +14,7 @@
 
 import { useEffect, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { resolvePort } from "./LaunchMenu";
 
 /** Verdict tag emitted by `/auto-review`. Mirrors the wire format from
  *  `pg::reviews::ReviewRow`. */
@@ -125,16 +126,12 @@ function projectReview(row: ReviewRowWire): ReviewState | null {
   };
 }
 
-/** Poll URL for the runner. Mirrors `useFileLockTracking`'s pattern of
- *  reading `__QONTINUI_PORT__` off `window` and falling back to the
- *  default dev port. */
+/** Poll URL for the runner. Resolves the port via the centralized
+ *  helper so secondary/temp runners on non-default ports get their
+ *  actually-bound port (populated asynchronously by `useApiReady` via
+ *  the `api-ready` Tauri event). */
 function runnerBaseUrl(): string {
-  const port =
-    typeof window !== "undefined" &&
-    (window as unknown as Record<string, unknown>).__QONTINUI_PORT__
-      ? Number((window as unknown as Record<string, unknown>).__QONTINUI_PORT__)
-      : 9876;
-  return `http://127.0.0.1:${port}`;
+  return `http://127.0.0.1:${resolvePort()}`;
 }
 
 /** Hook: returns the latest review state for a session, or `null` when
