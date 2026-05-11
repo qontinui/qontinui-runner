@@ -586,9 +586,12 @@ async fn run_ai_extractor(enabled: bool, prompt: &str, cwd: &str) -> (Vec<String
     if !enabled {
         return (Vec::new(), AiStatus::Disabled);
     }
-    if prompt.is_empty() {
+    if prompt.trim().is_empty() {
         // No prompt to enrich. Not an AI failure — surface as Ok with 0
         // counts so the frontend doesn't render an unwarranted badge.
+        // `probe_conflicts` already trims at the boundary; defending here
+        // too so a direct caller (test or future code) passing whitespace
+        // doesn't burn an AI call on it.
         return (Vec::new(), AiStatus::Ok);
     }
 
@@ -1391,9 +1394,15 @@ mod tests {
         assert!(paths.is_empty());
         assert_eq!(status, AiStatus::Ok);
 
-        // Whitespace-only prompt is treated identically — the handler
-        // trims before calling.
-        let (paths, status) = run_ai_extractor(true, "", "/repo").await;
+        // Whitespace-only prompt is treated identically — `run_ai_extractor`
+        // trims defensively (mirrors the `probe_conflicts` boundary trim),
+        // so a direct caller passing whitespace doesn't burn an AI call.
+        let (paths, status) = run_ai_extractor(true, "   ", "/repo").await;
+        assert!(paths.is_empty());
+        assert_eq!(status, AiStatus::Ok);
+
+        // Tabs + newlines + spaces also count as whitespace.
+        let (paths, status) = run_ai_extractor(true, "\t \n  \r", "/repo").await;
         assert!(paths.is_empty());
         assert_eq!(status, AiStatus::Ok);
     }
