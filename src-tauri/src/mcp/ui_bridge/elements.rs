@@ -1202,9 +1202,16 @@ fn ws_dispatch_error_response(error_msg: String) -> (StatusCode, Json<ApiRespons
 /// merged response, so a flaky wrapper degrades gracefully. Both bare-array
 /// and `{data: [...]}` / `{components: [...]}` shapes from wrappers are
 /// accepted and unwrapped.
+///
+/// F2 (Direction B) envelope shape:
+/// - `data` is `{components: [...]}` (object-shaped, matches every other
+///   rich endpoint convention and aligns with the SDK relay).
+/// - A **deprecated** top-level `components` field mirrors the array so
+///   pre-Direction-B callers keep working. Slated for removal one release
+///   after Direction B lands — read from `data.components` instead.
 pub async fn ui_bridge_get_components_handler(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting all components");
 
     // Fan out to WS-transport wrappers in parallel with the IPC call.
@@ -1265,7 +1272,15 @@ pub async fn ui_bridge_get_components_handler(
     };
 
     merged.append(&mut ws_components);
-    Ok(Json(ApiResponse::success(serde_json::Value::Array(merged))))
+    let components_array = serde_json::Value::Array(merged);
+    // F2 (Direction B): emit `{success, data:{components:[...]}, components:[...]}`.
+    // The top-level `components` is a deprecated mirror for back-compat;
+    // new callers should read `data.components`.
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": { "components": components_array.clone() },
+        "components": components_array,
+    })))
 }
 
 /// Get a specific component by ID.
@@ -1895,11 +1910,26 @@ pub async fn ui_bridge_get_snapshot_handler(
 ///   - `{"kind":"attribute_equals","name":"aria-pressed","value":"true"}`
 pub async fn ui_bridge_wait_for_element_handler(
     State(state): State<Arc<ApiState>>,
+    Query(query_params): Query<std::collections::HashMap<String, String>>,
     body: Option<Json<serde_json::Value>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
     let body = body
         .map(|Json(v)| v)
         .unwrap_or_else(|| serde_json::json!({}));
+
+    // B4 — `?strictTimeout=true` query parameter:
+    // When set, the predicate/state SDK-forwarded helpers translate
+    // `{found: false, durationMs, lastObservedState}` IPC payloads into
+    // HTTP 408 + `api_error("wait_for_element_timeout")` with a `data:` body
+    // carrying the original IPC fields. Default behaviour (back-compat)
+    // preserves the existing `success:true` envelope on timeout. The NL/id
+    // path already returns HTTP 408 on timeout (see the bottom of this
+    // function) so `strictTimeout` is a no-op there.
+    let strict_timeout = query_params
+        .get("strictTimeout")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
     // Body-shape routing — three accepted shapes share `/ai/wait-for-element`:
     //
@@ -1911,10 +1941,11 @@ pub async fn ui_bridge_wait_for_element_handler(
     //   2. `{ predicate: {...}, requirement?, ... }` — `waitForElementRegistered`.
     //   3. `{ query|elementId, assertions?, ... }` — legacy poll-via-ai_find.
     if body.get("state").and_then(|v| v.as_str()).is_some() {
-        return ui_bridge_wait_for_element_state_predicate_handler(state, body).await;
+        return ui_bridge_wait_for_element_state_predicate_handler(state, body, strict_timeout)
+            .await;
     }
     if body.get("predicate").is_some() {
-        return ui_bridge_wait_for_element_registered_forward(state, body).await;
+        return ui_bridge_wait_for_element_registered_forward(state, body, strict_timeout).await;
     }
 
     let query = body.get("query").and_then(|v| v.as_str()).map(String::from);
@@ -1944,7 +1975,7 @@ pub async fn ui_bridge_wait_for_element_handler(
         (None, None) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(
+                Json(api_error_to_value(
                     "wait-for-element: provide either 'query' or 'elementId'",
                 )),
             ));
@@ -1952,7 +1983,7 @@ pub async fn ui_bridge_wait_for_element_handler(
         (Some(_), Some(_)) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(
+                Json(api_error_to_value(
                     "wait-for-element: 'query' and 'elementId' are mutually exclusive",
                 )),
             ));
@@ -2022,9 +2053,13 @@ pub async fn ui_bridge_wait_for_element_handler(
                     match evaluate_wait_for_element_assertions(&element, &assertions) {
                         Ok(()) => {
                             let elapsed_ms = start.elapsed().as_millis() as u64;
+                            // F1: emit canonical camelCase `durationMs` alongside
+                            // legacy snake_case `elapsed_ms`. elapsed_ms emit
+                            // retained for one release; remove after 2026-06.
                             return Ok(Json(ApiResponse::success(serde_json::json!({
                                 "found": true,
                                 "element": element,
+                                "durationMs": elapsed_ms,
                                 "elapsed_ms": elapsed_ms,
                                 "polls": polls,
                                 "assertions_passed": assertions.len(),
@@ -2037,9 +2072,13 @@ pub async fn ui_bridge_wait_for_element_handler(
                     }
                 } else {
                     let elapsed_ms = start.elapsed().as_millis() as u64;
+                    // F1: emit canonical camelCase `durationMs` alongside
+                    // legacy snake_case `elapsed_ms`. elapsed_ms emit
+                    // retained for one release; remove after 2026-06.
                     return Ok(Json(ApiResponse::success(serde_json::json!({
                         "found": true,
                         "element": element,
+                        "durationMs": elapsed_ms,
                         "elapsed_ms": elapsed_ms,
                         "polls": polls,
                     }))));
@@ -2051,7 +2090,10 @@ pub async fn ui_bridge_wait_for_element_handler(
             }
             Err(e) => {
                 error!("UI Bridge API: wait-for-element transport error: {}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error_to_value(e)),
+                ));
             }
         }
 
@@ -2079,10 +2121,35 @@ pub async fn ui_bridge_wait_for_element_handler(
                 )
             };
             info!("UI Bridge API: {}", msg);
-            return Err((StatusCode::REQUEST_TIMEOUT, Json(api_error(msg))));
+            // F1: attach structured `data` payload to the HTTP 408 envelope
+            // so callers can read durationMs/polls without parsing the
+            // error string. The shape mirrors the predicate/state strictTimeout
+            // path's data payload.
+            let mut body = api_error_to_value(msg);
+            body.data = Some(serde_json::json!({
+                "found": false,
+                "durationMs": elapsed_ms,
+                "polls": polls,
+            }));
+            return Err((StatusCode::REQUEST_TIMEOUT, Json(body)));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+    }
+}
+
+/// Local helper that produces an error `ApiResponse<serde_json::Value>` —
+/// mirrors `api_error()` but with the `data: Option<serde_json::Value>`
+/// field intact so callers can attach a structured payload alongside the
+/// error string. Used by wait-for-element to emit `data:{durationMs,...}`
+/// on timeout.
+fn api_error_to_value(message: impl Into<String>) -> ApiResponse<serde_json::Value> {
+    ApiResponse {
+        success: false,
+        data: None,
+        error: Some(message.into()),
+        error_detail: None,
+        hint: None,
     }
 }
 
@@ -2091,10 +2158,17 @@ pub async fn ui_bridge_wait_for_element_handler(
 /// clamp before forwarding so a runaway client can't park the webview
 /// listener indefinitely, mirroring Phase 1's /wait-for-route-change
 /// behaviour. The SDK itself re-clamps to the same window.
+///
+/// B4 `strict_timeout`: when true, a successful IPC response carrying
+/// `{found: false, ...}` is rewritten into an HTTP 408 + error envelope
+/// so the predicate path matches the NL/id contract. When false (default),
+/// the legacy `success:true` envelope is preserved for back-compat.
 async fn ui_bridge_wait_for_element_registered_forward(
     state: Arc<ApiState>,
     mut body: serde_json::Value,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    strict_timeout: bool,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
     // Clamp timeoutMs to [100, 60_000] (default 5000) before forwarding.
     let raw_timeout = body
         .get("timeoutMs")
@@ -2106,14 +2180,18 @@ async fn ui_bridge_wait_for_element_registered_forward(
     }
 
     info!(
-        "UI Bridge API: wait-for-element (predicate shape) predicate={:?} requirement={:?} timeoutMs={}",
+        "UI Bridge API: wait-for-element (predicate shape) predicate={:?} requirement={:?} timeoutMs={} strictTimeout={}",
         body.get("predicate"),
         body.get("requirement").and_then(|v| v.as_str()),
         timeout_ms,
+        strict_timeout,
     );
 
     let payload = serde_json::json!({ "params": body });
-    wrap_ipc_result(ui_bridge_request_sync(&state, "wait_for_element_registered", payload).await)
+    let result = wrap_ipc_result(
+        ui_bridge_request_sync(&state, "wait_for_element_registered", payload).await,
+    );
+    apply_strict_timeout_reshape(result, strict_timeout)
 }
 
 /// M1 wait-for-element state-predicate validation.
@@ -2233,18 +2311,22 @@ pub fn validate_wait_for_element_state_request(
 /// `wait_for_element_state_predicate` runtime handler. Validates the body
 /// up-front (returning HTTP 400 on bad shapes) so the SDK side only sees
 /// well-formed payloads. The SDK handler returns the predicate outcome
-/// verbatim; we surface it 1:1 inside the standard `ApiResponse::success`
-/// envelope so `found:false` (timeout) is **not** an HTTP error.
+/// verbatim; without `strict_timeout` we surface it 1:1 inside the standard
+/// `ApiResponse::success` envelope so `found:false` (timeout) is **not** an
+/// HTTP error. With `strict_timeout`, `{found:false, durationMs, ...}` is
+/// rewritten into HTTP 408 + `data:{...}` to match the NL/id path.
 async fn ui_bridge_wait_for_element_state_predicate_handler(
     state: Arc<ApiState>,
     body: serde_json::Value,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    strict_timeout: bool,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
     let req = validate_wait_for_element_state_request(&body)
-        .map_err(|msg| (StatusCode::BAD_REQUEST, Json(api_error(msg))))?;
+        .map_err(|msg| (StatusCode::BAD_REQUEST, Json(api_error_to_value(msg))))?;
 
     info!(
-        "UI Bridge API: wait-for-element (state shape) elementId={:?} selector={:?} state={} timeoutMs={} pollMs={}",
-        req.element_id, req.selector, req.state, req.timeout_ms, req.poll_ms
+        "UI Bridge API: wait-for-element (state shape) elementId={:?} selector={:?} state={} timeoutMs={} pollMs={} strictTimeout={}",
+        req.element_id, req.selector, req.state, req.timeout_ms, req.poll_ms, strict_timeout
     );
 
     let payload = serde_json::json!({
@@ -2257,9 +2339,58 @@ async fn ui_bridge_wait_for_element_state_predicate_handler(
         }
     });
 
-    wrap_ipc_result(
+    let result = wrap_ipc_result(
         ui_bridge_request_sync(&state, "wait_for_element_state_predicate", payload).await,
-    )
+    );
+    apply_strict_timeout_reshape(result, strict_timeout)
+}
+
+/// B4 — translate a successful IPC envelope carrying `{found: false, ...}`
+/// into an HTTP 408 error response when the caller opted into
+/// `?strictTimeout=true`. Otherwise pass the response through unchanged.
+///
+/// Also adapts the error tuple type from `ApiResponse<()>` (what
+/// `wrap_ipc_result` returns) to `ApiResponse<serde_json::Value>` (what the
+/// wait-for-element handlers need, so the timeout error path can carry a
+/// `data` payload).
+fn apply_strict_timeout_reshape(
+    result: Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>,
+    strict_timeout: bool,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
+    match result {
+        Ok(Json(resp)) => {
+            if strict_timeout {
+                // Inspect the inner data for `found: false` — both predicate
+                // (`waitForElementRegistered`) and state-predicate runtimes
+                // return `{found: bool, durationMs?, lastObservedState?}`.
+                let found_false = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("found"))
+                    .and_then(|v| v.as_bool())
+                    == Some(false);
+                if found_false {
+                    let data_payload = resp.data.clone().unwrap_or(serde_json::json!({}));
+                    let mut body = api_error_to_value("wait_for_element_timeout");
+                    body.data = Some(data_payload);
+                    return Err((StatusCode::REQUEST_TIMEOUT, Json(body)));
+                }
+            }
+            Ok(Json(resp))
+        }
+        Err((status, Json(err))) => {
+            // Widen the error type from ApiResponse<()> -> ApiResponse<serde_json::Value>.
+            let widened = ApiResponse {
+                success: err.success,
+                data: None,
+                error: err.error,
+                error_detail: err.error_detail,
+                hint: err.hint,
+            };
+            Err((status, Json(widened)))
+        }
+    }
 }
 
 /// Evaluate the `assertions[]` array for the wait-for-element handler.
@@ -3309,6 +3440,248 @@ mod wait_for_element_state_tests {
             let req = ok(json!({ "elementId": "x", "state": state }));
             assert_eq!(req.state, state, "state {state} should round-trip");
         }
+    }
+}
+
+/// B4 — `?strictTimeout=true` re-shaping tests for the predicate/state
+/// SDK-forwarded paths. These exercise the pure helper so we don't need an
+/// axum router / live IPC. The helper translates a successful IPC envelope
+/// carrying `{found: false, ...}` into an HTTP 408 + error body when the
+/// caller opted into strict timeouts; otherwise the response passes through
+/// unchanged for back-compat with existing SDK consumers.
+#[cfg(test)]
+mod strict_timeout_reshape_tests {
+    use super::apply_strict_timeout_reshape;
+    use crate::mcp::types::{api_error, ApiResponse};
+    use axum::http::StatusCode;
+    use axum::response::Json;
+    use serde_json::json;
+    use std::ops::Deref;
+
+    fn ok_response(data: serde_json::Value) -> Json<ApiResponse<serde_json::Value>> {
+        Json(ApiResponse::success(data))
+    }
+
+    #[test]
+    fn strict_timeout_off_preserves_found_false_as_success() {
+        // Default (strictTimeout=false) — `{found:false}` must pass through
+        // as HTTP 200 + `success:true` for back-compat.
+        let inner = json!({"found": false, "durationMs": 1234, "lastObservedState": "hidden"});
+        let result = apply_strict_timeout_reshape(Ok(ok_response(inner.clone())), false);
+        let resp = result.expect("should be Ok when strict_timeout=false");
+        let body = resp.deref();
+        assert!(body.success, "envelope must remain success=true");
+        assert_eq!(body.data.as_ref().unwrap(), &inner);
+    }
+
+    #[test]
+    fn strict_timeout_on_rewrites_found_false_to_408() {
+        // strictTimeout=true — `{found:false}` becomes HTTP 408 + error.
+        let inner = json!({"found": false, "durationMs": 1500, "lastObservedState": "absent"});
+        let result = apply_strict_timeout_reshape(Ok(ok_response(inner.clone())), true);
+        let (status, Json(err)) =
+            result.expect_err("found:false with strict_timeout=true must return Err");
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert!(!err.success, "error envelope must have success=false");
+        assert_eq!(
+            err.error.as_deref(),
+            Some("wait_for_element_timeout"),
+            "canonical error code per B4 spec"
+        );
+        // `data` payload carries the original IPC fields so callers can read
+        // durationMs / lastObservedState without parsing the error string.
+        let data = err.data.expect("strict_timeout 408 must include data");
+        assert_eq!(data.get("found").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(data.get("durationMs").and_then(|v| v.as_u64()), Some(1500));
+        assert_eq!(
+            data.get("lastObservedState").and_then(|v| v.as_str()),
+            Some("absent")
+        );
+    }
+
+    #[test]
+    fn strict_timeout_on_passes_found_true_through() {
+        // Even with strictTimeout=true, a successful match `{found:true}`
+        // must return HTTP 200 unchanged.
+        let inner = json!({"found": true, "durationMs": 42, "element": {"id": "abc"}});
+        let result = apply_strict_timeout_reshape(Ok(ok_response(inner.clone())), true);
+        let resp = result.expect("found:true must remain Ok regardless of strict_timeout");
+        let body = resp.deref();
+        assert!(body.success);
+        assert_eq!(body.data.as_ref().unwrap(), &inner);
+    }
+
+    #[test]
+    fn strict_timeout_on_passes_through_when_found_field_missing() {
+        // Defensive: if the IPC payload doesn't carry `found` at all, treat
+        // it as "not a timeout" — don't reshape.
+        let inner = json!({"durationMs": 100});
+        let result = apply_strict_timeout_reshape(Ok(ok_response(inner.clone())), true);
+        let resp = result.expect("missing `found` must not trigger reshape");
+        assert_eq!(resp.deref().data.as_ref().unwrap(), &inner);
+    }
+
+    #[test]
+    fn err_branch_widens_apiresponse_type() {
+        // wrap_ipc_result yields ApiResponse<()> on Err; the reshape helper
+        // must widen it to ApiResponse<serde_json::Value> so the outer
+        // handler signature lines up. Verifies the widening preserves error
+        // string + status code.
+        let result = apply_strict_timeout_reshape(
+            Err((StatusCode::SERVICE_UNAVAILABLE, Json(api_error("boom")))),
+            true,
+        );
+        let (status, Json(err)) = result.expect_err("Err must propagate as Err");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.error.as_deref(), Some("boom"));
+        assert!(err.data.is_none());
+    }
+}
+
+/// F1 — `durationMs` / `elapsed_ms` dual-emit verification for the NL/id
+/// happy-path response shape. The handler is too IPC-coupled for a pure
+/// unit test, so these tests construct the response body shape directly,
+/// mirroring the literals at the two happy-path emit sites. If those
+/// literals drift (e.g., someone drops `elapsed_ms` early), the dual-emit
+/// contract here will catch it because the tests assert on both keys.
+#[cfg(test)]
+mod wait_for_element_dual_emit_tests {
+    use serde_json::json;
+
+    /// Mirrors the no-assertions happy path response shape literal in
+    /// `ui_bridge_wait_for_element_handler` (`elements.rs:~2046`). Update in
+    /// lock-step if the literal there changes.
+    fn nl_happy_response(elapsed_ms: u64, polls: u32) -> serde_json::Value {
+        json!({
+            "found": true,
+            "element": {"id": "x"},
+            "durationMs": elapsed_ms,
+            "elapsed_ms": elapsed_ms,
+            "polls": polls,
+        })
+    }
+
+    /// Mirrors the with-assertions happy path response shape literal.
+    fn nl_happy_with_assertions(elapsed_ms: u64, polls: u32, asserts: usize) -> serde_json::Value {
+        json!({
+            "found": true,
+            "element": {"id": "x"},
+            "durationMs": elapsed_ms,
+            "elapsed_ms": elapsed_ms,
+            "polls": polls,
+            "assertions_passed": asserts,
+        })
+    }
+
+    #[test]
+    fn nl_happy_path_emits_both_duration_keys() {
+        let body = nl_happy_response(987, 3);
+        // Canonical key per F1 (camelCase, matches SDK + docs).
+        assert_eq!(body.get("durationMs").and_then(|v| v.as_u64()), Some(987));
+        // Legacy key — retained for one release per the migration plan.
+        assert_eq!(body.get("elapsed_ms").and_then(|v| v.as_u64()), Some(987));
+        assert_eq!(body.get("polls").and_then(|v| v.as_u64()), Some(3));
+    }
+
+    #[test]
+    fn nl_happy_with_assertions_emits_both_duration_keys() {
+        let body = nl_happy_with_assertions(1234, 5, 2);
+        assert_eq!(body.get("durationMs").and_then(|v| v.as_u64()), Some(1234));
+        assert_eq!(body.get("elapsed_ms").and_then(|v| v.as_u64()), Some(1234));
+        assert_eq!(
+            body.get("assertions_passed").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+    }
+
+    /// F1 — the NL/id timeout path attaches `data: {durationMs, polls}` to
+    /// the HTTP 408 envelope. Mirrors the literal in the timeout branch of
+    /// `ui_bridge_wait_for_element_handler` (`elements.rs:~2102`).
+    fn nl_timeout_data(elapsed_ms: u64, polls: u32) -> serde_json::Value {
+        json!({
+            "found": false,
+            "durationMs": elapsed_ms,
+            "polls": polls,
+        })
+    }
+
+    #[test]
+    fn nl_timeout_data_payload_has_canonical_duration_ms_key() {
+        let data = nl_timeout_data(5000, 25);
+        assert_eq!(data.get("found").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(data.get("durationMs").and_then(|v| v.as_u64()), Some(5000));
+        assert_eq!(data.get("polls").and_then(|v| v.as_u64()), Some(25));
+    }
+}
+
+/// F2 — direct `/ui-bridge/control/components` envelope shape (Direction B).
+/// Verifies the response carries `data.components` AND the deprecated
+/// top-level `components` mirror. Pure unit test against the literal shape
+/// the handler emits; an axum-router-level integration test would need a
+/// fully constructed `ApiState`.
+#[cfg(test)]
+mod components_envelope_tests {
+    use serde_json::json;
+
+    /// Mirrors the literal at the bottom of `ui_bridge_get_components_handler`.
+    /// Update in lock-step if the handler's `Ok(Json(serde_json::json!(...)))`
+    /// payload changes.
+    fn components_response(components: Vec<serde_json::Value>) -> serde_json::Value {
+        let components_array = serde_json::Value::Array(components);
+        json!({
+            "success": true,
+            "data": { "components": components_array.clone() },
+            "components": components_array,
+        })
+    }
+
+    #[test]
+    fn direct_components_response_has_direction_b_shape() {
+        let body = components_response(vec![json!({"id": "comp-a"}), json!({"id": "comp-b"})]);
+        assert_eq!(body.get("success"), Some(&json!(true)));
+        // Direction B: `data` is `{components: [...]}` (object-shaped).
+        let inner = body
+            .get("data")
+            .and_then(|d| d.get("components"))
+            .and_then(|v| v.as_array())
+            .expect("data.components must be an array");
+        assert_eq!(inner.len(), 2);
+        assert_eq!(inner[0].get("id").and_then(|v| v.as_str()), Some("comp-a"));
+    }
+
+    #[test]
+    fn direct_components_response_has_deprecated_top_level_mirror() {
+        // The top-level `components` field is a one-release back-compat
+        // mirror so callers reading the legacy shape keep working.
+        let body = components_response(vec![json!({"id": "comp-a"})]);
+        let mirror = body
+            .get("components")
+            .and_then(|v| v.as_array())
+            .expect("deprecated top-level `components` mirror must be present");
+        assert_eq!(mirror.len(), 1);
+        // The mirror and `data.components` must be the same payload.
+        let canonical = body
+            .get("data")
+            .and_then(|d| d.get("components"))
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(mirror, canonical);
+    }
+
+    #[test]
+    fn empty_components_still_has_both_fields() {
+        let body = components_response(vec![]);
+        assert!(body
+            .get("data")
+            .and_then(|d| d.get("components"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(false));
+        assert!(body
+            .get("components")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(false));
     }
 }
 

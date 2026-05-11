@@ -65,6 +65,23 @@ pub struct AiFindRequest {
     pub include_hidden: Option<bool>,
 }
 
+/// Query-string params for `/ai/find` and `/control/ai/find`. The body
+/// continues to carry the query / context / minConfidence — this struct
+/// exists only to give the new `?strict=true` knob a typed home so axum
+/// can extract it via `Query<AiFindQuery>`. The body's `"strict": true`
+/// is honoured in parallel; either form works.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiFindQuery {
+    /// B2 — literal-match-only mode. When `true`, the SDK matcher
+    /// suppresses fuzzy candidates; returns `found: false` if no element
+    /// matches exactly. Default `false` keeps fuzzy behaviour PLUS
+    /// literal-match precedence (exact matches outrank fuzzy candidates
+    /// even when `strict` is omitted).
+    #[serde(default)]
+    pub strict: Option<bool>,
+}
+
 /// Natural language element find.
 ///
 /// Callers can pass `"minConfidence": 0.3` in the request body to override
@@ -75,8 +92,15 @@ pub struct AiFindRequest {
 /// filter. Default `true` matches the historical front-end behaviour and
 /// is what callers need when driving collapsed sidebars or tabs whose
 /// targets are off-screen but still in the registry.
+///
+/// B2 — `?strict=true` (query string) or `"strict": true` (body) enables
+/// literal-match-only mode. The SDK returns only candidates that have a
+/// case-insensitive exact match against id / labelText / ariaLabel /
+/// textContent / title / placeholder / value / name. No fuzzy fallback.
+/// If no element matches literally, the response is `found: false`.
 pub async fn ui_bridge_ai_find_handler(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<AiFindQuery>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: AI find");
@@ -90,12 +114,24 @@ pub async fn ui_bridge_ai_find_handler(
     let parsed: AiFindRequest = serde_json::from_value(body.clone()).unwrap_or_default();
     let include_hidden = parsed.include_hidden.unwrap_or(true);
 
+    // B2 — `strict` can arrive via two channels:
+    //   - query string: `?strict=true`
+    //   - JSON body:    `{"strict": true}`
+    // We OR them together so either form works, then normalise it into the
+    // forwarded params so the SDK handler always sees a concrete boolean.
+    let strict = query.strict.unwrap_or(false)
+        || body
+            .get("strict")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
     let mut forwarded_body = body.clone();
     if let Some(obj) = forwarded_body.as_object_mut() {
         obj.insert(
             "includeHidden".to_string(),
             serde_json::Value::Bool(include_hidden),
         );
+        obj.insert("strict".to_string(), serde_json::Value::Bool(strict));
     }
 
     let payload = serde_json::json!({ "params": forwarded_body });

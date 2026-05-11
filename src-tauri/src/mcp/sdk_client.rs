@@ -1285,6 +1285,10 @@ async fn handle_discover(
 }
 
 /// GET /ui-bridge/sdk/components — List components
+///
+/// F2 (Direction B): converges with the direct `/ui-bridge/control/components`
+/// route on `{success: true, data: {components: [...]}}`. Object-shaped
+/// `data` matches every other rich endpoint convention.
 async fn handle_components(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<HashMap<String, String>>,
@@ -1303,9 +1307,13 @@ async fn handle_components(
                 .unwrap_or(serde_json::json!([]));
             let mut response = serde_json::json!({
                 "success": true,
-                "data": components,
+                "data": { "components": components },
             });
-            if let Some(arr) = response.get("data").and_then(|d| d.as_array()) {
+            if let Some(arr) = response
+                .get("data")
+                .and_then(|d| d.get("components"))
+                .and_then(|c| c.as_array())
+            {
                 if arr.is_empty() {
                     if let Some(obj) = response.as_object_mut() {
                         obj.insert(
@@ -1330,11 +1338,37 @@ async fn handle_components(
         "/control/components".to_string()
     };
     match sdk_request(&state, Method::GET, &path, None).await {
-        Ok(mut data) => {
-            // Add helpful note if no components found
-            if let Some(arr) = data.get("data").and_then(|d| d.as_array()) {
+        Ok(data) => {
+            // The SDK app now returns Direction B shape:
+            // `{success: true, data: {components: [...]}}`. Older callers may
+            // still emit `{success: true, data: [array]}`. Normalize both to
+            // a plain array before re-wrapping so we don't double-nest as
+            // `data.components.components`.
+            let raw_data = data.get("data").cloned().unwrap_or(serde_json::json!([]));
+            let components_array = if let Some(arr) = raw_data.get("components").cloned() {
+                arr
+            } else if raw_data.is_array() {
+                raw_data
+            } else {
+                serde_json::json!([])
+            };
+            let mut response = serde_json::json!({
+                "success": data.get("success").cloned().unwrap_or(serde_json::Value::Bool(true)),
+                "data": { "components": components_array },
+            });
+            // Carry through any sibling fields (errors, timestamps, etc.).
+            if let Some(err) = data.get("error").cloned() {
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert("error".to_string(), err);
+                }
+            }
+            if let Some(arr) = response
+                .get("data")
+                .and_then(|d| d.get("components"))
+                .and_then(|c| c.as_array())
+            {
                 if arr.is_empty() {
-                    if let Some(obj) = data.as_object_mut() {
+                    if let Some(obj) = response.as_object_mut() {
                         obj.insert(
                             "note".to_string(),
                             serde_json::json!("No registered components found. Ensure the UI Bridge SDK provider is mounted and components are registered with useUIBridge or equivalent."),
@@ -1342,12 +1376,26 @@ async fn handle_components(
                     }
                 }
             }
-            Json(data)
+            Json(response)
         }
         Err(_) => {
-            // Fall back to IPC
+            // Fall back to IPC. The frontend `get_components` handler returns
+            // `{components: [...], count: N}` (object) rather than a bare
+            // array — unwrap so we don't double-nest as `data.components.components`.
             match ui_bridge_request_sync(&state, "get_components", serde_json::json!({})).await {
-                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Ok(data) => {
+                    let components_array = if let Some(arr) = data.get("components").cloned() {
+                        arr
+                    } else if data.is_array() {
+                        data
+                    } else {
+                        serde_json::json!([])
+                    };
+                    Json(serde_json::json!({
+                        "success": true,
+                        "data": { "components": components_array },
+                    }))
+                }
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
             }
         }

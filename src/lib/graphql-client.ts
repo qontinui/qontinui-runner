@@ -90,10 +90,10 @@ export function getGraphQLClient(): ApolloClient {
     },
     on: {
       connected: () => {
-        console.warn("[GraphQL WS] Connected");
+        console.info("[GraphQL WS] Connected");
       },
       closed: () => {
-        console.warn("[GraphQL WS] Closed");
+        console.info("[GraphQL WS] Closed");
       },
       error: (err) => {
         console.warn("[GraphQL WS] Error:", err);

@@ -134,12 +134,13 @@ pub struct ConsoleErrorsQuery {
     group_by: Option<String>,
     /// Comma-separated allow-list of console levels to keep. Accepts
     /// `error`, `warn`, `unhandledrejection`, `info`, `log`, `debug`,
-    /// or `all` / `*` (which disables filtering, same as omitting).
-    /// Default unset behaviour is unchanged: every captured entry is
-    /// returned. Item 3 of manual-test-remediation-2026-05-10 — the
-    /// endpoint name implies error-level only but the SDK captures
-    /// `console.warn` too, including info-level startup logs that
-    /// devs accidentally route through `console.warn`.
+    /// or `all` / `*` (which disables filtering).
+    /// Default unset behaviour: error-level entries only (`error` +
+    /// `unhandledrejection`). Pass `?level=all` or `?level=*` to
+    /// disable filtering. Item 3 of manual-test-remediation-2026-05-10
+    /// — the endpoint name implies error-level only but the SDK
+    /// captures `console.warn` too, including info-level startup logs
+    /// that devs accidentally route through `console.warn`.
     #[serde(default)]
     level: Option<String>,
 }
@@ -205,8 +206,18 @@ pub async fn ui_bridge_get_console_errors_handler(
 
     // Parse `?level=` before doing any IPC work so an invalid value short-
     // circuits to HTTP 400 without burning a frontend round-trip.
+    //
+    // Default (no `?level=` query) keeps only error-class entries so the
+    // endpoint name matches its semantics — the SDK's ConsoleCapture also
+    // collects `console.warn`/`console.info` which leaked through before
+    // (Phase B3 of plans/ui-bridge-quality-2026-05-10.md). Callers that
+    // want the legacy unfiltered behaviour can pass `?level=all` or
+    // `?level=*` and `parse_level_filter` returns `Ok(None)` for both.
     let level_filter = match query.level.as_deref() {
-        None => None,
+        None => Some(HashSet::from([
+            "error".to_string(),
+            "unhandledrejection".to_string(),
+        ])),
         Some(raw) => match parse_level_filter(raw) {
             Ok(parsed) => parsed,
             Err(unknown) => {
@@ -609,6 +620,49 @@ mod console_level_filter_tests {
         let levels: HashSet<String> = ["error".to_string()].into_iter().collect();
         apply_level_filter(&mut data, &levels);
         assert_eq!(data["note"].as_str(), Some("BrowserCapture not installed"));
+    }
+
+    #[test]
+    fn default_filter_keeps_only_error_class_entries() {
+        // Phase B3: the handler now defaults to `{error,
+        // unhandledrejection}` when no `?level=` is set. This mirrors
+        // what the handler installs into `level_filter` when
+        // `query.level` is `None`, so a regression in the producer-side
+        // default (or in the filter helper) is caught here.
+        let mut data = synthetic_ring();
+        let levels: HashSet<String> = ["error".to_string(), "unhandledrejection".to_string()]
+            .into_iter()
+            .collect();
+        apply_level_filter(&mut data, &levels);
+
+        let errors = data["errors"].as_array().expect("errors is array");
+        assert_eq!(
+            errors.len(),
+            3,
+            "two error entries + one unhandledrejection should remain; \
+             warn-level startup logs should be dropped"
+        );
+        for entry in errors {
+            let level = entry["level"].as_str().expect("level present");
+            assert!(
+                level == "error" || level == "unhandledrejection",
+                "default filter let through unexpected level {level}"
+            );
+        }
+        // Verify the specific startup messages from the manual test no
+        // longer survive the default filter.
+        assert!(
+            errors
+                .iter()
+                .all(|e| e["message"].as_str() != Some("[GraphQL WS] Connected")),
+            "GraphQL WS connected log must be dropped by default"
+        );
+        assert!(
+            errors
+                .iter()
+                .all(|e| e["message"].as_str() != Some("[BackgroundObserverService] Started")),
+            "BackgroundObserverService started log must be dropped by default"
+        );
     }
 
     #[test]
