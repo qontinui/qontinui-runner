@@ -1682,6 +1682,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         builder = builder.data_directory(dir.clone());
                     }
 
+                    // Inject the intended API port as a global so the frontend's
+                    // synchronous port-resolution fast-path (`window.__QONTINUI_PORT__`,
+                    // used by useFileLockTracking / useRegistryAwareness /
+                    // useMidSessionProbe / LaunchMenu / useSessionManager / etc.)
+                    // resolves to the *actual* runner port on temp/secondary instances
+                    // instead of silently falling through to the hardcoded 9876.
+                    // Without this, hooks on a temp runner route their reads at the
+                    // primary. The async `get_api_port` IPC + `setApiPort` path
+                    // remains the source of truth if the bound port differs from the
+                    // intended one (port-fallback rare case).
+                    let intended_api_port = crate::mcp::types::get_mcp_api_port();
+                    builder = builder.initialization_script(format!(
+                        "window.__QONTINUI_PORT__ = {};",
+                        intended_api_port
+                    ));
+
                     builder = placement.configure_builder(builder);
 
                     match builder.build() {
