@@ -165,6 +165,16 @@ jobs:
       - name: Run Rust tests
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
+        #
+        # Step has a hard 75-minute timeout. Ubuntu finishes ~43 min and
+        # Windows ~77 min on this step alone (single-threaded compile at
+        # JOBS=1 + test execution). macOS at JOBS=1 should land between
+        # the two given the M1's raw single-thread speed but with the
+        # 7GB-RAM swap-pressure penalty. 75 min covers worst case; without
+        # the cap, macOS swap-thrash hangs ran for 80+ min before admin-
+        # cancel (PR #84 was the most recent). Fail fast is better than
+        # burning runner minutes.
+        timeout-minutes: 75
         env:
           # `CARGO_BUILD_JOBS` reduces the parallel-rustc memory peak.
           # Empirically:
@@ -179,8 +189,20 @@ jobs:
           #   - Ubuntu OOM-killer is harsher: even with a 12 GB swapfile,
           #     JOBS=2 still trips the runner-agent shutdown. Drop Ubuntu
           #     to JOBS=1 for a single-threaded compile.
-          #   - macOS is on a fatter runner and stays at default 4.
-          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'macos-latest' && 4) || 1 }}
+          #   - macOS: GitHub-hosted M1/aarch64 runners ship with only
+          #     7 GB RAM (confirmed via `sysctl hw.memsize` in the
+          #     pre-test diagnostic) — NOT 16 GB like ubuntu/windows.
+          #     The older "fatter runner" comment was wrong. With
+          #     JOBS=4 the peak from two parallel large-crate rustc
+          #     invocations (qontinui_runner_lib + wrappers_mcp)
+          #     exceeds RAM and macOS swap-thrashes indefinitely (no
+          #     OOM-killer like Linux). PR #84's macOS leg hung 80+
+          #     min mid-compile before admin-cancel. PR #86 first
+          #     tried JOBS=2 — also still swap-pressured, hit the 45-
+          #     min timeout. JOBS=1 matches ubuntu/windows: one rustc
+          #     at a time, ~no swap pressure, slower wall-clock but
+          #     deterministic.
+          CARGO_BUILD_JOBS: 1
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             echo "=== free / df before cargo test ==="
@@ -189,6 +211,11 @@ jobs:
           elif [ "$RUNNER_OS" = "Windows" ]; then
             echo "=== Windows memory state before cargo test ==="
             powershell -NoProfile -Command "Get-CimInstance Win32_PageFileUsage | Format-List *; Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory | Format-List"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            echo "=== macOS memory state before cargo test ==="
+            sysctl -n hw.memsize | awk '{print "physical RAM:", $1/1024/1024/1024, "GB"}'
+            vm_stat
+            df -h
           fi
           cd src-tauri
           cargo test --verbose
