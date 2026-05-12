@@ -32,11 +32,13 @@ import { useEffect, useState } from "react";
 import { Hourglass } from "lucide-react";
 import { getApiPort } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
+import { REQUEST_YIELD_COOLDOWN_MS } from "@/lib/lock-yield";
 
 const logger = createLogger("WaitingLockBanner");
 
-/** 30-second cooldown after Request-yield click (Phase 3 spec). */
-export const REQUEST_YIELD_COOLDOWN_MS = 30_000;
+// Re-exported for backwards compatibility with consumers that imported
+// it from this file (test tripwires + downstream usage).
+export { REQUEST_YIELD_COOLDOWN_MS };
 
 // ── Pure helpers (exported for tests) ────────────────────────────────────────
 
