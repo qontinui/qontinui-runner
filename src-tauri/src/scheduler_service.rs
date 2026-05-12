@@ -2323,8 +2323,24 @@ mod tests {
     // ========================================================================
 
     /// Serialize env-mutating tests. `Mutex<()>` is fine — we only need
-    /// mutual exclusion, not data sharing.
+    /// mutual exclusion, not data sharing. `unwrap_or_else(into_inner)`
+    /// recovers from poison so a panicking test doesn't cascade-fail the
+    /// rest of the module.
     static REMOTE_AGENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: removes `QONTINUI_PORT` on drop, including the panic
+    /// path. Without this, each test would leak its mock's (now-closed)
+    /// random port into the process env, and any later test in this
+    /// binary that reads `QONTINUI_PORT` (via `launch_env::RunnerLaunchEnv::read`,
+    /// `mcp::types::get_mcp_api_port`, etc.) would see a dead port. The
+    /// `REMOTE_AGENT_TEST_LOCK` above gives intra-test serialization;
+    /// this guard gives inter-test cleanup.
+    struct QontinuiPortGuard;
+    impl Drop for QontinuiPortGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("QONTINUI_PORT");
+        }
+    }
 
     /// Spin up a tiny axum mock on a random localhost port that captures
     /// the most recent `/prompts/run` body and replies with `response`.
@@ -2383,7 +2399,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_launch_remote_agent_posts_full_body_when_all_fields_set() {
-        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+        let _lock = REMOTE_AGENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = QontinuiPortGuard;
 
         let (port, captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
             "session_id": "sid-123"
@@ -2426,7 +2445,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_launch_remote_agent_omits_optional_fields_when_none() {
-        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+        let _lock = REMOTE_AGENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = QontinuiPortGuard;
 
         let (port, captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
             "session_id": "sid-456"
@@ -2458,7 +2480,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_launch_remote_agent_extracts_session_id_from_data_envelope() {
-        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+        let _lock = REMOTE_AGENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = QontinuiPortGuard;
 
         // /prompts/run wraps successful responses in
         // `{ "success": true, "data": { ... } }`.
@@ -2479,7 +2504,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_launch_remote_agent_500_returns_err() {
-        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+        let _lock = REMOTE_AGENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = QontinuiPortGuard;
 
         let err_resp = axum::response::Response::builder()
             .status(500)
@@ -2506,7 +2534,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_launch_remote_agent_missing_session_id_returns_err() {
-        let _guard = REMOTE_AGENT_TEST_LOCK.lock().unwrap();
+        let _lock = REMOTE_AGENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = QontinuiPortGuard;
 
         // 200 OK but no session_id anywhere.
         let (port, _captured) = spawn_prompts_run_mock(ok_response(serde_json::json!({
