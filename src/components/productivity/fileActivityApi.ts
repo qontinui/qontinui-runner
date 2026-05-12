@@ -19,6 +19,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { resolvePort } from "@/lib/runner-api";
 
 /** Live entry from the in-process `FileRegistryManager.info()` snapshot. */
 export interface FileRegistryInfoEntry {
@@ -122,22 +123,12 @@ export function storeWindowSecs(secs: number): void {
   }
 }
 
-/** Resolve the runner MCP API base URL the same way `useFileLockTracking`
- *  does. The runner injects `__QONTINUI_PORT__` on its window object at
- *  boot; we fall back to the canonical 9876 port when missing. */
-function apiBaseUrl(): string {
-  if (typeof window === "undefined") return "http://127.0.0.1:9876";
-  const port = (window as unknown as Record<string, unknown>).__QONTINUI_PORT__;
-  const parsed = typeof port === "number" ? port : Number.parseInt(String(port ?? ""), 10);
-  return `http://127.0.0.1:${Number.isFinite(parsed) && parsed > 0 ? parsed : 9876}`;
-}
-
 export async function fetchHeatmap(
   windowSecs: number,
   limit = 25,
   signal?: AbortSignal,
 ): Promise<HeatmapResponse> {
-  const url = `${apiBaseUrl()}/file-activity/heatmap?window_secs=${windowSecs}&limit=${limit}`;
+  const url = `http://127.0.0.1:${resolvePort()}/file-activity/heatmap?window_secs=${windowSecs}&limit=${limit}`;
   const resp = await fetch(url, { signal });
   if (!resp.ok) {
     throw new Error(`heatmap fetch failed: HTTP ${resp.status}`);

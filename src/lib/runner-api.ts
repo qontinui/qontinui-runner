@@ -46,6 +46,30 @@ export function getWsBase(): string {
 }
 
 /**
+ * Resolve the runner HTTP port for local-control-surface traffic
+ * (`/file-registry/...`, `/file-locks/...`, `/file-activity/...`, etc.).
+ *
+ * Resolution order:
+ *   1. `window.__QONTINUI_PORT__` if explicitly set — manual-test override
+ *      and the fast-path the runner now injects at webview boot (PR #90,
+ *      `WebviewWindowBuilder::initialization_script`). On temp/secondary
+ *      runners this resolves to the correct port before any page JS runs.
+ *   2. `getApiPort()` — the async-populated centralized port from
+ *      `useApiReady` via Tauri's `api-ready` event and the `get_api_port`
+ *      IPC. Remains the source of truth if the bound port ever differs
+ *      from the intended one (port-fallback rare case).
+ *
+ * The hardcoded `9876` fallback lives inside `getApiPort()`'s default
+ * state so it's a single source of truth for the entire frontend.
+ */
+export function resolvePort(): number {
+  if (typeof window === "undefined") return getApiPort();
+  const fromGlobal = (window as unknown as Record<string, unknown>).__QONTINUI_PORT__;
+  if (fromGlobal) return Number(fromGlobal);
+  return getApiPort();
+}
+
+/**
  * React hook that returns the current API base URL and re-renders the
  * component whenever `setApiPort` runs. Use this in components whose props
  * (e.g. a polling URL passed to a hook) must track the resolved port —

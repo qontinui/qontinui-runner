@@ -12,7 +12,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
-import { resolvePort } from "./LaunchMenu";
+import { resolvePort } from "@/lib/runner-api";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState } from "./useZoneLayout";

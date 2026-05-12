@@ -14,7 +14,7 @@
 
 import { useEffect, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { resolvePort } from "./LaunchMenu";
+import { resolvePort } from "@/lib/runner-api";
 
 /** Verdict tag emitted by `/auto-review`. Mirrors the wire format from
  *  `pg::reviews::ReviewRow`. */
