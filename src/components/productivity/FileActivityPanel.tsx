@@ -42,17 +42,15 @@ import {
   type HotSessionRow,
 } from "./fileActivityApi";
 
+import { REQUEST_YIELD_COOLDOWN_MS } from "@/lib/lock-yield";
+
 const logger = createLogger("FileActivityPanel");
 
-/**
- * Lock-Yield cooldown — duplicate of `WaitingLockBanner.REQUEST_YIELD_COOLDOWN_MS`
- * (Phase 3). Kept local rather than imported across the productivity ↔ terminal
- * folder boundary; the two surfaces use the same UX so a future plan should
- * dedupe by hoisting both into a shared `lockYield` module.
- *
- * TODO(lock-yield): dedupe with WaitingLockBanner's constant.
- */
-export const REQUEST_YIELD_COOLDOWN_MS = 30_000;
+// Canonical home for the cooldown lives at `@/lib/lock-yield` — both this
+// dashboard surface and the per-tab WaitingLockBanner consume the same
+// constant. Re-exported for backwards compatibility with the tripwire
+// test in this file's sibling `.test.tsx`.
+export { REQUEST_YIELD_COOLDOWN_MS };
 
 /** Cooldown map key: `${file_path}::${holder_task_run_id}` — per the plan's
  *  Phase 4 spec, the cooldown is per-(file,holder) pair so clicking yield

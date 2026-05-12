@@ -153,7 +153,7 @@ export async function fetchHeatmap(
 export async function fetchLockInfo(
   signal?: AbortSignal,
 ): Promise<FileLockInfoEntry[]> {
-  const url = `${apiBaseUrl()}/file-locks/info`;
+  const url = `http://127.0.0.1:${resolvePort()}/file-locks/info`;
   const resp = await fetch(url, { signal });
   if (!resp.ok) {
     throw new Error(`lock info fetch failed: HTTP ${resp.status}`);
