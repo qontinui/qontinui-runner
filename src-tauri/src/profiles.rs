@@ -270,17 +270,32 @@ mod tests {
         assert_eq!(dev.auth.as_ref().unwrap().kind, "static-dev-token");
     }
 
+    /// RAII guard that restores `RUNNER_DATABASE_URL` to its pre-test
+    /// value on drop, including the panic path. Without this, a panic
+    /// in the test body between `remove_var` and the manual restore
+    /// would leak the unset state to any sibling test (current or
+    /// future) that reads the var.
+    struct DbUrlRestore {
+        prev: Option<String>,
+    }
+    impl Drop for DbUrlRestore {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("RUNNER_DATABASE_URL", v),
+                None => std::env::remove_var("RUNNER_DATABASE_URL"),
+            }
+        }
+    }
+
     #[test]
     fn legacy_fallback_uses_env_or_localhost_default() {
-        // SAFETY of env mutation in tests: we read-and-restore. Single-thread
-        // test runs avoid cross-test interference.
-        let prior = std::env::var("RUNNER_DATABASE_URL").ok();
+        let _restore = DbUrlRestore {
+            prev: std::env::var("RUNNER_DATABASE_URL").ok(),
+        };
         std::env::remove_var("RUNNER_DATABASE_URL");
         let p = legacy_env_fallback();
         assert_eq!(p.source, "legacy-env");
         assert!(p.database_url.contains("qontinui_user"));
-        if let Some(prev) = prior {
-            std::env::set_var("RUNNER_DATABASE_URL", prev);
-        }
+        // `_restore` drops here, including the panic path above.
     }
 }
