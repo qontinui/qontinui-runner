@@ -30,6 +30,25 @@ export interface FileRegistryInfoEntry {
   registered_at: number;
 }
 
+/**
+ * Live entry from the in-process `FileLockManager::info()` snapshot — the
+ * shape returned by `GET /file-locks/info` (see Rust `FileLockInfo` at
+ * `src-tauri/src/executor/file_registry.rs:642+`).
+ *
+ * The registry (`FileRegistryInfoEntry`) tracks ALL files a session has
+ * touched; the lock manager tracks the strict subset that are also held
+ * as exclusive locks. The Lock-Yield Protocol Phase 4 surface joins the
+ * two by `(holder_task_run_id, file_path)` so the "Request yield" action
+ * only renders for rows that actually have a lock to yield.
+ */
+export interface FileLockInfoEntry {
+  file_path: string;
+  holder_task_run_id: string;
+  holder_name: string;
+  /** seconds since unix epoch (Rust `u64` from `SystemTime::UNIX_EPOCH`). */
+  acquired_at: number;
+}
+
 /** One row of the windowed hot-files aggregate (PG-side). */
 export interface HotFileRow {
   file_path: string;
@@ -126,8 +145,44 @@ export async function fetchHeatmap(
   return (await resp.json()) as HeatmapResponse;
 }
 
+/**
+ * Fetch the live snapshot of currently-held exclusive file locks.
+ *
+ * Used by the Lock-Yield Protocol Phase 4 surface to decide which
+ * registry rows in `FileActivityPanel`'s Live snapshot section should
+ * show the "Request yield" action: only rows whose
+ * `(holder_task_run_id, file_path)` pair is present in this response
+ * are actually held as locks (registry membership alone does not imply
+ * lock ownership).
+ *
+ * Mirror of {@link fetchHeatmap}'s shape — error handling, abort signal,
+ * port resolution. Errors are surfaced to the caller (the hook degrades
+ * to "show no yield buttons" rather than failing the whole panel).
+ */
+export async function fetchLockInfo(
+  signal?: AbortSignal,
+): Promise<FileLockInfoEntry[]> {
+  const url = `${apiBaseUrl()}/file-locks/info`;
+  const resp = await fetch(url, { signal });
+  if (!resp.ok) {
+    throw new Error(`lock info fetch failed: HTTP ${resp.status}`);
+  }
+  return (await resp.json()) as FileLockInfoEntry[];
+}
+
 export interface UseFileActivityResult {
   data: HeatmapResponse | null;
+  /** Companion snapshot of currently-held exclusive locks, fetched on
+   *  the same poll cadence as `data`. The Lock-Yield Protocol Phase 4
+   *  UI joins this with `data.live` by `(holder_task_run_id, file_path)`
+   *  to decide which rows render the "Request yield" action.
+   *
+   *  Null until the first successful fetch; falls back to the previous
+   *  value on transient errors (same pattern as `data`). The lock-info
+   *  fetcher failing does NOT flip the heatmap `isStale` flag — lock
+   *  state is auxiliary, and we'd rather show stale locks (or no yield
+   *  buttons) than spuriously age the whole panel. */
+  lockInfo: FileLockInfoEntry[] | null;
   error: string | null;
   /** True when the latest fetch failed OR took longer than the slow
    *  threshold. Cleared by the next successful fast fetch. */
@@ -158,6 +213,7 @@ export function useFileActivity({
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
 }: UseFileActivityOptions): UseFileActivityResult {
   const [data, setData] = useState<HeatmapResponse | null>(null);
+  const [lockInfo, setLockInfo] = useState<FileLockInfoEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isStale, setIsStale] = useState<boolean>(false);
   /** Bumped by the user-facing `refresh()` to short-circuit the timer. */
@@ -191,22 +247,39 @@ export function useFileActivity({
 
     const poll = async () => {
       const start = performance.now();
-      try {
-        const payload = await fetchHeatmap(windowSecs, 25, ac.signal);
-        if (cancelled) return;
-        const elapsed = performance.now() - start;
-        setData(payload);
+      // Fetch heatmap + lock-info in parallel on the same 5s cadence so
+      // the Phase 4 yield-action join doesn't lag behind the registry
+      // rows it decorates. Errors are handled independently — a flaky
+      // lock-info fetch must not collapse the whole panel.
+      const [heatmapResult, lockResult] = await Promise.allSettled([
+        fetchHeatmap(windowSecs, 25, ac.signal),
+        fetchLockInfo(ac.signal),
+      ]);
+      if (cancelled || ac.signal.aborted) return;
+      const elapsed = performance.now() - start;
+
+      if (heatmapResult.status === "fulfilled") {
+        setData(heatmapResult.value);
         setError(null);
         setIsStale(elapsed > SLOW_FETCH_THRESHOLD_MS);
-      } catch (e) {
-        if (cancelled || ac.signal.aborted) return;
+      } else {
         // Network errors and abort errors look the same shape in fetch;
         // we already skipped abort above. Treat anything else as stale.
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg =
+          heatmapResult.reason instanceof Error
+            ? heatmapResult.reason.message
+            : String(heatmapResult.reason);
         setError(msg);
         setIsStale(true);
         // NB: keep `data` populated — see plan §Phase 3.
       }
+
+      if (lockResult.status === "fulfilled") {
+        setLockInfo(lockResult.value);
+      }
+      // On lock-info failure: keep the prior `lockInfo` value (yield
+      // buttons may briefly point at locks that have since released —
+      // benign; the POST is idempotent and the next poll heals it).
     };
 
     poll();
@@ -223,7 +296,7 @@ export function useFileActivity({
   }, []);
 
   return useMemo(
-    () => ({ data, error, isStale, refresh }),
-    [data, error, isStale, refresh],
+    () => ({ data, lockInfo, error, isStale, refresh }),
+    [data, lockInfo, error, isStale, refresh],
   );
 }

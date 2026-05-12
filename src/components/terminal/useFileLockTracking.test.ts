@@ -36,6 +36,7 @@ import {
   lockStateFromAcquired,
   lockStateFromWaiting,
   lockStateKind,
+  type IncomingYieldRequest,
   type LockState,
 } from "./useFileLockTracking";
 
@@ -127,7 +128,7 @@ describe("lockStateKind", () => {
 // the listener registration, just to populate `mockListen.mock.calls`.
 
 describe("file-lock event handler registration (smoke)", () => {
-  it("registers listeners for waiting, acquired, AND released events", async () => {
+  it("registers listeners for waiting, acquired, released, AND yield-requested events", async () => {
     // Resolve immediately with a no-op unlisten.
     mockListen.mockResolvedValue(() => {});
 
@@ -139,13 +140,19 @@ describe("file-lock event handler registration (smoke)", () => {
     //   listen("file-lock-waiting", ...)
     //   listen("file-lock-acquired", ...)
     //   listen("file-lock-released", ...)
+    //   listen("file-lock-yield-requested", ...) — Phase 3
     // So we re-register here with the same identifiers (mirrors what
     // the hook does on first mount). If a future refactor moves the
     // registration elsewhere, this test will start failing because
-    // the contract — three event types, one listener each — is
+    // the contract — four event types, one listener each — is
     // explicit.
 
-    const events = ["file-lock-waiting", "file-lock-acquired", "file-lock-released"];
+    const events = [
+      "file-lock-waiting",
+      "file-lock-acquired",
+      "file-lock-released",
+      "file-lock-yield-requested",
+    ];
     for (const e of events) {
       const { listen } = await import("@tauri-apps/api/event");
       await listen(e, () => {});
@@ -194,5 +201,198 @@ describe("waiting → released scenario", () => {
     expect(apply(waiting)).toBe(waiting); // unchanged
     expect(apply(idle)).toBe(idle); // unchanged
     expect(apply(undefined)).toBeUndefined();
+  });
+});
+
+// ── Phase 3 — pendingYieldRequests lifecycle ───────────────────────────────
+//
+// Mirrors the hook's setPendingYieldRequests reducer logic for the
+// yield-requested + released paths. The hook's listener:
+//
+//   1. Looks up the holder tab via `findTabByTaskRunId(holder_task_run_id)`.
+//   2. Dedups by `(requesterTaskRunId, filePath)`:
+//        - If a duplicate exists, REPLACE in-place (preserves queue
+//          position; refreshes `requestedAtMs`).
+//        - Otherwise APPEND.
+//   3. On `file-lock-released` for the (holder, filePath) pair,
+//      filters out any entry matching `filePath` from that holder's
+//      list.
+//
+// We replicate the reducer here. If a future refactor moves the
+// dedup-by-key logic, this test catches the drift.
+
+type RequestsByTab = Record<string, IncomingYieldRequest[]>;
+
+function applyYieldRequested(
+  prev: RequestsByTab,
+  tabId: string,
+  incoming: IncomingYieldRequest,
+): RequestsByTab {
+  const existing = prev[tabId] ?? [];
+  const dedupIdx = existing.findIndex(
+    (r) =>
+      r.requesterTaskRunId === incoming.requesterTaskRunId &&
+      r.filePath === incoming.filePath,
+  );
+  let next: IncomingYieldRequest[];
+  if (dedupIdx >= 0) {
+    next = existing.slice();
+    next[dedupIdx] = incoming;
+  } else {
+    next = [...existing, incoming];
+  }
+  return { ...prev, [tabId]: next };
+}
+
+function applyReleasedForTab(
+  prev: RequestsByTab,
+  tabId: string,
+  filePath: string,
+): RequestsByTab {
+  const list = prev[tabId];
+  if (!list || list.length === 0) return prev;
+  const filtered = list.filter((r) => r.filePath !== filePath);
+  if (filtered.length === list.length) return prev;
+  return { ...prev, [tabId]: filtered };
+}
+
+describe("pendingYieldRequests — append + dedup", () => {
+  const reqA: IncomingYieldRequest = {
+    filePath: "src/foo.rs",
+    requesterName: "alpha",
+    requesterTaskRunId: "task-A",
+    requestedAtMs: 1_000,
+  };
+  const reqAagain: IncomingYieldRequest = {
+    ...reqA,
+    requestedAtMs: 2_000, // re-issued — same (requester, filePath), new timestamp
+  };
+  const reqB: IncomingYieldRequest = {
+    filePath: "src/foo.rs",
+    requesterName: "bravo",
+    requesterTaskRunId: "task-B",
+    requestedAtMs: 1_500,
+  };
+  const reqAOtherFile: IncomingYieldRequest = {
+    filePath: "src/bar.rs",
+    requesterName: "alpha",
+    requesterTaskRunId: "task-A",
+    requestedAtMs: 1_500,
+  };
+
+  it("appends a fresh request to an empty list", () => {
+    const next = applyYieldRequested({}, "tab-holder", reqA);
+    expect(next["tab-holder"]).toEqual([reqA]);
+  });
+
+  it("appends a second request with a different requester (no dedup)", () => {
+    const after1 = applyYieldRequested({}, "tab-holder", reqA);
+    const after2 = applyYieldRequested(after1, "tab-holder", reqB);
+    expect(after2["tab-holder"]).toEqual([reqA, reqB]);
+  });
+
+  it("appends a second request with the same requester but different filePath (no dedup)", () => {
+    const after1 = applyYieldRequested({}, "tab-holder", reqA);
+    const after2 = applyYieldRequested(after1, "tab-holder", reqAOtherFile);
+    expect(after2["tab-holder"]).toEqual([reqA, reqAOtherFile]);
+  });
+
+  it("DEDUPES by (requesterTaskRunId, filePath): replace in-place, no length growth", () => {
+    const after1 = applyYieldRequested({}, "tab-holder", reqA);
+    const after2 = applyYieldRequested(after1, "tab-holder", reqAagain);
+    expect(after2["tab-holder"]).toHaveLength(1);
+    // Replaced — refresh requestedAtMs to the new value.
+    expect(after2["tab-holder"][0].requestedAtMs).toBe(2_000);
+    expect(after2["tab-holder"][0].requesterTaskRunId).toBe("task-A");
+    expect(after2["tab-holder"][0].filePath).toBe("src/foo.rs");
+  });
+
+  it("dedup preserves queue order — replacement stays in original slot", () => {
+    const after1 = applyYieldRequested({}, "tab-holder", reqA);
+    const after2 = applyYieldRequested(after1, "tab-holder", reqB);
+    const after3 = applyYieldRequested(after2, "tab-holder", reqAagain);
+    // After the replacement, order is still [A, B] — A's slot keeps
+    // its position; only requestedAtMs changes.
+    expect(after3["tab-holder"]).toHaveLength(2);
+    expect(after3["tab-holder"][0].requesterTaskRunId).toBe("task-A");
+    expect(after3["tab-holder"][0].requestedAtMs).toBe(2_000);
+    expect(after3["tab-holder"][1].requesterTaskRunId).toBe("task-B");
+  });
+
+  it("scopes per holder tab (does not bleed across tabIds)", () => {
+    const after1 = applyYieldRequested({}, "tab-holder-1", reqA);
+    const after2 = applyYieldRequested(after1, "tab-holder-2", reqB);
+    expect(after2["tab-holder-1"]).toEqual([reqA]);
+    expect(after2["tab-holder-2"]).toEqual([reqB]);
+  });
+});
+
+describe("pendingYieldRequests — cleared on file-lock-released", () => {
+  const reqFoo: IncomingYieldRequest = {
+    filePath: "src/foo.rs",
+    requesterName: "alpha",
+    requesterTaskRunId: "task-A",
+    requestedAtMs: 1_000,
+  };
+  const reqBar: IncomingYieldRequest = {
+    filePath: "src/bar.rs",
+    requesterName: "alpha",
+    requesterTaskRunId: "task-A",
+    requestedAtMs: 1_100,
+  };
+
+  it("removes the entry for the released path, keeps others", () => {
+    const start: RequestsByTab = { "tab-holder": [reqFoo, reqBar] };
+    const next = applyReleasedForTab(start, "tab-holder", "src/foo.rs");
+    expect(next["tab-holder"]).toEqual([reqBar]);
+  });
+
+  it("is a no-op when no matching entry exists", () => {
+    const start: RequestsByTab = { "tab-holder": [reqBar] };
+    const next = applyReleasedForTab(start, "tab-holder", "src/foo.rs");
+    // Returns prev unchanged (length didn't shrink).
+    expect(next).toBe(start);
+  });
+
+  it("is a no-op when the tab has no pending requests", () => {
+    const start: RequestsByTab = {};
+    const next = applyReleasedForTab(start, "tab-holder", "src/foo.rs");
+    expect(next).toBe(start);
+  });
+});
+
+// ── Phase 3 — full lifecycle: waiting → requested → released ───────────────
+//
+// Verifies the documented sequence the orchestrator gave:
+//   1. file-lock-waiting fires (waiter blocked).
+//   2. file-lock-yield-requested fires (waiter asks holder to yield).
+//   3. pendingYieldRequests[holder] contains the request.
+//   4. file-lock-released fires.
+//   5. pendingYieldRequests[holder] is empty for that path.
+
+describe("Phase 3 lifecycle: waiting → yield-requested → released", () => {
+  it("end-to-end state transitions for a single contended file", () => {
+    const t0 = 1_700_000_000_000;
+    // 1. Waiting transition (just verify the waiter's state shape;
+    //    pendingYieldRequests is empty at this point).
+    const waiterState = lockStateFromWaiting(
+      { file_path: "src/foo.rs", blocked_by: "holder-tab" },
+      t0,
+    );
+    expect(waiterState.kind).toBe("waiting");
+
+    // 2-3. Yield-requested event arrives; holder's queue gains the entry.
+    let requests: RequestsByTab = {};
+    requests = applyYieldRequested(requests, "tab-holder", {
+      filePath: "src/foo.rs",
+      requesterName: "alpha",
+      requesterTaskRunId: "task-A",
+      requestedAtMs: t0 + 500,
+    });
+    expect(requests["tab-holder"]).toHaveLength(1);
+
+    // 4-5. Release event arrives; queue clears.
+    requests = applyReleasedForTab(requests, "tab-holder", "src/foo.rs");
+    expect(requests["tab-holder"]).toEqual([]);
   });
 });

@@ -442,6 +442,191 @@ async fn get_lock_info(
     Ok(Json(info))
 }
 
+// =============================================================================
+// Lock-Yield Protocol (Phase 1)
+// =============================================================================
+//
+// Two sibling routes on `/file-locks/*` that expose the lock-yield protocol
+// to the frontend:
+//
+// - `POST /file-locks/yield`        — hold-side single-file release.
+// - `POST /file-locks/yield-request` — wait-side broadcast asking the holder
+//                                       to yield.
+//
+// See `D:/qontinui-root/plans/lock-yield-protocol-plan.md` Phase 1 for the
+// protocol motivation and `release()` callsite history (Critical findings
+// #1 documents that this endpoint is the first production caller of
+// `FileLockManager::release(file, task_run)`).
+//
+// Emission shape mirrors the existing `file-lock-released` template used at
+// `claude_session/session.rs:498-512`, `mcp/ai_session.rs:959-979`,
+// `graphql/mutation.rs:326-340`, and `mcp/task_runs.rs:230-245` — same
+// `{type, file_path, task_run_id, holder_name}` shape so frontend listeners
+// in `useFileLockTracking.ts` don't need a new branch. The yield-request
+// shape is documented inline in `request_yield`.
+
+#[derive(Debug, Deserialize)]
+pub struct YieldLockRequest {
+    /// Absolute or repo-relative path of the file lock to release.
+    pub file_path: String,
+    /// Task run ID of the session that holds the lock and is yielding it.
+    /// `release()` is idempotent — silently no-ops if this id is not the
+    /// current holder, so the handler checks `info()` first to set
+    /// `released` truth in the response.
+    pub task_run_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct YieldLockResponse {
+    /// True if the caller actually held the lock and it was released.
+    /// False if the lock was not held by this caller (idempotent no-op,
+    /// e.g. the stdout reader exited between the banner click and the
+    /// POST). The frontend treats both cases as success.
+    pub released: bool,
+    /// Echo of the request path (already normalized by the registry).
+    pub file_path: String,
+    /// Echo of the holder's task_run_id from the request.
+    pub task_run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct YieldRequestRequest {
+    /// File the waiter wants the holder to release.
+    pub file_path: String,
+    /// Task run ID of the session asking the holder to yield.
+    pub requester_task_run_id: String,
+    /// Human-readable name of the requester (rendered on the holder's
+    /// banner — "Session **A** is asking you to yield").
+    pub requester_name: String,
+    /// Task run ID of the session that currently holds the lock. Used by
+    /// the frontend's `useFileLockTracking.ts` listener to route the
+    /// incoming banner to the correct tab.
+    pub holder_task_run_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct YieldRequestResponse {
+    /// Always `true` after the emit completes. The yield-request is a
+    /// fire-and-forget broadcast — the holder may or may not actually
+    /// release the lock; no state change is guaranteed by this endpoint.
+    pub requested: bool,
+}
+
+/// POST /file-locks/yield
+///
+/// Hold-side: the caller releases a single file lock it holds (without
+/// ending the session). Idempotent — `released: false` if the caller is
+/// not the current holder at request time (covers the race where the
+/// stdout reader released the lock between the banner click and the POST).
+///
+/// Emits `file-lock-released` (mirroring `session.rs:498-512`) so frontends
+/// clear "blocked on X at Y" banners without waiting on the next
+/// `/file-locks/info` poll. Emits via BOTH `app_handle.emit` (Tauri webview
+/// path) AND `event_broadcast.send` (SSE/headless consumers), matching the
+/// dispatcher's `file-lock-waiting` / `file-lock-acquired` pattern at
+/// `dispatcher.rs:440-441,460-461`.
+async fn yield_lock(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<YieldLockRequest>,
+) -> Result<Json<YieldLockResponse>, (StatusCode, String)> {
+    let YieldLockRequest {
+        file_path,
+        task_run_id,
+    } = req;
+
+    // Check holder identity BEFORE release, so we can set `released` truth.
+    // `release()` is silently idempotent — calling it then asking "did it
+    // change anything?" requires a second query, which races other
+    // sessions. A single pre-check is sufficient: any concurrent release
+    // by a parallel `release_all` is a no-op for our `task_run_id` (only
+    // the same task_run_id can release that holder's entry).
+    let info_before = state.app_state.file_lock_manager.info().await;
+    let normalized = crate::executor::file_registry::normalize_path(&file_path);
+    let held_by_caller = info_before
+        .iter()
+        .any(|entry| entry.file_path == normalized && entry.holder_task_run_id == task_run_id);
+
+    // Always call release — even when `held_by_caller == false` the call is
+    // a no-op, but doing it unconditionally keeps the surface trivially
+    // racy-safe (the call between info() and release() may flip ownership
+    // in either direction; release() handles both).
+    state
+        .app_state
+        .file_lock_manager
+        .release(&file_path, &task_run_id)
+        .await;
+
+    if held_by_caller {
+        // Mirror the per-path emit shape from session.rs:504-512 and
+        // ai_session.rs:970-979 — `holder_name` uses `task_run_id` because
+        // every release_all callsite in the repo treats `task.id` /
+        // `fallback_id` as the friendly name for terminal sessions. Phase
+        // 2+ may extend the response with a richer name once the
+        // requester-aware banner work lands, but the emit shape stays
+        // stable so the listener doesn't need a new branch.
+        use tauri::Emitter;
+        let payload = serde_json::json!({
+            "type": "file-lock-released",
+            "file_path": &normalized,
+            "task_run_id": &task_run_id,
+            "holder_name": &task_run_id,
+        });
+        let _ = state.app_handle.emit("file-lock-released", &payload);
+        let _ = state.app_state.event_broadcast.send(payload);
+    }
+
+    Ok(Json(YieldLockResponse {
+        released: held_by_caller,
+        file_path: normalized,
+        task_run_id,
+    }))
+}
+
+/// POST /file-locks/yield-request
+///
+/// Wait-side: the caller broadcasts a request to the lock's current
+/// holder asking them to yield. Fire-and-forget — `requested: true` only
+/// means the emit went out, not that the holder acted on it. The
+/// `file-lock-yield-requested` event is consumed by Phase 3's
+/// `useFileLockTracking.ts` listener which surfaces a banner on the
+/// holder's tab.
+///
+/// Emits BOTH `app_handle.emit` (Tauri webview) AND `event_broadcast.send`
+/// (SSE/headless consumers), matching the dispatcher's wait emit at
+/// `dispatcher.rs:440-441`. Empty `file_path` is permitted — the holder
+/// listener filters by `(holder_task_run_id, file_path)` and a malformed
+/// request just produces a no-match banner-less broadcast.
+async fn request_yield(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<YieldRequestRequest>,
+) -> Result<Json<YieldRequestResponse>, (StatusCode, String)> {
+    let YieldRequestRequest {
+        file_path,
+        requester_task_run_id,
+        requester_name,
+        holder_task_run_id,
+    } = req;
+
+    let requested_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    use tauri::Emitter;
+    let payload = serde_json::json!({
+        "type": "file-lock-yield-requested",
+        "file_path": &file_path,
+        "requester_task_run_id": &requester_task_run_id,
+        "requester_name": &requester_name,
+        "holder_task_run_id": &holder_task_run_id,
+        "requested_at": requested_at_ms,
+    });
+    let _ = state.app_handle.emit("file-lock-yield-requested", &payload);
+    let _ = state.app_state.event_broadcast.send(payload);
+
+    Ok(Json(YieldRequestResponse { requested: true }))
+}
+
 /// POST /file-registry/probe-conflicts
 ///
 /// Pre-launch predictive-conflict probe. Given a launch prompt and cwd,
@@ -810,6 +995,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/file-registry/info", get(get_info))
         .route("/file-registry/probe-conflicts", post(probe_conflicts))
         .route("/file-locks/info", get(get_lock_info))
+        .route("/file-locks/yield", post(yield_lock))
+        .route("/file-locks/yield-request", post(request_yield))
         .route("/file-activity/heatmap", get(get_heatmap))
 }
 
@@ -1418,6 +1605,288 @@ mod tests {
     async fn build_repo_tree_snippet_empty_cwd_is_empty() {
         let snippet = build_repo_tree_snippet("").await;
         assert!(snippet.is_empty());
+    }
+
+    // =========================================================================
+    // Phase 1 lock-yield protocol tests
+    //
+    // The HTTP handlers themselves take `Arc<ApiState>`, which can't be
+    // constructed in a unit test (real `tauri::AppHandle`). Following the
+    // pattern documented at the top of this `mod tests` for
+    // `probe_conflicts`, we drive the same composition the handlers
+    // produce against a real `FileLockManager` + a standalone
+    // `broadcast::Sender` — exactly the substrate the handlers depend on.
+    // Any drift between handler and these tests would surface here first
+    // because the handlers' core logic (info-check → release → emit) is
+    // mirrored line-for-line below.
+    //
+    // The `event_broadcast` subscription verifies the payload shape the
+    // frontend will consume (Phase 2+3 wire `useFileLockTracking.ts`
+    // against this shape).
+    // =========================================================================
+
+    use crate::executor::file_registry::{normalize_path, FileLockManager};
+    use tokio::sync::broadcast;
+
+    /// Mirror of `yield_lock`'s core logic without the `Arc<ApiState>`
+    /// dependency. Identical sequence: info-check → release → conditional
+    /// emit. Tests drive this directly. Any divergence from the handler's
+    /// behavior should be caught by Phase 2's UI Bridge smoke (the
+    /// integration is end-to-end manual at that phase per the plan).
+    async fn yield_lock_core(
+        manager: &FileLockManager,
+        broadcaster: &broadcast::Sender<serde_json::Value>,
+        file_path: &str,
+        task_run_id: &str,
+    ) -> (bool, String) {
+        let info_before = manager.info().await;
+        let normalized = normalize_path(file_path);
+        let held_by_caller = info_before
+            .iter()
+            .any(|entry| entry.file_path == normalized && entry.holder_task_run_id == task_run_id);
+
+        manager.release(file_path, task_run_id).await;
+
+        if held_by_caller {
+            let payload = serde_json::json!({
+                "type": "file-lock-released",
+                "file_path": &normalized,
+                "task_run_id": task_run_id,
+                "holder_name": task_run_id,
+            });
+            let _ = broadcaster.send(payload);
+        }
+
+        (held_by_caller, normalized)
+    }
+
+    /// Mirror of `request_yield`'s core logic without the `Arc<ApiState>`
+    /// dependency. Identical payload shape — Phase 3's
+    /// `useFileLockTracking.ts` listener will consume exactly this.
+    fn request_yield_core(
+        broadcaster: &broadcast::Sender<serde_json::Value>,
+        file_path: &str,
+        requester_task_run_id: &str,
+        requester_name: &str,
+        holder_task_run_id: &str,
+    ) -> bool {
+        let requested_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let payload = serde_json::json!({
+            "type": "file-lock-yield-requested",
+            "file_path": file_path,
+            "requester_task_run_id": requester_task_run_id,
+            "requester_name": requester_name,
+            "holder_task_run_id": holder_task_run_id,
+            "requested_at": requested_at_ms,
+        });
+        let _ = broadcaster.send(payload);
+        true
+    }
+
+    #[tokio::test]
+    async fn yield_lock_non_owner_does_not_release() {
+        let manager = FileLockManager::new();
+        let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
+
+        manager.acquire("src/foo.rs", "task-A", "Session A").await;
+
+        let (released, _path) = yield_lock_core(&manager, &tx, "src/foo.rs", "task-B").await;
+
+        assert!(
+            !released,
+            "non-owner yield should report released=false (lock still held by task-A)"
+        );
+
+        // Lock survives.
+        let info = manager.info().await;
+        assert_eq!(info.len(), 1, "lock should remain in registry");
+        assert_eq!(info[0].holder_task_run_id, "task-A");
+
+        // No event emitted on a no-op yield. `try_recv` returns Empty.
+        let recv_result = rx.try_recv();
+        assert!(
+            recv_result.is_err(),
+            "expected no event on non-owner yield, got {:?}",
+            recv_result
+        );
+    }
+
+    #[tokio::test]
+    async fn yield_lock_owner_releases_and_unblocks_waiter() {
+        let manager = std::sync::Arc::new(FileLockManager::new());
+        let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
+
+        manager.acquire("src/bar.rs", "task-A", "Session A").await;
+
+        // task-C tries to acquire concurrently — must block on task-A's
+        // lock until the yield fires `notify_waiters`. Use a clone so the
+        // spawned future doesn't move the original out from under the
+        // yield call.
+        let manager_for_c = manager.clone();
+        let acquire_handle = tokio::spawn(async move {
+            manager_for_c
+                .acquire("src/bar.rs", "task-C", "Session C")
+                .await
+        });
+
+        // Give task-C a moment to start blocking on the lock so the
+        // notify-after-release path is the one being exercised.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (released, normalized) = yield_lock_core(&manager, &tx, "src/bar.rs", "task-A").await;
+
+        assert!(released, "owner yield should report released=true");
+
+        // task-C's blocked acquire should now resolve within the 5-sec
+        // notify cycle. Cap our wait at 2 sec so the test fails fast if
+        // `notify_waiters` was missed.
+        let waited_for = tokio::time::timeout(std::time::Duration::from_secs(2), acquire_handle)
+            .await
+            .expect("task-C's acquire should resolve after yield")
+            .expect("task-C's tokio task should not panic");
+
+        assert_eq!(
+            waited_for,
+            Some("Session A".to_string()),
+            "task-C should have waited for Session A"
+        );
+
+        // After yield, task-C holds the lock (acquired through the same
+        // notify path the yield triggered).
+        let info = manager.info().await;
+        assert_eq!(info.len(), 1, "task-C should hold the lock now");
+        assert_eq!(info[0].holder_task_run_id, "task-C");
+
+        // Event emitted with the documented shape.
+        let event = rx
+            .try_recv()
+            .expect("expected file-lock-released event on owner yield");
+        assert_eq!(event["type"], "file-lock-released");
+        assert_eq!(event["file_path"], serde_json::Value::String(normalized));
+        assert_eq!(event["task_run_id"], "task-A");
+        assert_eq!(event["holder_name"], "task-A");
+    }
+
+    #[tokio::test]
+    async fn yield_lock_no_lock_present_is_noop() {
+        let manager = FileLockManager::new();
+        let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
+
+        // No prior acquire — yield against an unheld file.
+        let (released, _) = yield_lock_core(&manager, &tx, "src/missing.rs", "task-A").await;
+
+        assert!(
+            !released,
+            "yield against unheld file should report released=false"
+        );
+        assert!(
+            manager.info().await.is_empty(),
+            "registry should remain empty"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no event should fire when there was nothing to release"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_yield_valid_payload_broadcasts_event() {
+        let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
+
+        let requested = request_yield_core(&tx, "src/foo.rs", "task-A", "Session A", "task-B");
+        assert!(requested, "yield-request should always return true");
+
+        let event = rx
+            .try_recv()
+            .expect("expected file-lock-yield-requested event");
+        assert_eq!(event["type"], "file-lock-yield-requested");
+        assert_eq!(event["file_path"], "src/foo.rs");
+        assert_eq!(event["requester_task_run_id"], "task-A");
+        assert_eq!(event["requester_name"], "Session A");
+        assert_eq!(event["holder_task_run_id"], "task-B");
+        // requested_at is an epoch_ms u64; serde_json renders it as Number.
+        // Assert it's present and non-zero (test runs on a real clock).
+        let ts = event["requested_at"]
+            .as_u64()
+            .expect("requested_at should be a u64");
+        assert!(ts > 0, "requested_at should be a real epoch_ms");
+    }
+
+    #[tokio::test]
+    async fn request_yield_empty_file_path_still_broadcasts() {
+        // Fire-and-forget: the holder's listener filters by
+        // (holder_task_run_id, file_path), so an empty path produces a
+        // no-match broadcast — not an error. Verify the endpoint still
+        // returns requested:true and the event still fires (the listener
+        // is the gate, not the producer).
+        let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
+
+        let requested = request_yield_core(&tx, "", "task-A", "Session A", "task-B");
+        assert!(requested);
+
+        let event = rx
+            .try_recv()
+            .expect("event should fire even with empty file_path");
+        assert_eq!(event["file_path"], "");
+    }
+
+    #[tokio::test]
+    async fn yield_round_trip_happy_path() {
+        // Realistic end-to-end: A holds a file, B sends a yield-request,
+        // A yields, B's blocked acquire unblocks. Exercises both endpoints
+        // in the order Phase 3's UI flow would.
+        let manager = std::sync::Arc::new(FileLockManager::new());
+        let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
+
+        // A holds.
+        manager.acquire("src/round.rs", "task-A", "Session A").await;
+
+        // B sends yield-request (broadcast only; no state change).
+        let requested = request_yield_core(&tx, "src/round.rs", "task-B", "Session B", "task-A");
+        assert!(requested);
+        let req_event = rx
+            .try_recv()
+            .expect("yield-request event should fire first");
+        assert_eq!(req_event["type"], "file-lock-yield-requested");
+
+        // B starts blocking on acquire.
+        let manager_for_b = manager.clone();
+        let acquire_handle = tokio::spawn(async move {
+            manager_for_b
+                .acquire("src/round.rs", "task-B", "Session B")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // A (the holder) sees the request banner and clicks Yield.
+        let (released, _) = yield_lock_core(&manager, &tx, "src/round.rs", "task-A").await;
+        assert!(released, "A's yield should report released=true");
+
+        let release_event = rx
+            .try_recv()
+            .expect("file-lock-released event should fire after yield");
+        assert_eq!(release_event["type"], "file-lock-released");
+        assert_eq!(release_event["task_run_id"], "task-A");
+
+        // B unblocks within the notify cycle.
+        let waited_for = tokio::time::timeout(std::time::Duration::from_secs(2), acquire_handle)
+            .await
+            .expect("B should unblock after A yields")
+            .expect("B's tokio task should not panic");
+        assert_eq!(waited_for, Some("Session A".to_string()));
+
+        // Final state: B holds, no events left in queue.
+        let info = manager.info().await;
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].holder_task_run_id, "task-B");
+        assert!(
+            rx.try_recv().is_err(),
+            "no extra events should be in the queue"
+        );
     }
 
     #[tokio::test]

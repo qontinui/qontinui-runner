@@ -117,6 +117,30 @@ export function lockStateKind(
  */
 export type FileLockState = LockState;
 
+/**
+ * Incoming yield request payload as seen by the holder's tab.
+ *
+ * Emitted by the runner's POST /file-locks/yield-request handler
+ * (`mcp/file_registry.rs::request_yield`) as a Tauri event named
+ * `file-lock-yield-requested`. The event payload uses snake_case keys
+ * (the handler builds the JSON via `serde_json::json!` directly, NOT a
+ * struct with `#[serde(rename_all = "camelCase")]`), so the listener
+ * here destructures `file_path`, `requester_task_run_id`,
+ * `requester_name`, `holder_task_run_id`, and `requested_at`.
+ *
+ * The hook keys these per the HOLDER's tab id (resolved via
+ * {@link findTabByTaskRunId} against `holder_task_run_id`) and dedups
+ * by `(requesterTaskRunId, filePath)` — a duplicate replaces the prior
+ * entry rather than appending so the banner shows a single up-to-date
+ * "asked you to yield" stamp per (requester, file) pair.
+ */
+export type IncomingYieldRequest = {
+  filePath: string;
+  requesterName: string;
+  requesterTaskRunId: string;
+  requestedAtMs: number;
+};
+
 interface FileLockEvent {
   type: string;
   file_path: string;
@@ -148,8 +172,54 @@ interface FileLockInfoEntry {
   acquired_at: number;
 }
 
-export function useFileLockTracking(tabs: TerminalTab[]): Record<string, LockState> {
+/**
+ * `file-lock-yield-requested` Tauri event payload.
+ *
+ * Wire-format keys are snake_case (Rust handler emits via
+ * `serde_json::json!` literal — see `mcp/file_registry.rs::request_yield`).
+ */
+interface FileLockYieldRequestedEvent {
+  type: string;
+  file_path: string;
+  requester_task_run_id: string;
+  requester_name: string;
+  holder_task_run_id: string;
+  requested_at: number;
+}
+
+/**
+ * Return shape of {@link useFileLockTracking}.
+ *
+ * Phase 3 widened the hook from a bare `Record<string, LockState>` to
+ * an object so callers can pull `pendingYieldRequests` (per-holder-tab
+ * incoming yield request queues) without a second hook + a duplicate
+ * `tabs` ref. Existing consumers destructure `{ lockStates }` for the
+ * old slot.
+ */
+export interface FileLockTracking {
+  lockStates: Record<string, LockState>;
+  /**
+   * Map of holder-tab id → list of incoming yield requests targeting
+   * that tab. Keys correspond to `tab.id`; the request is routed to
+   * the tab whose `tab.claudeSessionId === payload.holder_task_run_id`.
+   *
+   * Cleared on `file-lock-released` for the matching
+   * `(holder_task_run_id, file_path)` pair — once the holder lets go,
+   * any pending "please yield" request for that path is moot.
+   *
+   * Dedup invariant: within a tab's list, at most one entry exists per
+   * `(requesterTaskRunId, filePath)` tuple. A subsequent
+   * yield-requested event for the same pair replaces the prior entry
+   * (refreshing `requestedAtMs`) rather than appending a duplicate.
+   */
+  pendingYieldRequests: Record<string, IncomingYieldRequest[]>;
+}
+
+export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
   const [lockStates, setLockStates] = useState<Record<string, LockState>>({});
+  const [pendingYieldRequests, setPendingYieldRequests] = useState<
+    Record<string, IncomingYieldRequest[]>
+  >({});
   const tabsRef = useRef(tabs);
   useEffect(() => {
     tabsRef.current = tabs;
@@ -191,6 +261,41 @@ export function useFileLockTracking(tabs: TerminalTab[]): Record<string, LockSta
     let unlistenWaiting: (() => void) | null = null;
     let unlistenAcquired: (() => void) | null = null;
     let unlistenReleased: (() => void) | null = null;
+    let unlistenYieldRequested: (() => void) | null = null;
+
+    /**
+     * Refresh `waiterCount` on every holding tab from the current
+     * `waitingHolders.current` map. Used by all three event listeners
+     * (waiting/acquired/released) so the per-holder waiter count tracks
+     * waiter arrivals/departures live — without this, holding tabs only
+     * pick up new waiter counts on the next 10s `/file-locks/info` poll
+     * tick, which is too slow for the Phase 2 yield banner UX (the
+     * banner needs to appear within one notify cycle of the waiter
+     * arriving).
+     *
+     * Pure-functional: takes a `Record<tabId, LockState>` snapshot and
+     * returns a new snapshot with refreshed `waiterCount` on holding
+     * entries. Idle/waiting entries pass through unchanged. Bails out
+     * early if no `waiterCount` actually changed so React's strict
+     * equality check skips the re-render.
+     */
+    const refreshWaiterCounts = (
+      prev: Record<string, LockState>,
+    ): Record<string, LockState> => {
+      const counts = deriveWaiterCounts(waitingHolders.current.values());
+      let dirty = false;
+      const next: Record<string, LockState> = { ...prev };
+      for (const tab of tabsRef.current) {
+        const state = prev[tab.id];
+        if (!state || state.kind !== "holding") continue;
+        const fresh = counts.get(tab.title) ?? 0;
+        if ((state.waiterCount ?? 0) !== fresh) {
+          next[tab.id] = { ...state, waiterCount: fresh };
+          dirty = true;
+        }
+      }
+      return dirty ? next : prev;
+    };
 
     listen<FileLockEvent>("file-lock-waiting", (event) => {
       // `holder_name` here is the WAITER. `blocked_by` is the holder.
@@ -202,27 +307,38 @@ export function useFileLockTracking(tabs: TerminalTab[]): Record<string, LockSta
         sinceMs: nowMs,
       });
       const tabId = findTabByHolderName(holder_name);
-      if (tabId) {
-        const patch = lockStateFromWaiting(
-          { file_path, blocked_by: blocked_by ?? null },
-          nowMs,
-        );
-        setLockStates((prev) => ({ ...prev, [tabId]: patch }));
-      }
+      setLockStates((prev) => {
+        // Apply the waiter's own state transition (if any) first, then
+        // refresh all holding-tab waiter counts using the new map.
+        let base = prev;
+        if (tabId) {
+          const patch = lockStateFromWaiting(
+            { file_path, blocked_by: blocked_by ?? null },
+            nowMs,
+          );
+          base = { ...prev, [tabId]: patch };
+        }
+        return refreshWaiterCounts(base);
+      });
     }).then((fn) => {
       unlistenWaiting = fn;
     });
 
     listen<FileLockEvent>("file-lock-acquired", (event) => {
       // The waiter just unblocked; transition to holding. The poll loop
-      // will backfill `waiterCount` shortly.
+      // also backfills `waiterCount` every 10s, but we refresh here too
+      // so the prior holder's count drops immediately.
       const { holder_name, file_path } = event.payload;
       waitingHolders.current.delete(holder_name);
       const tabId = findTabByHolderName(holder_name);
-      if (tabId) {
-        const patch = lockStateFromAcquired({ file_path }, Date.now());
-        setLockStates((prev) => ({ ...prev, [tabId]: patch }));
-      }
+      setLockStates((prev) => {
+        let base = prev;
+        if (tabId) {
+          const patch = lockStateFromAcquired({ file_path }, Date.now());
+          base = { ...prev, [tabId]: patch };
+        }
+        return refreshWaiterCounts(base);
+      });
     }).then((fn) => {
       unlistenAcquired = fn;
     });
@@ -231,30 +347,98 @@ export function useFileLockTracking(tabs: TerminalTab[]): Record<string, LockSta
     // when a holder releases a lock — payload mirrors the other
     // file-lock events.
     listen<FileLockEvent>("file-lock-released", (event) => {
-      const { holder_name, task_run_id } = event.payload;
+      const { holder_name, task_run_id, file_path } = event.payload;
       // Try matching by holder_name first (tab title), fall back to
       // task_run_id (claudeSessionId) so SDK-style tabs still clear.
       const tabId =
         findTabByHolderName(holder_name) ?? findTabByTaskRunId(task_run_id);
-      if (tabId) {
-        setLockStates((prev) => {
+      setLockStates((prev) => {
+        let base = prev;
+        if (tabId) {
           // Only flip to idle if we still believe the tab held this
           // path — avoids stomping a state set by a later event.
           const current = prev[tabId];
           if (current && current.kind === "holding") {
-            return { ...prev, [tabId]: { kind: "idle" } };
+            base = { ...prev, [tabId]: { kind: "idle" } };
           }
-          return prev;
+        }
+        // The released event may unblock a waiter elsewhere on the same
+        // file; their `file-lock-acquired` will arrive next and prune
+        // its `waitingHolders` entry, but for the in-between moment the
+        // remaining holders' counts may have dropped. Refresh now so
+        // the banner clears promptly even if the acquired event is
+        // delayed.
+        return refreshWaiterCounts(base);
+      });
+
+      // Phase 3 — clear any pending yield request targeting THIS holder
+      // for THIS file path. Once the holder has released, the request is
+      // moot; if a new holder picks the lock back up, the original
+      // requester needs to re-issue (the request was directed at the
+      // prior holder's task_run_id, not "whoever holds it").
+      if (tabId) {
+        setPendingYieldRequests((prev) => {
+          const list = prev[tabId];
+          if (!list || list.length === 0) return prev;
+          const filtered = list.filter((r) => r.filePath !== file_path);
+          if (filtered.length === list.length) return prev;
+          return { ...prev, [tabId]: filtered };
         });
       }
     }).then((fn) => {
       unlistenReleased = fn;
     });
 
+    // Phase 3 — wait-side yield-request listener. Routes the incoming
+    // request to the HOLDER's tab (lookup by `holder_task_run_id` →
+    // `tab.claudeSessionId` via {@link findTabByTaskRunId}). Dedups by
+    // `(requesterTaskRunId, filePath)` — a duplicate replaces the prior
+    // entry rather than appending so we don't compound the banner
+    // counter on retries.
+    listen<FileLockYieldRequestedEvent>("file-lock-yield-requested", (event) => {
+      const {
+        file_path,
+        requester_task_run_id,
+        requester_name,
+        holder_task_run_id,
+        requested_at,
+      } = event.payload;
+      const tabId = findTabByTaskRunId(holder_task_run_id);
+      if (!tabId) return; // Holder tab isn't in this window; ignore.
+      const incoming: IncomingYieldRequest = {
+        filePath: file_path,
+        requesterName: requester_name,
+        requesterTaskRunId: requester_task_run_id,
+        requestedAtMs: requested_at,
+      };
+      setPendingYieldRequests((prev) => {
+        const existing = prev[tabId] ?? [];
+        const dedupIdx = existing.findIndex(
+          (r) =>
+            r.requesterTaskRunId === requester_task_run_id &&
+            r.filePath === file_path,
+        );
+        let next: IncomingYieldRequest[];
+        if (dedupIdx >= 0) {
+          // Replace in-place so request ordering is preserved (the
+          // banner shows the oldest first; a re-issued request shouldn't
+          // jump the queue past unrelated requests).
+          next = existing.slice();
+          next[dedupIdx] = incoming;
+        } else {
+          next = [...existing, incoming];
+        }
+        return { ...prev, [tabId]: next };
+      });
+    }).then((fn) => {
+      unlistenYieldRequested = fn;
+    });
+
     return () => {
       unlistenWaiting?.();
       unlistenAcquired?.();
       unlistenReleased?.();
+      unlistenYieldRequested?.();
     };
   }, []);
 
@@ -355,5 +539,5 @@ export function useFileLockTracking(tabs: TerminalTab[]): Record<string, LockSta
     };
   }, []);
 
-  return lockStates;
+  return { lockStates, pendingYieldRequests };
 }

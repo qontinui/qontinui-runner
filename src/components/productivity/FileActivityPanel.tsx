@@ -25,8 +25,10 @@
  * doesn't exist yet at the CoordinatorDashboard scope).
  */
 
-import { useCallback, useMemo, useState } from "react";
-import { Flame, FileText, Clock, RefreshCw, Users } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Flame, FileText, Clock, Hand, RefreshCw, Users } from "lucide-react";
+import { getApiPort } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
 import {
   DEFAULT_WINDOW_SECS,
   WINDOW_OPTIONS,
@@ -34,10 +36,77 @@ import {
   loadStoredWindowSecs,
   storeWindowSecs,
   useFileActivity,
+  type FileLockInfoEntry,
   type FileRegistryInfoEntry,
   type HotFileRow,
   type HotSessionRow,
 } from "./fileActivityApi";
+
+const logger = createLogger("FileActivityPanel");
+
+/**
+ * Lock-Yield cooldown — duplicate of `WaitingLockBanner.REQUEST_YIELD_COOLDOWN_MS`
+ * (Phase 3). Kept local rather than imported across the productivity ↔ terminal
+ * folder boundary; the two surfaces use the same UX so a future plan should
+ * dedupe by hoisting both into a shared `lockYield` module.
+ *
+ * TODO(lock-yield): dedupe with WaitingLockBanner's constant.
+ */
+export const REQUEST_YIELD_COOLDOWN_MS = 30_000;
+
+/** Cooldown map key: `${file_path}::${holder_task_run_id}` — per the plan's
+ *  Phase 4 spec, the cooldown is per-(file,holder) pair so clicking yield
+ *  on one row doesn't disable yield on another. */
+export function lockYieldCooldownKey(filePath: string, holderTaskRunId: string): string {
+  return `${filePath}::${holderTaskRunId}`;
+}
+
+/** Returns true iff the registry entry's (holder_task_run_id, file_path)
+ *  pair matches a currently-held exclusive lock. Pure / exported for tests. */
+export function hasExclusiveLock(
+  entry: Pick<FileRegistryInfoEntry, "file_path" | "holder_task_run_id">,
+  lockInfo: readonly FileLockInfoEntry[] | null,
+): boolean {
+  if (!lockInfo) return false;
+  return lockInfo.some(
+    (l) =>
+      l.file_path === entry.file_path &&
+      l.holder_task_run_id === entry.holder_task_run_id,
+  );
+}
+
+/** Compute cooldown's remaining seconds (rounded UP to mirror
+ *  `WaitingLockBanner.cooldownRemainingSecs`). Pure / exported for tests. */
+export function lockYieldCooldownRemainingSecs(
+  cooldownUntilMs: number,
+  nowMs: number,
+): number {
+  if (cooldownUntilMs <= nowMs) return 0;
+  return Math.ceil((cooldownUntilMs - nowMs) / 1000);
+}
+
+/** Build the POST body for the Phase 1 `/file-locks/yield-request` endpoint
+ *  using the synthetic Coordinator Dashboard requester identity per
+ *  §Open Q5 of the lock-yield plan. The holder banner will display
+ *  "Coordinator Dashboard has asked you to yield" — intentional signal
+ *  that the request came from the global dashboard view, not a peer
+ *  session. */
+export function buildYieldRequestBody(
+  filePath: string,
+  holderTaskRunId: string,
+): {
+  file_path: string;
+  requester_task_run_id: string;
+  requester_name: string;
+  holder_task_run_id: string;
+} {
+  return {
+    file_path: filePath,
+    requester_task_run_id: "coordinator-dashboard",
+    requester_name: "Coordinator Dashboard",
+    holder_task_run_id: holderTaskRunId,
+  };
+}
 
 /** Render relative-time label without pulling in date-fns again — the
  *  existing import in CoordinatorDashboard works, but the panel is
@@ -139,10 +208,50 @@ function PanelHeader({
 
 interface LiveSnapshotSectionProps {
   rows: readonly FileRegistryInfoEntry[];
+  /** Subset of `rows` that are also currently held as exclusive locks.
+   *  Null until the first `/file-locks/info` fetch resolves — yield
+   *  buttons stay hidden until then to avoid flashing in-then-out
+   *  during initial poll. */
+  lockInfo: readonly FileLockInfoEntry[] | null;
   onJumpToHolder: (holderName: string) => void;
+  /** Test seam — defaults to `globalThis.fetch`. */
+  fetchImpl?: typeof fetch;
 }
 
-function LiveSnapshotSection({ rows, onJumpToHolder }: LiveSnapshotSectionProps) {
+function LiveSnapshotSection({
+  rows,
+  lockInfo,
+  onJumpToHolder,
+  fetchImpl,
+}: LiveSnapshotSectionProps) {
+  // Per-(file,holder) cooldown map. Key shape: `lockYieldCooldownKey()`.
+  // Value: epoch ms at which the cooldown ends. Entries are never pruned
+  // — the map grows with each click but stays bounded by the live row
+  // count (no leak on the time-scale of a single panel mount).
+  const [cooldowns, setCooldowns] = useState<Map<string, number>>(
+    () => new Map(),
+  );
+
+  // Re-render once per second so the cooldown countdown stays visually
+  // accurate. Cheap — same cadence WaitingLockBanner uses.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    // Skip the timer when there are no active cooldowns to avoid the
+    // tick churn on the dashboard. The effect re-runs when `cooldowns`
+    // changes, so a new click immediately re-arms the interval.
+    let anyActive = false;
+    const t0 = Date.now();
+    for (const until of cooldowns.values()) {
+      if (until > t0) {
+        anyActive = true;
+        break;
+      }
+    }
+    if (!anyActive) return;
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [cooldowns]);
+
   // Group by holder_name. Map insertion order is preserved — sort holders
   // by their newest-registered file so the most recently active appears
   // first; ties broken alphabetically.
@@ -161,6 +270,40 @@ function LiveSnapshotSection({ rows, onJumpToHolder }: LiveSnapshotSectionProps)
       }))
       .sort((a, b) => b.latest - a.latest || a.holder.localeCompare(b.holder));
   }, [rows]);
+
+  const handleRequestYield = useCallback(
+    async (filePath: string, holderTaskRunId: string) => {
+      const key = lockYieldCooldownKey(filePath, holderTaskRunId);
+      // Optimistically start the cooldown — even on POST failure we
+      // don't want the user spamming the button.
+      const cooldownUntil = Date.now() + REQUEST_YIELD_COOLDOWN_MS;
+      setCooldowns((prev) => {
+        const next = new Map(prev);
+        next.set(key, cooldownUntil);
+        return next;
+      });
+
+      try {
+        const f = fetchImpl ?? globalThis.fetch;
+        const resp = await f(
+          `http://127.0.0.1:${getApiPort()}/file-locks/yield-request`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(buildYieldRequestBody(filePath, holderTaskRunId)),
+          },
+        );
+        if (!resp.ok) {
+          logger.warn(
+            `yield-request POST returned ${resp.status} for ${filePath} (holder=${holderTaskRunId})`,
+          );
+        }
+      } catch (err) {
+        logger.error("yield-request POST failed:", err);
+      }
+    },
+    [fetchImpl],
+  );
 
   if (grouped.length === 0) {
     return (
@@ -193,15 +336,54 @@ function LiveSnapshotSection({ rows, onJumpToHolder }: LiveSnapshotSectionProps)
             {holder}
           </button>
           <ul className="mt-1 pl-3 text-xs text-muted-foreground space-y-0.5">
-            {entries.map((e) => (
-              <li
-                key={e.file_path}
-                className="truncate"
-                title={e.file_path}
-              >
-                {e.file_path}
-              </li>
-            ))}
+            {entries.map((e) => {
+              const yieldable = hasExclusiveLock(e, lockInfo);
+              const key = lockYieldCooldownKey(e.file_path, e.holder_task_run_id);
+              const cooldownUntil = cooldowns.get(key) ?? 0;
+              const cooldownLeft = lockYieldCooldownRemainingSecs(
+                cooldownUntil,
+                nowMs,
+              );
+              const inCooldown = cooldownLeft > 0;
+              const buttonTitle = inCooldown
+                ? `Cooldown — request again in ${cooldownLeft}s`
+                : "Ask the holder to yield this lock";
+
+              return (
+                <li
+                  key={e.file_path}
+                  className="flex items-center gap-2"
+                  data-ui-bridge-id="productivity.file-activity-live-file-row"
+                  data-file-path={e.file_path}
+                  data-holder-task-run-id={e.holder_task_run_id}
+                >
+                  <span className="truncate flex-1" title={e.file_path}>
+                    {e.file_path}
+                  </span>
+                  {yieldable && (
+                    <button
+                      type="button"
+                      data-ui-bridge-id="productivity.file-activity-yield"
+                      data-file-path={e.file_path}
+                      data-holder-task-run-id={e.holder_task_run_id}
+                      disabled={inCooldown}
+                      onClick={() =>
+                        void handleRequestYield(e.file_path, e.holder_task_run_id)
+                      }
+                      title={buttonTitle}
+                      className={
+                        inCooldown
+                          ? "inline-flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground/60 cursor-not-allowed"
+                          : "inline-flex items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted/30"
+                      }
+                    >
+                      <Hand className="w-3 h-3" />
+                      {inCooldown ? `${cooldownLeft}s` : "Yield"}
+                    </button>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </li>
       ))}
@@ -319,6 +501,10 @@ export interface FileActivityPanelProps {
   /** Test seam — when supplied, the panel skips its polling loop and
    *  renders the supplied snapshot. Production callers omit this. */
   initialDataForTest?: import("./fileActivityApi").HeatmapResponse;
+  /** Test seam — companion lock-info snapshot when `initialDataForTest`
+   *  is set. Production callers omit this; the panel's poll loop will
+   *  fetch it on the same 5s cadence as the heatmap. */
+  initialLockInfoForTest?: FileLockInfoEntry[];
   /** Optional callback fired when the user clicks a holder name. Used
    *  by tests to assert click-to-jump behavior. Production wires to
    *  `__UI_BRIDGE__.navigateHandler("terminal")` (page-nav only;
@@ -328,18 +514,22 @@ export interface FileActivityPanelProps {
 
 export function FileActivityPanel({
   initialDataForTest,
+  initialLockInfoForTest,
   onJumpToHolder,
 }: FileActivityPanelProps) {
   const [windowSecs, setWindowSecsState] = useState<number>(() =>
     initialDataForTest ? DEFAULT_WINDOW_SECS : loadStoredWindowSecs(),
   );
 
-  const { data, error, isStale, refresh } = useFileActivity({
+  const { data, lockInfo, error, isStale, refresh } = useFileActivity({
     windowSecs,
     enabled: initialDataForTest == null,
   });
 
   const snapshot = initialDataForTest ?? data;
+  const effectiveLockInfo = initialDataForTest
+    ? (initialLockInfoForTest ?? null)
+    : lockInfo;
 
   const handleWindowChange = useCallback((secs: number) => {
     setWindowSecsState(secs);
@@ -386,6 +576,7 @@ export function FileActivityPanel({
           </div>
           <LiveSnapshotSection
             rows={snapshot?.live ?? []}
+            lockInfo={effectiveLockInfo}
             onJumpToHolder={jumpHandler}
           />
         </section>
