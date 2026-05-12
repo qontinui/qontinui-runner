@@ -1950,13 +1950,7 @@ mod tests {
         // not provided, real-clock signaled_at timestamp).
         let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
 
-        let signaled = signal_long_wait_core(
-            &tx,
-            "src/foo.rs",
-            "task-B",
-            "Session B",
-            None,
-        );
+        let signaled = signal_long_wait_core(&tx, "src/foo.rs", "task-B", "Session B", None);
         assert!(signaled, "signal-long-wait should always return true");
 
         let event = rx
@@ -1985,13 +1979,8 @@ mod tests {
         // `formatEstimate` helper depends on the numeric shape.
         let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
 
-        let signaled = signal_long_wait_core(
-            &tx,
-            "src/foo.rs",
-            "task-B",
-            "Session B",
-            Some(300_000),
-        );
+        let signaled =
+            signal_long_wait_core(&tx, "src/foo.rs", "task-B", "Session B", Some(300_000));
         assert!(signaled);
 
         let event = rx
