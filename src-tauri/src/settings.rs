@@ -39,9 +39,9 @@ pub enum CliExecutionMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountSelectionMode {
-    #[default]
     Manual, // Use the explicitly configured config_dir
-    LeastUsage, // Auto-select the account with lowest utilization
+    #[default]
+    LeastUsage, // Auto-select the account with lowest utilization. No-op when fewer than two config dirs are configured, so safe as the default.
 }
 
 /// Settings for Claude Code CLI execution
@@ -66,7 +66,7 @@ impl Default for ClaudeCliSettings {
             custom_path: None,
             timeout_seconds: 600,
             config_dir: None,
-            account_selection_mode: AccountSelectionMode::Manual,
+            account_selection_mode: AccountSelectionMode::LeastUsage,
         }
     }
 }

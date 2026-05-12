@@ -310,8 +310,11 @@ pub async fn plan_intent_handler(
     );
     let full_prompt = format!("{}\n\nUser request: {}", system_prompt, request.prompt);
 
-    // Run through the configured AI provider (Claude CLI, Claude API, Gemini, etc.)
+    // Pin the Claude account with the most remaining quota for the duration
+    // of this prompt-home submission. No-op unless multi-account least-usage
+    // mode is enabled in settings.
     let ai_response = tokio::task::spawn_blocking(move || {
+        crate::ai_provider::pick_best_account();
         crate::ai_provider::routing::run_prompt_sync(&full_prompt, None)
     })
     .await

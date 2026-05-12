@@ -946,6 +946,68 @@ pub struct DiscoveryPortsPayload {
     pub ports: Vec<u16>,
 }
 
+/// Payload for `GET/PUT /settings/claude-config-dirs`.
+///
+/// `dirs` is the list of Claude Code config directories (each containing a
+/// `.credentials.json` for one account) that the runner is allowed to
+/// rotate among in `AccountSelectionMode::LeastUsage`. On `PUT`, entries
+/// without a `projects/` subdirectory are filtered out — the response
+/// echoes the accepted list so callers can detect the drop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeConfigDirsPayload {
+    pub dirs: Vec<String>,
+}
+
+/// GET /settings/claude-config-dirs
+async fn get_claude_config_dirs_setting(
+) -> Result<Json<ApiResponse<ClaudeConfigDirsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let dirs = tokio::task::spawn_blocking(settings::get_claude_config_dirs)
+        .await
+        .map_err(|e| {
+            error!("Failed to get claude config dirs: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Task failed: {}", e))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(ClaudeConfigDirsPayload { dirs })))
+}
+
+/// PUT /settings/claude-config-dirs
+///
+/// Mirrors the validation in `commands::config::save_claude_config_dirs`:
+/// each path must have a `projects/` subdirectory or it is silently
+/// dropped. The response includes the filtered (accepted) list.
+async fn save_claude_config_dirs_setting(
+    Json(payload): Json<ClaudeConfigDirsPayload>,
+) -> Result<Json<ApiResponse<ClaudeConfigDirsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = tokio::task::spawn_blocking(move || {
+        let valid_dirs: Vec<String> = payload
+            .dirs
+            .into_iter()
+            .filter(|d| std::path::Path::new(d).join("projects").exists())
+            .collect();
+        settings::save_claude_config_dirs(valid_dirs.clone()).map(|()| valid_dirs)
+    })
+    .await
+    .map_err(|e| {
+        error!("Failed to save claude config dirs: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Task failed: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(dirs) => {
+            info!("Saved {} Claude config dirs via HTTP", dirs.len());
+            Ok(Json(ApiResponse::success(ClaudeConfigDirsPayload { dirs })))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
 /// GET /settings/discovery-ports
 async fn get_discovery_ports_setting(
 ) -> Result<Json<ApiResponse<DiscoveryPortsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -1008,6 +1070,12 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/settings/ai/api-key", post(save_ai_api_key))
         .route("/settings/ai/api-key/{provider}", delete(delete_ai_api_key))
         .route("/settings/ai/has-key/{provider}", get(has_ai_api_key))
+        // Multi-account Claude config dirs (used by `pick_best_account` in
+        // `account_selection_mode = "least_usage"`)
+        .route(
+            "/settings/claude-config-dirs",
+            get(get_claude_config_dirs_setting).put(save_claude_config_dirs_setting),
+        )
         // Agentic settings
         .route(
             "/settings/agentic",

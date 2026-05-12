@@ -2390,20 +2390,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                // If least-usage mode is enabled, resolve the best account
-                let ai_settings = settings::get_ai_settings();
-                if matches!(
-                    ai_settings.claude_cli.account_selection_mode,
-                    settings::AccountSelectionMode::LeastUsage
-                ) {
-                    info!("Least-usage account selection enabled, resolving best account...");
-                    if let Some(dir) =
-                        commands::ai_settings::resolve_active_config_dir().await
-                    {
-                        info!("Resolved least-usage account: {}", dir);
-                        ai_provider::set_resolved_config_dir(Some(dir));
-                    }
-                }
+                // Cooldown-driven account selection. `pick_best_account`
+                // internally checks `account_selection_mode == LeastUsage`
+                // and returns immediately otherwise — no need to gate the
+                // call here. Runs on a blocking pool because the picker
+                // reads global settings/state synchronously.
+                info!("Running cooldown-driven account selection at startup...");
+                tokio::task::spawn_blocking(ai_provider::pick_best_account)
+                    .await
+                    .ok();
             });
 
             // Bootstrap World State Verifier live config from persisted

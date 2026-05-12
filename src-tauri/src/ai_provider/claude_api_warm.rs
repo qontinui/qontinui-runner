@@ -31,11 +31,35 @@ use super::types::AiResponse;
 use crate::config_facade::ai_keychain;
 use crate::doctor::DoctorHandle;
 use crate::settings;
+use reqwest::StatusCode;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
+
+/// Default cooldown for a rate-limited account when the server response
+/// omits a `Retry-After` header. Five minutes.
+const DEFAULT_RETRY_AFTER_SECS: u64 = 300;
+
+/// Parse `Retry-After` from a 429 response and mark the currently-resolved
+/// Claude account as rate-limited for that duration. Mirrors the helper of
+/// the same name in `claude_api.rs` — the warm provider sends its OAuth
+/// token (when used) as `x-api-key`, and OAuth credentials are scoped to
+/// `config_dir`, so the active dir from `super::config::get_resolved_config_dir`
+/// is the right cooldown target. If no dir is resolved (manual single-key
+/// mode), this is a no-op and the generic cooldown rotation handles it.
+fn mark_current_account_rate_limited(headers: &reqwest::header::HeaderMap) {
+    let Some(dir) = super::config::get_resolved_config_dir() else {
+        return;
+    };
+    let secs = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RETRY_AFTER_SECS);
+    super::config::mark_account_rate_limited_with_duration(&dir, Duration::from_secs(secs));
+}
 
 /// A credential usable for authenticating to `api.anthropic.com`.
 ///
@@ -315,6 +339,9 @@ pub(crate) fn run_claude_api_warm(
             Ok(resp) => {
                 if !resp.status().is_success() {
                     let status = resp.status();
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        mark_current_account_rate_limited(resp.headers());
+                    }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!(
                         "Claude API (warm) error ({}): {}",
@@ -453,6 +480,9 @@ pub(crate) fn run_claude_api_warm_with_structured_output(
             Ok(resp) => {
                 if !resp.status().is_success() {
                     let status = resp.status();
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        mark_current_account_rate_limited(resp.headers());
+                    }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!(
                         "Claude API (warm, structured) error ({}): {}",

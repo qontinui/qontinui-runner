@@ -1043,54 +1043,6 @@ pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandRes
     })
 }
 
-/// Resolve the effective config_dir based on account selection mode.
-///
-/// - Manual mode: returns the configured config_dir as-is
-/// - LeastUsage mode: probes all accounts and returns the one with lowest utilization
-pub async fn resolve_active_config_dir() -> Option<String> {
-    let ai_settings = settings::get_ai_settings();
-    let cli_settings = &ai_settings.claude_cli;
-
-    match cli_settings.account_selection_mode {
-        AccountSelectionMode::Manual => cli_settings.config_dir.clone(),
-        AccountSelectionMode::LeastUsage => {
-            let config_dirs = settings::get_claude_config_dirs();
-            if config_dirs.is_empty() {
-                info!("No config dirs configured, falling back to manual config_dir");
-                return cli_settings.config_dir.clone();
-            }
-
-            let futures: Vec<_> = config_dirs
-                .into_iter()
-                .map(|dir| async move { probe_account_usage(dir).await })
-                .collect();
-
-            let results = futures::future::join_all(futures).await;
-
-            let best = results.iter().filter(|r| r.error.is_none()).min_by(|a, b| {
-                a.utilization
-                    .partial_cmp(&b.utilization)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            match best {
-                Some(account) => {
-                    info!(
-                        "Auto-selected account '{}' with {:.0}% utilization",
-                        account.label,
-                        account.utilization * 100.0
-                    );
-                    Some(account.config_dir.clone())
-                }
-                None => {
-                    info!("All account probes failed, falling back to manual config_dir");
-                    cli_settings.config_dir.clone()
-                }
-            }
-        }
-    }
-}
-
 // ============================================================================
 // Account Switching
 // ============================================================================
