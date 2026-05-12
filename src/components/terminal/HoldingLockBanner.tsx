@@ -181,6 +181,39 @@ export function pickOldestRequest(
   return oldest;
 }
 
+/**
+ * Auto-yield-on-idle policy (lock-yield-protocol-plan §Open Q4):
+ * formats an advisory countdown for the holder's banner.
+ *
+ *   - When the policy is disabled, returns `null` (no badge).
+ *   - When `waiterCount <= 0`, returns `null` (no waiter, no auto-yield risk).
+ *   - Otherwise returns the remaining seconds until the policy can
+ *     fire, computed as `max(idleThresholdSecs - holderIdleSecs,
+ *     minWaitSecs - waiterWaitedSecs, 0)`. The actual policy AND-gates
+ *     both thresholds so the larger remaining duration is the true
+ *     "earliest auto-yield" estimate.
+ *   - String form is `"auto-yield in Ns"` for N>0, or
+ *     `"auto-yield imminent"` for N==0.
+ *
+ * Pure helper exported for vitest.
+ */
+export function formatAutoYieldCountdown(args: {
+  enabled: boolean;
+  waiterCount: number;
+  holderIdleSecs: number;
+  waiterWaitedSecs: number;
+  idleThresholdSecs: number;
+  minWaitSecs: number;
+}): string | null {
+  if (!args.enabled) return null;
+  if (args.waiterCount <= 0) return null;
+  const idleRemaining = Math.max(0, args.idleThresholdSecs - args.holderIdleSecs);
+  const waitRemaining = Math.max(0, args.minWaitSecs - args.waiterWaitedSecs);
+  const remaining = Math.max(idleRemaining, waitRemaining);
+  if (remaining <= 0) return "auto-yield imminent";
+  return `auto-yield in ${remaining}s`;
+}
+
 // ── Component ───────────────────────────────────────────────────────────────
 
 export interface HoldingLockBannerProps {
@@ -214,6 +247,21 @@ export interface HoldingLockBannerProps {
    * mode takes priority over ambient `waiterCount > 0` mode.
    */
   incomingRequests?: IncomingYieldRequest[];
+  /**
+   * Lock-yield-protocol-plan §Open Q4 — auto-yield-on-idle policy
+   * context. When provided AND `enabled === true` AND
+   * `waiterCount > 0`, the banner renders a subtle countdown line
+   * advising the holder that the auto-yield policy may release this
+   * lock on their behalf. Purely advisory — the runner runs the
+   * policy regardless of whether this prop is set.
+   */
+  autoYieldPolicy?: {
+    enabled: boolean;
+    idleThresholdSecs: number;
+    minWaitSecs: number;
+    /** Seconds since holder's last terminal output (from idle-status feed). */
+    holderIdleSecs: number;
+  };
 }
 
 export function HoldingLockBanner({
@@ -226,6 +274,7 @@ export function HoldingLockBanner({
   onDismissLocal,
   fetchImpl,
   incomingRequests,
+  autoYieldPolicy,
 }: HoldingLockBannerProps) {
   // Phase 2 (stuck-session heartbeat) — subscribe to the shared 1Hz
   // broadcast so the seconds-since label keeps ticking. Previously
@@ -285,6 +334,21 @@ export function HoldingLockBanner({
   // practice they usually match, but a forward-looking heatmap-driven
   // request might target a different lock this tab also holds).
   const yieldFilePath = inRequestMode ? oldestRequest.filePath : filePath;
+
+  // Auto-yield countdown (advisory). The runner's policy is the actual
+  // truth — this badge just tells the user when they might lose the
+  // lock involuntarily, so they aren't surprised by a sudden release.
+  const waiterWaitedSecs = Math.max(0, Math.floor((nowMs - sinceMs) / 1000));
+  const autoYieldLabel = autoYieldPolicy
+    ? formatAutoYieldCountdown({
+        enabled: autoYieldPolicy.enabled,
+        waiterCount,
+        holderIdleSecs: autoYieldPolicy.holderIdleSecs,
+        waiterWaitedSecs,
+        idleThresholdSecs: autoYieldPolicy.idleThresholdSecs,
+        minWaitSecs: autoYieldPolicy.minWaitSecs,
+      })
+    : null;
 
   // Phase 3 (stuck-session heartbeat) — fire-and-forget POST to the
   // signal-long-wait endpoint. Even if the POST fails the cooldown
@@ -353,6 +417,16 @@ export function HoldingLockBanner({
         <Hourglass className="w-3.5 h-3.5 shrink-0 text-[#e0af68] mt-0.5" />
         <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
           {message}
+          {autoYieldLabel && (
+            <span
+              data-ui-bridge-id="terminal.holding-lock-banner-auto-yield-countdown"
+              data-task-run-id={taskRunId}
+              data-file-path={filePath}
+              className="ml-1 text-[10px] text-muted-foreground"
+            >
+              ({autoYieldLabel})
+            </span>
+          )}
         </div>
         <button
           type="button"

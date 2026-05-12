@@ -454,6 +454,27 @@ struct FileLockEntry {
     acquired_at: u64,
 }
 
+/// A single waiter currently blocked in [`FileLockManager::acquire`].
+///
+/// Auto-yield (§Open Q4 of lock-yield-protocol-plan) needs the
+/// `waiting_since_ms` (oldest-waiter age check) and the waiter's own
+/// friendly `holder_name` (event payload). The list is FIFO — the
+/// first entry is the longest-waiting; this is the one the policy
+/// task consults when deciding whether to auto-release.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileLockWaiter {
+    /// Task run ID of the session waiting on the lock.
+    pub task_run_id: String,
+    /// Friendly name of the WAITER (not the current holder). This is
+    /// the same string `claude_session::dispatcher.rs` emits as
+    /// `holder_name` on `file-lock-waiting` events.
+    pub holder_name: String,
+    /// Epoch milliseconds when this waiter first entered the wait
+    /// queue. Stable across acquire-loop iterations — the entry is
+    /// pushed exactly once, on the first observation of contention.
+    pub waiting_since_ms: u64,
+}
+
 /// Exclusive per-file lock manager that blocks concurrent access.
 ///
 /// When a session edits a file (Edit/Write tool), it acquires an exclusive lock.
@@ -464,14 +485,26 @@ struct FileLockEntry {
 /// Unlike the advisory `FileRegistryManager`, this is a hard blocking mechanism.
 #[derive(Debug, Clone)]
 pub struct FileLockManager {
-    state: Arc<RwLock<HashMap<String, FileLockEntry>>>,
+    state: Arc<RwLock<FileLockManagerState>>,
     notify: Arc<Notify>,
+}
+
+/// Internal state for [`FileLockManager`]. Held under a single
+/// `RwLock` so the held-locks map and the per-file waiter queues stay
+/// consistent across acquire / release transitions.
+#[derive(Debug, Default)]
+struct FileLockManagerState {
+    locks: HashMap<String, FileLockEntry>,
+    /// `file_path` (normalized) → ordered list of waiters (FIFO).
+    /// Auto-yield consults `waiters[normalized][0]` as the
+    /// longest-waiting blocked session for the oldest-wait check.
+    waiters: HashMap<String, Vec<FileLockWaiter>>,
 }
 
 impl FileLockManager {
     pub fn new() -> Self {
         Self {
-            state: Arc::new(RwLock::new(HashMap::new())),
+            state: Arc::new(RwLock::new(FileLockManagerState::default())),
             notify: Arc::new(Notify::new()),
         }
     }
@@ -490,28 +523,54 @@ impl FileLockManager {
     ) -> Option<String> {
         let normalized = normalize_path(file_path);
         let mut waited_for: Option<String> = None;
+        // Track whether this caller has registered a waiter row for
+        // the current acquire call. The auto-yield policy task reads
+        // `waiters[normalized][0].waiting_since_ms` to decide when
+        // the oldest waiter has waited long enough; pushing on every
+        // loop iteration would reset the clock and starve the policy.
+        let mut registered_waiter = false;
 
         loop {
             {
                 let mut state = self.state.write().await;
 
                 // Check if already held by this session (idempotent)
-                if let Some(entry) = state.get(&normalized) {
+                if let Some(entry) = state.locks.get(&normalized) {
                     if entry.holder_task_run_id == task_run_id {
+                        // Acquired by self (idempotent). Clean up any
+                        // stale waiter row we may have left from a
+                        // prior loop iteration before the holder
+                        // changed identity.
+                        Self::remove_waiter_locked(&mut state, &normalized, task_run_id);
                         return waited_for;
                     }
                     // Held by another session — record who we're waiting for, then wait
                     waited_for = Some(entry.holder_name.clone());
+                    if !registered_waiter {
+                        state
+                            .waiters
+                            .entry(normalized.clone())
+                            .or_default()
+                            .push(FileLockWaiter {
+                                task_run_id: task_run_id.to_string(),
+                                holder_name: holder_name.to_string(),
+                                waiting_since_ms: now_millis(),
+                            });
+                        registered_waiter = true;
+                    }
                 } else {
-                    // Free — acquire it
-                    state.insert(
-                        normalized,
+                    // Free — acquire it. Pop our waiter row (if any)
+                    // so `waiters[file]` only ever contains live
+                    // blocked sessions.
+                    state.locks.insert(
+                        normalized.clone(),
                         FileLockEntry {
                             holder_task_run_id: task_run_id.to_string(),
                             holder_name: holder_name.to_string(),
                             acquired_at: now_millis(),
                         },
                     );
+                    Self::remove_waiter_locked(&mut state, &normalized, task_run_id);
                     return waited_for;
                 }
             }
@@ -523,14 +582,29 @@ impl FileLockManager {
         }
     }
 
+    /// Remove a single waiter entry for `(file_path, task_run_id)` from
+    /// the shared state. Must be called with the state write lock held.
+    fn remove_waiter_locked(
+        state: &mut FileLockManagerState,
+        normalized: &str,
+        task_run_id: &str,
+    ) {
+        if let Some(queue) = state.waiters.get_mut(normalized) {
+            queue.retain(|w| w.task_run_id != task_run_id);
+            if queue.is_empty() {
+                state.waiters.remove(normalized);
+            }
+        }
+    }
+
     /// Release a specific file lock.
     pub async fn release(&self, file_path: &str, task_run_id: &str) {
         let normalized = normalize_path(file_path);
         let mut state = self.state.write().await;
 
-        if let Some(entry) = state.get(&normalized) {
+        if let Some(entry) = state.locks.get(&normalized) {
             if entry.holder_task_run_id == task_run_id {
-                state.remove(&normalized);
+                state.locks.remove(&normalized);
                 drop(state);
                 self.notify.notify_waiters();
             }
@@ -546,7 +620,7 @@ impl FileLockManager {
     pub async fn release_all(&self, task_run_id: &str) -> Vec<String> {
         let mut state = self.state.write().await;
         let mut released_paths: Vec<String> = Vec::new();
-        state.retain(|path, entry| {
+        state.locks.retain(|path, entry| {
             if entry.holder_task_run_id == task_run_id {
                 released_paths.push(path.clone());
                 false
@@ -554,6 +628,13 @@ impl FileLockManager {
                 true
             }
         });
+        // Also evict this task from every waiter queue — when a session
+        // ends mid-wait it must not linger as a stale "blocked
+        // session" the auto-yield policy could account for.
+        for queue in state.waiters.values_mut() {
+            queue.retain(|w| w.task_run_id != task_run_id);
+        }
+        state.waiters.retain(|_, queue| !queue.is_empty());
         if !released_paths.is_empty() {
             info!(
                 "Released {} file lock(s) for task {}",
@@ -578,7 +659,7 @@ impl FileLockManager {
             match self.state.try_write() {
                 Ok(mut state) => {
                     let mut released_paths: Vec<String> = Vec::new();
-                    state.retain(|path, entry| {
+                    state.locks.retain(|path, entry| {
                         if entry.holder_task_run_id == task_run_id {
                             released_paths.push(path.clone());
                             false
@@ -586,6 +667,10 @@ impl FileLockManager {
                             true
                         }
                     });
+                    for queue in state.waiters.values_mut() {
+                        queue.retain(|w| w.task_run_id != task_run_id);
+                    }
+                    state.waiters.retain(|_, queue| !queue.is_empty());
                     if !released_paths.is_empty() {
                         drop(state);
                         self.notify.notify_waiters();
@@ -611,6 +696,7 @@ impl FileLockManager {
         let normalized = normalize_path(file_path);
         let state = self.state.read().await;
         state
+            .locks
             .get(&normalized)
             .filter(|e| e.holder_task_run_id != task_run_id)
             .map(|e| e.holder_name.clone())
@@ -620,12 +706,39 @@ impl FileLockManager {
     pub async fn info(&self) -> Vec<FileLockInfo> {
         let state = self.state.read().await;
         state
+            .locks
             .iter()
             .map(|(path, entry)| FileLockInfo {
                 file_path: path.clone(),
                 holder_task_run_id: entry.holder_task_run_id.clone(),
                 holder_name: entry.holder_name.clone(),
                 acquired_at: entry.acquired_at,
+            })
+            .collect()
+    }
+
+    /// Get info about all held locks with their live waiter queues.
+    ///
+    /// Mirrors [`Self::info`] shape but extends each entry with the
+    /// `waiters: Vec<FileLockWaiter>` consumed by the auto-yield
+    /// policy task (see `executor::auto_yield_policy`). The bare
+    /// [`Self::info`] remains unchanged so existing lock-yield Phase 4
+    /// consumers don't need to migrate.
+    pub async fn info_with_waiters(&self) -> Vec<FileLockInfoWithWaiters> {
+        let state = self.state.read().await;
+        state
+            .locks
+            .iter()
+            .map(|(path, entry)| FileLockInfoWithWaiters {
+                file_path: path.clone(),
+                holder_task_run_id: entry.holder_task_run_id.clone(),
+                holder_name: entry.holder_name.clone(),
+                acquired_at: entry.acquired_at,
+                waiters: state
+                    .waiters
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_default(),
             })
             .collect()
     }
@@ -644,6 +757,21 @@ pub struct FileLockInfo {
     pub holder_task_run_id: String,
     pub holder_name: String,
     pub acquired_at: u64,
+}
+
+/// Information about a held file lock plus its live waiter queue.
+///
+/// Returned by [`FileLockManager::info_with_waiters`] and consumed by
+/// the auto-yield policy task. The `waiters` Vec is FIFO — the first
+/// entry is the longest-waiting session and is what the policy uses
+/// to check the `min_wait_secs` floor before triggering an auto-yield.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileLockInfoWithWaiters {
+    pub file_path: String,
+    pub holder_task_run_id: String,
+    pub holder_name: String,
+    pub acquired_at: u64,
+    pub waiters: Vec<FileLockWaiter>,
 }
 
 #[cfg(test)]
@@ -1233,5 +1361,237 @@ mod tests {
         rt.block_on(async {
             assert!(mgr.info().await.is_empty());
         });
+    }
+
+    // =========================================================================
+    // Waiter tracking (lock-yield-protocol-plan §Open Q4)
+    //
+    // `FileLockManager::acquire` now records each blocked caller in
+    // `waiters[normalized]` so the auto-yield policy task can see
+    // ordered (FIFO) blocked-session metadata. Tests cover push on
+    // first observation of contention, pop on actual acquisition,
+    // pop on `release_all` mid-wait, and `info_with_waiters` shape.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_info_with_waiters_empty_when_uncontended() {
+        let mgr = FileLockManager::new();
+        mgr.acquire("src/a.rs", "task-1", "Session A").await;
+        let infos = mgr.info_with_waiters().await;
+        assert_eq!(infos.len(), 1);
+        assert!(
+            infos[0].waiters.is_empty(),
+            "uncontested lock must have an empty waiter queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_waiter_pushed_when_contended_and_popped_on_acquire() {
+        let mgr = FileLockManager::new();
+
+        // task-1 holds the lock.
+        mgr.acquire("src/a.rs", "task-1", "Session A").await;
+
+        // task-2 starts to wait. Spawn it; it blocks until task-1 releases.
+        let mgr_clone = mgr.clone();
+        let waiter_handle = tokio::spawn(async move {
+            mgr_clone
+                .acquire("src/a.rs", "task-2", "Session B")
+                .await
+        });
+
+        // Poll until the waiter has registered (acquire loop pushes the
+        // FileLockWaiter on first iteration when it sees contention).
+        let waiter_seen = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let infos = mgr.info_with_waiters().await;
+                if let Some(entry) = infos.first() {
+                    if !entry.waiters.is_empty() {
+                        return entry.waiters.clone();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("waiter row should have appeared within 2s");
+
+        assert_eq!(waiter_seen.len(), 1);
+        assert_eq!(waiter_seen[0].task_run_id, "task-2");
+        assert_eq!(waiter_seen[0].holder_name, "Session B");
+        assert!(waiter_seen[0].waiting_since_ms > 0);
+
+        // Release the lock so task-2 can acquire.
+        mgr.release("src/a.rs", "task-1").await;
+        let waited_for = waiter_handle
+            .await
+            .expect("waiter task should complete after release");
+        assert_eq!(waited_for.as_deref(), Some("Session A"));
+
+        // After acquisition the waiter row must be gone.
+        let infos = mgr.info_with_waiters().await;
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].holder_task_run_id, "task-2");
+        assert!(
+            infos[0].waiters.is_empty(),
+            "waiter row must be popped on acquisition"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_waiter_dropped_on_release_all_mid_wait() {
+        let mgr = FileLockManager::new();
+
+        mgr.acquire("src/a.rs", "task-1", "Session A").await;
+
+        // task-2 starts to wait.
+        let mgr_clone = mgr.clone();
+        let waiter_handle = tokio::spawn(async move {
+            mgr_clone
+                .acquire("src/a.rs", "task-2", "Session B")
+                .await
+        });
+
+        // Wait until task-2 has registered.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let infos = mgr.info_with_waiters().await;
+                if infos.first().map(|e| e.waiters.len()).unwrap_or(0) == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("waiter row should appear");
+
+        // task-2 ends mid-wait — `release_all` evicts its waiter row.
+        mgr.release_all("task-2").await;
+
+        let infos = mgr.info_with_waiters().await;
+        assert_eq!(infos.len(), 1);
+        assert!(
+            infos[0].waiters.is_empty(),
+            "release_all must evict the waiter row for the released task"
+        );
+
+        // Clean up: release task-1's lock so the spawned waiter wakes
+        // (the acquire loop will see the lock free and proceed; the
+        // waiter row is gone but that's fine for the wake path).
+        mgr.release("src/a.rs", "task-1").await;
+        let _ = waiter_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_waiter_fifo_order_preserved() {
+        let mgr = FileLockManager::new();
+        mgr.acquire("src/a.rs", "task-1", "Session A").await;
+
+        // Spawn task-2 first, then task-3, with a small gap so the
+        // waiting_since_ms values are monotonically increasing and
+        // FIFO order is unambiguous.
+        let mgr2 = mgr.clone();
+        let h2 = tokio::spawn(async move {
+            mgr2.acquire("src/a.rs", "task-2", "Session B").await
+        });
+        // Wait for task-2 to register before spawning task-3.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let infos = mgr.info_with_waiters().await;
+                if infos.first().map(|e| e.waiters.len()).unwrap_or(0) >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("task-2 should register");
+
+        let mgr3 = mgr.clone();
+        let h3 = tokio::spawn(async move {
+            mgr3.acquire("src/a.rs", "task-3", "Session C").await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let infos = mgr.info_with_waiters().await;
+                if infos.first().map(|e| e.waiters.len()).unwrap_or(0) >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("task-3 should register");
+
+        // task-2 should be at the head of the queue (longest-waiting).
+        let infos = mgr.info_with_waiters().await;
+        let waiters = &infos[0].waiters;
+        assert_eq!(waiters.len(), 2);
+        assert_eq!(waiters[0].task_run_id, "task-2");
+        assert_eq!(waiters[1].task_run_id, "task-3");
+
+        // Cleanup.
+        mgr.release("src/a.rs", "task-1").await;
+        let _ = h2.await;
+        // Whichever wakes first now holds; release it so the other can proceed.
+        // Easiest: release_all on both task-2 and task-3 if they ended up holding.
+        mgr.release_all("task-2").await;
+        mgr.release_all("task-3").await;
+        let _ = h3.await;
+    }
+
+    #[tokio::test]
+    async fn test_waiter_idempotent_no_duplicate_on_same_caller() {
+        // Property: `acquire` registers the caller in the waiter queue
+        // exactly once per call, even though the acquire loop wakes on
+        // every notify_waiters() tick (e.g. another lock release fires
+        // notify on this lock too).
+        let mgr = FileLockManager::new();
+        mgr.acquire("src/a.rs", "task-1", "Session A").await;
+
+        let mgr_clone = mgr.clone();
+        let h = tokio::spawn(async move {
+            mgr_clone.acquire("src/a.rs", "task-2", "Session B").await
+        });
+
+        // Wait for the first waiter row to appear.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let infos = mgr.info_with_waiters().await;
+                if infos.first().map(|e| e.waiters.len()).unwrap_or(0) >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("waiter row should appear");
+
+        // Spam notify by acquiring + releasing a different lock; this
+        // forces the waiter's acquire loop to re-iterate without the
+        // held lock changing identity.
+        for _ in 0..3 {
+            mgr.acquire("src/other.rs", "task-other", "Other").await;
+            mgr.release("src/other.rs", "task-other").await;
+        }
+
+        // Give the waiter loop time to spin a couple of times.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let infos = mgr.info_with_waiters().await;
+        let waiters = infos
+            .iter()
+            .find(|e| e.file_path == normalize_path("src/a.rs"))
+            .map(|e| e.waiters.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            waiters.len(),
+            1,
+            "same caller must not appear multiple times in the waiter queue"
+        );
+
+        // Cleanup.
+        mgr.release("src/a.rs", "task-1").await;
+        let _ = h.await;
     }
 }

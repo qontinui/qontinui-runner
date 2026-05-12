@@ -1028,6 +1028,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::library_sync::sync_macros_to_backend,
             commands::library_sync::sync_prompt_snippets_to_backend,
             commands::library_sync::sync_shell_commands_to_backend,
+            commands::lock_yield_policy_settings::get_lock_yield_policy_settings,
+            commands::lock_yield_policy_settings::save_lock_yield_policy_settings,
             commands::logging::append_ai_output_log,
             commands::logging::append_render_log,
             commands::logging::clear_ai_output_log,
@@ -2233,6 +2235,27 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             });
 
             // Embedding backfill job removed (SQLite embeddings deprecated, PG handles this)
+
+            // Start auto-yield-on-idle policy task (lock-yield-protocol-plan
+            // §Open Q4). Polls every 5s; releases held file locks when the
+            // holder has been stdout-idle for `idle_threshold_secs` AND
+            // the oldest waiter has been blocked for `min_wait_secs`.
+            // Disabled by default; user opts in via Settings → Lock-yield.
+            info!("Starting auto-yield-on-idle policy task");
+            {
+                let app_handle_for_yield = app.handle().clone();
+                let app_state_for_yield = app.state::<Arc<AppState>>().inner().clone();
+                let session_manager_for_yield = app
+                    .state::<Arc<claude_session::SessionManager>>()
+                    .inner()
+                    .clone();
+                executor::auto_yield_policy::spawn(
+                    app_handle_for_yield,
+                    app_state_for_yield.file_lock_manager.clone(),
+                    session_manager_for_yield,
+                    app_state_for_yield.event_broadcast.clone(),
+                );
+            }
 
             // Start memory consolidation scheduler in background
             info!("Starting memory consolidation scheduler");

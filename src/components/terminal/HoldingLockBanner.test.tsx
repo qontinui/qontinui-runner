@@ -55,6 +55,7 @@ vi.mock("@/lib/logger", () => ({
 }));
 
 import {
+  formatAutoYieldCountdown,
   formatBannerSeconds,
   formatBannerText,
   formatIncomingRequestText,
@@ -782,5 +783,67 @@ describe("signal-long-wait cooldown lifecycle", () => {
     // Beyond — still disabled-clear.
     vi.setSystemTime(new Date(start + 60_000));
     expect(inSignalCooldown(cooldownUntilMs, Date.now())).toBe(false);
+  });
+});
+
+// ── Auto-yield countdown (lock-yield-protocol-plan §Open Q4) ───────────────
+describe("formatAutoYieldCountdown", () => {
+  const baseArgs = {
+    enabled: true,
+    waiterCount: 1,
+    holderIdleSecs: 0,
+    waiterWaitedSecs: 0,
+    idleThresholdSecs: 60,
+    minWaitSecs: 30,
+  };
+
+  it("returns null when policy is disabled", () => {
+    expect(formatAutoYieldCountdown({ ...baseArgs, enabled: false })).toBeNull();
+  });
+
+  it("returns null when no waiter is present", () => {
+    expect(formatAutoYieldCountdown({ ...baseArgs, waiterCount: 0 })).toBeNull();
+  });
+
+  it("uses the larger remaining of (idle, wait) — wait dominates", () => {
+    // idle remaining: 60-50 = 10. wait remaining: 30-5 = 25. max = 25.
+    expect(
+      formatAutoYieldCountdown({
+        ...baseArgs,
+        holderIdleSecs: 50,
+        waiterWaitedSecs: 5,
+      }),
+    ).toBe("auto-yield in 25s");
+  });
+
+  it("uses the larger remaining of (idle, wait) — idle dominates", () => {
+    // idle remaining: 60-10 = 50. wait remaining: 30-25 = 5. max = 50.
+    expect(
+      formatAutoYieldCountdown({
+        ...baseArgs,
+        holderIdleSecs: 10,
+        waiterWaitedSecs: 25,
+      }),
+    ).toBe("auto-yield in 50s");
+  });
+
+  it("returns 'imminent' when both thresholds met", () => {
+    expect(
+      formatAutoYieldCountdown({
+        ...baseArgs,
+        holderIdleSecs: 60,
+        waiterWaitedSecs: 30,
+      }),
+    ).toBe("auto-yield imminent");
+  });
+
+  it("returns 'imminent' when both thresholds exceeded", () => {
+    expect(
+      formatAutoYieldCountdown({
+        ...baseArgs,
+        holderIdleSecs: 1000,
+        waiterWaitedSecs: 1000,
+      }),
+    ).toBe("auto-yield imminent");
   });
 });
