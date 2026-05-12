@@ -261,12 +261,24 @@ pub async fn compute_plan_recommendations(
     let active_info = app_state.file_registry_manager.info().await;
     let active_paths: HashSet<String> = active_info.into_iter().map(|i| i.file_path).collect();
 
-    // Idle session count — sessions not currently assigned to any task.
-    // Cheap pass over the SessionManager: every active session that the
-    // task table doesn't list as `assigned_session_id` for an in-flight
-    // task is idle.
+    // Idle session count — Ready (not Initializing) sessions not currently
+    // assigned to any task. `list_active` returns every non-Closed session
+    // by design (broad-by-default so cleanup / observability callers see
+    // them); the dispatch-eligibility filter belongs here. Initializing
+    // workers exist but their embedded Claude CLI hasn't surfaced its
+    // readline yet — including them would re-introduce the Phase 1
+    // dispatch race the worker state machine just plugged.
     let live_sessions: Vec<String> = match &session_manager {
-        Some(sm) => sm.list_active(),
+        Some(sm) => sm
+            .list_active()
+            .into_iter()
+            .filter(|id| {
+                matches!(
+                    sm.get_state(id),
+                    Some(crate::claude_session::state::SessionState::Ready)
+                )
+            })
+            .collect(),
         None => Vec::new(),
     };
 

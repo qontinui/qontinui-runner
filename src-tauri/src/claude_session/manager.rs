@@ -216,6 +216,13 @@ impl SessionManager {
     /// List all active session task_run_ids — union of ClaudeSessions and
     /// Workers whose state is non-Closed. Phase 6: workers participate in
     /// `Observation.live_sessions` so Rule B can assign them tasks.
+    ///
+    /// Broad-by-default: includes `Initializing` workers (Phase 1 of the
+    /// 2026-05-11 dispatch-fix plan). Callers that need dispatch-eligible
+    /// sessions only (i.e. `Ready` and not currently assigned) MUST filter
+    /// the returned ids via [`Self::get_state`]. See
+    /// `mcp::reflection::compute_plan_recommendations` for the canonical
+    /// `idle_session_count` pattern.
     pub fn list_active(&self) -> Vec<String> {
         let mut active: Vec<String> = self
             .sessions
