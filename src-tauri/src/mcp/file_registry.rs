@@ -1683,12 +1683,9 @@ mod tests {
         let manager = FileLockManager::new();
         let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
 
-        manager
-            .acquire("src/foo.rs", "task-A", "Session A")
-            .await;
+        manager.acquire("src/foo.rs", "task-A", "Session A").await;
 
-        let (released, _path) =
-            yield_lock_core(&manager, &tx, "src/foo.rs", "task-B").await;
+        let (released, _path) = yield_lock_core(&manager, &tx, "src/foo.rs", "task-B").await;
 
         assert!(
             !released,
@@ -1714,9 +1711,7 @@ mod tests {
         let manager = std::sync::Arc::new(FileLockManager::new());
         let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
 
-        manager
-            .acquire("src/bar.rs", "task-A", "Session A")
-            .await;
+        manager.acquire("src/bar.rs", "task-A", "Session A").await;
 
         // task-C tries to acquire concurrently — must block on task-A's
         // lock until the yield fires `notify_waiters`. Use a clone so the
@@ -1733,19 +1728,17 @@ mod tests {
         // notify-after-release path is the one being exercised.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let (released, normalized) =
-            yield_lock_core(&manager, &tx, "src/bar.rs", "task-A").await;
+        let (released, normalized) = yield_lock_core(&manager, &tx, "src/bar.rs", "task-A").await;
 
         assert!(released, "owner yield should report released=true");
 
         // task-C's blocked acquire should now resolve within the 5-sec
         // notify cycle. Cap our wait at 2 sec so the test fails fast if
         // `notify_waiters` was missed.
-        let waited_for =
-            tokio::time::timeout(std::time::Duration::from_secs(2), acquire_handle)
-                .await
-                .expect("task-C's acquire should resolve after yield")
-                .expect("task-C's tokio task should not panic");
+        let waited_for = tokio::time::timeout(std::time::Duration::from_secs(2), acquire_handle)
+            .await
+            .expect("task-C's acquire should resolve after yield")
+            .expect("task-C's tokio task should not panic");
 
         assert_eq!(
             waited_for,
@@ -1775,8 +1768,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
 
         // No prior acquire — yield against an unheld file.
-        let (released, _) =
-            yield_lock_core(&manager, &tx, "src/missing.rs", "task-A").await;
+        let (released, _) = yield_lock_core(&manager, &tx, "src/missing.rs", "task-A").await;
 
         assert!(
             !released,
@@ -1796,13 +1788,7 @@ mod tests {
     async fn request_yield_valid_payload_broadcasts_event() {
         let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
 
-        let requested = request_yield_core(
-            &tx,
-            "src/foo.rs",
-            "task-A",
-            "Session A",
-            "task-B",
-        );
+        let requested = request_yield_core(&tx, "src/foo.rs", "task-A", "Session A", "task-B");
         assert!(requested, "yield-request should always return true");
 
         let event = rx
@@ -1830,8 +1816,7 @@ mod tests {
         // is the gate, not the producer).
         let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
 
-        let requested =
-            request_yield_core(&tx, "", "task-A", "Session A", "task-B");
+        let requested = request_yield_core(&tx, "", "task-A", "Session A", "task-B");
         assert!(requested);
 
         let event = rx
@@ -1849,18 +1834,10 @@ mod tests {
         let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
 
         // A holds.
-        manager
-            .acquire("src/round.rs", "task-A", "Session A")
-            .await;
+        manager.acquire("src/round.rs", "task-A", "Session A").await;
 
         // B sends yield-request (broadcast only; no state change).
-        let requested = request_yield_core(
-            &tx,
-            "src/round.rs",
-            "task-B",
-            "Session B",
-            "task-A",
-        );
+        let requested = request_yield_core(&tx, "src/round.rs", "task-B", "Session B", "task-A");
         assert!(requested);
         let req_event = rx
             .try_recv()
@@ -1877,8 +1854,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // A (the holder) sees the request banner and clicks Yield.
-        let (released, _) =
-            yield_lock_core(&manager, &tx, "src/round.rs", "task-A").await;
+        let (released, _) = yield_lock_core(&manager, &tx, "src/round.rs", "task-A").await;
         assert!(released, "A's yield should report released=true");
 
         let release_event = rx
@@ -1888,11 +1864,10 @@ mod tests {
         assert_eq!(release_event["task_run_id"], "task-A");
 
         // B unblocks within the notify cycle.
-        let waited_for =
-            tokio::time::timeout(std::time::Duration::from_secs(2), acquire_handle)
-                .await
-                .expect("B should unblock after A yields")
-                .expect("B's tokio task should not panic");
+        let waited_for = tokio::time::timeout(std::time::Duration::from_secs(2), acquire_handle)
+            .await
+            .expect("B should unblock after A yields")
+            .expect("B's tokio task should not panic");
         assert_eq!(waited_for, Some("Session A".to_string()));
 
         // Final state: B holds, no events left in queue.
