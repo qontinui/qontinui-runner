@@ -1979,9 +1979,7 @@ pub fn get_lock_yield_policy_settings() -> LockYieldPolicySettings {
 }
 
 /// Save the lock-yield policy settings.
-pub fn save_lock_yield_policy_settings(
-    policy: LockYieldPolicySettings,
-) -> Result<(), String> {
+pub fn save_lock_yield_policy_settings(policy: LockYieldPolicySettings) -> Result<(), String> {
     let mut settings = load_settings();
     settings.lock_yield_policy = policy;
     save_settings(&settings)

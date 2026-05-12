@@ -98,7 +98,13 @@ pub fn spawn(
     event_broadcast: broadcast::Sender<serde_json::Value>,
 ) {
     tauri::async_runtime::spawn(async move {
-        run_policy_loop(app_handle, file_lock_manager, session_manager, event_broadcast).await;
+        run_policy_loop(
+            app_handle,
+            file_lock_manager,
+            session_manager,
+            event_broadcast,
+        )
+        .await;
     });
 }
 
@@ -145,17 +151,13 @@ async fn run_policy_loop(
                 Some(s) => s,
                 None => continue, // Holder is not a Claude session — can't measure idle.
             };
-            let holder_last_activity_s =
-                holder_session.last_activity_tracker().load(Ordering::Relaxed);
+            let holder_last_activity_s = holder_session
+                .last_activity_tracker()
+                .load(Ordering::Relaxed);
             let holder_idle_secs = now_s.saturating_sub(holder_last_activity_s);
             let oldest_waiter_waited_ms = now_ms.saturating_sub(oldest.waiting_since_ms);
 
-            if !should_yield(
-                holder_idle_secs,
-                oldest_waiter_waited_ms,
-                &settings,
-                now_ms,
-            ) {
+            if !should_yield(holder_idle_secs, oldest_waiter_waited_ms, &settings, now_ms) {
                 continue;
             }
 
@@ -171,10 +173,7 @@ async fn run_policy_loop(
             let oldest_waiter_waited_secs = oldest_waiter_waited_ms / 1000;
             info!(
                 "Auto-yielded file lock '{}' held by '{}' (idle {}s, waiter waited {}s)",
-                entry.file_path,
-                entry.holder_name,
-                holder_idle_secs,
-                oldest_waiter_waited_secs
+                entry.file_path, entry.holder_name, holder_idle_secs, oldest_waiter_waited_secs
             );
 
             let auto_yield_payload = json!({
@@ -213,7 +212,11 @@ async fn run_policy_loop(
 mod tests {
     use super::*;
 
-    fn settings(enabled: bool, idle_threshold_secs: u64, min_wait_secs: u64) -> LockYieldPolicySettings {
+    fn settings(
+        enabled: bool,
+        idle_threshold_secs: u64,
+        min_wait_secs: u64,
+    ) -> LockYieldPolicySettings {
         LockYieldPolicySettings {
             enabled,
             idle_threshold_secs,

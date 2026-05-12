@@ -584,11 +584,7 @@ impl FileLockManager {
 
     /// Remove a single waiter entry for `(file_path, task_run_id)` from
     /// the shared state. Must be called with the state write lock held.
-    fn remove_waiter_locked(
-        state: &mut FileLockManagerState,
-        normalized: &str,
-        task_run_id: &str,
-    ) {
+    fn remove_waiter_locked(state: &mut FileLockManagerState, normalized: &str, task_run_id: &str) {
         if let Some(queue) = state.waiters.get_mut(normalized) {
             queue.retain(|w| w.task_run_id != task_run_id);
             if queue.is_empty() {
@@ -734,11 +730,7 @@ impl FileLockManager {
                 holder_task_run_id: entry.holder_task_run_id.clone(),
                 holder_name: entry.holder_name.clone(),
                 acquired_at: entry.acquired_at,
-                waiters: state
-                    .waiters
-                    .get(path)
-                    .cloned()
-                    .unwrap_or_default(),
+                waiters: state.waiters.get(path).cloned().unwrap_or_default(),
             })
             .collect()
     }
@@ -1394,11 +1386,8 @@ mod tests {
 
         // task-2 starts to wait. Spawn it; it blocks until task-1 releases.
         let mgr_clone = mgr.clone();
-        let waiter_handle = tokio::spawn(async move {
-            mgr_clone
-                .acquire("src/a.rs", "task-2", "Session B")
-                .await
-        });
+        let waiter_handle =
+            tokio::spawn(async move { mgr_clone.acquire("src/a.rs", "task-2", "Session B").await });
 
         // Poll until the waiter has registered (acquire loop pushes the
         // FileLockWaiter on first iteration when it sees contention).
@@ -1446,11 +1435,8 @@ mod tests {
 
         // task-2 starts to wait.
         let mgr_clone = mgr.clone();
-        let waiter_handle = tokio::spawn(async move {
-            mgr_clone
-                .acquire("src/a.rs", "task-2", "Session B")
-                .await
-        });
+        let waiter_handle =
+            tokio::spawn(async move { mgr_clone.acquire("src/a.rs", "task-2", "Session B").await });
 
         // Wait until task-2 has registered.
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1491,9 +1477,7 @@ mod tests {
         // waiting_since_ms values are monotonically increasing and
         // FIFO order is unambiguous.
         let mgr2 = mgr.clone();
-        let h2 = tokio::spawn(async move {
-            mgr2.acquire("src/a.rs", "task-2", "Session B").await
-        });
+        let h2 = tokio::spawn(async move { mgr2.acquire("src/a.rs", "task-2", "Session B").await });
         // Wait for task-2 to register before spawning task-3.
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -1508,9 +1492,7 @@ mod tests {
         .expect("task-2 should register");
 
         let mgr3 = mgr.clone();
-        let h3 = tokio::spawn(async move {
-            mgr3.acquire("src/a.rs", "task-3", "Session C").await
-        });
+        let h3 = tokio::spawn(async move { mgr3.acquire("src/a.rs", "task-3", "Session C").await });
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let infos = mgr.info_with_waiters().await;
@@ -1550,9 +1532,8 @@ mod tests {
         mgr.acquire("src/a.rs", "task-1", "Session A").await;
 
         let mgr_clone = mgr.clone();
-        let h = tokio::spawn(async move {
-            mgr_clone.acquire("src/a.rs", "task-2", "Session B").await
-        });
+        let h =
+            tokio::spawn(async move { mgr_clone.acquire("src/a.rs", "task-2", "Session B").await });
 
         // Wait for the first waiter row to appear.
         tokio::time::timeout(Duration::from_secs(2), async {
