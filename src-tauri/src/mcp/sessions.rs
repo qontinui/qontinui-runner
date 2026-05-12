@@ -174,23 +174,13 @@ async fn spawn_session(
             return Err(format!("register failed: {}", e));
         }
 
-        crate::commands::ai_session::emit_session_state(
-            &handle,
-            &trid,
-            &trid,
-            session.state(),
-        );
+        crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
 
         if let Err(e) = session.send_initial_prompt(&initial_prompt_for_closure) {
             return Err(format!("initial prompt failed: {}", e));
         }
 
-        crate::commands::ai_session::emit_session_state(
-            &handle,
-            &trid,
-            &trid,
-            session.state(),
-        );
+        crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
 
         Ok(())
     })

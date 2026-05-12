@@ -729,8 +729,7 @@ async fn get_coordinator_leader(
             )
         })?;
     let lease_status = crate::commands::productivity::compute_lease_status_for_http(&leader);
-    let seconds_since_renew =
-        crate::commands::productivity::compute_seconds_since_renew(&leader);
+    let seconds_since_renew = crate::commands::productivity::compute_seconds_since_renew(&leader);
     Ok(Json(crate::commands::productivity::LeaderResponse {
         leader,
         lease_status,
