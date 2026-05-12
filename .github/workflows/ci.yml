@@ -223,13 +223,22 @@ jobs:
 
       - name: Live AI extractor smoke
         # Single live API call per PR — Haiku 4.5, ~$0.001 each. Ubuntu-only so the
-        # 3-platform matrix doesn't 3x the cost for no extra signal. continue-on-error:
-        # true because Haiku output is non-deterministic; we want the signal without
-        # flake-blocking PRs.
-        if: ${{ secrets.ANTHROPIC_API_KEY != '' && matrix.platform == 'ubuntu-22.04' }}
+        # 3-platform matrix doesn't 3x the cost for no extra signal. continue-on-error
+        # is true because Haiku output is non-deterministic; we want the signal
+        # without flake-blocking PRs.
+        #
+        # The secret presence check runs INSIDE the shell, not in `if:` — the
+        # `secrets` context is not available to step-level `if:` (only job-level
+        # `if:` and step `env:`/`run:`/`with:`). Setting an empty env var is
+        # safe; we early-exit before invoking cargo.
+        if: matrix.platform == 'ubuntu-22.04'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "ANTHROPIC_API_KEY secret not set — skipping live AI smoke test."
+            exit 0
+          fi
           cd src-tauri
           cargo test --bin qontinui-runner -- --ignored --exact \
             util::path_extraction::tests::test_extract_paths_via_ai_real_call
