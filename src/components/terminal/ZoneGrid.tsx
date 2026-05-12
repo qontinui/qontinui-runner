@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useReducer, useRef, useEffect, type RefObject } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import { instanceStorage } from "@/lib/instance-storage";
@@ -166,6 +167,14 @@ export function ZoneGrid({
       const trimmed = title.trim();
       if (!trimmed) return;
       renameTab(tabId, trimmed);
+      // Phase 2: bi-directional title sync. The local React rename above
+      // updates UI immediately; fire-and-forget the backend write so other
+      // observers (`GET /terminals`, multi-window setups) see the same
+      // value. Failures are non-fatal — at worst the backend keeps the
+      // spawn-time title; we still rendered the new one locally.
+      invoke("terminal_set_title", { terminalId: tabId, title: trimmed }).catch((e) => {
+        console.warn(`[ZoneGrid] terminal_set_title failed for ${tabId}:`, e);
+      });
     },
     [renameTab],
   );
