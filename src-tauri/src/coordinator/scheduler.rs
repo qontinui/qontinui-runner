@@ -151,6 +151,14 @@ pub fn start_coordinator_scheduler(
         // flips back to us the metric counter increments.
         let mut held_lease_last_tick = false;
 
+        // Per-process stale-assignment sweep: tasks that were `assigned` to
+        // a worker session in a prior runner lifetime point at session ids
+        // that no longer exist; without a sweep, Rule B's "assign ready task"
+        // never fires and the queue stalls forever. Run once after the first
+        // successful lease takeover so the sweep runs from the lease holder
+        // (avoids a race where two sibling instances both try to reset).
+        let mut sweep_done = false;
+
         loop {
             tick.tick().await;
             iteration = iteration.wrapping_add(1);
@@ -199,6 +207,32 @@ pub fn start_coordinator_scheduler(
                         );
                     }
                     held_lease_last_tick = true;
+                    // First-lease-takeover stale-assignment sweep. Idempotent —
+                    // a fresh runner has no live sessions, so every
+                    // `assigned`/`needs_fix` row is eligible; subsequent
+                    // bounces of the lease within the same process find no
+                    // matches (sweep_done gates this anyway).
+                    if !sweep_done {
+                        sweep_done = true;
+                        match crate::mcp::coordinator::sweep_stale_assignments(&state, false).await
+                        {
+                            Ok(resp) => {
+                                if !resp.reset.is_empty() || !resp.skipped.is_empty() {
+                                    info!(
+                                        "Coordinator scheduler: startup stale-assignment sweep — reset={} skipped={}",
+                                        resp.reset.len(),
+                                        resp.skipped.len()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Coordinator scheduler: startup stale-assignment sweep failed: {} (proceeding; assignment may stall until next manual reset)",
+                                    e
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(false) => {
                     held_lease_last_tick = false;

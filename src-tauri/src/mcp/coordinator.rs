@@ -554,13 +554,16 @@ pub struct ResetStaleTasksResponse {
 /// `coord.tasks.assigned_session_id` and prevent the next coordinator
 /// iteration from picking the task back up.
 ///
+/// Reusable across the HTTP handler and the scheduler's startup sweep
+/// (`coordinator::scheduler::start_coordinator_scheduler`); both share the
+/// same classification + flip logic so behaviour stays consistent.
+///
 /// Idempotent: a second concurrent call will see the task already in
 /// `ready` and skip it with reason `status not assigned/needs_fix`.
-async fn reset_stale_tasks(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<ResetStaleTasksQuery>,
-) -> Result<Json<ResetStaleTasksResponse>, (StatusCode, String)> {
-    let dry_run = query.dry_run;
+pub(crate) async fn sweep_stale_assignments(
+    state: &Arc<ApiState>,
+    dry_run: bool,
+) -> Result<ResetStaleTasksResponse, String> {
     let app = state.app_state.clone();
 
     // 1. Pull every non-terminal task — same source the dashboard uses.
@@ -568,12 +571,7 @@ async fn reset_stale_tasks(
         .pg_db
         .list_tasks_by_status(NON_TERMINAL_STATUSES)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("list_tasks_by_status: {}", e),
-            )
-        })?;
+        .map_err(|e| format!("list_tasks_by_status: {}", e))?;
 
     // 2. Resolve the live session set. If SessionManager isn't registered
     //    (test harness, or runner shutting down), treat the live set as
@@ -690,11 +688,23 @@ async fn reset_stale_tasks(
         );
     }
 
-    Ok(Json(ResetStaleTasksResponse {
+    Ok(ResetStaleTasksResponse {
         reset: reset_ids,
         skipped,
         dry_run,
-    }))
+    })
+}
+
+/// Thin HTTP wrapper around [`sweep_stale_assignments`]. Mounts at
+/// `POST /coordinator/tasks/reset-stale`; query string supports `dry_run`.
+async fn reset_stale_tasks(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ResetStaleTasksQuery>,
+) -> Result<Json<ResetStaleTasksResponse>, (StatusCode, String)> {
+    sweep_stale_assignments(&state, query.dry_run)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 // =============================================================================
