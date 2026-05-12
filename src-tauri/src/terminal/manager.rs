@@ -95,12 +95,7 @@ impl TerminalManager {
     /// user sees in the UI. Without this, `TerminalSession.title` was
     /// frozen at spawn time and drifted from the OSC 0 title the child
     /// emits at runtime.
-    pub fn set_title(
-        &self,
-        id: &str,
-        title: String,
-        app_handle: &AppHandle,
-    ) -> Result<(), String> {
+    pub fn set_title(&self, id: &str, title: String, app_handle: &AppHandle) -> Result<(), String> {
         let session = self
             .get(id)
             .ok_or_else(|| format!("Terminal session not found: {}", id))?;
