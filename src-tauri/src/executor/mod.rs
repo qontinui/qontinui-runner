@@ -1,3 +1,4 @@
+pub mod auto_yield_policy;
 pub mod bridge_helpers;
 pub mod bridge_manager;
 pub mod context;
@@ -39,7 +40,9 @@ pub use python_bridge::PythonBridge;
 pub use results::{ExecutionOutcome, IntoOutcome};
 pub use state::ExecutorState;
 
-pub use file_registry::{FileLockInfo, FileLockManager, FileRegistryManager};
+pub use file_registry::{
+    FileLockInfo, FileLockInfoWithWaiters, FileLockManager, FileLockWaiter, FileRegistryManager,
+};
 #[allow(unused_imports)]
 pub use url_lock::UrlLockInfo;
 pub use url_lock::UrlLockManager;

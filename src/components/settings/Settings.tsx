@@ -28,6 +28,7 @@ import { RunnerInstancesSettings } from "./RunnerInstancesSettings";
 import { NotificationSettings } from "./NotificationSettings";
 import { OtelSettings } from "./OtelSettings";
 import { ContainerSettings } from "./ContainerSettings";
+import { LockYieldPolicySettings } from "./LockYieldPolicySettings";
 import { SecuritySettings } from "./SecuritySettings";
 
 interface SettingsProps {
@@ -57,6 +58,7 @@ type SettingsTab =
   | "otel"
   | "containers"
   | "security"
+  | "lock-yield"
   | "advanced"
   | "updates";
 
@@ -90,6 +92,7 @@ const SETTINGS_TABS = [
   { id: "otel", label: "OpenTelemetry" },
   { id: "containers", label: "Container Isolation" },
   { id: "security", label: "Security" },
+  { id: "lock-yield", label: "Lock-yield Policy" },
   { id: "advanced", label: "Debug" },
   { id: "updates", label: "Updates" },
 ] as const satisfies ReadonlyArray<{ id: SettingsTab; label: string }>;
@@ -221,6 +224,8 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         return <ContainerSettings onLog={onLog} />;
       case "security":
         return <SecuritySettings onLog={onLog} />;
+      case "lock-yield":
+        return <LockYieldPolicySettings onLog={onLog} />;
       case "advanced":
         return <AdvancedSettings onLog={onLog} onDebugModeChange={onDebugModeChange} />;
       case "updates":

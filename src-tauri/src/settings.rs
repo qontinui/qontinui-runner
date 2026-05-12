@@ -1175,6 +1175,13 @@ pub struct Settings {
     /// Default: false (shipped but inert until the migration is applied).
     #[serde(default)]
     pub trace_api: TraceApiSettings,
+    /// Auto-yield-on-idle policy for file locks. See
+    /// `executor::auto_yield_policy` for the background task that
+    /// consumes this setting. Defaults preserve historical behavior:
+    /// `enabled = false`, so existing deployments don't auto-yield
+    /// until a user opts in.
+    #[serde(default)]
+    pub lock_yield_policy: LockYieldPolicySettings,
 }
 
 // ============================================================================
@@ -1188,6 +1195,58 @@ pub struct Settings {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TraceApiSettings {
     pub enabled: bool,
+}
+
+// ============================================================================
+// Lock Yield Policy Settings (lock-yield-protocol-plan §Open Q4)
+// ============================================================================
+
+/// Auto-yield-on-idle policy for `FileLockManager`.
+///
+/// When `enabled`, a background task (see
+/// `executor::auto_yield_policy`) periodically scans currently-held
+/// file locks and, for each holder that has been idle (no terminal
+/// stdout activity) for at least `idle_threshold_secs` AND whose
+/// oldest waiter has been blocked for at least `min_wait_secs`,
+/// releases the lock on the holder's behalf and emits a
+/// `file-lock-auto-yielded` event.
+///
+/// Defaults are intentionally conservative: `enabled = false` so the
+/// policy is opt-in. Once a user opts in, the 60s idle / 30s wait
+/// thresholds keep transient contention (e.g. a sub-second multi-edit
+/// burst from a busy session) from triggering false-positive yields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockYieldPolicySettings {
+    /// Enable auto-yield. Default off until users opt in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum holder-idle duration (no stdout activity from the holding
+    /// session for this many seconds) before the holder is considered
+    /// yieldable. Default 60.
+    #[serde(default = "default_auto_yield_idle_threshold_secs")]
+    pub idle_threshold_secs: u64,
+    /// Minimum wait duration (a waiter has been blocked on this file
+    /// for at least this many seconds) before auto-yield fires.
+    /// Default 30.
+    #[serde(default = "default_auto_yield_min_wait_secs")]
+    pub min_wait_secs: u64,
+}
+
+fn default_auto_yield_idle_threshold_secs() -> u64 {
+    60
+}
+fn default_auto_yield_min_wait_secs() -> u64 {
+    30
+}
+
+impl Default for LockYieldPolicySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_threshold_secs: default_auto_yield_idle_threshold_secs(),
+            min_wait_secs: default_auto_yield_min_wait_secs(),
+        }
+    }
 }
 
 // ============================================================================
@@ -1907,5 +1966,21 @@ pub fn get_saved_projects() -> Vec<SavedProject> {
 pub fn save_saved_projects(projects: Vec<SavedProject>) -> Result<(), String> {
     let mut settings = load_settings();
     settings.saved_projects = projects;
+    save_settings(&settings)
+}
+
+// ============================================================================
+// Lock Yield Policy accessors
+// ============================================================================
+
+/// Get the current lock-yield policy settings.
+pub fn get_lock_yield_policy_settings() -> LockYieldPolicySettings {
+    load_settings().lock_yield_policy
+}
+
+/// Save the lock-yield policy settings.
+pub fn save_lock_yield_policy_settings(policy: LockYieldPolicySettings) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.lock_yield_policy = policy;
     save_settings(&settings)
 }
