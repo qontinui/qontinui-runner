@@ -566,8 +566,15 @@ export function TerminalTabBar({
         )}
       </div>
 
-      {/* Scrollable tab area */}
-      <div className="flex items-center gap-0.5 px-1 overflow-x-auto scrollbar-none flex-1 min-w-0 h-full">
+      {/* Scrollable tab area.
+          Phase 3: `items-end` (was `items-center`) anchors every tab to
+          the bottom edge of the strip where the active tab's `-mb-px`
+          overlap happens, so the taller active tab grows UPWARD without
+          dragging the inactive tabs along (active renders extra rows for
+          tags + working-dir; inactives don't). Pair with `min-h-[37px]`
+          on each tab below to give inactives a baseline matching the
+          observed active-tab height. */}
+      <div className="flex items-end gap-0.5 px-1 overflow-x-auto scrollbar-none flex-1 min-w-0 h-full">
         {tabs.map((tab) => {
           const isActive = tab.id === activeId;
           const isDead = !tab.isAlive;
@@ -601,7 +608,7 @@ export function TerminalTabBar({
                 e.dataTransfer.effectAllowed = "move";
               }}
               className={`
-              flex items-center gap-1.5 px-3 py-1 rounded-t text-xs font-medium
+              flex items-center gap-1.5 px-3 py-1 rounded-t text-xs font-medium min-h-[37px]
               transition-colors whitespace-nowrap max-w-[260px] group cursor-grab active:cursor-grabbing
               ${
                 isActive

@@ -11,8 +11,13 @@
 //! Workers carry their own `Arc<AtomicU8>` for state (see
 //! [`SessionManager`](super::SessionManager) for the sibling-map
 //! registration shape — Option B′ from the Phase 6 worker plan).
-//! Workers track only `Ready ⇄ Processing → Closed`; they never enter
-//! the `Created`/`Initializing`/`Interrupting`/`Promoting` states.
+//! Workers track `Initializing → Ready ⇄ Processing → Closed`. They
+//! start in `Initializing` so dispatchers (Rule B `assign-task`) can
+//! gate on readline visibility before sending the brief; the
+//! readline-observer task in `commands::productivity::spawn_worker_session`
+//! transitions them to `Ready` once the embedded Claude CLI has set its
+//! OSC 0 title (or after the 8 s fallback timeout). Workers never enter
+//! the `Created`/`Interrupting`/`Promoting` states.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -21,15 +26,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::state::SessionState;
 use crate::terminal::TerminalManager;
 
-// Compact u8 encoding for the three states a worker can hold. Round-trips
+// Compact u8 encoding for the four states a worker can hold. Round-trips
 // only the states the worker lifecycle uses; other variants map back to
 // `Closed` on read so a corrupt write fails closed rather than open.
+const STATE_INITIALIZING: u8 = 1;
 const STATE_READY: u8 = 2;
 const STATE_PROCESSING: u8 = 3;
 const STATE_CLOSED: u8 = 7;
 
 fn state_to_u8(state: SessionState) -> u8 {
     match state {
+        SessionState::Initializing => STATE_INITIALIZING,
         SessionState::Ready => STATE_READY,
         SessionState::Processing => STATE_PROCESSING,
         SessionState::Closed => STATE_CLOSED,
@@ -42,6 +49,7 @@ fn state_to_u8(state: SessionState) -> u8 {
 
 fn state_from_u8(value: u8) -> SessionState {
     match value {
+        STATE_INITIALIZING => SessionState::Initializing,
         STATE_READY => SessionState::Ready,
         STATE_PROCESSING => SessionState::Processing,
         _ => SessionState::Closed,
@@ -59,8 +67,13 @@ pub struct WorkerSession {
 }
 
 impl WorkerSession {
-    /// Build a new worker. State starts as `Ready` — workers are immediately
-    /// available to Rule B once registered.
+    /// Build a new worker. State starts as `Initializing` — the worker is
+    /// registered but NOT yet eligible for assignment. A readline-observer
+    /// task spawned by `spawn_worker_session` transitions to `Ready` once
+    /// the embedded Claude CLI emits an OSC 0 title (its standard startup
+    /// signal) or after an 8 s fallback timeout, whichever fires first.
+    /// See plan `2026-05-11-runner-dispatch-and-terminal-ux-fixes-plan.md`
+    /// Phase 1 for the dispatch-race motivation.
     pub fn new(
         task_run_id: String,
         terminal_id: String,
@@ -75,7 +88,7 @@ impl WorkerSession {
             task_run_id,
             terminal_id,
             title,
-            state: Arc::new(AtomicU8::new(STATE_READY)),
+            state: Arc::new(AtomicU8::new(STATE_INITIALIZING)),
             terminal_manager,
             created_at_unix,
         }
@@ -105,14 +118,17 @@ impl WorkerSession {
     /// Returns the worker's logical state. Workers are NEVER `Closed`
     /// unless we explicitly call [`Self::close`] — the pty might outlive
     /// the worker registration if the user closed the tab. We track
-    /// `Ready ⇄ Processing`.
+    /// `Initializing → Ready ⇄ Processing`.
     pub fn state(&self) -> SessionState {
         state_from_u8(self.state.load(Ordering::Acquire))
     }
 
-    /// Set state. Used by `observe.rs` Phase 2c wiring (Processing→Ready
-    /// when the assigned task transitions to `done`/`cancelled`) and by
-    /// [`Self::send_user_message`] (Ready→Processing on dispatch).
+    /// Set state. Used by:
+    /// - `spawn_worker_session`'s readline-observer task
+    ///   (Initializing→Ready when OSC 0 lands or the 8 s fallback fires).
+    /// - `observe.rs` Phase 2c wiring (Processing→Ready when the assigned
+    ///   task transitions to `done`/`cancelled`).
+    /// - [`Self::send_user_message`] (Ready→Processing on dispatch).
     pub fn set_state(&self, new_state: SessionState) {
         let encoded = state_to_u8(new_state);
         if encoded == STATE_CLOSED && !matches!(new_state, SessionState::Closed) {
@@ -185,6 +201,13 @@ mod tests {
 
     #[test]
     fn state_round_trip() {
+        // Initializing now round-trips — Phase 1 of the dispatch-fix plan
+        // requires workers to be observable in this state so dispatchers
+        // can gate on Ready before sending briefs.
+        assert_eq!(
+            state_from_u8(state_to_u8(SessionState::Initializing)),
+            SessionState::Initializing
+        );
         assert_eq!(
             state_from_u8(state_to_u8(SessionState::Ready)),
             SessionState::Ready
@@ -197,9 +220,17 @@ mod tests {
             state_from_u8(state_to_u8(SessionState::Closed)),
             SessionState::Closed
         );
-        // Unsupported state encodes to Closed.
+        // Truly unsupported variants still collapse to Closed.
         assert_eq!(
-            state_from_u8(state_to_u8(SessionState::Initializing)),
+            state_from_u8(state_to_u8(SessionState::Created)),
+            SessionState::Closed
+        );
+        assert_eq!(
+            state_from_u8(state_to_u8(SessionState::Interrupting)),
+            SessionState::Closed
+        );
+        assert_eq!(
+            state_from_u8(state_to_u8(SessionState::Promoting)),
             SessionState::Closed
         );
     }
@@ -223,7 +254,47 @@ mod tests {
     }
 
     #[test]
+    fn new_starts_in_initializing_and_is_active() {
+        // Phase 1 contract: workers spawn in Initializing and stay
+        // "active" so existing observability paths (cleanup_closed,
+        // list_active, list_all_with_state) keep surfacing them while
+        // they wait for the readline-observer task to flip them Ready.
+        let tm = Arc::new(TerminalManager::new());
+        let w = WorkerSession::new(
+            "task-init".to_string(),
+            "term-init".to_string(),
+            "Worker init".to_string(),
+            tm,
+        );
+        assert_eq!(w.state(), SessionState::Initializing);
+        assert!(
+            w.state().is_active(),
+            "Initializing workers must be considered active"
+        );
+    }
+
+    #[test]
+    fn initializing_to_ready_transition_round_trips() {
+        // The spawn_worker_session readline-observer task drives this
+        // exact transition. Guard it explicitly.
+        let tm = Arc::new(TerminalManager::new());
+        let w = WorkerSession::new(
+            "task-ir".to_string(),
+            "term-ir".to_string(),
+            "Worker ir".to_string(),
+            tm,
+        );
+        assert_eq!(w.state(), SessionState::Initializing);
+        w.set_state(SessionState::Ready);
+        assert_eq!(w.state(), SessionState::Ready);
+    }
+
+    #[test]
     fn unsupported_set_state_is_ignored() {
+        // Initializing, Ready, Processing, and Closed are all accepted.
+        // Created / Interrupting / Promoting collapse to STATE_CLOSED on
+        // encoding and trigger the set_state guard, leaving the previous
+        // state intact.
         let tm = Arc::new(TerminalManager::new());
         let w = WorkerSession::new(
             "task-1".to_string(),
@@ -231,12 +302,18 @@ mod tests {
             "Worker 1".to_string(),
             tm,
         );
+        assert_eq!(w.state(), SessionState::Initializing);
+        // Created is unsupported — set_state should refuse and leave the
+        // previous state in place.
+        w.set_state(SessionState::Created);
+        assert_eq!(w.state(), SessionState::Initializing);
+        w.set_state(SessionState::Interrupting);
+        assert_eq!(w.state(), SessionState::Initializing);
+        w.set_state(SessionState::Promoting);
+        assert_eq!(w.state(), SessionState::Initializing);
+        // Ready, Processing, and Closed are accepted.
+        w.set_state(SessionState::Ready);
         assert_eq!(w.state(), SessionState::Ready);
-        // Initializing isn't representable for a worker; set_state should
-        // refuse and leave the previous state in place.
-        w.set_state(SessionState::Initializing);
-        assert_eq!(w.state(), SessionState::Ready);
-        // Processing and Closed are accepted.
         w.set_state(SessionState::Processing);
         assert_eq!(w.state(), SessionState::Processing);
         w.set_state(SessionState::Ready);

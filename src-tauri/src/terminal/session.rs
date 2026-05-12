@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -83,8 +83,10 @@ pub(crate) fn build_submit_payload(message: &str) -> Vec<u8> {
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
     id: TerminalId,
-    /// Display title.
-    title: String,
+    /// Display title. Mutated post-spawn by [`Self::set_title`] (Phase 2 of
+    /// the bi-directional title sync — frontend OSC 0 observers in xterm.js
+    /// call back via `terminal_set_title` Tauri command).
+    title: Arc<Mutex<String>>,
     /// Working directory the shell was started in.
     working_dir: String,
     /// Which terminal page this session belongs to.
@@ -119,6 +121,21 @@ pub struct TerminalSession {
     output_tx: broadcast::Sender<String>,
     /// Server-side cell grid produced by the VT parser tee in the reader thread.
     grid: Arc<Mutex<Grid>>,
+    /// One-shot sender fired by the reader thread when it observes the
+    /// first OSC 0 / OSC 2 title from the child process. Used by
+    /// `spawn_worker_session` (Phase 1) to gate `Initializing → Ready` on
+    /// readline visibility: Claude Code's CLI emits an OSC 0 title
+    /// (`"✳ Claude Code"`) on startup, so this resolves ~150–300 ms after
+    /// child spawn. Wrapped in `Mutex<Option<...>>` because the sender is
+    /// consumed (`take()`'d) on first fire — subsequent OSC 0s do not
+    /// re-fire.
+    first_osc_title_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// One-shot receiver, taken at most once by
+    /// [`Self::subscribe_first_osc_title`]. After the take, callers that
+    /// ask again get `None` and should treat the worker as already ready
+    /// (the OSC may have fired before they could subscribe, in which case
+    /// the sender already consumed the slot above).
+    first_osc_title_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
 }
 
 impl TerminalSession {
@@ -222,6 +239,15 @@ impl TerminalSession {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        // Phase 1: one-shot fired by the reader thread on the first OSC
+        // 0/2 title transition. The session owns the receiver until a
+        // caller (`spawn_worker_session`) takes it via
+        // `subscribe_first_osc_title`; the reader owns the sender via
+        // an Arc<Mutex<Option<...>>> slot and `take`s it on first fire.
+        let (osc_title_tx, osc_title_rx) = oneshot::channel::<()>();
+        let first_osc_title_tx = Arc::new(Mutex::new(Some(osc_title_tx)));
+        let first_osc_title_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>> =
+            Arc::new(Mutex::new(Some(osc_title_rx)));
 
         // Get a reader from the master PTY
         let mut reader = pair
@@ -239,6 +265,7 @@ impl TerminalSession {
         let reader_total_bytes = total_bytes_produced.clone();
         let reader_output_tx = output_tx.clone();
         let reader_grid = grid.clone();
+        let reader_osc_title_tx = first_osc_title_tx.clone();
         let reader_handle = thread::Builder::new()
             .name(format!("terminal-reader-{}", &id))
             .spawn(move || {
@@ -278,9 +305,41 @@ impl TerminalSession {
                             reader_total_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
 
                             // Tee through the VT parser into the per-session cell grid.
+                            // Detect the first OSC 0/2 title transition by
+                            // checking whether the grid's title became
+                            // `Some` *during* this parser advance. The
+                            // sender lives in an `Arc<Mutex<Option<...>>>`
+                            // slot we drain on first fire — subsequent
+                            // title changes don't re-fire. Worker dispatch
+                            // gating in `spawn_worker_session` only needs
+                            // the one-shot signal.
+                            let title_was_none = reader_grid
+                                .lock()
+                                .ok()
+                                .map(|g| g.title().is_none())
+                                .unwrap_or(false);
                             if let Ok(mut g) = reader_grid.lock() {
                                 let mut perf = GridPerformer::new(&mut g);
                                 parser.advance(&mut perf, &data);
+                            }
+                            if title_was_none {
+                                let title_is_now_some = reader_grid
+                                    .lock()
+                                    .ok()
+                                    .map(|g| g.title().is_some())
+                                    .unwrap_or(false);
+                                if title_is_now_some {
+                                    if let Ok(mut slot) = reader_osc_title_tx.lock() {
+                                        if let Some(tx) = slot.take() {
+                                            // Receiver may have been
+                                            // dropped (caller didn't
+                                            // subscribe). Ignore — the
+                                            // sender simply discards the
+                                            // signal.
+                                            let _ = tx.send(());
+                                        }
+                                    }
+                                }
                             }
 
                             let encoded = STANDARD.encode(&data);
@@ -390,7 +449,7 @@ impl TerminalSession {
 
         Ok(Self {
             id,
-            title,
+            title: Arc::new(Mutex::new(title)),
             working_dir: cwd,
             page_id,
             writer,
@@ -409,6 +468,8 @@ impl TerminalSession {
             created_at,
             output_tx,
             grid,
+            first_osc_title_tx,
+            first_osc_title_rx,
         })
     }
 
@@ -568,9 +629,17 @@ impl TerminalSession {
 
     /// Get terminal info for the frontend.
     pub fn info(&self) -> TerminalInfo {
+        // Phase 2: title is now `Arc<Mutex<String>>`. Clone under the lock
+        // so the returned snapshot doesn't observe a torn write from a
+        // concurrent `set_title`.
+        let title = self
+            .title
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone());
         TerminalInfo {
             id: self.id.clone(),
-            title: self.title.clone(),
+            title,
             pid: self.child_pid,
             cols: self.cols.load(Ordering::Relaxed),
             rows: self.rows.load(Ordering::Relaxed),
@@ -581,6 +650,42 @@ impl TerminalSession {
             total_bytes_produced: self.total_bytes_produced.load(Ordering::Relaxed),
             page_id: self.page_id.clone(),
         }
+    }
+
+    /// Update the session's display title. Phase 2 of bi-directional
+    /// title sync: the frontend's xterm.js `onTitleChange` handler relays
+    /// observed OSC 0/2 titles back to the runner via the
+    /// `terminal_set_title` Tauri command, which routes through
+    /// `TerminalManager::set_title` to here. Subsequent `info()` calls
+    /// (and `GET /terminals`) see the new value; other observers get the
+    /// `terminal-title-changed` event emitted by the manager.
+    pub fn set_title(&self, title: String) {
+        match self.title.lock() {
+            Ok(mut g) => *g = title,
+            // Poisoned: recover and overwrite. Title is a pure-text field
+            // with no invariants to preserve, so this is safe.
+            Err(e) => *e.into_inner() = title,
+        }
+    }
+
+    /// Take the one-shot receiver that resolves when the reader thread
+    /// observes the first OSC 0/2 title from the child process. Returns
+    /// `None` if a previous caller already took the receiver — callers
+    /// should treat that as "already initialized" and skip the wait.
+    /// `Some(rx)` resolves to `Ok(())` when the title lands, or
+    /// `Err(oneshot::error::RecvError)` if the session closes before any
+    /// OSC 0/2 arrives (caller should fall back to a timeout regardless).
+    ///
+    /// Used by `spawn_worker_session` (Phase 1) to gate
+    /// `Initializing → Ready` on Claude CLI readline visibility — the CLI
+    /// emits its OSC 0 title (`"✳ Claude Code"`) ~150–300 ms after
+    /// startup, so the rx resolves well before the 8 s fallback timeout
+    /// the dispatcher uses.
+    pub fn subscribe_first_osc_title(&self) -> Option<oneshot::Receiver<()>> {
+        self.first_osc_title_rx
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     /// Get the scrollback buffer contents and the byte offset where the data starts.
@@ -762,9 +867,10 @@ mod tests {
     fn make_test_session(buf: Arc<Mutex<Vec<u8>>>) -> TerminalSession {
         let writer: Box<dyn Write + Send> = Box::new(CapturingWriter(buf));
         let (output_tx, _) = broadcast::channel::<String>(1);
+        let (osc_title_tx, osc_title_rx) = oneshot::channel::<()>();
         TerminalSession {
             id: "test".to_string(),
-            title: "test".to_string(),
+            title: Arc::new(Mutex::new("test".to_string())),
             working_dir: ".".to_string(),
             page_id: "default".to_string(),
             writer: Arc::new(Mutex::new(writer)),
@@ -785,6 +891,8 @@ mod tests {
             created_at: 0,
             output_tx,
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
+            first_osc_title_tx: Arc::new(Mutex::new(Some(osc_title_tx))),
+            first_osc_title_rx: Arc::new(Mutex::new(Some(osc_title_rx))),
         }
     }
 
@@ -828,5 +936,30 @@ mod tests {
             "submit_prompt must not emit LF bytes; got {:?}",
             written
         );
+    }
+
+    #[test]
+    fn set_title_updates_info() {
+        // Phase 2: bi-directional title sync. set_title must be visible
+        // via info() so subsequent /terminals reads see the new value.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf);
+        assert_eq!(session.info().title, "test");
+        session.set_title("✳ Claude Code".to_string());
+        assert_eq!(session.info().title, "✳ Claude Code");
+        // Idempotent overwrite.
+        session.set_title("Worker 1".to_string());
+        assert_eq!(session.info().title, "Worker 1");
+    }
+
+    #[test]
+    fn subscribe_first_osc_title_returns_some_once() {
+        // The receiver can be taken at most once. Subsequent takes return
+        // `None` — `spawn_worker_session` interprets that as "already
+        // ready, skip the wait".
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf);
+        assert!(session.subscribe_first_osc_title().is_some());
+        assert!(session.subscribe_first_osc_title().is_none());
     }
 }

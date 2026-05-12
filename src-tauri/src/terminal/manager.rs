@@ -84,6 +84,37 @@ impl TerminalManager {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
     }
 
+    /// Update the title of a terminal session and emit a
+    /// `terminal-title-changed` Tauri event so other webview windows
+    /// (and the backend relay's WS subscribers) stay in sync.
+    ///
+    /// Phase 2 of the bi-directional title sync (plan
+    /// `2026-05-11-runner-dispatch-and-terminal-ux-fixes-plan.md`): the
+    /// frontend's xterm.js `onTitleChange` callback now invokes
+    /// `terminal_set_title` so backend `/terminals` titles match what the
+    /// user sees in the UI. Without this, `TerminalSession.title` was
+    /// frozen at spawn time and drifted from the OSC 0 title the child
+    /// emits at runtime.
+    pub fn set_title(&self, id: &str, title: String, app_handle: &AppHandle) -> Result<(), String> {
+        let session = self
+            .get(id)
+            .ok_or_else(|| format!("Terminal session not found: {}", id))?;
+        session.set_title(title.clone());
+        let payload = serde_json::json!({ "id": id, "title": title });
+        if let Err(e) = app_handle.emit("terminal-title-changed", &payload) {
+            error!("Failed to emit terminal-title-changed: {}", e);
+        }
+        // Mirror to the backend WS relay so remote mobile viewers stay
+        // consistent (same pattern as the reader thread's terminal-output
+        // mirror in session.rs).
+        crate::event_system::broadcast_ws_notification(
+            app_handle,
+            "terminal-title-changed",
+            &payload,
+        );
+        Ok(())
+    }
+
     /// Remove and close a terminal session.
     pub fn close(&self, id: &str) -> Result<(), String> {
         let session = {
@@ -120,6 +151,43 @@ impl TerminalManager {
     /// Get the number of active sessions.
     pub fn count(&self) -> usize {
         self.sessions.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Return the `(cols, rows)` of the largest currently-registered
+    /// terminal — "largest" measured by `cols * rows` cell count. Falls
+    /// back to `(120, 30)` (the historical `create()` default) when no
+    /// sessions exist.
+    ///
+    /// Phase 4 of the 2026-05-11 dispatch-fix plan: worker tabs spawned
+    /// into a zone where another tab is currently visible mount under
+    /// `display: none`. xterm.js's fit-addon then can't measure the
+    /// container, so the backend PTY stays at the 120×30 default until
+    /// the user activates the tab. Pre-sizing the new PTY to the
+    /// dominant zone dims means Coordinator dispatch lands on a PTY
+    /// matching the eventual visible size (Claude doesn't have to wrap
+    /// twice). Fallback dims match what `create()` would have used on
+    /// `None, None`, so behaviour is identical when there's no signal to
+    /// crib from.
+    pub fn dominant_zone_dims(&self) -> (u16, u16) {
+        let sessions = match self.sessions.lock() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Sessions lock poisoned in dominant_zone_dims: {}", e);
+                return (120, 30);
+            }
+        };
+        let mut best: Option<(u16, u16, u32)> = None;
+        for sess in sessions.values() {
+            let info = sess.info();
+            let area = (info.cols as u32).saturating_mul(info.rows as u32);
+            if area == 0 {
+                continue;
+            }
+            if best.map(|(_, _, a)| area > a).unwrap_or(true) {
+                best = Some((info.cols, info.rows, area));
+            }
+        }
+        best.map(|(c, r, _)| (c, r)).unwrap_or((120, 30))
     }
 
     /// Snapshot of `(session_id, Arc<TerminalSession>)` pairs for

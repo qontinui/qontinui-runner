@@ -1347,6 +1347,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_list,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_save_scrollback,
+            commands::terminal::terminal_set_title,
             commands::terminal::terminal_write,
             commands::terminal_analysis::analyze_architecture,
             commands::terminal_analysis::analyze_change_impact,
