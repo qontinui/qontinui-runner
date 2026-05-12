@@ -74,9 +74,11 @@ impl WarmCredential {
 /// 1. Explicit API key via `ai_keychain().get("claude_api")`. Preferred when
 ///    present so production runners with a deliberately provisioned key bill
 ///    that key rather than silently falling through to the user's OAuth quota.
-/// 2. OAuth access token from the Claude CLI's `.credentials.json`, skipped
+/// 2. `$ANTHROPIC_API_KEY` env-var fallback. Useful for CI lanes and local dev
+///    where neither the OS keychain nor a Claude CLI OAuth file is set up.
+/// 3. OAuth access token from the Claude CLI's `.credentials.json`, skipped
 ///    if `expiresAt` is already in the past.
-/// 3. `None` — the warm provider is unavailable; the `auto` path should fall
+/// 4. `None` — the warm provider is unavailable; the `auto` path should fall
 ///    through to `Disabled`.
 pub(super) fn resolve_warm_credential() -> Option<WarmCredential> {
     // 1. Keychain API key wins when present.
@@ -96,7 +98,18 @@ pub(super) fn resolve_warm_credential() -> Option<WarmCredential> {
         }
     }
 
-    // 2. OAuth fallback via the Claude CLI credentials file.
+    // 2. ANTHROPIC_API_KEY env-var fallback. Useful for CI lanes and local dev
+    //    where neither the OS keychain nor a Claude CLI OAuth file is set up.
+    //    Keychain wins when both are present so production runners with a
+    //    deliberately provisioned key bill that key rather than the env var.
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.trim().is_empty() {
+            debug!("Warm credential: resolved from $ANTHROPIC_API_KEY env var");
+            return Some(WarmCredential::ApiKey(key));
+        }
+    }
+
+    // 3. OAuth fallback via the Claude CLI credentials file.
     let creds_path = crate::commands::ai_settings::find_claude_credentials_path()?;
     resolve_oauth_from_path(&creds_path).map(WarmCredential::OAuth)
 }
