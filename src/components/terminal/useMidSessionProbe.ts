@@ -17,7 +17,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ConflictReport, PredictedCollision } from "./useSessionManager";
-import { resolvePort, buildProbeUrl } from "./LaunchMenu";
+import { resolvePort } from "@/lib/runner-api";
+import { buildProbeUrl } from "./LaunchMenu";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 

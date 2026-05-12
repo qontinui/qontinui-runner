@@ -21,7 +21,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { resolvePort } from "./LaunchMenu";
+import { resolvePort } from "@/lib/runner-api";
 import type { TerminalTab } from "./useTerminalManager";
 
 // ── Pure helpers (exported for tests) ────────────────────────────────────────

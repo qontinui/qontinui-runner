@@ -38,9 +38,9 @@ import {
   confidenceTier,
   formatHoldingAge,
   groupHoldingsByHolder,
-  resolvePort,
   summarizeFileLocksByHolder,
 } from "./LaunchMenu";
+import { resolvePort } from "@/lib/runner-api";
 import type {
   ConflictReport,
   FileLockInfo,

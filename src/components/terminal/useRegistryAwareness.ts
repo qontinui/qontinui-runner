@@ -17,7 +17,7 @@
  */
 
 import { useState, useEffect, useRef } from "react";
-import { resolvePort } from "./LaunchMenu";
+import { resolvePort } from "@/lib/runner-api";
 import type { TerminalTab } from "./useTerminalManager";
 import type {
   ConflictReport,
