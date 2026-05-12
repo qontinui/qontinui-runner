@@ -65,6 +65,14 @@ enum BuildReplayErr {
 pub struct ClaudeSession {
     /// Session identifier (typically the task_run_id + phase suffix).
     session_id: String,
+    /// Friendly display name for this session. Mirrors what the file-lock
+    /// dispatcher (`claude_session/dispatcher.rs:398-404`) emits as
+    /// `holder_name` on `file-lock-*` events:
+    /// `session_ctx.session_name` when present (workflow path), else falls
+    /// back to `session_id` (terminal path). Stored here so out-of-process
+    /// consumers (e.g. `GET /sessions/idle-status`) can surface the same
+    /// label without re-deriving it.
+    holder_name: String,
     /// State machine for session lifecycle.
     state_tracker: SessionStateTracker,
     /// Thread-safe stdin writer.
@@ -930,8 +938,19 @@ impl ClaudeSession {
         let stderr_handle = stderr_handle
             .ok_or_else(|| "Internal error: stderr handle consumed unexpectedly".to_string())?;
 
+        // Compute holder_name (matches dispatcher.rs:398-404's derivation
+        // for file-lock event emits). For workflow sessions this is the
+        // human-readable `session_name`; for terminal-launched sessions
+        // (no session_ctx) it falls back to the session_id, which equals
+        // the task_run_id in that path.
+        let holder_name = session_ctx
+            .as_ref()
+            .map(|c| c.session_name.clone())
+            .unwrap_or_else(|| session_id.to_string());
+
         Ok(Self {
             session_id: session_id.to_string(),
+            holder_name,
             state_tracker,
             stdin_writer,
             pending_messages,
@@ -975,6 +994,18 @@ impl ClaudeSession {
     /// Get the last-activity tracker Arc (for Doctor health monitoring).
     pub fn last_activity_tracker(&self) -> Arc<AtomicU64> {
         self.last_activity.clone()
+    }
+
+    /// Friendly display name for this session.
+    ///
+    /// This is the same string the file-lock dispatcher emits as
+    /// `holder_name` on `file-lock-*` events (see
+    /// `claude_session/dispatcher.rs:398-404`): for workflow-spawned
+    /// sessions it is `AiSessionContext::session_name` (e.g.
+    /// `"My Workflow - Iteration 3"`); for terminal-launched sessions
+    /// it falls back to `session_id`.
+    pub fn holder_name(&self) -> &str {
+        &self.holder_name
     }
 
     /// Whether a user has interacted with this session.

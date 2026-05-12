@@ -137,8 +137,13 @@ function TerminalPageInner({
     onSessionCountChange?.(tabs.length);
   }, [tabs.length, onSessionCountChange]);
 
-  const { fileConflicts, fileLockStates, pendingYieldRequests, sessionPersistence } =
-    useShellInfra();
+  const {
+    fileConflicts,
+    fileLockStates,
+    pendingYieldRequests,
+    pendingLongWaitSignals,
+    sessionPersistence,
+  } = useShellInfra();
 
   // Re-key per-tab fileLockStates (keyed by tab.id) onto session ids so
   // SessionCard can render a "blocked on …" subtitle. session.sessionId
@@ -722,6 +727,7 @@ function TerminalPageInner({
               activeTab.claudeSessionId && (
                 <HoldingLockBanner
                   taskRunId={activeTab.claudeSessionId}
+                  taskRunName={activeTab.title}
                   filePath={activeLockState.filePath}
                   waiterName={activeLockState.counterpartyName}
                   sinceMs={activeLockState.sinceMs}
@@ -759,6 +765,34 @@ function TerminalPageInner({
                   blockerName={activeLockState.counterpartyName}
                   blockerTaskRunId={blockerTaskRunId}
                   sinceMs={activeLockState.sinceMs}
+                  // Phase 2 (stuck-session heartbeat) — joined from
+                  // `/sessions/idle-status` by useFileLockTracking's
+                  // 10s poll; threaded through as a prop so the banner
+                  // surfaces "(holder idle Xm)" inline on the headline.
+                  // Undefined on holding/idle branches by design (the
+                  // hook only attaches it to the waiting branch).
+                  holderIdleMs={activeLockState.holderIdleMs}
+                  longWaitSignal={(() => {
+                    // Phase 3 (stuck-session heartbeat): surface the
+                    // most-recent long-wait signal targeting this
+                    // waiter for the contested file. The hook dedups
+                    // by `(holderTaskRunId, filePath)` so the list is
+                    // already keyed cleanly; picking [0] yields the
+                    // first-arrived entry, but for the banner copy any
+                    // matching entry is acceptable since a new signal
+                    // for the same pair replaces in place.
+                    const signals =
+                      (activeId && pendingLongWaitSignals?.[activeId]) || [];
+                    const match = signals.find(
+                      (s) => s.filePath === activeLockState.filePath,
+                    );
+                    if (!match) return undefined;
+                    return {
+                      holderName: match.holderName,
+                      estimatedRemainingMs: match.estimatedRemainingMs,
+                      signaledAtMs: match.signaledAtMs,
+                    };
+                  })()}
                 />
               )}
           </div>

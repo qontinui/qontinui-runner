@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,88 @@ pub struct RunPromptResponse {
 }
 
 // ============================================================================
+// Idle-status (Phase 1 of stuck-session-heartbeat-plan.md)
+// ============================================================================
+
+/// Per-session idle stats returned by `GET /sessions/idle-status`.
+///
+/// The frontend join (`useFileLockTracking.ts`, Phase 2) keys the
+/// existing `/file-locks/info` entries on `holder_task_run_id` →
+/// `task_run_id` here, then attaches `idle_ms` to each waiter's
+/// `LockState` so the UI can render e.g. "(holder idle 7m)".
+///
+/// `holder_name` is the same friendly display name the file-lock
+/// dispatcher emits on `file-lock-*` events (see
+/// `claude_session/dispatcher.rs:398-404` and
+/// `ClaudeSession::holder_name`).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SessionIdleEntry {
+    pub(crate) task_run_id: String,
+    pub(crate) holder_name: String,
+    /// Epoch milliseconds of the last observed stdout line.
+    pub(crate) last_activity_ms: u64,
+    /// `now_ms.saturating_sub(last_activity_ms)`. Clock skew or a stale
+    /// `last_activity` value from the future is clamped to 0 by the
+    /// saturating subtraction.
+    pub(crate) idle_ms: u64,
+}
+
+/// Compute idle entries from a `SessionManager` snapshot at the given
+/// `now_ms`. Pure helper extracted for testability — the HTTP handler
+/// is a thin shim over this plus `SystemTime::now()`.
+///
+/// The atomic stores epoch SECONDS (see
+/// `claude_session/session.rs:420`); we multiply by 1000 at this
+/// boundary so the response is in milliseconds, matching every other
+/// `*_ms` field the frontend consumes.
+pub(crate) fn build_idle_entries(
+    snapshot: Vec<(String, String, Arc<std::sync::atomic::AtomicU64>)>,
+    now_ms: u64,
+) -> Vec<SessionIdleEntry> {
+    snapshot
+        .into_iter()
+        .map(|(task_run_id, holder_name, tracker)| {
+            let last_activity_s = tracker.load(std::sync::atomic::Ordering::Relaxed);
+            let last_activity_ms = last_activity_s.saturating_mul(1000);
+            let idle_ms = now_ms.saturating_sub(last_activity_ms);
+            SessionIdleEntry {
+                task_run_id,
+                holder_name,
+                last_activity_ms,
+                idle_ms,
+            }
+        })
+        .collect()
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `GET /sessions/idle-status` — return per-session idle stats for
+/// every currently-registered `ClaudeSession`.
+///
+/// Returns an empty array when no AI sessions are registered, or when
+/// `SessionManager` is not available in Tauri state (which would only
+/// happen during early startup). PTY workers and inline-PID
+/// registrations are intentionally excluded — see
+/// `SessionManager::snapshot` for the rationale.
+pub async fn idle_status(State(state): State<Arc<ApiState>>) -> Json<Vec<SessionIdleEntry>> {
+    use crate::claude_session::manager::SessionManager;
+
+    let snapshot = state
+        .app_handle
+        .try_state::<Arc<SessionManager>>()
+        .map(|s| s.inner().snapshot())
+        .unwrap_or_default();
+
+    Json(build_idle_entries(snapshot, now_epoch_ms()))
+}
+
+// ============================================================================
 // Routes
 // ============================================================================
 
@@ -185,6 +267,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/stop-ai-analysis", post(stop_ai_analysis))
         .route("/restart-runner", post(restart_runner))
         .route("/prompts/run", post(run_prompt))
+        .route("/sessions/idle-status", get(idle_status))
         .route(
             "/sessions/{session_id}/promote-to-worktree",
             post(promote_session_to_worktree_handler),
@@ -2086,3 +2169,156 @@ If your task requires running visual automation, use the Runner API to execute w
 // Macro handlers moved to crate::mcp::macros
 // Playwright script handlers moved to crate::mcp::playwright
 // Prompt snippet handlers moved to crate::mcp::prompt_snippets
+
+#[cfg(test)]
+mod tests {
+    // Phase 1 of stuck-session-heartbeat-plan.md — `GET /sessions/idle-status`.
+    //
+    // The HTTP handler takes `Arc<ApiState>`, which can't be constructed in
+    // a unit test (real `tauri::AppHandle`). Following the pattern used by
+    // `mcp::file_registry::tests` (see `request_yield_valid_payload_broadcasts_event`
+    // and friends), we drive the same composition the handler produces
+    // against a real `SessionManager` snapshot via the `build_idle_entries`
+    // pure helper — exactly the substrate the handler depends on.
+    //
+    // The handler body itself is a four-line shim
+    // (`try_state` → `snapshot` → `build_idle_entries` → `Json`), so
+    // covering the helper covers every interesting branch.
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Mirrors the friendly-name derivation in
+    /// `claude_session/dispatcher.rs:398-404` and
+    /// `ClaudeSession::holder_name`. Kept as a test-local helper so a
+    /// future change to that derivation will surface here if the two
+    /// paths diverge.
+    fn derive_holder_name(session_id: &str, session_name: Option<&str>) -> String {
+        session_name
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| session_id.to_string())
+    }
+
+    #[test]
+    fn idle_status_returns_empty_when_no_sessions() {
+        // Empty snapshot — what `SessionManager::snapshot()` returns when
+        // no `ClaudeSession`s are registered.
+        let entries = build_idle_entries(Vec::new(), 1_700_000_000_000);
+        assert!(
+            entries.is_empty(),
+            "expected empty Vec for empty snapshot, got {} entries",
+            entries.len()
+        );
+    }
+
+    #[test]
+    fn idle_status_returns_entry_for_registered_session() {
+        // Synthetic snapshot: one session, last_activity 2 seconds ago.
+        // last_activity is stored as epoch SECONDS (per
+        // `claude_session/session.rs:81,420`), so the tracker holds
+        // (now_ms / 1000) - 2.
+        let now_ms = 1_700_000_000_000_u64;
+        let last_activity_s = (now_ms / 1000) - 2;
+        let tracker = Arc::new(AtomicU64::new(last_activity_s));
+
+        let snapshot = vec![(
+            "task-A".to_string(),
+            "Session A".to_string(),
+            tracker.clone(),
+        )];
+
+        let entries = build_idle_entries(snapshot, now_ms);
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.task_run_id, "task-A");
+        assert_eq!(entry.holder_name, "Session A");
+        // last_activity_ms = last_activity_s * 1000 = now_ms - 2000
+        assert_eq!(entry.last_activity_ms, now_ms - 2_000);
+        // idle_ms = now - last_activity = 2 seconds = 2000 ms
+        assert_eq!(entry.idle_ms, 2_000);
+    }
+
+    #[test]
+    fn idle_status_idle_ms_zero_when_activity_at_now() {
+        // Activity timestamp matches the moment we compute idle_ms —
+        // idle_ms must be 0, not negative (saturating sub).
+        let now_ms = 1_700_000_000_000_u64;
+        let tracker = Arc::new(AtomicU64::new(now_ms / 1000));
+        let snapshot = vec![("t".to_string(), "T".to_string(), tracker)];
+
+        let entries = build_idle_entries(snapshot, now_ms);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].idle_ms, 0);
+    }
+
+    #[test]
+    fn idle_status_idle_ms_saturates_on_future_activity() {
+        // last_activity in the future (clock skew between threads, or a
+        // test using a synthetic now): idle_ms must clamp to 0 rather
+        // than wrap around.
+        let now_ms = 1_700_000_000_000_u64;
+        let future_s = (now_ms / 1000) + 60;
+        let tracker = Arc::new(AtomicU64::new(future_s));
+        let snapshot = vec![("t".to_string(), "T".to_string(), tracker)];
+
+        let entries = build_idle_entries(snapshot, now_ms);
+        assert_eq!(entries[0].idle_ms, 0);
+    }
+
+    #[test]
+    fn idle_status_holder_name_matches_dispatcher_emit() {
+        // Cross-check that holder_name comes through the snapshot with
+        // the exact friendly-name shape the file-lock dispatcher emits
+        // on `file-lock-*` events (claude_session/dispatcher.rs:437).
+        //
+        // Workflow path: holder_name = session_ctx.session_name
+        let workflow = derive_holder_name("task-w-1", Some("My Workflow - Iteration 3"));
+        // Terminal path: session_ctx is None → falls back to session_id
+        let terminal = derive_holder_name("term-task-123", None);
+
+        let now_ms = 1_700_000_000_000_u64;
+        let snapshot = vec![
+            (
+                "task-w-1".to_string(),
+                workflow.clone(),
+                Arc::new(AtomicU64::new(now_ms / 1000)),
+            ),
+            (
+                "term-task-123".to_string(),
+                terminal.clone(),
+                Arc::new(AtomicU64::new(now_ms / 1000)),
+            ),
+        ];
+
+        let entries = build_idle_entries(snapshot, now_ms);
+        assert_eq!(entries.len(), 2);
+        // Order is preserved from snapshot input.
+        assert_eq!(entries[0].holder_name, "My Workflow - Iteration 3");
+        assert_eq!(entries[1].holder_name, "term-task-123");
+        // Equivalent to what `ClaudeSession::holder_name()` returns:
+        assert_eq!(workflow, "My Workflow - Iteration 3");
+        assert_eq!(terminal, "term-task-123");
+    }
+
+    #[test]
+    fn idle_status_sees_live_atomic_updates() {
+        // The snapshot hands out `Arc<AtomicU64>`s, not snapshots of the
+        // value. A second build_idle_entries call after the tracker
+        // advances must reflect the new value — this is how the live
+        // /sessions/idle-status endpoint stays fresh between requests
+        // without a new snapshot.
+        let now_ms_1 = 1_700_000_000_000_u64;
+        let tracker = Arc::new(AtomicU64::new(now_ms_1 / 1000 - 5));
+        let snapshot = vec![("t".to_string(), "T".to_string(), tracker.clone())];
+
+        let first = build_idle_entries(snapshot.clone(), now_ms_1);
+        assert_eq!(first[0].idle_ms, 5_000);
+
+        // Simulate a new stdout line landing — bumps the tracker to
+        // "now_ms_1's second" (1 sec idle relative to a slightly later now).
+        tracker.store(now_ms_1 / 1000, Ordering::Relaxed);
+        let now_ms_2 = now_ms_1 + 1_000;
+        let second = build_idle_entries(snapshot, now_ms_2);
+        assert_eq!(second[0].idle_ms, 1_000);
+    }
+}
