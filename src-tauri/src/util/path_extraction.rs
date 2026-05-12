@@ -154,8 +154,12 @@ async fn extract_paths_via_ai_inner(
         user_message.len(),
     );
 
-    let call_future =
-        provider.call_json(&system_prefix, &user_message, schema, AI_EXTRACT_SCHEMA_NAME);
+    let call_future = provider.call_json(
+        &system_prefix,
+        &user_message,
+        schema,
+        AI_EXTRACT_SCHEMA_NAME,
+    );
 
     let output_value = match tokio::time::timeout(AI_EXTRACT_TIMEOUT, call_future).await {
         Ok(Ok(v)) => v,
@@ -1216,7 +1220,11 @@ mod tests {
         let fake = FakeOneshotLlm::returning(Err(OneshotError::NoCredentials));
         let result =
             extract_paths_via_ai_inner("anything", &AiContextBundle::default(), &fake).await;
-        assert!(matches!(result, Err(ExtractError::Offline)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(ExtractError::Offline)),
+            "got {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -1224,7 +1232,11 @@ mod tests {
         let fake = FakeOneshotLlm::returning(Err(OneshotError::Disabled));
         let result =
             extract_paths_via_ai_inner("anything", &AiContextBundle::default(), &fake).await;
-        assert!(matches!(result, Err(ExtractError::Offline)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(ExtractError::Offline)),
+            "got {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -1260,7 +1272,11 @@ mod tests {
         )));
         let result =
             extract_paths_via_ai_inner("anything", &AiContextBundle::default(), &fake).await;
-        assert!(matches!(result, Err(ExtractError::Offline)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(ExtractError::Offline)),
+            "got {:?}",
+            result
+        );
     }
 
     #[tokio::test]

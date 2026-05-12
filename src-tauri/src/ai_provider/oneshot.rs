@@ -423,9 +423,9 @@ impl OneshotLlm for OneshotClaudeApiWarm {
                 &system,
                 &user,
                 &claude_api_settings,
-                model_override,      // pinned by with_overrides, else use settings default
-                None,                // doctor_handle
-                Some(0.0),           // deterministic
+                model_override, // pinned by with_overrides, else use settings default
+                None,           // doctor_handle
+                Some(0.0),      // deterministic
                 max_tokens_override, // pinned by with_overrides, else use settings default
                 &schema_owned,
                 &schema_name_owned,
