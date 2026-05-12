@@ -383,6 +383,14 @@ Decision rules:
 - Never re-issue an action that's already in the recent_decisions window for the same target — that's a loop.
 - If no action is clearly correct, return idle-no-action with a brief reasoning.
 - Reasoning should be one short sentence; the dashboard renders it verbatim.
+- A task in `review` for >5 min with no verdict is stalled — escalate-with-text rather than guess at a merge.
+- A `needs_fix` task with retry_count >= 3 should escalate, never reassign-needs-fix.
+- A session in Processing for >10 min on a small-claim task is likely stuck — advise-with-text, do not pause unilaterally.
+
+Worked examples:
+- Observation: one `ready` task `T1` (claims `a.rs`), one idle session `S1` (touched `b.rs` last). Cheap Rule B already passed without firing. Likely cause: tab-title pattern mismatch. Action: `{"type": "assign-task", "taskId": "T1", "sessionId": "S1", "reasoning": "no overlap; Rule B's pattern matcher likely missed this pairing"}`.
+- Observation: one task in `review` for 8 min, no review row in `recent_reviews`. Action: `{"type": "escalate-with-text", "targetId": "<task-id>", "reasoning": "review stalled — auto-reviewer never produced a verdict; user attention needed"}`.
+- Observation: no `ready` tasks, all sessions idle, one open escalation already noted twice in `recent_decisions`. Action: `{"type": "idle-no-action", "reasoning": "nothing actionable this tick; escalation already surfaced"}`.
 "#,
     )
 }

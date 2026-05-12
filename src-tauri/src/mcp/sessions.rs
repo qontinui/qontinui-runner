@@ -145,81 +145,88 @@ async fn spawn_session(
     let dispatched = slash_command.is_some();
     let role_for_response = req.role.clone();
 
-    let session = match crate::claude_session::ClaudeSession::spawn(
-        &working_dir,
-        &task_run_id,
-        &state.app_handle,
-        Some(session_ctx),
-        None,
-        None,
-        None,
-        None,
-        None,
-    ) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            warn!("Failed to spawn role={:?} session: {}", req.role, e);
-            return Ok(Json(SpawnSessionResponse {
+    // Wrap the spawn+register+initial-prompt sequence in spawn_blocking so the
+    // CLI init handshake can't race SessionManager::register — otherwise output
+    // events emitted during the handshake land before the session is reachable
+    // by id and the chunk writer drops them.
+    let sm = session_manager.clone();
+    let handle = state.app_handle.clone();
+    let trid = task_run_id.clone();
+    let working_dir_for_closure = working_dir.clone();
+    let initial_prompt_for_closure = initial_prompt.clone();
+    let spawn_result = tokio::task::spawn_blocking(move || {
+        let session = match crate::claude_session::ClaudeSession::spawn(
+            &working_dir_for_closure,
+            &trid,
+            &handle,
+            Some(session_ctx),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            Ok(s) => Arc::new(s),
+            Err(e) => return Err(format!("spawn failed: {}", e)),
+        };
+
+        if let Err(e) = sm.register(&trid, session.clone()) {
+            return Err(format!("register failed: {}", e));
+        }
+
+        crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
+
+        if let Err(e) = session.send_initial_prompt(&initial_prompt_for_closure) {
+            return Err(format!("initial prompt failed: {}", e));
+        }
+
+        crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
+
+        Ok(())
+    })
+    .await;
+
+    match spawn_result {
+        Ok(Ok(())) => {
+            info!(
+                "Spawned session task_run_id={} role={:?} dispatched={}",
+                task_run_id, req.role, dispatched
+            );
+            Ok(Json(SpawnSessionResponse {
+                task_run_id,
+                task_name: req.task_name,
+                state: "ready".to_string(),
+                role: role_for_response,
+                dispatched_slash_command: dispatched,
+            }))
+        }
+        Ok(Err(e)) => {
+            warn!(
+                "Failed to spawn role={:?} session {}: {}",
+                req.role, task_run_id, e
+            );
+            Ok(Json(SpawnSessionResponse {
                 task_run_id,
                 task_name: req.task_name,
                 state: "error".to_string(),
                 role: role_for_response,
                 dispatched_slash_command: false,
-            }));
+            }))
         }
-    };
-
-    if let Err(e) = session_manager.register(&task_run_id, session.clone()) {
-        warn!("Failed to register spawned session {}: {}", task_run_id, e);
-        return Ok(Json(SpawnSessionResponse {
-            task_run_id,
-            task_name: req.task_name,
-            state: "error".to_string(),
-            role: role_for_response,
-            dispatched_slash_command: false,
-        }));
+        Err(join_err) => {
+            warn!(
+                "spawn_blocking join error for session {}: {}",
+                task_run_id, join_err
+            );
+            Ok(Json(SpawnSessionResponse {
+                task_run_id,
+                task_name: req.task_name,
+                state: "error".to_string(),
+                role: role_for_response,
+                dispatched_slash_command: false,
+            }))
+        }
     }
-
-    crate::commands::ai_session::emit_session_state(
-        &state.app_handle,
-        &task_run_id,
-        &task_run_id,
-        session.state(),
-    );
-
-    if let Err(e) = session.send_initial_prompt(&initial_prompt) {
-        warn!(
-            "Failed to send initial prompt for spawned session {}: {}",
-            task_run_id, e
-        );
-        return Ok(Json(SpawnSessionResponse {
-            task_run_id,
-            task_name: req.task_name,
-            state: "error".to_string(),
-            role: role_for_response,
-            dispatched_slash_command: false,
-        }));
-    }
-
-    crate::commands::ai_session::emit_session_state(
-        &state.app_handle,
-        &task_run_id,
-        &task_run_id,
-        session.state(),
-    );
-
-    info!(
-        "Spawned session task_run_id={} role={:?} dispatched={}",
-        task_run_id, req.role, dispatched
-    );
-
-    Ok(Json(SpawnSessionResponse {
-        task_run_id,
-        task_name: req.task_name,
-        state: "ready".to_string(),
-        role: role_for_response,
-        dispatched_slash_command: dispatched,
-    }))
 }
 
 // =============================================================================
