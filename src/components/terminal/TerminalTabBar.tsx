@@ -11,6 +11,7 @@ import { CommitTrafficLight } from "./CommitTrafficLight";
 import type { CommitState } from "./useCommitState";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { RefObject } from "react";
+import { useNow1Hz } from "./useNow1Hz";
 
 interface TerminalTabBarProps {
   tabs: TerminalTab[];
@@ -94,11 +95,20 @@ function formatTime(value?: string | number): string {
  * Format a "since" epoch-ms as a short relative-age string ("5s",
  * "42s", "5m", "2h"). Mirrors `formatHoldingAge` from `LaunchMenu.tsx`
  * but takes the "since" timestamp directly. Negative ages clamp to
- * "0s". Returns the empty string when `ms` is undefined.
+ * "0s". Returns the empty string when `sinceMs` is undefined.
+ *
+ * Phase 2 of the stuck-session heartbeat plan widened the signature
+ * from `(sinceMs?)` to `(sinceMs?, nowMs)` — the helper used to read
+ * `Date.now()` internally, which made it invisible to React's render
+ * cycle (re-mount didn't tick). Callers now pass `useNow1Hz()` as the
+ * second arg so the tooltip text refreshes on next-hover after the
+ * shared 1Hz broadcast fires. Native HTML `title` tooltips can't
+ * refresh while visibly open — the tick lands at next-hover. See the
+ * plan's Problem §1 caveat.
  */
-function formatSince(ms?: number): string {
-  if (ms === undefined) return "";
-  const deltaSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+function formatSince(sinceMs: number | undefined, nowMs: number): string {
+  if (sinceMs === undefined) return "";
+  const deltaSec = Math.max(0, Math.floor((nowMs - sinceMs) / 1000));
   if (deltaSec < 60) return `${deltaSec}s`;
   const deltaMin = Math.floor(deltaSec / 60);
   if (deltaMin < 60) return `${deltaMin}m`;
@@ -225,6 +235,13 @@ export function TerminalTabBar({
   const [showDropdown, setShowDropdown] = useState(false);
   const [showQuickLaunch, setShowQuickLaunch] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Phase 2 (stuck-session heartbeat) — subscribe to the shared 1Hz
+  // broadcast so the lock tooltip's "since 5m" text refreshes on next-
+  // hover. Native HTML `title` tooltips don't update while visibly open
+  // — the tick lands when the user re-hovers. Documented at
+  // `formatSince`'s docstring and Problem §1 of the plan.
+  const nowMs = useNow1Hz();
 
   // Live elapsed-time tick (30s interval), only in multi-zone mode
   const [, setTick] = useState(0);
@@ -569,7 +586,7 @@ export function TerminalTabBar({
                   aria-label="waiting on file lock"
                   title={`waiting on ${lockState.counterpartyName ?? "another session"}'s ${
                     lockState.filePath ?? "edit"
-                  }${lockState.sinceMs ? ` since ${formatSince(lockState.sinceMs)}` : ""}`}
+                  }${lockState.sinceMs ? ` since ${formatSince(lockState.sinceMs, nowMs)}` : ""}`}
                 >
                   <Lock className="w-2.5 h-2.5 text-[#e0af68] animate-pulse" />
                 </span>

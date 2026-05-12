@@ -1,6 +1,7 @@
 //! SessionManager - tracks active Claude sessions by task_run_id.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
@@ -209,6 +210,43 @@ impl SessionManager {
                 let mut v: Vec<_> = guard.iter().map(|(k, w)| (k.clone(), w.clone())).collect();
                 v.sort_by_key(|(_, w)| w.created_at_unix());
                 v
+            })
+            .unwrap_or_default()
+    }
+
+    /// Snapshot every registered `ClaudeSession` as a tuple of
+    /// `(task_run_id, holder_name, last_activity_tracker)`.
+    ///
+    /// `holder_name` matches the friendly display name the file-lock
+    /// dispatcher emits as `holder_name` on `file-lock-*` events (see
+    /// `claude_session/dispatcher.rs:398-404` and
+    /// `ClaudeSession::holder_name`).
+    ///
+    /// `last_activity_tracker` is a shared `Arc<AtomicU64>` holding the
+    /// most-recent stdout-line epoch SECONDS (written at
+    /// `claude_session/session.rs:420`). Callers convert to ms at the
+    /// boundary.
+    ///
+    /// `WorkerSession` and inline-PID registrations are intentionally
+    /// excluded: workers don't run a Claude CLI (no Claude-side activity
+    /// tracker) and inline PIDs don't expose a `last_activity` channel.
+    /// Returns an empty Vec when no `ClaudeSession`s are registered or
+    /// when the inner Mutex is poisoned.
+    pub fn snapshot(&self) -> Vec<(String, String, Arc<AtomicU64>)> {
+        self.sessions
+            .lock()
+            .ok()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|(id, s)| {
+                        (
+                            id.clone(),
+                            s.holder_name().to_string(),
+                            s.last_activity_tracker(),
+                        )
+                    })
+                    .collect()
             })
             .unwrap_or_default()
     }

@@ -512,6 +512,36 @@ pub struct YieldRequestResponse {
     pub requested: bool,
 }
 
+/// Phase 3 (stuck-session heartbeat): hold-side fire-and-forget signal
+/// to every waiter that the holder expects to be busy with this lock for
+/// a while. Distinct from yielding — the lock is NOT released; this is
+/// advisory only so the waiter can decide whether to cancel and re-route
+/// elsewhere. Listener at `useFileLockTracking.ts` routes the event to
+/// each tab currently waiting on `file_path`.
+#[derive(Debug, Deserialize)]
+pub struct SignalLongWaitRequest {
+    /// File the holder will be busy with.
+    pub file_path: String,
+    /// Task run ID of the session holding the lock.
+    pub holder_task_run_id: String,
+    /// Human-readable name of the holder ("Session **B** says they'll be
+    /// a while" on the waiter's banner).
+    pub holder_name: String,
+    /// Optional estimate of how much longer the holder expects to hold
+    /// the lock, in milliseconds. `None` when the holder declined to
+    /// provide an estimate; the waiter banner omits the "(~Xm)" suffix
+    /// in that case.
+    pub estimated_remaining_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SignalLongWaitResponse {
+    /// Always `true` after the emit completes. Mirrors
+    /// `YieldRequestResponse.requested` — fire-and-forget; no state
+    /// change is guaranteed.
+    pub signaled: bool,
+}
+
 /// POST /file-locks/yield
 ///
 /// Hold-side: the caller releases a single file lock it holds (without
@@ -625,6 +655,55 @@ async fn request_yield(
     let _ = state.app_state.event_broadcast.send(payload);
 
     Ok(Json(YieldRequestResponse { requested: true }))
+}
+
+/// POST /file-locks/signal-long-wait
+///
+/// Hold-side fire-and-forget channel: the holder broadcasts that they
+/// expect to be busy with `file_path` for a while. Every tab currently
+/// waiting on this path consumes the resulting
+/// `file-lock-long-wait-signaled` event via
+/// `useFileLockTracking.ts`'s listener and surfaces an advisory line on
+/// the `WaitingLockBanner` — the lock is NOT released; the waiter just
+/// gains a hint to decide whether to cancel and re-route elsewhere.
+///
+/// Mirrors `request_yield` line-for-line: builds the payload via
+/// `serde_json::json!` (no struct round-trip), dual-emits via
+/// `app_handle.emit()` + `event_broadcast.send()`. `signaled: true` only
+/// means the emit went out, not that any waiter acted on it. An empty
+/// `file_path` still broadcasts — the waiter listener filters by
+/// `file_path`, so a malformed signal produces a no-match broadcast.
+async fn signal_long_wait(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<SignalLongWaitRequest>,
+) -> Result<Json<SignalLongWaitResponse>, (StatusCode, String)> {
+    let SignalLongWaitRequest {
+        file_path,
+        holder_task_run_id,
+        holder_name,
+        estimated_remaining_ms,
+    } = req;
+
+    let signaled_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    use tauri::Emitter;
+    let payload = serde_json::json!({
+        "type": "file-lock-long-wait-signaled",
+        "file_path": &file_path,
+        "holder_task_run_id": &holder_task_run_id,
+        "holder_name": &holder_name,
+        "estimated_remaining_ms": estimated_remaining_ms,
+        "signaled_at": signaled_at_ms,
+    });
+    let _ = state
+        .app_handle
+        .emit("file-lock-long-wait-signaled", &payload);
+    let _ = state.app_state.event_broadcast.send(payload);
+
+    Ok(Json(SignalLongWaitResponse { signaled: true }))
 }
 
 /// POST /file-registry/probe-conflicts
@@ -997,6 +1076,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/file-locks/info", get(get_lock_info))
         .route("/file-locks/yield", post(yield_lock))
         .route("/file-locks/yield-request", post(request_yield))
+        .route("/file-locks/signal-long-wait", post(signal_long_wait))
         .route("/file-activity/heatmap", get(get_heatmap))
 }
 
@@ -1687,6 +1767,33 @@ mod tests {
         true
     }
 
+    /// Mirror of `signal_long_wait`'s core logic without the
+    /// `Arc<ApiState>` dependency. Identical payload shape — Phase 3
+    /// (stuck-session heartbeat) waiter listener consumes exactly this.
+    fn signal_long_wait_core(
+        broadcaster: &broadcast::Sender<serde_json::Value>,
+        file_path: &str,
+        holder_task_run_id: &str,
+        holder_name: &str,
+        estimated_remaining_ms: Option<u64>,
+    ) -> bool {
+        let signaled_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let payload = serde_json::json!({
+            "type": "file-lock-long-wait-signaled",
+            "file_path": file_path,
+            "holder_task_run_id": holder_task_run_id,
+            "holder_name": holder_name,
+            "estimated_remaining_ms": estimated_remaining_ms,
+            "signaled_at": signaled_at_ms,
+        });
+        let _ = broadcaster.send(payload);
+        true
+    }
+
     #[tokio::test]
     async fn yield_lock_non_owner_does_not_release() {
         let manager = FileLockManager::new();
@@ -1832,6 +1939,54 @@ mod tests {
             .try_recv()
             .expect("event should fire even with empty file_path");
         assert_eq!(event["file_path"], "");
+    }
+
+    #[tokio::test]
+    async fn signal_long_wait_valid_payload_broadcasts_event() {
+        // Stuck-session heartbeat Phase 3: holder broadcasts that they
+        // expect to be busy with `file_path` for a while. Verifies the
+        // payload shape the waiter's `useFileLockTracking.ts` listener
+        // consumes (snake_case keys, `null` estimated_remaining_ms when
+        // not provided, real-clock signaled_at timestamp).
+        let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
+
+        let signaled = signal_long_wait_core(&tx, "src/foo.rs", "task-B", "Session B", None);
+        assert!(signaled, "signal-long-wait should always return true");
+
+        let event = rx
+            .try_recv()
+            .expect("expected file-lock-long-wait-signaled event");
+        assert_eq!(event["type"], "file-lock-long-wait-signaled");
+        assert_eq!(event["file_path"], "src/foo.rs");
+        assert_eq!(event["holder_task_run_id"], "task-B");
+        assert_eq!(event["holder_name"], "Session B");
+        // serde_json renders None as JSON null — the wait-side listener
+        // omits the "(~Xm)" suffix when this is null/absent.
+        assert!(
+            event["estimated_remaining_ms"].is_null(),
+            "estimated_remaining_ms should serialise as JSON null when None"
+        );
+        let ts = event["signaled_at"]
+            .as_u64()
+            .expect("signaled_at should be a u64");
+        assert!(ts > 0, "signaled_at should be a real epoch_ms");
+    }
+
+    #[tokio::test]
+    async fn signal_long_wait_with_estimate_serialises_as_number() {
+        // When the holder supplies an estimate, the wire payload carries
+        // it as a JSON number (NOT a string) — the waiter banner's
+        // `formatEstimate` helper depends on the numeric shape.
+        let (tx, mut rx) = broadcast::channel::<serde_json::Value>(16);
+
+        let signaled =
+            signal_long_wait_core(&tx, "src/foo.rs", "task-B", "Session B", Some(300_000));
+        assert!(signaled);
+
+        let event = rx
+            .try_recv()
+            .expect("expected file-lock-long-wait-signaled event");
+        assert_eq!(event["estimated_remaining_ms"].as_u64(), Some(300_000));
     }
 
     #[tokio::test]

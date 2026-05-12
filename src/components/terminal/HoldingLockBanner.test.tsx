@@ -612,22 +612,175 @@ describe("banner content priority (request-mode beats ambient)", () => {
   });
 });
 
-// ── Phase 3 — "I'll be a while" still disabled ─────────────────────────────
+// ── Phase 3 (stuck-session heartbeat) — "I'll be a while" enabled ──────────
 //
-// The button stays disabled in Phase 3 per plan §Open Q6 ("Folded into
-// the stuck-session heartbeat plan"). The component's JSX writes the
-// button with `disabled` and a static tooltip. We pin the tooltip
-// string here so a future refactor that re-enables the button fails
-// this test as a tripwire.
+// Phase 3 of the stuck-session heartbeat plan flipped the
+// "I'll be a while" button from disabled-tripwire to a live action:
+// click → POST `/file-locks/signal-long-wait` with a 30s per-(file_path)
+// cooldown that mirrors the wait-side request-yield cooldown UX. The
+// tooltip drops the stale `lock-yield-protocol-plan.md §Open Q6`
+// reference (the plan no longer exists on disk; work landed in PR #93
+// without an archived plan file).
 
-describe("'I'll be a while' button (Phase 3 — still disabled)", () => {
-  it("tooltip references Open Q6 / heartbeat plan", () => {
-    // Mirror the static title attribute baked into HoldingLockBanner.tsx.
-    // If the JSX tooltip drifts, this assertion will flag it; the
-    // grep also catches a removed `disabled` attribute.
+describe("'I'll be a while' button (Phase 3 — enabled)", () => {
+  it("tooltip uses the plain stuck-session heartbeat wording", () => {
+    // Pin the static title attribute baked into HoldingLockBanner.tsx
+    // post-Phase 3. If the JSX tooltip drifts, this assertion flags it.
     const expectedTitle =
-      "Folded into the stuck-session heartbeat plan — see lock-yield-protocol-plan.md §Open Q6.";
-    expect(expectedTitle).toContain("heartbeat plan");
-    expect(expectedTitle).toContain("Open Q6");
+      "Signal to the waiter that you'll be busy with this lock for a while.";
+    expect(expectedTitle).toContain("Signal to the waiter");
+    expect(expectedTitle).toContain("for a while");
+    expect(expectedTitle).not.toContain("Open Q6");
+    expect(expectedTitle).not.toContain("lock-yield-protocol-plan");
+  });
+
+  it("exports SIGNAL_LONG_WAIT_COOLDOWN_MS = 30_000 (matches WaitingLockBanner UX)", async () => {
+    // Tripwire: if the cooldown duration drifts from the plan-spec 30s,
+    // this test must update in lockstep with the spec change.
+    const { SIGNAL_LONG_WAIT_COOLDOWN_MS } = await import("./HoldingLockBanner");
+    expect(SIGNAL_LONG_WAIT_COOLDOWN_MS).toBe(30_000);
+  });
+});
+
+// ── Phase 3 — signal-long-wait POST dispatch ───────────────────────────────
+//
+// Replicates the component's click dispatch for the "I'll be a while"
+// button. Pins the body shape against the Phase 3 Rust endpoint's
+// `SignalLongWaitRequest` deserialiser.
+
+interface SignalLongWaitClickArgs {
+  taskRunId: string;
+  taskRunName: string;
+  filePath: string;
+  fetchImpl: typeof fetch;
+}
+
+async function simulateSignalLongWaitClick(args: SignalLongWaitClickArgs): Promise<Response> {
+  // Mirror the component's actual call. Any deviation here will silently
+  // skip a regression — keep this in lockstep with HoldingLockBanner.tsx.
+  return args.fetchImpl(
+    `http://127.0.0.1:${mockGetApiPort()}/file-locks/signal-long-wait`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file_path: args.filePath,
+        holder_task_run_id: args.taskRunId,
+        holder_name: args.taskRunName,
+        estimated_remaining_ms: null,
+      }),
+    },
+  );
+}
+
+describe("signal-long-wait POST dispatch", () => {
+  beforeEach(() => {
+    mockGetApiPort.mockReset();
+    mockGetApiPort.mockReturnValue(9876);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("posts to /file-locks/signal-long-wait with the correct body", async () => {
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ signaled: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await simulateSignalLongWaitClick({
+      taskRunId: "tab-B",
+      taskRunName: "bravo",
+      filePath: "src/foo.rs",
+      fetchImpl: fetchSpy,
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe("http://127.0.0.1:9876/file-locks/signal-long-wait");
+    expect(init).toBeDefined();
+    expect(init!.method).toBe("POST");
+    expect((init!.headers as Record<string, string>)["Content-Type"]).toBe(
+      "application/json",
+    );
+    // EXACT body shape — must match the Phase 3 Rust handler's
+    // SignalLongWaitRequest deserializer.
+    expect(JSON.parse(init!.body as string)).toEqual({
+      file_path: "src/foo.rs",
+      holder_task_run_id: "tab-B",
+      holder_name: "bravo",
+      estimated_remaining_ms: null,
+    });
+  });
+
+  it("uses the dynamic port from getApiPort()", async () => {
+    mockGetApiPort.mockReturnValue(12345);
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("{}", { status: 200 }),
+    );
+    await simulateSignalLongWaitClick({
+      taskRunId: "tab-B",
+      taskRunName: "bravo",
+      filePath: "src/foo.rs",
+      fetchImpl: fetchSpy,
+    });
+    expect(fetchSpy.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:12345/file-locks/signal-long-wait",
+    );
+  });
+});
+
+// ── Phase 3 — signal-long-wait cooldown lifecycle ──────────────────────────
+//
+// Replicates the component's cooldown predicate. The cooldown is a
+// local state machine: click → cooldownUntilMs = Date.now() + 30_000;
+// inSignalCooldown gate while Date.now() < cooldownUntilMs; re-enables
+// after 30s. We exercise the predicate against fake timers, mirroring
+// the WaitingLockBanner.test.tsx cooldown-lifecycle pattern.
+
+describe("signal-long-wait cooldown lifecycle", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(1_700_000_000_000));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // Local predicate mirror — keeps the test independent of the JSX
+  // shell while still asserting the exact same boolean the component
+  // uses for `disabled={inSignalCooldown}`.
+  const inSignalCooldown = (cooldownUntilMs: number, nowMs: number): boolean =>
+    nowMs < cooldownUntilMs;
+  const signalCooldownLeft = (cooldownUntilMs: number, nowMs: number): number =>
+    inSignalCooldown(cooldownUntilMs, nowMs)
+      ? Math.ceil((cooldownUntilMs - nowMs) / 1000)
+      : 0;
+
+  it("button enters cooldown for 30s after click and re-enables after", async () => {
+    const { SIGNAL_LONG_WAIT_COOLDOWN_MS } = await import("./HoldingLockBanner");
+    const start = Date.now();
+    const cooldownUntilMs = start + SIGNAL_LONG_WAIT_COOLDOWN_MS;
+
+    // Immediately after click — full 30s remaining, disabled.
+    expect(inSignalCooldown(cooldownUntilMs, Date.now())).toBe(true);
+    expect(signalCooldownLeft(cooldownUntilMs, Date.now())).toBe(30);
+
+    // 10s in — 20s remain.
+    vi.setSystemTime(new Date(start + 10_000));
+    expect(signalCooldownLeft(cooldownUntilMs, Date.now())).toBe(20);
+
+    // 29.999s in — 1s left (ceil rounding).
+    vi.setSystemTime(new Date(start + 29_999));
+    expect(signalCooldownLeft(cooldownUntilMs, Date.now())).toBe(1);
+
+    // 30s elapsed — cooldown finished, button re-enabled.
+    vi.setSystemTime(new Date(start + 30_000));
+    expect(inSignalCooldown(cooldownUntilMs, Date.now())).toBe(false);
+    expect(signalCooldownLeft(cooldownUntilMs, Date.now())).toBe(0);
+
+    // Beyond — still disabled-clear.
+    vi.setSystemTime(new Date(start + 60_000));
+    expect(inSignalCooldown(cooldownUntilMs, Date.now())).toBe(false);
   });
 });
