@@ -342,6 +342,26 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         // Read-only — empty args is the canonical call shape.
         probe_with_empty_args: true,
     },
+    // Coord/terminal smoke commands — bi-directional title sync (Phase 2
+    // of runner-dispatch-and-terminal-ux-fixes-plan) + worker spawn.
+    ProxyableCommand {
+        name: "terminal_set_title",
+        description: "Update a terminal session's display title. Mirrors OSC 0/2 titles emitted by the PTY into TerminalSession.title and broadcasts terminal-title-changed to other webviews / WS subscribers. Pair to ZoneGrid's onTitleChange handler.",
+        args_schema: r#"{"type":"object","required":["terminalId","title"],"properties":{"terminalId":{"type":"string"},"title":{"type":"string"}},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":["object","null"]}}}"#,
+        // Required `terminalId` + `title`; empty-args probe would always
+        // fail, and a real call would mutate session state.
+        probe_with_empty_args: false,
+    },
+    ProxyableCommand {
+        name: "spawn_worker_session",
+        description: "Spawn a Claude-Code-backed worker PTY pre-sized to the dominant zone dimensions and register it under a fresh task_run_id in SessionManager.worker_sessions. Used by the Productivity tab Workers panel and coord soak smokes.",
+        args_schema: r#"{"type":"object","properties":{"titleHint":{"type":["string","null"]}},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["mode"],"properties":{"mode":{"type":"string"},"terminalId":{"type":["string","null"]},"taskRunId":{"type":["string","null"]}}}"#,
+        // Spawns a PTY child process — side-effectful even with empty
+        // args. Probe must skip.
+        probe_with_empty_args: false,
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.
@@ -449,6 +469,12 @@ mod tests {
         assert!(is_allowlisted("report_ui_error"));
         assert!(is_allowlisted("clear_ui_error"));
         assert!(is_allowlisted("get_ui_error"));
+    }
+
+    #[test]
+    fn is_allowlisted_recognizes_coord_terminal_commands() {
+        assert!(is_allowlisted("terminal_set_title"));
+        assert!(is_allowlisted("spawn_worker_session"));
     }
 
     #[test]
