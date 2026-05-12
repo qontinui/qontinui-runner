@@ -9,6 +9,7 @@ export { useAISearchEvents } from "./useAISearchEvents";
 export { useWorkflowEvents } from "./useWorkflowEvents";
 export { useMediaEvents } from "./useMediaEvents";
 export { useAnnotationEvents } from "./useAnnotationEvents";
+export { useTerminalsEvents } from "./useTerminalsEvents";
 
 export type {
   UIBridgeRequestType,

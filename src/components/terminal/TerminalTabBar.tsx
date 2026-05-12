@@ -22,9 +22,25 @@ interface TerminalTabBarProps {
   onRename: (id: string, title: string) => void;
   sessionStates?: Record<string, SessionState>;
   layoutPicker?: ReactNode;
-  onQuickLaunch?: (count: number, autoCommand?: string) => void;
-  onLaunchAiSession?: (count: number, configDir: string, context?: string) => void;
-  onLaunchMultiAiSessions?: (configDirs: string[], context?: string) => void;
+  /**
+   * Spawn N plain PTY terminals. Returns the created `tab.id`s in
+   * launch order so UI Bridge action handlers can surface them in the
+   * synchronous response — see `chore/uib-terminal-sessions-endpoint`.
+   * The user-click path through `<LaunchMenu>` ignores the return
+   * value (it's a fire-and-forget).
+   */
+  onQuickLaunch?: (count: number, autoCommand?: string) => Promise<string[]> | void;
+  /** Spawn N AI sessions for a single account; returns the new `tab.id`s. */
+  onLaunchAiSession?: (
+    count: number,
+    configDir: string,
+    context?: string,
+  ) => Promise<string[]> | void;
+  /** Spawn one AI session per `configDir`; returns the new `tab.id`s. */
+  onLaunchMultiAiSessions?: (
+    configDirs: string[],
+    context?: string,
+  ) => Promise<string[]> | void;
   accountUsage?: AccountUsageInfo[];
   launchCommands?: Record<string, string>;
   fileLocks?: import("./useSessionManager").FileLockInfo[];
@@ -338,13 +354,22 @@ export function TerminalTabBar({
         label: "Create Plain Terminal",
         description: "Spawn N blank terminals using the user's default shell.",
         paramSchema: { count: "number (>= 1, defaults to 1)" },
-        handler: (params?: unknown) => {
+        handler: async (params?: unknown) => {
           const { count = 1 } = (params ?? {}) as { count?: number };
           if (typeof count !== "number" || count < 1) {
             throw new Error("create-plain requires { count: number } where count >= 1");
           }
-          onQuickLaunch?.(count);
+          // PTY-only tabs never own a Claude task_run_id, so the parallel
+          // task_run_ids array is empty — callers polling
+          // `/control/terminal-sessions/{id}` for the readiness signal
+          // (`state` / `is_alive`) is the right pattern for these.
+          const tabIds = ((await onQuickLaunch?.(count)) ?? []) as string[];
           closeLaunchMenu();
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: [] as Array<string | null>,
+          };
         },
       },
       {
@@ -357,7 +382,7 @@ export function TerminalTabBar({
           configDir: "string (absolute path to a Claude Code config dir, required)",
           context: "string (optional initial prompt auto-typed after claude starts)",
         },
-        handler: (params?: unknown) => {
+        handler: async (params?: unknown) => {
           const {
             count = 1,
             configDir,
@@ -374,8 +399,19 @@ export function TerminalTabBar({
           if (typeof count !== "number" || count < 1) {
             throw new Error("create-ai-session: count must be a positive number");
           }
-          onLaunchAiSession?.(count, configDir, context);
+          // `task_run_id` (= Claude session_id) is captured asynchronously
+          // by `useTabSessionIdCapture` once Claude CLI writes its first
+          // JSONL record. At handler-return time the value is `null` for
+          // every fresh tab — callers correlate via
+          // `GET /control/terminal-sessions/{tab_id}` and watch for
+          // `task_run_id` to flip non-null.
+          const tabIds = ((await onLaunchAiSession?.(count, configDir, context)) ?? []) as string[];
           closeLaunchMenu();
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: tabIds.map(() => null) as Array<string | null>,
+          };
         },
       },
       {
@@ -387,7 +423,7 @@ export function TerminalTabBar({
           count: "number (>= 1, defaults to 1)",
           context: "string (optional initial prompt auto-typed after claude starts)",
         },
-        handler: (params?: unknown) => {
+        handler: async (params?: unknown) => {
           const { count = 1, context } = (params ?? {}) as {
             count?: number;
             context?: string;
@@ -397,8 +433,14 @@ export function TerminalTabBar({
           }
           const best = sortedAccountsForBridge[0];
           if (!best) throw new Error("No AI accounts available");
-          onLaunchAiSession?.(count, best.config_dir, context);
+          const tabIds = ((await onLaunchAiSession?.(count, best.config_dir, context)) ??
+            []) as string[];
           closeLaunchMenu();
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: tabIds.map(() => null) as Array<string | null>,
+          };
         },
       },
       {
@@ -410,7 +452,7 @@ export function TerminalTabBar({
           count: "number (>= 1, defaults to 1)",
           command: "string (the shell command to type + Enter, required)",
         },
-        handler: (params?: unknown) => {
+        handler: async (params?: unknown) => {
           const { count = 1, command } = (params ?? {}) as {
             count?: number;
             command?: string;
@@ -420,8 +462,16 @@ export function TerminalTabBar({
           if (typeof count !== "number" || count < 1) {
             throw new Error("create-with-command: count must be a positive number");
           }
-          onQuickLaunch?.(count, command);
+          // `create-with-command` reuses the plain-PTY path (no Claude
+          // CLI), so `task_run_ids` is empty by definition. Callers can
+          // still observe the spawned tabs via `terminal-sessions`.
+          const tabIds = ((await onQuickLaunch?.(count, command)) ?? []) as string[];
           closeLaunchMenu();
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: [] as Array<string | null>,
+          };
         },
       },
     ],
