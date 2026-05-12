@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useMemo } from "react";
+import { useEffect, useCallback, useMemo, useState } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
@@ -43,6 +43,8 @@ import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
 import { useRegistryAwareness } from "./useRegistryAwareness";
 import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionProbe";
 import { MidSessionToast } from "./MidSessionToast";
+import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner";
+import { WaitingLockBanner } from "./WaitingLockBanner";
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -135,7 +137,8 @@ function TerminalPageInner({
     onSessionCountChange?.(tabs.length);
   }, [tabs.length, onSessionCountChange]);
 
-  const { fileConflicts, fileLockStates, sessionPersistence } = useShellInfra();
+  const { fileConflicts, fileLockStates, pendingYieldRequests, sessionPersistence } =
+    useShellInfra();
 
   // Re-key per-tab fileLockStates (keyed by tab.id) onto session ids so
   // SessionCard can render a "blocked on …" subtitle. session.sessionId
@@ -151,6 +154,92 @@ function TerminalPageInner({
     }
     return map;
   }, [tabs, fileLockStates]);
+
+  // ── Hold-side yield banner (Lock-Yield Protocol Phase 2) ─────────────
+  //
+  // Local-only dismissal set keyed by `${tab.id}:${filePath}`. When the
+  // user clicks "Hold" we add the key so the banner stops rendering for
+  // that pair. The banner re-appears when:
+  //   - the file path changes (different lock contested), OR
+  //   - waiterCount drops to 0 then back to ≥1 (a new wave of waiters).
+  //
+  // The clearing-on-zero-waiters effect handles the second case: when
+  // `useFileLockTracking`'s event listeners refresh waiterCount and it
+  // hits 0 for a previously-dismissed (tab, file_path), we drop that
+  // entry from the set so the next waiter wakes the banner up again.
+  //
+  // The banner is rendered alongside MidSessionToast (overlay above the
+  // active terminal pane). Wiring it into `TerminalTabBar.tsx` instead
+  // would force it into the tab-bar's tight horizontal layout — the
+  // plan flagged this ambiguity; the cleaner placement is here next to
+  // the contention toast, matching its visual language.
+  const [dismissedBanners, setDismissedBanners] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional sync: drop stale dismissals whenever fileLockStates changes so the banner re-shows on a fresh waiter wave (count 0 → 1 after a "Hold" click). The same React-rules exception pattern is used at lib/runner-api.ts:61 / :79 for the port-listener sync.
+    setDismissedBanners((prev) => {
+      if (prev.size === 0) return prev;
+      let dirty = false;
+      const next = new Set(prev);
+      for (const key of prev) {
+        const sep = key.indexOf(":");
+        if (sep < 0) continue;
+        const tabId = key.slice(0, sep);
+        const filePath = key.slice(sep + 1);
+        const state = fileLockStates?.[tabId];
+        // Drop the dismissal when the state no longer matches the
+        // (tab, file) pair OR when waiterCount has gone to 0.
+        if (
+          !state ||
+          state.kind !== "holding" ||
+          state.filePath !== filePath ||
+          (state.waiterCount ?? 0) === 0
+        ) {
+          next.delete(key);
+          dirty = true;
+        }
+      }
+      return dirty ? next : prev;
+    });
+  }, [fileLockStates]);
+
+  const activeTab = useMemo(
+    () => tabs.find((t) => t.id === activeId),
+    [tabs, activeId],
+  );
+  const activeLockState = activeId ? fileLockStates?.[activeId] : undefined;
+  // Phase 3 — pull per-tab incoming yield requests so the holding
+  // banner can shift into request-mode and we can surface the request
+  // count to the gating predicate.
+  const activeIncomingRequests = activeId ? pendingYieldRequests?.[activeId] : undefined;
+  const showHoldingBanner =
+    !!activeTab &&
+    !!activeId &&
+    shouldShowHoldingBanner({
+      lockState: activeLockState,
+      dismissed: dismissedBanners,
+      tabId: activeId,
+      incomingRequests: activeIncomingRequests,
+    });
+
+  // Phase 3 — resolve the blocker's task_run_id from
+  // `counterpartyName` (the blocker's tab title) by walking the local
+  // tabs list. Per the plan we use option (b) — pass-from-parent —
+  // rather than exporting `findTabByHolderName` from the hook so the
+  // hook's surface area stays minimal.
+  const showWaitingBanner =
+    !!activeTab &&
+    !!activeId &&
+    activeLockState?.kind === "waiting" &&
+    !!activeLockState.filePath &&
+    activeLockState.sinceMs !== undefined &&
+    !!activeTab.claudeSessionId;
+  const blockerTaskRunId = useMemo(() => {
+    if (!showWaitingBanner) return undefined;
+    const blockerName = activeLockState?.counterpartyName;
+    if (!blockerName) return undefined;
+    const holderTab = tabs.find((t) => t.title === blockerName);
+    return holderTab?.claudeSessionId;
+  }, [showWaitingBanner, activeLockState?.counterpartyName, tabs]);
 
   // Per-tab commit-readiness state (Plan §3). Sibling to fileLockStates;
   // both are passed through to TerminalTabBar for rendering.
@@ -613,6 +702,65 @@ function TerminalPageInner({
                 }}
               />
             )}
+
+            {/* Lock-Yield Protocol Phase 2 — hold-side yield banner.
+                Renders ONLY when the active tab is holding a file lock
+                AND at least one OTHER session is waiting on it. Same
+                overlay placement as MidSessionToast above. Uses
+                `tab.claudeSessionId` as the task_run_id for the yield
+                POST (canonical mapping for live AI tabs — same join
+                that `useFileLockTracking.findTabByTaskRunId` uses); if
+                a tab has no `claudeSessionId` yet (pre-spawn), the
+                banner stays hidden because the POST has nowhere
+                meaningful to land. */}
+            {showHoldingBanner &&
+              activeTab &&
+              activeId &&
+              activeLockState?.kind === "holding" &&
+              activeLockState.filePath &&
+              activeLockState.sinceMs !== undefined &&
+              activeTab.claudeSessionId && (
+                <HoldingLockBanner
+                  taskRunId={activeTab.claudeSessionId}
+                  filePath={activeLockState.filePath}
+                  waiterName={activeLockState.counterpartyName}
+                  sinceMs={activeLockState.sinceMs}
+                  waiterCount={activeLockState.waiterCount ?? 0}
+                  incomingRequests={activeIncomingRequests}
+                  onDismissLocal={() => {
+                    setDismissedBanners((prev) => {
+                      const next = new Set(prev);
+                      next.add(`${activeId}:${activeLockState.filePath}`);
+                      return next;
+                    });
+                  }}
+                />
+              )}
+
+            {/* Lock-Yield Protocol Phase 3 — wait-side yield-request
+                banner. Mutually exclusive with the holding banner above
+                (a tab is either holding OR waiting on a given path,
+                never both for the same file). Renders ONLY when the
+                active tab is waiting and we can identify both sides
+                — the blocker's task_run_id is resolved locally from
+                `tab.title === counterpartyName` (option (b) per the
+                plan; avoids exporting `findTabByHolderName` from the
+                hook). */}
+            {showWaitingBanner &&
+              activeTab &&
+              activeLockState?.kind === "waiting" &&
+              activeLockState.filePath &&
+              activeLockState.sinceMs !== undefined &&
+              activeTab.claudeSessionId && (
+                <WaitingLockBanner
+                  taskRunId={activeTab.claudeSessionId}
+                  taskRunName={activeTab.title}
+                  filePath={activeLockState.filePath}
+                  blockerName={activeLockState.counterpartyName}
+                  blockerTaskRunId={blockerTaskRunId}
+                  sinceMs={activeLockState.sinceMs}
+                />
+              )}
           </div>
 
           {uiState.showControlPanel && zoneLayout.isMultiZone && (
