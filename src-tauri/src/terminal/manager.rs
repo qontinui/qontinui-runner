@@ -6,11 +6,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use super::interceptor::OutputInterceptor;
 use super::session::TerminalSession;
 use super::types::{TerminalId, TerminalInfo};
+use crate::claude_session::SessionManager;
 
 /// Manages all active terminal sessions.
 pub struct TerminalManager {
@@ -113,6 +114,45 @@ impl TerminalManager {
             &payload,
         );
         Ok(())
+    }
+
+    /// Like [`Self::set_title`], but silently drops the update when the
+    /// terminal is registered with a `WorkerSession` in `session_manager`.
+    /// Used by the `terminal_set_title` Tauri command to pin `Worker N`
+    /// tab titles against OSC 0 drift from the embedded Claude CLI.
+    ///
+    /// Why: PR #98 (`0b61fa70a`, `feat(coord): worker readiness gate +
+    /// terminal UX fixes from coord soak`) made title sync bidirectional,
+    /// so OSC 0 titles emitted by Claude inside a worker pty overwrite
+    /// both the in-memory `TerminalSession.title` AND the UI tab strip
+    /// via `ZoneGrid::onTitleChange → invoke("terminal_set_title")`.
+    /// `Worker N` is the at-a-glance identifier operators (and the
+    /// Coordinator's `coord.tasks.assigned_session_id` join) use to
+    /// triage workers — preserving it requires gating the post-spawn
+    /// title mutations from worker-backed ptys.
+    ///
+    /// Non-worker terminals (manual `POST /terminals`, dashboard launch
+    /// buttons, etc.) keep the existing OSC 0 follow-the-child behaviour
+    /// through the unguarded [`Self::set_title`] path. Direct internal
+    /// callers (e.g. a future "rename tab from settings" UI) should
+    /// continue to invoke `set_title` directly — the gate applies only
+    /// to the OSC 0 echo path.
+    pub fn set_title_unless_worker(
+        &self,
+        session_manager: &SessionManager,
+        id: &str,
+        title: String,
+        app_handle: &AppHandle,
+    ) -> Result<(), String> {
+        if session_manager.find_worker_by_terminal_id(id).is_some() {
+            debug!(
+                terminal_id = id,
+                title = %title,
+                "dropping OSC 0 title update for worker-backed terminal"
+            );
+            return Ok(());
+        }
+        self.set_title(id, title, app_handle)
     }
 
     /// Remove and close a terminal session.

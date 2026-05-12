@@ -7,6 +7,7 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Manager;
 use tracing::{info, warn};
 
+use crate::claude_session::SessionManager;
 use crate::commands::CommandResponse;
 use crate::error::AppError;
 use crate::terminal::{strip_ansi, TerminalManager};
@@ -70,14 +71,27 @@ pub fn terminal_write(
 /// runner mirrors the new title onto `TerminalSession.title` and emits
 /// a `terminal-title-changed` event so other webview windows / WS
 /// subscribers stay consistent.
+///
+/// Worker pin (plan `2026-05-12-claude-auto-title-suppression-worker-tabs-plan.md`):
+/// goes through [`TerminalManager::set_title_unless_worker`] so OSC 0
+/// titles emitted by Claude inside a worker pty are silently dropped —
+/// `Worker N` stays pinned for the lifetime of the tab. Non-worker
+/// terminals (manual `claude` from the Terminal tab, PowerShell, etc.)
+/// keep the existing follow-the-child behaviour.
 #[tauri::command]
 pub fn terminal_set_title(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    session_manager: tauri::State<'_, Arc<SessionManager>>,
     app_handle: tauri::AppHandle,
     terminal_id: String,
     title: String,
 ) -> Result<CommandResponse, String> {
-    terminal_manager.set_title(&terminal_id, title, &app_handle)?;
+    terminal_manager.set_title_unless_worker(
+        session_manager.inner().as_ref(),
+        &terminal_id,
+        title,
+        &app_handle,
+    )?;
     Ok(CommandResponse {
         success: true,
         message: None,

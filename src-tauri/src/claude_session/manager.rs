@@ -123,6 +123,26 @@ impl SessionManager {
             .and_then(|guard| guard.get(task_run_id).cloned())
     }
 
+    /// Reverse lookup: find the worker (if any) backed by the given pty
+    /// terminal. The primary key is `task_run_id`; this walks the worker
+    /// map to match on `WorkerSession::terminal_id()`. Used by
+    /// `TerminalManager::set_title_unless_worker` to pin `Worker N` tab
+    /// titles against OSC 0 drift from the embedded Claude CLI.
+    ///
+    /// O(N) over registered workers. N is bounded by the operator's
+    /// active worker count (≤ 16 in practice), so a HashMap secondary
+    /// index keyed by `terminal_id` would be overkill — call sites are
+    /// limited to the title-set Tauri command path, which fires at
+    /// human-visible rates, not per-byte.
+    pub fn find_worker_by_terminal_id(&self, terminal_id: &str) -> Option<Arc<WorkerSession>> {
+        self.worker_sessions.lock().ok().and_then(|guard| {
+            guard
+                .values()
+                .find(|w| w.terminal_id() == terminal_id)
+                .cloned()
+        })
+    }
+
     /// Remove and return a worker registration. Does NOT close the
     /// underlying pty (TerminalManager owns those lifetimes).
     pub fn remove_worker(&self, task_run_id: &str) -> Option<Arc<WorkerSession>> {
@@ -457,5 +477,29 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0, "task-closed");
         assert_eq!(listed[0].1.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn find_worker_by_terminal_id_round_trips() {
+        let mgr = SessionManager::new();
+        let w1 = make_worker("task-1", "term-1", "Worker 1");
+        let w2 = make_worker("task-2", "term-2", "Worker 2");
+        mgr.register_worker(w1).expect("register w1");
+        mgr.register_worker(w2).expect("register w2");
+
+        let found = mgr
+            .find_worker_by_terminal_id("term-2")
+            .expect("term-2 should resolve");
+        assert_eq!(found.task_run_id(), "task-2");
+        assert_eq!(found.terminal_id(), "term-2");
+    }
+
+    #[test]
+    fn find_worker_by_terminal_id_returns_none_for_unknown_terminal() {
+        let mgr = SessionManager::new();
+        let w = make_worker("task-only", "term-only", "Worker only");
+        mgr.register_worker(w).expect("register");
+        assert!(mgr.find_worker_by_terminal_id("unrelated-term").is_none());
+        assert!(mgr.find_worker_by_terminal_id("").is_none());
     }
 }
