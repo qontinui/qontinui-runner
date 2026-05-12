@@ -850,6 +850,7 @@ mod tests {
                 depends_on: &[],
                 status: "running",
                 notes: None,
+                identity_hash: "",
             })
             .await
             .expect("insert task");
