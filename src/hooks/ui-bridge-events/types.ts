@@ -208,6 +208,9 @@ export type UIBridgeRequestType =
   // Tab control (F4 — first-class tab activation)
   | "tabs_list"
   | "tab_activate"
+  // Terminal session inspection (chore/uib-terminal-sessions-endpoint)
+  | "terminal_sessions_list"
+  | "terminal_session_get"
   // Page playbook (combined tab + component + intent + primary-action snapshot)
   | "get_playbook"
   // Network stubs (F2)
@@ -443,6 +446,14 @@ export type AnnotationEventTypes =
   | "annotations_export"
   | "annotations_import";
 
+/**
+ * Terminal session inspection — GET /control/terminal-sessions[/{id}].
+ * Reads from the module-level `terminal-sessions-registry` populated by
+ * `TerminalPageInner`, mirroring the "Rust asks, frontend answers"
+ * shape used by `tabs_list` / `tab_activate`.
+ */
+export type TerminalEventTypes = "terminal_sessions_list" | "terminal_session_get";
+
 /** Union of every variant claimed by a sub-hook. */
 export type AllHandledTypes =
   | ControlEventTypes
@@ -455,7 +466,8 @@ export type AllHandledTypes =
   | AISearchEventTypes
   | WorkflowEventTypes
   | MediaEventTypes
-  | AnnotationEventTypes;
+  | AnnotationEventTypes
+  | TerminalEventTypes;
 
 /**
  * Type-level assertion helper. `AssertEqual<X, Y>` is the literal type
@@ -544,6 +556,8 @@ export interface UIBridgeRequestPayload {
   maxTokens?: number;
   /** Target tab id for `tab_activate`. */
   tabId?: string;
+  /** Target id for `terminal_session_get` (== `tab.id` from `useTerminalManager`). */
+  id?: string;
   /** DOM-tree depth for `get_element_dom_tree` (clamped server-side to [1,6]). */
   depth?: number;
   /**

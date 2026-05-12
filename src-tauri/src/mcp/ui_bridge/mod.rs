@@ -38,6 +38,7 @@ pub mod screenshots;
 pub mod sdk_spec_sync;
 pub mod state_machine;
 pub mod stubs;
+pub mod terminals;
 pub mod toasts;
 pub mod types;
 
@@ -336,6 +337,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(sdk_spec_sync::route_entries());
         all.extend_from_slice(state_machine::route_entries());
         all.extend_from_slice(stubs::route_entries());
+        all.extend_from_slice(terminals::route_entries());
         all.extend_from_slice(toasts::route_entries());
         all
     })
@@ -382,6 +384,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(sdk_spec_sync::routes())
         .merge(state_machine::routes())
         .merge(stubs::routes())
+        .merge(terminals::routes())
         .merge(toasts::routes())
         // Tier 2.1 — safelisted Tauri command proxy
         .merge(crate::mcp::tauri_proxy::routes())

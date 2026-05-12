@@ -46,6 +46,7 @@ import {
   useWorkflowEvents,
   useMediaEvents,
   useAnnotationEvents,
+  useTerminalsEvents,
 } from "./ui-bridge-events";
 
 import type { UIBridgeRequestPayload, UIBridgeResponsePayload } from "./ui-bridge-events/types";
@@ -129,6 +130,7 @@ export function useUIBridgeEventHandler(): void {
   const handleWorkflow = useWorkflowEvents(context);
   const handleMedia = useMediaEvents(context);
   const handleAnnotations = useAnnotationEvents(context);
+  const handleTerminals = useTerminalsEvents(context);
 
   /**
    * Handle incoming UI Bridge requests
@@ -166,6 +168,7 @@ export function useUIBridgeEventHandler(): void {
           handleWorkflow,
           handleMedia,
           handleAnnotations,
+          handleTerminals,
         ];
 
         for (const handler of handlers) {
@@ -205,6 +208,7 @@ export function useUIBridgeEventHandler(): void {
       handleWorkflow,
       handleMedia,
       handleAnnotations,
+      handleTerminals,
     ],
   );
 
