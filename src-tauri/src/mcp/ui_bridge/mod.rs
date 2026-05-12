@@ -667,6 +667,11 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/element/{}/assert"),
             ("POST", "/ui-bridge/control/batch-actions"),
             ("POST", "/ui-bridge/circuit-breaker/reset"),
+            // Terminal sessions — runner-only (terminal tabs are a Tauri-host
+            // construct; SDK/web/supervisor consumers don't host PTY tabs).
+            // Pairs with `terminal-launch-menu` component actions.
+            ("GET", "/ui-bridge/control/terminal-sessions"),
+            ("GET", "/ui-bridge/control/terminal-sessions/{}"),
             // /control/ai/* aliases mirroring SDK /ai/* (runner-side dual mount)
             ("DELETE", "/ui-bridge/control/ai/bookmark/{}"),
             ("DELETE", "/ui-bridge/control/ai/bookmarks/{}"),
