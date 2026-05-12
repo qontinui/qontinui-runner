@@ -529,6 +529,7 @@ pub struct LeaderResponse {
     pub leader: Option<CoordinatorLeaderRow>,
     /// One of `"active" | "stale" | "vacant"`.
     pub lease_status: String,
+    pub seconds_since_renew: Option<i64>,
 }
 
 /// Result returned by [`launch_coordinator_session`] / [`spawn_worker_session`].
@@ -560,6 +561,16 @@ pub struct LaunchResult {
 /// regardless of which serialiser fed the row.
 pub(crate) fn compute_lease_status_for_http(leader: &Option<CoordinatorLeaderRow>) -> String {
     compute_lease_status(leader)
+}
+
+pub(crate) fn compute_seconds_since_renew(leader: &Option<CoordinatorLeaderRow>) -> Option<i64> {
+    let row = leader.as_ref()?;
+    let renewed_at = parse_pg_timestamptz(&row.renewed_at)?;
+    Some(
+        chrono::Utc::now()
+            .signed_duration_since(renewed_at)
+            .num_seconds(),
+    )
 }
 
 /// Parse a PG-style timestamptz text representation into UTC.
@@ -686,6 +697,40 @@ mod lease_status_tests {
         let r = row(&until, &renewed);
         assert_eq!(compute_lease_status(&r), "stale");
     }
+
+    #[test]
+    fn seconds_since_renew_none_when_no_leader() {
+        assert_eq!(compute_seconds_since_renew(&None), None);
+    }
+
+    #[test]
+    fn seconds_since_renew_matches_renewed_at_age() {
+        let now = chrono::Utc::now();
+        let renewed = (now - chrono::Duration::seconds(45))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let until = (now + chrono::Duration::seconds(60))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let r = row(&until, &renewed);
+        let age = compute_seconds_since_renew(&r).expect("renewed_at parses");
+        assert!(
+            (44..=46).contains(&age),
+            "expected ~45s since renew, got {}",
+            age
+        );
+    }
+
+    #[test]
+    fn seconds_since_renew_none_when_renewed_at_unparseable() {
+        let r = Some(CoordinatorLeaderRow {
+            instance_id: "rust-test".to_string(),
+            leased_until: "2026-05-03 18:01:08.681561+00".to_string(),
+            acquired_at: "2026-05-03 17:59:43.892179+00".to_string(),
+            renewed_at: "not-a-timestamp".to_string(),
+        });
+        assert_eq!(compute_seconds_since_renew(&r), None);
+    }
 }
 
 /// Read the current coordinator-leader lease + computed status. Drives the
@@ -698,9 +743,11 @@ pub async fn get_coordinator_leader(
     let app_state = require_app_state(&app_handle)?;
     let leader = app_state.pg_db.current_coordinator_leader().await?;
     let lease_status = compute_lease_status(&leader);
+    let seconds_since_renew = compute_seconds_since_renew(&leader);
     Ok(LeaderResponse {
         leader,
         lease_status,
+        seconds_since_renew,
     })
 }
 
