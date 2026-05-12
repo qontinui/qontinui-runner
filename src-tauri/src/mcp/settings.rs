@@ -247,6 +247,54 @@ async fn test_ai_connection(
     }))))
 }
 
+/// Body for `POST /settings/ai/path-prediction`.
+#[derive(Debug, Deserialize)]
+pub struct PathPredictionTogglePayload {
+    pub enabled: bool,
+}
+
+/// Response shape for `POST /settings/ai/path-prediction` — the resolved
+/// post-toggle value, so smoke callers don't need to GET to confirm.
+#[derive(Debug, Serialize)]
+pub struct PathPredictionToggleResponse {
+    pub ai_path_prediction_enabled: bool,
+}
+
+/// POST /settings/ai/path-prediction
+///
+/// Single-field toggle for `AiSettings.ai_path_prediction_enabled`. Exists
+/// alongside the full `PUT /settings/ai` so smoke tests can flip the AI
+/// extractor on the predictive-conflict probe without round-tripping the
+/// entire AiSettings object (which would race other agents and require a
+/// prior GET). Returns the resolved value after persistence.
+async fn save_ai_path_prediction_enabled(
+    Json(payload): Json<PathPredictionTogglePayload>,
+) -> Result<Json<ApiResponse<PathPredictionToggleResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut current = settings::get_ai_settings();
+        current.ai_path_prediction_enabled = payload.enabled;
+        settings::save_ai_settings(current).map(|()| payload.enabled)
+    })
+    .await
+    .map_err(|e| {
+        error!("Failed to toggle ai_path_prediction_enabled: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Task failed: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(enabled) => {
+            info!("ai_path_prediction_enabled toggled to {} via HTTP", enabled);
+            Ok(Json(ApiResponse::success(PathPredictionToggleResponse {
+                ai_path_prediction_enabled: enabled,
+            })))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
 /// POST /settings/ai/api-key
 async fn save_ai_api_key(
     Json(req): Json<SaveApiKeyRequest>,
@@ -953,6 +1001,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // AI settings
         .route("/settings/ai", get(get_ai_settings).put(save_ai_settings))
         .route("/settings/ai/test-connection", post(test_ai_connection))
+        .route(
+            "/settings/ai/path-prediction",
+            post(save_ai_path_prediction_enabled),
+        )
         .route("/settings/ai/api-key", post(save_ai_api_key))
         .route("/settings/ai/api-key/{provider}", delete(delete_ai_api_key))
         .route("/settings/ai/has-key/{provider}", get(has_ai_api_key))
