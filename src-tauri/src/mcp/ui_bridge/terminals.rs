@@ -70,10 +70,8 @@ pub async fn ui_bridge_terminal_sessions_list_handler(
 pub(crate) fn classify_terminal_session_get_response(
     id: &str,
     data: serde_json::Value,
-) -> Result<
-    Json<ApiResponse<serde_json::Value>>,
-    (StatusCode, Json<ApiResponse<serde_json::Value>>),
-> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
+{
     match data.get("found").and_then(serde_json::Value::as_bool) {
         Some(true) => Ok(Json(ApiResponse::success(data))),
         Some(false) => {
