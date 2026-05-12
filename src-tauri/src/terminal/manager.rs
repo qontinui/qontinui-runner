@@ -84,6 +84,42 @@ impl TerminalManager {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
     }
 
+    /// Update the title of a terminal session and emit a
+    /// `terminal-title-changed` Tauri event so other webview windows
+    /// (and the backend relay's WS subscribers) stay in sync.
+    ///
+    /// Phase 2 of the bi-directional title sync (plan
+    /// `2026-05-11-runner-dispatch-and-terminal-ux-fixes-plan.md`): the
+    /// frontend's xterm.js `onTitleChange` callback now invokes
+    /// `terminal_set_title` so backend `/terminals` titles match what the
+    /// user sees in the UI. Without this, `TerminalSession.title` was
+    /// frozen at spawn time and drifted from the OSC 0 title the child
+    /// emits at runtime.
+    pub fn set_title(
+        &self,
+        id: &str,
+        title: String,
+        app_handle: &AppHandle,
+    ) -> Result<(), String> {
+        let session = self
+            .get(id)
+            .ok_or_else(|| format!("Terminal session not found: {}", id))?;
+        session.set_title(title.clone());
+        let payload = serde_json::json!({ "id": id, "title": title });
+        if let Err(e) = app_handle.emit("terminal-title-changed", &payload) {
+            error!("Failed to emit terminal-title-changed: {}", e);
+        }
+        // Mirror to the backend WS relay so remote mobile viewers stay
+        // consistent (same pattern as the reader thread's terminal-output
+        // mirror in session.rs).
+        crate::event_system::broadcast_ws_notification(
+            app_handle,
+            "terminal-title-changed",
+            &payload,
+        );
+        Ok(())
+    }
+
     /// Remove and close a terminal session.
     pub fn close(&self, id: &str) -> Result<(), String> {
         let session = {
