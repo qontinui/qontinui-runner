@@ -1008,12 +1008,20 @@ pub async fn spawn_worker_session(
     // Coordinator's flag for the same reason).
     let initial_command = "claude --dangerously-skip-permissions".to_string();
 
+    // Phase 4: pre-size the worker PTY to match the dominant existing
+    // zone so worker briefs land on a grid the same size the user will
+    // eventually see (rather than the 120×30 default, which produces
+    // mis-wrapped output until the user activates the tab and fit-addon
+    // resizes the PTY). Falls back to (120, 30) when no other terminals
+    // exist — same as `terminal_manager.create(None, None)` historically.
+    let (dom_cols, dom_rows) = terminal_manager.dominant_zone_dims();
+
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(repo_path),
         None,
-        None,
-        None,
+        Some(dom_cols),
+        Some(dom_rows),
         app_handle.clone(),
     )?;
 
