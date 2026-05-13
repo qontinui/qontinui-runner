@@ -638,24 +638,24 @@ impl RecordLearningOutcomeStmt {
     }
 }
 impl<
-        'c,
-        'a,
-        's,
-        C: GenericClient,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
-        T9: crate::StringSql,
-        T10: crate::StringSql,
-        T11: crate::StringSql,
-        T12: crate::StringSql,
-        T13: crate::StringSql,
-    >
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+    T9: crate::StringSql,
+    T10: crate::StringSql,
+    T11: crate::StringSql,
+    T12: crate::StringSql,
+    T13: crate::StringSql,
+>
     crate::client::async_::Params<
         'c,
         'a,
@@ -820,15 +820,15 @@ impl SaveLearningPatternStmt {
     }
 }
 impl<
-        'c,
-        'a,
-        's,
-        C: GenericClient,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-    >
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+>
     crate::client::async_::Params<
         'c,
         'a,
