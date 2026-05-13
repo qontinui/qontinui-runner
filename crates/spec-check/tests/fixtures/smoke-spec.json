@@ -1,0 +1,60 @@
+{
+  "version": "1.0",
+  "id": "smoke-page",
+  "name": "Smoke Page",
+  "states": [
+    {
+      "id": "loaded",
+      "name": "Loaded",
+      "isInitial": true,
+      "assertions": [
+        {
+          "id": "save-btn-asn",
+          "description": "Save button is present",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "text": "Save" },
+            "label": "Save button"
+          },
+          "source": "test-fixture",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "page-title-asn",
+          "description": "Page heading is present",
+          "category": "element-presence",
+          "severity": "error",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading", "text": "Settings" },
+            "label": "Page heading"
+          },
+          "source": "test-fixture",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "email-input-asn",
+          "description": "Email input is present",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox", "ariaLabel": "Email" },
+            "label": "Email input"
+          },
+          "source": "test-fixture",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "transitions": []
+}

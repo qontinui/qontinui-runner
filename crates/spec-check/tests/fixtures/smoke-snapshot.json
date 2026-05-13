@@ -1,0 +1,108 @@
+{
+  "timestamp": 1700000000000,
+  "elements": [
+    {
+      "id": "save-btn",
+      "type": "button",
+      "label": "Save",
+      "actions": ["click"],
+      "identifier": {
+        "htmlId": "save-btn",
+        "xpath": "/html/body/main/form/button[1]",
+        "selector": "button.save"
+      },
+      "state": {
+        "visible": true,
+        "enabled": true,
+        "focused": false,
+        "rect": {
+          "x": 100,
+          "y": 200,
+          "width": 80,
+          "height": 32,
+          "top": 200,
+          "right": 180,
+          "bottom": 232,
+          "left": 100
+        }
+      },
+      "registeredAt": 1700000000000,
+      "mounted": true,
+      "visible": true,
+      "role": "button",
+      "tagName": "button",
+      "accessibleName": "Save",
+      "text": "Save"
+    },
+    {
+      "id": "page-title",
+      "type": "heading",
+      "label": "Settings",
+      "actions": [],
+      "identifier": {
+        "htmlId": "page-title",
+        "xpath": "/html/body/main/h1",
+        "selector": "h1#page-title"
+      },
+      "state": {
+        "visible": true,
+        "enabled": true,
+        "focused": false,
+        "rect": {
+          "x": 24,
+          "y": 24,
+          "width": 200,
+          "height": 36,
+          "top": 24,
+          "right": 224,
+          "bottom": 60,
+          "left": 24
+        }
+      },
+      "registeredAt": 1700000000000,
+      "mounted": true,
+      "visible": true,
+      "role": "heading",
+      "tagName": "h1",
+      "accessibleName": "Settings",
+      "text": "Settings"
+    },
+    {
+      "id": "email-input",
+      "type": "input",
+      "label": "Email",
+      "actions": ["type", "clear"],
+      "identifier": {
+        "htmlId": "email-input",
+        "testId": "email-input",
+        "xpath": "/html/body/main/form/input[1]",
+        "selector": "input[name='email']"
+      },
+      "state": {
+        "visible": true,
+        "enabled": true,
+        "focused": false,
+        "rect": {
+          "x": 100,
+          "y": 120,
+          "width": 240,
+          "height": 28,
+          "top": 120,
+          "right": 340,
+          "bottom": 148,
+          "left": 100
+        },
+        "value": ""
+      },
+      "registeredAt": 1700000000000,
+      "mounted": true,
+      "visible": true,
+      "role": "textbox",
+      "tagName": "input",
+      "ariaLabel": "Email",
+      "accessibleName": "Email",
+      "text": ""
+    }
+  ],
+  "components": []
+}

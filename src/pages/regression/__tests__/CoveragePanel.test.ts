@@ -25,6 +25,7 @@ import {
   deriveCoverageStats,
   type AssertionExecutionRow,
 } from "../CoveragePanel";
+import { makeTestAssertion } from "@/lib/__test-helpers__/ir-fixtures";
 
 // ---------------------------------------------------------------------------
 // Fixtures — minimal IR + suite generated from it. Mirrors the shape used in
@@ -39,12 +40,12 @@ const FIXTURE_IR: IRDocument = {
     {
       id: "s-root",
       name: "Root",
-      requiredElements: [{ tagName: "body" }],
+      assertions: [makeTestAssertion("s-root", 0, { tagName: "body" })],
     },
     {
       id: "s-page",
       name: "Page",
-      requiredElements: [{ role: "heading" }],
+      assertions: [makeTestAssertion("s-page", 0, { role: "heading" })],
     },
   ],
   transitions: [

@@ -24,7 +24,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-import type { IRDocument } from "@qontinui/shared-types/ui-bridge-ir";
+import type { IRDocument, IRElementCriteria } from "@qontinui/shared-types/ui-bridge-ir";
 import type {
   RegressionSuite,
   RegressionCase,
@@ -211,8 +211,9 @@ interface AssertionOutcome {
 
 /**
  * State-active dispatch: every required element must be findable
- * unambiguously. The IR's `requiredElements` array supplies the queries;
- * the assertion's `requiredElementIds` indexes into it.
+ * unambiguously. The IR's `assertions` array supplies the queries (each
+ * assertion's `target.criteria`); the suite's `requiredElementIds` indexes
+ * into it.
  *
  * "Unambiguous" here means `findFirst` returns a non-null match. We do NOT
  * gate on `ambiguities.length === 0` — the suite is a spec, not a uniqueness
@@ -236,12 +237,13 @@ function evaluateStateActive(
   const elements = registry.getAllElements();
   const missing: number[] = [];
   for (const idx of assertion.requiredElementIds) {
-    const criteria = state.requiredElements[idx];
-    if (!criteria) {
+    const irAssertion = state.assertions[idx];
+    if (!irAssertion) {
       // Defensive: a stale suite may carry indices the IR no longer has.
       missing.push(idx);
       continue;
     }
+    const criteria = irAssertion.target.criteria as IRElementCriteria;
     const result = findFirst(elements, criteria);
     if (!result.match) missing.push(idx);
   }
@@ -307,13 +309,13 @@ async function evaluateVisualGate(
   manager: ScreenshotAssertionManager,
 ): Promise<AssertionOutcome> {
   const state = ir.states.find((s) => s.id === assertion.stateId);
-  if (!state || state.requiredElements.length === 0) {
+  if (!state || state.assertions.length === 0) {
     return {
       status: "skip",
     };
   }
   const elements = registry.getAllElements();
-  const found = findFirst(elements, state.requiredElements[0]!);
+  const found = findFirst(elements, state.assertions[0]!.target.criteria as IRElementCriteria);
   if (!found.match) {
     return {
       status: "skip",
@@ -390,7 +392,10 @@ async function evaluateOverlay(
         };
       }
       const state = ir.states.find((s) => s.id === stateId);
-      const criteria = state?.requiredElements[idx];
+      const irAssertion = state?.assertions[idx];
+      const criteria = irAssertion
+        ? (irAssertion.target.criteria as IRElementCriteria)
+        : undefined;
       if (!criteria) {
         return {
           status: "fail",

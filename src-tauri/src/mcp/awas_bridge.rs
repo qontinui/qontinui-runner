@@ -125,6 +125,9 @@ pub fn awas_action_to_ui_bridge_element(
         // and the caller falls through to the structured criteria matcher.
         bbox: None,
         visible: None,
+        // ARIA / DOM walker fields — not populated for manifest-declared
+        // AWAS elements (no live DOM ref to read from). Downstream criteria
+        // matchers must tolerate `None` for these.
         role: None,
         tag_name: None,
         aria_label: None,

@@ -243,8 +243,8 @@ fn build_state_machine_state(
             .assertions
             .iter()
             .map(|a| {
-                let crit: IrElementCriteria = serde_json::from_value(a.target.criteria.clone())
-                    .expect(
+                let crit: IrElementCriteria =
+                    serde_json::from_value(a.target.criteria.clone()).expect(
                         "IrState.assertions[].target.criteria must be IrElementCriteria-shaped",
                     );
                 convert_criteria(&crit)
