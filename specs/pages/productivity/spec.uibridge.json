@@ -658,7 +658,7 @@
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "FileActivityPanel — heatmap of currently-edited files, hot files in the selected window, and hot sessions. Added by the file-ownership-heatmap plan; lives below the spec-locked five-panel block.",
+          "description": "FileActivityPanel — heatmap of currently-edited files, hot files in the selected window, and hot sessions. Added by the file-ownership-heatmap plan; lives below the spec-locked six-panel block.",
           "enabled": true,
           "id": "productivity-coordinator-panels-elem-6",
           "precondition": "The Coordinator sub-view is active.",
@@ -674,12 +674,32 @@
             "label": "Required element for Coordinator Dashboard — File Activity panel",
             "type": "search"
           }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "DeferralsPanel — Rule B advise-with-text rows whose reasoning matches /deferred/, grouped by targetId. Each row shows the blocker label extracted from one of the two Rule B advisory templates (held-lock or cross-task) and a 'Force-assign anyway' button that opens an idle-session picker and fires POST /coordinator/dispatch-action with AssignTask. Added by the coordinator-driven-scheduling plan; sits between AdvisoriesPanel (3) and EscalationsPanel (5) in the spec-locked stack.",
+          "enabled": true,
+          "id": "productivity-coordinator-panels-elem-7",
+          "precondition": "The Coordinator sub-view is active.",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "manual",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "ui-bridge-id": "productivity.coord-deferrals"
+              }
+            },
+            "label": "Required element for Coordinator Dashboard — Deferrals panel",
+            "type": "search"
+          }
         }
       ],
       "category": "element-presence",
-      "description": "The Coordinator dashboard renders six vertically-stacked panels. The first five are spec-locked in fixed order: (1) PlanRecommendations 'Coordinator suggests next plan' card; (2) RecommendationsPanel — medium-confidence approved review queue; (3) AdvisoriesPanel — LLM advise-with-text rows from the last hour; (4) EscalationsPanel — open destructive recommendations the agent flagged advisory-only; (5) DecisionLogPanel — chronological feed of last 200 coordinator_decisions rows filterable by rule (A-E or LLM) and action. Below the locked block sits (6) FileActivityPanel — file-ownership heatmap with a live-snapshot grouped by holder, a hot-files table, and a hot-sessions table, refreshed every 5 s while visible; the panel is OUTSIDE the productivity-stack spec's order-invariant guarantee but is required to exist. Each panel is wrapped in a border-border + bg-card/30 rounded-lg section with its own header (icon + title + count or selector + Refresh button) and a content area that handles error / empty / populated states.",
+      "description": "The Coordinator dashboard renders seven vertically-stacked panels. The first six are spec-locked in fixed order: (1) PlanRecommendations 'Coordinator suggests next plan' card; (2) RecommendationsPanel — medium-confidence approved review queue; (3) AdvisoriesPanel — LLM advise-with-text rows from the last hour; (4) DeferralsPanel — Rule B deferral advisories (held-lock + cross-task) grouped by targetId, each with a force-assign session-picker override fired via POST /coordinator/dispatch-action; (5) EscalationsPanel — open destructive recommendations the agent flagged advisory-only; (6) DecisionLogPanel — chronological feed of last 200 coordinator_decisions rows filterable by rule (A-E or LLM) and action. Below the locked block sits (7) FileActivityPanel — file-ownership heatmap with a live-snapshot grouped by holder, a hot-files table, and a hot-sessions table, refreshed every 5 s while visible; the panel is OUTSIDE the productivity-stack spec's order-invariant guarantee but is required to exist. Each panel is wrapped in a border-border + bg-card/30 rounded-lg section with its own header (icon + title + count or selector + Refresh button) and a content area that handles error / empty / populated states.",
       "id": "productivity-coordinator-panels",
-      "name": "Coordinator Dashboard — Five-Panel Stack",
+      "name": "Coordinator Dashboard — Six-Panel Stack",
       "source": "migrated"
     },
     {
@@ -1902,7 +1922,7 @@
         "transitions": []
       },
       {
-        "description": "The Coordinator dashboard renders five vertically-stacked panels in a fixed order: (1) PlanRecommendations 'Coordinator suggests next plan' card; (2) RecommendationsPanel — medium-confidence approved review queue; (3) AdvisoriesPanel — LLM advise-with-text rows from the last hour; (4) EscalationsPanel — open destructive recommendations the agent flagged advisory-only; (5) DecisionLogPanel — chronological feed of last 200 coordinator_decisions rows filterable by rule (A-E or LLM) and action. Each panel is wrapped in a border-border + bg-card/30 rounded-lg section with its own header (icon + title + count chip + Refresh button) and a content area that handles error / empty / populated states.",
+        "description": "The Coordinator dashboard renders six vertically-stacked panels in a fixed order: (1) PlanRecommendations 'Coordinator suggests next plan' card; (2) RecommendationsPanel — medium-confidence approved review queue; (3) AdvisoriesPanel — LLM advise-with-text rows from the last hour; (4) DeferralsPanel — Rule B deferral advisories (held-lock + cross-task) grouped by targetId, each row carries a force-assign session-picker override fired via POST /coordinator/dispatch-action; (5) EscalationsPanel — open destructive recommendations the agent flagged advisory-only; (6) DecisionLogPanel — chronological feed of last 200 coordinator_decisions rows filterable by rule (A-E or LLM) and action. Each panel is wrapped in a border-border + bg-card/30 rounded-lg section with its own header (icon + title + count chip + Refresh button) and a content area that handles error / empty / populated states.",
         "elements": [
           {
             "dataAttributes": {
@@ -1917,6 +1937,11 @@
           {
             "dataAttributes": {
               "ui-bridge-id": "productivity.coord-advisories"
+            }
+          },
+          {
+            "dataAttributes": {
+              "ui-bridge-id": "productivity.coord-deferrals"
             }
           },
           {
@@ -1937,7 +1962,7 @@
         ],
         "id": "productivity-coordinator-panels",
         "isInitial": false,
-        "name": "Coordinator Dashboard — Five-Panel Stack",
+        "name": "Coordinator Dashboard — Six-Panel Stack",
         "transitions": []
       },
       {
