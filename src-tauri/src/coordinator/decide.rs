@@ -1042,10 +1042,8 @@ mod tests {
         obs.tasks.push(task);
         obs.live_sessions
             .push(make_session("sess-a", SessionState::Ready));
-        obs.held_locks.insert(
-            normalize_path("src/foo.rs"),
-            "sess-holder".to_string(),
-        );
+        obs.held_locks
+            .insert(normalize_path("src/foo.rs"), "sess-holder".to_string());
 
         let outcome = rule_b(&obs).expect("rule B should fire (deferral)");
         match outcome.action {
@@ -1167,10 +1165,8 @@ mod tests {
         obs.tasks.push(task);
         obs.live_sessions
             .push(make_session("sess-a", SessionState::Ready));
-        obs.held_locks.insert(
-            normalize_path("src/foo.rs"),
-            "sess-holder".to_string(),
-        );
+        obs.held_locks
+            .insert(normalize_path("src/foo.rs"), "sess-holder".to_string());
 
         let mut prior = make_decision("B", "advise-with-text", Some("t-1"));
         prior.reasoning = format!(

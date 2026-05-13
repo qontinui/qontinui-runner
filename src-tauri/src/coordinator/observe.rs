@@ -201,11 +201,8 @@ impl Observation {
         }
 
         // Heatmap aggregates: sort by task_run_id for stable hashing.
-        let mut breadth: Vec<(&String, &u64)> = self
-            .heatmap
-            .session_distinct_files
-            .iter()
-            .collect();
+        let mut breadth: Vec<(&String, &u64)> =
+            self.heatmap.session_distinct_files.iter().collect();
         breadth.sort_by(|a, b| a.0.cmp(b.0));
         hasher.update(b"heatmap_breadth:");
         for (id, n) in &breadth {
@@ -214,8 +211,7 @@ impl Observation {
             hasher.update(n.to_string().as_bytes());
             hasher.update(b";");
         }
-        let mut held_count: Vec<(&String, &u64)> =
-            self.heatmap.session_held_count.iter().collect();
+        let mut held_count: Vec<(&String, &u64)> = self.heatmap.session_held_count.iter().collect();
         held_count.sort_by(|a, b| a.0.cmp(b.0));
         hasher.update(b"heatmap_held:");
         for (id, n) in &held_count {
@@ -371,8 +367,7 @@ pub(crate) async fn observe(state: &Arc<ApiState>) -> Result<Observation, String
         Ok(rows) => {
             for row in rows {
                 if row.distinct_files >= 0 {
-                    session_distinct_files
-                        .insert(row.task_run_id, row.distinct_files as u64);
+                    session_distinct_files.insert(row.task_run_id, row.distinct_files as u64);
                 }
             }
         }
