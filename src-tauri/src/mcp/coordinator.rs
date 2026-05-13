@@ -729,9 +729,11 @@ async fn get_coordinator_leader(
             )
         })?;
     let lease_status = crate::commands::productivity::compute_lease_status_for_http(&leader);
+    let seconds_since_renew = crate::commands::productivity::compute_seconds_since_renew(&leader);
     Ok(Json(crate::commands::productivity::LeaderResponse {
         leader,
         lease_status,
+        seconds_since_renew,
     }))
 }
 
@@ -811,20 +813,56 @@ pub struct BreakLeaseResponse {
     pub lease_status: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BreakLeaseQuery {
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 async fn break_coordinator_lease(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<BreakLeaseQuery>,
 ) -> Result<Json<BreakLeaseResponse>, (StatusCode, String)> {
-    let broken = state
-        .app_state
-        .pg_db
-        .release_stale_coordinator_lease()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("release_stale_coordinator_lease: {}", e),
-            )
-        })?;
+    // Safety rail: a stray curl with force=true alone must not strip an
+    // actively-held lease — operator confirmation is required to bypass
+    // the 60s stale grace.
+    if query.force && !query.confirm {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "force=true requires confirm=true to bypass the 60s stale grace".to_string(),
+        ));
+    }
+
+    let (broken, forced) = if query.force {
+        let instance = state
+            .app_state
+            .pg_db
+            .force_release_coordinator_lease()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("force_release_coordinator_lease: {}", e),
+                )
+            })?;
+        (instance.is_some(), Some(instance))
+    } else {
+        let b = state
+            .app_state
+            .pg_db
+            .release_stale_coordinator_lease()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("release_stale_coordinator_lease: {}", e),
+                )
+            })?;
+        (b, None)
+    };
 
     let current = state
         .app_state
@@ -839,7 +877,12 @@ async fn break_coordinator_lease(
         })?;
     let lease_status = crate::commands::productivity::compute_lease_status_for_http(&current);
 
-    if broken {
+    if let Some(instance) = forced {
+        info!(
+            "Coordinator lease FORCE-cleared (instance_id={:?}); post-action lease_status={}",
+            instance, lease_status
+        );
+    } else if broken {
         info!(
             "Coordinator stale lease cleared; post-action lease_status={}",
             lease_status

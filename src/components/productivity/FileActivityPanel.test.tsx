@@ -27,6 +27,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mockGetApiPort = vi.fn(() => 9876);
 vi.mock("@/lib/runner-api", () => ({
   getApiPort: () => mockGetApiPort(),
+  // `fetchHeatmap` + `fetchLockInfo` (`fileActivityApi.ts`) use
+  // `resolvePort()` for port lookup so the synthetic window global
+  // wins over `getApiPort()` in test runs; mock to the same value
+  // for parity.
+  resolvePort: () => mockGetApiPort(),
 }));
 vi.mock("@/lib/logger", () => ({
   createLogger: () => ({

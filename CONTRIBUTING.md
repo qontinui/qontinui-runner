@@ -178,6 +178,14 @@ cd python-bridge
 pytest
 ```
 
+### Rust unit tests — env-var hygiene
+
+Cargo runs tests within a binary in parallel by default. Two tests in the same binary that touch the same process-wide env var will race: one mutates it, the other reads it expecting the unset (or differently-set) state. The race is OS-sensitive — macOS/Windows tend to finish the env-toggling test fast enough to hide the leak; Ubuntu CI exposes it routinely.
+
+**Canonical pattern: [`src-tauri/src/startup_panic.rs::tests`](src-tauri/src/startup_panic.rs).** That module ships the full shape — module-local `static ENV_LOCK: Mutex<()>` for inter-test serialization, an `EnvGuard` RAII `Drop` that clears the touched vars on every exit path (including panics), and `.lock().unwrap_or_else(|e| e.into_inner())` poison recovery so a panicking test doesn't cascade-fail siblings. Copy that shape verbatim before reaching for `serial_test` or rolling your own. If your test mutates a different env var, name the guard accordingly (e.g. `QontinuiPortGuard` in `scheduler_service.rs::tests`); if multiple modules touch the same var, promote the lock to a shared module.
+
+Avoid the half-pattern (lock without RAII, or RAII without poison recovery): the env state leaks across tests on every panic. See PRs #82 and #95 for examples of retrofitting the full shape onto modules that had one or both halves missing.
+
 ## CI & Merge Readiness
 
 A PR is ready to merge when every required workflow is green on the PR's HEAD commit. Don't merge through red, and don't assume someone else's red is "fine" because `main` is also red — that's how `main` ended up with a 685-run failure streak going back to 2025-09-24.

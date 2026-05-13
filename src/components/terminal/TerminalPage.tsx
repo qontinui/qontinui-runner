@@ -37,6 +37,10 @@ import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { useTerminalInitialization } from "./useTerminalInitialization";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
+import {
+  setTerminalSessions,
+  type TerminalSessionEntry,
+} from "@/lib/terminal-sessions-registry";
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
@@ -137,8 +141,13 @@ function TerminalPageInner({
     onSessionCountChange?.(tabs.length);
   }, [tabs.length, onSessionCountChange]);
 
-  const { fileConflicts, fileLockStates, pendingYieldRequests, sessionPersistence } =
-    useShellInfra();
+  const {
+    fileConflicts,
+    fileLockStates,
+    pendingYieldRequests,
+    pendingLongWaitSignals,
+    sessionPersistence,
+  } = useShellInfra();
 
   // Re-key per-tab fileLockStates (keyed by tab.id) onto session ids so
   // SessionCard can render a "blocked on …" subtitle. session.sessionId
@@ -270,6 +279,37 @@ function TerminalPageInner({
   } = useZoneMetadata();
 
   const stateTracking = useSessionState();
+
+  // Publish a snapshot of the current tabs + per-tab session state to the
+  // module-level `terminal-sessions-registry`. The UI Bridge IPC handlers
+  // for `GET /control/terminal-sessions[/{id}]` read from there since the
+  // dispatcher (`useUIBridgeEventHandler`) sits above `TerminalCoreProvider`
+  // and can't reach into this context directly. On unmount we clear the
+  // snapshot so a stale view doesn't survive a route switch.
+  useEffect(() => {
+    const entries: TerminalSessionEntry[] = tabs.map((t) => ({
+      id: t.id,
+      title: t.title,
+      taskRunId: t.claudeSessionId ?? null,
+      claudeSessionId: t.claudeSessionId ?? null,
+      workingDir: t.workingDir ?? "",
+      // `sessionStates` keys are tab.id; tabs without a tracked state
+      // (plain pwsh, freshly-created AI tabs before the state machine
+      // observes them) fall through to "idle" so the field is always
+      // a valid `TerminalSessionState`.
+      state: stateTracking.sessionStates[t.id] ?? "idle",
+      isAlive: Boolean(t.isAlive),
+      exitCode: t.exitCode,
+      type: t.type ?? "terminal",
+      createdAt: t.createdAt ?? null,
+    }));
+    setTerminalSessions(entries);
+    return () => {
+      // Best-effort clear when TerminalPage unmounts so stale entries
+      // don't survive tab switches away from `/terminals`.
+      setTerminalSessions([]);
+    };
+  }, [tabs, stateTracking.sessionStates]);
 
   const transitionEffects = useTransitionEffects();
   const { handleRestartInZone } = transitionEffects;
@@ -514,6 +554,10 @@ function TerminalPageInner({
                 writeWhenReady(tabId, `${autoCommand}\r`);
               }
             }
+            // Returned ids surface in the UI Bridge action response so
+            // automation can immediately poll
+            // `/control/terminal-sessions/{id}` without screen-scraping.
+            return createdTabIds;
           }}
           onLaunchAiSession={async (count, configDir, context) => {
             const totalTabs = tabs.length + count;
@@ -561,6 +605,10 @@ function TerminalPageInner({
                 }, 8000);
               }
             }
+            // Returned ids surface in the UI Bridge action response so
+            // automation can immediately poll
+            // `/control/terminal-sessions/{id}` without screen-scraping.
+            return createdTabIds;
           }}
           onLaunchMultiAiSessions={async (configDirs, context) => {
             const count = configDirs.length;
@@ -604,6 +652,10 @@ function TerminalPageInner({
                 setTimeout(() => writeWhenReady(tabId, `${safeContext}\r`), j * 300 + 8000);
               }
             }
+            // Returned ids surface in the UI Bridge action response so
+            // automation can immediately poll
+            // `/control/terminal-sessions/{id}` without screen-scraping.
+            return createdTabIds;
           }}
           accountUsage={sessionManager.accountUsage}
           launchCommands={sessionManager.launchCommands}
@@ -722,6 +774,7 @@ function TerminalPageInner({
               activeTab.claudeSessionId && (
                 <HoldingLockBanner
                   taskRunId={activeTab.claudeSessionId}
+                  taskRunName={activeTab.title}
                   filePath={activeLockState.filePath}
                   waiterName={activeLockState.counterpartyName}
                   sinceMs={activeLockState.sinceMs}
@@ -759,6 +812,34 @@ function TerminalPageInner({
                   blockerName={activeLockState.counterpartyName}
                   blockerTaskRunId={blockerTaskRunId}
                   sinceMs={activeLockState.sinceMs}
+                  // Phase 2 (stuck-session heartbeat) — joined from
+                  // `/sessions/idle-status` by useFileLockTracking's
+                  // 10s poll; threaded through as a prop so the banner
+                  // surfaces "(holder idle Xm)" inline on the headline.
+                  // Undefined on holding/idle branches by design (the
+                  // hook only attaches it to the waiting branch).
+                  holderIdleMs={activeLockState.holderIdleMs}
+                  longWaitSignal={(() => {
+                    // Phase 3 (stuck-session heartbeat): surface the
+                    // most-recent long-wait signal targeting this
+                    // waiter for the contested file. The hook dedups
+                    // by `(holderTaskRunId, filePath)` so the list is
+                    // already keyed cleanly; picking [0] yields the
+                    // first-arrived entry, but for the banner copy any
+                    // matching entry is acceptable since a new signal
+                    // for the same pair replaces in place.
+                    const signals =
+                      (activeId && pendingLongWaitSignals?.[activeId]) || [];
+                    const match = signals.find(
+                      (s) => s.filePath === activeLockState.filePath,
+                    );
+                    if (!match) return undefined;
+                    return {
+                      holderName: match.holderName,
+                      estimatedRemainingMs: match.estimatedRemainingMs,
+                      signaledAtMs: match.signaledAtMs,
+                    };
+                  })()}
                 />
               )}
           </div>

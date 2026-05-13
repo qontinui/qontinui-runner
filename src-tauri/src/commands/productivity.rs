@@ -529,6 +529,7 @@ pub struct LeaderResponse {
     pub leader: Option<CoordinatorLeaderRow>,
     /// One of `"active" | "stale" | "vacant"`.
     pub lease_status: String,
+    pub seconds_since_renew: Option<i64>,
 }
 
 /// Result returned by [`launch_coordinator_session`] / [`spawn_worker_session`].
@@ -560,6 +561,16 @@ pub struct LaunchResult {
 /// regardless of which serialiser fed the row.
 pub(crate) fn compute_lease_status_for_http(leader: &Option<CoordinatorLeaderRow>) -> String {
     compute_lease_status(leader)
+}
+
+pub(crate) fn compute_seconds_since_renew(leader: &Option<CoordinatorLeaderRow>) -> Option<i64> {
+    let row = leader.as_ref()?;
+    let renewed_at = parse_pg_timestamptz(&row.renewed_at)?;
+    Some(
+        chrono::Utc::now()
+            .signed_duration_since(renewed_at)
+            .num_seconds(),
+    )
 }
 
 /// Parse a PG-style timestamptz text representation into UTC.
@@ -686,6 +697,40 @@ mod lease_status_tests {
         let r = row(&until, &renewed);
         assert_eq!(compute_lease_status(&r), "stale");
     }
+
+    #[test]
+    fn seconds_since_renew_none_when_no_leader() {
+        assert_eq!(compute_seconds_since_renew(&None), None);
+    }
+
+    #[test]
+    fn seconds_since_renew_matches_renewed_at_age() {
+        let now = chrono::Utc::now();
+        let renewed = (now - chrono::Duration::seconds(45))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let until = (now + chrono::Duration::seconds(60))
+            .format("%Y-%m-%d %H:%M:%S%.6f+00")
+            .to_string();
+        let r = row(&until, &renewed);
+        let age = compute_seconds_since_renew(&r).expect("renewed_at parses");
+        assert!(
+            (44..=46).contains(&age),
+            "expected ~45s since renew, got {}",
+            age
+        );
+    }
+
+    #[test]
+    fn seconds_since_renew_none_when_renewed_at_unparseable() {
+        let r = Some(CoordinatorLeaderRow {
+            instance_id: "rust-test".to_string(),
+            leased_until: "2026-05-03 18:01:08.681561+00".to_string(),
+            acquired_at: "2026-05-03 17:59:43.892179+00".to_string(),
+            renewed_at: "not-a-timestamp".to_string(),
+        });
+        assert_eq!(compute_seconds_since_renew(&r), None);
+    }
 }
 
 /// Read the current coordinator-leader lease + computed status. Drives the
@@ -698,9 +743,11 @@ pub async fn get_coordinator_leader(
     let app_state = require_app_state(&app_handle)?;
     let leader = app_state.pg_db.current_coordinator_leader().await?;
     let lease_status = compute_lease_status(&leader);
+    let seconds_since_renew = compute_seconds_since_renew(&leader);
     Ok(LeaderResponse {
         leader,
         lease_status,
+        seconds_since_renew,
     })
 }
 
@@ -1008,12 +1055,20 @@ pub async fn spawn_worker_session(
     // Coordinator's flag for the same reason).
     let initial_command = "claude --dangerously-skip-permissions".to_string();
 
+    // Phase 4: pre-size the worker PTY to match the dominant existing
+    // zone so worker briefs land on a grid the same size the user will
+    // eventually see (rather than the 120×30 default, which produces
+    // mis-wrapped output until the user activates the tab and fit-addon
+    // resizes the PTY). Falls back to (120, 30) when no other terminals
+    // exist — same as `terminal_manager.create(None, None)` historically.
+    let (dom_cols, dom_rows) = terminal_manager.dominant_zone_dims();
+
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(repo_path),
         None,
-        None,
-        None,
+        Some(dom_cols),
+        Some(dom_rows),
         app_handle.clone(),
     )?;
 
@@ -1023,9 +1078,63 @@ pub async fn spawn_worker_session(
         title,
         terminal_manager.clone(),
     );
-    if let Err(e) = session_manager.register_worker(Arc::new(worker)) {
+    let worker_arc = Arc::new(worker);
+    if let Err(e) = session_manager.register_worker(worker_arc.clone()) {
         warn!("spawn_worker_session: register_worker failed: {}", e);
     }
+
+    // Phase 1: readline-observer task. Workers register in `Initializing`
+    // (see `WorkerSession::new`); Coordinator's `idle_session_count`
+    // reader filters Ready-only. We flip to Ready once one of:
+    //   - the embedded Claude CLI emits its OSC 0 title (`"✳ Claude
+    //     Code"` on startup, observed by the reader thread's grid parser
+    //     in `terminal/session.rs` and surfaced via
+    //     `subscribe_first_osc_title`); or
+    //   - 8 s elapses (defensive fallback for Claude binaries that fail
+    //     to emit an OSC 0 — e.g. auth prompts, missing binary). The
+    //     Coordinator's Rule A "stuck session" detector then catches the
+    //     downstream failure.
+    let osc_title_rx = terminal_manager
+        .get(&info.id)
+        .and_then(|s| s.subscribe_first_osc_title());
+    let observer_worker = worker_arc.clone();
+    let observer_terminal_id = info.id.clone();
+    tokio::spawn(async move {
+        let trigger = match osc_title_rx {
+            Some(rx) => {
+                tokio::select! {
+                    res = rx => {
+                        match res {
+                            Ok(()) => "osc_title",
+                            // Sender dropped (session closed before any
+                            // OSC fired). Don't flip Ready in that case;
+                            // the worker will be cleaned up by
+                            // close_all_sessions / cleanup_closed.
+                            Err(_) => "closed",
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(8)) => "timeout",
+                }
+            }
+            // No receiver available means the OSC already fired (or the
+            // session vanished before we could subscribe). Either way,
+            // skip the wait and let the worker proceed.
+            None => "already_subscribed",
+        };
+        if trigger == "closed" {
+            tracing::warn!(
+                terminal_id = %observer_terminal_id,
+                "spawn_worker_session: PTY closed before readline; worker stays Initializing"
+            );
+            return;
+        }
+        tracing::info!(
+            terminal_id = %observer_terminal_id,
+            trigger = trigger,
+            "spawn_worker_session: worker transition Initializing → Ready"
+        );
+        observer_worker.set_state(crate::claude_session::state::SessionState::Ready);
+    });
 
     schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
 

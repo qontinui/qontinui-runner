@@ -28,15 +28,18 @@
  * {@link HoldingLockBanner}.
  */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Hourglass } from "lucide-react";
 import { getApiPort } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
+import { REQUEST_YIELD_COOLDOWN_MS } from "@/lib/lock-yield";
+import { useNow1Hz } from "./useNow1Hz";
 
 const logger = createLogger("WaitingLockBanner");
 
-/** 30-second cooldown after Request-yield click (Phase 3 spec). */
-export const REQUEST_YIELD_COOLDOWN_MS = 30_000;
+// Re-exported for backwards compatibility with consumers that imported
+// it from this file (test tripwires + downstream usage).
+export { REQUEST_YIELD_COOLDOWN_MS };
 
 // ── Pure helpers (exported for tests) ────────────────────────────────────────
 
@@ -87,6 +90,62 @@ export function cooldownRemainingSecs(cooldownUntilMs: number, nowMs: number): n
   return Math.ceil((cooldownUntilMs - nowMs) / 1000);
 }
 
+/**
+ * Format an estimated-remaining-time value for the long-wait advisory.
+ *
+ *   - `< 60_000ms` → rounded nearest second, e.g. `"~45s"`
+ *   - `>= 60_000ms` → rounded nearest minute, e.g. `"~5m"` (a value of
+ *     90_000 rounds to `"~2m"` since Math.round of 1.5 is 2).
+ *
+ * Pure / exported for tests so the rounding boundary is independently
+ * verifiable.
+ */
+export function formatEstimate(ms: number): string {
+  if (ms < 60_000) {
+    const secs = Math.max(0, Math.round(ms / 1000));
+    return `~${secs}s`;
+  }
+  const mins = Math.round(ms / 60_000);
+  return `~${mins}m`;
+}
+
+/**
+ * Format the holder's idle duration for the inline "(holder idle Xm)"
+ * advisory rendered when `holderIdleMs > HOLDER_IDLE_DISPLAY_THRESHOLD_MS`.
+ *
+ *   - `< 60_000ms`     → seconds, e.g. `"45s"` (used in unit tests; in
+ *     production the parent gates display on >60s so this branch is
+ *     unreachable via the JSX path).
+ *   - `< 3_600_000ms`  → whole minutes (floor), e.g. `"7m"`.
+ *   - `>= 3_600_000ms` → whole hours (floor), e.g. `"2h"`.
+ *
+ * Pure / exported for tests so the rounding boundaries are independently
+ * verifiable. Sibling to {@link formatEstimate} (the long-wait advisory
+ * uses tilde-rounding, while idle-duration uses floor-rounding because
+ * the holder really has been idle at least that long — overstating
+ * idleness would be wrong).
+ */
+export function formatIdleDuration(ms: number): string {
+  const clamped = Math.max(0, ms);
+  if (clamped < 60_000) {
+    return `${Math.floor(clamped / 1000)}s`;
+  }
+  if (clamped < 3_600_000) {
+    return `${Math.floor(clamped / 60_000)}m`;
+  }
+  return `${Math.floor(clamped / 3_600_000)}h`;
+}
+
+/**
+ * Display threshold for the inline "(holder idle Xm)" advisory.
+ * Below this value the suffix is hidden — Phase 2's Open Q3 chose 60s
+ * as the default; revisit if telemetry shows it rarely fires.
+ *
+ * Exported so the unit tests pin against the constant rather than the
+ * literal, catching accidental drift.
+ */
+export const HOLDER_IDLE_DISPLAY_THRESHOLD_MS = 60_000;
+
 // ── Component ───────────────────────────────────────────────────────────────
 
 export interface WaitingLockBannerProps {
@@ -107,6 +166,29 @@ export interface WaitingLockBannerProps {
   blockerTaskRunId?: string;
   /** When this tab entered the waiting state (epoch ms). */
   sinceMs: number;
+  /**
+   * Phase 2 (stuck-session heartbeat) — milliseconds since the HOLDER's
+   * last observed stdout activity, joined from `/sessions/idle-status`.
+   * When `> HOLDER_IDLE_DISPLAY_THRESHOLD_MS` the banner renders an
+   * inline "(holder idle Xm)" suffix on the headline. Lower values
+   * (or `undefined`) hide the suffix — short idle gaps are noise
+   * (typing/thinking pauses), only a sustained idle window is a useful
+   * cue for "the holder is parked, yield is safe to request."
+   */
+  holderIdleMs?: number;
+  /**
+   * Phase 3 (stuck-session heartbeat) — most-recent long-wait signal
+   * from the holder, if any. When present, the banner renders an
+   * additional advisory line below the primary "Waiting on …" headline:
+   * "**B** says they'll be a while. Request yield or cancel?". The
+   * Request-yield button stays the primary action — no behaviour
+   * change, just a visual prominence cue.
+   */
+  longWaitSignal?: {
+    holderName: string;
+    estimatedRemainingMs?: number;
+    signaledAtMs: number;
+  };
   /** Optional fetch override for tests. Defaults to `globalThis.fetch`. */
   fetchImpl?: typeof fetch;
 }
@@ -118,15 +200,15 @@ export function WaitingLockBanner({
   blockerName,
   blockerTaskRunId,
   sinceMs,
+  holderIdleMs,
+  longWaitSignal,
   fetchImpl,
 }: WaitingLockBannerProps) {
-  // Re-render every 1s so the seconds-since label keeps ticking AND
-  // the cooldown countdown decrements visibly.
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNowMs(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
+  // Phase 2 (stuck-session heartbeat) — subscribe to the shared 1Hz
+  // broadcast so the seconds-since label AND the cooldown countdown
+  // tick visibly. Singleton interval shared across all banner consumers
+  // (see Now1HzProvider at the runner-app root).
+  const nowMs = useNow1Hz();
 
   // Cooldown state — `0` means "no cooldown active." Set to
   // `Date.now() + REQUEST_YIELD_COOLDOWN_MS` on click; the
@@ -199,8 +281,40 @@ export function WaitingLockBanner({
         <Hourglass className="w-3.5 h-3.5 shrink-0 text-[#7aa2f7] mt-0.5" />
         <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
           {message}
+          {/*
+            Phase 2 (stuck-session heartbeat) — inline "(holder idle Xm)"
+            suffix. Subdued color so the headline reads naturally; the
+            idle cue is supplementary information, not the primary
+            signal. Hidden below the 60s display threshold to avoid
+            noise on transient typing/thinking pauses (Open Q3 in the
+            plan; threshold tuneable via the constant).
+          */}
+          {holderIdleMs !== undefined &&
+            holderIdleMs > HOLDER_IDLE_DISPLAY_THRESHOLD_MS && (
+              <span
+                data-ui-bridge-id="terminal.waiting-lock-banner-holder-idle"
+                data-task-run-id={taskRunId}
+                data-file-path={filePath}
+                className="ml-1 text-[#a9b1d6]/70"
+              >
+                (holder idle {formatIdleDuration(holderIdleMs)})
+              </span>
+            )}
         </div>
       </div>
+      {longWaitSignal && (
+        <div
+          data-ui-bridge-id="terminal.waiting-lock-banner-long-wait-advisory"
+          data-task-run-id={taskRunId}
+          data-file-path={filePath}
+          className="mt-1.5 ml-5 text-[10px] text-[#a9b1d6]/80 leading-snug"
+        >
+          <strong className="text-[#c0caf5]">{longWaitSignal.holderName}</strong>{" "}
+          says they&apos;ll be a while. Request yield or cancel?
+          {longWaitSignal.estimatedRemainingMs !== undefined &&
+            ` (${formatEstimate(longWaitSignal.estimatedRemainingMs)})`}
+        </div>
+      )}
       <div className="mt-2 flex items-center gap-1.5">
         <button
           type="button"

@@ -95,6 +95,16 @@ export type LockState = {
   sinceMs?: number;
   /** Number of waiters (holding state only). */
   waiterCount?: number;
+  /**
+   * Only populated for `kind === "waiting"`: milliseconds since the
+   * HOLDER's last stdout activity, joined from `GET /sessions/idle-status`
+   * (Phase 1 of the stuck-session heartbeat plan). The waiter banner
+   * surfaces "(holder idle Xm)" when this exceeds the 60s display
+   * threshold — see {@link WaitingLockBanner}. `undefined` when no
+   * idle entry matched the holder, the idle fetch failed, or the
+   * holder isn't an AI session (PTY holders aren't in the snapshot).
+   */
+  holderIdleMs?: number;
 };
 
 /**
@@ -141,6 +151,34 @@ export type IncomingYieldRequest = {
   requestedAtMs: number;
 };
 
+/**
+ * Incoming long-wait signal payload as seen by a WAITER tab.
+ *
+ * Emitted by the runner's POST /file-locks/signal-long-wait handler
+ * (`mcp/file_registry.rs::signal_long_wait`) as a Tauri event named
+ * `file-lock-long-wait-signaled`. The signal flows from the HOLDER to
+ * every tab currently waiting on the same `file_path` — opposite
+ * direction to {@link IncomingYieldRequest} (which flows waiter → holder).
+ *
+ * Wire-format keys are snake_case (handler emits via `serde_json::json!`
+ * directly, not a `#[serde(rename_all = "camelCase")]` struct); the
+ * frontend uses camelCase on this type.
+ *
+ * Dedup invariant on the consumer side: at most one entry per
+ * `(holder_task_run_id, file_path)` tuple per waiter — a re-issued signal
+ * replaces the prior entry rather than appending. Cleared on
+ * `file-lock-released` or `file-lock-acquired` for the same `file_path`
+ * (the waiter is no longer blocked, so the advisory is moot).
+ */
+export type IncomingLongWaitSignal = {
+  filePath: string;
+  holderName: string;
+  holderTaskRunId: string;
+  /** Optional estimated remaining time in ms; `undefined` when the holder didn't supply one. */
+  estimatedRemainingMs?: number;
+  signaledAtMs: number;
+};
+
 interface FileLockEvent {
   type: string;
   file_path: string;
@@ -173,6 +211,27 @@ interface FileLockInfoEntry {
 }
 
 /**
+ * Per-session idle stats returned by `GET /sessions/idle-status`
+ * (Phase 1 of the stuck-session heartbeat plan; backend handler at
+ * `mcp/ai_session.rs::idle_status`).
+ *
+ * The poll loop below joins these entries against the waiting branch
+ * of `LockState`: for each waiting tab, look up the holder's idle ms
+ * by `holder_name` (the friendly name carried on the original
+ * `file-lock-waiting` event's `blocked_by` field) and attach as
+ * `holderIdleMs`. Keyed by `holder_name` rather than `task_run_id`
+ * because `LockState.counterpartyName` is the friendly name, not a
+ * task_run_id — the waiter doesn't know the holder's task_run_id
+ * directly.
+ */
+interface SessionIdleEntry {
+  task_run_id: string;
+  holder_name: string;
+  last_activity_ms: number;
+  idle_ms: number;
+}
+
+/**
  * `file-lock-yield-requested` Tauri event payload.
  *
  * Wire-format keys are snake_case (Rust handler emits via
@@ -185,6 +244,26 @@ interface FileLockYieldRequestedEvent {
   requester_name: string;
   holder_task_run_id: string;
   requested_at: number;
+}
+
+/**
+ * `file-lock-long-wait-signaled` Tauri event payload (Phase 3 of the
+ * stuck-session heartbeat plan).
+ *
+ * Wire-format keys are snake_case (Rust handler emits via
+ * `serde_json::json!` literal — see
+ * `mcp/file_registry.rs::signal_long_wait`). `estimated_remaining_ms`
+ * is `null` over the wire when the holder didn't supply an estimate;
+ * the listener normalises it to `undefined` on the camelCase
+ * {@link IncomingLongWaitSignal}.
+ */
+interface FileLockLongWaitSignaledEvent {
+  type: string;
+  file_path: string;
+  holder_task_run_id: string;
+  holder_name: string;
+  estimated_remaining_ms: number | null;
+  signaled_at: number;
 }
 
 /**
@@ -213,6 +292,25 @@ export interface FileLockTracking {
    * (refreshing `requestedAtMs`) rather than appending a duplicate.
    */
   pendingYieldRequests: Record<string, IncomingYieldRequest[]>;
+  /**
+   * Map of WAITER-tab id → list of incoming long-wait signals targeting
+   * that waiter. Opposite key polarity to {@link pendingYieldRequests}:
+   * signals flow from holder → every waiter, so the consumer is the
+   * waiting tab. Keys correspond to `tab.id`; signals are routed to
+   * every tab whose current `lockState.kind === "waiting"` and
+   * `lockState.filePath === payload.file_path`.
+   *
+   * Cleared on `file-lock-released` AND `file-lock-acquired` for the
+   * matching `file_path` — both events mean the waiter is no longer
+   * blocked, so the "I'll be a while" advisory is moot.
+   *
+   * Dedup invariant: within a tab's list, at most one entry exists per
+   * `(holderTaskRunId, filePath)` tuple. A re-issued signal for the
+   * same pair replaces the prior entry (refreshing `signaledAtMs` /
+   * `estimatedRemainingMs`) rather than appending a duplicate — the
+   * waiter banner consumes only the most-recent entry.
+   */
+  pendingLongWaitSignals: Record<string, IncomingLongWaitSignal[]>;
 }
 
 export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
@@ -220,6 +318,19 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
   const [pendingYieldRequests, setPendingYieldRequests] = useState<
     Record<string, IncomingYieldRequest[]>
   >({});
+  const [pendingLongWaitSignals, setPendingLongWaitSignals] = useState<
+    Record<string, IncomingLongWaitSignal[]>
+  >({});
+  // The long-wait-signaled listener needs the live `lockStates` to find
+  // every WAITER tab currently waiting on the broadcast `file_path`
+  // without going through findTabByHolderName (the holder may not have
+  // a tab in this window). A ref keeps the listener closure stable —
+  // re-subscribing on every state change would tear down + rebuild the
+  // Tauri listener.
+  const lockStatesRef = useRef(lockStates);
+  useEffect(() => {
+    lockStatesRef.current = lockStates;
+  }, [lockStates]);
   const tabsRef = useRef(tabs);
   useEffect(() => {
     tabsRef.current = tabs;
@@ -262,6 +373,7 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
     let unlistenAcquired: (() => void) | null = null;
     let unlistenReleased: (() => void) | null = null;
     let unlistenYieldRequested: (() => void) | null = null;
+    let unlistenLongWaitSignaled: (() => void) | null = null;
 
     /**
      * Refresh `waiterCount` on every holding tab from the current
@@ -339,6 +451,19 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
         }
         return refreshWaiterCounts(base);
       });
+
+      // Phase 3 (stuck-session heartbeat) — clear any long-wait signal
+      // targeting THIS waiter for THIS file path. Once the waiter has
+      // acquired, the holder's "I'll be a while" advisory is moot.
+      if (tabId) {
+        setPendingLongWaitSignals((prev) => {
+          const list = prev[tabId];
+          if (!list || list.length === 0) return prev;
+          const filtered = list.filter((s) => s.filePath !== file_path);
+          if (filtered.length === list.length) return prev;
+          return { ...prev, [tabId]: filtered };
+        });
+      }
     }).then((fn) => {
       unlistenAcquired = fn;
     });
@@ -385,6 +510,27 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
           return { ...prev, [tabId]: filtered };
         });
       }
+
+      // Phase 3 (stuck-session heartbeat) — clear long-wait signals for
+      // THIS file path across every waiter tab. Unlike yield requests
+      // (keyed by holder tab id), long-wait signals are keyed by waiter
+      // tab id; ANY waiter still holding a stale signal for this file
+      // should drop it once the lock is released. The next acquire by
+      // a fresh holder produces a new signal if applicable.
+      setPendingLongWaitSignals((prev) => {
+        let dirty = false;
+        const next: Record<string, IncomingLongWaitSignal[]> = {};
+        for (const [waiterTabId, signals] of Object.entries(prev)) {
+          const filtered = signals.filter((s) => s.filePath !== file_path);
+          if (filtered.length !== signals.length) {
+            dirty = true;
+            next[waiterTabId] = filtered;
+          } else {
+            next[waiterTabId] = signals;
+          }
+        }
+        return dirty ? next : prev;
+      });
     }).then((fn) => {
       unlistenReleased = fn;
     });
@@ -434,11 +580,82 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
       unlistenYieldRequested = fn;
     });
 
+    // Phase 3 (stuck-session heartbeat) — hold-side long-wait signal
+    // listener. The signal flows from HOLDER to every WAITER tab on the
+    // same `file_path` (opposite polarity to the yield-request which is
+    // waiter → holder). Iterate every tab whose current `lockState.kind
+    // === "waiting"` and `lockState.filePath === payload.file_path`, and
+    // for each such tab append the signal to `pendingLongWaitSignals`.
+    // Dedup invariant: at most one entry per `(holderTaskRunId,
+    // filePath)` tuple per waiter — a re-issued signal replaces the
+    // prior entry rather than appending.
+    listen<FileLockLongWaitSignaledEvent>("file-lock-long-wait-signaled", (event) => {
+      const {
+        file_path,
+        holder_task_run_id,
+        holder_name,
+        estimated_remaining_ms,
+        signaled_at,
+      } = event.payload;
+      const incoming: IncomingLongWaitSignal = {
+        filePath: file_path,
+        holderName: holder_name,
+        holderTaskRunId: holder_task_run_id,
+        // serde_json renders Rust's `None` as JSON `null`; the camelCase
+        // type uses `undefined` per the optional-field convention.
+        estimatedRemainingMs:
+          estimated_remaining_ms === null || estimated_remaining_ms === undefined
+            ? undefined
+            : estimated_remaining_ms,
+        signaledAtMs: signaled_at,
+      };
+      // Find every waiter tab currently blocked on this file. The
+      // listener closure captured `lockStates` via the ref above so a
+      // late-mounting tab still picks up signals on the next event.
+      const currentLockStates = lockStatesRef.current;
+      const waiterTabIds: string[] = [];
+      for (const tab of tabsRef.current) {
+        const s = currentLockStates[tab.id];
+        if (
+          s &&
+          s.kind === "waiting" &&
+          s.filePath === file_path
+        ) {
+          waiterTabIds.push(tab.id);
+        }
+      }
+      if (waiterTabIds.length === 0) return; // No waiter for this file in this window.
+      setPendingLongWaitSignals((prev) => {
+        const next: Record<string, IncomingLongWaitSignal[]> = { ...prev };
+        for (const tabId of waiterTabIds) {
+          const existing = prev[tabId] ?? [];
+          const dedupIdx = existing.findIndex(
+            (s) =>
+              s.holderTaskRunId === holder_task_run_id &&
+              s.filePath === file_path,
+          );
+          let updated: IncomingLongWaitSignal[];
+          if (dedupIdx >= 0) {
+            // Replace in-place so queue position is preserved.
+            updated = existing.slice();
+            updated[dedupIdx] = incoming;
+          } else {
+            updated = [...existing, incoming];
+          }
+          next[tabId] = updated;
+        }
+        return next;
+      });
+    }).then((fn) => {
+      unlistenLongWaitSignaled = fn;
+    });
+
     return () => {
       unlistenWaiting?.();
       unlistenAcquired?.();
       unlistenReleased?.();
       unlistenYieldRequested?.();
+      unlistenLongWaitSignaled?.();
     };
   }, []);
 
@@ -456,9 +673,40 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
         // the second tick. `__QONTINUI_PORT__` still wins when set
         // (manual-test override).
         const port = resolvePort();
-        const resp = await fetch(`http://127.0.0.1:${port}/file-locks/info`);
-        if (!resp.ok || !active) return;
-        const locks = (await resp.json()) as FileLockInfoEntry[];
+        // Phase 2 (stuck-session heartbeat) — piggyback the idle-status
+        // fetch on the same 10s poll cycle, in parallel, with allSettled
+        // so a transient failure on either endpoint doesn't tear down
+        // the loop. We always honour the locks-info shape (the
+        // pre-Phase-2 contract); idle-status is purely additive — when
+        // missing/failed, `holderIdleMs` stays `undefined` on every
+        // waiting LockState.
+        const [locksRes, idleRes] = await Promise.allSettled([
+          fetch(`http://127.0.0.1:${port}/file-locks/info`),
+          fetch(`http://127.0.0.1:${port}/sessions/idle-status`),
+        ]);
+        if (!active) return;
+
+        // Build the idle-by-holder-name index FIRST (it's optional so
+        // any failure mode keeps the rest of the poll behaviour
+        // identical to pre-Phase-2). Keyed by `holder_name` because
+        // `LockState.counterpartyName` carries the friendly name — the
+        // waiter doesn't know the holder's task_run_id directly.
+        const idleByHolderName = new Map<string, number>();
+        if (idleRes.status === "fulfilled" && idleRes.value.ok) {
+          try {
+            const entries = (await idleRes.value.json()) as SessionIdleEntry[];
+            for (const e of entries) {
+              idleByHolderName.set(e.holder_name, e.idle_ms);
+            }
+          } catch {
+            // JSON parse failure — treat as empty.
+          }
+        }
+
+        // If the locks fetch failed we have nothing to derive; bail out
+        // (silently, same as the pre-Phase-2 catch).
+        if (locksRes.status !== "fulfilled" || !locksRes.value.ok) return;
+        const locks = (await locksRes.value.json()) as FileLockInfoEntry[];
 
         // Index holders by holder_name → list of held entries.
         const holderEntries = new Map<string, FileLockInfoEntry[]>();
@@ -507,6 +755,10 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
                 filePath: waiting.filePath,
                 counterpartyName: waiting.blockedBy,
                 sinceMs: waiting.sinceMs,
+                // Phase 2 — attach the holder's idle_ms if the join hit.
+                // We DON'T attach holderIdleMs on holding or idle
+                // branches; the field is a waiter-only signal.
+                holderIdleMs: idleByHolderName.get(waiting.blockedBy),
               };
               continue;
             }
@@ -539,5 +791,5 @@ export function useFileLockTracking(tabs: TerminalTab[]): FileLockTracking {
     };
   }, []);
 
-  return { lockStates, pendingYieldRequests };
+  return { lockStates, pendingYieldRequests, pendingLongWaitSignals };
 }

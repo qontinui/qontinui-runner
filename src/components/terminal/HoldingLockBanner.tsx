@@ -30,13 +30,22 @@
  * source of truth populated by `useApiReady`.
  */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Hourglass, X } from "lucide-react";
 import { getApiPort } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
 import type { IncomingYieldRequest } from "./useFileLockTracking";
+import { useNow1Hz } from "./useNow1Hz";
 
 const logger = createLogger("HoldingLockBanner");
+
+/**
+ * Per-`(file_path)` cooldown after the holder clicks "I'll be a while".
+ * Mirrors the wait-side {@link WaitingLockBanner.REQUEST_YIELD_COOLDOWN_MS}
+ * pattern — 30s window to prevent the holder spamming the waiter with
+ * advisory signals. Cooldown is local state; a reload resets it.
+ */
+export const SIGNAL_LONG_WAIT_COOLDOWN_MS = 30_000;
 
 // ── Pure helpers (exported for tests) ────────────────────────────────────────
 
@@ -172,11 +181,52 @@ export function pickOldestRequest(
   return oldest;
 }
 
+/**
+ * Auto-yield-on-idle policy (lock-yield-protocol-plan §Open Q4):
+ * formats an advisory countdown for the holder's banner.
+ *
+ *   - When the policy is disabled, returns `null` (no badge).
+ *   - When `waiterCount <= 0`, returns `null` (no waiter, no auto-yield risk).
+ *   - Otherwise returns the remaining seconds until the policy can
+ *     fire, computed as `max(idleThresholdSecs - holderIdleSecs,
+ *     minWaitSecs - waiterWaitedSecs, 0)`. The actual policy AND-gates
+ *     both thresholds so the larger remaining duration is the true
+ *     "earliest auto-yield" estimate.
+ *   - String form is `"auto-yield in Ns"` for N>0, or
+ *     `"auto-yield imminent"` for N==0.
+ *
+ * Pure helper exported for vitest.
+ */
+export function formatAutoYieldCountdown(args: {
+  enabled: boolean;
+  waiterCount: number;
+  holderIdleSecs: number;
+  waiterWaitedSecs: number;
+  idleThresholdSecs: number;
+  minWaitSecs: number;
+}): string | null {
+  if (!args.enabled) return null;
+  if (args.waiterCount <= 0) return null;
+  const idleRemaining = Math.max(0, args.idleThresholdSecs - args.holderIdleSecs);
+  const waitRemaining = Math.max(0, args.minWaitSecs - args.waiterWaitedSecs);
+  const remaining = Math.max(idleRemaining, waitRemaining);
+  if (remaining <= 0) return "auto-yield imminent";
+  return `auto-yield in ${remaining}s`;
+}
+
 // ── Component ───────────────────────────────────────────────────────────────
 
 export interface HoldingLockBannerProps {
   /** This tab's `task_run_id` (sent as the body's `task_run_id` field on yield). */
   taskRunId: string;
+  /**
+   * Friendly name of this holding tab — sent as the body's `holder_name`
+   * on the Phase 3 (stuck-session heartbeat) signal-long-wait POST.
+   * Optional for back-compat with existing callers that didn't supply
+   * it; when missing the holder appears as the {@link taskRunId}
+   * fallback in the waiter banner.
+   */
+  taskRunName?: string;
   /** File the lock is on — from `lockState.filePath`. */
   filePath: string;
   /** Friendly name of the waiter (undefined → falls back to "another session"). */
@@ -197,10 +247,26 @@ export interface HoldingLockBannerProps {
    * mode takes priority over ambient `waiterCount > 0` mode.
    */
   incomingRequests?: IncomingYieldRequest[];
+  /**
+   * Lock-yield-protocol-plan §Open Q4 — auto-yield-on-idle policy
+   * context. When provided AND `enabled === true` AND
+   * `waiterCount > 0`, the banner renders a subtle countdown line
+   * advising the holder that the auto-yield policy may release this
+   * lock on their behalf. Purely advisory — the runner runs the
+   * policy regardless of whether this prop is set.
+   */
+  autoYieldPolicy?: {
+    enabled: boolean;
+    idleThresholdSecs: number;
+    minWaitSecs: number;
+    /** Seconds since holder's last terminal output (from idle-status feed). */
+    holderIdleSecs: number;
+  };
 }
 
 export function HoldingLockBanner({
   taskRunId,
+  taskRunName,
   filePath,
   waiterName,
   sinceMs,
@@ -208,15 +274,13 @@ export function HoldingLockBanner({
   onDismissLocal,
   fetchImpl,
   incomingRequests,
+  autoYieldPolicy,
 }: HoldingLockBannerProps) {
-  // Re-render every 1s so the seconds-since label keeps ticking. We
-  // can't depend on `Date.now()` directly in JSX — React won't re-run
-  // the render function without state changing.
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNowMs(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
+  // Phase 2 (stuck-session heartbeat) — subscribe to the shared 1Hz
+  // broadcast so the seconds-since label keeps ticking. Previously
+  // each banner owned a private setInterval; the singleton-via-context
+  // primitive collapses three+ on-screen tickers into one fire.
+  const nowMs = useNow1Hz();
 
   // Optimistic dismissal: when the user clicks Yield, hide the banner
   // immediately. The actual lock release happens async; the
@@ -226,7 +290,20 @@ export function HoldingLockBanner({
   // the parent will simply re-render the banner on the next waiter
   // event — the dismissal is purely a visual nicety.
   const [optimisticallyYielded, setOptimisticallyYielded] = useState(false);
+
+  // Phase 3 (stuck-session heartbeat) — cooldown for the "I'll be a
+  // while" button. `0` means "no cooldown active." Set to
+  // `Date.now() + SIGNAL_LONG_WAIT_COOLDOWN_MS` on click; the
+  // `nowMs >= signalCooldownUntilMs` check re-enables the button.
+  // Mirrors the wait-side cooldown UX in {@link WaitingLockBanner}.
+  const [signalCooldownUntilMs, setSignalCooldownUntilMs] = useState(0);
+
   if (optimisticallyYielded) return null;
+
+  const inSignalCooldown = nowMs < signalCooldownUntilMs;
+  const signalCooldownLeft = inSignalCooldown
+    ? Math.ceil((signalCooldownUntilMs - nowMs) / 1000)
+    : 0;
 
   const oldestRequest = pickOldestRequest(incomingRequests);
   const inRequestMode = oldestRequest !== undefined;
@@ -257,6 +334,56 @@ export function HoldingLockBanner({
   // practice they usually match, but a forward-looking heatmap-driven
   // request might target a different lock this tab also holds).
   const yieldFilePath = inRequestMode ? oldestRequest.filePath : filePath;
+
+  // Auto-yield countdown (advisory). The runner's policy is the actual
+  // truth — this badge just tells the user when they might lose the
+  // lock involuntarily, so they aren't surprised by a sudden release.
+  const waiterWaitedSecs = Math.max(0, Math.floor((nowMs - sinceMs) / 1000));
+  const autoYieldLabel = autoYieldPolicy
+    ? formatAutoYieldCountdown({
+        enabled: autoYieldPolicy.enabled,
+        waiterCount,
+        holderIdleSecs: autoYieldPolicy.holderIdleSecs,
+        waiterWaitedSecs,
+        idleThresholdSecs: autoYieldPolicy.idleThresholdSecs,
+        minWaitSecs: autoYieldPolicy.minWaitSecs,
+      })
+    : null;
+
+  // Phase 3 (stuck-session heartbeat) — fire-and-forget POST to the
+  // signal-long-wait endpoint. Even if the POST fails the cooldown
+  // still starts so the user can't pound the button. The cooldown is
+  // keyed implicitly by file_path (the banner is per-tab; a different
+  // file would render a different banner instance with its own
+  // cooldown state).
+  const handleSignalLongWait = async () => {
+    if (inSignalCooldown) return;
+    setSignalCooldownUntilMs(Date.now() + SIGNAL_LONG_WAIT_COOLDOWN_MS);
+    try {
+      const f = fetchImpl ?? globalThis.fetch;
+      const resp = await f(
+        `http://127.0.0.1:${getApiPort()}/file-locks/signal-long-wait`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            file_path: filePath,
+            holder_task_run_id: taskRunId,
+            holder_name: taskRunName ?? taskRunId,
+            estimated_remaining_ms: null,
+          }),
+        },
+      );
+      if (!resp.ok) {
+        logger.warn(
+          `signal-long-wait POST returned ${resp.status} for ${filePath} (holder=${taskRunId})`,
+        );
+      }
+    } catch (err) {
+      logger.error("signal-long-wait POST failed:", err);
+    }
+  };
+
   const handleYield = async () => {
     setOptimisticallyYielded(true);
     try {
@@ -290,6 +417,16 @@ export function HoldingLockBanner({
         <Hourglass className="w-3.5 h-3.5 shrink-0 text-[#e0af68] mt-0.5" />
         <div className="text-[11px] text-[#c0caf5] leading-snug flex-1">
           {message}
+          {autoYieldLabel && (
+            <span
+              data-ui-bridge-id="terminal.holding-lock-banner-auto-yield-countdown"
+              data-task-run-id={taskRunId}
+              data-file-path={filePath}
+              className="ml-1 text-[10px] text-muted-foreground"
+            >
+              ({autoYieldLabel})
+            </span>
+          )}
         </div>
         <button
           type="button"
@@ -328,11 +465,16 @@ export function HoldingLockBanner({
           data-ui-bridge-id="terminal.holding-lock-banner-signal-long-wait"
           data-task-run-id={taskRunId}
           data-file-path={filePath}
-          disabled
-          title="Folded into the stuck-session heartbeat plan — see lock-yield-protocol-plan.md §Open Q6."
-          className="px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89]/30 text-[#565f89]/60 cursor-not-allowed"
+          disabled={inSignalCooldown}
+          onClick={() => void handleSignalLongWait()}
+          title="Signal to the waiter that you'll be busy with this lock for a while."
+          className={
+            inSignalCooldown
+              ? "px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89]/30 text-[#565f89]/60 cursor-not-allowed"
+              : "px-2 py-0.5 rounded text-[10px] font-medium border border-[#565f89] text-[#a9b1d6] hover:text-[#c0caf5] hover:border-[#a9b1d6] transition-colors"
+          }
         >
-          I'll be a while
+          {inSignalCooldown ? `Cooldown ${signalCooldownLeft}s` : "I'll be a while"}
         </button>
       </div>
     </div>

@@ -62,6 +62,7 @@ import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
 import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
+import { Now1HzProvider } from "./components/terminal/useNow1Hz";
 import { ReorganizeDialog, type ReorganizePlan } from "./components/terminal/ReorganizeDialog";
 import { PerformanceOverlay, GiantSCCFixture } from "./components/dev";
 import { CommandPalette } from "./components/unified-search/CommandPalette";
@@ -634,19 +635,30 @@ function AppWithTutorials() {
   return (
     <TutorialProvider onNavigate={navigate}>
       <PromptExecutionProvider>
-        <AppContent />
-        <ContextualTutorial />
-        <DemoVisualOverlay />
-        <PromptAutomationOverlay />
         {/*
-          Persistent global pill that surfaces in-progress background tasks
-          (currently the long-running UI Bridge integration generation
-          triggered from the home prompt). Mounted inside
-          PromptExecutionProvider but outside <AppContent>'s tab content so
-          it stays visible across tab switches. See BackgroundTaskPill.tsx
-          for the detection rule and dismiss flow.
+          Now1HzProvider — Phase 2 of the stuck-session heartbeat plan.
+          Runs ONE 1000ms interval and broadcasts Date.now() to every
+          consumer (HoldingLockBanner, WaitingLockBanner,
+          FileActivityPanel, TerminalTabBar tooltip ticks) so we don't
+          burn three+ private intervals on the same cadence. Mounted
+          here because every consumer of useNow1Hz lives under
+          AppContent — TerminalPage, CoordinatorDashboard, etc.
         */}
-        <BackgroundTaskPill />
+        <Now1HzProvider>
+          <AppContent />
+          <ContextualTutorial />
+          <DemoVisualOverlay />
+          <PromptAutomationOverlay />
+          {/*
+            Persistent global pill that surfaces in-progress background tasks
+            (currently the long-running UI Bridge integration generation
+            triggered from the home prompt). Mounted inside
+            PromptExecutionProvider but outside <AppContent>'s tab content so
+            it stays visible across tab switches. See BackgroundTaskPill.tsx
+            for the detection rule and dismiss flow.
+          */}
+          <BackgroundTaskPill />
+        </Now1HzProvider>
       </PromptExecutionProvider>
     </TutorialProvider>
   );

@@ -34,10 +34,10 @@ pub struct WorkerInfo {
     /// has been removed from the manager (the worker registration outlived
     /// its pty — surfaces as a stale row the user can clean up).
     pub terminal_title: Option<String>,
-    /// One of `"ready"`, `"processing"`, `"closed"`. Workers never
-    /// logically enter the other `SessionState` variants; defensively map
-    /// anything unexpected to `"closed"` so the dashboard doesn't have to
-    /// handle a wider variant set.
+    /// One of `"initializing"`, `"ready"`, `"processing"`, `"closed"`.
+    /// Workers never logically enter the other `SessionState` variants;
+    /// defensively map anything unexpected to `"closed"` so the dashboard
+    /// doesn't have to handle a wider variant set.
     pub state: String,
     /// The `coord.tasks.id` (uuid string) currently assigned to this
     /// worker, if any. `None` when the worker is idle or when the lookup
@@ -50,12 +50,13 @@ pub struct WorkerInfo {
     pub created_at_ms: i64,
 }
 
-/// Map a `SessionState` to the wire-format string. Workers track only
-/// `Ready ⇄ Processing → Closed`; any other variant falls through to
-/// `"closed"` so the dashboard handles a closed pseudo-state instead of
-/// rendering a foreign string.
+/// Map a `SessionState` to the wire-format string. Workers track
+/// `Initializing → Ready ⇄ Processing → Closed`; any other variant falls
+/// through to `"closed"` so the dashboard handles a closed pseudo-state
+/// instead of rendering a foreign string.
 fn state_string(state: SessionState) -> &'static str {
     match state {
+        SessionState::Initializing => "initializing",
         SessionState::Ready => "ready",
         SessionState::Processing => "processing",
         SessionState::Closed => "closed",
@@ -118,12 +119,14 @@ mod tests {
 
     #[test]
     fn state_string_maps_supported_variants() {
+        assert_eq!(state_string(SessionState::Initializing), "initializing");
         assert_eq!(state_string(SessionState::Ready), "ready");
         assert_eq!(state_string(SessionState::Processing), "processing");
         assert_eq!(state_string(SessionState::Closed), "closed");
         // Unsupported variants fall through to "closed" rather than
         // expanding the wire surface.
-        assert_eq!(state_string(SessionState::Initializing), "closed");
         assert_eq!(state_string(SessionState::Created), "closed");
+        assert_eq!(state_string(SessionState::Interrupting), "closed");
+        assert_eq!(state_string(SessionState::Promoting), "closed");
     }
 }

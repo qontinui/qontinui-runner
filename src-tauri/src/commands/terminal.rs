@@ -60,6 +60,31 @@ pub fn terminal_write(
     })
 }
 
+/// Update a terminal session's display title.
+///
+/// Phase 2 of the bi-directional title sync (plan
+/// `2026-05-11-runner-dispatch-and-terminal-ux-fixes-plan.md`): the
+/// frontend's xterm.js `onTitleChange` handler (see
+/// `components/terminal/ZoneGrid.tsx`) invokes this whenever it
+/// observes a new OSC 0/2 title in a `terminal-output` paint. The
+/// runner mirrors the new title onto `TerminalSession.title` and emits
+/// a `terminal-title-changed` event so other webview windows / WS
+/// subscribers stay consistent.
+#[tauri::command]
+pub fn terminal_set_title(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    app_handle: tauri::AppHandle,
+    terminal_id: String,
+    title: String,
+) -> Result<CommandResponse, String> {
+    terminal_manager.set_title(&terminal_id, title, &app_handle)?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
 /// Resize a terminal's PTY dimensions.
 #[tauri::command]
 pub fn terminal_resize(
@@ -508,6 +533,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_create,
             terminal_write,
             terminal_resize,
+            terminal_set_title,
             terminal_close,
             terminal_list,
             terminal_ack,

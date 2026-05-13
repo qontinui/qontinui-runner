@@ -166,15 +166,21 @@ jobs:
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
         #
-        # Step has a hard 75-minute timeout. Ubuntu finishes ~43 min and
-        # Windows ~77 min on this step alone (single-threaded compile at
-        # JOBS=1 + test execution). macOS at JOBS=1 should land between
-        # the two given the M1's raw single-thread speed but with the
-        # 7GB-RAM swap-pressure penalty. 75 min covers worst case; without
-        # the cap, macOS swap-thrash hangs ran for 80+ min before admin-
-        # cancel (PR #84 was the most recent). Fail fast is better than
-        # burning runner minutes.
-        timeout-minutes: 75
+        # Step has a hard 90-minute timeout. Empirical durations from
+        # main-branch runs on 2026-05-11/12 (10-run sample): Ubuntu p50
+        # ~43 min, Windows p50 ~70 min, macOS p50 ~58 min / p90 ~70 min /
+        # max(success) ~72 min. The earlier 75-min cap sat at p90+5 min;
+        # PR #104 and PR #105 (both content-trivial — terminal-sessions
+        # endpoint additions / JSON spec) blew it three times in 36 h
+        # with `Run Rust tests` landing at 75.2 / 75.4 / 75.5 min.
+        # Variance is dominated by GitHub-hosted macOS runner load +
+        # cache state (cold-cache runs land at 65-72 min, warm-cache at
+        # 30-40 min). 90 min = p90 + 20 min headroom covers the slow
+        # tail without hiding genuine regressions. The original cap
+        # rationale ("fail fast on swap-thrash hangs") is preserved —
+        # JOBS=1 below prevents the 80+ min swap-thrash scenario from
+        # PR #84, so the cap is just bounding normal variance now.
+        timeout-minutes: 90
         env:
           # `CARGO_BUILD_JOBS` reduces the parallel-rustc memory peak.
           # Empirically:

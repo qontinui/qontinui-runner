@@ -25,10 +25,11 @@
  * doesn't exist yet at the CoordinatorDashboard scope).
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Flame, FileText, Clock, Hand, RefreshCw, Users } from "lucide-react";
 import { getApiPort } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
+import { useNow1Hz } from "../terminal/useNow1Hz";
 import {
   DEFAULT_WINDOW_SECS,
   WINDOW_OPTIONS,
@@ -42,17 +43,15 @@ import {
   type HotSessionRow,
 } from "./fileActivityApi";
 
+import { REQUEST_YIELD_COOLDOWN_MS } from "@/lib/lock-yield";
+
 const logger = createLogger("FileActivityPanel");
 
-/**
- * Lock-Yield cooldown — duplicate of `WaitingLockBanner.REQUEST_YIELD_COOLDOWN_MS`
- * (Phase 3). Kept local rather than imported across the productivity ↔ terminal
- * folder boundary; the two surfaces use the same UX so a future plan should
- * dedupe by hoisting both into a shared `lockYield` module.
- *
- * TODO(lock-yield): dedupe with WaitingLockBanner's constant.
- */
-export const REQUEST_YIELD_COOLDOWN_MS = 30_000;
+// Canonical home for the cooldown lives at `@/lib/lock-yield` — both this
+// dashboard surface and the per-tab WaitingLockBanner consume the same
+// constant. Re-exported for backwards compatibility with the tripwire
+// test in this file's sibling `.test.tsx`.
+export { REQUEST_YIELD_COOLDOWN_MS };
 
 /** Cooldown map key: `${file_path}::${holder_task_run_id}` — per the plan's
  *  Phase 4 spec, the cooldown is per-(file,holder) pair so clicking yield
@@ -232,25 +231,14 @@ function LiveSnapshotSection({
     () => new Map(),
   );
 
-  // Re-render once per second so the cooldown countdown stays visually
-  // accurate. Cheap — same cadence WaitingLockBanner uses.
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    // Skip the timer when there are no active cooldowns to avoid the
-    // tick churn on the dashboard. The effect re-runs when `cooldowns`
-    // changes, so a new click immediately re-arms the interval.
-    let anyActive = false;
-    const t0 = Date.now();
-    for (const until of cooldowns.values()) {
-      if (until > t0) {
-        anyActive = true;
-        break;
-      }
-    }
-    if (!anyActive) return;
-    const id = setInterval(() => setNowMs(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [cooldowns]);
+  // Phase 2 (stuck-session heartbeat) — subscribe to the shared 1Hz
+  // broadcast so the cooldown countdown stays visually accurate. The
+  // pre-Phase-2 implementation skipped the timer when no cooldowns
+  // were active to dodge tick churn; the singleton fires for the
+  // banners regardless, so the panel paying the same fire it already
+  // would have is free. No-cost-savings-lost — and the consumer-count
+  // drop matches the plan's collapse-three-tickers goal.
+  const nowMs = useNow1Hz();
 
   // Group by holder_name. Map insertion order is preserved — sort holders
   // by their newest-registered file so the most recently active appears

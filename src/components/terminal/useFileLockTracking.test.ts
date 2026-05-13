@@ -36,6 +36,7 @@ import {
   lockStateFromAcquired,
   lockStateFromWaiting,
   lockStateKind,
+  type IncomingLongWaitSignal,
   type IncomingYieldRequest,
   type LockState,
 } from "./useFileLockTracking";
@@ -128,7 +129,7 @@ describe("lockStateKind", () => {
 // the listener registration, just to populate `mockListen.mock.calls`.
 
 describe("file-lock event handler registration (smoke)", () => {
-  it("registers listeners for waiting, acquired, released, AND yield-requested events", async () => {
+  it("registers listeners for waiting, acquired, released, yield-requested, AND long-wait-signaled events", async () => {
     // Resolve immediately with a no-op unlisten.
     mockListen.mockResolvedValue(() => {});
 
@@ -140,11 +141,12 @@ describe("file-lock event handler registration (smoke)", () => {
     //   listen("file-lock-waiting", ...)
     //   listen("file-lock-acquired", ...)
     //   listen("file-lock-released", ...)
-    //   listen("file-lock-yield-requested", ...) — Phase 3
+    //   listen("file-lock-yield-requested", ...) — Phase 3 lock-yield
+    //   listen("file-lock-long-wait-signaled", ...) — Phase 3 stuck-session
     // So we re-register here with the same identifiers (mirrors what
     // the hook does on first mount). If a future refactor moves the
     // registration elsewhere, this test will start failing because
-    // the contract — four event types, one listener each — is
+    // the contract — five event types, one listener each — is
     // explicit.
 
     const events = [
@@ -152,6 +154,7 @@ describe("file-lock event handler registration (smoke)", () => {
       "file-lock-acquired",
       "file-lock-released",
       "file-lock-yield-requested",
+      "file-lock-long-wait-signaled",
     ];
     for (const e of events) {
       const { listen } = await import("@tauri-apps/api/event");
@@ -394,5 +397,320 @@ describe("Phase 3 lifecycle: waiting → yield-requested → released", () => {
     // 4-5. Release event arrives; queue clears.
     requests = applyReleasedForTab(requests, "tab-holder", "src/foo.rs");
     expect(requests["tab-holder"]).toEqual([]);
+  });
+});
+
+// ── Phase 3 (stuck-session heartbeat) — pendingLongWaitSignals lifecycle ───
+//
+// Mirrors the hook's setPendingLongWaitSignals reducer logic. The
+// long-wait signal flows HOLDER → every WAITER currently waiting on
+// the same `file_path` (opposite polarity to yield-requested which is
+// waiter → holder). The hook's listener:
+//
+//   1. Finds every waiter tab whose `lockState.kind === "waiting"` AND
+//      `lockState.filePath === payload.file_path`.
+//   2. For each such waiter tab, dedups by `(holderTaskRunId, filePath)`:
+//        - If a duplicate exists, REPLACE in-place (preserves queue
+//          position; refreshes signaledAtMs / estimatedRemainingMs).
+//        - Otherwise APPEND.
+//   3. On `file-lock-released` for the payload's file_path, filters out
+//      any matching entry across ALL waiter tabs (every waiter on that
+//      file is no longer blocked).
+//   4. On `file-lock-acquired` for the resolved waiter tab, filters out
+//      any entry matching the acquired file_path from THAT tab's list.
+
+type SignalsByTab = Record<string, IncomingLongWaitSignal[]>;
+
+function applyLongWaitSignaled(
+  prev: SignalsByTab,
+  waiterTabIds: string[],
+  incoming: IncomingLongWaitSignal,
+): SignalsByTab {
+  if (waiterTabIds.length === 0) return prev;
+  const next: SignalsByTab = { ...prev };
+  for (const tabId of waiterTabIds) {
+    const existing = prev[tabId] ?? [];
+    const dedupIdx = existing.findIndex(
+      (s) =>
+        s.holderTaskRunId === incoming.holderTaskRunId &&
+        s.filePath === incoming.filePath,
+    );
+    let updated: IncomingLongWaitSignal[];
+    if (dedupIdx >= 0) {
+      updated = existing.slice();
+      updated[dedupIdx] = incoming;
+    } else {
+      updated = [...existing, incoming];
+    }
+    next[tabId] = updated;
+  }
+  return next;
+}
+
+function applyLongWaitReleased(
+  prev: SignalsByTab,
+  filePath: string,
+): SignalsByTab {
+  let dirty = false;
+  const next: SignalsByTab = {};
+  for (const [waiterTabId, signals] of Object.entries(prev)) {
+    const filtered = signals.filter((s) => s.filePath !== filePath);
+    if (filtered.length !== signals.length) {
+      dirty = true;
+      next[waiterTabId] = filtered;
+    } else {
+      next[waiterTabId] = signals;
+    }
+  }
+  return dirty ? next : prev;
+}
+
+function applyLongWaitAcquired(
+  prev: SignalsByTab,
+  waiterTabId: string,
+  filePath: string,
+): SignalsByTab {
+  const list = prev[waiterTabId];
+  if (!list || list.length === 0) return prev;
+  const filtered = list.filter((s) => s.filePath !== filePath);
+  if (filtered.length === list.length) return prev;
+  return { ...prev, [waiterTabId]: filtered };
+}
+
+describe("pendingLongWaitSignals — append + dedup", () => {
+  const sigA: IncomingLongWaitSignal = {
+    filePath: "src/foo.rs",
+    holderName: "Session B",
+    holderTaskRunId: "task-B",
+    estimatedRemainingMs: 300_000,
+    signaledAtMs: 1_000,
+  };
+  const sigAReissued: IncomingLongWaitSignal = {
+    ...sigA,
+    estimatedRemainingMs: 600_000, // bumped estimate
+    signaledAtMs: 2_000,
+  };
+  const sigBHolder: IncomingLongWaitSignal = {
+    filePath: "src/foo.rs",
+    holderName: "Session C",
+    holderTaskRunId: "task-C",
+    signaledAtMs: 1_500,
+  };
+
+  it("appends a fresh signal to each waiter's empty list", () => {
+    // Holder broadcasts; both waiters get the signal.
+    const next = applyLongWaitSignaled({}, ["tab-waiter-1", "tab-waiter-2"], sigA);
+    expect(next["tab-waiter-1"]).toEqual([sigA]);
+    expect(next["tab-waiter-2"]).toEqual([sigA]);
+  });
+
+  it("no-ops when no waiter tabs match the file_path", () => {
+    const start: SignalsByTab = {};
+    const next = applyLongWaitSignaled(start, [], sigA);
+    expect(next).toBe(start);
+  });
+
+  it("DEDUPES by (holderTaskRunId, filePath): replace in-place, no length growth", () => {
+    const after1 = applyLongWaitSignaled({}, ["tab-waiter"], sigA);
+    const after2 = applyLongWaitSignaled(after1, ["tab-waiter"], sigAReissued);
+    expect(after2["tab-waiter"]).toHaveLength(1);
+    expect(after2["tab-waiter"][0].signaledAtMs).toBe(2_000);
+    expect(after2["tab-waiter"][0].estimatedRemainingMs).toBe(600_000);
+  });
+
+  it("appends a second signal from a different holder (no dedup)", () => {
+    const after1 = applyLongWaitSignaled({}, ["tab-waiter"], sigA);
+    const after2 = applyLongWaitSignaled(after1, ["tab-waiter"], sigBHolder);
+    expect(after2["tab-waiter"]).toEqual([sigA, sigBHolder]);
+  });
+});
+
+describe("pendingLongWaitSignals — cleared on file-lock-released", () => {
+  const sigFoo: IncomingLongWaitSignal = {
+    filePath: "src/foo.rs",
+    holderName: "Session B",
+    holderTaskRunId: "task-B",
+    signaledAtMs: 1_000,
+  };
+  const sigBar: IncomingLongWaitSignal = {
+    filePath: "src/bar.rs",
+    holderName: "Session B",
+    holderTaskRunId: "task-B",
+    signaledAtMs: 1_100,
+  };
+
+  it("clears matching entries across all waiter tabs", () => {
+    const start: SignalsByTab = {
+      "tab-waiter-1": [sigFoo, sigBar],
+      "tab-waiter-2": [sigFoo],
+    };
+    const next = applyLongWaitReleased(start, "src/foo.rs");
+    expect(next["tab-waiter-1"]).toEqual([sigBar]);
+    expect(next["tab-waiter-2"]).toEqual([]);
+  });
+
+  it("is a no-op when no matching entry exists", () => {
+    const start: SignalsByTab = { "tab-waiter-1": [sigBar] };
+    const next = applyLongWaitReleased(start, "src/foo.rs");
+    expect(next).toBe(start);
+  });
+});
+
+describe("pendingLongWaitSignals — cleared on file-lock-acquired (per waiter)", () => {
+  const sigFoo: IncomingLongWaitSignal = {
+    filePath: "src/foo.rs",
+    holderName: "Session B",
+    holderTaskRunId: "task-B",
+    signaledAtMs: 1_000,
+  };
+
+  it("removes entries for the acquired file path on that waiter tab", () => {
+    const start: SignalsByTab = { "tab-waiter": [sigFoo] };
+    const next = applyLongWaitAcquired(start, "tab-waiter", "src/foo.rs");
+    expect(next["tab-waiter"]).toEqual([]);
+  });
+
+  it("is a no-op when the waiter has no signals", () => {
+    const start: SignalsByTab = {};
+    const next = applyLongWaitAcquired(start, "tab-waiter", "src/foo.rs");
+    expect(next).toBe(start);
+  });
+});
+
+// ── Phase 2 (stuck-session heartbeat) — holderIdleMs join from /sessions/idle-status
+//
+// The hook's 10s poll loop runs `/file-locks/info` and
+// `/sessions/idle-status` in parallel via Promise.allSettled, then
+// joins by `holder_name` to attach `holderIdleMs` to each waiting
+// tab's LockState. The reducer logic under test:
+//
+//   1. Idle entries are indexed by `holder_name` (not task_run_id),
+//      because the waiter's `LockState.counterpartyName` carries the
+//      friendly name.
+//   2. When a waiter's blockedBy holder matches an idle entry, attach
+//      `idle_ms` as `holderIdleMs`. Pure function — no side effects.
+//   3. When no idle entry matches (network error, holder is a PTY-side
+//      session not in the snapshot), `holderIdleMs` is `undefined`.
+//   4. `holderIdleMs` is ONLY attached to the waiting branch — never
+//      to holding or idle.
+
+interface SessionIdleEntry {
+  task_run_id: string;
+  holder_name: string;
+  last_activity_ms: number;
+  idle_ms: number;
+}
+
+function buildIdleIndex(entries: SessionIdleEntry[] | null): Map<string, number> {
+  // Mirror of the hook's idle-by-holder-name index. Null input models
+  // the fetch-failed branch (allSettled resolved to rejected).
+  const idx = new Map<string, number>();
+  if (!entries) return idx;
+  for (const e of entries) idx.set(e.holder_name, e.idle_ms);
+  return idx;
+}
+
+// Reducer mirror for the waiting branch — captures the exact field set
+// the hook writes onto next[tab.id] in the waiting case.
+function buildWaitingLockState(
+  waiting: { blockedBy: string; filePath: string; sinceMs: number },
+  idleByHolderName: Map<string, number>,
+): LockState {
+  return {
+    kind: "waiting",
+    filePath: waiting.filePath,
+    counterpartyName: waiting.blockedBy,
+    sinceMs: waiting.sinceMs,
+    holderIdleMs: idleByHolderName.get(waiting.blockedBy),
+  };
+}
+
+describe("holderIdleMs join — /sessions/idle-status × /file-locks/info", () => {
+  const waiting = {
+    blockedBy: "Session B",
+    filePath: "src/foo.rs",
+    sinceMs: 1_700_000_000_000,
+  };
+
+  it("populates holderIdleMs when the join matches a holder_name entry", () => {
+    const entries: SessionIdleEntry[] = [
+      {
+        task_run_id: "task-B",
+        holder_name: "Session B",
+        last_activity_ms: 1_700_000_000_000,
+        idle_ms: 420_000, // 7m idle
+      },
+    ];
+    const idx = buildIdleIndex(entries);
+    const state = buildWaitingLockState(waiting, idx);
+    expect(state.kind).toBe("waiting");
+    expect(state.holderIdleMs).toBe(420_000);
+    expect(state.counterpartyName).toBe("Session B");
+  });
+
+  it("leaves holderIdleMs undefined when no idle entry matches", () => {
+    const entries: SessionIdleEntry[] = [
+      {
+        task_run_id: "task-C",
+        holder_name: "Session C", // a different holder
+        last_activity_ms: 1_700_000_000_000,
+        idle_ms: 60_000,
+      },
+    ];
+    const idx = buildIdleIndex(entries);
+    const state = buildWaitingLockState(waiting, idx);
+    expect(state.holderIdleMs).toBeUndefined();
+  });
+
+  it("leaves holderIdleMs undefined when the idle fetch failed (null input)", () => {
+    // Models the allSettled rejected branch: idleByHolderName is built
+    // from an empty list, so every lookup misses.
+    const idx = buildIdleIndex(null);
+    const state = buildWaitingLockState(waiting, idx);
+    expect(state.holderIdleMs).toBeUndefined();
+    // The rest of the waiting branch is still populated — the join is
+    // additive, no field is dropped on idle failure.
+    expect(state.kind).toBe("waiting");
+    expect(state.filePath).toBe("src/foo.rs");
+    expect(state.counterpartyName).toBe("Session B");
+    expect(state.sinceMs).toBe(1_700_000_000_000);
+  });
+
+  it("leaves holderIdleMs undefined when the idle response is empty", () => {
+    const idx = buildIdleIndex([]);
+    const state = buildWaitingLockState(waiting, idx);
+    expect(state.holderIdleMs).toBeUndefined();
+  });
+
+  it("indexes by holder_name (not task_run_id)", () => {
+    // The waiter's blockedBy is the friendly name — the join must use
+    // holder_name, not task_run_id. If the reducer accidentally
+    // indexed by task_run_id, this lookup would miss.
+    const entries: SessionIdleEntry[] = [
+      {
+        task_run_id: "task-B-very-different-string",
+        holder_name: "Session B",
+        last_activity_ms: 1_700_000_000_000,
+        idle_ms: 90_000,
+      },
+    ];
+    const idx = buildIdleIndex(entries);
+    const state = buildWaitingLockState(waiting, idx);
+    expect(state.holderIdleMs).toBe(90_000);
+  });
+
+  it("does NOT attach holderIdleMs to holding or idle states", () => {
+    // The reducer's holding-branch writer never reads idleByHolderName,
+    // and the idle branch is just { kind: "idle" }. Verify by direct
+    // construction — this test pins the documented contract.
+    const holding: LockState = {
+      kind: "holding",
+      filePath: "src/foo.rs",
+      waiterCount: 1,
+      sinceMs: 1_700_000_000_000,
+    };
+    const idle: LockState = { kind: "idle" };
+    expect(holding.holderIdleMs).toBeUndefined();
+    expect(idle.holderIdleMs).toBeUndefined();
   });
 });

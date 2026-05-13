@@ -140,6 +140,31 @@ impl PgDb {
         Ok(row.is_some())
     }
 
+    /// UNCONDITIONAL break of the leader-lease row — no 60s stale grace.
+    /// Only callers carrying an explicit operator-confirm flag should
+    /// reach this; it can evict a still-renewing orphan coordinator.
+    pub async fn force_release_coordinator_lease(&self) -> Result<Option<String>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                r#"
+                DELETE FROM coord.coordinator_leader
+                WHERE id = TRUE
+                RETURNING instance_id
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("Failed to force-release coordinator lease: {}", e))?;
+
+        Ok(row.map(|r| r.get(0)))
+    }
+
     /// Return the current leader-lease row, or `None` if no instance has
     /// taken the lease yet. Read-only — intended for the dashboard's
     /// "current leader" badge.

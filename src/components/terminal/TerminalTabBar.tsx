@@ -11,6 +11,7 @@ import { CommitTrafficLight } from "./CommitTrafficLight";
 import type { CommitState } from "./useCommitState";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { RefObject } from "react";
+import { useNow1Hz } from "./useNow1Hz";
 
 interface TerminalTabBarProps {
   tabs: TerminalTab[];
@@ -21,9 +22,25 @@ interface TerminalTabBarProps {
   onRename: (id: string, title: string) => void;
   sessionStates?: Record<string, SessionState>;
   layoutPicker?: ReactNode;
-  onQuickLaunch?: (count: number, autoCommand?: string) => void;
-  onLaunchAiSession?: (count: number, configDir: string, context?: string) => void;
-  onLaunchMultiAiSessions?: (configDirs: string[], context?: string) => void;
+  /**
+   * Spawn N plain PTY terminals. Returns the created `tab.id`s in
+   * launch order so UI Bridge action handlers can surface them in the
+   * synchronous response — see `chore/uib-terminal-sessions-endpoint`.
+   * The user-click path through `<LaunchMenu>` ignores the return
+   * value (it's a fire-and-forget).
+   */
+  onQuickLaunch?: (count: number, autoCommand?: string) => Promise<string[]> | void;
+  /** Spawn N AI sessions for a single account; returns the new `tab.id`s. */
+  onLaunchAiSession?: (
+    count: number,
+    configDir: string,
+    context?: string,
+  ) => Promise<string[]> | void;
+  /** Spawn one AI session per `configDir`; returns the new `tab.id`s. */
+  onLaunchMultiAiSessions?: (
+    configDirs: string[],
+    context?: string,
+  ) => Promise<string[]> | void;
   accountUsage?: AccountUsageInfo[];
   launchCommands?: Record<string, string>;
   fileLocks?: import("./useSessionManager").FileLockInfo[];
@@ -94,11 +111,20 @@ function formatTime(value?: string | number): string {
  * Format a "since" epoch-ms as a short relative-age string ("5s",
  * "42s", "5m", "2h"). Mirrors `formatHoldingAge` from `LaunchMenu.tsx`
  * but takes the "since" timestamp directly. Negative ages clamp to
- * "0s". Returns the empty string when `ms` is undefined.
+ * "0s". Returns the empty string when `sinceMs` is undefined.
+ *
+ * Phase 2 of the stuck-session heartbeat plan widened the signature
+ * from `(sinceMs?)` to `(sinceMs?, nowMs)` — the helper used to read
+ * `Date.now()` internally, which made it invisible to React's render
+ * cycle (re-mount didn't tick). Callers now pass `useNow1Hz()` as the
+ * second arg so the tooltip text refreshes on next-hover after the
+ * shared 1Hz broadcast fires. Native HTML `title` tooltips can't
+ * refresh while visibly open — the tick lands at next-hover. See the
+ * plan's Problem §1 caveat.
  */
-function formatSince(ms?: number): string {
-  if (ms === undefined) return "";
-  const deltaSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+function formatSince(sinceMs: number | undefined, nowMs: number): string {
+  if (sinceMs === undefined) return "";
+  const deltaSec = Math.max(0, Math.floor((nowMs - sinceMs) / 1000));
   if (deltaSec < 60) return `${deltaSec}s`;
   const deltaMin = Math.floor(deltaSec / 60);
   if (deltaMin < 60) return `${deltaMin}m`;
@@ -226,6 +252,13 @@ export function TerminalTabBar({
   const [showQuickLaunch, setShowQuickLaunch] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
+  // Phase 2 (stuck-session heartbeat) — subscribe to the shared 1Hz
+  // broadcast so the lock tooltip's "since 5m" text refreshes on next-
+  // hover. Native HTML `title` tooltips don't update while visibly open
+  // — the tick lands when the user re-hovers. Documented at
+  // `formatSince`'s docstring and Problem §1 of the plan.
+  const nowMs = useNow1Hz();
+
   // Live elapsed-time tick (30s interval), only in multi-zone mode
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -321,13 +354,22 @@ export function TerminalTabBar({
         label: "Create Plain Terminal",
         description: "Spawn N blank terminals using the user's default shell.",
         paramSchema: { count: "number (>= 1, defaults to 1)" },
-        handler: (params?: unknown) => {
+        handler: async (params?: unknown) => {
           const { count = 1 } = (params ?? {}) as { count?: number };
           if (typeof count !== "number" || count < 1) {
             throw new Error("create-plain requires { count: number } where count >= 1");
           }
-          onQuickLaunch?.(count);
+          // PTY-only tabs never own a Claude task_run_id, so the parallel
+          // task_run_ids array is empty — callers polling
+          // `/control/terminal-sessions/{id}` for the readiness signal
+          // (`state` / `is_alive`) is the right pattern for these.
+          const tabIds = ((await onQuickLaunch?.(count)) ?? []) as string[];
           closeLaunchMenu();
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: [] as Array<string | null>,
+          };
         },
       },
       {
@@ -340,7 +382,7 @@ export function TerminalTabBar({
           configDir: "string (absolute path to a Claude Code config dir, required)",
           context: "string (optional initial prompt auto-typed after claude starts)",
         },
-        handler: (params?: unknown) => {
+        handler: async (params?: unknown) => {
           const {
             count = 1,
             configDir,
@@ -357,8 +399,19 @@ export function TerminalTabBar({
           if (typeof count !== "number" || count < 1) {
             throw new Error("create-ai-session: count must be a positive number");
           }
-          onLaunchAiSession?.(count, configDir, context);
+          // `task_run_id` (= Claude session_id) is captured asynchronously
+          // by `useTabSessionIdCapture` once Claude CLI writes its first
+          // JSONL record. At handler-return time the value is `null` for
+          // every fresh tab — callers correlate via
+          // `GET /control/terminal-sessions/{tab_id}` and watch for
+          // `task_run_id` to flip non-null.
+          const tabIds = ((await onLaunchAiSession?.(count, configDir, context)) ?? []) as string[];
           closeLaunchMenu();
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: tabIds.map(() => null) as Array<string | null>,
+          };
         },
       },
       {
@@ -370,7 +423,7 @@ export function TerminalTabBar({
           count: "number (>= 1, defaults to 1)",
           context: "string (optional initial prompt auto-typed after claude starts)",
         },
-        handler: (params?: unknown) => {
+        handler: async (params?: unknown) => {
           const { count = 1, context } = (params ?? {}) as {
             count?: number;
             context?: string;
@@ -380,8 +433,14 @@ export function TerminalTabBar({
           }
           const best = sortedAccountsForBridge[0];
           if (!best) throw new Error("No AI accounts available");
-          onLaunchAiSession?.(count, best.config_dir, context);
+          const tabIds = ((await onLaunchAiSession?.(count, best.config_dir, context)) ??
+            []) as string[];
           closeLaunchMenu();
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: tabIds.map(() => null) as Array<string | null>,
+          };
         },
       },
       {
@@ -393,7 +452,7 @@ export function TerminalTabBar({
           count: "number (>= 1, defaults to 1)",
           command: "string (the shell command to type + Enter, required)",
         },
-        handler: (params?: unknown) => {
+        handler: async (params?: unknown) => {
           const { count = 1, command } = (params ?? {}) as {
             count?: number;
             command?: string;
@@ -403,8 +462,16 @@ export function TerminalTabBar({
           if (typeof count !== "number" || count < 1) {
             throw new Error("create-with-command: count must be a positive number");
           }
-          onQuickLaunch?.(count, command);
+          // `create-with-command` reuses the plain-PTY path (no Claude
+          // CLI), so `task_run_ids` is empty by definition. Callers can
+          // still observe the spawned tabs via `terminal-sessions`.
+          const tabIds = ((await onQuickLaunch?.(count, command)) ?? []) as string[];
           closeLaunchMenu();
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: [] as Array<string | null>,
+          };
         },
       },
     ],
@@ -499,8 +566,15 @@ export function TerminalTabBar({
         )}
       </div>
 
-      {/* Scrollable tab area */}
-      <div className="flex items-center gap-0.5 px-1 overflow-x-auto scrollbar-none flex-1 min-w-0 h-full">
+      {/* Scrollable tab area.
+          Phase 3: `items-end` (was `items-center`) anchors every tab to
+          the bottom edge of the strip where the active tab's `-mb-px`
+          overlap happens, so the taller active tab grows UPWARD without
+          dragging the inactive tabs along (active renders extra rows for
+          tags + working-dir; inactives don't). Pair with `min-h-[37px]`
+          on each tab below to give inactives a baseline matching the
+          observed active-tab height. */}
+      <div className="flex items-end gap-0.5 px-1 overflow-x-auto scrollbar-none flex-1 min-w-0 h-full">
         {tabs.map((tab) => {
           const isActive = tab.id === activeId;
           const isDead = !tab.isAlive;
@@ -534,7 +608,7 @@ export function TerminalTabBar({
                 e.dataTransfer.effectAllowed = "move";
               }}
               className={`
-              flex items-center gap-1.5 px-3 py-1 rounded-t text-xs font-medium
+              flex items-center gap-1.5 px-3 py-1 rounded-t text-xs font-medium min-h-[37px]
               transition-colors whitespace-nowrap max-w-[260px] group cursor-grab active:cursor-grabbing
               ${
                 isActive
@@ -569,7 +643,7 @@ export function TerminalTabBar({
                   aria-label="waiting on file lock"
                   title={`waiting on ${lockState.counterpartyName ?? "another session"}'s ${
                     lockState.filePath ?? "edit"
-                  }${lockState.sinceMs ? ` since ${formatSince(lockState.sinceMs)}` : ""}`}
+                  }${lockState.sinceMs ? ` since ${formatSince(lockState.sinceMs, nowMs)}` : ""}`}
                 >
                   <Lock className="w-2.5 h-2.5 text-[#e0af68] animate-pulse" />
                 </span>

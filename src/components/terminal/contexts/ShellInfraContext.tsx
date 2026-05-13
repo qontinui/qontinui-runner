@@ -11,6 +11,7 @@ import {
   useFileLockTracking,
   type LockState,
   type IncomingYieldRequest,
+  type IncomingLongWaitSignal,
 } from "../useFileLockTracking";
 import { useSessionPersistence } from "../useSessionPersistence";
 
@@ -30,6 +31,13 @@ export interface ShellInfraContextValue {
    * `Record<tabId, LockState>` consumer shape stays binary-compatible.
    */
   pendingYieldRequests: Record<string, IncomingYieldRequest[]>;
+  /**
+   * Per-tab incoming long-wait signals keyed by WAITER `tab.id` (Phase 3
+   * stuck-session heartbeat). Surfaced separately from
+   * {@link pendingYieldRequests} because the polarity differs — signals
+   * flow holder → every waiter, requests flow waiter → holder.
+   */
+  pendingLongWaitSignals: Record<string, IncomingLongWaitSignal[]>;
   sessionPersistence: ReturnType<typeof useSessionPersistence>;
 }
 
@@ -43,12 +51,25 @@ export function ShellInfraProvider({ children }: ShellInfraProviderProps) {
   const { tabs, pageId } = useTerminalCore();
 
   const fileConflicts = useFileConflicts();
-  const { lockStates: fileLockStates, pendingYieldRequests } = useFileLockTracking(tabs);
+  const { lockStates: fileLockStates, pendingYieldRequests, pendingLongWaitSignals } =
+    useFileLockTracking(tabs);
   const sessionPersistence = useSessionPersistence(pageId);
 
   const value = useMemo<ShellInfraContextValue>(
-    () => ({ fileConflicts, fileLockStates, pendingYieldRequests, sessionPersistence }),
-    [fileConflicts, fileLockStates, pendingYieldRequests, sessionPersistence],
+    () => ({
+      fileConflicts,
+      fileLockStates,
+      pendingYieldRequests,
+      pendingLongWaitSignals,
+      sessionPersistence,
+    }),
+    [
+      fileConflicts,
+      fileLockStates,
+      pendingYieldRequests,
+      pendingLongWaitSignals,
+      sessionPersistence,
+    ],
   );
 
   return <ShellInfraContext.Provider value={value}>{children}</ShellInfraContext.Provider>;

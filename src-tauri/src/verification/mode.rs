@@ -172,18 +172,35 @@ mod tests {
     /// race if run in parallel. Serialize through this mutex.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn with_env<F: FnOnce()>(key: &str, value: Option<&str>, f: F) {
+    /// RAII guard that restores `key` to its pre-test value on drop,
+    /// including the panic path. Without this, a panic inside `f()` would
+    /// leave the env var pointing at the test's mutated value, leaking
+    /// state to any sibling test that reads the same key.
+    struct EnvRestore {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => env::set_var(self.key, v),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn with_env<F: FnOnce()>(key: &'static str, value: Option<&str>, f: F) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = env::var(key).ok();
+        let _restore = EnvRestore {
+            key,
+            prev: env::var(key).ok(),
+        };
         match value {
             Some(v) => env::set_var(key, v),
             None => env::remove_var(key),
         }
         f();
-        match prev {
-            Some(v) => env::set_var(key, v),
-            None => env::remove_var(key),
-        }
+        // `_restore` drops here — runs whether or not `f()` panicked.
     }
 
     #[test]

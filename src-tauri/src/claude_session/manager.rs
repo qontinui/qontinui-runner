@@ -1,6 +1,7 @@
 //! SessionManager - tracks active Claude sessions by task_run_id.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
@@ -213,9 +214,53 @@ impl SessionManager {
             .unwrap_or_default()
     }
 
+    /// Snapshot every registered `ClaudeSession` as a tuple of
+    /// `(task_run_id, holder_name, last_activity_tracker)`.
+    ///
+    /// `holder_name` matches the friendly display name the file-lock
+    /// dispatcher emits as `holder_name` on `file-lock-*` events (see
+    /// `claude_session/dispatcher.rs:398-404` and
+    /// `ClaudeSession::holder_name`).
+    ///
+    /// `last_activity_tracker` is a shared `Arc<AtomicU64>` holding the
+    /// most-recent stdout-line epoch SECONDS (written at
+    /// `claude_session/session.rs:420`). Callers convert to ms at the
+    /// boundary.
+    ///
+    /// `WorkerSession` and inline-PID registrations are intentionally
+    /// excluded: workers don't run a Claude CLI (no Claude-side activity
+    /// tracker) and inline PIDs don't expose a `last_activity` channel.
+    /// Returns an empty Vec when no `ClaudeSession`s are registered or
+    /// when the inner Mutex is poisoned.
+    pub fn snapshot(&self) -> Vec<(String, String, Arc<AtomicU64>)> {
+        self.sessions
+            .lock()
+            .ok()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|(id, s)| {
+                        (
+                            id.clone(),
+                            s.holder_name().to_string(),
+                            s.last_activity_tracker(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// List all active session task_run_ids — union of ClaudeSessions and
     /// Workers whose state is non-Closed. Phase 6: workers participate in
     /// `Observation.live_sessions` so Rule B can assign them tasks.
+    ///
+    /// Broad-by-default: includes `Initializing` workers (Phase 1 of the
+    /// 2026-05-11 dispatch-fix plan). Callers that need dispatch-eligible
+    /// sessions only (i.e. `Ready` and not currently assigned) MUST filter
+    /// the returned ids via [`Self::get_state`]. See
+    /// `mcp::reflection::compute_plan_recommendations` for the canonical
+    /// `idle_session_count` pattern.
     pub fn list_active(&self) -> Vec<String> {
         let mut active: Vec<String> = self
             .sessions

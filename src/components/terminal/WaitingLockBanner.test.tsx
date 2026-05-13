@@ -42,8 +42,11 @@ vi.mock("@/lib/logger", () => ({
 }));
 
 import {
+  HOLDER_IDLE_DISPLAY_THRESHOLD_MS,
   REQUEST_YIELD_COOLDOWN_MS,
   cooldownRemainingSecs,
+  formatEstimate,
+  formatIdleDuration,
   formatWaitingBannerText,
   formatWaitingSeconds,
   type WaitingLockBannerProps,
@@ -300,5 +303,168 @@ const _propsTypeAnchor: WaitingLockBannerProps = {
   blockerName: "bravo",
   blockerTaskRunId: "tab-B",
   sinceMs: 0,
+  holderIdleMs: 420_000,
+  longWaitSignal: {
+    holderName: "bravo",
+    estimatedRemainingMs: 300_000,
+    signaledAtMs: 1_700_000_000_000,
+  },
 };
 void _propsTypeAnchor;
+
+// ── Phase 3 (stuck-session heartbeat) — formatEstimate ─────────────────────
+
+describe("formatEstimate", () => {
+  it("rounds to nearest second for values < 60_000ms", () => {
+    expect(formatEstimate(0)).toBe("~0s");
+    expect(formatEstimate(1_499)).toBe("~1s"); // round(1.499) = 1
+    expect(formatEstimate(1_500)).toBe("~2s"); // round(1.5) = 2 (banker's at .5 in JS = 2)
+    expect(formatEstimate(45_400)).toBe("~45s");
+    expect(formatEstimate(59_999)).toBe("~60s"); // edge case: rounds to 60 before flipping to minutes
+  });
+
+  it("rounds to nearest minute for values >= 60_000ms", () => {
+    expect(formatEstimate(60_000)).toBe("~1m");
+    expect(formatEstimate(90_000)).toBe("~2m"); // round(1.5) = 2
+    expect(formatEstimate(300_000)).toBe("~5m");
+    expect(formatEstimate(610_000)).toBe("~10m"); // round(10.166) = 10
+  });
+});
+
+// ── Phase 3 — long-wait advisory render predicate ─────────────────────────
+//
+// The component renders the advisory line iff `longWaitSignal !== undefined`.
+// Replicates the JSX render gating logic without invoking React (no
+// jsdom — see vitest.config.ts environment: "node"). Verifies:
+//
+//   1. Line is omitted when `longWaitSignal` is undefined.
+//   2. Line is rendered when `longWaitSignal` is provided.
+//   3. Estimate tail is appended when `estimatedRemainingMs` is provided;
+//      omitted when undefined.
+
+type LongWaitSignal = WaitingLockBannerProps["longWaitSignal"];
+
+// Pure mirror of the JSX render gating. Returns the rendered advisory
+// text or `null` if the line is omitted.
+function renderLongWaitAdvisory(signal: LongWaitSignal): string | null {
+  if (!signal) return null;
+  const base = `${signal.holderName} says they'll be a while. Request yield or cancel?`;
+  if (signal.estimatedRemainingMs !== undefined) {
+    return `${base} (${formatEstimate(signal.estimatedRemainingMs)})`;
+  }
+  return base;
+}
+
+describe("long-wait advisory line — render predicate", () => {
+  it("omits the advisory line when longWaitSignal is undefined", () => {
+    expect(renderLongWaitAdvisory(undefined)).toBeNull();
+  });
+
+  it("renders the advisory line when longWaitSignal is provided (no estimate)", () => {
+    const rendered = renderLongWaitAdvisory({
+      holderName: "bravo",
+      signaledAtMs: 1_700_000_000_000,
+    });
+    expect(rendered).toBe(
+      "bravo says they'll be a while. Request yield or cancel?",
+    );
+    // Estimate tail must NOT be present when `estimatedRemainingMs` is omitted.
+    expect(rendered).not.toMatch(/\(~/);
+  });
+
+  it("appends the formatted estimate when estimatedRemainingMs is provided", () => {
+    const rendered = renderLongWaitAdvisory({
+      holderName: "bravo",
+      estimatedRemainingMs: 300_000,
+      signaledAtMs: 1_700_000_000_000,
+    });
+    expect(rendered).toBe(
+      "bravo says they'll be a while. Request yield or cancel? (~5m)",
+    );
+  });
+
+  it("uses seconds rounding for sub-minute estimates", () => {
+    const rendered = renderLongWaitAdvisory({
+      holderName: "bravo",
+      estimatedRemainingMs: 45_000,
+      signaledAtMs: 1_700_000_000_000,
+    });
+    expect(rendered).toContain("(~45s)");
+  });
+});
+
+// ── Phase 2 (stuck-session heartbeat) — formatIdleDuration ────────────────
+
+describe("formatIdleDuration", () => {
+  it("floor-rounds to seconds for values < 60_000ms", () => {
+    expect(formatIdleDuration(0)).toBe("0s");
+    expect(formatIdleDuration(999)).toBe("0s"); // floor
+    expect(formatIdleDuration(1_499)).toBe("1s"); // floor (round → 1)
+    expect(formatIdleDuration(1_500)).toBe("1s"); // floor
+    expect(formatIdleDuration(45_900)).toBe("45s");
+    expect(formatIdleDuration(59_999)).toBe("59s"); // edge — stays seconds until 60s
+  });
+
+  it("floor-rounds to minutes for values in [60_000, 3_600_000)", () => {
+    expect(formatIdleDuration(60_000)).toBe("1m");
+    expect(formatIdleDuration(119_999)).toBe("1m"); // floor
+    expect(formatIdleDuration(120_000)).toBe("2m");
+    expect(formatIdleDuration(420_000)).toBe("7m");
+    expect(formatIdleDuration(3_599_999)).toBe("59m"); // edge — stays minutes until 1h
+  });
+
+  it("floor-rounds to hours for values >= 3_600_000ms", () => {
+    expect(formatIdleDuration(3_600_000)).toBe("1h");
+    expect(formatIdleDuration(7_199_999)).toBe("1h");
+    expect(formatIdleDuration(7_200_000)).toBe("2h");
+    expect(formatIdleDuration(8_400_000)).toBe("2h"); // 2h20m → 2h
+  });
+
+  it("clamps negative inputs to 0s (defensive, shouldn't happen in production)", () => {
+    expect(formatIdleDuration(-500)).toBe("0s");
+    expect(formatIdleDuration(-60_000)).toBe("0s");
+  });
+});
+
+// ── Phase 2 — holder-idle advisory render predicate ──────────────────────
+//
+// The banner renders the inline "(holder idle Xm)" span iff
+// `holderIdleMs !== undefined && holderIdleMs > HOLDER_IDLE_DISPLAY_THRESHOLD_MS`.
+// The threshold is 60_000ms; values at/under it are noise (typing
+// pauses, brief thinking gaps). Replicates the JSX render gating
+// without invoking React (no jsdom — see vitest.config.ts).
+
+// Pure mirror of the JSX render gating. Returns the rendered span text
+// or `null` if the suffix is omitted.
+function renderHolderIdleSuffix(holderIdleMs: number | undefined): string | null {
+  if (holderIdleMs === undefined) return null;
+  if (holderIdleMs <= HOLDER_IDLE_DISPLAY_THRESHOLD_MS) return null;
+  return `(holder idle ${formatIdleDuration(holderIdleMs)})`;
+}
+
+describe("holder-idle suffix — render predicate", () => {
+  it("omits the suffix when holderIdleMs is undefined", () => {
+    expect(renderHolderIdleSuffix(undefined)).toBeNull();
+  });
+
+  it("omits the suffix at/below the 60s display threshold", () => {
+    expect(renderHolderIdleSuffix(0)).toBeNull();
+    expect(renderHolderIdleSuffix(30_000)).toBeNull();
+    expect(renderHolderIdleSuffix(59_999)).toBeNull();
+    expect(renderHolderIdleSuffix(60_000)).toBeNull(); // exact threshold = hidden (gate is `>`)
+  });
+
+  it("renders the suffix above the 60s display threshold", () => {
+    expect(renderHolderIdleSuffix(60_001)).toBe("(holder idle 1m)");
+    expect(renderHolderIdleSuffix(120_000)).toBe("(holder idle 2m)");
+    expect(renderHolderIdleSuffix(420_000)).toBe("(holder idle 7m)");
+    expect(renderHolderIdleSuffix(3_600_000)).toBe("(holder idle 1h)");
+  });
+
+  it("uses the constant HOLDER_IDLE_DISPLAY_THRESHOLD_MS = 60000", () => {
+    // Tripwire: if a future plan changes the threshold (Open Q3 of the
+    // stuck-session heartbeat plan), this assertion must change in
+    // lockstep with the spec.
+    expect(HOLDER_IDLE_DISPLAY_THRESHOLD_MS).toBe(60_000);
+  });
+});

@@ -1125,6 +1125,60 @@
       "id": "term-commit-traffic-light",
       "name": "Per-Tab Commit Traffic Light",
       "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Lock-Yield Protocol Banners",
+          "enabled": true,
+          "id": "term-lock-yield-banners-elem-0",
+          "precondition": "At least two active AI sessions contend on the same file: one holds an exclusive lock via FileLockManager, another is blocked on `acquire()`. Verifiable via GET /file-locks/info returning at least one entry whose holder_task_run_id corresponds to a live tab, while another tab's lockState.kind === 'waiting' on the same file_path.",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataUiBridgeId": "terminal.waiting-lock-banner"
+            },
+            "label": "Required element for Lock-Yield Protocol Banners",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When two AI sessions contend on the same file, the holder and the waiter each see an in-tab banner driven by `<HoldingLockBanner>` (qontinui-runner/src/components/terminal/HoldingLockBanner.tsx) and `<WaitingLockBanner>` (qontinui-runner/src/components/terminal/WaitingLockBanner.tsx). The banners share placement: absolutely-positioned `top-2 right-2 z-30 w-[340px]` overlays inside the active tab's pane. They are gated to active AI tabs only (per `proj_holding_banner_pty_gate.md` — PTY tabs without `claudeSessionId` never render either banner). Banner mounting is driven by `useFileLockTracking` (qontinui-runner/src/components/terminal/useFileLockTracking.ts) exposing `lockStates: Record<tabId, LockState>` and `pendingYieldRequests: Record<holderTabId, IncomingYieldRequest[]>`. HoldingLockBanner shows above the active tab's pane when `lockState.kind === 'holding'` AND (`waiterCount > 0` OR pending yield requests exist for this tab). Its three buttons are `terminal.holding-lock-banner-yield` (calls POST `/file-locks/yield` to release this lock without ending the session), `terminal.holding-lock-banner-hold` (dismisses the banner locally until the next waiter event), and `terminal.holding-lock-banner-signal-long-wait` (Stuck-Session Heartbeat surface — see `term-heartbeat-idle-status`). WaitingLockBanner shows above the active tab's pane when `lockState.kind === 'waiting'` and exposes one primary action `terminal.waiting-lock-banner-request-yield` (POST `/file-locks/yield-request`). After click, the button enters a 30-second cooldown matching `REQUEST_YIELD_COOLDOWN_MS` (re-exported from `@/lib/lock-yield` for consumer tripwires) — local state, not server-tracked, reload resets it. Disabled state: when `blockerTaskRunId` is undefined the parent couldn't resolve the holder session by name, so there's nothing to route the request to and the button is disabled with a guidance tooltip. Backend wiring lives in `qontinui-runner/src-tauri/src/mcp/file_registry.rs::yield_lock` and `::request_yield` (registered in `routes()` at `/file-locks/yield` and `/file-locks/yield-request` POST). Both emit via the dual-emit pattern: `state.app_handle.emit(name, &payload)` for the Tauri webview AND `state.app_state.event_broadcast.send(payload)` for SSE/headless consumers, matching the dispatcher's wait emit at `claude_session/dispatcher.rs:436-441`. The yield endpoint emits `file-lock-released` (same shape used by session.rs, ai_session.rs, graphql/mutation.rs, task_runs.rs). The yield-request endpoint emits `file-lock-yield-requested` `{type, file_path, requester_task_run_id, requester_name, holder_task_run_id, requested_at}` which `useFileLockTracking`'s third listener routes to the holder's tab by matching `tab.claudeSessionId === payload.holder_task_run_id` (via `findTabByTaskRunId`). The pending-yield list is deduped by `(requesterTaskRunId, filePath)` so a holder doesn't see N entries from spam clicks. Entries clear automatically on `file-lock-released` for the matching `(holder_task_run_id, file_path)` pair. Banner-side 1Hz seconds-tick uses `useNow1Hz` (see `term-heartbeat-idle-status`).",
+      "id": "term-lock-yield-banners",
+      "name": "Lock-Yield Protocol Banners",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Stuck-Session Heartbeat",
+          "enabled": true,
+          "id": "term-heartbeat-idle-status-elem-0",
+          "precondition": "At least two active AI sessions contend on the same file: one holds an exclusive lock via FileLockManager, another is blocked on `acquire()`. Verifiable via GET /file-locks/info returning at least one entry whose holder_task_run_id corresponds to a live tab, while another tab's lockState.kind === 'waiting' on the same file_path.",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataUiBridgeId": "terminal.waiting-lock-banner-holder-idle"
+            },
+            "label": "Required element for Stuck-Session Heartbeat",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "On top of the Lock-Yield Protocol surface, the terminal page exposes live idle telemetry so a waiter can tell whether the holder is busy or sitting in Ready, and the holder can broadcast 'I'll be a while' to current waiters. Backend: `GET /sessions/idle-status` (registered in `qontinui-runner/src-tauri/src/mcp/ai_session.rs::routes()` as `/sessions/idle-status`) returns `[{task_run_id, holder_name, last_activity_ms, idle_ms}]` for every registered Claude Code session. The handler iterates `SessionManager::snapshot()` (returns `Vec<(task_run_id, holder_name, Arc<AtomicU64>)>` triples without holding the manager lock during reads), reads each session's `last_activity_tracker().load(Ordering::Relaxed)` atomic (epoch seconds, written by `last_activity_stdout.store(now, Ordering::Relaxed)` on every stdout line in `claude_session/session.rs`), converts to ms at the response boundary, and computes `idle_ms = now_ms.saturating_sub(last_activity_ms)` (saturating to 0 on future-skew). `holder_name` is cached on `ClaudeSession` at spawn from the same source as the file-lock dispatcher (`session_ctx.session_name` for workflow sessions, `session_id` as the terminal fallback) so the response joins by-name with `file-lock-*` events. POST `/file-locks/signal-long-wait` (registered alongside the yield routes in `mcp/file_registry.rs::routes()`) accepts `{file_path, holder_task_run_id, holder_name, estimated_remaining_ms?: number}` and returns `{signaled: true}`. It dual-emits `file-lock-long-wait-signaled` `{type, file_path, holder_task_run_id, holder_name, estimated_remaining_ms, signaled_at}` to the Tauri webview AND the broadcast channel, mirroring the yield-request shape. Frontend: `<Now1HzProvider>` (qontinui-runner/src/components/terminal/useNow1Hz.tsx) mounts at the runner-app root inside `<PromptExecutionProvider>` in `AppWithTutorials` and broadcasts `Date.now()` once per second via React context. Every consumer of `useNow1Hz()` subscribes to the shared interval; a private per-component fallback fires only when no provider is in the tree (test isolation). Pre-existing component-local 1Hz tickers in `HoldingLockBanner`, `WaitingLockBanner`, and `productivity/FileActivityPanel` were collapsed onto the singleton. Tab-icon tooltips use the native HTML `title` attribute — the next hover sees fresh text but the OS-rendered popup does NOT refresh its visible text while open; the banner-side seconds-tick (real JSX) ticks fully live. `formatSince(sinceMs, nowMs)` (helper in `TerminalTabBar.tsx`) takes both arguments explicitly — promoted from a single-arg `Date.now()`-internal variant to match the established `formatBannerSeconds` pattern. `useFileLockTracking`'s 10s `/file-locks/info` poll now runs in parallel with `/sessions/idle-status` via `Promise.allSettled`; the join indexes idle entries by `holder_name` (waiters know the holder's friendly name from `file-lock-waiting`'s `blocked_by`, not its task_run_id) and attaches `holderIdleMs: number | undefined` to each waiting `LockState`. Idle-fetch failure is silent — `holderIdleMs` stays undefined; the lock-info loop is unaffected. WaitingLockBanner renders an inline `(holder idle Xm)` suffix (subdued via `text-[#a9b1d6]/70`, `data-ui-bridge-id=\"terminal.waiting-lock-banner-holder-idle\"`) inside the headline when `holderIdleMs > HOLDER_IDLE_DISPLAY_THRESHOLD_MS` (60_000 — exported for tripwire tests). `file-lock-long-wait-signaled` is consumed by `useFileLockTracking`'s fourth listener: it routes the signal to every waiter tab whose `lockState.kind === 'waiting' && lockState.filePath === payload.file_path`, deduping per `(holder_task_run_id, file_path)` and clearing on `file-lock-released` (for the file) or `file-lock-acquired` (for that waiter tab). Waiting tabs whose `pendingLongWaitSignals[tab.id]` has entries render an advisory `\"<strong>B</strong> says they'll be a while.\"` line below the main headline, plus `(~Xm)` when the holder included an estimate. The HoldingLockBanner's `terminal.holding-lock-banner-signal-long-wait` button (previously disabled) is enabled and POSTs to the new endpoint on click; the button enters a 30s cooldown using `SIGNAL_LONG_WAIT_COOLDOWN_MS` (exported constant) with the same UX as the waiter's yield-request cooldown.",
+      "id": "term-heartbeat-idle-status",
+      "name": "Stuck-Session Heartbeat",
+      "source": "ai-generated"
     }
   ],
   "metadata": {
@@ -1460,6 +1514,30 @@
         "id": "term-commit-traffic-light",
         "isInitial": false,
         "name": "Per-Tab Commit Traffic Light",
+        "transitions": []
+      },
+      {
+        "description": "When two AI sessions contend on the same file, the holder and the waiter each see an in-tab banner driven by `<HoldingLockBanner>` (qontinui-runner/src/components/terminal/HoldingLockBanner.tsx) and `<WaitingLockBanner>` (qontinui-runner/src/components/terminal/WaitingLockBanner.tsx). The banners share placement: absolutely-positioned `top-2 right-2 z-30 w-[340px]` overlays inside the active tab's pane. They are gated to active AI tabs only (per `proj_holding_banner_pty_gate.md` — PTY tabs without `claudeSessionId` never render either banner). Banner mounting is driven by `useFileLockTracking` (qontinui-runner/src/components/terminal/useFileLockTracking.ts) exposing `lockStates: Record<tabId, LockState>` and `pendingYieldRequests: Record<holderTabId, IncomingYieldRequest[]>`. HoldingLockBanner shows above the active tab's pane when `lockState.kind === 'holding'` AND (`waiterCount > 0` OR pending yield requests exist for this tab). Its three buttons are `terminal.holding-lock-banner-yield` (calls POST `/file-locks/yield` to release this lock without ending the session), `terminal.holding-lock-banner-hold` (dismisses the banner locally until the next waiter event), and `terminal.holding-lock-banner-signal-long-wait` (Stuck-Session Heartbeat surface — see `term-heartbeat-idle-status`). WaitingLockBanner shows above the active tab's pane when `lockState.kind === 'waiting'` and exposes one primary action `terminal.waiting-lock-banner-request-yield` (POST `/file-locks/yield-request`). After click, the button enters a 30-second cooldown matching `REQUEST_YIELD_COOLDOWN_MS` (re-exported from `@/lib/lock-yield` for consumer tripwires) — local state, not server-tracked, reload resets it. Disabled state: when `blockerTaskRunId` is undefined the parent couldn't resolve the holder session by name, so there's nothing to route the request to and the button is disabled with a guidance tooltip. Backend wiring lives in `qontinui-runner/src-tauri/src/mcp/file_registry.rs::yield_lock` and `::request_yield` (registered in `routes()` at `/file-locks/yield` and `/file-locks/yield-request` POST). Both emit via the dual-emit pattern: `state.app_handle.emit(name, &payload)` for the Tauri webview AND `state.app_state.event_broadcast.send(payload)` for SSE/headless consumers, matching the dispatcher's wait emit at `claude_session/dispatcher.rs:436-441`. The yield endpoint emits `file-lock-released` (same shape used by session.rs, ai_session.rs, graphql/mutation.rs, task_runs.rs). The yield-request endpoint emits `file-lock-yield-requested` `{type, file_path, requester_task_run_id, requester_name, holder_task_run_id, requested_at}` which `useFileLockTracking`'s third listener routes to the holder's tab by matching `tab.claudeSessionId === payload.holder_task_run_id` (via `findTabByTaskRunId`). The pending-yield list is deduped by `(requesterTaskRunId, filePath)` so a holder doesn't see N entries from spam clicks. Entries clear automatically on `file-lock-released` for the matching `(holder_task_run_id, file_path)` pair. Banner-side 1Hz seconds-tick uses `useNow1Hz` (see `term-heartbeat-idle-status`).",
+        "elements": [
+          {
+            "dataUiBridgeId": "terminal.waiting-lock-banner"
+          }
+        ],
+        "id": "term-lock-yield-banners",
+        "isInitial": false,
+        "name": "Lock-Yield Protocol Banners",
+        "transitions": []
+      },
+      {
+        "description": "On top of the Lock-Yield Protocol surface, the terminal page exposes live idle telemetry so a waiter can tell whether the holder is busy or sitting in Ready, and the holder can broadcast 'I'll be a while' to current waiters. Backend: `GET /sessions/idle-status` (registered in `qontinui-runner/src-tauri/src/mcp/ai_session.rs::routes()` as `/sessions/idle-status`) returns `[{task_run_id, holder_name, last_activity_ms, idle_ms}]` for every registered Claude Code session. The handler iterates `SessionManager::snapshot()` (returns `Vec<(task_run_id, holder_name, Arc<AtomicU64>)>` triples without holding the manager lock during reads), reads each session's `last_activity_tracker().load(Ordering::Relaxed)` atomic (epoch seconds, written by `last_activity_stdout.store(now, Ordering::Relaxed)` on every stdout line in `claude_session/session.rs`), converts to ms at the response boundary, and computes `idle_ms = now_ms.saturating_sub(last_activity_ms)` (saturating to 0 on future-skew). `holder_name` is cached on `ClaudeSession` at spawn from the same source as the file-lock dispatcher (`session_ctx.session_name` for workflow sessions, `session_id` as the terminal fallback) so the response joins by-name with `file-lock-*` events. POST `/file-locks/signal-long-wait` (registered alongside the yield routes in `mcp/file_registry.rs::routes()`) accepts `{file_path, holder_task_run_id, holder_name, estimated_remaining_ms?: number}` and returns `{signaled: true}`. It dual-emits `file-lock-long-wait-signaled` `{type, file_path, holder_task_run_id, holder_name, estimated_remaining_ms, signaled_at}` to the Tauri webview AND the broadcast channel, mirroring the yield-request shape. Frontend: `<Now1HzProvider>` (qontinui-runner/src/components/terminal/useNow1Hz.tsx) mounts at the runner-app root inside `<PromptExecutionProvider>` in `AppWithTutorials` and broadcasts `Date.now()` once per second via React context. Every consumer of `useNow1Hz()` subscribes to the shared interval; a private per-component fallback fires only when no provider is in the tree (test isolation). Pre-existing component-local 1Hz tickers in `HoldingLockBanner`, `WaitingLockBanner`, and `productivity/FileActivityPanel` were collapsed onto the singleton. Tab-icon tooltips use the native HTML `title` attribute — the next hover sees fresh text but the OS-rendered popup does NOT refresh its visible text while open; the banner-side seconds-tick (real JSX) ticks fully live. `formatSince(sinceMs, nowMs)` (helper in `TerminalTabBar.tsx`) takes both arguments explicitly — promoted from a single-arg `Date.now()`-internal variant to match the established `formatBannerSeconds` pattern. `useFileLockTracking`'s 10s `/file-locks/info` poll now runs in parallel with `/sessions/idle-status` via `Promise.allSettled`; the join indexes idle entries by `holder_name` (waiters know the holder's friendly name from `file-lock-waiting`'s `blocked_by`, not its task_run_id) and attaches `holderIdleMs: number | undefined` to each waiting `LockState`. Idle-fetch failure is silent — `holderIdleMs` stays undefined; the lock-info loop is unaffected. WaitingLockBanner renders an inline `(holder idle Xm)` suffix (subdued via `text-[#a9b1d6]/70`, `data-ui-bridge-id=\"terminal.waiting-lock-banner-holder-idle\"`) inside the headline when `holderIdleMs > HOLDER_IDLE_DISPLAY_THRESHOLD_MS` (60_000 — exported for tripwire tests). `file-lock-long-wait-signaled` is consumed by `useFileLockTracking`'s fourth listener: it routes the signal to every waiter tab whose `lockState.kind === 'waiting' && lockState.filePath === payload.file_path`, deduping per `(holder_task_run_id, file_path)` and clearing on `file-lock-released` (for the file) or `file-lock-acquired` (for that waiter tab). Waiting tabs whose `pendingLongWaitSignals[tab.id]` has entries render an advisory `\"<strong>B</strong> says they'll be a while.\"` line below the main headline, plus `(~Xm)` when the holder included an estimate. The HoldingLockBanner's `terminal.holding-lock-banner-signal-long-wait` button (previously disabled) is enabled and POSTs to the new endpoint on click; the button enters a 30s cooldown using `SIGNAL_LONG_WAIT_COOLDOWN_MS` (exported constant) with the same UX as the waiter's yield-request cooldown.",
+        "elements": [
+          {
+            "dataUiBridgeId": "terminal.waiting-lock-banner-holder-idle"
+          }
+        ],
+        "id": "term-heartbeat-idle-status",
+        "isInitial": false,
+        "name": "Stuck-Session Heartbeat",
         "transitions": []
       }
     ]
