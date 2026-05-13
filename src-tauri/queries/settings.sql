@@ -36,3 +36,6 @@ ORDER BY updated_at DESC;
 
 --! delete_config
 DELETE FROM configs WHERE id = :id RETURNING id;
+
+--! count_settings
+SELECT COUNT(*)::bigint AS count FROM settings;
