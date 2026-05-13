@@ -83,7 +83,7 @@ async fn create_trigger(
         TriggerConfig::TicketSync { .. } => "ticket_sync",
     };
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now();
     let trigger = WorkflowTrigger {
         id: uuid::Uuid::new_v4().to_string(),
         name: request.name,
@@ -102,7 +102,7 @@ async fn create_trigger(
         last_triggered_at: None,
         last_execution_id: None,
         trigger_count: 0,
-        created_at: now.clone(),
+        created_at: now,
         updated_at: now,
     };
 
@@ -172,8 +172,13 @@ async fn update_trigger(
         };
         trigger.trigger_config = config;
     }
+    // PATCH semantics: providing workflow_id sets it; omitting leaves it
+    // unchanged. There is no way to clear workflow_id to NULL via this
+    // PATCH endpoint — supervision rows are created via the bootstrap
+    // path, not via the HTTP API, and existing trigger-spawn rows have
+    // no use-case for becoming "untargeted".
     if let Some(wf_id) = request.workflow_id {
-        trigger.workflow_id = wf_id;
+        trigger.workflow_id = Some(wf_id);
     }
     if let Some(overrides) = request.workflow_overrides {
         trigger.workflow_overrides = overrides;
@@ -197,7 +202,7 @@ async fn update_trigger(
         trigger.retry_delay_seconds = retry_delay_seconds;
     }
 
-    trigger.updated_at = chrono::Utc::now().to_rfc3339();
+    trigger.updated_at = chrono::Utc::now();
 
     match state.app_state.pg_db.update_trigger(&trigger).await {
         Ok(()) => {
@@ -330,16 +335,41 @@ async fn get_history(
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Json<ApiResponse<Vec<TriggerHistoryEntry>>> {
+    // Parse since/until at the HTTP boundary so the DB layer can bind
+    // them as native TIMESTAMPTZ values (no `::TIMESTAMPTZ` casts).
+    let since = match query
+        .since
+        .as_deref()
+        .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&chrono::Utc)))
+    {
+        Some(Ok(d)) => Some(d),
+        Some(Err(e)) => {
+            return Json(ApiResponse::error(format!(
+                "Invalid `since` (expected RFC3339): {}",
+                e
+            )));
+        }
+        None => None,
+    };
+    let until = match query
+        .until
+        .as_deref()
+        .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&chrono::Utc)))
+    {
+        Some(Ok(d)) => Some(d),
+        Some(Err(e)) => {
+            return Json(ApiResponse::error(format!(
+                "Invalid `until` (expected RFC3339): {}",
+                e
+            )));
+        }
+        None => None,
+    };
+
     match state
         .app_state
         .pg_db
-        .get_trigger_history_filtered(
-            &id,
-            query.limit,
-            query.action.as_deref(),
-            query.since.as_deref(),
-            query.until.as_deref(),
-        )
+        .get_trigger_history_filtered(&id, query.limit, query.action.as_deref(), since, until)
         .await
     {
         Ok(entries) => Json(ApiResponse::success(entries)),

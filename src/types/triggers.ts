@@ -75,7 +75,12 @@ export interface WorkflowTrigger {
   description?: string;
   trigger_type: string;
   trigger_config: TriggerConfig;
-  workflow_id: string;
+  /**
+   * Optional after Phase 5b: supervision-channel rows have no workflow
+   * target. The backend omits the field on the wire (skip_serializing_if)
+   * rather than emitting null, so this is `string | undefined`.
+   */
+  workflow_id?: string;
   workflow_overrides?: Record<string, unknown>;
   conditions: TriggerCondition[];
   debounce_ms: number;
@@ -114,7 +119,8 @@ export interface CreateTriggerRequest {
   name: string;
   description?: string;
   trigger_config: TriggerConfig;
-  workflow_id: string;
+  /** Optional after Phase 5b — omit for supervision-channel rows. */
+  workflow_id?: string;
   workflow_overrides?: Record<string, unknown>;
   conditions?: TriggerCondition[];
   debounce_ms?: number;

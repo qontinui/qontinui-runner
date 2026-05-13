@@ -371,7 +371,8 @@ mod tests {
                 payload_filter: None,
                 variable_mapping: HashMap::new(),
             },
-            workflow_id: "wf-1".to_string(),
+            // Evaluator tests don't exercise workflow execution.
+            workflow_id: None,
             workflow_overrides: None,
             conditions: vec![],
             debounce_ms,
@@ -383,8 +384,8 @@ mod tests {
             last_triggered_at: None,
             last_execution_id: None,
             trigger_count: 0,
-            created_at: String::new(),
-            updated_at: String::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         }
     }
 
