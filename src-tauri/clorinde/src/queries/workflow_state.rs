@@ -233,8 +233,8 @@ pub struct GetLatestStepProgressMarker {
     pub id: i64,
     pub checkpoint_id: String,
     pub marker_type: String,
-    pub current_value: i32,
-    pub total_value: i32,
+    pub current_value: i64,
+    pub total_value: i64,
     pub description: String,
     pub data_json: String,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
@@ -243,8 +243,8 @@ pub struct GetLatestStepProgressMarkerBorrowed<'a> {
     pub id: i64,
     pub checkpoint_id: &'a str,
     pub marker_type: &'a str,
-    pub current_value: i32,
-    pub total_value: i32,
+    pub current_value: i64,
+    pub total_value: i64,
     pub description: &'a str,
     pub data_json: &'a str,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
@@ -681,16 +681,16 @@ impl SaveWorkflowExecutionStateStmt {
     }
 }
 impl<
-        'c,
-        'a,
-        's,
-        C: GenericClient,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-    >
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+>
     crate::client::async_::Params<
         'c,
         'a,

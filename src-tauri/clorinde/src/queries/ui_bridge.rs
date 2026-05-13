@@ -71,6 +71,36 @@ pub struct GetAutomationRegressionsParams {
     pub since_epoch_ms: i64,
     pub max_results: i64,
 }
+#[derive(Debug)]
+pub struct InsertCausalEventParams<
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+    T9: crate::StringSql,
+    T10: crate::StringSql,
+> {
+    pub task_run_id: Option<i64>,
+    pub timestamp: i64,
+    pub sequence: i64,
+    pub event_type: T1,
+    pub element_id: Option<T2>,
+    pub state_id: Option<T3>,
+    pub transition_id: Option<T4>,
+    pub action: Option<T5>,
+    pub params: Option<T6>,
+    pub result: Option<T7>,
+    pub duration_ms: Option<f64>,
+    pub success: bool,
+    pub error_message: Option<T8>,
+    pub metadata: Option<T9>,
+    pub recording_session_id: Option<T10>,
+    pub caused_by_event_id: Option<i64>,
+}
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UiBridgeEventRow {
     pub id: i64,
@@ -464,6 +494,36 @@ impl<'a> From<GetUnannotatedHighInteractionElementsBorrowed<'a>>
             interaction_count,
             action_types,
             success_rate,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ListRecordingSessions {
+    pub recording_session_id: String,
+    pub event_count: i64,
+    pub started_at: i64,
+    pub ended_at: i64,
+}
+pub struct ListRecordingSessionsBorrowed<'a> {
+    pub recording_session_id: &'a str,
+    pub event_count: i64,
+    pub started_at: i64,
+    pub ended_at: i64,
+}
+impl<'a> From<ListRecordingSessionsBorrowed<'a>> for ListRecordingSessions {
+    fn from(
+        ListRecordingSessionsBorrowed {
+            recording_session_id,
+            event_count,
+            started_at,
+            ended_at,
+        }: ListRecordingSessionsBorrowed<'a>,
+    ) -> Self {
+        Self {
+            recording_session_id: recording_session_id.into(),
+            event_count,
+            started_at,
+            ended_at,
         }
     }
 }
@@ -1421,6 +1481,74 @@ where
         Ok(mapped)
     }
 }
+pub struct ListRecordingSessionsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor:
+        fn(&tokio_postgres::Row) -> Result<ListRecordingSessionsBorrowed, tokio_postgres::Error>,
+    mapper: fn(ListRecordingSessionsBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> ListRecordingSessionsQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(ListRecordingSessionsBorrowed) -> R,
+    ) -> ListRecordingSessionsQuery<'c, 'a, 's, C, R, N> {
+        ListRecordingSessionsQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
 pub struct InsertUiBridgeEventStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn insert_ui_bridge_event() -> InsertUiBridgeEventStmt {
     InsertUiBridgeEventStmt(
@@ -1494,20 +1622,20 @@ impl InsertUiBridgeEventStmt {
     }
 }
 impl<
-        'c,
-        'a,
-        's,
-        C: GenericClient,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
-        T9: crate::StringSql,
-    >
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+    T9: crate::StringSql,
+>
     crate::client::async_::Params<
         'c,
         'a,
@@ -1845,17 +1973,17 @@ impl InsertStallEventStmt {
     }
 }
 impl<
-        'c,
-        'a,
-        's,
-        C: GenericClient,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-    >
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+>
     crate::client::async_::Params<
         'c,
         'a,
@@ -2338,6 +2466,273 @@ impl GetUnannotatedHighInteractionElementsStmt {
                 })
             },
             mapper: |it| GetUnannotatedHighInteractionElements::from(it),
+        }
+    }
+}
+pub struct InsertCausalEventStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn insert_causal_event() -> InsertCausalEventStmt {
+    InsertCausalEventStmt(
+        "INSERT INTO ui_bridge_events (task_run_id, timestamp, sequence, event_type, element_id, state_id, transition_id, action, params, result, duration_ms, success, error_message, metadata, recording_session_id, caused_by_event_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id",
+        None,
+    )
+}
+impl InsertCausalEventStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<
+        'c,
+        'a,
+        's,
+        C: GenericClient,
+        T1: crate::StringSql,
+        T2: crate::StringSql,
+        T3: crate::StringSql,
+        T4: crate::StringSql,
+        T5: crate::StringSql,
+        T6: crate::StringSql,
+        T7: crate::StringSql,
+        T8: crate::StringSql,
+        T9: crate::StringSql,
+        T10: crate::StringSql,
+    >(
+        &'s self,
+        client: &'c C,
+        task_run_id: &'a Option<i64>,
+        timestamp: &'a i64,
+        sequence: &'a i64,
+        event_type: &'a T1,
+        element_id: &'a Option<T2>,
+        state_id: &'a Option<T3>,
+        transition_id: &'a Option<T4>,
+        action: &'a Option<T5>,
+        params: &'a Option<T6>,
+        result: &'a Option<T7>,
+        duration_ms: &'a Option<f64>,
+        success: &'a bool,
+        error_message: &'a Option<T8>,
+        metadata: &'a Option<T9>,
+        recording_session_id: &'a Option<T10>,
+        caused_by_event_id: &'a Option<i64>,
+    ) -> I64Query<'c, 'a, 's, C, i64, 16> {
+        I64Query {
+            client,
+            params: [
+                task_run_id,
+                timestamp,
+                sequence,
+                event_type,
+                element_id,
+                state_id,
+                transition_id,
+                action,
+                params,
+                result,
+                duration_ms,
+                success,
+                error_message,
+                metadata,
+                recording_session_id,
+                caused_by_event_id,
+            ],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |row| Ok(row.try_get(0)?),
+            mapper: |it| it,
+        }
+    }
+}
+impl<
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+    T9: crate::StringSql,
+    T10: crate::StringSql,
+>
+    crate::client::async_::Params<
+        'c,
+        'a,
+        's,
+        InsertCausalEventParams<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>,
+        I64Query<'c, 'a, 's, C, i64, 16>,
+        C,
+    > for InsertCausalEventStmt
+{
+    fn params(
+        &'s self,
+        client: &'c C,
+        params: &'a InsertCausalEventParams<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>,
+    ) -> I64Query<'c, 'a, 's, C, i64, 16> {
+        self.bind(
+            client,
+            &params.task_run_id,
+            &params.timestamp,
+            &params.sequence,
+            &params.event_type,
+            &params.element_id,
+            &params.state_id,
+            &params.transition_id,
+            &params.action,
+            &params.params,
+            &params.result,
+            &params.duration_ms,
+            &params.success,
+            &params.error_message,
+            &params.metadata,
+            &params.recording_session_id,
+            &params.caused_by_event_id,
+        )
+    }
+}
+pub struct ListRecordingSessionsStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn list_recording_sessions() -> ListRecordingSessionsStmt {
+    ListRecordingSessionsStmt(
+        "SELECT recording_session_id, COUNT(*)::bigint AS event_count, MIN(timestamp)::bigint AS started_at, MAX(timestamp)::bigint AS ended_at FROM ui_bridge_events WHERE recording_session_id IS NOT NULL GROUP BY recording_session_id ORDER BY MIN(timestamp) DESC LIMIT $1",
+        None,
+    )
+}
+impl ListRecordingSessionsStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
+        &'s self,
+        client: &'c C,
+        limit: &'a i64,
+    ) -> ListRecordingSessionsQuery<'c, 'a, 's, C, ListRecordingSessions, 1> {
+        ListRecordingSessionsQuery {
+            client,
+            params: [limit],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<ListRecordingSessionsBorrowed, tokio_postgres::Error> {
+                Ok(ListRecordingSessionsBorrowed {
+                    recording_session_id: row.try_get(0)?,
+                    event_count: row.try_get(1)?,
+                    started_at: row.try_get(2)?,
+                    ended_at: row.try_get(3)?,
+                })
+            },
+            mapper: |it| ListRecordingSessions::from(it),
+        }
+    }
+}
+pub struct GetRecordingSessionStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_recording_session() -> GetRecordingSessionStmt {
+    GetRecordingSessionStmt(
+        "SELECT id, task_run_id, timestamp, sequence, event_type, element_id, state_id, transition_id, action, params, result, duration_ms, success, error_message, metadata FROM ui_bridge_events WHERE recording_session_id = $1 ORDER BY sequence ASC",
+        None,
+    )
+}
+impl GetRecordingSessionStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        recording_session_id: &'a T1,
+    ) -> UiBridgeEventRowQuery<'c, 'a, 's, C, UiBridgeEventRow, 1> {
+        UiBridgeEventRowQuery {
+            client,
+            params: [recording_session_id],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<UiBridgeEventRowBorrowed, tokio_postgres::Error> {
+                Ok(UiBridgeEventRowBorrowed {
+                    id: row.try_get(0)?,
+                    task_run_id: row.try_get(1)?,
+                    timestamp: row.try_get(2)?,
+                    sequence: row.try_get(3)?,
+                    event_type: row.try_get(4)?,
+                    element_id: row.try_get(5)?,
+                    state_id: row.try_get(6)?,
+                    transition_id: row.try_get(7)?,
+                    action: row.try_get(8)?,
+                    params: row.try_get(9)?,
+                    result: row.try_get(10)?,
+                    duration_ms: row.try_get(11)?,
+                    success: row.try_get(12)?,
+                    error_message: row.try_get(13)?,
+                    metadata: row.try_get(14)?,
+                })
+            },
+            mapper: |it| UiBridgeEventRow::from(it),
+        }
+    }
+}
+pub struct GetCausalChainStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_causal_chain() -> GetCausalChainStmt {
+    GetCausalChainStmt(
+        "WITH RECURSIVE chain AS ( SELECT id, task_run_id, timestamp, sequence, event_type, element_id, state_id, transition_id, action, params, result, duration_ms, success, error_message, metadata, caused_by_event_id, 0 AS depth FROM ui_bridge_events WHERE id = $1 UNION ALL SELECT p.id, p.task_run_id, p.timestamp, p.sequence, p.event_type, p.element_id, p.state_id, p.transition_id, p.action, p.params, p.result, p.duration_ms, p.success, p.error_message, p.metadata, p.caused_by_event_id, c.depth + 1 FROM ui_bridge_events p JOIN chain c ON p.id = c.caused_by_event_id ) SELECT id, task_run_id, timestamp, sequence, event_type, element_id, state_id, transition_id, action, params, result, duration_ms, success, error_message, metadata FROM chain ORDER BY depth DESC",
+        None,
+    )
+}
+impl GetCausalChainStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
+        &'s self,
+        client: &'c C,
+        event_id: &'a i64,
+    ) -> UiBridgeEventRowQuery<'c, 'a, 's, C, UiBridgeEventRow, 1> {
+        UiBridgeEventRowQuery {
+            client,
+            params: [event_id],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<UiBridgeEventRowBorrowed, tokio_postgres::Error> {
+                Ok(UiBridgeEventRowBorrowed {
+                    id: row.try_get(0)?,
+                    task_run_id: row.try_get(1)?,
+                    timestamp: row.try_get(2)?,
+                    sequence: row.try_get(3)?,
+                    event_type: row.try_get(4)?,
+                    element_id: row.try_get(5)?,
+                    state_id: row.try_get(6)?,
+                    transition_id: row.try_get(7)?,
+                    action: row.try_get(8)?,
+                    params: row.try_get(9)?,
+                    result: row.try_get(10)?,
+                    duration_ms: row.try_get(11)?,
+                    success: row.try_get(12)?,
+                    error_message: row.try_get(13)?,
+                    metadata: row.try_get(14)?,
+                })
+            },
+            mapper: |it| UiBridgeEventRow::from(it),
         }
     }
 }
