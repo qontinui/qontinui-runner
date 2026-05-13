@@ -285,7 +285,12 @@ export function UIBridgeStateMachinePage() {
   // ======================================================================
   const selectedProvenance: StateProvenance | undefined = (() => {
     const raw = selectedState?.extra_metadata?.provenance;
-    if (raw === "observed" || raw === "ai-generated" || raw === "ai-fallback") {
+    if (
+      raw === "observed" ||
+      raw === "ai-generated" ||
+      raw === "ai-fallback" ||
+      raw === "git-supervised"
+    ) {
       return raw;
     }
     return undefined;
