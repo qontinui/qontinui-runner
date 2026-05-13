@@ -169,7 +169,13 @@ pub struct WorkflowTrigger {
     pub description: Option<String>,
     pub trigger_type: String,
     pub trigger_config: TriggerConfig,
-    pub workflow_id: String,
+    /// Target workflow for trigger-spawn rows. `None` for supervision-channel
+    /// rows (`SupervisionProposal` action), which are routed directly into
+    /// `git_supervision::handle_supervision_action` without ever loading a
+    /// workflow. The FK `workflow_triggers_workflow_id_fkey` still enforces
+    /// referential integrity for non-NULL values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
     /// Optional JSON overrides for the workflow (max_iterations, model, etc.)
     #[serde(default)]
     pub workflow_overrides: Option<serde_json::Value>,
@@ -192,12 +198,12 @@ pub struct WorkflowTrigger {
     #[serde(default = "default_retry_delay")]
     pub retry_delay_seconds: u64,
     pub enabled: bool,
-    pub last_triggered_at: Option<String>,
+    pub last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_execution_id: Option<String>,
     #[serde(default)]
     pub trigger_count: u64,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn default_debounce_ms() -> u64 {
@@ -262,7 +268,7 @@ pub struct TriggerHistoryEntry {
     pub task_run_id: Option<String>,
     /// Error message if something went wrong
     pub error_message: Option<String>,
-    pub triggered_at: String,
+    pub triggered_at: chrono::DateTime<chrono::Utc>,
 }
 
 // ============================================================================
@@ -276,7 +282,10 @@ pub struct CreateTriggerRequest {
     #[serde(default)]
     pub description: Option<String>,
     pub trigger_config: TriggerConfig,
-    pub workflow_id: String,
+    /// `None` for supervision-channel triggers (no workflow target);
+    /// `Some(id)` for trigger-spawn rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
     #[serde(default)]
     pub workflow_overrides: Option<serde_json::Value>,
     #[serde(default)]

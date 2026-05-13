@@ -26,7 +26,7 @@ impl PgDb {
                        debounce_ms, cooldown_seconds, max_concurrent,
                        retry_count, retry_delay_seconds,
                        enabled, last_triggered_at, last_execution_id,
-                       trigger_count, created_at::TEXT, updated_at::TEXT
+                       trigger_count, created_at, updated_at
                 FROM workflow_triggers
                 ORDER BY created_at DESC
                 "#,
@@ -57,7 +57,7 @@ impl PgDb {
                        debounce_ms, cooldown_seconds, max_concurrent,
                        retry_count, retry_delay_seconds,
                        enabled, last_triggered_at, last_execution_id,
-                       trigger_count, created_at::TEXT, updated_at::TEXT
+                       trigger_count, created_at, updated_at
                 FROM workflow_triggers WHERE id = $1
                 "#,
                 &[&id],
@@ -84,7 +84,7 @@ impl PgDb {
                        debounce_ms, cooldown_seconds, max_concurrent,
                        retry_count, retry_delay_seconds,
                        enabled, last_triggered_at, last_execution_id,
-                       trigger_count, created_at::TEXT, updated_at::TEXT
+                       trigger_count, created_at, updated_at
                 FROM workflow_triggers WHERE enabled = TRUE
                 "#,
                 &[],
@@ -131,7 +131,7 @@ impl PgDb {
              enabled, last_triggered_at, last_execution_id,
              trigger_count, created_at, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15::TIMESTAMPTZ, $16, $17, $18::TIMESTAMPTZ, $19::TIMESTAMPTZ)
+                    $15, $16, $17, $18, $19)
             "#,
             &[
                 &trigger.id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -191,7 +191,7 @@ impl PgDb {
                 workflow_id = $5, workflow_overrides = $6, conditions = $7,
                 debounce_ms = $8, cooldown_seconds = $9, max_concurrent = $10,
                 retry_count = $11, retry_delay_seconds = $12,
-                enabled = $13, updated_at = $14::TIMESTAMPTZ
+                enabled = $13, updated_at = $14
             WHERE id = $15
             "#,
             &[
@@ -241,10 +241,10 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now();
 
         conn.execute(
-            "UPDATE workflow_triggers SET enabled = $1, updated_at = $2::TIMESTAMPTZ WHERE id = $3",
+            "UPDATE workflow_triggers SET enabled = $1, updated_at = $2 WHERE id = $3",
             &[
                 &enabled as &(dyn tokio_postgres::types::ToSql + Sync),
                 &now as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -268,12 +268,12 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now();
 
         conn.execute(
             r#"UPDATE workflow_triggers SET
-               last_triggered_at = $1::TIMESTAMPTZ, last_execution_id = $2,
-               trigger_count = trigger_count + 1, updated_at = $1::TIMESTAMPTZ
+               last_triggered_at = $1, last_execution_id = $2,
+               trigger_count = trigger_count + 1, updated_at = $1
                WHERE id = $3"#,
             &[
                 &now as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -305,7 +305,7 @@ impl PgDb {
         conn.execute(
             r#"INSERT INTO trigger_history
                (id, trigger_id, event_type, event_data, action, task_run_id, error_message, triggered_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8::TIMESTAMPTZ)"#,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
             &[
                 &entry.id as &(dyn tokio_postgres::types::ToSql + Sync),
                 &entry.trigger_id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -324,13 +324,17 @@ impl PgDb {
     }
 
     /// Get trigger history entries with optional filtering.
+    ///
+    /// `since` / `until` are bound as `DateTime<Utc>` so they match the
+    /// `trigger_history.triggered_at` TIMESTAMPTZ column with zero casts.
+    /// Callers parse incoming RFC3339 strings before invoking.
     pub async fn get_trigger_history_filtered(
         &self,
         trigger_id: &str,
         limit: u32,
         action_filter: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<TriggerHistoryEntry>, String> {
         let conn = self
             .pool
@@ -340,22 +344,24 @@ impl PgDb {
 
         // Build dynamic WHERE clause with $N params
         let mut conditions = vec!["trigger_id = $1".to_string()];
-        let mut param_values: Vec<String> = vec![trigger_id.to_string()];
         let mut param_index = 2u32;
 
-        if let Some(action) = action_filter {
+        // Heterogeneous params: trigger_id is a &str, action is a String
+        // (owned for lifetime), since/until are DateTime<Utc>. We hold
+        // owned action separately so the borrow can live in `params`.
+        let trigger_id_owned = trigger_id.to_string();
+        let action_owned: Option<String> = action_filter.map(|s| s.to_string());
+
+        if action_owned.is_some() {
             conditions.push(format!("action = ${}", param_index));
-            param_values.push(action.to_string());
             param_index += 1;
         }
-        if let Some(since_val) = since {
+        if since.is_some() {
             conditions.push(format!("triggered_at >= ${}", param_index));
-            param_values.push(since_val.to_string());
             param_index += 1;
         }
-        if let Some(until_val) = until {
+        if until.is_some() {
             conditions.push(format!("triggered_at <= ${}", param_index));
-            param_values.push(until_val.to_string());
             param_index += 1;
         }
 
@@ -363,7 +369,7 @@ impl PgDb {
 
         let query = format!(
             r#"SELECT id, trigger_id, event_type, event_data, action,
-                      task_run_id, error_message, triggered_at::TEXT
+                      task_run_id, error_message, triggered_at
                FROM trigger_history
                WHERE {}
                ORDER BY triggered_at DESC
@@ -372,10 +378,16 @@ impl PgDb {
             param_index
         );
 
-        // Build params: all strings + the limit as i64
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
-        for v in &param_values {
-            params.push(v as &(dyn tokio_postgres::types::ToSql + Sync));
+        params.push(&trigger_id_owned as &(dyn tokio_postgres::types::ToSql + Sync));
+        if let Some(ref action) = action_owned {
+            params.push(action as &(dyn tokio_postgres::types::ToSql + Sync));
+        }
+        if let Some(ref since_dt) = since {
+            params.push(since_dt as &(dyn tokio_postgres::types::ToSql + Sync));
+        }
+        if let Some(ref until_dt) = until {
+            params.push(until_dt as &(dyn tokio_postgres::types::ToSql + Sync));
         }
         params.push(&limit_i64 as &(dyn tokio_postgres::types::ToSql + Sync));
 
@@ -474,5 +486,277 @@ impl PgDb {
             created_at: row.get(17),
             updated_at: row.get(18),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trigger_system::types::TriggerConfig;
+    use std::collections::HashMap;
+
+    /// Build a unique trigger id per test so concurrent test runs don't
+    /// collide on the same PG instance. Uses nanos-since-epoch + a thread
+    /// id — collision-free for any realistic test cadence.
+    fn unique_trigger_id(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!(
+            "test-trig-{}-{}-{:?}",
+            label,
+            nanos,
+            std::thread::current().id()
+        )
+    }
+
+    /// Build a baseline `WorkflowTrigger` with `last_triggered_at: None` —
+    /// the exact shape that triggered the original serialization bug.
+    fn make_baseline_trigger(id: String) -> WorkflowTrigger {
+        let now = chrono::Utc::now();
+        WorkflowTrigger {
+            id,
+            name: "regression-test-trigger".to_string(),
+            description: Some("regression test for serialization bug".to_string()),
+            trigger_type: "webhook".to_string(),
+            trigger_config: TriggerConfig::Webhook {
+                secret: None,
+                payload_filter: None,
+                variable_mapping: HashMap::new(),
+            },
+            // Tests exercise trigger CRUD; no workflow_id is set so we
+            // don't have to seed an `unified_workflows` row to satisfy
+            // the FK. Phase 5b made this column nullable.
+            workflow_id: None,
+            workflow_overrides: None,
+            conditions: Vec::new(),
+            debounce_ms: 1000,
+            cooldown_seconds: 60,
+            max_concurrent: 1,
+            retry_count: 0,
+            retry_delay_seconds: 30,
+            enabled: true,
+            last_triggered_at: None,
+            last_execution_id: None,
+            trigger_count: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Regression: prior bug serialized `Option<String>` to a TIMESTAMPTZ
+    /// slot and failed with `error serializing parameter 14`. This exact
+    /// shape (last_triggered_at = None) must now round-trip cleanly.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn create_then_get_round_trips_with_none_last_triggered() {
+        let db = PgDb::new_blocking_for_test();
+        let id = unique_trigger_id("create-get-none");
+        let trigger = make_baseline_trigger(id.clone());
+
+        db.create_trigger(&trigger)
+            .await
+            .expect("create_trigger should succeed with last_triggered_at: None");
+
+        let fetched = db
+            .get_trigger(&id)
+            .await
+            .expect("get_trigger pool/query ok")
+            .expect("trigger row must exist after create");
+
+        assert_eq!(fetched.id, trigger.id);
+        assert_eq!(fetched.name, trigger.name);
+        assert_eq!(fetched.description, trigger.description);
+        assert_eq!(fetched.trigger_type, trigger.trigger_type);
+        assert_eq!(fetched.workflow_id, trigger.workflow_id);
+        assert_eq!(fetched.debounce_ms, trigger.debounce_ms);
+        assert_eq!(fetched.cooldown_seconds, trigger.cooldown_seconds);
+        assert_eq!(fetched.max_concurrent, trigger.max_concurrent);
+        assert_eq!(fetched.retry_count, trigger.retry_count);
+        assert_eq!(fetched.retry_delay_seconds, trigger.retry_delay_seconds);
+        assert_eq!(fetched.enabled, trigger.enabled);
+        assert!(
+            fetched.last_triggered_at.is_none(),
+            "last_triggered_at must round-trip as None, got {:?}",
+            fetched.last_triggered_at
+        );
+        assert_eq!(fetched.trigger_count, 0);
+
+        // Cleanup
+        let _ = db.delete_trigger(&id).await;
+    }
+
+    /// `update_trigger` must persist a fresh `updated_at` value bound as
+    /// a TIMESTAMPTZ. Asserts the new timestamp advances past the original.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn update_round_trips_updated_at() {
+        let db = PgDb::new_blocking_for_test();
+        let id = unique_trigger_id("update-updated-at");
+        let trigger = make_baseline_trigger(id.clone());
+        let original_updated_at = trigger.updated_at;
+
+        db.create_trigger(&trigger).await.expect("create_trigger");
+
+        // Sleep so the new updated_at is strictly greater than the original.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let mut mutated = trigger.clone();
+        mutated.name = "regression-test-trigger-updated".to_string();
+        mutated.updated_at = chrono::Utc::now();
+
+        db.update_trigger(&mutated).await.expect("update_trigger");
+
+        let fetched = db
+            .get_trigger(&id)
+            .await
+            .expect("get_trigger pool/query ok")
+            .expect("trigger row must exist after update");
+
+        assert_eq!(fetched.name, "regression-test-trigger-updated");
+        assert!(
+            fetched.updated_at > original_updated_at,
+            "updated_at must advance after update: orig={:?} new={:?}",
+            original_updated_at,
+            fetched.updated_at
+        );
+
+        let _ = db.delete_trigger(&id).await;
+    }
+
+    /// `set_trigger_enabled` flips the `enabled` flag and bumps
+    /// `updated_at`. Exercises the post-rewrite UPDATE path that bound
+    /// `now: String` to `$2::TIMESTAMPTZ`.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn set_trigger_enabled_toggles_and_advances_updated_at() {
+        let db = PgDb::new_blocking_for_test();
+        let id = unique_trigger_id("set-enabled");
+        let trigger = make_baseline_trigger(id.clone());
+        let original_updated_at = trigger.updated_at;
+        assert!(trigger.enabled, "test precondition: starts enabled=true");
+
+        db.create_trigger(&trigger).await.expect("create_trigger");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        db.set_trigger_enabled(&id, false)
+            .await
+            .expect("set_trigger_enabled(false)");
+
+        let fetched = db
+            .get_trigger(&id)
+            .await
+            .expect("get_trigger pool/query ok")
+            .expect("trigger row must exist after toggle");
+
+        assert!(!fetched.enabled, "enabled flip must land");
+        assert!(
+            fetched.updated_at > original_updated_at,
+            "updated_at must advance after set_trigger_enabled: orig={:?} new={:?}",
+            original_updated_at,
+            fetched.updated_at
+        );
+
+        let _ = db.delete_trigger(&id).await;
+    }
+
+    /// `record_trigger_fired` stamps `last_triggered_at`, increments
+    /// `trigger_count`, and bumps `updated_at` — all in a single UPDATE.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn record_trigger_fired_increments_and_stamps() {
+        let db = PgDb::new_blocking_for_test();
+        let id = unique_trigger_id("record-fired");
+        let trigger = make_baseline_trigger(id.clone());
+        let original_updated_at = trigger.updated_at;
+
+        db.create_trigger(&trigger).await.expect("create_trigger");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        db.record_trigger_fired(&id, Some("exec-regression-1"))
+            .await
+            .expect("record_trigger_fired");
+
+        let fetched = db
+            .get_trigger(&id)
+            .await
+            .expect("get_trigger pool/query ok")
+            .expect("trigger row must exist after fire");
+
+        assert!(
+            fetched.last_triggered_at.is_some(),
+            "last_triggered_at must be set after record_trigger_fired"
+        );
+        assert_eq!(fetched.trigger_count, 1, "trigger_count must increment");
+        assert_eq!(
+            fetched.last_execution_id.as_deref(),
+            Some("exec-regression-1")
+        );
+        assert!(
+            fetched.updated_at > original_updated_at,
+            "updated_at must advance after record_trigger_fired: orig={:?} new={:?}",
+            original_updated_at,
+            fetched.updated_at
+        );
+
+        let _ = db.delete_trigger(&id).await;
+    }
+
+    /// `record_trigger_history` + `get_trigger_history_filtered` must
+    /// round-trip `triggered_at` as a `DateTime<Utc>` with no string
+    /// reparse step.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn record_then_get_history_round_trips_triggered_at() {
+        let db = PgDb::new_blocking_for_test();
+        let trigger_id = unique_trigger_id("hist-roundtrip");
+        let trigger = make_baseline_trigger(trigger_id.clone());
+
+        // Need a trigger row to satisfy any FK constraint on trigger_history.
+        db.create_trigger(&trigger).await.expect("create_trigger");
+
+        let entry_id = unique_trigger_id("hist-entry");
+        let triggered_at = chrono::Utc::now();
+        let entry = TriggerHistoryEntry {
+            id: entry_id.clone(),
+            trigger_id: trigger_id.clone(),
+            event_type: "test".to_string(),
+            event_data: serde_json::json!({"hello": "world"}),
+            action: "executed".to_string(),
+            task_run_id: Some("tr-1".to_string()),
+            error_message: None,
+            triggered_at,
+        };
+
+        db.record_trigger_history(&entry)
+            .await
+            .expect("record_trigger_history");
+
+        let history = db
+            .get_trigger_history_filtered(&trigger_id, 10, None, None, None)
+            .await
+            .expect("get_trigger_history_filtered");
+
+        let found = history
+            .iter()
+            .find(|h| h.id == entry_id)
+            .expect("history entry must round-trip back");
+
+        // Same wall-clock moment to microsecond precision — PG TIMESTAMPTZ
+        // truncates nanos to microseconds, so allow ≤1µs drift.
+        let drift = (found.triggered_at - triggered_at).num_microseconds();
+        assert!(
+            drift.map(|d| d.abs() <= 1).unwrap_or(false),
+            "triggered_at must round-trip with ≤1µs drift: orig={:?} fetched={:?}",
+            triggered_at,
+            found.triggered_at
+        );
+        assert_eq!(found.action, "executed");
+        assert_eq!(found.task_run_id.as_deref(), Some("tr-1"));
+
+        let _ = db.delete_trigger(&trigger_id).await;
     }
 }
