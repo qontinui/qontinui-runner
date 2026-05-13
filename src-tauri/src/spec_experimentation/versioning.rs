@@ -1,7 +1,6 @@
 //! Spec versioning — tracks spec changes over time with content hashing and diffs.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::database::pg::PgDb;
@@ -68,18 +67,6 @@ pub struct AssertionModification {
 
 // ── Core functions ────────────────────────────────────────────────────
 
-/// Compute SHA-256 content hash of spec JSON (normalized).
-fn compute_content_hash(spec_json: &str) -> String {
-    // Normalize by parsing and re-serializing to remove formatting differences
-    let normalized = match serde_json::from_str::<serde_json::Value>(spec_json) {
-        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| spec_json.to_string()),
-        Err(_) => spec_json.to_string(),
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
 /// Count assertions and groups in a spec JSON.
 fn count_spec_stats(spec_json: &str) -> (i64, i64) {
     let parsed: serde_json::Value = match serde_json::from_str(spec_json) {
@@ -121,7 +108,10 @@ pub async fn snapshot_spec_version(
     change_summary: Option<&str>,
     change_type: &str,
 ) -> Result<SpecVersion, String> {
-    let content_hash = compute_content_hash(spec_json);
+    let parsed: serde_json::Value = serde_json::from_str(spec_json)
+        .unwrap_or(serde_json::Value::Null);
+    let content_hash = crate::spec_api::hashing::canonical_hash(&parsed)
+        .map_err(|e| format!("hash failed: {e}"))?;
     let (assertion_count, group_count) = count_spec_stats(spec_json);
 
     // Check if latest version has same hash

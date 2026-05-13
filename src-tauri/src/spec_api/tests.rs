@@ -13,9 +13,9 @@ use serde_json::{json, Value};
 
 use super::projection::project_ir_to_bundled_page;
 use super::storage::{self, ReadWithinRootError};
-use super::types::IrDocument;
+use super::types::IrPageSpec;
 
-fn small_doc() -> IrDocument {
+fn small_doc() -> IrPageSpec {
     let raw = json!({
         "version": "1.0",
         "id": "active",

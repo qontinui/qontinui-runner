@@ -35,10 +35,11 @@ pub fn export_all_schemas() -> Value {
     use qontinui_types::{
         accessibility as qa, ai_workflows as qaw, app_events as qae, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn, geometry as qg,
-        mcp_config as qmc, orchestration_config as qoc, process_management as qpm, rag as qr,
-        runner as qrn, scheduler as qs, state_machine as qsm, targets as qt, task_run as qtr,
-        terminal as qtm, ticket_system as qts, tree_events as qte, ui_bridge as qub,
-        verification as qv, worker_output as qwo, workflow as qw, workflow_step as qws,
+        ir as qir, mcp_config as qmc, orchestration_config as qoc, process_management as qpm,
+        rag as qr, runner as qrn, scheduler as qs, spec_check as qsc, state_machine as qsm,
+        targets as qt, task_run as qtr, terminal as qtm, ticket_system as qts,
+        tree_events as qte, ui_bridge as qub, verification as qv, worker_output as qwo,
+        workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -205,6 +206,29 @@ pub fn export_all_schemas() -> Value {
     add!("MonitorPosition", qg::MonitorPosition);
     add!("Monitor", qg::Monitor);
     add!("VirtualDesktop", qg::VirtualDesktop);
+
+    // ── qontinui-types: ir (Spec API IR + Legacy wire types) ──
+    add!("IrPageSpec", qir::IrPageSpec);
+    add!("IrElementCriteria", qir::IrElementCriteria);
+    add!("IrProvenance", qir::IrProvenance);
+    add!("IrMetadata", qir::IrMetadata);
+    add!("IrCrossRef", qir::IrCrossRef);
+    add!("IrWaitSpec", qir::IrWaitSpec);
+    add!("IrTransitionAction", qir::IrTransitionAction);
+    add!("IrStateCondition", qir::IrStateCondition);
+    add!("IrState", qir::IrState);
+    add!("IrTransition", qir::IrTransition);
+    add!("IrAssertionTarget", qir::IrAssertionTarget);
+    add!("IrAssertion", qir::IrAssertion);
+    add!("IrGroup", qir::IrGroup);
+    add!("LegacyAssertionTarget", qir::LegacyAssertionTarget);
+    add!("LegacyAssertion", qir::LegacyAssertion);
+    add!("LegacyGroup", qir::LegacyGroup);
+    add!("LegacyProcessStep", qir::LegacyProcessStep);
+    add!("LegacyTransition", qir::LegacyTransition);
+    add!("LegacyStateMachineState", qir::LegacyStateMachineState);
+    add!("LegacyStateMachine", qir::LegacyStateMachine);
+    add!("LegacySpec", qir::LegacySpec);
 
     // ── qontinui-types: tree_events ──
     add!("NodeType", qte::NodeType);
@@ -615,6 +639,39 @@ pub fn export_all_schemas() -> Value {
     add!("TaskCompletionResult", qv::TaskCompletionResult);
     add!("StageTransition", qv::StageTransition);
 
+    // ── qontinui-types: spec_check (Plan 01 foundation) ──
+    // `Confidence` collides with `qv::Confidence` (registered above) so the
+    // spec-check variant is registered as `SpecCheckConfidence`. Downstream
+    // Rust consumers use `qontinui_types::spec_check::Confidence`
+    // directly; the generated TS / Python bindings emit
+    // `SpecCheckConfidence` as the type name.
+    // Step 1 — result + fingerprint + validation types (16)
+    add!("SpecCheckResult", qsc::SpecCheckResult);
+    add!("SpecCheckSummary", qsc::SpecCheckSummary);
+    add!("RecommendedState", qsc::RecommendedState);
+    add!("MatchOutcome", qsc::MatchOutcome);
+    add!("SpecCheckConfidence", qsc::Confidence);
+    add!("StateMatchResult", qsc::StateMatchResult);
+    add!("AssertionResult", qsc::AssertionResult);
+    add!("AssertionOutcome", qsc::AssertionOutcome);
+    add!("MatchedElement", qsc::MatchedElement);
+    add!("AssertionMiss", qsc::AssertionMiss);
+    add!("CandidateMiss", qsc::CandidateMiss);
+    add!("FieldDiff", qsc::FieldDiff);
+    add!("MissReason", qsc::MissReason);
+    add!("AssertionSeverityCounts", qsc::AssertionSeverityCounts);
+    add!("BridgeFingerprint", qsc::BridgeFingerprint);
+    add!("SpecValidation", qsc::SpecValidation);
+    // Step 2 — policy + step-config types (8)
+    add!("SpecCheckStepConfig", qsc::SpecCheckStepConfig);
+    add!("SpecCheckPolicy", qsc::SpecCheckPolicy);
+    add!("PolicyConjunct", qsc::PolicyConjunct);
+    add!("AssertionScope", qsc::AssertionScope);
+    add!("ConjunctRule", qsc::ConjunctRule);
+    add!("PolicyEvaluation", qsc::PolicyEvaluation);
+    add!("ConjunctEvaluation", qsc::ConjunctEvaluation);
+    add!("PolicyStatus", qsc::PolicyStatus);
+
     // ── qontinui-types: ui_bridge ──
     add!("ElementBbox", qub::ElementBbox);
     add!("ElementRect", qub::ElementRect);
@@ -694,7 +751,7 @@ mod tests {
             obj.contains_key("UiBridgeResponseEnvelope"),
             "Missing UiBridgeResponseEnvelope schema"
         );
-        assert_eq!(obj.len(), 431, "Expected 431 schema entries");
+        assert_eq!(obj.len(), 476, "Expected 476 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

@@ -4,7 +4,7 @@
 use serde_json::json;
 
 use crate::spec_api::types::{
-    IrDocument, IrElementCriteria, IrState, IrTransition, IrTransitionAction,
+    IrPageSpec, IrElementCriteria, IrState, IrTransition, IrTransitionAction,
 };
 
 use super::projection::project_scenarios;
@@ -67,8 +67,8 @@ fn empty_transition(
     }
 }
 
-fn make_ir() -> IrDocument {
-    IrDocument {
+fn make_ir() -> IrPageSpec {
+    IrPageSpec {
         version: "1.0".to_string(),
         id: "test-page".to_string(),
         name: "Test Page".to_string(),
@@ -212,7 +212,7 @@ fn project_scenarios_marks_deterministic_true() {
 
 #[test]
 fn project_scenarios_handles_empty_ir() {
-    let ir = IrDocument {
+    let ir = IrPageSpec {
         version: "1.0".to_string(),
         id: "empty".to_string(),
         name: "empty".to_string(),

@@ -665,7 +665,8 @@ fn build_cache_key(goal: &str, schema_hint: &serde_json::Value, output_preview: 
     let mut hasher = Sha256::new();
     hasher.update(goal.as_bytes());
     hasher.update(b"|");
-    hasher.update(canonical_json(schema_hint).as_bytes());
+    let canonical = serde_jcs::to_string(schema_hint).unwrap_or_default();
+    hasher.update(canonical.as_bytes());
     hasher.update(b"|");
     let preview_slice = if output_preview.len() > CACHE_KEY_PREVIEW_BYTES {
         // Slice at a char boundary to avoid panics on multi-byte preview
@@ -680,39 +681,6 @@ fn build_cache_key(goal: &str, schema_hint: &serde_json::Value, output_preview: 
     };
     hasher.update(preview_slice.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-/// Serialize a serde_json::Value with deterministic key ordering.
-fn canonical_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            let mut s = String::from("{");
-            for (i, (k, v)) in entries.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                s.push_str(&serde_json::to_string(k).unwrap_or_default());
-                s.push(':');
-                s.push_str(&canonical_json(v));
-            }
-            s.push('}');
-            s
-        }
-        serde_json::Value::Array(items) => {
-            let mut s = String::from("[");
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                s.push_str(&canonical_json(item));
-            }
-            s.push(']');
-            s
-        }
-        other => serde_json::to_string(other).unwrap_or_default(),
-    }
 }
 
 // ============================================================================
@@ -1383,16 +1351,6 @@ mod tests {
         let hit = lookup_cached(&key).expect("hit");
         assert_eq!(hit.expression, "output.slice(0, 10)");
         assert_eq!(hit.model_id, "claude-haiku-x");
-    }
-
-    #[test]
-    fn canonical_json_sorts_keys_recursively() {
-        let v = serde_json::json!({
-            "z": 1,
-            "a": { "y": 2, "b": 3 }
-        });
-        let s = canonical_json(&v);
-        assert_eq!(s, r#"{"a":{"b":3,"y":2},"z":1}"#);
     }
 
     #[test]

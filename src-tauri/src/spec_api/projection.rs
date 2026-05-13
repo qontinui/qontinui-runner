@@ -1,7 +1,7 @@
 //! Rust port of `projectIRToBundledPage`
 //! (`qontinui-schemas/ts/src/ui-bridge-ir/projection.ts`).
 //!
-//! Same intent: pure function from `IrDocument` (+ optional notes) to the
+//! Same intent: pure function from `IrPageSpec` (+ optional notes) to the
 //! legacy `*.spec.uibridge.json` shape. Same byte-stable output rule —
 //! object keys are sorted lexicographically at the final step, arrays
 //! preserve input order, no timestamps / random IDs.
@@ -12,7 +12,7 @@
 use serde_json::{json, Map, Value};
 
 use super::types::{
-    IrAssertion, IrDocument, IrElementCriteria, IrGroup, IrState, IrTransition, IrTransitionAction,
+    IrAssertion, IrPageSpec, IrElementCriteria, IrGroup, IrState, IrTransition, IrTransitionAction,
     LegacyAssertion, LegacyAssertionTarget, LegacyGroup, LegacyProcessStep, LegacySpec,
     LegacyStateMachine, LegacyStateMachineState, LegacyTransition,
 };
@@ -217,7 +217,7 @@ fn build_transition(transition: &IrTransition) -> LegacyTransition {
 fn build_state_machine_state(
     state: &IrState,
     transitions: &[IrTransition],
-    doc: &IrDocument,
+    doc: &IrPageSpec,
 ) -> LegacyStateMachineState {
     let outgoing: Vec<LegacyTransition> = transitions
         .iter()
@@ -247,7 +247,7 @@ fn build_state_machine_state(
 /// Pure / deterministic: same input always produces structurally identical
 /// output. The output is returned as a `serde_json::Value` so callers can
 /// rely on the lex-sorted key order applied at the final step.
-pub fn project_ir_to_bundled_page(doc: &IrDocument, notes: Option<&str>) -> Value {
+pub fn project_ir_to_bundled_page(doc: &IrPageSpec, notes: Option<&str>) -> Value {
     let base_description = doc.description.clone().unwrap_or_else(|| doc.name.clone());
     let description = match notes {
         Some(n) if !n.is_empty() => format!("{}\n\n{}", base_description, n),
@@ -302,7 +302,7 @@ pub fn project_ir_to_bundled_page(doc: &IrDocument, notes: Option<&str>) -> Valu
 /// Convenience: project + serialize to pretty JSON with 2-space indent and
 /// trailing newline (matches the Node CLI's output exactly so the two paths
 /// can be byte-diffed).
-pub fn project_to_pretty_json(doc: &IrDocument, notes: Option<&str>) -> String {
+pub fn project_to_pretty_json(doc: &IrPageSpec, notes: Option<&str>) -> String {
     let value = project_ir_to_bundled_page(doc, notes);
     let mut s = serde_json::to_string_pretty(&value).expect("Value must serialize");
     s.push('\n');

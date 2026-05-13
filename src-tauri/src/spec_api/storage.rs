@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use include_dir::{include_dir, Dir};
 
 use super::projection::project_to_pretty_json;
-use super::types::IrDocument;
+use super::types::IrPageSpec;
 
 /// Compile-time snapshot of `<runner>/specs/pages/`. Section 4 ships an
 /// offline-capable runner: production binaries serve specs from this embedded
@@ -123,19 +123,19 @@ pub fn list_pages(root: &Path) -> std::io::Result<Vec<String>> {
 /// Filesystem-first, embedded-second. The embedded snapshot
 /// (`EMBEDDED_PAGES`) only kicks in when the on-disk file is absent — dev
 /// hot-reload and `/update-spec` writes always win.
-pub fn read_ir(root: &Path, page_id: &str) -> Result<Option<IrDocument>, String> {
+pub fn read_ir(root: &Path, page_id: &str) -> Result<Option<IrPageSpec>, String> {
     let paths = PagePaths::for_page(root, page_id);
     if paths.ir_path.exists() {
         let data = fs::read_to_string(&paths.ir_path)
             .map_err(|e| format!("read {} failed: {}", paths.ir_path.display(), e))?;
-        let doc: IrDocument = serde_json::from_str(&data)
+        let doc: IrPageSpec = serde_json::from_str(&data)
             .map_err(|e| format!("parse {} failed: {}", paths.ir_path.display(), e))?;
         return Ok(Some(doc));
     }
     // Embedded fallback.
     let embedded_rel = format!("{}/state-machine.derived.json", page_id);
     if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-        let doc: IrDocument = serde_json::from_slice(file.contents())
+        let doc: IrPageSpec = serde_json::from_slice(file.contents())
             .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
         return Ok(Some(doc));
     }
@@ -223,7 +223,7 @@ fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// snapshot and cannot be mutated at runtime. After this call, subsequent
 /// `read_ir` / `read_projection` calls will resolve to the freshly-written
 /// file (filesystem wins over embedded).
-pub fn write_ir_and_regenerate(root: &Path, doc: &IrDocument) -> Result<PathBuf, String> {
+pub fn write_ir_and_regenerate(root: &Path, doc: &IrPageSpec) -> Result<PathBuf, String> {
     let paths = PagePaths::for_page(root, &doc.id);
     let ir_json =
         serde_json::to_string_pretty(doc).map_err(|e| format!("serialize IR failed: {}", e))?;
