@@ -849,6 +849,8 @@ mod tests {
             open_escalations: Vec::new(),
             session_touched_files: std::collections::HashMap::new(),
             recent_decisions: Vec::new(),
+            held_locks: std::collections::HashMap::new(),
+            heatmap: super::super::observe::HeatmapSnapshot::default(),
         }
     }
 
