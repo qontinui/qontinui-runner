@@ -361,11 +361,28 @@ fn parse_payload(output: &str) -> Result<Value, OneshotError> {
 /// This is the recommended default for one-shot calls when the user has
 /// either an Anthropic API key in the keychain or a Claude CLI OAuth token.
 /// Reference call template: `coordinator/llm_decide.rs:153-166`.
-pub struct OneshotClaudeApiWarm;
+pub struct OneshotClaudeApiWarm {
+    model_override: Option<&'static str>,
+    max_tokens_override: Option<u32>,
+}
 
 impl OneshotClaudeApiWarm {
     pub fn new() -> Self {
-        Self
+        Self {
+            model_override: None,
+            max_tokens_override: None,
+        }
+    }
+
+    /// Pin a specific model + max_tokens for this adapter, overriding the
+    /// values from `settings::get_ai_settings()`. Used by callers like the
+    /// path-extractor that need Haiku 4.5 for cache savings regardless of
+    /// the user's configured default.
+    pub fn with_overrides(model: &'static str, max_tokens: u32) -> Self {
+        Self {
+            model_override: Some(model),
+            max_tokens_override: Some(max_tokens),
+        }
     }
 }
 
@@ -394,6 +411,10 @@ impl OneshotLlm for OneshotClaudeApiWarm {
         let user = user_prompt.to_string();
         let schema_owned = schema.clone();
         let schema_name_owned = schema_name.to_string();
+        // Capture overrides into locals before the `move` closure so we don't
+        // borrow `self` across the `spawn_blocking` boundary.
+        let model_override = self.model_override;
+        let max_tokens_override = self.max_tokens_override;
 
         // run_claude_api_warm_with_structured_output uses reqwest::blocking,
         // so bounce off the tokio reactor.
@@ -402,10 +423,10 @@ impl OneshotLlm for OneshotClaudeApiWarm {
                 &system,
                 &user,
                 &claude_api_settings,
-                None,      // model_override — use settings default
-                None,      // doctor_handle
-                Some(0.0), // deterministic
-                None,      // max_tokens — use settings default
+                model_override, // pinned by with_overrides, else use settings default
+                None,           // doctor_handle
+                Some(0.0),      // deterministic
+                max_tokens_override, // pinned by with_overrides, else use settings default
                 &schema_owned,
                 &schema_name_owned,
             )

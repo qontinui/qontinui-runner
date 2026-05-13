@@ -28,7 +28,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use crate::ai_provider::claude_api_warm::{self, WARM_NO_CREDENTIAL_MARKER};
+use crate::ai_provider::{OneshotClaudeApiWarm, OneshotError, OneshotLlm};
 use crate::executor::file_registry::normalize_path;
 
 /// Substrings that, if present in a normalized path, disqualify it as a
@@ -130,8 +130,15 @@ pub async fn extract_paths_via_ai(
     prompt: &str,
     bundle: &AiContextBundle,
 ) -> Result<Vec<String>, ExtractError> {
-    let claude_api_settings = crate::settings::get_ai_settings().claude_api;
+    let provider = OneshotClaudeApiWarm::with_overrides(AI_EXTRACT_MODEL, AI_EXTRACT_MAX_TOKENS);
+    extract_paths_via_ai_inner(prompt, bundle, &provider).await
+}
 
+async fn extract_paths_via_ai_inner(
+    prompt: &str,
+    bundle: &AiContextBundle,
+    provider: &dyn OneshotLlm,
+) -> Result<Vec<String>, ExtractError> {
     let system_prefix = build_system_prefix();
     let user_message = build_user_message(prompt, bundle);
     let schema = ai_extract_schema();
@@ -147,27 +154,38 @@ pub async fn extract_paths_via_ai(
         user_message.len(),
     );
 
-    // The warm path uses `reqwest::blocking::Client`; bounce off the tokio
-    // reactor for the round-trip (reference: coordinator/llm_decide.rs:173).
-    let join_future = tauri::async_runtime::spawn_blocking(move || {
-        claude_api_warm::run_claude_api_warm_with_structured_output(
-            &system_prefix,
-            &user_message,
-            &claude_api_settings,
-            Some(AI_EXTRACT_MODEL),
-            None,      // no doctor handle — short synthetic call
-            Some(0.0), // deterministic
-            Some(AI_EXTRACT_MAX_TOKENS),
-            &schema,
-            AI_EXTRACT_SCHEMA_NAME,
-        )
-    });
+    let call_future = provider.call_json(
+        &system_prefix,
+        &user_message,
+        schema,
+        AI_EXTRACT_SCHEMA_NAME,
+    );
 
-    let response = match tokio::time::timeout(AI_EXTRACT_TIMEOUT, join_future).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(join_err)) => {
-            warn!("path_extraction.ai_join_error: {}", join_err);
-            return Err(ExtractError::Other(format!("spawn join: {}", join_err)));
+    let output_value = match tokio::time::timeout(AI_EXTRACT_TIMEOUT, call_future).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(OneshotError::NoCredentials)) => {
+            info!("path_extraction.ai_disabled reason=no_credentials");
+            return Err(ExtractError::Offline);
+        }
+        Ok(Err(OneshotError::Disabled)) => {
+            info!("path_extraction.ai_disabled reason=provider_disabled");
+            return Err(ExtractError::Offline);
+        }
+        Ok(Err(OneshotError::BudgetExhausted)) => {
+            info!("path_extraction.ai_rate_limited reason=budget");
+            return Err(ExtractError::RateLimited);
+        }
+        Ok(Err(OneshotError::ProviderTransport(msg))) => {
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("rate") && lower.contains("limit") {
+                info!("path_extraction.ai_rate_limited");
+                return Err(ExtractError::RateLimited);
+            }
+            warn!("path_extraction.ai_transport_error: {}", msg);
+            return Err(ExtractError::Offline);
+        }
+        Ok(Err(OneshotError::SchemaParse(msg))) => {
+            return Err(ExtractError::ParseFailure(msg));
         }
         Err(_elapsed) => {
             info!(
@@ -178,36 +196,15 @@ pub async fn extract_paths_via_ai(
         }
     };
 
-    if !response.success {
-        // The warm provider stuffs the credential marker into the `error`
-        // field (see `claude_api_warm.rs:385`); HTTP/transport errors land
-        // there too. Output is usually empty on failure but we check both
-        // to be defensive.
-        let error_str = response.error.as_deref().unwrap_or("");
-        let combined = format!("{}|{}", response.output, error_str);
-        let lower = combined.to_ascii_lowercase();
+    // `OneshotLlm::call_json` returns a parsed JSON `Value`. Serialize back
+    // to a string so the existing `parse_ai_paths_response(&str, &cwd)`
+    // post-processor (slash-normalize → cwd-resolve → blacklist → dedupe →
+    // cap) stays untouched. The downstream pipeline expects a stringy input
+    // and we don't want to dual-track string vs Value parsers.
+    let output = serde_json::to_string(&output_value)
+        .map_err(|e| ExtractError::ParseFailure(format!("re-serialize: {}", e)))?;
 
-        if combined.contains(WARM_NO_CREDENTIAL_MARKER) {
-            info!("path_extraction.ai_disabled reason=no_warm_credentials");
-            return Err(ExtractError::Offline);
-        }
-        if lower.contains("rate") && lower.contains("limit") {
-            info!("path_extraction.ai_rate_limited");
-            return Err(ExtractError::RateLimited);
-        }
-        warn!(
-            "path_extraction.ai_failed error={} output_len={}",
-            error_str,
-            response.output.len()
-        );
-        return Err(ExtractError::Other(if error_str.is_empty() {
-            response.output
-        } else {
-            error_str.to_string()
-        }));
-    }
-
-    let paths = parse_ai_paths_response(&response.output, &cwd)?;
+    let paths = parse_ai_paths_response(&output, &cwd)?;
     debug!(
         "path_extraction.ai_call_succeeded returned={} cwd_resolved={}",
         paths.len(),
@@ -1143,12 +1140,156 @@ mod tests {
         assert_eq!(paths, vec![normalize_path("src/main.rs")]);
     }
 
+    use crate::ai_provider::{OneshotError, OneshotLlm};
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    /// Test-only fake provider. Each call consumes the response by move
+    /// (`OneshotError` is `Debug` but not `Clone`); construct one fake per
+    /// test rather than reusing. Optional `delay` is applied before the
+    /// response, so a `with_delay(TIMEOUT+1s)` fake exercises the timeout
+    /// branch of `extract_paths_via_ai_inner`.
+    struct FakeOneshotLlm {
+        response: Mutex<Option<Result<Value, OneshotError>>>,
+        delay: Duration,
+    }
+
+    impl FakeOneshotLlm {
+        fn returning(response: Result<Value, OneshotError>) -> Self {
+            Self {
+                response: Mutex::new(Some(response)),
+                delay: Duration::from_millis(0),
+            }
+        }
+
+        fn with_delay(delay: Duration) -> Self {
+            Self {
+                response: Mutex::new(Some(Ok(serde_json::json!({"paths": []})))),
+                delay,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OneshotLlm for FakeOneshotLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn call_json(
+            &self,
+            _system_prompt: &str,
+            _user_prompt: &str,
+            _schema: Value,
+            _schema_name: &str,
+        ) -> Result<Value, OneshotError> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.response
+                .lock()
+                .expect("FakeOneshotLlm poisoned")
+                .take()
+                .expect("FakeOneshotLlm::call_json invoked twice — construct a fresh fake per test")
+        }
+    }
+
     #[tokio::test]
-    #[ignore = "requires injectable warm provider — extractor calls run_claude_api_warm_with_structured_output directly; mocking it would mean refactoring out a trait, which belongs to a follow-up plan. The 5s tokio::time::timeout in extract_paths_via_ai → ExtractError::Offline is exercised indirectly by the no-credentials path in test_extract_paths_via_ai_real_call."]
     async fn test_extract_paths_via_ai_timeout() {
-        // Intentionally empty body — see ignore message above. Kept as a
-        // documented placeholder so a future contributor adding a trait-based
-        // mock has a slot to fill in.
+        // Fake that sleeps past AI_EXTRACT_TIMEOUT. The plan called for
+        // `start_paused = true` to keep this <1ms wall-clock, but that
+        // attribute requires tokio's `test-util` feature which isn't
+        // enabled in this crate's Cargo.toml (tokio = features = ["full"]
+        // — `full` does NOT include `test-util`). To keep this PR scoped
+        // to the three planned source files, the test uses a real delay
+        // and pays the ~AI_EXTRACT_TIMEOUT wall-clock cost. A follow-up
+        // adding `tokio` to dev-dependencies with the `test-util` feature
+        // is the right way to speed this back up.
+        let fake = FakeOneshotLlm::with_delay(AI_EXTRACT_TIMEOUT + Duration::from_secs(1));
+        let bundle = AiContextBundle::default();
+        let result = extract_paths_via_ai_inner("anything", &bundle, &fake).await;
+        assert!(
+            matches!(result, Err(ExtractError::Offline)),
+            "expected Err(Offline), got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_credentials_maps_to_offline() {
+        let fake = FakeOneshotLlm::returning(Err(OneshotError::NoCredentials));
+        let result =
+            extract_paths_via_ai_inner("anything", &AiContextBundle::default(), &fake).await;
+        assert!(
+            matches!(result, Err(ExtractError::Offline)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disabled_maps_to_offline() {
+        let fake = FakeOneshotLlm::returning(Err(OneshotError::Disabled));
+        let result =
+            extract_paths_via_ai_inner("anything", &AiContextBundle::default(), &fake).await;
+        assert!(
+            matches!(result, Err(ExtractError::Offline)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_budget_exhausted_maps_to_rate_limited() {
+        let fake = FakeOneshotLlm::returning(Err(OneshotError::BudgetExhausted));
+        let result =
+            extract_paths_via_ai_inner("anything", &AiContextBundle::default(), &fake).await;
+        assert!(
+            matches!(result, Err(ExtractError::RateLimited)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transport_rate_limit_maps_to_rate_limited() {
+        let fake = FakeOneshotLlm::returning(Err(OneshotError::ProviderTransport(
+            "HTTP 429: rate limit exceeded".to_string(),
+        )));
+        let result =
+            extract_paths_via_ai_inner("anything", &AiContextBundle::default(), &fake).await;
+        assert!(
+            matches!(result, Err(ExtractError::RateLimited)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transport_generic_maps_to_offline() {
+        let fake = FakeOneshotLlm::returning(Err(OneshotError::ProviderTransport(
+            "connection refused".to_string(),
+        )));
+        let result =
+            extract_paths_via_ai_inner("anything", &AiContextBundle::default(), &fake).await;
+        assert!(
+            matches!(result, Err(ExtractError::Offline)),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schema_parse_maps_to_parse_failure() {
+        let fake = FakeOneshotLlm::returning(Err(OneshotError::SchemaParse(
+            "missing field `paths`".to_string(),
+        )));
+        let result =
+            extract_paths_via_ai_inner("anything", &AiContextBundle::default(), &fake).await;
+        match result {
+            Err(ExtractError::ParseFailure(msg)) => assert!(msg.contains("missing field")),
+            other => panic!("expected ParseFailure, got {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -1176,7 +1317,16 @@ mod tests {
                 );
             }
             Err(ExtractError::Offline) => {
-                // Acceptable: no credentials available in the test env.
+                // Acceptable ONLY when no credential was supplied. If
+                // ANTHROPIC_API_KEY is set in the env, an Offline result means the
+                // env-var fallback in resolve_warm_credential regressed — fail loud
+                // so the CI lane catches it instead of silently passing.
+                if std::env::var("ANTHROPIC_API_KEY")
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    panic!("Offline result despite ANTHROPIC_API_KEY being set — env-var fallback regression?");
+                }
             }
             Err(e) => panic!("unexpected extractor error: {:?}", e),
         }
