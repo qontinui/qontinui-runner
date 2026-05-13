@@ -1227,6 +1227,40 @@ pub async fn decompose_plan(
 }
 
 // ============================================================================
+// Backfill stuck tasks — coord-task-status-hygiene plan, Phase 3
+// ============================================================================
+//
+// One-shot cross-reference of non-terminal `coord.tasks` rows against
+// `git log` on `main` in the known qontinui ecosystem repos. Flags rows
+// whose `expected_file_claims` overlap commits as candidates and emits the
+// preview SQL. When `options.apply == true`, executes the UPDATEs inside a
+// single transaction. Dry-run by default.
+//
+// Companion to Phase 2 of the same plan (the github-merge listener that
+// catches FUTURE merges); this command addresses the EXISTING backlog.
+
+/// Walk non-terminal `coord.tasks` rows, look at each row's
+/// `expected_file_claims`, and ask `git log` whether any commit on `main`
+/// in the scanned repos touched those paths. Newest matching commit per
+/// task wins.
+///
+/// `options` defaults: scan the known qontinui ecosystem repos, look at
+/// commits since `2026-04-01`, **dry-run** (emit SQL only). Pass
+/// `apply=true` to execute the generated UPDATEs in one transaction.
+#[tauri::command]
+pub async fn backfill_completed_tasks_from_history(
+    app_handle: tauri::AppHandle,
+    options: Option<crate::productivity::backfill_tasks::BackfillOptions>,
+) -> Result<crate::productivity::backfill_tasks::BackfillResult, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let pg = app_state.pg_db.clone();
+    let opts = options.unwrap_or_default();
+    crate::productivity::backfill_tasks::run_backfill(&pg, opts)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ============================================================================
 // Auto-Review — Phase 4 (in-product replacement for /auto-review)
 // ============================================================================
 //

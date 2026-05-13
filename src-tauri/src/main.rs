@@ -1166,6 +1166,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::approve_recommendation,
             commands::productivity::archive_plan,
             commands::productivity::auto_review_task,
+            commands::productivity::backfill_completed_tasks_from_history,
             commands::productivity::check_path_claims,
             commands::productivity::decompose_plan,
             commands::productivity::get_coordinator_decisions,

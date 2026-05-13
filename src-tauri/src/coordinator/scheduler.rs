@@ -127,6 +127,24 @@ pub fn start_coordinator_scheduler(
             }
         }
 
+        // Self-heal the coord.tasks.identity_hash column + partial unique
+        // index for re-decompose idempotency (Phase 1 of
+        // coord-task-status-hygiene plan). Idempotent. Logs but doesn't
+        // fail the scheduler — when the column is missing, the
+        // /plans/decompose endpoint's 3-way-merge path will surface a
+        // clear error.
+        if let Err(e) = state
+            .app_state
+            .pg_db
+            .ensure_tasks_identity_hash_column()
+            .await
+        {
+            warn!(
+                "Coordinator scheduler: ensure_tasks_identity_hash_column failed: {} — re-decompose may fail until alembic upgrade",
+                e
+            );
+        }
+
         info!(
             "Coordinator (Rust) scheduler started: instance_id={} interval={}s rule_version={} max_llm_calls_per_hour={} auto_review_enabled={} shadow_mode_enabled={} initial_enabled={}",
             instance_id,

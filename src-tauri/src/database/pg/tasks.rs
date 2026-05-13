@@ -44,6 +44,16 @@ pub struct TaskRow {
 /// Input shape for `insert_task`. The DB allocates the `id`. `depends_on`
 /// must be the UUIDs of already-inserted prereq tasks (resolved by the
 /// caller — see `mcp::plans::POST /plans/decompose`).
+///
+/// `identity_hash` is the stable per-task identity used for
+/// re-decompose 3-way merge — `sha256(plan_id || '|' || phase_name ||
+/// '|' || sequence_in_phase || '|' || description)`, in hex. The runner
+/// computes it inside `mcp/plans.rs::decompose_plan` after the plan
+/// UPSERT (because we need the post-UPSERT plan_id). Callers that
+/// don't have a sensible hash to supply (synthetic-test inserts, ad-hoc
+/// fixtures) may pass an empty string — the DB column is nullable, but
+/// the field is intentionally `&str` rather than `Option<&str>` so the
+/// merge path in `decompose_plan` can't accidentally elide it.
 #[derive(Debug, Clone)]
 pub struct InsertTaskInput<'a> {
     pub plan_id: &'a str,
@@ -56,6 +66,7 @@ pub struct InsertTaskInput<'a> {
     pub depends_on: &'a [String],
     pub status: &'a str,
     pub notes: Option<&'a str>,
+    pub identity_hash: &'a str,
 }
 
 /// Statuses considered non-terminal — these tasks still belong in the
@@ -119,6 +130,15 @@ impl PgDb {
         // "error serializing parameter 0".
         let plan_uuid =
             Uuid::parse_str(input.plan_id).map_err(|e| format!("invalid plan_id uuid: {}", e))?;
+        // identity_hash column is nullable so historical inserts pre-dating
+        // the column can coexist; empty-string callers (test fixtures) get
+        // mapped to NULL here so the partial unique index on
+        // (plan_id, identity_hash) doesn't collide on the sentinel.
+        let identity_hash_opt: Option<&str> = if input.identity_hash.is_empty() {
+            None
+        } else {
+            Some(input.identity_hash)
+        };
         let row = conn
             .query_one(
                 &format!(
@@ -126,12 +146,12 @@ impl PgDb {
                     INSERT INTO coord.tasks (
                         plan_id, plan_version_hash, phase_name, sequence_in_phase,
                         description, expected_file_claims, expected_dirs,
-                        depends_on, status, notes
+                        depends_on, status, notes, identity_hash
                     )
                     VALUES (
                         $1::uuid, $2, $3, $4, $5, $6, $7,
                         (SELECT COALESCE(array_agg(d::uuid), '{{}}') FROM unnest($8::text[]) d),
-                        $9, $10
+                        $9, $10, $11
                     )
                     RETURNING {}
                     "#,
@@ -148,12 +168,43 @@ impl PgDb {
                     &depends_on_owned,
                     &input.status,
                     &input.notes,
+                    &identity_hash_opt,
                 ],
             )
             .await
             .map_err(|e| format!("Failed to insert task: {}", e))?;
 
         Ok(task_row_from_pg(&row))
+    }
+
+    /// Self-heal the `coord.tasks.identity_hash` column + the partial
+    /// unique index on PG instances where the
+    /// `coord_tasks_identity_hash` alembic migration hasn't been applied
+    /// yet. Idempotent. Mirrors the
+    /// `ensure_shadow_decisions_table` pattern at
+    /// `coordinator_shadow_decisions.rs:143`.
+    ///
+    /// Skips the UPDATE backfill that the alembic migration performs —
+    /// it's expensive on every boot; new column starts NULL and gets
+    /// populated on the next decompose-or-touch.
+    pub async fn ensure_tasks_identity_hash_column(&self) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        conn.batch_execute(
+            r#"
+            ALTER TABLE coord.tasks
+                ADD COLUMN IF NOT EXISTS identity_hash TEXT;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_plan_identity_hash
+                ON coord.tasks(plan_id, identity_hash)
+                WHERE identity_hash IS NOT NULL;
+            "#,
+        )
+        .await
+        .map_err(|e| format!("Failed to ensure tasks.identity_hash column: {}", e))
     }
 
     /// Look up the most-recent non-terminal task assigned to the given
@@ -590,6 +641,7 @@ mod tests {
                 depends_on: &[],
                 status: "pending",
                 notes: None,
+                identity_hash: "",
             })
             .await
             .expect("insert_task should round-trip plan_id uuid");

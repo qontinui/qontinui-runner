@@ -1528,6 +1528,7 @@ mod tests {
                 depends_on: &[],
                 status: "pending",
                 notes: None,
+                identity_hash: "",
             })
             .await
             .expect("insert A");
@@ -1543,6 +1544,7 @@ mod tests {
                 depends_on: &[],
                 status: "pending",
                 notes: None,
+                identity_hash: "",
             })
             .await
             .expect("insert B");
@@ -1558,6 +1560,7 @@ mod tests {
                 depends_on: &[],
                 status: "pending",
                 notes: None,
+                identity_hash: "",
             })
             .await
             .expect("insert C");
@@ -1637,6 +1640,7 @@ mod tests {
                     depends_on: &deps,
                     status: "pending",
                     notes: None,
+                    identity_hash: "",
                 })
                 .await
                 .expect("insert task")
