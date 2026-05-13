@@ -1,4 +1,7 @@
 --- Settings and config storage operations.
+--- (No-op comment edit to exercise the clorinde auto-regen CI gate
+--- against the post-#116 canonical baseline. Expected: clorinde-verify
+--- and schema-fresh-verify both pass with "no drift" trivially.)
 
 --! get_setting
 SELECT value FROM settings WHERE key = :key;
