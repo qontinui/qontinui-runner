@@ -1,4 +1,5 @@
 --- Activity Timeline CRUD and search operations (screenpipe-inspired capture history).
+--- (smoke-test for clorinde auto-regen workflow happy path — PR #116 acceptance criterion #4)
 
 --- Row types with nullable field annotations (? suffix = Option<T> in Rust).
 --: SearchTimelineRow(app_name?, window_title?, url?, screenshot_path?, element_count?, confidence?)
