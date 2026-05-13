@@ -207,6 +207,129 @@ impl PgDb {
         .map_err(|e| format!("Failed to ensure tasks.identity_hash column: {}", e))
     }
 
+    /// Self-heal the `coord.tasks` schema additions required by the
+    /// "Coord as Deconflicter, not Dispatcher" Phase 1 plan
+    /// (§4.2 of `plans/2026-05-13-coord-as-deconflicter-plan.md`).
+    /// Mirrors the same idempotent pattern as
+    /// [`Self::ensure_tasks_identity_hash_column`].
+    ///
+    /// Adds:
+    ///   - `origin TEXT NOT NULL DEFAULT 'plan_seeded'` + a
+    ///     `coord_tasks_origin_chk` CHECK constraint restricting it to
+    ///     `('plan_seeded', 'session_emergent', 'manual')`.
+    ///   - `DROP NOT NULL` on the per-row identity columns that
+    ///     `session_emergent` rows have no value for (`plan_id`,
+    ///     `plan_version_hash`, `phase_name`, `sequence_in_phase`,
+    ///     `description`). Columns that already have `'{}'` defaults
+    ///     (`expected_file_claims`, `expected_dirs`, `depends_on`) are left
+    ///     NOT NULL.
+    ///   - A partial unique index
+    ///     `idx_tasks_emergent_per_session` so the `create_emergent_task`
+    ///     INSERT can use `ON CONFLICT (assigned_session_id) WHERE
+    ///     origin = 'session_emergent' DO NOTHING` for idempotent
+    ///     re-registration.
+    ///   - A partial index `idx_tasks_assigned_session_open` to speed up
+    ///     the deconflicter's "who else is editing this file" lookup.
+    ///   - A composite index `idx_session_touched_files_file_recorded` on
+    ///     `coord.session_touched_files` for the same query. NOTE: the
+    ///     index has no partial-`now()` predicate — partial-index
+    ///     predicates must be IMMUTABLE and `now()` is STABLE, so PG
+    ///     rejects it. The query's `WHERE recorded_at > now() - interval
+    ///     '15 minutes'` predicate uses the full composite just as well.
+    ///
+    /// `CREATE INDEX CONCURRENTLY` is not used because `batch_execute`
+    /// wraps the statements in an implicit transaction. Brief contention
+    /// at boot is acceptable per §4.2's risk table.
+    pub async fn ensure_coord_tasks_emergent_columns(&self) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        conn.batch_execute(
+            r#"
+            ALTER TABLE coord.tasks
+                ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'plan_seeded';
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'coord_tasks_origin_chk'
+                ) THEN
+                    ALTER TABLE coord.tasks
+                        ADD CONSTRAINT coord_tasks_origin_chk
+                        CHECK (origin IN ('plan_seeded', 'session_emergent', 'manual'));
+                END IF;
+            END $$;
+            ALTER TABLE coord.tasks ALTER COLUMN plan_id DROP NOT NULL;
+            ALTER TABLE coord.tasks ALTER COLUMN plan_version_hash DROP NOT NULL;
+            ALTER TABLE coord.tasks ALTER COLUMN phase_name DROP NOT NULL;
+            ALTER TABLE coord.tasks ALTER COLUMN sequence_in_phase DROP NOT NULL;
+            ALTER TABLE coord.tasks ALTER COLUMN description DROP NOT NULL;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_emergent_per_session
+                ON coord.tasks (assigned_session_id)
+                WHERE origin = 'session_emergent' AND assigned_session_id IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_assigned_session_open
+                ON coord.tasks (assigned_session_id, status)
+                WHERE status IN ('in_progress', 'assigned', 'running');
+
+            CREATE INDEX IF NOT EXISTS idx_session_touched_files_file_recorded
+                ON coord.session_touched_files (file_path, recorded_at DESC);
+            "#,
+        )
+        .await
+        .map_err(|e| format!("Failed to ensure coord.tasks emergent columns: {}", e))
+    }
+
+    /// Insert a `session_emergent` row in `coord.tasks` for an AI session
+    /// that didn't come from a plan decomposition. Idempotent via the
+    /// partial unique index `idx_tasks_emergent_per_session` (added in
+    /// [`Self::ensure_coord_tasks_emergent_columns`]); a second call for
+    /// the same `assigned_session_id` returns `Ok(None)`.
+    ///
+    /// `assigned_session_id` is typically the worker's `task_run_id`
+    /// (workers) or the Claude session id (launch-menu AI sessions).
+    /// `description` is intentionally `Option<&str>` — Phase 1 leaves it
+    /// `None`; Phase 2 will enrich.
+    ///
+    /// Returns `Ok(Some(id))` on a fresh insert, `Ok(None)` on a conflict
+    /// (existing emergent row), or `Err(_)` on a PG error. Callers are
+    /// expected to treat this as best-effort: never fail an AI-session
+    /// spawn just because PG was unreachable.
+    pub async fn create_emergent_task(
+        &self,
+        assigned_session_id: &str,
+        status: &str,
+        origin: &str,
+        description: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                r#"
+                INSERT INTO coord.tasks (
+                    assigned_session_id, status, origin, plan_id,
+                    plan_version_hash, phase_name, sequence_in_phase, description
+                )
+                VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4)
+                ON CONFLICT (assigned_session_id) WHERE origin = 'session_emergent' DO NOTHING
+                RETURNING id::text
+                "#,
+                &[&assigned_session_id, &status, &origin, &description],
+            )
+            .await
+            .map_err(|e| format!("Failed to create emergent task: {}", e))?;
+
+        Ok(row.map(|r| r.get(0)))
+    }
+
     /// Look up the most-recent non-terminal task assigned to the given
     /// session id. `assigned_session_id` is a `text` column (workers use
     /// UUID v4 strings, but the column type itself is text — no

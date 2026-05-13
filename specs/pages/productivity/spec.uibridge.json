@@ -1253,10 +1253,39 @@
         }
       ],
       "category": "element-presence",
-      "description": "The Decision log panel queries getCoordinatorDecisions(limit=200, {rule, action}) and renders rows sorted by createdAt descending. The rule-filter select (data-ui-bridge-id productivity.coord-decision-log-rule-filter) offers options 'all' (value=''), A, B, C, D, E, LLM, idle. The action-filter select (data-ui-bridge-id productivity.coord-decision-log-action-filter) offers options 'all' plus the 11 CoordinatorActionName values: assign-task, pause-session, merge-task, reassign-needs-fix, escalate, advise-with-text, escalate-with-text, kill-session, force-promote-to-worktree, cancel-task, idle-no-action. Changing either filter triggers a reload and re-renders rows. Each row shows action (color-keyed by autoActed), rule, iteration, time, optional targetId, and full reasoning.",
+      "description": "The Decision log panel queries getCoordinatorDecisions(limit=200, {rule, action}) and renders rows sorted by createdAt descending. Three independent filters are offered. (1) Rule-filter select (data-ui-bridge-id `productivity.coord-decision-log-rule-filter`): options `all` (value=''), A, B, C, D, E, LLM, idle, plus `deconflict` (set by rows emitted by the Rust deconflicter loop in coordinator/deconflicter.rs). (2) Action-filter select (data-ui-bridge-id `productivity.coord-decision-log-action-filter`): options `all` plus the 11 CoordinatorActionName values: assign-task, pause-session, merge-task, reassign-needs-fix, escalate, advise-with-text, escalate-with-text, kill-session, force-promote-to-worktree, cancel-task, idle-no-action. (3) Source-filter chip group (data-ui-bridge-id `productivity.decision-source-filter`): three button chips with `data-source-filter-key` of `all`, `ai`, `deconflicter`. `all` (default-pressed) returns every row. `ai` keeps rows whose `sessionId` does NOT start with the literal `deconflicter-` prefix (i.e., the AI Coordinator PTY skill's rule-A-through-E and LLM fires). `deconflicter` keeps rows whose `sessionId` starts with `deconflicter-` (currently only the Rust loop's reserved `deconflicter-rust`). The source filter is purely client-side over the existing `getCoordinatorDecisions` payload — no extra HTTP call — and is independent of the rule/action selects (intersected with them). Active chip carries `aria-pressed=\"true\"`; chips are styled with the existing bg-muted/border-border palette. Changing any of the three filters re-renders rows. Each row shows action (color-keyed by autoActed), rule, iteration, time, optional targetId, and full reasoning.",
       "id": "productivity-decision-log-filters",
       "name": "Decision Log — Filters & Row Cap",
       "source": "migrated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Required element 0 for state Coordinator Lease Status Pill",
+          "enabled": true,
+          "id": "productivity-lease-status-pill-elem-0",
+          "precondition": "Coordinator sub-tab is active on the Productivity tab (`productivity.view-tab-coordinator` selected).",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataAttributes": {
+                "ui-bridge-id": "productivity.lease-status-pill"
+              }
+            },
+            "label": "Required element for Coordinator Lease Status Pill",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Coordinator sub-tab renders a single-line lease-status pill (data-ui-bridge-id `productivity.lease-status-pill`) reflecting the `coord.coordinator_leader` row state for the AI Coordinator PTY skill (the user-driven, expensive coordinator). Three derived states render different text + `data-lease-status` attribute values: (a) `active` — pill renders \"AI Coordinator: running (<short-instance-id>, <relative-age>)\" with `data-lease-status=\"active\"` and emerald styling, lease row exists and `leased_until > NOW()`; (b) `stale` — pill renders \"AI Coordinator: stale lease (last heartbeat <age> ago)\" with `data-lease-status=\"stale\"` and amber styling, lease row exists but `leased_until <= NOW()` (renewal timer skipped or the PTY died without releasing); (c) vacant — pill renders \"AI Coordinator: vacant\" with `data-lease-status=\"vacant\"` and neutral styling, no lease row found. The label uses \"AI Coordinator\" (not bare \"Coordinator\") to distinguish from the Rust deconflicter loop which writes its own decisions and has no lease pill (intentional per §5.3 — the deconflicter is invisible at the lease-pill surface; its activity is visible only through the Source filter chip in the decision-log panel, see `productivity-decision-log-filters`). The pill is read-only — the Launch / Stop coordinator buttons live in a sibling header row (`productivity.launch-coordinator`, `productivity.stop-coordinator`, `productivity.launch-coordinator-claude-skill`). Renderer: CoordinatorLeaseStatusPill function in CoordinatorDashboard.tsx; data source is the `currentLeader()` query joined with a NOW() comparison in the dashboard's loadLeaderState path.",
+      "id": "productivity-lease-status-pill",
+      "name": "Coordinator Lease Status Pill",
+      "source": "ai-generated"
     },
     {
       "assertions": [

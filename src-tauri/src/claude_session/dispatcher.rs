@@ -510,6 +510,28 @@ fn auto_register_file(
                 }
             });
 
+            // Broadcast the touch to the Rust deconflicter loop
+            // (§4.1 of plans/2026-05-13-coord-as-deconflicter-plan.md).
+            // `.send` returns `Err` only when there are no receivers,
+            // which is fine — the deconflicter is a soft advisor and
+            // missed touches degrade gracefully. The send is non-blocking
+            // (broadcast channel) so it can run right here without
+            // spawning. Sent AFTER the record_file_touched spawn above
+            // so the deconflicter's SQL query (which reads
+            // `coord.session_touched_files`) is racing the same writer
+            // it depends on — but the dedup window plus the 15-minute
+            // recent-touch lookback make the order non-load-bearing:
+            // a brand-new path will simply have one row when the
+            // deconflicter peeks (this session's row), find no
+            // *other* recent toucher, and stay silent. A second
+            // session editing the same path later sees both rows.
+            let _ = app_state
+                .touch_events_tx
+                .send(crate::coordinator::deconflicter::TouchEvent {
+                    task_run_id: task_run_id.clone(),
+                    file_path: file_path.clone(),
+                });
+
             // Productivity-stack §3 wiring: after the active registry is
             // updated, peek the in-memory UpcomingFileRegistry for any
             // *future* claims on this path. If the claimer's owning task

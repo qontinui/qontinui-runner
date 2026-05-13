@@ -386,7 +386,26 @@ pub async fn create_ai_session(
     })
     .await;
 
-    // 3. Return result
+    // 3. Best-effort emergent-task row so the deconflicter/banner have
+    // somewhere to attach. Runs in the outer async context (PG access is
+    // not available inside spawn_blocking without a runtime hop) and never
+    // blocks the response — a failure here just means no advisory banner
+    // for this session, not a broken AI session. See coord-as-deconflicter
+    // plan §4.3.
+    if let Ok(Ok(())) = &spawn_result {
+        if let Err(e) = app_state
+            .pg_db()
+            .create_emergent_task(&task_run_id, "in_progress", "session_emergent", None)
+            .await
+        {
+            warn!(
+                "create_ai_session: create_emergent_task failed for {}: {}",
+                task_run_id, e
+            );
+        }
+    }
+
+    // 4. Return result
     match spawn_result {
         Ok(Ok(())) => Ok(CommandResponse {
             success: true,
@@ -1328,6 +1347,22 @@ pub async fn resume_ai_sessions(
             Ok(())
         })
         .await;
+
+        // Best-effort emergent-task row for the resumed session (deconflicter
+        // attaches to the assigned_session_id). Identical pattern to
+        // create_ai_session above; the partial unique index makes it a no-op
+        // if a row already exists from a prior boot. See plan §4.3.
+        if let Ok(Ok(())) = &spawn_result {
+            if let Err(e) = pg
+                .create_emergent_task(&task_run_id, "in_progress", "session_emergent", None)
+                .await
+            {
+                warn!(
+                    "AI session resume: create_emergent_task failed for {}: {}",
+                    task_run_id, e
+                );
+            }
+        }
 
         match spawn_result {
             Ok(Ok(())) => {

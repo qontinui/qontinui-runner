@@ -58,7 +58,20 @@ pub(crate) fn action_name(action: &CoordinatorAction) -> &'static str {
 /// user-fire actions even when `must_advise_only` is true (because the
 /// HTTP POST itself IS the user-confirmed escalation). See
 /// `is_user_fire_only_action` for the carve-out predicate.
-pub(crate) fn must_advise_only(action: &CoordinatorAction) -> bool {
+///
+/// Per coord-as-deconflicter plan §4.6, sessions whose `session_id` starts
+/// with `"deconflicter-"` are restricted to `AdviseWithText` only — any
+/// other action is gated (returns `true`) so the HTTP layer can reject it
+/// with `403 FORBIDDEN`. For the deconflicter's own `AdviseWithText` the
+/// function returns `false` so the audit row reads as auto-acted (advise IS
+/// the primary action for the deconflicter, not an escalation).
+pub(crate) fn must_advise_only(session_id: &str, action: &CoordinatorAction) -> bool {
+    // Deconflicter sessions (Rust-driven, §4.6 of coord-as-deconflicter plan)
+    // are restricted to AdviseWithText only — any other action returned true
+    // here is rejected at the HTTP layer with 403.
+    if session_id.starts_with("deconflicter-") {
+        return !matches!(action, CoordinatorAction::AdviseWithText { .. });
+    }
     matches!(
         action,
         CoordinatorAction::KillSession { .. }
@@ -1261,5 +1274,38 @@ mod tests {
             condensed_indices.is_empty(),
             "cache hit should produce no new condensed_bodies entries"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // coord-as-deconflicter plan §4.6: per-session_id narrowing of
+    // `must_advise_only` so deconflicter sessions are restricted to
+    // AdviseWithText only.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn deconflicter_session_restricted_to_advise() {
+        let advise = CoordinatorAction::AdviseWithText {
+            target_id: Some("t".into()),
+            reasoning: "test".into(),
+        };
+        let assign = CoordinatorAction::AssignTask {
+            task_id: "t".into(),
+            session_id: "s".into(),
+            reasoning: None,
+        };
+
+        // Deconflicter: advise is the primary action (NOT advise-only),
+        // anything else is gated.
+        assert!(!must_advise_only("deconflicter-rust", &advise));
+        assert!(must_advise_only("deconflicter-rust", &assign));
+
+        // Regular session: existing destructive-set behavior unchanged.
+        assert!(!must_advise_only("worker-abc", &advise));
+        assert!(!must_advise_only("worker-abc", &assign));
+        let kill = CoordinatorAction::KillSession {
+            session_id: "s".into(),
+            reasoning: "test".into(),
+        };
+        assert!(must_advise_only("worker-abc", &kill));
     }
 }

@@ -319,6 +319,14 @@ pub struct AppState {
     /// sessions trying to edit the same file block until the lock is released.
     /// This prevents concurrent edits deterministically (no AI judgment needed).
     pub file_lock_manager: Arc<FileLockManager>,
+    /// Best-effort broadcast sender for the Rust deconflicter loop
+    /// (§4.1 of plans/2026-05-13-coord-as-deconflicter-plan.md). Fires
+    /// every time `claude_session::dispatcher::auto_register_file`
+    /// UPSERTs a row into `coord.session_touched_files`. Drop-on-no-
+    /// receiver is fine — the deconflicter is a soft advisor and missed
+    /// touches degrade gracefully (the next touch on the same path
+    /// re-triggers).
+    pub touch_events_tx: broadcast::Sender<crate::coordinator::deconflicter::TouchEvent>,
     /// Tracks consecutive UI Bridge failures per URL.
     /// After 3+ consecutive failures to the same URL, triggers an AI diagnostic.
     pub ui_bridge_failure_tracker: UiBridgeFailureTracker,

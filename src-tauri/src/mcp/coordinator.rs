@@ -314,8 +314,23 @@ async fn coordinator_act(
         return Err((StatusCode::BAD_REQUEST, "rule is required".to_string()));
     }
 
+    // Coord-as-deconflicter plan §4.6: deconflicter sessions are restricted
+    // to advisory actions at the HTTP layer. The Rust deconflicter only
+    // emits `AdviseWithText` by construction, but the wall protects against
+    // a future bug or config that hands the deconflicter id to a richer
+    // code path. Reject non-advisory actions with 403 BEFORE any side
+    // effects or row inserts run.
+    if req.session_id.starts_with("deconflicter-")
+        && !matches!(req.action, CoordinatorAction::AdviseWithText { .. })
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "deconflicter restricted to advisory actions".to_string(),
+        ));
+    }
+
     let action_name_str = crate::coordinator::act::action_name(&req.action);
-    let advise_only = crate::coordinator::act::must_advise_only(&req.action);
+    let advise_only = crate::coordinator::act::must_advise_only(&req.session_id, &req.action);
     let auto_acted = !advise_only;
     let target_id = crate::coordinator::act::action_target(&req.action);
     let reasoning = crate::coordinator::act::action_reasoning(&req.action);

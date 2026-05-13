@@ -1158,6 +1158,33 @@
         {
           "assertionType": "exists",
           "category": "element-presence",
+          "description": "Required element 0 for state Deconflict Advisory Banner",
+          "enabled": true,
+          "id": "term-deconflict-advisory-banner-elem-0",
+          "precondition": "At least one unresolved `coord.coordinator_decisions` row exists where `rule = 'deconflict'`, `target_id` equals the active tab's `claudeSessionId`, and `resolved = false`. Verifiable via GET `/coordinator/decisions?rule=deconflict` returning a row whose `targetId` matches the active tab.",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "dataUiBridgeId": "terminal.deconflict-advisory-banner"
+            },
+            "label": "Required element for Deconflict Advisory Banner",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "When the Rust deconflicter loop (qontinui-runner/src-tauri/src/coordinator/deconflicter.rs, started from `main.rs::setup` via `tauri::async_runtime::spawn`) detects that another live AI session has recently touched the same file the active session is editing, it inserts a `coord.coordinator_decisions` row `{session_id: 'deconflicter-rust', rule: 'deconflict', action: 'advise-with-text', target_id: <touching session's task_run_id>, reasoning: <one-line advisory text>}` and emits a `coordinator-decision-created` Tauri event with the same payload. The active tab subscribes via `<DeconflictAdvisoryBanner>` (qontinui-runner/src/components/terminal/DeconflictAdvisoryBanner.tsx), mounted in TerminalPage.tsx as a sibling of `<HoldingLockBanner>`/`<WaitingLockBanner>` inside the existing `claudeSessionId`-gated section. The banner gates on `props.taskRunId === active tab's claudeSessionId` AND `decision.target_id === taskRunId` AND `decision.session_id.startsWith('deconflicter-')` AND `decision.resolved === false`. PTY-only tabs without `claudeSessionId` never render the banner. Banner placement matches the lock-yield surface (absolutely-positioned overlay inside the active tab's pane); each unresolved deconflict advisory renders one row carrying `data-ui-bridge-id=\"terminal.deconflict-advisory-banner\"` and `data-advisory-decision-id=<decision.id>`. The Dismiss action invokes the pre-existing `resolve_escalation` Tauri command (commands/productivity.rs:294) with `{decisionId, resolution: 'dismissed'}`, which flips `resolved=true, resolution='dismissed'` on the row via `PgDb::resolve_coordinator_decision`. Emergent-task rows underpin the cross-session conflict signal: every AI session gets a `coord.tasks` row with `origin='session_emergent'` so the deconflicter's SQL (`JOIN coord.tasks t ON t.assigned_session_id = stf.task_run_id WHERE stf.recorded_at > now() - interval '15 minutes' AND t.status IN ('in_progress','assigned','running')`) can find the other live session. Worker-spawn writes emergent rows at `commands/productivity.rs:1084`; user-launched AI sessions write them at `commands/ai_session.rs:368` (create_ai_session) and the resume-from-log loop at `:1309`. Touch events flow `auto_register_file` (dispatcher.rs) → `broadcast::Sender<TouchEvent>` in `AppState.touch_events_tx` → the deconflicter loop's receiver. The loop deduplicates `(session, path)` pairs for 5 minutes to keep noise low and is restricted by `must_advise_only` (coordinator/act.rs:61-72) to `AdviseWithText` actions only: any other action attempted with a `session_id` starting `deconflicter-` is rejected at `/coordinator/act` with HTTP 403 \"deconflicter restricted to advisory actions.\"",
+      "id": "term-deconflict-advisory-banner",
+      "name": "Deconflict Advisory Banner",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
           "description": "Required element 0 for state Stuck-Session Heartbeat",
           "enabled": true,
           "id": "term-heartbeat-idle-status-elem-0",

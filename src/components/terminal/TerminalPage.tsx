@@ -49,6 +49,7 @@ import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionPr
 import { MidSessionToast } from "./MidSessionToast";
 import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner";
 import { WaitingLockBanner } from "./WaitingLockBanner";
+import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -842,6 +843,18 @@ function TerminalPageInner({
                   })()}
                 />
               )}
+
+            {/* Coord-as-Deconflicter Phase 1 (§4.4) — in-session
+                advisory banner that surfaces `coord.coordinator_decisions`
+                rows fired by the Rust deconflicter loop. Gated on
+                `claudeSessionId` per `proj_holding_banner_pty_gate` — the
+                emergent-task wiring (commands/productivity.rs:1082 +
+                ai_session register sites) ensures every AI tab has one.
+                Lives below the lock-yield banners by document order so
+                they stack instead of overlapping. */}
+            {activeTab?.claudeSessionId && (
+              <DeconflictAdvisoryBanner taskRunId={activeTab.claudeSessionId} />
+            )}
           </div>
 
           {uiState.showControlPanel && zoneLayout.isMultiZone && (

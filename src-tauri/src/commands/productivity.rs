@@ -1014,7 +1014,7 @@ pub async fn spawn_worker_session(
     app_handle: tauri::AppHandle,
     title_hint: Option<String>,
 ) -> Result<LaunchResult, String> {
-    let _app_state = require_app_state(&app_handle)?;
+    let app_state = require_app_state(&app_handle)?;
 
     let repo_path = resolve_runner_repo_path()
         .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
@@ -1081,6 +1081,24 @@ pub async fn spawn_worker_session(
     let worker_arc = Arc::new(worker);
     if let Err(e) = session_manager.register_worker(worker_arc.clone()) {
         warn!("spawn_worker_session: register_worker failed: {}", e);
+    }
+
+    // "Coord as Deconflicter, not Dispatcher" Phase 1 (§4.3): create an
+    // emergent `coord.tasks` row keyed by this worker's task_run_id so
+    // the deconflicter and in-session advisory banner have something to
+    // attach to. Best-effort — never block worker spawn on this. The
+    // partial unique index `idx_tasks_emergent_per_session` (added by
+    // `ensure_coord_tasks_emergent_columns`) makes the INSERT idempotent
+    // on re-registration.
+    if let Err(e) = app_state
+        .pg_db
+        .create_emergent_task(&task_run_id, "in_progress", "session_emergent", None)
+        .await
+    {
+        warn!(
+            "spawn_worker_session: create_emergent_task failed for task_run_id={}: {}",
+            task_run_id, e
+        );
     }
 
     // Phase 1: readline-observer task. Workers register in `Initializing`

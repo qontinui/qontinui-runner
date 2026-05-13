@@ -10,6 +10,7 @@
 pub mod act;
 pub mod config;
 mod decide;
+pub mod deconflicter;
 mod llm_decide;
 mod observe;
 pub mod scheduler;

@@ -346,6 +346,18 @@ pub(crate) async fn promote_session_inner(
         .inner()
         .clone();
 
+    // 1b. Best-effort handle to PgDb for the "Coord as Deconflicter" Phase 1
+    //     emergent-task creation (§4.3). Failing to resolve AppState here
+    //     must NOT block promote — every emergent-task call below is
+    //     wrapped in a `.ok()` / matched `Err` so the worktree-promotion
+    //     path still works against a partially-initialised runner.
+    let pg_db_opt: Option<Arc<crate::database::pg::PgDb>> = {
+        use crate::commands::AppState;
+        app_handle
+            .try_state::<Arc<AppState>>()
+            .map(|s| s.inner().pg_db.clone())
+    };
+
     // 2. Resolve repo path. `current_project_path()` returns the workspace root,
     //    which is what create_worktree expects (per worktrees.rs handlers).
     let repo_path = crate::mcp::shared::current_project_path().ok_or((
@@ -377,6 +389,20 @@ pub(crate) async fn promote_session_inner(
                 session_id, e
             );
         }
+        // §4.3: best-effort emergent-task row so the in-session advisory
+        // banner has something to attach to. Idempotent via partial unique
+        // index.
+        if let Some(pg) = pg_db_opt.as_ref() {
+            if let Err(e) = pg
+                .create_emergent_task(session_id, "in_progress", "session_emergent", None)
+                .await
+            {
+                warn!(
+                    "promote_to_worktree: create_emergent_task failed for session {}: {}",
+                    session_id, e
+                );
+            }
+        }
         return Err((
             StatusCode::CONFLICT,
             format!(
@@ -398,6 +424,18 @@ pub(crate) async fn promote_session_inner(
                     "promote_to_worktree: failed to re-register busy session {}: {}",
                     session_id, e
                 );
+            }
+            // §4.3: best-effort emergent-task row. Idempotent.
+            if let Some(pg) = pg_db_opt.as_ref() {
+                if let Err(e) = pg
+                    .create_emergent_task(session_id, "in_progress", "session_emergent", None)
+                    .await
+                {
+                    warn!(
+                        "promote_to_worktree: create_emergent_task failed for session {}: {}",
+                        session_id, e
+                    );
+                }
             }
             return Err((
                 StatusCode::CONFLICT,
@@ -441,6 +479,18 @@ pub(crate) async fn promote_session_inner(
                     session_id, re
                 );
             }
+            // §4.3: best-effort emergent-task row. Idempotent.
+            if let Some(pg) = pg_db_opt.as_ref() {
+                if let Err(ce) = pg
+                    .create_emergent_task(session_id, "in_progress", "session_emergent", None)
+                    .await
+                {
+                    warn!(
+                        "promote_to_worktree: create_emergent_task failed for session {}: {}",
+                        session_id, ce
+                    );
+                }
+            }
             // Map "already promoted" race to 409, anything else to 500.
             let status = if e.contains("already") {
                 StatusCode::CONFLICT
@@ -462,6 +512,18 @@ pub(crate) async fn promote_session_inner(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("worktree promoted but re-register failed: {}", e),
         ));
+    }
+    // §4.3: best-effort emergent-task row. Idempotent.
+    if let Some(pg) = pg_db_opt.as_ref() {
+        if let Err(e) = pg
+            .create_emergent_task(session_id, "in_progress", "session_emergent", None)
+            .await
+        {
+            warn!(
+                "promote_to_worktree: create_emergent_task failed for session {}: {}",
+                session_id, e
+            );
+        }
     }
 
     info!(

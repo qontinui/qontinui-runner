@@ -400,6 +400,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Capacity of 256 allows for burst events without dropping
     let (event_broadcast, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
+    // Touch-events broadcast channel for the Rust deconflicter loop
+    // (§4.1 of plans/2026-05-13-coord-as-deconflicter-plan.md). The sender
+    // is stashed in AppState so `claude_session::dispatcher::auto_register_file`
+    // can fire on every Edit/Write; the receiver is consumed by
+    // `DeconflicterLoop::start` after the Tauri app handle is available.
+    // Capacity 256 mirrors the WebSocket channel — drop-on-full is fine
+    // because the deconflicter is a soft advisor (missed touches degrade
+    // gracefully: the next touch on the same path re-triggers).
+    let (touch_events_tx, touch_events_rx) =
+        tokio::sync::broadcast::channel::<crate::coordinator::deconflicter::TouchEvent>(256);
+
     // Create run recording handler for automatic workflow execution recording
     let run_recording_handler = Arc::new(RunRecordingHandler::new());
 
@@ -474,6 +485,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             crate::executor::upcoming_file_registry::UpcomingFileRegistry::new(),
         ),
         file_lock_manager: Arc::new(crate::executor::FileLockManager::new()),
+        touch_events_tx: touch_events_tx.clone(),
         ui_bridge_failure_tracker:
             crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()
@@ -2273,6 +2285,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             let snapshot_pruner_pg = app.state::<Arc<AppState>>().inner().pg_db.clone();
             crate::database::pg::session_file_snapshots::start_session_snapshot_pruner(
                 snapshot_pruner_pg,
+            );
+
+            // Start the Rust deconflicter loop — §4.1 of
+            // plans/2026-05-13-coord-as-deconflicter-plan.md. Consumes
+            // the `touch_events_rx` we created alongside AppState's
+            // `touch_events_tx`. The loop runs until process exit (the
+            // sender lives in AppState; receivers exit cleanly on
+            // `RecvError::Closed`).
+            info!("Starting Rust deconflicter loop");
+            let deconflicter_pg = app.state::<Arc<AppState>>().inner().pg_db.clone();
+            let deconflicter_app_handle = app.handle().clone();
+            crate::coordinator::deconflicter::DeconflicterLoop::start(
+                deconflicter_pg,
+                deconflicter_app_handle,
+                touch_events_rx,
             );
 
             // Start dreamer (formal reasoning) scheduler in background

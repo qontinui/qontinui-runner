@@ -145,6 +145,26 @@ pub fn start_coordinator_scheduler(
             );
         }
 
+        // Self-heal the coord.tasks schema additions required by the
+        // "Coord as Deconflicter, not Dispatcher" Phase 1 plan
+        // (§4.2 of plans/2026-05-13-coord-as-deconflicter-plan.md):
+        // origin column + NOT NULL relaxations + new indexes used by the
+        // deconflicter's "who else recently touched this file" lookup.
+        // Idempotent. Logs but doesn't fail the scheduler — when the
+        // columns are missing, emergent-task creation degrades gracefully
+        // (the INSERT errors, callers log and continue).
+        if let Err(e) = state
+            .app_state
+            .pg_db
+            .ensure_coord_tasks_emergent_columns()
+            .await
+        {
+            warn!(
+                "Coordinator scheduler: ensure_coord_tasks_emergent_columns failed: {} — emergent task creation may fail until alembic upgrade",
+                e
+            );
+        }
+
         info!(
             "Coordinator (Rust) scheduler started: instance_id={} interval={}s rule_version={} max_llm_calls_per_hour={} auto_review_enabled={} shadow_mode_enabled={} initial_enabled={}",
             instance_id,
@@ -417,7 +437,7 @@ pub(crate) async fn run_one_iteration(
         let action_name = act::action_name(&outcome.action);
         let target = act::action_target(&outcome.action);
         let reasoning = act::action_reasoning(&outcome.action);
-        let advise_only = act::must_advise_only(&outcome.action);
+        let advise_only = act::must_advise_only(instance_id, &outcome.action);
         let auto_acted = !advise_only;
 
         info!(
@@ -640,7 +660,7 @@ async fn apply_and_log(
     let action_name = act::action_name(&outcome.action);
     let target = act::action_target(&outcome.action);
     let reasoning = act::action_reasoning(&outcome.action);
-    let advise_only = act::must_advise_only(&outcome.action);
+    let advise_only = act::must_advise_only(instance_id, &outcome.action);
     let auto_acted = !advise_only;
 
     if auto_acted {
@@ -786,7 +806,7 @@ async fn run_shadow_iteration(
             let name = act::action_name(&o.action).to_string();
             let target = act::action_target(&o.action);
             let reasoning = act::action_reasoning(&o.action);
-            let advise_only = act::must_advise_only(&o.action);
+            let advise_only = act::must_advise_only(instance_id, &o.action);
             (o.rule.to_string(), name, target, reasoning, !advise_only)
         }
         None => (

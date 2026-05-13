@@ -77,6 +77,21 @@ const ACTION_FILTER_OPTIONS = [
 
 const RULE_FILTER_OPTIONS = ["", "A", "B", "C", "D", "E", "LLM", "idle"] as const;
 
+/** Source filter — partitions the decision log by writer. The deconflicter
+ *  is a Rust-side loop that writes rows with `session_id` prefixed by
+ *  `"deconflicter-"` (see §3.1 of the deconflicter plan); the AI Coordinator
+ *  PTY skill writes rows with a Claude session UUID. Filter is client-side
+ *  only — no new endpoint. */
+type SourceFilterKey = "all" | "ai" | "deconflicter";
+
+const SOURCE_FILTER_OPTIONS: ReadonlyArray<{ key: SourceFilterKey; label: string }> = [
+  { key: "all", label: "All" },
+  { key: "ai", label: "AI Coordinator" },
+  { key: "deconflicter", label: "Deconflicter" },
+] as const;
+
+const DECONFLICTER_SESSION_PREFIX = "deconflicter-";
+
 // ---------------------------------------------------------------------------
 // Recommendations queue (Phase 3)
 // ---------------------------------------------------------------------------
@@ -498,8 +513,10 @@ interface DecisionLogPanelProps {
   error: string | null;
   ruleFilter: string;
   actionFilter: string;
+  sourceFilter: SourceFilterKey;
   onRuleFilterChange: (v: string) => void;
   onActionFilterChange: (v: string) => void;
+  onSourceFilterChange: (v: SourceFilterKey) => void;
   onRefresh: () => void;
 }
 
@@ -509,8 +526,10 @@ function DecisionLogPanel({
   error,
   ruleFilter,
   actionFilter,
+  sourceFilter,
   onRuleFilterChange,
   onActionFilterChange,
+  onSourceFilterChange,
   onRefresh,
 }: DecisionLogPanelProps) {
   return (
@@ -531,7 +550,33 @@ function DecisionLogPanel({
           </h2>
           <span className="text-xs text-muted-foreground">last {DECISION_LOG_LIMIT} rows</span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <div
+            className="inline-flex items-center gap-1 rounded-md border border-border bg-background p-0.5"
+            role="group"
+            aria-label="source filter"
+            data-ui-bridge-id="productivity.decision-source-filter"
+          >
+            {SOURCE_FILTER_OPTIONS.map((opt) => {
+              const active = sourceFilter === opt.key;
+              return (
+                <button
+                  key={opt.key}
+                  type="button"
+                  onClick={() => onSourceFilterChange(opt.key)}
+                  aria-pressed={active}
+                  data-source-filter-key={opt.key}
+                  className={`rounded px-2 py-0.5 text-xs ${
+                    active
+                      ? "bg-muted/50 text-foreground"
+                      : "text-muted-foreground hover:text-foreground hover:bg-muted/30"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
           <label className="text-xs text-muted-foreground">
             rule
             <select
@@ -653,15 +698,15 @@ function CoordinatorLeaseStatusPill({ status, leader }: CoordinatorLeaseStatusPi
   if (status === "active" && leader) {
     className =
       "inline-flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300";
-    text = `Coordinator: running (${leader.instanceId.slice(0, 8)}, ${safeFormatAge(leader.renewedAt)})`;
+    text = `AI Coordinator: running (${leader.instanceId.slice(0, 8)}, ${safeFormatAge(leader.renewedAt)})`;
   } else if (status === "stale" && leader) {
     className =
       "inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-300";
-    text = `Coordinator: stale lease (last heartbeat ${safeFormatAge(leader.renewedAt)} ago)`;
+    text = `AI Coordinator: stale lease (last heartbeat ${safeFormatAge(leader.renewedAt)} ago)`;
   } else {
     className =
       "inline-flex items-center gap-1.5 rounded-full border border-border/40 bg-muted/20 px-2.5 py-1 text-xs font-medium text-muted-foreground";
-    text = "Coordinator: vacant";
+    text = "AI Coordinator: vacant";
   }
 
   return (
@@ -694,6 +739,7 @@ export function CoordinatorDashboard() {
   const [advisoriesError, setAdvisoriesError] = useState<string | null>(null);
   const [ruleFilter, setRuleFilter] = useState("");
   const [actionFilter, setActionFilter] = useState("");
+  const [sourceFilter, setSourceFilter] = useState<SourceFilterKey>("all");
   const [highlightedReviewId, setHighlightedReviewId] = useState<string | null>(null);
   const [leaderResponse, setLeaderResponse] = useState<LeaderResponse | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
@@ -1036,8 +1082,16 @@ export function CoordinatorDashboard() {
   );
 
   // Memoise the list so the table doesn't re-render when other panels
-  // update.
-  const decisionRows = useMemo(() => decisions, [decisions]);
+  // update. Source filter is applied client-side here (no backend filter
+  // by session_id today — see SOURCE_FILTER_OPTIONS / §4.5).
+  const decisionRows = useMemo(() => {
+    if (sourceFilter === "all") return decisions;
+    if (sourceFilter === "deconflicter") {
+      return decisions.filter((r) => r.sessionId.startsWith(DECONFLICTER_SESSION_PREFIX));
+    }
+    // "ai": everything that isn't a deconflicter-prefixed row.
+    return decisions.filter((r) => !r.sessionId.startsWith(DECONFLICTER_SESSION_PREFIX));
+  }, [decisions, sourceFilter]);
   const escalationRows = useMemo(() => escalations, [escalations]);
   const recommendationRows = useMemo(() => recommendations, [recommendations]);
   const advisoryRows = useMemo(() => advisories, [advisories]);
@@ -1178,8 +1232,10 @@ export function CoordinatorDashboard() {
           error={decisionsError}
           ruleFilter={ruleFilter}
           actionFilter={actionFilter}
+          sourceFilter={sourceFilter}
           onRuleFilterChange={setRuleFilter}
           onActionFilterChange={setActionFilter}
+          onSourceFilterChange={setSourceFilter}
           onRefresh={loadDecisions}
         />
 
