@@ -50,6 +50,11 @@ $SKIP_ROUTES = @{
     # Workflows by id need a real workflow registered first.
     "POST /control/workflow/:id/run"         = "needs a registered workflow id"
     "GET /control/workflow/:runId/status"    = "needs a real run id from a prior /run call"
+    # vision/raw is intentionally invisible without QONTINUI_VISION_RAW=1
+    # (Phase 2 of the UI Bridge vision-pipeline plan): it 404s by design so a
+    # caller can't tell whether the route exists. Treating 404 as a route-not-
+    # registered failure would be a false positive.
+    "POST /vision/raw"                       = "gated behind QONTINUI_VISION_RAW=1 env var; 404 is intentional"
 }
 
 # ---------------------------------------------------------------------------
@@ -66,7 +71,6 @@ $BODY_FIXTURES = @{
     "POST /control/component/:id/action/:actionId" = '{}'
     "POST /control/find"                      = '{"query":"smoke"}'
     "POST /control/discover"                  = '{"query":"smoke"}'
-    "POST /control/get-element-images"        = '{"ids":[]}'
     "POST /ai/search"                         = '{"query":"smoke"}'
     "POST /ai/find"                           = '{"query":"smoke"}'
     "POST /ai/execute"                        = '{"intent":"smoke"}'
@@ -467,6 +471,59 @@ try {
         }
     } catch {
         Record "FAIL" "POST" "/control/element/:id/expect (timeout)" "exception: $($_.Exception.Message)"
+        $exitCode = 1
+    }
+
+    # Probe 4: /vision/capture returns the Phase-2 envelope shape
+    # POST {"contract":"claude"} should yield:
+    #   200 + { success: true, data: { path, sha256, width, height, bytes,
+    #          format: "jpeg", contract: "claude_vision_v1" } }
+    # path must start with "tmp_vision_cache/" and bytes must be < 5 MiB
+    # (Claude vision input ceiling from the OutputContract pipeline).
+    try {
+        $body = '{"contract":"claude"}'
+        $cap = Invoke-Probe -Method "POST" -Url "$runnerBase/vision/capture" -Body $body
+        if ($cap[0] -eq 404) {
+            Record "FAIL" "POST" "/vision/capture (shape)" "404 -- route not registered"
+            $exitCode = 1
+        } elseif ($cap[0] -ne 200) {
+            Record "FAIL" "POST" "/vision/capture (shape)" "$($cap[0]) -- expected 200"
+            $exitCode = 1
+        } else {
+            $obj = $cap[1] | ConvertFrom-Json
+            if (-not $obj.success -or -not $obj.data) {
+                Record "FAIL" "POST" "/vision/capture (shape)" "envelope missing success/data"
+                $exitCode = 1
+            } else {
+                $d = $obj.data
+                $errs = @()
+                foreach ($key in @('path','sha256','width','height','bytes','format','contract')) {
+                    if (-not ($d.PSObject.Properties.Name -contains $key)) {
+                        $errs += "missing $key"
+                    }
+                }
+                if ($d.format -and $d.format -ne 'jpeg') {
+                    $errs += "format=$($d.format) (expected jpeg for claude contract)"
+                }
+                if ($d.contract -and $d.contract -ne 'claude_vision_v1') {
+                    $errs += "contract=$($d.contract) (expected claude_vision_v1)"
+                }
+                if ($d.bytes -and [int]$d.bytes -ge (5 * 1024 * 1024)) {
+                    $errs += "bytes=$($d.bytes) >= 5 MiB ceiling"
+                }
+                if ($d.path -and -not ($d.path -match '^tmp_vision_cache[\\/].+\.(jpe?g|webp|png)$')) {
+                    $errs += "path=$($d.path) (expected tmp_vision_cache/<sha>.<ext>)"
+                }
+                if ($errs.Count -gt 0) {
+                    Record "FAIL" "POST" "/vision/capture (shape)" ($errs -join "; ")
+                    $exitCode = 1
+                } else {
+                    Record "PASS" "POST" "/vision/capture (shape)" "$($d.width)x$($d.height) $($d.bytes)b $($d.format) $($d.contract)"
+                }
+            }
+        }
+    } catch {
+        Record "FAIL" "POST" "/vision/capture (shape)" "exception: $($_.Exception.Message)"
         $exitCode = 1
     }
 } finally {

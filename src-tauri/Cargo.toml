@@ -98,6 +98,7 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_j
 deadpool-postgres = "0.14"
 qontinui-db = { path = "./clorinde" }
 qontinui-types = { path = "../../qontinui-schemas/rust", version = "^0.1.2" }
+qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core", version = "^0.1.0" }
 socket2 = "0.6"
 cron = "0.15"
 chrono-tz = "0.10"
@@ -130,7 +131,8 @@ arboard = "3.4"
 dashmap = "6"
 lru = "0.12"
 xcap = "0.4"
-image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+tempfile = "3"
 # notify-rust removed — replaced by tauri-plugin-notification (session 15)
 
 # MCP (Model Context Protocol) client

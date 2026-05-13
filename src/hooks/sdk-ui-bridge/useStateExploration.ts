@@ -25,6 +25,7 @@ import {
 } from "../../lib/ui-bridge/fingerprintGenerator";
 import { cropThumbnails } from "@/lib/thumbnail-cropper";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { captureScreenshotBase64 } from "@/lib/vision-api";
 import { setPendingCaptureScreenshots } from "./useCaptureSession";
 
 /** Maximum number of interactions during automated state exploration */
@@ -197,22 +198,21 @@ export function useStateExploration(
             // Capture thumbnails (non-fatal, in separate try/catch)
             try {
               if (Object.keys(session.elementBoundsMap).length > 0) {
-                // Capture the connected app's window so element bounds align with the screenshot.
-                // For self-connection (same port), use runner=true (Tauri window capture).
-                // For cross-runner connections, target the other window by title.
-                const ssParams = new URLSearchParams();
+                // Phase 2 of the UI Bridge vision-pipeline plan replaced the
+                // legacy `/ui-bridge/sdk/screenshot` route (which could target
+                // either the runner window or an arbitrary other window by
+                // title) with `/ui-bridge/vision/capture`, which always
+                // captures the runner's own window. Cross-runner window
+                // capture by title is no longer available via SDK route — we
+                // only proceed in the self-connect case where the captured
+                // window matches the connected app.
                 const isSelfConnection = connectedApp?.port === Number(new URL(getApiBase()).port);
                 if (isSelfConnection) {
-                  ssParams.set("runner", "true");
-                } else if (connectedApp?.appName) {
-                  // Try window title match for the other runner instance
-                  ssParams.set("window_title", connectedApp.appName);
-                }
-                const ssUrl = `${getApiBase()}/ui-bridge/sdk/screenshot${ssParams.toString() ? `?${ssParams}` : ""}`;
-                const ssResp = await tracedFetch(ssUrl);
-                const ssJson = await ssResp.json();
-                if (ssJson.success && ssJson.data?.screenshot) {
-                  const dpr = ssJson.data.scaleFactor || 1;
+                  const ss = await captureScreenshotBase64({ contract: "claude" });
+                  // The vision endpoint returns physical-pixel image dimensions.
+                  // DOM element bounds are reported in CSS pixels, so we scale
+                  // them by window.devicePixelRatio to align with the image.
+                  const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
                   const existingThumbs = session.elementThumbnails || {};
                   const newElements = Object.entries(session.elementBoundsMap)
                     .filter(([hash]) => !existingThumbs[hash])
@@ -226,7 +226,7 @@ export function useStateExploration(
                       },
                     }));
                   if (newElements.length > 0) {
-                    const thumbs = await cropThumbnails(ssJson.data.screenshot, newElements, {
+                    const thumbs = await cropThumbnails(ss.screenshot, newElements, {
                       maxSize: 48,
                     });
                     if (!session.elementThumbnails) session.elementThumbnails = {};
@@ -268,15 +268,16 @@ export function useStateExploration(
                     if (!session.captureScreenshots) session.captureScreenshots = [];
                     const screenshotEntry = {
                       captureIndex: session.captureScreenshots.length,
-                      screenshotBase64: ssJson.data.screenshot,
-                      // ssJson.data.width/height are already in physical pixels
-                      // (xcap returns image.width()/height()). Element bounds above
-                      // ARE multiplied by dpr because the SDK reports them in CSS
-                      // pixels — but the screenshot dims are not. Multiplying by
-                      // dpr here would store metadata at 1.5x the actual stored
-                      // bytes on HiDPI displays.
-                      width: Math.round(ssJson.data.width || 1920),
-                      height: Math.round(ssJson.data.height || 1080),
+                      screenshotBase64: ss.screenshot,
+                      // ss.width/height are already in physical pixels —
+                      // vision/capture returns the post-encode image
+                      // dimensions. Element bounds above ARE multiplied by
+                      // dpr because the SDK reports them in CSS pixels — but
+                      // the screenshot dims are not. Multiplying by dpr here
+                      // would store metadata at 1.5x the actual stored bytes
+                      // on HiDPI displays.
+                      width: Math.round(ss.width || 1920),
+                      height: Math.round(ss.height || 1080),
                       elementBoundsJson: JSON.stringify(currentPageBounds),
                       fingerprintHashesJson: JSON.stringify([...currentPageHashes]),
                       capturedAt: new Date().toISOString(),
@@ -302,6 +303,12 @@ export function useStateExploration(
                       });
                   }
                 }
+                // Cross-runner exploration: skip thumbnails. The legacy
+                // window_title-based capture is gone in Phase 2 and there is
+                // no replacement in vision/capture (Phase 4 will add the
+                // multi-window target story). Element fingerprints and
+                // co-occurrence data are still captured above; only the
+                // visual thumbnails are unavailable until Phase 4.
               }
             } catch {
               // Thumbnails are optional — don't fail the capture

@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  '@qontinui/ui-bridge': link:../wt-vision-phase2-ui-bridge/packages/ui-bridge
+
 importers:
 
   .:
@@ -22,16 +25,16 @@ importers:
         version: 1.0.0(tailwindcss@4.2.4)
       '@qontinui/navigation':
         specifier: ^0.1.0
-        version: 0.1.1(@qontinui/ui-bridge@0.4.0(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react@19.2.5)
+        version: 0.1.1(@qontinui/ui-bridge@wt-vision-phase2-ui-bridge+packages+ui-bridge)(react@19.2.5)
       '@qontinui/shared-types':
         specifier: ^0.2.5
         version: 0.2.5
       '@qontinui/ui-bridge':
-        specifier: ^0.4.0
-        version: 0.4.0(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+        specifier: link:../wt-vision-phase2-ui-bridge/packages/ui-bridge
+        version: link:../wt-vision-phase2-ui-bridge/packages/ui-bridge
       '@qontinui/ui-bridge-auto':
         specifier: ^0.1.5
-        version: 0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+        version: 0.1.5
       '@qontinui/workflow-ui':
         specifier: ^0.1.0
         version: 0.1.0(@xyflow/react@12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(lucide-react@1.14.0(react@19.2.5))(mermaid@11.14.0)(react-window@2.2.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)
@@ -1142,60 +1145,6 @@ packages:
     engines: {node: '>=18.0.0'}
     peerDependencies:
       eslint: ^8.0.0 || ^9.0.0 || ^10.0.0
-
-  '@qontinui/ui-bridge@0.3.9':
-    resolution: {integrity: sha512-VLWgdvkm3lP/gTYXYqd4FgUFZhVRG7VNB7/GEwoDLF6QvxwUsDPenyb/CSTvHSO54xFMX9A4KELhkpHv+dhYqQ==}
-    peerDependencies:
-      '@qontinui/ui-bridge-auto': '>=0.1.0'
-      '@qontinui/ui-bridge-headless': '>=0.1.0'
-      express: ^4.18.0 || ^5.0.0
-      next: '>=13.0.0'
-      react: ^18.0.0 || ^19.0.0
-      react-dom: ^18.0.0 || ^19.0.0
-      react-native: '>=0.70.0'
-      ws: ^8.0.0
-    peerDependenciesMeta:
-      '@qontinui/ui-bridge-auto':
-        optional: true
-      '@qontinui/ui-bridge-headless':
-        optional: true
-      express:
-        optional: true
-      next:
-        optional: true
-      react-dom:
-        optional: true
-      react-native:
-        optional: true
-      ws:
-        optional: true
-
-  '@qontinui/ui-bridge@0.4.0':
-    resolution: {integrity: sha512-UD9Q91Xbz1GgpoP+3dN/VoIClVHgKkGKt0t7BDr3BJsZ2MnJ6qMe5At7fpAIyo1OVk48UmHn5zEMC1wDiDoJLQ==}
-    peerDependencies:
-      '@qontinui/ui-bridge-auto': '>=0.1.0'
-      '@qontinui/ui-bridge-headless': '>=0.1.0'
-      express: ^4.18.0 || ^5.0.0
-      next: '>=13.0.0'
-      react: ^18.0.0 || ^19.0.0
-      react-dom: ^18.0.0 || ^19.0.0
-      react-native: '>=0.70.0'
-      ws: ^8.0.0
-    peerDependenciesMeta:
-      '@qontinui/ui-bridge-auto':
-        optional: true
-      '@qontinui/ui-bridge-headless':
-        optional: true
-      express:
-        optional: true
-      next:
-        optional: true
-      react-dom:
-        optional: true
-      react-native:
-        optional: true
-      ws:
-        optional: true
 
   '@qontinui/workflow-ui@0.1.0':
     resolution: {integrity: sha512-78F+ujUIKP1+SzdxAePSxbhTGPlmv5V+UywmQUQtlJuQFgsYFBUw5LWRN3T+zTRAFIZ9IThTr6MaEaRIBWEfYg==}
@@ -6133,26 +6082,18 @@ snapshots:
     optionalDependencies:
       tailwindcss: 4.2.4
 
-  '@qontinui/navigation@0.1.1(@qontinui/ui-bridge@0.4.0(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react@19.2.5)':
+  '@qontinui/navigation@0.1.1(@qontinui/ui-bridge@wt-vision-phase2-ui-bridge+packages+ui-bridge)(react@19.2.5)':
     optionalDependencies:
-      '@qontinui/ui-bridge': 0.4.0(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+      '@qontinui/ui-bridge': link:../wt-vision-phase2-ui-bridge/packages/ui-bridge
       react: 19.2.5
 
   '@qontinui/shared-types@0.2.5': {}
 
-  '@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)':
+  '@qontinui/ui-bridge-auto@0.1.5':
     dependencies:
       '@qontinui/shared-types': 0.2.5
-      '@qontinui/ui-bridge': 0.3.9(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
+      '@qontinui/ui-bridge': link:../wt-vision-phase2-ui-bridge/packages/ui-bridge
       ts-morph: 27.0.2
-    transitivePeerDependencies:
-      - '@qontinui/ui-bridge-headless'
-      - express
-      - next
-      - react
-      - react-dom
-      - react-native
-      - ws
 
   '@qontinui/ui-bridge-eslint-plugin@0.1.0(eslint@10.3.0(jiti@2.6.1))(typescript@6.0.3)':
     dependencies:
@@ -6161,24 +6102,6 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
       - typescript
-
-  '@qontinui/ui-bridge@0.3.9(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)':
-    dependencies:
-      react: 19.2.5
-    optionalDependencies:
-      '@qontinui/ui-bridge-auto': 0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
-      '@tauri-apps/api': 2.11.0
-      react-dom: 19.2.5(react@19.2.5)
-      ws: 8.20.0
-
-  '@qontinui/ui-bridge@0.4.0(@qontinui/ui-bridge-auto@0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)':
-    dependencies:
-      react: 19.2.5
-    optionalDependencies:
-      '@qontinui/ui-bridge-auto': 0.1.5(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
-      '@tauri-apps/api': 2.11.0
-      react-dom: 19.2.5(react@19.2.5)
-      ws: 8.20.0
 
   '@qontinui/workflow-ui@0.1.0(@xyflow/react@12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(lucide-react@1.14.0(react@19.2.5))(mermaid@11.14.0)(react-window@2.2.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)':
     dependencies:

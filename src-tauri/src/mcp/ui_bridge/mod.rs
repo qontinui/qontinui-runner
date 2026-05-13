@@ -41,6 +41,7 @@ pub mod stubs;
 pub mod terminals;
 pub mod toasts;
 pub mod types;
+pub mod vision_routes;
 
 // Re-export all public symbols so every currently-used path like
 // `crate::mcp::ui_bridge::UiBridgeError`, `::ui_bridge_request_sync`,
@@ -156,16 +157,11 @@ pub use page::{
 };
 pub use request::{handle_ui_bridge_response, ui_bridge_request_sync};
 pub use screenshots::{
-    capture_runner_window_base64, ui_bridge_annotated_screenshot_handler,
-    ui_bridge_annotations_coverage_handler, ui_bridge_annotations_create_handler,
-    ui_bridge_annotations_delete_handler, ui_bridge_annotations_export_handler,
-    ui_bridge_annotations_get_handler, ui_bridge_annotations_list_handler,
-    ui_bridge_annotations_update_handler, ui_bridge_capture_element_images_handler,
-    ui_bridge_diagnose_stuck_screen_handler, ui_bridge_element_screenshot_handler,
-    ui_bridge_get_element_images_handler, ui_bridge_media_analyze_handler,
-    ui_bridge_media_audit_handler, ui_bridge_media_find_handler, ui_bridge_media_snapshot_handler,
-    ui_bridge_page_health_handler, ui_bridge_screenshot_handler, AnnotatedScreenshotData,
-    AnnotatedScreenshotQuery, PageHealthRequest, ScreenshotRequest, ScreenshotResponse,
+    capture_runner_window_base64, ui_bridge_annotations_coverage_handler,
+    ui_bridge_annotations_create_handler, ui_bridge_annotations_delete_handler,
+    ui_bridge_annotations_export_handler, ui_bridge_annotations_get_handler,
+    ui_bridge_annotations_list_handler, ui_bridge_annotations_update_handler,
+    ui_bridge_page_health_handler, PageHealthRequest,
 };
 pub use types::{
     classify_assertion_failure, classify_transport_error, recovery_hint_for, ClipboardWriteRequest,
@@ -339,6 +335,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(stubs::route_entries());
         all.extend_from_slice(terminals::route_entries());
         all.extend_from_slice(toasts::route_entries());
+        all.extend_from_slice(vision_routes::route_entries());
         all
     })
 }
@@ -386,6 +383,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(stubs::routes())
         .merge(terminals::routes())
         .merge(toasts::routes())
+        .merge(vision_routes::routes())
         // Tier 2.1 — safelisted Tauri command proxy
         .merge(crate::mcp::tauri_proxy::routes())
         // Phase 3I.1 + 3I.2 — UI Bridge invoke proxy (HTTP → Tauri invoke round-trip)

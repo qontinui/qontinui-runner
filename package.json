@@ -91,6 +91,11 @@
   },
   "name": "qontinui-runner",
   "packageManager": "pnpm@10.33.2",
+  "pnpm": {
+    "overrides": {
+      "@qontinui/ui-bridge": "link:../wt-vision-phase2-ui-bridge/packages/ui-bridge"
+    }
+  },
   "private": true,
   "scripts": {
     "build": "tsc && vite build",
