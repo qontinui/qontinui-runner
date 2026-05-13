@@ -208,26 +208,25 @@ jobs:
         if: steps.cache-clorinde.outputs.cache-hit != 'true'
         run: cargo install clorinde --locked
 
-      # Run `clorinde --help` so workflow logs document the real CLI
-      # surface. If the invocation below is wrong, this output points
-      # at the right flags for the next iteration.
-      - name: Show clorinde --help
-        run: clorinde --help || true
+      # Document the actual CLI surface in workflow logs. `clorinde live`
+      # is the subcommand we use; the top-level help shows there are
+      # also `schema` and `fresh` variants we don't need here.
+      - name: Show clorinde live --help
+        run: clorinde live --help || true
 
-      # Run Clorinde codegen in-place. The destination (`clorinde/`)
-      # comes from `src-tauri/clorinde.toml`; the queries directory
-      # (`queries/`) comes from the same toml. Connection is via
-      # standard libpq env vars + DATABASE_URL.
+      # Run Clorinde codegen in-place. `clorinde live` reads
+      # DATABASE_URL from env (clap `[env: DATABASE_URL=]` binding),
+      # then uses `clorinde.toml` in the working directory for the
+      # queries-path + destination + sync/async settings. The
+      # `--search-path` matches the canonical PG runtime config in
+      # `database/pg/mod.rs` so queries resolve table references in
+      # both `project` (alembic-managed) and `public` schemas the same
+      # way the runner does at runtime.
       - name: Run Clorinde codegen
         working-directory: qontinui-runner/src-tauri
         env:
           DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
-          PGHOST: localhost
-          PGPORT: "5433"
-          PGUSER: qontinui_user
-          PGPASSWORD: qontinui_dev_password
-          PGDATABASE: qontinui_db
-        run: clorinde
+        run: clorinde live --search-path "project,public"
 
       # Drift detection: if `git diff` on src-tauri/clorinde/ is empty,
       # the checked-in bindings match a fresh regen. Otherwise we have
