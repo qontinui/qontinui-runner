@@ -14,7 +14,7 @@ use crate::config_storage::ConfigStorage;
 use crate::AppState;
 
 use super::evaluator::TriggerEvaluator;
-use super::executor::{self, TriggerExecutorDeps};
+use super::executor::{self, ActionType, TriggerExecutorDeps};
 
 use super::types::{TriggerEvent, TriggerHistoryEntry, TriggerSystemStatus, WorkflowTrigger};
 use super::watchers;
@@ -469,6 +469,68 @@ impl TriggerService {
         let action = eval_result.action_name().to_string();
 
         if eval_result.should_execute() {
+            // D5 Phase 1: dispatch on the effective action variant. Old
+            // trigger rows (no `action_type` override) resolve to
+            // `ExecuteWorkflow` and follow the legacy workflow-spawn path
+            // below. Rows marked `supervision_proposal` are routed into
+            // the supervision channel instead.
+            let action_type = ActionType::from_trigger(&trigger);
+            if let ActionType::SupervisionProposal { provenance } = &action_type {
+                self.evaluator.record_execution_start(&trigger.id).await;
+
+                // Append + emit. This is fire-and-forget — supervision
+                // dispatch never spawns a workflow and never retries.
+                crate::git_supervision::handle_supervision_action(
+                    &self.deps.app_handle,
+                    &event.event_type,
+                    event.event_data.clone(),
+                    provenance,
+                )
+                .await;
+
+                // Mirror the workflow-execution path's bookkeeping so the
+                // trigger row's `last_triggered_at` and history stay
+                // accurate. Pass `None` for execution_id — supervision
+                // proposals don't produce task_runs.
+                if let Err(e) = self
+                    .deps
+                    .app_state
+                    .pg_db
+                    .record_trigger_fired(&trigger.id, None)
+                    .await
+                {
+                    error!("Failed to record supervision trigger fired: {}", e);
+                }
+
+                let history = TriggerHistoryEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    trigger_id: trigger.id.clone(),
+                    event_type: event.event_type.clone(),
+                    event_data: event.event_data.clone(),
+                    action: "supervision_proposal".to_string(),
+                    task_run_id: None,
+                    error_message: None,
+                    triggered_at: chrono::Utc::now().to_rfc3339(),
+                };
+                if let Err(e) = self
+                    .deps
+                    .app_state
+                    .pg_db
+                    .record_trigger_history(&history)
+                    .await
+                {
+                    error!("Failed to record supervision history: {}", e);
+                }
+
+                info!(
+                    "Trigger '{}' fired supervision proposal (provenance={}, event_type={})",
+                    trigger.name, provenance, event.event_type
+                );
+
+                self.evaluator.record_execution_end(&trigger.id).await;
+                return;
+            }
+
             // Execute: spawn the workflow (with retry support)
             self.evaluator.record_execution_start(&trigger.id).await;
 
@@ -683,15 +745,171 @@ pub async fn start_trigger_service(
         pid_tracker,
     };
 
-    let service = Arc::new(TriggerService::new(deps));
+    let service = Arc::new(TriggerService::new(deps.clone()));
     *service_guard = Some(service.clone());
     drop(service_guard);
+
+    // D5 Phase 1 — bootstrap the default supervision-channel trigger rows
+    // BEFORE the service spawns and reads `get_enabled_triggers`. If the
+    // user has set `QONTINUI_DISABLE_GIT_SUPERVISION=1`, skip the
+    // bootstrap entirely; existing rows remain enabled/disabled as the
+    // user last left them.
+    if std::env::var("QONTINUI_DISABLE_GIT_SUPERVISION").unwrap_or_default() != "1" {
+        if let Err(e) = bootstrap_default_supervision_triggers(&deps).await {
+            warn!("Git supervision bootstrap skipped: {}", e);
+        }
+    } else {
+        info!("QONTINUI_DISABLE_GIT_SUPERVISION=1; skipping default supervision trigger bootstrap");
+    }
 
     tokio::spawn(async move {
         service.start().await;
     });
 
     info!("Trigger service started");
+}
+
+// ============================================================================
+// D5 Phase 1 — default supervision trigger bootstrap
+// ============================================================================
+
+/// Sentinel name for the default git-event supervision trigger row.
+pub const GIT_SUPERVISION_DEFAULT_NAME: &str = "__git-supervision-default__";
+/// Sentinel name for the default spec-file FS supervision trigger row.
+pub const SPEC_FILE_SUPERVISION_DEFAULT_NAME: &str = "__spec-file-supervision-default__";
+
+/// Insert the two default supervision trigger rows if they don't already
+/// exist. Idempotent — re-running it after a restart is a no-op.
+///
+/// The git-event row points at the runner's own working tree (via
+/// `crate::mcp::shared::current_project_path`) and watches `commit`,
+/// `branch_switch`, and `tag` events. The spec-file row uses the
+/// `FileWatch` trigger type on the `specs/` directory restricted to
+/// `*.uibridge.json`.
+///
+/// Both rows are marked `enabled: true` initially. If the user disables
+/// them via the trigger UI, this function won't re-enable them.
+async fn bootstrap_default_supervision_triggers(deps: &TriggerExecutorDeps) -> Result<(), String> {
+    let repo_path = match crate::mcp::shared::current_project_path() {
+        Some(p) => p,
+        None => {
+            return Err(
+                "current_project_path() returned None; cannot bootstrap supervision triggers"
+                    .to_string(),
+            );
+        }
+    };
+
+    // Existing rows are keyed by name (sentinels are unique) — query once
+    // and skip the inserts that are already present.
+    let existing = deps
+        .app_state
+        .pg_db
+        .get_all_triggers()
+        .await
+        .map_err(|e| format!("get_all_triggers failed: {}", e))?;
+    let have_git = existing
+        .iter()
+        .any(|t| t.name == GIT_SUPERVISION_DEFAULT_NAME);
+    let have_spec = existing
+        .iter()
+        .any(|t| t.name == SPEC_FILE_SUPERVISION_DEFAULT_NAME);
+
+    let overrides_json =
+        ActionType::supervision_overrides_json(ActionType::DEFAULT_SUPERVISION_PROVENANCE);
+
+    if !have_git {
+        let now = chrono::Utc::now().to_rfc3339();
+        let trigger = WorkflowTrigger {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: GIT_SUPERVISION_DEFAULT_NAME.to_string(),
+            description: Some(
+                "D5 Phase 1 default git-event supervision channel (auto-created)".to_string(),
+            ),
+            trigger_type: "git_event".to_string(),
+            trigger_config: super::types::TriggerConfig::GitEvent {
+                repo_path: repo_path.clone(),
+                events: vec![
+                    "commit".to_string(),
+                    "branch_switch".to_string(),
+                    "tag".to_string(),
+                ],
+                branch_filter: None,
+            },
+            // `workflow_id` is irrelevant for supervision rows — the
+            // dispatcher routes them to `git_supervision::handle_supervision_action`
+            // before ever loading a workflow. We stash a sentinel for
+            // observability.
+            workflow_id: "__supervision__".to_string(),
+            workflow_overrides: Some(overrides_json.clone()),
+            conditions: Vec::new(),
+            debounce_ms: 1000,
+            cooldown_seconds: 0, // supervision is observation-only; no cooldown needed
+            max_concurrent: 1,
+            retry_count: 0,
+            retry_delay_seconds: 30,
+            enabled: true,
+            last_triggered_at: None,
+            last_execution_id: None,
+            trigger_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        deps.app_state
+            .pg_db
+            .create_trigger(&trigger)
+            .await
+            .map_err(|e| format!("create_trigger (git supervision): {}", e))?;
+        info!(
+            "Bootstrapped default git supervision trigger '{}' watching {}",
+            GIT_SUPERVISION_DEFAULT_NAME, repo_path
+        );
+    }
+
+    if !have_spec {
+        let specs_dir = std::path::Path::new(&repo_path).join("specs");
+        let spec_path_str = specs_dir.to_string_lossy().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let trigger = WorkflowTrigger {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: SPEC_FILE_SUPERVISION_DEFAULT_NAME.to_string(),
+            description: Some(
+                "D5 Phase 1 default spec-file FS supervision channel (auto-created)".to_string(),
+            ),
+            trigger_type: "file_watch".to_string(),
+            trigger_config: super::types::TriggerConfig::FileWatch {
+                paths: vec![spec_path_str.clone()],
+                patterns: vec!["*.uibridge.json".to_string()],
+                ignore_patterns: Vec::new(),
+                recursive: true,
+            },
+            workflow_id: "__supervision__".to_string(),
+            workflow_overrides: Some(overrides_json),
+            conditions: Vec::new(),
+            debounce_ms: 1000,
+            cooldown_seconds: 0,
+            max_concurrent: 1,
+            retry_count: 0,
+            retry_delay_seconds: 30,
+            enabled: true,
+            last_triggered_at: None,
+            last_execution_id: None,
+            trigger_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        deps.app_state
+            .pg_db
+            .create_trigger(&trigger)
+            .await
+            .map_err(|e| format!("create_trigger (spec supervision): {}", e))?;
+        info!(
+            "Bootstrapped default spec-file supervision trigger '{}' watching {}",
+            SPEC_FILE_SUPERVISION_DEFAULT_NAME, spec_path_str
+        );
+    }
+
+    Ok(())
 }
 
 /// Stop the global trigger service.

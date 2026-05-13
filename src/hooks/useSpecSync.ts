@@ -7,7 +7,7 @@
  * 3. Compile phase: compile all specs' stateMachine sections into a runtime state machine
  */
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAiSession } from "./useAiSession";
 import { buildPageSpecPrompt } from "@/lib/page-analysis-prompt-builder";
@@ -15,6 +15,7 @@ import { getApiBase } from "@/lib/runner-api";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
 import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
 import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compilation";
+import { useGitSupervision } from "./useGitSupervision";
 import type { LoadedSpec } from "@/pages/specs/types";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 
@@ -313,6 +314,33 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
   });
 
   const ai = useAiSession();
+
+  // Derive the set of known state IDs from currently-loaded page specs so
+  // the git-supervision hook can infer state IDs from event paths when the
+  // Rust side hasn't already mapped them. Recomputed only when `specs`
+  // changes; the Set identity is stable inside a single render pass.
+  const knownStateIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const s of specs) {
+      if (s.kind !== "page-spec") continue;
+      const cfg = s.config as SpecConfig;
+      const sm = cfg.stateMachine;
+      if (!sm?.states) continue;
+      for (const st of sm.states) {
+        if (st && typeof st.id === "string") ids.add(st.id);
+      }
+    }
+    return ids;
+  }, [specs]);
+
+  const { proposalsByStateId } = useGitSupervision({ knownStateIds });
+
+  // Keep proposals in a ref so `finishSync` (defined inside a useCallback
+  // with stable deps) sees the freshest map without re-binding callbacks.
+  const proposalsRef = useRef(proposalsByStateId);
+  useEffect(() => {
+    proposalsRef.current = proposalsByStateId;
+  }, [proposalsByStateId]);
   const abortRef = useRef<AbortController | null>(null);
   const syncQueueRef = useRef<SpecToSync[]>([]);
   const processedCountRef = useRef(0);
@@ -470,7 +498,15 @@ export function useSpecSync(specs: LoadedSpec[], onSpecUpdated: (spec: LoadedSpe
       return { specId: s.specId, config: updated ?? (s.config as SpecConfig) };
     });
     try {
-      const result = compileStateMachineFromSpecs(inputs);
+      // Discovery artifact + invalidation state aren't wired into this
+      // path yet (callers persist them server-side), so we pass undefined
+      // for both — git proposals are the only "extra" lane available here.
+      const result = compileStateMachineFromSpecs(
+        inputs,
+        undefined,
+        undefined,
+        proposalsRef.current,
+      );
 
       if (!result.compiled) {
         // Quarantined — surface to the user via warnings and persist the

@@ -36,14 +36,20 @@ import type {
 /**
  * Source of a compiled state's element list.
  *
- * - `ai-generated` — Spec JSON, not yet enough observations to promote.
- * - `observed`     — Elements came from co-occurrence discovery artifact;
- *                    the authoritative source.
- * - `ai-fallback`  — State was previously `observed` but was invalidated
- *                    (e.g. recent refactor); using JSON elements again
- *                    until observations re-accumulate.
+ * - `ai-generated`   — Spec JSON, not yet enough observations to promote.
+ * - `observed`       — Elements came from co-occurrence discovery artifact;
+ *                      the authoritative source.
+ * - `ai-fallback`    — State was previously `observed` but was invalidated
+ *                      (e.g. recent refactor); using JSON elements again
+ *                      until observations re-accumulate.
+ * - `git-supervised` — A git event (commit / branch switch / spec_changed)
+ *                      identifies this state as appearing in the on-disk
+ *                      version-controlled spec. Weaker than `observed`
+ *                      (no runtime co-occurrence evidence) but stronger
+ *                      than bare `ai-generated` (the spec is reproducible
+ *                      from VCS). See D5 git supervision channel plan.
  */
-export type StateProvenance = "ai-generated" | "observed" | "ai-fallback";
+export type StateProvenance = "ai-generated" | "observed" | "ai-fallback" | "git-supervised";
 
 /** Minimum per-state support (fraction) required to promote to `observed`. */
 export const MIN_SUPPORT = 0.75;
@@ -83,6 +89,22 @@ export interface DiscoveryArtifact {
  */
 export type InvalidationState = Record<string, { invalidatedAt: string }>;
 
+/**
+ * Optional per-state git-supervision proposals keyed by compiled-state ID.
+ *
+ * Populated by the `useGitSupervision` hook from buffered Tauri
+ * `git-supervision` events. When a state ID appears in this map AND the
+ * artifact match was not strong enough to promote to `observed`, the
+ * compile pipeline tags it `git-supervised` instead of falling back to
+ * bare `ai-generated`.
+ *
+ * "Recent" semantics (per Phase 1 of the D5 plan): presence in the map
+ * is recency — the upstream ring buffer prunes old entries (default 256
+ * events), so the consumer hook only re-emits proposals it has actually
+ * received. No second-layer time check is performed here.
+ */
+export type GitProposalState = Record<string, { proposedAt: string; kind: string }>;
+
 /** Metadata attached to a state describing how its provenance was decided. */
 export interface StateProvenanceMeta {
   support?: number;
@@ -91,6 +113,16 @@ export interface StateProvenanceMeta {
   lastObserved?: string;
   /** Only populated when `provenance === "ai-fallback"`. */
   invalidatedAt?: string;
+  /** Only populated when `provenance === "git-supervised"`. ISO-8601. */
+  gitProposedAt?: string;
+  /**
+   * Only populated when `provenance === "git-supervised"`. Carries the
+   * triggering git event kind ("commit" / "branch_switch" / "tag" /
+   * "spec_changed" / "working_tree_drift") so consumers can audit *why*
+   * a state was tagged git-supervised without having to cross-reference
+   * the event ring.
+   */
+  gitProposalKind?: string;
 }
 
 /**
@@ -201,11 +233,17 @@ export interface SpecCompilerInput {
  * @param invalidationState   Optional map of compiled-state-id → invalidation
  *                            timestamp. States invalidated within
  *                            `INVALIDATION_WINDOW_HOURS` force `ai-fallback`.
+ * @param gitProposals        Optional map of compiled-state-id → git
+ *                            supervision proposal metadata. States named
+ *                            here without a strong-enough observed match
+ *                            are tagged `git-supervised` instead of
+ *                            `ai-generated`. See [D5 plan Phase 1 §3.3].
  */
 export function compileStateMachineFromSpecs(
   inputs: SpecCompilerInput[],
   discoveryArtifact?: DiscoveryArtifact,
   invalidationState?: InvalidationState,
+  gitProposals?: GitProposalState,
 ): CompilationResult {
   const warnings: string[] = [];
   const allStates: StateDefinitionWithProvenance[] = [];
@@ -218,6 +256,7 @@ export function compileStateMachineFromSpecs(
     "ai-generated": 0,
     observed: 0,
     "ai-fallback": 0,
+    "git-supervised": 0,
   };
   let specsProcessed = 0;
 
@@ -241,7 +280,12 @@ export function compileStateMachineFromSpecs(
 
       // Compile base state then decide its provenance.
       const baseState = convertState(specState);
-      const promotion = choosePromotion(specState, discoveryArtifact, invalidationState);
+      const promotion = choosePromotion(
+        specState,
+        discoveryArtifact,
+        invalidationState,
+        gitProposals,
+      );
 
       const compiledState: StateDefinitionWithProvenance = {
         ...baseState,
@@ -450,11 +494,24 @@ interface PromotionChoice {
  * Decide a compiled state's provenance given the discovery artifact and
  * any pending invalidation. See the "Merging" table in the observation
  * pipeline plan for the priority order.
+ *
+ * Priority order (top wins):
+ *   1.   recent invalidation → ai-fallback
+ *   2.   artifact match with sufficient support + contrast → observed
+ *   2.5. git supervision proposal (state present in the on-disk spec
+ *        AND named in `gitProposals`) → git-supervised
+ *   3.   default → ai-generated
+ *
+ * The 2.5 lane sits between observed and ai-generated by design: a git
+ * proposal proves the state exists in version control (reproducible,
+ * auditable) but carries no runtime co-occurrence evidence, so it's
+ * weaker than `observed`. See D5 Phase 1 plan §3.3.
  */
 function choosePromotion(
   specState: SpecState,
   artifact: DiscoveryArtifact | undefined,
   invalidationState: InvalidationState | undefined,
+  gitProposals: GitProposalState | undefined,
 ): PromotionChoice {
   // Priority 1: recent invalidation → ai-fallback.
   const invalidation = invalidationState?.[specState.id];
@@ -491,6 +548,22 @@ function choosePromotion(
         },
       };
     }
+  }
+
+  // Priority 2.5: git supervision proposal. The spec state is present
+  // on disk (we wouldn't be compiling it otherwise) and the upstream
+  // git-supervision ring named it — that's "sufficient support" per
+  // Phase 1. Recency is implicit: the consumer hook prunes old entries
+  // before producing the map.
+  const proposal = gitProposals?.[specState.id];
+  if (proposal) {
+    return {
+      provenance: "git-supervised",
+      meta: {
+        gitProposedAt: proposal.proposedAt,
+        gitProposalKind: proposal.kind,
+      },
+    };
   }
 
   // Priority 3: default — keep AI-authored elements.

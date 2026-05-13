@@ -107,14 +107,46 @@ pub fn start_git_watcher(
                     variables.insert("branch".to_string(), details.clone());
                     variables.insert("repo_path".to_string(), repo_path_clone.clone());
 
+                    // Base payload: always populated, even if git2 enrichment fails.
+                    // This preserves the pre-D5-Phase-1 shape so trigger configs
+                    // that depend on the minimal payload continue to work.
+                    let mut event_data = serde_json::json!({
+                        "event": event_type,
+                        "detail": details,
+                        "repo_path": repo_path_clone,
+                    });
+
+                    // D5 Phase 1: enrich `commit` events with libgit2 metadata
+                    // (sha, message, author, timestamp, changed_files). If
+                    // git2 fails for any reason — repo locked, libgit2 error,
+                    // partial commit on disk — we silently fall back to the
+                    // base payload so the supervision channel never breaks
+                    // the existing trigger pipeline.
+                    if event_type == "commit" {
+                        if let Some(commit_meta) = enrich_commit_metadata(&repo_path_clone) {
+                            if let Some(obj) = event_data.as_object_mut() {
+                                for (k, v) in commit_meta.as_object().into_iter().flatten() {
+                                    obj.insert(k.clone(), v.clone());
+                                }
+                            }
+                            // Surface SHA + author into template variables so
+                            // workflow prompts (and supervision payloads) can
+                            // reference {{sha}} / {{author_name}}.
+                            if let Some(sha) = commit_meta.get("sha").and_then(|v| v.as_str()) {
+                                variables.insert("sha".to_string(), sha.to_string());
+                            }
+                            if let Some(author) =
+                                commit_meta.get("author_name").and_then(|v| v.as_str())
+                            {
+                                variables.insert("author_name".to_string(), author.to_string());
+                            }
+                        }
+                    }
+
                     let trigger_event = TriggerEvent {
                         trigger_id: trigger_id_clone.clone(),
                         event_type: format!("git_{}", event_type),
-                        event_data: serde_json::json!({
-                            "event": event_type,
-                            "detail": details,
-                            "repo_path": repo_path_clone,
-                        }),
+                        event_data,
                         variables,
                         chain_depth: 0,
                     };
@@ -167,6 +199,98 @@ pub fn start_git_watcher(
     );
 
     Ok(watcher)
+}
+
+/// Enrich a `commit` event payload with libgit2-derived metadata.
+///
+/// Returns a `serde_json::Value` (object) with keys:
+///   - `sha`: full commit SHA (string)
+///   - `message`: commit message (string, trimmed)
+///   - `author_name`: commit author name (string)
+///   - `author_email`: commit author email (string)
+///   - `timestamp`: commit author timestamp (unix seconds, i64)
+///   - `changed_files`: array of `{path, status}` objects (status is one of
+///     "added" | "modified" | "deleted" | "renamed" | "typechange" | "other")
+///
+/// Returns `None` if the repository can't be opened, HEAD can't be peeled
+/// to a commit, or any other git2 error occurs. Callers should fall back
+/// to the minimal pre-enrichment payload in that case.
+fn enrich_commit_metadata(repo_path: &str) -> Option<serde_json::Value> {
+    let repo = git2::Repository::open(repo_path).ok()?;
+    let head = repo.head().ok()?;
+    let commit = head.peel_to_commit().ok()?;
+
+    let sha = commit.id().to_string();
+    let message = commit.message().unwrap_or("").trim().to_string();
+    let author = commit.author();
+    let author_name = author.name().unwrap_or("").to_string();
+    let author_email = author.email().unwrap_or("").to_string();
+    let timestamp = commit.time().seconds();
+
+    // Compute changed files by diffing this commit's tree against its first
+    // parent's tree. Initial commits (no parents) report every file in the
+    // tree as added. If the diff fails for any reason, omit the field.
+    let changed_files = collect_changed_files(&repo, &commit);
+
+    Some(serde_json::json!({
+        "sha": sha,
+        "message": message,
+        "author_name": author_name,
+        "author_email": author_email,
+        "timestamp": timestamp,
+        "changed_files": changed_files,
+    }))
+}
+
+/// Diff a commit against its first parent (or an empty tree for the initial
+/// commit) and return the resulting per-file `{path, status}` list. Returns
+/// an empty vec on diff failure rather than propagating the error — the
+/// commit payload is still useful without the file list.
+fn collect_changed_files(
+    repo: &git2::Repository,
+    commit: &git2::Commit<'_>,
+) -> Vec<serde_json::Value> {
+    let new_tree = match commit.tree() {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let parent_tree = if commit.parent_count() > 0 {
+        match commit.parent(0).and_then(|p| p.tree()) {
+            Ok(t) => Some(t),
+            Err(_) => return Vec::new(),
+        }
+    } else {
+        None
+    };
+
+    let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for delta in diff.deltas() {
+        let status = match delta.status() {
+            git2::Delta::Added => "added",
+            git2::Delta::Deleted => "deleted",
+            git2::Delta::Modified => "modified",
+            git2::Delta::Renamed => "renamed",
+            git2::Delta::Typechange => "typechange",
+            git2::Delta::Copied => "copied",
+            _ => "other",
+        };
+        // Prefer new_file().path() (post-change); fall back to old_file().path()
+        // for deletions where new_file is empty.
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        out.push(serde_json::json!({ "path": path, "status": status }));
+    }
+    out
 }
 
 /// Read the current branch from .git/HEAD.

@@ -9,9 +9,81 @@ use tauri::Manager;
 use tracing::info;
 
 use crate::config_storage::ConfigStorage;
+use crate::trigger_system::types::WorkflowTrigger;
 use crate::unified_workflow_executor::LoopConfig;
 use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::AppState;
+
+/// Effective action variant produced by evaluating a trigger.
+///
+/// Encoded in the trigger's `workflow_overrides` JSON column (key
+/// `action_type`) so we don't need a schema migration. Older trigger rows
+/// (no `action_type` key) implicitly resolve to
+/// [`ActionType::ExecuteWorkflow`], preserving pre-D5 behavior.
+///
+/// `SupervisionProposal` is the D5 Phase 1 git supervision channel action —
+/// the trigger fires the supervision dispatcher
+/// (`crate::git_supervision::handle_supervision_action`) instead of
+/// spawning a workflow. The `provenance` field is the tag attached to the
+/// resulting `GitSupervisionEvent` and is propagated downstream into the
+/// spec compile pipeline's `provenance` enum.
+#[derive(Debug, Clone)]
+pub enum ActionType {
+    /// Default: spawn the trigger's `workflow_id` via the workflow executor.
+    ExecuteWorkflow,
+    /// D5 Phase 1: record a supervision proposal on the in-process ring
+    /// buffer + emit a Tauri event. Does not spawn a workflow.
+    SupervisionProposal {
+        /// Provenance tag attached to the emitted `GitSupervisionEvent`.
+        /// Phase 1 always supplies `"git-supervised"`.
+        provenance: String,
+    },
+}
+
+impl ActionType {
+    /// Sentinel value used in `workflow_overrides.action_type` to opt a
+    /// trigger row into supervision-proposal dispatch.
+    pub const SUPERVISION_PROPOSAL_TAG: &'static str = "supervision_proposal";
+
+    /// Phase 1 default provenance for `SupervisionProposal` actions when
+    /// the override doesn't supply one explicitly.
+    pub const DEFAULT_SUPERVISION_PROVENANCE: &'static str = "git-supervised";
+
+    /// Derive the effective action from a `WorkflowTrigger`. Reads
+    /// `workflow_overrides.action_type` (and the optional sibling
+    /// `provenance` key); falls back to [`ActionType::ExecuteWorkflow`]
+    /// when either field is absent or malformed.
+    pub fn from_trigger(trigger: &WorkflowTrigger) -> Self {
+        let overrides = match trigger.workflow_overrides.as_ref() {
+            Some(v) => v,
+            None => return ActionType::ExecuteWorkflow,
+        };
+        let action_type = overrides
+            .get("action_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if action_type == Self::SUPERVISION_PROPOSAL_TAG {
+            let provenance = overrides
+                .get("provenance")
+                .and_then(|v| v.as_str())
+                .unwrap_or(Self::DEFAULT_SUPERVISION_PROVENANCE)
+                .to_string();
+            ActionType::SupervisionProposal { provenance }
+        } else {
+            ActionType::ExecuteWorkflow
+        }
+    }
+
+    /// Build the JSON value stored on `WorkflowTrigger.workflow_overrides`
+    /// to mark a trigger as a supervision-proposal row. Used by the
+    /// bootstrap path in `trigger_system::service`.
+    pub fn supervision_overrides_json(provenance: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action_type": Self::SUPERVISION_PROPOSAL_TAG,
+            "provenance": provenance,
+        })
+    }
+}
 
 /// Dependencies needed to spawn triggered workflows.
 pub struct TriggerExecutorDeps {

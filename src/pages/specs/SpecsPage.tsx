@@ -15,7 +15,7 @@
  * 5. Spec-to-workflow pipeline (build verification workflows from specs)
  */
 
-import { useEffect, useCallback, useReducer, useState } from "react";
+import { useEffect, useCallback, useReducer, useState, useMemo, useRef } from "react";
 import { ShieldCheck, FlaskConical, FileJson, X, CheckCircle2, AlertTriangle } from "lucide-react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { useSpecsState } from "./useSpecsState";
@@ -41,6 +41,7 @@ import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machin
 import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compilation";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import { useSpecSync } from "@/hooks/useSpecSync";
+import { useGitSupervision } from "@/hooks/useGitSupervision";
 
 // ============================================================================
 // AI spec-generation flag — persisted via instanceStorage
@@ -344,6 +345,33 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   // Spec sync — batch update all stale specs with AI merge mode
   const specSync = useSpecSync(state.specs, state.addSpec);
 
+  // Git supervision channel (D5 Phase 1) — buffers `git-supervision` Tauri
+  // events and exposes per-state-id proposals to the compile pipeline.
+  // The set of known state IDs comes from the currently-loaded page specs
+  // so path-based event inference can recover state IDs Rust hasn't
+  // already mapped.
+  const knownStateIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const s of state.specs) {
+      if (s.kind !== "page-spec") continue;
+      const cfg = s.config as SpecConfig;
+      const sm = cfg.stateMachine;
+      if (!sm?.states) continue;
+      for (const st of sm.states) {
+        if (st && typeof st.id === "string") ids.add(st.id);
+      }
+    }
+    return ids;
+  }, [state.specs]);
+  const { proposalsByStateId: gitProposals } = useGitSupervision({ knownStateIds });
+
+  // Stash proposals in a ref so the compile callback can read the freshest
+  // map without re-binding (and re-rendering downstream UI) on every event.
+  const gitProposalsRef = useRef(gitProposals);
+  useEffect(() => {
+    gitProposalsRef.current = gitProposals;
+  }, [gitProposals]);
+
   // Triage resolution context — set when user clicks "Update Spec" in SpecTriageView
   const [triageContext, setTriageContext] = useState<{
     specId: string;
@@ -536,13 +564,21 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     ],
   );
 
-  // Compile all specs' stateMachine sections into a runtime state machine
+  // Compile all specs' stateMachine sections into a runtime state machine.
+  // Threads git-supervision proposals through so states named by recent
+  // git events are tagged `git-supervised` rather than `ai-generated`
+  // (see D5 plan §3.3 priority 2.5).
   const handleCompileStateMachine = useCallback(() => {
     const inputs = state.specs.map((s) => ({
       specId: s.specId,
       config: s.config as SpecConfig,
     }));
-    const compilation = compileStateMachineFromSpecs(inputs);
+    const compilation = compileStateMachineFromSpecs(
+      inputs,
+      undefined,
+      undefined,
+      gitProposalsRef.current,
+    );
 
     if (!compilation.compiled) {
       // Quarantined — persist the record and refuse to load into the engine.

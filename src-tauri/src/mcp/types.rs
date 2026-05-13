@@ -252,6 +252,12 @@ pub struct ApiState {
     /// responses. The `ui-bridge:evaluate-response` Tauri listener in
     /// `mcp_api.rs` fires the sender on arrival.
     pub ui_bridge_evaluate_store: Arc<crate::ui_bridge_evaluate::EvaluateRequestStore>,
+    /// D5 Phase 1 Git Supervision Channel — bounded in-process ring buffer
+    /// of recent `GitSupervisionEvent`s appended by the trigger system's
+    /// `SupervisionProposal` dispatch path. Exposed via
+    /// `GET /git-supervision/recent-events` for diagnostics and via the
+    /// `git-supervision` Tauri event channel for the frontend hook.
+    pub supervision_state: crate::git_supervision::SupervisionState,
 }
 
 /// Response for API endpoints

@@ -58,6 +58,11 @@ mod flow_control;
 mod follow_up;
 mod fs_atomic;
 mod git_status_subset;
+// D5 Phase 1 — Git Supervision Channel. Consumes git/spec events from the
+// existing `trigger_system` (via the `SupervisionProposal` action variant)
+// and routes them into a bounded in-process ring buffer + Tauri event
+// channel for the frontend supervision hook.
+mod git_supervision;
 mod graphql;
 mod health_monitor;
 mod heartbeat;

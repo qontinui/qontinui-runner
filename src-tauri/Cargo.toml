@@ -109,6 +109,13 @@ flate2 = "1.0"
 # `spec_api::storage` so the Spec API still answers /spec/page/<id>.
 include_dir = "0.7"
 notify = "8"
+# libgit2 bindings for git supervision channel (D5 Phase 1).
+# Used by `trigger_system::watchers::git_watcher` to populate commit
+# metadata (sha, message, author, changed files) on `commit` events.
+# Default features include `https`/`ssh` transports that the watcher
+# doesn't need — kept on to match the simplest install path. Binary-size
+# cost is acceptable per the plan §3.5 decision.
+git2 = "0.20"
 glob = "0.3"
 petgraph = "0.6"
 imageproc = "0.25"

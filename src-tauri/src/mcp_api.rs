@@ -515,6 +515,8 @@ pub fn create_router(
         ios_transport: Arc::new(crate::mcp::transport::ios::IosTransport::new()),
         ui_bridge_invoke_store: Arc::new(crate::ui_bridge_invoke::InvokeRequestStore::new()),
         ui_bridge_evaluate_store: Arc::new(crate::ui_bridge_evaluate::EvaluateRequestStore::new()),
+        // D5 Phase 1 Git Supervision Channel — bounded ring + Tauri emitter.
+        supervision_state: crate::git_supervision::SupervisionState::new(),
     });
 
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
@@ -1558,6 +1560,8 @@ pub fn create_router(
         .merge(crate::mcp::file_browser::routes())
         .merge(crate::mcp::file_registry::routes())
         .merge(crate::mcp::findings_api::routes())
+        // D5 Phase 1 — Git Supervision Channel diagnostic endpoint.
+        .merge(crate::mcp::git_supervision_api::routes())
         .merge(crate::mcp::debug_builder_prompt::routes())
         .merge(crate::mcp::generation_rules_api::routes())
         .merge(crate::mcp::meta_optimizer_api::routes())

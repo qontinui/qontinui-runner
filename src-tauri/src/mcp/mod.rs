@@ -60,6 +60,7 @@ pub mod file_registry;
 pub mod findings_api;
 pub mod generation_rules_api;
 pub mod generator_eval;
+pub mod git_supervision_api;
 pub mod goals;
 pub mod graph_api;
 pub mod gui_config;
