@@ -1356,6 +1356,41 @@ ALTER SEQUENCE cloud.subscriptions_id_seq OWNED BY cloud.subscriptions.id;
 
 
 --
+-- Name: build_events; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.build_events (
+    build_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    machine_id uuid NOT NULL,
+    repo text NOT NULL,
+    started_at timestamp with time zone NOT NULL,
+    ended_at timestamp with time zone,
+    result text,
+    duration_ms bigint,
+    slot integer,
+    requester_id text,
+    head_sha text,
+    error_summary text,
+    error_file text,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL
+);
+
+
+--
+-- Name: COLUMN build_events.result; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.build_events.result IS 'success | failure | cancelled | NULL while running';
+
+
+--
+-- Name: COLUMN build_events.slot; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.build_events.slot IS 'supervisor build pool slot id (0..N)';
+
+
+--
 -- Name: ci_baselines; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -1407,7 +1442,8 @@ CREATE TABLE coord.coordinator_decisions (
     resolved boolean DEFAULT false NOT NULL,
     resolution text,
     resolved_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    observation_hash text DEFAULT ''::text NOT NULL
 );
 
 
@@ -1422,6 +1458,24 @@ CREATE TABLE coord.coordinator_leader (
     acquired_at timestamp with time zone DEFAULT now() NOT NULL,
     renewed_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT coordinator_leader_singleton CHECK ((id = true))
+);
+
+
+--
+-- Name: coordinator_shadow_decisions; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.coordinator_shadow_decisions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    instance_id text NOT NULL,
+    iteration bigint NOT NULL,
+    observation_hash text NOT NULL,
+    rule text NOT NULL,
+    action text NOT NULL,
+    target_id text,
+    reasoning text NOT NULL,
+    would_have_acted boolean NOT NULL,
+    taken_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -11294,6 +11348,14 @@ ALTER TABLE ONLY cloud.subscriptions
 
 
 --
+-- Name: build_events build_events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.build_events
+    ADD CONSTRAINT build_events_pkey PRIMARY KEY (build_id);
+
+
+--
 -- Name: ci_baselines ci_baselines_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -11326,6 +11388,22 @@ ALTER TABLE ONLY coord.coordinator_leader
 
 
 --
+-- Name: coordinator_shadow_decisions coordinator_shadow_decisions_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.coordinator_shadow_decisions
+    ADD CONSTRAINT coordinator_shadow_decisions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: correlation_topics correlation_topics_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.correlation_topics
+    ADD CONSTRAINT correlation_topics_pkey PRIMARY KEY (topic);
+
+
+--
 -- Name: events events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -11355,14 +11433,6 @@ ALTER TABLE ONLY coord.machine_status
 
 ALTER TABLE ONLY coord.machines
     ADD CONSTRAINT machines_pkey PRIMARY KEY (machine_id);
-
-
---
--- Name: correlation_topics pk_correlation_topics; Type: CONSTRAINT; Schema: coord; Owner: -
---
-
-ALTER TABLE ONLY coord.correlation_topics
-    ADD CONSTRAINT pk_correlation_topics PRIMARY KEY (topic);
 
 
 --
@@ -14775,6 +14845,27 @@ CREATE INDEX idx_subscriptions_stripe_subscription ON cloud.subscriptions USING 
 
 
 --
+-- Name: build_events_machine_idx; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX build_events_machine_idx ON coord.build_events USING btree (machine_id, started_at DESC);
+
+
+--
+-- Name: build_events_recent_idx; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX build_events_recent_idx ON coord.build_events USING btree (started_at DESC) WHERE (result IS NOT NULL);
+
+
+--
+-- Name: build_events_repo_idx; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX build_events_repo_idx ON coord.build_events USING btree (repo, started_at DESC);
+
+
+--
 -- Name: idx_cd_created; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -14835,6 +14926,27 @@ CREATE INDEX idx_claims_audit_resource ON coord.claims_audit USING btree (claim_
 --
 
 CREATE INDEX idx_correlation_topics_id ON coord.correlation_topics USING btree (correlation_id);
+
+
+--
+-- Name: idx_csd_instance; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_csd_instance ON coord.coordinator_shadow_decisions USING btree (instance_id, taken_at DESC);
+
+
+--
+-- Name: idx_csd_obs_hash; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_csd_obs_hash ON coord.coordinator_shadow_decisions USING btree (observation_hash);
+
+
+--
+-- Name: idx_csd_taken_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_csd_taken_at ON coord.coordinator_shadow_decisions USING btree (taken_at DESC);
 
 
 --
@@ -21604,6 +21716,14 @@ ALTER TABLE ONLY auth.usage_metrics
 
 ALTER TABLE ONLY cloud.subscriptions
     ADD CONSTRAINT subscriptions_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: build_events build_events_machine_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.build_events
+    ADD CONSTRAINT build_events_machine_id_fkey FOREIGN KEY (machine_id) REFERENCES coord.machines(machine_id) ON DELETE CASCADE;
 
 
 --
