@@ -5,10 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Generate `restate_sdk::serde::Serialize` and `Deserialize` impls for
-/// a type that already derives `serde::Serialize + serde::Deserialize`.
-/// Restate's serde traits are distinct from serde's (to allow non-serde
-/// serialization formats like protobuf), so we bridge them with JSON.
+/// Generate `restate_sdk::serde::Serialize`, `Deserialize`, and
+/// `PayloadMetadata` impls for a type that already derives
+/// `serde::Serialize + serde::Deserialize`. Restate's serde traits are
+/// distinct from serde's (to allow non-serde serialization formats like
+/// protobuf), so we bridge them with JSON. `PayloadMetadata` is required
+/// for any type used directly as a handler input/output in restate-sdk 0.10+
+/// — the default `json_schema()` returns an empty object schema which is
+/// fine for our JSON-on-the-wire types.
 ///
 /// Only usable when the `restate` Cargo feature is enabled (which is the
 /// default — see `Cargo.toml:[features]`).
@@ -27,6 +31,7 @@ macro_rules! impl_restate_serde_via_json {
                 serde_json::from_slice(bytes)
             }
         }
+        impl restate_sdk::serde::PayloadMetadata for $ty {}
     };
 }
 
@@ -156,9 +161,11 @@ pub struct ApprovalPendingEvent {
 // ---------------------------------------------------------------------------
 // Restate SDK serde impls.
 //
-// Restate 0.4 defines its own Serialize/Deserialize traits (distinct from
+// Restate defines its own Serialize/Deserialize traits (distinct from
 // serde's) so that non-serde formats (protobuf, etc.) can plug in. Our types
-// are JSON across the boundary, so we bridge via serde_json.
+// are JSON across the boundary, so we bridge via serde_json. Restate 0.10
+// also requires `PayloadMetadata` for any type used directly as a handler
+// input/output payload; the macro implements all three.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "restate")]

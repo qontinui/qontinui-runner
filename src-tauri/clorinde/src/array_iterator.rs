@@ -2,7 +2,7 @@
 
 use super::fallible_iterator::FallibleIterator;
 use super::utils::escape_domain;
-use postgres_protocol::types::{array_from_sql, ArrayValues};
+use postgres_protocol::types::{ArrayValues, array_from_sql};
 use postgres_types::{FromSql, Kind, Type};
 use std::fmt::Debug;
 use std::marker::PhantomData;

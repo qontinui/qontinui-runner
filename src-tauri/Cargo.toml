@@ -130,10 +130,11 @@ image = { version = "0.25", default-features = false, features = ["png", "webp"]
 rmcp = "0.1"
 
 # Restate durable execution (optional — behind `restate` feature flag)
-restate-sdk = { version = "0.4", optional = true }
+restate-sdk = { version = "0.10", optional = true }
 # Required when the `restate` feature is on so local types can implement
-# `restate_sdk::serde::Serialize`/`Deserialize` (whose signatures use
-# `bytes::Bytes`). restate-sdk 1.10 is the compatible range.
+# `restate_sdk::serde::Serialize`/`Deserialize` — the trait methods take/return
+# `bytes::Bytes` (see `src/restate/types.rs::impl_restate_serde_via_json!`).
+# Restate-sdk 0.10 still depends on bytes ^1.11, so this stays in sync.
 bytes = "1"
 
 # Code analysis (tree-sitter for parsing)

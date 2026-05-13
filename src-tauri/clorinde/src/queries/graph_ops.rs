@@ -35,7 +35,7 @@ pub struct InsertStepFindingLinkParams<
     pub step_index: i32,
     pub finding_id: T4,
     pub link_type: T5,
-    pub confidence: f32,
+    pub confidence: f64,
 }
 #[derive(Debug)]
 pub struct GetFindingsForStepParams<T1: crate::StringSql, T2: crate::StringSql> {
@@ -200,7 +200,7 @@ pub struct StepFindingLinkRow {
     pub step_index: i32,
     pub finding_id: String,
     pub link_type: String,
-    pub confidence: f32,
+    pub confidence: f64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
 }
 pub struct StepFindingLinkRowBorrowed<'a> {
@@ -210,7 +210,7 @@ pub struct StepFindingLinkRowBorrowed<'a> {
     pub step_index: i32,
     pub finding_id: &'a str,
     pub link_type: &'a str,
-    pub confidence: f32,
+    pub confidence: f64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
 }
 impl<'a> From<StepFindingLinkRowBorrowed<'a>> for StepFindingLinkRow {
@@ -1246,17 +1246,17 @@ impl InsertWorkflowVersionStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,
@@ -1413,7 +1413,7 @@ impl InsertStepFindingLinkStmt {
         step_index: &'a i32,
         finding_id: &'a T4,
         link_type: &'a T5,
-        confidence: &'a f32,
+        confidence: &'a f64,
     ) -> Result<u64, tokio_postgres::Error> {
         client
             .execute(
@@ -1432,14 +1432,14 @@ impl InsertStepFindingLinkStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,
@@ -1640,18 +1640,18 @@ impl InsertStepProvenanceStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
-        T9: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+    T9: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,
@@ -1861,15 +1861,15 @@ impl InsertPipelineEventStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,
@@ -2046,16 +2046,16 @@ impl InsertRuleInfluenceStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,
@@ -2223,16 +2223,16 @@ impl UpsertCrossRunPatternStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,

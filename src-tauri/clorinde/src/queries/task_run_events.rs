@@ -1967,20 +1967,20 @@ impl CreateTaskRunEventStmt {
     }
 }
 impl<
-        'c,
-        'a,
-        's,
-        C: GenericClient,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
-        T9: crate::StringSql,
-    >
+    'c,
+    'a,
+    's,
+    C: GenericClient,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+    T9: crate::StringSql,
+>
     crate::client::async_::Params<
         'c,
         'a,
@@ -2369,15 +2369,15 @@ impl CreateTaskRunScreenshotStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,
@@ -2598,20 +2598,20 @@ impl CreateTaskRunPlaywrightResultStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
-        T9: crate::StringSql,
-        T10: crate::StringSql,
-        T11: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+    T9: crate::StringSql,
+    T10: crate::StringSql,
+    T11: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,
@@ -2887,25 +2887,25 @@ impl CreateTaskRunApiRequestStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
-        T9: crate::StringSql,
-        T10: crate::StringSql,
-        T11: crate::StringSql,
-        T12: crate::StringSql,
-        T13: crate::StringSql,
-        T14: crate::StringSql,
-        T15: crate::StringSql,
-        T16: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+    T9: crate::StringSql,
+    T10: crate::StringSql,
+    T11: crate::StringSql,
+    T12: crate::StringSql,
+    T13: crate::StringSql,
+    T14: crate::StringSql,
+    T15: crate::StringSql,
+    T16: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,
@@ -3188,19 +3188,19 @@ impl CreateTaskRunAwasStepStmt {
     }
 }
 impl<
-        'a,
-        C: GenericClient + Send + Sync,
-        T1: crate::StringSql,
-        T2: crate::StringSql,
-        T3: crate::StringSql,
-        T4: crate::StringSql,
-        T5: crate::StringSql,
-        T6: crate::StringSql,
-        T7: crate::StringSql,
-        T8: crate::StringSql,
-        T9: crate::StringSql,
-        T10: crate::StringSql,
-    >
+    'a,
+    C: GenericClient + Send + Sync,
+    T1: crate::StringSql,
+    T2: crate::StringSql,
+    T3: crate::StringSql,
+    T4: crate::StringSql,
+    T5: crate::StringSql,
+    T6: crate::StringSql,
+    T7: crate::StringSql,
+    T8: crate::StringSql,
+    T9: crate::StringSql,
+    T10: crate::StringSql,
+>
     crate::client::async_::Params<
         'a,
         'a,

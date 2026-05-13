@@ -5,8 +5,8 @@ pub use generic_client::GenericClient;
 mod deadpool;
 mod generic_client;
 use tokio_postgres::{
-    types::{BorrowToSql, ToSql},
     Error, Row, RowStream, Statement,
+    types::{BorrowToSql, ToSql},
 };
 /// This trait allows you to bind parameters to a query using a single
 /// struct, rather than passing each bind parameter as a function parameter.
