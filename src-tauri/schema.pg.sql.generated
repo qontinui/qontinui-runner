@@ -1778,6 +1778,7 @@ CREATE TABLE coord.tasks (
     completion_report jsonb,
     completion_source text,
     assignment_brief_extras jsonb,
+    identity_hash text,
     CONSTRAINT tasks_done_requires_report CHECK (((status <> 'done'::text) OR ((completion_report IS NOT NULL) AND (completion_source IS NOT NULL))))
 );
 
@@ -15171,6 +15172,13 @@ CREATE INDEX idx_tasks_phase ON coord.tasks USING btree (plan_id, phase_name, se
 --
 
 CREATE INDEX idx_tasks_plan ON coord.tasks USING btree (plan_id);
+
+
+--
+-- Name: idx_tasks_plan_identity_hash; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_tasks_plan_identity_hash ON coord.tasks USING btree (plan_id, identity_hash) WHERE (identity_hash IS NOT NULL);
 
 
 --
