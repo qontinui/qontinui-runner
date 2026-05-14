@@ -304,7 +304,7 @@ fn is_empty_criterion(c: &IrElementCriteria) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec_api::types::{IrAssertion, IrAssertionTarget, IrPageSpec, IrState};
+    use qontinui_types::ir::{IrAssertion, IrAssertionTarget, IrPageSpec, IrState};
     use serde_json::json;
 
     // ------------------------------------------------------------------------
