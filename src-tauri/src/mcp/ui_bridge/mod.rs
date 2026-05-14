@@ -677,6 +677,7 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/invoke/{}"),
             ("POST", "/ui-bridge/pong"),
             ("POST", "/ui-bridge/ipc-response"),
+            ("POST", "/ui-bridge/vision/mutation-occurred"),
             ("POST", "/ui-bridge/batch"),
             ("POST", "/ui-bridge/control/batch"),
             ("POST", "/ui-bridge/render-log"),
