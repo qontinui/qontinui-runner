@@ -26,7 +26,9 @@ use tracing::info;
 use crate::mcp::types::{ApiResponse, ApiState};
 
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
-use super::{ipc_handler_get, ipc_handler_path_get, ipc_handler_post};
+use super::{
+    ipc_handler_get, ipc_handler_path_get, ipc_handler_post, ipc_handler_post_bumps_mutation,
+};
 
 // ============================================================================
 // Undo / Redo
@@ -116,7 +118,14 @@ pub async fn ui_bridge_run_spec_handler(
 // ============================================================================
 
 // Runner-specific: tab navigation and storage management
-ipc_handler_post!(ui_bridge_navigate_tab_handler, "navigate_tab");
+// navigate_tab + scroll_page can change rendered pixels — bump
+// vision_mutation_id so subsequent `/vision/capture` calls re-render
+// instead of hitting a stale cache entry. clear_storage and
+// annotations_import are excluded: storage-only mutations don't
+// directly affect rendered pixels, and annotation imports go through
+// the React layer whose own DOM changes will be picked up by the
+// frontend mutationOccurred signal.
+ipc_handler_post_bumps_mutation!(ui_bridge_navigate_tab_handler, "navigate_tab");
 ipc_handler_post!(ui_bridge_clear_storage_handler, "clear_storage");
 
 // Component state
@@ -126,8 +135,8 @@ ipc_handler_path_get!(
     "componentId"
 );
 
-// Page scroll
-ipc_handler_post!(ui_bridge_scroll_page_handler, "scroll_page");
+// Page scroll: changes the viewport content → rendered pixels change.
+ipc_handler_post_bumps_mutation!(ui_bridge_scroll_page_handler, "scroll_page");
 
 // Performance entries
 ipc_handler_get!(

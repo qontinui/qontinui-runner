@@ -235,6 +235,26 @@ macro_rules! ipc_handler_post {
     };
 }
 
+/// Variant of [`ipc_handler_post`] that bumps `vision_mutation_id` before
+/// dispatching the IPC. Use for handlers whose action can change rendered
+/// pixels but that you'd otherwise generate via the plain macro (so the
+/// 3-line handler body stays uniform). The bump uses Relaxed ordering —
+/// monotonic counter, no cross-thread happens-before constraints.
+macro_rules! ipc_handler_post_bumps_mutation {
+    ($fn_name:ident, $ipc_type:expr) => {
+        pub async fn $fn_name(
+            State(state): State<Arc<ApiState>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+            $crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
+            let payload = serde_json::json!({ "params": body });
+            $crate::mcp::ui_bridge::request::wrap_ipc_result(
+                ui_bridge_request_sync(&state, $ipc_type, payload).await,
+            )
+        }
+    };
+}
+
 macro_rules! ipc_handler_path_get {
     ($fn_name:ident, $ipc_type:expr, $param_name:expr) => {
         pub async fn $fn_name(
@@ -280,6 +300,7 @@ pub(crate) use ipc_handler_get;
 pub(crate) use ipc_handler_path_get;
 pub(crate) use ipc_handler_path_post;
 pub(crate) use ipc_handler_post;
+pub(crate) use ipc_handler_post_bumps_mutation;
 
 // Per-family submodules host the rest of the macro-generated handlers:
 //   - state_machine.rs   (states/, state/, state-groups/, transitions/)
