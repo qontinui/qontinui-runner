@@ -800,19 +800,22 @@ pub const SPEC_FILE_SUPERVISION_DEFAULT_NAME: &str = "__spec-file-supervision-de
 /// exist. Idempotent — re-running it after a restart is a no-op.
 ///
 /// The git-event row points at the runner's own working tree (via
-/// `crate::mcp::shared::current_project_path`) and watches `commit`,
+/// `crate::mcp::shared::current_runner_path`) and watches `commit`,
 /// `branch_switch`, and `tag` events. The spec-file row uses the
-/// `FileWatch` trigger type on the `specs/` directory restricted to
-/// `*.uibridge.json`.
+/// `FileWatch` trigger type on the runner's `specs/` directory restricted
+/// to `*.uibridge.json`. Both paths target the runner checkout itself
+/// (not the umbrella workspace_root from `current_project_path`) because
+/// the umbrella isn't a git repo and contains no `specs/` dir — defaults
+/// pointing there register but fail to attach a watcher.
 ///
 /// Both rows are marked `enabled: true` initially. If the user disables
 /// them via the trigger UI, this function won't re-enable them.
 async fn bootstrap_default_supervision_triggers(deps: &TriggerExecutorDeps) -> Result<(), String> {
-    let repo_path = match crate::mcp::shared::current_project_path() {
+    let repo_path = match crate::mcp::shared::current_runner_path() {
         Some(p) => p,
         None => {
             return Err(
-                "current_project_path() returned None; cannot bootstrap supervision triggers"
+                "current_runner_path() returned None; cannot bootstrap supervision triggers"
                     .to_string(),
             );
         }

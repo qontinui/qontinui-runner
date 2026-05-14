@@ -283,6 +283,29 @@ pub fn current_project_path() -> Option<String> {
         .map(|(root, _, _)| root.to_string_lossy().to_string())
 }
 
+/// Get the runner's own checkout directory (the qontinui-runner repo root,
+/// parent of `src-tauri/`). Unlike [`current_project_path`] which returns
+/// the umbrella workspace_root containing all sibling repos, this returns a
+/// directory that is itself a git repo and that holds the runner's
+/// `specs/` tree — the right default for self-supervision triggers.
+///
+/// Returns `None` only if the runner's exe path doesn't sit under a
+/// recognizable runner checkout (effectively never in dev/build/bundled
+/// layouts).
+pub fn current_runner_path() -> Option<String> {
+    let exe_path = std::env::current_exe().ok()?;
+    let mut current = exe_path.as_path();
+    loop {
+        let parent = current.parent()?;
+        if parent.join("src-tauri").exists()
+            || parent.file_name().is_some_and(|n| n == "qontinui-runner")
+        {
+            return Some(parent.to_string_lossy().to_string());
+        }
+        current = parent;
+    }
+}
+
 /// Get the monorepo root directory (parent of qontinui-runner).
 /// This is the directory containing all sibling repos.
 pub fn get_monorepo_root() -> Option<String> {
