@@ -133,7 +133,10 @@ mod tests {
             plugin_version: None,
             status: None,
         });
-        assert_eq!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
+        assert_eq!(
+            hash_ir_page_spec(&a).unwrap(),
+            hash_ir_page_spec(&b).unwrap()
+        );
     }
 
     #[test]
@@ -156,7 +159,10 @@ mod tests {
             plugin_version: None,
             status: None,
         });
-        assert_ne!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
+        assert_ne!(
+            hash_ir_page_spec(&a).unwrap(),
+            hash_ir_page_spec(&b).unwrap()
+        );
     }
 
     #[test]
@@ -215,7 +221,10 @@ mod tests {
             }),
             cross_refs: None,
         });
-        assert_eq!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
+        assert_eq!(
+            hash_ir_page_spec(&a).unwrap(),
+            hash_ir_page_spec(&b).unwrap()
+        );
     }
 
     #[test]
@@ -225,6 +234,9 @@ mod tests {
         // demonstrates that explicitly by hashing the same spec twice.
         let a = empty_spec();
         let b = empty_spec();
-        assert_eq!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
+        assert_eq!(
+            hash_ir_page_spec(&a).unwrap(),
+            hash_ir_page_spec(&b).unwrap()
+        );
     }
 }
