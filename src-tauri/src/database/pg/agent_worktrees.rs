@@ -57,13 +57,18 @@ pub struct AgentWorktreeRow {
     pub worktree_path: String,
     pub status: String,
     pub intent: Option<String>,
+    /// Per Phase 1B (§4.10): file/glob paths the agent declared at
+    /// allocation time. Populated by agent input, falling back to LLM
+    /// derivation from `intent`; `None` for pre-1B rows.
+    pub declared_overlap_paths: Option<Vec<String>>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const SELECT_COLS: &str = r#"
     agent_id::text, machine_id::text, repo, branch, parent_sha,
-    worktree_path, status, intent, created_at::text, updated_at::text
+    worktree_path, status, intent, declared_overlap_paths,
+    created_at::text, updated_at::text
 "#;
 
 fn row_to_aw(r: &tokio_postgres::Row) -> AgentWorktreeRow {
@@ -76,8 +81,9 @@ fn row_to_aw(r: &tokio_postgres::Row) -> AgentWorktreeRow {
         worktree_path: r.get(5),
         status: r.get(6),
         intent: r.get(7),
-        created_at: r.get(8),
-        updated_at: r.get(9),
+        declared_overlap_paths: r.get(8),
+        created_at: r.get(9),
+        updated_at: r.get(10),
     }
 }
 
@@ -137,6 +143,12 @@ impl PgDb {
             CREATE INDEX IF NOT EXISTS idx_agent_worktrees_machine_status
                 ON coord.agent_worktrees (machine_id, status)
                 WHERE machine_id IS NOT NULL;
+
+            ALTER TABLE coord.agent_worktrees
+                ADD COLUMN IF NOT EXISTS declared_overlap_paths TEXT[];
+
+            CREATE INDEX IF NOT EXISTS idx_agent_worktrees_overlap_paths_gin
+                ON coord.agent_worktrees USING gin (declared_overlap_paths);
             "#,
         )
         .await
