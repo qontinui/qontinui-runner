@@ -19,6 +19,7 @@
 //!
 //! Entry point: [`routes`]. Merge into the main router from `mcp_api.rs`.
 
+pub mod distinctness;
 pub mod events;
 pub mod handlers;
 pub mod hashing;
@@ -51,5 +52,6 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/spec/derive", post(handlers::post_derive))
         .route("/spec/diff", get(handlers::get_diff))
         .route("/spec/author", post(handlers::post_author))
+        .route("/spec/validate", post(handlers::post_validate))
         .route("/spec/subscribe", get(handlers::get_subscribe))
 }

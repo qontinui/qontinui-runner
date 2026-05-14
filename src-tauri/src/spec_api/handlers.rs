@@ -29,11 +29,22 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::mcp::types::ApiState;
 
+use super::distinctness;
 use super::events::{self, SpecChanged};
 use super::projection::project_ir_to_bundled_page;
 use super::responses::{EmptyOk, QueryResult, SpecError};
 use super::storage::{self, ReadWithinRootError};
 use super::types::IrPageSpec;
+use qontinui_types::spec_check::SpecValidation;
+
+/// Feature flag for `POST /spec/derive`: when set, the endpoint hard-stops
+/// on distinctness violations. Default off for the first 30 days post-ship
+/// per Plan 04 Step 5 — gives the corpus cleanup pass (Path A) runway.
+fn enforce_distinctness_on_derive() -> bool {
+    std::env::var("QONTINUI_SPEC_DISTINCTNESS_ENFORCE_ON_DERIVE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 // ---------------------------------------------------------------------------
 // GET /spec/get?path=<rel>
@@ -277,7 +288,21 @@ pub(crate) fn build_list_response(root: &std::path::Path) -> Response {
         let Some(projection) = projection else {
             continue;
         };
-        specs.push(json!({
+        // Plan 04 Step 7 — surface the landed `SpecValidation` rollup on each
+        // entry when the IR fails distinctness. Clean specs omit the field
+        // entirely so consumers don't pay a deserialization cost.
+        let validation: Option<SpecValidation> = match storage::read_ir(root, id) {
+            Ok(Some(doc)) => {
+                let r = distinctness::report(&doc);
+                if r.ok {
+                    None
+                } else {
+                    Some(distinctness::to_spec_validation(id, &r))
+                }
+            }
+            _ => None,
+        };
+        let mut entry = json!({
             "specId": id,
             "appName": "Qontinui Runner",
             "config": {
@@ -286,7 +311,11 @@ pub(crate) fn build_list_response(root: &std::path::Path) -> Response {
                 "groups": projection.get("groups").cloned().unwrap_or(Value::Array(Vec::new())),
                 "metadata": projection.get("metadata").cloned().unwrap_or(Value::Null),
             }
-        }));
+        });
+        if let Some(v) = validation {
+            entry["validation"] = serde_json::to_value(v).unwrap_or(Value::Null);
+        }
+        specs.push(entry);
     }
 
     (StatusCode::OK, Json(json!({ "ok": true, "specs": specs }))).into_response()
@@ -425,8 +454,22 @@ pub async fn post_derive(
     State(_state): State<Arc<ApiState>>,
     Json(body): Json<DeriveBody>,
 ) -> Response {
-    let root = storage::resolve_specs_root();
-    let doc = match storage::read_ir(&root, &body.page_id) {
+    build_derive_response(
+        &storage::resolve_specs_root(),
+        body,
+        enforce_distinctness_on_derive(),
+    )
+}
+
+/// Inner implementation of `post_derive` parameterized by the storage root
+/// and the distinctness-enforce toggle (tests pass the flag explicitly to
+/// avoid env-var races under cargo's parallel test runner).
+pub(crate) fn build_derive_response(
+    root: &std::path::Path,
+    body: DeriveBody,
+    enforce_distinctness: bool,
+) -> Response {
+    let doc = match storage::read_ir(root, &body.page_id) {
         Ok(Some(d)) => d,
         Ok(None) => {
             return (
@@ -449,6 +492,24 @@ pub async fn post_derive(
                 .into_response();
         }
     };
+
+    // Plan 04 Step 5 — feature-flagged distinctness enforcement on derive.
+    // Default off; flipped to on after the corpus cleanup pass (Step 9) lands.
+    if enforce_distinctness {
+        if let Err(report) = distinctness::validate(&doc) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(SpecError::with_detail(
+                    "spec-validation-failed",
+                    json!({
+                        "pageId": body.page_id,
+                        "violations": report.violations,
+                    }),
+                )),
+            )
+                .into_response();
+        }
+    }
 
     match body.derivation.as_str() {
         "incomingTransitions" => {
@@ -556,6 +617,13 @@ pub async fn post_author(
     State(_state): State<Arc<ApiState>>,
     Json(doc): Json<IrPageSpec>,
 ) -> Response {
+    build_author_response(&storage::resolve_specs_root(), doc)
+}
+
+/// Inner implementation of `post_author` parameterized by the storage root
+/// so tests can exercise the validation + write path without constructing
+/// an `ApiState`.
+pub(crate) fn build_author_response(root: &std::path::Path, doc: IrPageSpec) -> Response {
     if doc.id.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -573,8 +641,22 @@ pub async fn post_author(
         )
             .into_response();
     }
-    let root = storage::resolve_specs_root();
-    if let Err(e) = std::fs::create_dir_all(&root) {
+    // Plan 04 Step 5 — hard-stop on distinctness violations. 422 per RFC 4918
+    // §11.2 (semantic rejection, not a parse failure).
+    if let Err(report) = distinctness::validate(&doc) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(SpecError::with_detail(
+                "spec-validation-failed",
+                json!({
+                    "pageId": doc.id,
+                    "violations": report.violations,
+                }),
+            )),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::create_dir_all(root) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(SpecError::with_detail(
@@ -584,7 +666,7 @@ pub async fn post_author(
         )
             .into_response();
     }
-    let projection_path = match storage::write_ir_and_regenerate(&root, &doc) {
+    let projection_path = match storage::write_ir_and_regenerate(root, &doc) {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -636,4 +718,67 @@ pub async fn get_subscribe(
 /// Smoke endpoint — used to confirm the spec_api router is mounted.
 pub async fn get_health() -> Response {
     (StatusCode::OK, Json(EmptyOk::new("spec-api-mounted"))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /spec/validate  (Plan 04 Step 6)
+// ---------------------------------------------------------------------------
+
+/// Diagnostic body: caller supplies either an inline `document` or a `pageId`
+/// pointing at an on-disk IR. The endpoint always returns 200 OK with the
+/// full `DistinctnessReport` (the 422 hard-stop contract is reserved for
+/// persistence endpoints — `/spec/validate` is a read-only diagnostic).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateBody {
+    #[serde(default)]
+    pub document: Option<IrPageSpec>,
+    #[serde(default)]
+    pub page_id: Option<String>,
+}
+
+pub async fn post_validate(
+    State(_state): State<Arc<ApiState>>,
+    Json(body): Json<ValidateBody>,
+) -> Response {
+    build_validate_response(&storage::resolve_specs_root(), body)
+}
+
+/// Inner implementation of `post_validate` parameterized by the storage root.
+pub(crate) fn build_validate_response(root: &std::path::Path, body: ValidateBody) -> Response {
+    let doc: IrPageSpec = match (body.document, body.page_id.as_deref()) {
+        (Some(d), _) => d,
+        (None, Some(id)) => match storage::read_ir(root, id) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(SpecError::with_detail(
+                        "page-not-found",
+                        json!({ "pageId": id }),
+                    )),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SpecError::with_detail(
+                        "ir-read-failed",
+                        json!({ "pageId": id, "error": e }),
+                    )),
+                )
+                    .into_response();
+            }
+        },
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SpecError::new("missing-document-or-page-id")),
+            )
+                .into_response();
+        }
+    };
+    let report = distinctness::report(&doc);
+    (StatusCode::OK, Json(report)).into_response()
 }
