@@ -37,6 +37,7 @@ use sha2::Digest;
 use tracing::{debug, info, warn};
 
 use super::screenshots::lookup_element_normalized_rect;
+use super::vision_ai::{self, OcrClient, VlmClient};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
@@ -282,6 +283,71 @@ pub struct DiffResponse {
     pub pixel_delta_ratio: f64,
     /// Bounding rectangle of all changed pixels. Naive single-rect for Phase 2.
     pub changed_regions: Vec<RegionRequest>,
+}
+
+/// `POST /ui-bridge/vision/extract` request shape (plan §3.2). OCR
+/// extraction — image goes to a model, only text + bbox come back.
+/// No pixels in the response.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractRequest {
+    #[serde(default)]
+    pub region: Option<RegionRequest>,
+    #[serde(default)]
+    pub element: Option<String>,
+    /// Language hint; passed through to the model. Empty / unset = model
+    /// default (usually English-biased).
+    #[serde(default)]
+    pub lang: Option<String>,
+    /// Drop blocks below this confidence. Default 0.5.
+    #[serde(default)]
+    pub min_confidence: Option<f64>,
+    /// Bypass the read-side cache.
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractResponse {
+    pub blocks: Vec<vision_ai::OcrBlock>,
+    /// Block texts joined by newline in scan order (top-to-bottom). Useful
+    /// for `contains` / `regex` searches without walking the bbox list.
+    pub aggregate_text: String,
+    /// Model alias the request was routed to (after env-var resolution).
+    pub model: String,
+    /// True iff we read from cache instead of calling the model.
+    pub cached: bool,
+}
+
+/// `POST /ui-bridge/vision/describe` request shape (plan §3.2). VLM
+/// caption / Q&A — same no-pixels-in-response contract as extract.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribeRequest {
+    #[serde(default)]
+    pub region: Option<RegionRequest>,
+    #[serde(default)]
+    pub element: Option<String>,
+    /// Optional addendum to the canonical VLM system prompt. e.g.,
+    /// `"Focus on the terminal area."`. The agent's actual question
+    /// can also be phrased here.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Caller-cap on caption length. Default 256.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribeResponse {
+    pub description: String,
+    pub tokens: Option<vision_ai::VlmTokens>,
+    pub model: String,
+    pub cached: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1297,7 +1363,7 @@ async fn vision_raw_handler(
         element: None,
         reason: None,
     });
-    let reason = req.reason.unwrap_or_default();
+    let reason = req.reason.clone().unwrap_or_default();
     if !matches!(reason.as_str(), "vga_grounding" | "regression_baseline") {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1364,6 +1430,205 @@ async fn vision_raw_handler(
         format: "png".to_string(),
         contract: "raw".to_string(),
     })))
+}
+
+/// `POST /ui-bridge/vision/extract` (plan §3.2, Phase 4) — capture +
+/// PaddleOCR-via-llama-swap → text blocks with bbox. **No pixels in
+/// the response.** Cache-keyed by (mutation_id, request shape).
+async fn vision_extract_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<ExtractRequest>>,
+) -> Result<Json<ApiResponse<ExtractResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let force = req.force.unwrap_or(false);
+    let min_conf = req.min_confidence.unwrap_or(0.5).clamp(0.0, 1.0);
+
+    let client = OcrClient::from_env();
+    let model_name = std::env::var(vision_ai::ENV_OCR_MODEL)
+        .unwrap_or_else(|_| vision_ai::DEFAULT_OCR_MODEL.to_string());
+
+    // Cache key: composed pre-capture from request shape + mutation id.
+    let mut_id = state
+        .vision_mutation_id
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let cache_input = format!(
+        "v=1|extract|mut={mut_id}|model={}|min_conf={:.3}|req={req:?}",
+        model_name, min_conf
+    );
+    let cache_key = qontinui_vision_core::sha256_of(cache_input.as_bytes());
+
+    if !force {
+        if let Some(hit) = state.vision_cache.get(&cache_key) {
+            let bytes = std::fs::read(&hit.path).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("read cached extract: {}", e))),
+                )
+            })?;
+            let mut resp: ExtractResponse = serde_json::from_slice(&bytes).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("decode cached extract: {}", e))),
+                )
+            })?;
+            resp.cached = true;
+            debug!(
+                "vision/extract: cache HIT key={} blocks={}",
+                &hit.sha256_hex[..12],
+                resp.blocks.len()
+            );
+            return Ok(Json(ApiResponse::success(resp)));
+        }
+    }
+
+    // Miss → capture + encode + call OCR.
+    let png_bytes = capture_and_encode_png(&state, &req.region, &req.element)
+        .await
+        .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+    let (blocks, aggregate_text) = client
+        .extract(&png_bytes, "image/png", min_conf)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("OCR call: {}", e))),
+            )
+        })?;
+    let resp = ExtractResponse {
+        blocks,
+        aggregate_text,
+        model: model_name.clone(),
+        cached: false,
+    };
+    // Cache the response as JSON for next lookup.
+    let resp_json = serde_json::to_vec(&resp).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("encode extract: {}", e))),
+        )
+    })?;
+    if let Err(e) = state.vision_cache.put(&cache_key, &resp_json, "json") {
+        warn!("vision/extract: cache put failed: {} (continuing)", e);
+    }
+    info!(
+        "vision/extract: cache MISS model={} blocks={} aggregate_chars={}",
+        model_name,
+        resp.blocks.len(),
+        resp.aggregate_text.chars().count()
+    );
+    Ok(Json(ApiResponse::success(resp)))
+}
+
+/// `POST /ui-bridge/vision/describe` (plan §3.2, Phase 4) — capture +
+/// VLM caption. **No pixels in the response.** Cache-keyed by
+/// (mutation_id, request shape, max_tokens, prompt).
+async fn vision_describe_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<DescribeRequest>>,
+) -> Result<Json<ApiResponse<DescribeResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let force = req.force.unwrap_or(false);
+    let max_tokens = req.max_tokens.unwrap_or(256).clamp(64, 4096);
+
+    let client = VlmClient::from_env();
+    let model_name = std::env::var(vision_ai::ENV_VLM_MODEL)
+        .unwrap_or_else(|_| vision_ai::DEFAULT_VLM_MODEL.to_string());
+
+    let mut_id = state
+        .vision_mutation_id
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let cache_input = format!(
+        "v=1|describe|mut={mut_id}|model={}|tokens={}|req={req:?}",
+        model_name, max_tokens
+    );
+    let cache_key = qontinui_vision_core::sha256_of(cache_input.as_bytes());
+
+    if !force {
+        if let Some(hit) = state.vision_cache.get(&cache_key) {
+            let bytes = std::fs::read(&hit.path).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("read cached describe: {}", e))),
+                )
+            })?;
+            let mut resp: DescribeResponse = serde_json::from_slice(&bytes).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("decode cached describe: {}", e))),
+                )
+            })?;
+            resp.cached = true;
+            debug!(
+                "vision/describe: cache HIT key={} chars={}",
+                &hit.sha256_hex[..12],
+                resp.description.chars().count()
+            );
+            return Ok(Json(ApiResponse::success(resp)));
+        }
+    }
+
+    let png_bytes = capture_and_encode_png(&state, &req.region, &req.element)
+        .await
+        .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+    let vlm = client
+        .describe(&png_bytes, "image/png", req.prompt.as_deref(), max_tokens)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("VLM call: {}", e))),
+            )
+        })?;
+    let resp = DescribeResponse {
+        description: vlm.description,
+        tokens: vlm.tokens,
+        model: model_name.clone(),
+        cached: false,
+    };
+    let resp_json = serde_json::to_vec(&resp).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("encode describe: {}", e))),
+        )
+    })?;
+    if let Err(e) = state.vision_cache.put(&cache_key, &resp_json, "json") {
+        warn!("vision/describe: cache put failed: {} (continuing)", e);
+    }
+    info!(
+        "vision/describe: cache MISS model={} chars={}",
+        model_name,
+        resp.description.chars().count()
+    );
+    Ok(Json(ApiResponse::success(resp)))
+}
+
+/// Capture the runner window, optionally crop to a region or element, and
+/// encode as PNG bytes. Shared by `vision/extract` and `vision/describe` —
+/// both want the same "raw-ish PNG to feed the model" output.
+async fn capture_and_encode_png(
+    state: &Arc<ApiState>,
+    region_req: &Option<RegionRequest>,
+    element_id: &Option<String>,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    let frame = capture_runner_window_frame(state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let crop = resolve_crop_region(state, region_req, element_id, frame.width, frame.height)
+        .await
+        .map_err(|(code, msg)| (code, msg))?;
+    // PNG-only pipeline. No alpha policy here — we want lossless bytes to
+    // feed the model; the model handles its own preprocessing.
+    let mut pipeline = qontinui_vision_core::Pipeline::new();
+    if let Some(region) = crop {
+        pipeline = pipeline.push(Stage::CropRegion(region));
+    }
+    pipeline = pipeline.push(Stage::Encode(EncodedFormat::Png));
+    pipeline.run(frame).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("pipeline: {}", e),
+        )
+    })
 }
 
 /// `GET /ui-bridge/vision/cache/{sha256}` — stream a cached image.
@@ -1476,6 +1741,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/vision/annotate", post(vision_annotate_handler))
         .route("/ui-bridge/vision/diff", post(vision_diff_handler))
         .route("/ui-bridge/vision/raw", post(vision_raw_handler))
+        .route("/ui-bridge/vision/extract", post(vision_extract_handler))
+        .route("/ui-bridge/vision/describe", post(vision_describe_handler))
         .route(
             "/ui-bridge/vision/cache/{sha256}",
             get(vision_cache_get_handler),
@@ -1493,6 +1760,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/vision/annotate"),
         ("POST", "/ui-bridge/vision/diff"),
         ("POST", "/ui-bridge/vision/raw"),
+        ("POST", "/ui-bridge/vision/extract"),
+        ("POST", "/ui-bridge/vision/describe"),
         ("GET", "/ui-bridge/vision/cache/{sha256}"),
         ("GET", "/ui-bridge/vision/health"),
         ("POST", "/ui-bridge/vision/mutation-occurred"),
