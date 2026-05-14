@@ -1772,9 +1772,19 @@ pub async fn list_overlapping_intents(
             }
             // Stable lexical pair ordering.
             let (agent_a, agent_b, intent_a, intent_b) = if a.agent_id <= b.agent_id {
-                (a.agent_id.clone(), b.agent_id.clone(), a.intent.clone(), b.intent.clone())
+                (
+                    a.agent_id.clone(),
+                    b.agent_id.clone(),
+                    a.intent.clone(),
+                    b.intent.clone(),
+                )
             } else {
-                (b.agent_id.clone(), a.agent_id.clone(), b.intent.clone(), a.intent.clone())
+                (
+                    b.agent_id.clone(),
+                    a.agent_id.clone(),
+                    b.intent.clone(),
+                    a.intent.clone(),
+                )
             };
             pairs.push(OverlappingIntentPair {
                 agent_a,
@@ -1842,15 +1852,15 @@ mod overlap_tests {
             &["qontinui-web/backend/app/auth/**".to_string()],
             &["qontinui-web/backend/app/auth/token.py".to_string()],
         );
-        assert_eq!(r, vec!["qontinui-web/backend/app/auth/token.py".to_string()]);
+        assert_eq!(
+            r,
+            vec!["qontinui-web/backend/app/auth/token.py".to_string()]
+        );
     }
 
     #[test]
     fn disjoint_empty() {
-        let r = compute_overlap(
-            &["a/b.rs".to_string()],
-            &["x/y.rs".to_string()],
-        );
+        let r = compute_overlap(&["a/b.rs".to_string()], &["x/y.rs".to_string()]);
         assert!(r.is_empty());
     }
 }
