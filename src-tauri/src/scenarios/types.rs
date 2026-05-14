@@ -41,7 +41,7 @@ pub struct ProjectedState {
     pub outbound_transitions: Vec<ProjectedTransition>,
 }
 
-/// Static, deterministic projection. Same `IrDocument` input → byte-identical
+/// Static, deterministic projection. Same `IrPageSpec` input → byte-identical
 /// JSON output via the canonical sort discipline. Mirror of `ScenarioProjection` (TS).
 ///
 /// The `deterministic: true` field is a load-bearing marker — Phase B3 tools

@@ -510,7 +510,7 @@ impl TriggerService {
                     action: "supervision_proposal".to_string(),
                     task_run_id: None,
                     error_message: None,
-                    triggered_at: chrono::Utc::now().to_rfc3339(),
+                    triggered_at: chrono::Utc::now(),
                 };
                 if let Err(e) = self
                     .deps
@@ -531,7 +531,25 @@ impl TriggerService {
                 return;
             }
 
-            // Execute: spawn the workflow (with retry support)
+            // Execute: spawn the workflow (with retry support).
+            //
+            // Non-supervision triggers MUST carry a workflow_id — the
+            // SupervisionProposal branch above is the only legitimate
+            // None case and it returns early. Defensive correctness: if
+            // a non-supervision row somehow has workflow_id=NULL (data
+            // corruption, schema migration regression, or future
+            // ActionType variant), log+skip instead of unwrapping.
+            let workflow_id = match trigger.workflow_id.as_deref() {
+                Some(wf) => wf,
+                None => {
+                    error!(
+                        "Trigger '{}' (id={}) has no workflow_id and was not routed via supervision; skipping execution (this is a bug)",
+                        trigger.name, trigger.id
+                    );
+                    return;
+                }
+            };
+
             self.evaluator.record_execution_start(&trigger.id).await;
 
             let max_attempts = trigger.retry_count + 1; // retry_count=0 means 1 attempt
@@ -560,7 +578,7 @@ impl TriggerService {
 
                 let exec_result = executor::execute_triggered_workflow(
                     &self.deps,
-                    &trigger.workflow_id,
+                    workflow_id,
                     trigger.workflow_overrides.as_ref(),
                     &event.variables,
                     &trigger.name,
@@ -593,7 +611,7 @@ impl TriggerService {
                             },
                             task_run_id: Some(execution_id.clone()),
                             error_message: None,
-                            triggered_at: chrono::Utc::now().to_rfc3339(),
+                            triggered_at: chrono::Utc::now(),
                         };
 
                         if let Err(e) = self
@@ -651,7 +669,7 @@ impl TriggerService {
                         } else {
                             e
                         }),
-                        triggered_at: chrono::Utc::now().to_rfc3339(),
+                        triggered_at: chrono::Utc::now(),
                     };
 
                     if let Err(e) = self
@@ -677,7 +695,7 @@ impl TriggerService {
                 action,
                 task_run_id: None,
                 error_message: None,
-                triggered_at: chrono::Utc::now().to_rfc3339(),
+                triggered_at: chrono::Utc::now(),
             };
 
             if let Err(e) = self
@@ -782,19 +800,22 @@ pub const SPEC_FILE_SUPERVISION_DEFAULT_NAME: &str = "__spec-file-supervision-de
 /// exist. Idempotent — re-running it after a restart is a no-op.
 ///
 /// The git-event row points at the runner's own working tree (via
-/// `crate::mcp::shared::current_project_path`) and watches `commit`,
+/// `crate::mcp::shared::current_runner_path`) and watches `commit`,
 /// `branch_switch`, and `tag` events. The spec-file row uses the
-/// `FileWatch` trigger type on the `specs/` directory restricted to
-/// `*.uibridge.json`.
+/// `FileWatch` trigger type on the runner's `specs/` directory restricted
+/// to `*.uibridge.json`. Both paths target the runner checkout itself
+/// (not the umbrella workspace_root from `current_project_path`) because
+/// the umbrella isn't a git repo and contains no `specs/` dir — defaults
+/// pointing there register but fail to attach a watcher.
 ///
 /// Both rows are marked `enabled: true` initially. If the user disables
 /// them via the trigger UI, this function won't re-enable them.
 async fn bootstrap_default_supervision_triggers(deps: &TriggerExecutorDeps) -> Result<(), String> {
-    let repo_path = match crate::mcp::shared::current_project_path() {
+    let repo_path = match crate::mcp::shared::current_runner_path() {
         Some(p) => p,
         None => {
             return Err(
-                "current_project_path() returned None; cannot bootstrap supervision triggers"
+                "current_runner_path() returned None; cannot bootstrap supervision triggers"
                     .to_string(),
             );
         }
@@ -819,7 +840,7 @@ async fn bootstrap_default_supervision_triggers(deps: &TriggerExecutorDeps) -> R
         ActionType::supervision_overrides_json(ActionType::DEFAULT_SUPERVISION_PROVENANCE);
 
     if !have_git {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now();
         let trigger = WorkflowTrigger {
             id: uuid::Uuid::new_v4().to_string(),
             name: GIT_SUPERVISION_DEFAULT_NAME.to_string(),
@@ -836,11 +857,11 @@ async fn bootstrap_default_supervision_triggers(deps: &TriggerExecutorDeps) -> R
                 ],
                 branch_filter: None,
             },
-            // `workflow_id` is irrelevant for supervision rows — the
-            // dispatcher routes them to `git_supervision::handle_supervision_action`
-            // before ever loading a workflow. We stash a sentinel for
-            // observability.
-            workflow_id: "__supervision__".to_string(),
+            // Supervision rows have no workflow target — the dispatcher
+            // routes them to `git_supervision::handle_supervision_action`
+            // before ever loading a workflow. Stored as SQL NULL after
+            // the Phase 5a migration made workflow_id nullable.
+            workflow_id: None,
             workflow_overrides: Some(overrides_json.clone()),
             conditions: Vec::new(),
             debounce_ms: 1000,
@@ -852,7 +873,7 @@ async fn bootstrap_default_supervision_triggers(deps: &TriggerExecutorDeps) -> R
             last_triggered_at: None,
             last_execution_id: None,
             trigger_count: 0,
-            created_at: now.clone(),
+            created_at: now,
             updated_at: now,
         };
         deps.app_state
@@ -869,7 +890,7 @@ async fn bootstrap_default_supervision_triggers(deps: &TriggerExecutorDeps) -> R
     if !have_spec {
         let specs_dir = std::path::Path::new(&repo_path).join("specs");
         let spec_path_str = specs_dir.to_string_lossy().to_string();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now();
         let trigger = WorkflowTrigger {
             id: uuid::Uuid::new_v4().to_string(),
             name: SPEC_FILE_SUPERVISION_DEFAULT_NAME.to_string(),
@@ -883,7 +904,8 @@ async fn bootstrap_default_supervision_triggers(deps: &TriggerExecutorDeps) -> R
                 ignore_patterns: Vec::new(),
                 recursive: true,
             },
-            workflow_id: "__supervision__".to_string(),
+            // See git-supervision row above: no workflow target.
+            workflow_id: None,
             workflow_overrides: Some(overrides_json),
             conditions: Vec::new(),
             debounce_ms: 1000,
@@ -895,7 +917,7 @@ async fn bootstrap_default_supervision_triggers(deps: &TriggerExecutorDeps) -> R
             last_triggered_at: None,
             last_execution_id: None,
             trigger_count: 0,
-            created_at: now.clone(),
+            created_at: now,
             updated_at: now,
         };
         deps.app_state

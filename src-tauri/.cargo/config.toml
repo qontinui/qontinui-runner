@@ -1,6 +1,28 @@
 # Increase linker stack size to prevent STATUS_STACK_BUFFER_OVERRUN
-# when linking the large test binary on Windows.
-# Default MSVC stack is 1MB; this binary needs more due to deep
-# async-graphql type expansion and Tauri codegen.
+# when linking the large test binary on Windows. Default MSVC stack is
+# 1 MB; this binary needs more due to deep async-graphql type expansion
+# and Tauri codegen.
+#
+# /Brepro tells link.exe to zero the PE COFF timestamp and the RSDS
+# debug GUID so identical inputs produce byte-identical .exe / .pdb
+# outputs. Required by the content-addressed build cache rolled out in
+# Row 10 / Wave 0 — without it, two cargo builds of the same source
+# differ in 16 bytes at PE offset 107636 (the RSDS GUID is regenerated
+# per link), defeating cross-worktree CAS dedup. Spike artifacts at
+# tmp_spike_bazel_remote/ + memory `proj_canonical_diff_hash_recipe`
+# document the empirical proof.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-args=/STACK:8388608"]
+rustflags = ["-C", "link-args=/STACK:8388608 /Brepro"]
+
+# Linux equivalent of /Brepro. ld embeds a per-link build-id by default,
+# which varies across builds of identical inputs. --build-id=none drops
+# the .note.gnu.build-id section so two builds produce byte-identical
+# ELFs. The build-id is only used by debuginfo-lookup tooling; ELFs
+# without it run normally, and the workspace profile already strips
+# debuginfo so nothing downstream depends on it. Same Row 10 / Wave 0
+# rationale.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--build-id=none"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--build-id=none"]

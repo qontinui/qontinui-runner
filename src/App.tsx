@@ -828,7 +828,10 @@ export default function App() {
       <BuildRefreshBanner />
       <UIBridgeProvider
         features={{ renderLog: true, control: true, debug: true }}
-        browserCaptureConfig={{ console: true }}
+        browserCaptureConfig={{
+          console: true,
+          consoleLevels: ['error', 'warn', 'debug', 'info', 'log'],
+        }}
       >
         <UIBridgeEventHandler />
         <UIBridgeInvokeHandler />

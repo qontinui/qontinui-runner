@@ -341,6 +341,8 @@ The runner observes:
 - recent_reviews: 1-hour window of completed code reviews with verdicts approved | needs_fix | escalate
 - open_escalations: prior coordinator decisions that flipped auto_acted=false and have not been resolved
 - recent_decisions: last 20 coordinator_decisions rows so you can avoid loops
+- held_locks: path → task_run_id of the session currently holding an exclusive `FileLockManager` lock. Assigning a task whose expected_file_claims overlap a path held by a non-candidate session means the new worker will block on its first Edit. If the candidate session ITSELF is the holder, the assignment is lock-safe (the lock is already theirs).
+- heatmap: per-session aggregates over the last hour. `sessionDistinctFiles[task_run_id]` is breadth of recent activity; `sessionHeldLockCount[task_run_id]` is the count of files this session currently locks. Cheap Rule B's composite tie-break already prefers `breadth + held*4` lower; if you override Rule B, apply the same intuition (lower-rank sessions are lighter and freer).
 
 You emit ONE action by calling the coordinator_action_v1 tool. The "type" tag picks the variant; the variant determines which fields are required:
 
@@ -380,12 +382,14 @@ You emit ONE action by calling the coordinator_action_v1 tool. The "type" tag pi
 Decision rules:
 - Prefer non-destructive actions (advise-with-text, escalate-with-text, idle-no-action) when in doubt.
 - Never assign a task to a session whose touched files overlap the task's expected_file_claims — Rule B already enforces this; if you're considering an assign, double-check overlap.
+- Never assign a task whose expected_file_claims include a path in `held_locks` to a session OTHER than that path's holder — the worker would block on its first Edit. Rule B already enforces this; if every candidate is lock-blocked, prefer `advise-with-text` "deferred until {holder} releases {path}" over racing the lock.
 - Never re-issue an action that's already in the recent_decisions window for the same target — that's a loop.
 - If no action is clearly correct, return idle-no-action with a brief reasoning.
 - Reasoning should be one short sentence; the dashboard renders it verbatim.
 - A task in `review` for >5 min with no verdict is stalled — escalate-with-text rather than guess at a merge.
 - A `needs_fix` task with retry_count >= 3 should escalate, never reassign-needs-fix.
 - A session in Processing for >10 min on a small-claim task is likely stuck — advise-with-text, do not pause unilaterally.
+- When breaking ties between multiple lock-safe candidates, prefer the lower-rank session (rank = `heatmap.sessionDistinctFiles[id] + 4 * heatmap.sessionHeldLockCount[id]`) — that's the Rule B composite already encoded as data.
 
 Worked examples:
 - Observation: one `ready` task `T1` (claims `a.rs`), one idle session `S1` (touched `b.rs` last). Cheap Rule B already passed without firing. Likely cause: tab-title pattern mismatch. Action: `{"type": "assign-task", "taskId": "T1", "sessionId": "S1", "reasoning": "no overlap; Rule B's pattern matcher likely missed this pairing"}`.
@@ -647,6 +651,15 @@ fn build_user_message(
         "recentReviews": recent_reviews,
         "openEscalations": open_escalations,
         "sessionTouchedFiles": observation.session_touched_files,
+        // Phase 1 of coordinator-driven-scheduling-plan: surface the
+        // blocking-lock snapshot and per-session heatmap aggregates so
+        // the LLM can reason about contention. See build_system_prefix
+        // for the decision rules these signals support.
+        "heldLocks": observation.held_locks,
+        "heatmap": {
+            "sessionDistinctFiles": observation.heatmap.session_distinct_files,
+            "sessionHeldLockCount": observation.heatmap.session_held_count,
+        },
     });
 
     let decisions_json = json!(recent_decisions);
@@ -849,7 +862,50 @@ mod tests {
             open_escalations: Vec::new(),
             session_touched_files: std::collections::HashMap::new(),
             recent_decisions: Vec::new(),
+            held_locks: std::collections::HashMap::new(),
+            heatmap: super::super::observe::HeatmapSnapshot::default(),
         }
+    }
+
+    #[test]
+    fn build_user_message_surfaces_held_locks_and_heatmap() {
+        // Coordinator-driven-scheduling Phase 1 contract: the LLM
+        // observation includes the new lock-state + heatmap fields so
+        // the model can reason about contention. Without these the
+        // system prompt's lock-safe rule has no data to bind against.
+        let mut obs = empty_observation();
+        obs.held_locks
+            .insert("src/foo.rs".to_string(), "sess-holder".to_string());
+        obs.heatmap
+            .session_distinct_files
+            .insert("sess-a".to_string(), 7);
+        obs.heatmap
+            .session_held_count
+            .insert("sess-a".to_string(), 1);
+
+        let msg = build_user_message(&obs, &[], "");
+
+        assert!(
+            msg.contains("\"heldLocks\""),
+            "user message must include heldLocks key: {}",
+            &msg[..msg.len().min(500)]
+        );
+        assert!(
+            msg.contains("\"src/foo.rs\""),
+            "held_locks path must round-trip into the user message"
+        );
+        assert!(
+            msg.contains("\"heatmap\""),
+            "user message must include heatmap key"
+        );
+        assert!(
+            msg.contains("\"sessionDistinctFiles\""),
+            "heatmap.sessionDistinctFiles must surface"
+        );
+        assert!(
+            msg.contains("\"sessionHeldLockCount\""),
+            "heatmap.sessionHeldLockCount must surface"
+        );
     }
 
     #[test]

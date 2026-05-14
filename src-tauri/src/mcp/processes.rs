@@ -93,7 +93,11 @@ pub async fn start_process(
         )
     })?;
 
-    manager.start_process(&id).await.map_err(|e| {
+    let resolved = manager
+        .resolve_process_id(&id)
+        .await
+        .unwrap_or_else(|| id.clone());
+    manager.start_process(&resolved).await.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(api_error(format!("Failed to start process: {}", e))),
@@ -126,7 +130,11 @@ pub async fn stop_process(
         )
     })?;
 
-    manager.stop_process(&id).await.map_err(|e| {
+    let resolved = manager
+        .resolve_process_id(&id)
+        .await
+        .unwrap_or_else(|| id.clone());
+    manager.stop_process(&resolved).await.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(api_error(format!("Failed to stop process: {}", e))),
@@ -159,7 +167,11 @@ pub async fn restart_process(
         )
     })?;
 
-    manager.restart_process(&id).await.map_err(|e| {
+    let resolved = manager
+        .resolve_process_id(&id)
+        .await
+        .unwrap_or_else(|| id.clone());
+    manager.restart_process(&resolved).await.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(api_error(format!("Failed to restart process: {}", e))),
@@ -196,8 +208,12 @@ pub async fn rebuild_and_restart_process(
         )
     })?;
 
+    let resolved = manager
+        .resolve_process_id(&id)
+        .await
+        .unwrap_or_else(|| id.clone());
     manager
-        .rebuild_and_restart_process(&id)
+        .rebuild_and_restart_process(&resolved)
         .await
         .map_err(|e| {
             (
@@ -243,7 +259,11 @@ pub async fn get_output(
         )
     })?;
 
-    let output = manager.get_output(&id, tail).await.map_err(|e| {
+    let resolved = manager
+        .resolve_process_id(&id)
+        .await
+        .unwrap_or_else(|| id.clone());
+    let output = manager.get_output(&resolved, tail).await.map_err(|e| {
         (
             StatusCode::NOT_FOUND,
             Json(api_error(format!("Failed to get output: {}", e))),

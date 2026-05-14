@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::spec_api::types::{IrDocument, IrTransition};
+use crate::spec_api::types::{IrPageSpec, IrTransition};
 
 use super::types::{ProjectedState, ProjectedTransition, ScenarioProjection};
 
@@ -25,7 +25,7 @@ use super::types::{ProjectedState, ProjectedTransition, ScenarioProjection};
 /// (the TS version re-sorts after collection; using a sorted map here is
 /// equivalent and avoids a needless allocation).
 fn index_transitions_by_from_state<'a>(
-    ir: &'a IrDocument,
+    ir: &'a IrPageSpec,
 ) -> BTreeMap<&'a str, Vec<&'a IrTransition>> {
     let mut out: BTreeMap<&'a str, Vec<&'a IrTransition>> = BTreeMap::new();
     for t in &ir.transitions {
@@ -59,12 +59,12 @@ fn project_transition(t: &IrTransition) -> ProjectedTransition {
 }
 
 /// Walk the IR and emit a deterministic projection of every state with
-/// its outbound transitions. Same `IrDocument` input → byte-identical
+/// its outbound transitions. Same `IrPageSpec` input → byte-identical
 /// output as the TS `projectScenarios`.
 ///
 /// Cost is `O(|states| log |states| + |transitions| log |transitions|)`
 /// for the sorts plus `O(|transitions|)` for the bucketing.
-pub fn project_scenarios(ir: &IrDocument) -> ScenarioProjection {
+pub fn project_scenarios(ir: &IrPageSpec) -> ScenarioProjection {
     let by_from_state = index_transitions_by_from_state(ir);
 
     // Defensive sort — callers may build IRs in arbitrary order.

@@ -165,6 +165,17 @@ pub fn start_coordinator_scheduler(
             );
         }
 
+        // Coordination Phase 1 (branch-per-agent): self-heal
+        // coord.agent_worktrees. Idempotent. Logs but doesn't fail —
+        // when the table is missing, /agents/allocate-local will
+        // surface the error from coord rather than from the runner.
+        if let Err(e) = state.app_state.pg_db.ensure_agent_worktrees_table().await {
+            warn!(
+                "Coordinator scheduler: ensure_agent_worktrees_table failed: {} — agent worktree allocation may fail until alembic upgrade",
+                e
+            );
+        }
+
         info!(
             "Coordinator (Rust) scheduler started: instance_id={} interval={}s rule_version={} max_llm_calls_per_hour={} auto_review_enabled={} shadow_mode_enabled={} initial_enabled={}",
             instance_id,

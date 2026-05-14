@@ -9,8 +9,8 @@
 //! migration that lands in section 3.
 //!
 //! Submodules:
-//! - [`types`]      Rust mirrors of `IRDocument` + legacy spec types
-//! - [`projection`] Pure `IrDocument -> LegacySpec` projection (Rust port of
+//! - [`types`]      Rust mirrors of `IrPageSpec` + legacy spec types
+//! - [`projection`] Pure `IrPageSpec -> LegacySpec` projection (Rust port of
 //!   the TS `projectIRToBundledPage`)
 //! - [`storage`]    Filesystem layer for the storage layout under `<runner>/specs/`
 //! - [`responses`]  Empty/error envelope shapes — every empty response carries `reason`
@@ -21,6 +21,7 @@
 
 pub mod events;
 pub mod handlers;
+pub mod hashing;
 pub mod projection;
 pub mod responses;
 pub mod storage;

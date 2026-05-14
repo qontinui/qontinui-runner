@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod action_service;
+mod agent_worktree;
 mod agentic_verification;
 mod ai_pricing;
 mod ai_provider;

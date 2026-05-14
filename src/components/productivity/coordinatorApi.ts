@@ -261,3 +261,29 @@ export async function getCoordinatorState(): Promise<CoordinatorState> {
   }
   return (await res.json()) as CoordinatorState;
 }
+
+/** Discriminated wire shape consumed by `POST /coordinator/dispatch-action`.
+ *  Mirrors `CoordinatorAction` (kebab-case `type`, camelCase fields). Only
+ *  the variants the deferrals panel actually fires are listed; extend as
+ *  more dashboard surfaces need manual dispatch. */
+export type DispatchCoordinatorAction =
+  | { type: "assign-task"; taskId: string; sessionId: string; reasoning?: string };
+
+/** Fire an arbitrary CoordinatorAction through the manual dispatch path.
+ *  Audited as `rule = "manual"`, `sessionId = "manual-<uuid>"`. */
+export async function dispatchCoordinatorAction(
+  action: DispatchCoordinatorAction,
+  reasoning?: string,
+): Promise<void> {
+  const port = await invoke<number>("get_api_port");
+  if (!port || port <= 0) throw new Error(`invalid runner port: ${port}`);
+  const res = await fetch(`http://localhost:${port}/coordinator/dispatch-action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ action, reasoning }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+  }
+}

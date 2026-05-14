@@ -62,7 +62,10 @@ pub async fn check_workflow_chains(
 
             info!(
                 "Workflow chain trigger '{}' matched: {} -> {} (status: {})",
-                trigger.name, completed_workflow_id, trigger.workflow_id, status
+                trigger.name,
+                completed_workflow_id,
+                trigger.workflow_id.as_deref().unwrap_or("<none>"),
+                status
             );
 
             // Build variables

@@ -1483,7 +1483,7 @@ mod tests {
         tags: Option<Vec<&str>>,
         existing_synthesized_groups: Vec<Value>,
     ) {
-        use crate::spec_api::types::{IrDocument, IrGroup, IrMetadata};
+        use crate::spec_api::types::{IrGroup, IrMetadata, IrPageSpec};
 
         let metadata = if purpose.is_some() || tags.is_some() {
             Some(IrMetadata {
@@ -1502,7 +1502,7 @@ mod tests {
             .map(|v| serde_json::from_value(v).expect("synthesized group fixture must parse"))
             .collect();
 
-        let doc = IrDocument {
+        let doc = IrPageSpec {
             version: "1.0".to_string(),
             id: page_id.to_string(),
             name: page_id.to_string(),

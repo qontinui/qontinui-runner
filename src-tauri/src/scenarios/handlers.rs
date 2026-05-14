@@ -35,7 +35,7 @@ use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
 use crate::spec_api::storage;
-use crate::spec_api::types::IrDocument;
+use crate::spec_api::types::IrPageSpec;
 use crate::ui_bridge_invoke::InvokeResponse;
 
 use super::projection::project_scenarios;
@@ -87,7 +87,7 @@ fn err_envelope(msg: impl Into<String>) -> ScenarioEnvelope<Value> {
 // ---------------------------------------------------------------------------
 
 enum LoadIr {
-    Found(IrDocument),
+    Found(IrPageSpec),
     NotFound,
     Error(String),
 }

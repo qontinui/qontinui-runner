@@ -34,6 +34,22 @@ pub(crate) struct LiveSession {
     pub assigned_task_id: Option<String>,
 }
 
+/// Heatmap-derived per-session aggregates the Rule B composite tie-break
+/// reads. Populated once per `observe()` tick from `PgDb::hot_sessions`
+/// and `FileLockManager::info()`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HeatmapSnapshot {
+    /// task_run_id → distinct file paths touched in window. Sourced from
+    /// `HotSessionRow.distinct_files`. The `coord.session_touched_files`
+    /// table UPSERTs on `(task_run_id, file_path)`, so re-edits don't
+    /// inflate — this is breadth-of-activity, not raw frequency.
+    pub session_distinct_files: HashMap<String, u64>,
+    /// task_run_id → count of files this session currently holds locks
+    /// on. Derived from `FileLockManager::info()` grouped by
+    /// `holder_task_run_id`.
+    pub session_held_count: HashMap<String, u64>,
+}
+
 /// Single-tick snapshot. Bundles every read the cheap rules need.
 #[derive(Debug, Clone)]
 pub(crate) struct Observation {
@@ -51,6 +67,17 @@ pub(crate) struct Observation {
     /// for Rule D's "process new reviews only" boundary and for the
     /// idempotency guards in rules A/B.
     pub recent_decisions: Vec<CoordinatorDecisionRow>,
+    /// path → task_run_id of the session currently holding a blocking
+    /// file lock on it. Sourced from `FileLockManager::info()`. Distinct
+    /// from `active_file_registry` (advisory `FileRegistryManager`) —
+    /// only the lock manager tells us "would assigning this task block
+    /// the worker's first Edit."
+    pub held_locks: HashMap<String, String>,
+    /// Per-session aggregates over the heatmap window. Populated only
+    /// when `PgDb::hot_sessions` / `FileLockManager::info` succeed —
+    /// degrades to `HeatmapSnapshot::default()` on error so rules can
+    /// read it unconditionally.
+    pub heatmap: HeatmapSnapshot,
 }
 
 impl Observation {
@@ -160,6 +187,39 @@ impl Observation {
         // what every rule consults.
         hasher.update(b"open_escalations_count:");
         hasher.update(self.open_escalations.len().to_string().as_bytes());
+
+        // Held locks: sort by path so two observations with equal lock
+        // state hash identically regardless of iteration order.
+        let mut held: Vec<(&String, &String)> = self.held_locks.iter().collect();
+        held.sort_by(|a, b| a.0.cmp(b.0));
+        hasher.update(b"held_locks:");
+        for (p, holder) in &held {
+            hasher.update(p.as_bytes());
+            hasher.update(b"|");
+            hasher.update(holder.as_bytes());
+            hasher.update(b";");
+        }
+
+        // Heatmap aggregates: sort by task_run_id for stable hashing.
+        let mut breadth: Vec<(&String, &u64)> =
+            self.heatmap.session_distinct_files.iter().collect();
+        breadth.sort_by(|a, b| a.0.cmp(b.0));
+        hasher.update(b"heatmap_breadth:");
+        for (id, n) in &breadth {
+            hasher.update(id.as_bytes());
+            hasher.update(b"|");
+            hasher.update(n.to_string().as_bytes());
+            hasher.update(b";");
+        }
+        let mut held_count: Vec<(&String, &u64)> = self.heatmap.session_held_count.iter().collect();
+        held_count.sort_by(|a, b| a.0.cmp(b.0));
+        hasher.update(b"heatmap_held:");
+        for (id, n) in &held_count {
+            hasher.update(id.as_bytes());
+            hasher.update(b"|");
+            hasher.update(n.to_string().as_bytes());
+            hasher.update(b";");
+        }
 
         format!("{:x}", hasher.finalize())
     }
@@ -285,6 +345,42 @@ pub(crate) async fn observe(state: &Arc<ApiState>) -> Result<Observation, String
         .await
         .map_err(|e| format!("list_recent_coordinator_decisions: {}", e))?;
 
+    // Held-lock snapshot: cheap in-memory read of the blocking lock map.
+    // Rule B uses this to avoid assigning tasks whose expected_file_claims
+    // would collide with a lock held by a non-holder candidate session.
+    let mut held_locks: HashMap<String, String> = HashMap::new();
+    let mut session_held_count: HashMap<String, u64> = HashMap::new();
+    for entry in app.file_lock_manager.info().await {
+        *session_held_count
+            .entry(entry.holder_task_run_id.clone())
+            .or_insert(0) += 1;
+        held_locks.insert(entry.file_path, entry.holder_task_run_id);
+    }
+
+    // Heatmap breadth: per-session distinct-file count over the same
+    // window the /file-activity/heatmap route exposes (default 3600s,
+    // matching mcp/file_registry.rs:403). Plan §9.1 open question:
+    // promote to Settings once telemetry justifies it. Limit 200 is
+    // generous — there are rarely more than a handful of live sessions.
+    let mut session_distinct_files: HashMap<String, u64> = HashMap::new();
+    match pg.hot_sessions(3600, 200).await {
+        Ok(rows) => {
+            for row in rows {
+                if row.distinct_files >= 0 {
+                    session_distinct_files.insert(row.task_run_id, row.distinct_files as u64);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!("observe: hot_sessions failed: {}", e);
+        }
+    }
+
+    let heatmap = HeatmapSnapshot {
+        session_distinct_files,
+        session_held_count,
+    };
+
     Ok(Observation {
         tasks,
         active_file_registry,
@@ -294,6 +390,8 @@ pub(crate) async fn observe(state: &Arc<ApiState>) -> Result<Observation, String
         open_escalations,
         session_touched_files,
         recent_decisions,
+        held_locks,
+        heatmap,
     })
 }
 

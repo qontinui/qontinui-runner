@@ -32,8 +32,10 @@ import {
   ExternalLink,
 } from "lucide-react";
 import {
+  dispatchCoordinatorAction,
   getCoordinatorDecisions,
   getCoordinatorLeader,
+  getCoordinatorState,
   getEscalations,
   launchCoordinatorSession,
   resolveEscalation,
@@ -44,6 +46,7 @@ import {
   type CoordinatorLeaderRow,
   type Escalation,
   type LeaderResponse,
+  type LiveSession,
 } from "./coordinatorApi";
 import {
   approveRecommendation,
@@ -495,6 +498,264 @@ function AdvisoriesPanel({ rows, loading, error, onRefresh, onAcknowledge }: Adv
                   <CheckCircle2 className="w-3 h-3" /> Acknowledge
                 </button>
               </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Deferrals panel — coordinator-driven-scheduling-plan Phase 3
+//
+// Lists Rule B advisories whose reasoning matches `/deferred/` — these are
+// tasks the scheduler chose NOT to assign this tick because either
+// (a) every candidate session collides with a held lock, or (b) an earlier
+// task in the same iteration already claims overlapping paths. Grouped by
+// `targetId` so a task gets ONE row regardless of how many deferral
+// advisories its lifecycle produces.
+//
+// Each row's "Force-assign anyway" button opens a session-picker (idle
+// `LiveSession`s from `/coordinator/state`) and fires
+// `/coordinator/dispatch-action` with `AssignTask`. The user override is
+// audited as `rule = "manual"` so the Decision Log shows it as a manual
+// fire alongside the original deferral advisory.
+// ---------------------------------------------------------------------------
+
+/** Parse a deferral advisory's `reasoning` body to extract a
+ *  human-readable blocker label. Two templates are emitted by Rule B in
+ *  decide.rs (Phase 1 + Phase 2 of the plan):
+ *
+ *    "task {id} deferred — every candidate session would collide with
+ *     held lock on {paths}"             → "lock on {paths}"
+ *    "task {id} deferred behind task {Y} — overlaps {paths}"
+ *                                       → "task {Y}"
+ *
+ *  Returns `null` when neither template matches — the row is skipped.
+ *  The `[rule=B v=YYYY-MM-DD]` stamp prefix is optional, since the
+ *  RULE_VERSION bumps over time.
+ */
+function extractDeferralBlocker(reasoning: string): string | null {
+  const lockMatch = reasoning.match(
+    /deferred — every candidate session would collide with held lock on (.+)$/,
+  );
+  if (lockMatch) return `lock on ${lockMatch[1].trim()}`;
+  const taskMatch = reasoning.match(/deferred behind task ([^\s—]+)/);
+  if (taskMatch) return `task ${taskMatch[1]}`;
+  return null;
+}
+
+interface DeferralRow {
+  taskId: string;
+  blockerLabel: string;
+  latestAt: string;
+  reasoning: string;
+  count: number;
+}
+
+/** Group the decision feed into one row per deferred task. Picks the
+ *  newest deferral per `targetId` so the blocker label and timestamp
+ *  reflect the most-recent advisory. */
+function groupDeferrals(decisions: CoordinatorDecision[]): DeferralRow[] {
+  const groups = new Map<string, DeferralRow>();
+  for (const d of decisions) {
+    if (d.rule !== "B" || d.action !== "advise-with-text" || !d.targetId) continue;
+    const blockerLabel = extractDeferralBlocker(d.reasoning);
+    if (!blockerLabel) continue;
+    const existing = groups.get(d.targetId);
+    if (!existing) {
+      groups.set(d.targetId, {
+        taskId: d.targetId,
+        blockerLabel,
+        latestAt: d.createdAt,
+        reasoning: d.reasoning,
+        count: 1,
+      });
+    } else {
+      existing.count += 1;
+      if (new Date(d.createdAt).getTime() > new Date(existing.latestAt).getTime()) {
+        existing.latestAt = d.createdAt;
+        existing.blockerLabel = blockerLabel;
+        existing.reasoning = d.reasoning;
+      }
+    }
+  }
+  return Array.from(groups.values()).sort(
+    (a, b) => new Date(b.latestAt).getTime() - new Date(a.latestAt).getTime(),
+  );
+}
+
+interface DeferralsPanelProps {
+  rows: DeferralRow[];
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  onForceAssign: (taskId: string, sessionId: string) => Promise<void>;
+}
+
+function DeferralsPanel({ rows, loading, error, onRefresh, onForceAssign }: DeferralsPanelProps) {
+  const [pickerTaskId, setPickerTaskId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<LiveSession[]>([]);
+  const [pickerError, setPickerError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const openPicker = useCallback(async (taskId: string) => {
+    setPickerError(null);
+    setPickerTaskId(taskId);
+    setSessions([]);
+    try {
+      const state = await getCoordinatorState();
+      // Idle sessions only — Ready and not assigned. Same filter the
+      // backend Rule B's `is_idle` predicate uses, but client-side here
+      // since `/coordinator/state` doesn't expose `assignedTaskId` per
+      // session today. We filter by `state === "Ready"` and let the
+      // user pick — dispatch will fail server-side if the session has
+      // since transitioned.
+      setSessions(state.liveSessions.filter((s) => s.state === "Ready"));
+    } catch (err) {
+      setPickerError(err instanceof Error ? err.message : "Failed to load sessions");
+    }
+  }, []);
+
+  const closePicker = () => {
+    setPickerTaskId(null);
+    setSessions([]);
+    setPickerError(null);
+  };
+
+  const handlePick = async (sessionId: string) => {
+    if (!pickerTaskId) return;
+    setBusy(true);
+    try {
+      await onForceAssign(pickerTaskId, sessionId);
+      closePicker();
+    } catch (err) {
+      setPickerError(err instanceof Error ? err.message : "Force-assign failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section
+      role="region"
+      aria-labelledby="productivity-coord-deferrals-heading"
+      className="flex flex-col rounded-lg border border-border bg-card/30 p-4 gap-3"
+      data-ui-bridge-id="productivity.coord-deferrals"
+    >
+      <header className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-amber-400" />
+          <h2
+            id="productivity-coord-deferrals-heading"
+            className="text-sm font-semibold text-foreground"
+          >
+            Deferred tasks
+          </h2>
+          <span className="text-xs text-muted-foreground">{rows.length} waiting</span>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={loading}
+          className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 disabled:opacity-50"
+        >
+          <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
+          Refresh
+        </button>
+      </header>
+
+      {error ? (
+        <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400">
+          {error}
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="rounded-md border border-border/40 bg-muted/10 p-3 text-xs text-muted-foreground">
+          No deferred tasks. Rule B routes new work around held locks and overlapping ready tasks
+          automatically — entries here are tasks the scheduler chose to wait on rather than race.
+        </div>
+      ) : (
+        <ul className="flex flex-col gap-2">
+          {rows.map((row) => (
+            <li
+              key={row.taskId}
+              className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3"
+              data-ui-bridge-id="productivity.coord-deferral-card"
+              data-task-id={row.taskId}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex flex-col gap-1 min-w-0">
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="font-mono text-amber-300">{row.taskId}</span>
+                    <span className="text-muted-foreground">·</span>
+                    <span className="text-muted-foreground">
+                      deferred until {row.blockerLabel}
+                    </span>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    last advised{" "}
+                    {formatDistanceToNowStrict(new Date(row.latestAt), { addSuffix: true })}
+                    {row.count > 1 ? ` · ${row.count} advisories` : ""}
+                  </div>
+                  <p className="text-xs text-muted-foreground whitespace-pre-wrap break-words font-mono">
+                    {row.reasoning}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={busy && pickerTaskId === row.taskId}
+                  onClick={() => openPicker(row.taskId)}
+                  className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-300 hover:bg-amber-500/20 disabled:opacity-50 shrink-0"
+                  data-ui-bridge-id="productivity.coord-deferral-force-assign"
+                >
+                  Force-assign anyway
+                </button>
+              </div>
+              {pickerTaskId === row.taskId ? (
+                <div
+                  className="mt-3 rounded-md border border-border bg-card p-3 flex flex-col gap-2"
+                  data-ui-bridge-id="productivity.coord-deferral-picker"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-foreground">
+                      Pick a session to assign {row.taskId}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={closePicker}
+                      className="text-xs text-muted-foreground hover:text-foreground"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  {pickerError ? (
+                    <div className="text-xs text-red-400">{pickerError}</div>
+                  ) : sessions.length === 0 ? (
+                    <div className="text-xs text-muted-foreground">
+                      No idle Ready sessions available. Spawn a worker tab first.
+                    </div>
+                  ) : (
+                    <ul className="flex flex-col gap-1">
+                      {sessions.map((s) => (
+                        <li key={s.taskRunId}>
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => handlePick(s.taskRunId)}
+                            className="w-full text-left rounded-md border border-border/60 bg-muted/20 px-2 py-1 text-xs font-mono text-foreground hover:bg-muted/40 disabled:opacity-50"
+                          >
+                            {s.taskRunId}
+                            {s.title ? (
+                              <span className="ml-2 text-muted-foreground">— {s.title}</span>
+                            ) : null}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ) : null}
             </li>
           ))}
         </ul>
@@ -1096,6 +1357,34 @@ export function CoordinatorDashboard() {
   const recommendationRows = useMemo(() => recommendations, [recommendations]);
   const advisoryRows = useMemo(() => advisories, [advisories]);
 
+  // Deferrals: derived from the full decision feed (already loaded for the
+  // log panel), filtered to Rule B advise-with-text rows whose reasoning
+  // body matches one of the two deferral templates. Resolved rows are
+  // suppressed — once a force-assign lands or the task transitions out of
+  // `ready`, the deconflicter advisory stops appearing.
+  const deferralRows = useMemo(
+    () => groupDeferrals(decisions.filter((d) => !d.resolved)),
+    [decisions],
+  );
+
+  const handleForceAssign = useCallback(
+    async (taskId: string, sessionId: string) => {
+      await dispatchCoordinatorAction(
+        {
+          type: "assign-task",
+          taskId,
+          sessionId,
+          reasoning: `force-assigned from deferrals panel (task ${taskId} → session ${sessionId})`,
+        },
+        `[manual] force-assign from deferrals panel`,
+      );
+      // Refresh the decision feed so the new `rule = "manual"` row
+      // shows up alongside the original deferral advisory.
+      await loadDecisions();
+    },
+    [loadDecisions],
+  );
+
   // Defaults to `vacant` when the leader endpoint is unavailable (older
   // runner builds without the Phase 1 backend command).
   const leaseStatus: "active" | "stale" | "vacant" = leaderResponse?.leaseStatus ?? "vacant";
@@ -1216,6 +1505,14 @@ export function CoordinatorDashboard() {
           error={advisoriesError}
           onRefresh={loadAdvisories}
           onAcknowledge={handleAcknowledgeAdvisory}
+        />
+
+        <DeferralsPanel
+          rows={deferralRows}
+          loading={decisionsLoading}
+          error={decisionsError}
+          onRefresh={loadDecisions}
+          onForceAssign={handleForceAssign}
         />
 
         <EscalationsPanel

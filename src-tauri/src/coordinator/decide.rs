@@ -28,9 +28,16 @@ use crate::database::pg::tasks::TaskRow;
 use crate::executor::file_registry::normalize_path;
 use crate::mcp::coordinator::CoordinatorAction;
 
-use super::observe::{LiveSession, Observation};
+use super::observe::{HeatmapSnapshot, LiveSession, Observation};
 
-pub(crate) const RULE_VERSION: &str = "2026-05-02";
+pub(crate) const RULE_VERSION: &str = "2026-05-13";
+
+/// Composite tie-break weight: each currently-held lock penalizes a
+/// candidate session by this much vs each unit of breadth (distinct
+/// files touched in the heatmap window). Tunable from telemetry per
+/// plan §9.2; named so a follow-up PR can move it from a literal
+/// without a schema touch.
+const HELD_LOCK_WEIGHT: u64 = 4;
 
 /// Result of a fired rule. `rule` is the single-letter tag the scheduler
 /// stamps on the persisted decision row; `action` is the wire-shaped
@@ -152,6 +159,79 @@ fn is_idle(session: &LiveSession) -> bool {
     session.state == Some(SessionState::Ready) && session.assigned_task_id.is_none()
 }
 
+/// Composite per-session score used by Rule B's tie-break. Lower is
+/// better. Combines breadth-of-recent-activity (`distinct_files`
+/// touched in the heatmap window) with held-lock count, weighted so
+/// that an active lock outweighs `HELD_LOCK_WEIGHT` units of breadth —
+/// active locks block future work, breadth is a softer "how busy".
+fn rank(session: &LiveSession, heatmap: &HeatmapSnapshot) -> u64 {
+    let breadth = heatmap
+        .session_distinct_files
+        .get(&session.task_run_id)
+        .copied()
+        .unwrap_or(0);
+    let held = heatmap
+        .session_held_count
+        .get(&session.task_run_id)
+        .copied()
+        .unwrap_or(0);
+    breadth + held * HELD_LOCK_WEIGHT
+}
+
+/// One element of `order_ready_tasks`'s output. `deferred_behind` names
+/// an earlier task in the same iteration whose `expected_file_claims`
+/// overlap this task's — Rule B emits a "deferred behind task Y"
+/// advisory instead of racing the two tasks against the same paths.
+#[derive(Debug, Clone)]
+pub(crate) struct OrderedTask<'a> {
+    pub task: &'a TaskRow,
+    pub deferred_behind: Option<String>,
+}
+
+/// Filter `tasks` to `status == "ready"`, sort by id lexicographically
+/// (reproducible across iterations), then walk in order: tasks whose
+/// `expected_file_claims` are disjoint from earlier-task claims keep
+/// their position at the head; tasks whose claims overlap an earlier
+/// task get pushed to the tail with `deferred_behind = Some(earlier_id)`.
+///
+/// Pure — no I/O — so it's covered by the in-memory `decide.rs` tests.
+pub(crate) fn order_ready_tasks(tasks: &[TaskRow]) -> Vec<OrderedTask<'_>> {
+    let mut ready: Vec<&TaskRow> = tasks.iter().filter(|t| t.status == "ready").collect();
+    ready.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut claimed_paths: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut head: Vec<OrderedTask<'_>> = Vec::new();
+    let mut tail: Vec<OrderedTask<'_>> = Vec::new();
+
+    for task in ready {
+        let blocker = task.expected_file_claims.iter().find_map(|p| {
+            let p = normalize_path(p);
+            claimed_paths.get(&p).cloned()
+        });
+
+        if blocker.is_some() {
+            tail.push(OrderedTask {
+                task,
+                deferred_behind: blocker,
+            });
+        } else {
+            for p in &task.expected_file_claims {
+                claimed_paths
+                    .entry(normalize_path(p))
+                    .or_insert_with(|| task.id.clone());
+            }
+            head.push(OrderedTask {
+                task,
+                deferred_behind: None,
+            });
+        }
+    }
+
+    head.extend(tail);
+    head
+}
+
 pub(crate) fn rule_b(obs: &Observation) -> Option<DecideOutcome> {
     // Phase 1b ports the simplified version: tab-title-prefix matching
     // doesn't have a Rust-side surface (sessions are keyed by
@@ -159,10 +239,10 @@ pub(crate) fn rule_b(obs: &Observation) -> Option<DecideOutcome> {
     // skipped here. Documented in the report; revisit if Phase 2 wants
     // tighter routing.
 
-    for task in &obs.tasks {
-        if task.status != "ready" {
-            continue;
-        }
+    let ordered = order_ready_tasks(&obs.tasks);
+
+    for ot in &ordered {
+        let task = ot.task;
 
         // Idempotency: was this task already assigned in the recent
         // decisions window? If so, skip — the worker is mid-startup.
@@ -175,9 +255,44 @@ pub(crate) fn rule_b(obs: &Observation) -> Option<DecideOutcome> {
             continue;
         }
 
+        // Cross-task ordering: if an earlier task in this iteration's
+        // sort already claims overlapping paths, emit a deferral
+        // advisory instead of racing them for the same lock. Idempotent
+        // against repeated cross-task deferrals for the same task.
+        if let Some(blocker_id) = &ot.deferred_behind {
+            let already_deferred = obs.recent_decisions.iter().take(20).any(|d| {
+                d.rule == "B"
+                    && d.action == "advise-with-text"
+                    && d.target_id.as_deref() == Some(task.id.as_str())
+                    && d.reasoning.contains("deferred behind task")
+            });
+            if already_deferred {
+                continue;
+            }
+
+            let overlap_paths: Vec<String> = task
+                .expected_file_claims
+                .iter()
+                .map(|p| normalize_path(p))
+                .collect();
+            let body = format!(
+                "task {} deferred behind task {} — overlaps {}",
+                task.id,
+                blocker_id,
+                overlap_paths.join(", ")
+            );
+            return Some(DecideOutcome {
+                rule: "B",
+                action: CoordinatorAction::AdviseWithText {
+                    target_id: Some(task.id.clone()),
+                    reasoning: stamp_reasoning("B", &body),
+                },
+            });
+        }
+
         // Idle sessions where last touched paths don't overlap the task's
         // expected_file_claims.
-        let mut candidates: Vec<&LiveSession> = obs
+        let candidates: Vec<&LiveSession> = obs
             .live_sessions
             .iter()
             .filter(|ls| is_idle(ls))
@@ -191,8 +306,29 @@ pub(crate) fn rule_b(obs: &Observation) -> Option<DecideOutcome> {
             })
             .collect();
 
-        match candidates.len() {
-            0 => {
+        // Lock-state filter: a candidate is lock-safe for this task if
+        // every expected_file_claim path is either unheld OR held by
+        // this same session. Held by someone else → assigning this
+        // session would block on its first Edit.
+        let mut candidates_lock_safe: Vec<&LiveSession> = candidates
+            .iter()
+            .copied()
+            .filter(|ls| {
+                task.expected_file_claims.iter().all(|p| {
+                    let p = normalize_path(p);
+                    match obs.held_locks.get(&p) {
+                        None => true,
+                        Some(holder) => holder == &ls.task_run_id,
+                    }
+                })
+            })
+            .collect();
+
+        if candidates_lock_safe.is_empty() {
+            if candidates.is_empty() {
+                // Path-overlap pass already excluded everyone — emit the
+                // existing no-suitable-session advisory. One advisory
+                // per task per tick max (plan §9.5).
                 let body = format!(
                     "no suitable idle session for ready task {} (phase={}); user attention requested",
                     task.id, task.phase_name
@@ -205,51 +341,80 @@ pub(crate) fn rule_b(obs: &Observation) -> Option<DecideOutcome> {
                     },
                 });
             }
-            1 => {
-                let session = candidates[0];
-                let body = format!(
-                    "assigning ready task {} to idle session {} (phase={})",
-                    task.id, session.task_run_id, task.phase_name
-                );
-                return Some(DecideOutcome {
-                    rule: "B",
-                    action: CoordinatorAction::AssignTask {
-                        task_id: task.id.clone(),
-                        session_id: session.task_run_id.clone(),
-                        reasoning: Some(stamp_reasoning("B", &body)),
-                    },
-                });
+
+            // Path-overlap found candidates, lock-state ruled them all
+            // out. Emit a deferral advisory naming the blocker paths,
+            // idempotent against repeated deferrals for the same task.
+            let blocker_paths: Vec<String> = task
+                .expected_file_claims
+                .iter()
+                .map(|p| normalize_path(p))
+                .filter(|p| obs.held_locks.contains_key(p))
+                .collect();
+
+            let already_deferred = obs.recent_decisions.iter().take(20).any(|d| {
+                d.rule == "B"
+                    && d.action == "advise-with-text"
+                    && d.target_id.as_deref() == Some(task.id.as_str())
+                    && d.reasoning.contains("deferred — every candidate session")
+            });
+            if already_deferred {
+                continue;
             }
-            _ => {
-                // Multi-match → least-recently-busy. With no per-session
-                // last-busy timestamp on `LiveSession`, fall back to
-                // "smallest touched-files set" (proxy for "least
-                // recently busy" — fewer touched files implies the
-                // session has been idle longer or just started).
-                candidates.sort_by_key(|ls| {
-                    obs.session_touched_files
-                        .get(&ls.task_run_id)
-                        .map(|v| v.len())
-                        .unwrap_or(0)
-                });
-                let session = candidates[0];
-                let body = format!(
-                    "assigning ready task {} to idle session {} (least-recently-busy of {} candidates; phase={})",
-                    task.id,
-                    session.task_run_id,
-                    candidates.len(),
-                    task.phase_name
-                );
-                return Some(DecideOutcome {
-                    rule: "B",
-                    action: CoordinatorAction::AssignTask {
-                        task_id: task.id.clone(),
-                        session_id: session.task_run_id.clone(),
-                        reasoning: Some(stamp_reasoning("B", &body)),
-                    },
-                });
-            }
+
+            let body = format!(
+                "task {} deferred — every candidate session would collide with held lock on {}",
+                task.id,
+                blocker_paths.join(", ")
+            );
+            return Some(DecideOutcome {
+                rule: "B",
+                action: CoordinatorAction::AdviseWithText {
+                    target_id: Some(task.id.clone()),
+                    reasoning: stamp_reasoning("B", &body),
+                },
+            });
         }
+
+        if candidates_lock_safe.len() == 1 {
+            let session = candidates_lock_safe[0];
+            let body = format!(
+                "assigning ready task {} to lock-safe idle session {} (phase={})",
+                task.id, session.task_run_id, task.phase_name
+            );
+            return Some(DecideOutcome {
+                rule: "B",
+                action: CoordinatorAction::AssignTask {
+                    task_id: task.id.clone(),
+                    session_id: session.task_run_id.clone(),
+                    reasoning: Some(stamp_reasoning("B", &body)),
+                },
+            });
+        }
+
+        // Multi-match composite tie-break. Sort ascending by (rank,
+        // task_run_id) so rank ties are broken deterministically — the
+        // old smallest-touched-files heuristic could shuffle on ties.
+        let total = candidates_lock_safe.len();
+        candidates_lock_safe.sort_by(|a, b| {
+            let ra = rank(a, &obs.heatmap);
+            let rb = rank(b, &obs.heatmap);
+            ra.cmp(&rb).then_with(|| a.task_run_id.cmp(&b.task_run_id))
+        });
+        let session = candidates_lock_safe[0];
+        let chosen_rank = rank(session, &obs.heatmap);
+        let body = format!(
+            "assigning ready task {} to lock-safe session {} (composite rank {} of {} candidates; phase={})",
+            task.id, session.task_run_id, chosen_rank, total, task.phase_name
+        );
+        return Some(DecideOutcome {
+            rule: "B",
+            action: CoordinatorAction::AssignTask {
+                task_id: task.id.clone(),
+                session_id: session.task_run_id.clone(),
+                reasoning: Some(stamp_reasoning("B", &body)),
+            },
+        });
     }
     None
 }
@@ -629,6 +794,8 @@ mod tests {
             open_escalations: Vec::new(),
             session_touched_files: HashMap::new(),
             recent_decisions: Vec::new(),
+            held_locks: HashMap::new(),
+            heatmap: HeatmapSnapshot::default(),
         }
     }
 
@@ -822,6 +989,335 @@ mod tests {
 
         // Recent assign → skipped. No other tasks → returns None.
         assert!(rule_b(&obs).is_none());
+    }
+
+    #[test]
+    fn rule_b_holder_is_preferred_over_non_holder() {
+        // Task wants src/foo.rs. Two idle Ready sessions; sess-b holds
+        // the lock on that path. Lock-safe filter keeps sess-b (the
+        // holder already has the lock — no collision) and drops sess-a
+        // (it would block on its first Edit). Expect AssignTask → sess-b.
+        let mut obs = empty_obs();
+        let mut task = make_task("t-1", "ready");
+        task.expected_file_claims = vec!["src/foo.rs".to_string()];
+        obs.tasks.push(task);
+        obs.live_sessions
+            .push(make_session("sess-a", SessionState::Ready));
+        obs.live_sessions
+            .push(make_session("sess-b", SessionState::Ready));
+        obs.held_locks
+            .insert(normalize_path("src/foo.rs"), "sess-b".to_string());
+
+        let outcome = rule_b(&obs).expect("rule B should fire");
+        match outcome.action {
+            CoordinatorAction::AssignTask {
+                session_id,
+                reasoning,
+                ..
+            } => {
+                assert_eq!(
+                    session_id, "sess-b",
+                    "holder of conflicting lock must be preferred"
+                );
+                let r = reasoning.unwrap_or_default();
+                assert!(
+                    r.contains("lock-safe"),
+                    "expected 'lock-safe' in reasoning: {}",
+                    r
+                );
+            }
+            _ => panic!("expected AssignTask"),
+        }
+    }
+
+    #[test]
+    fn rule_b_defers_when_all_candidates_blocked_by_lock() {
+        // Task wants src/foo.rs. One idle Ready candidate. A separate
+        // session (not idle, won't be a candidate) holds the lock. The
+        // sole candidate therefore can't be lock-safe. Expect deferral
+        // advisory, NOT the no-suitable-session one.
+        let mut obs = empty_obs();
+        let mut task = make_task("t-1", "ready");
+        task.expected_file_claims = vec!["src/foo.rs".to_string()];
+        obs.tasks.push(task);
+        obs.live_sessions
+            .push(make_session("sess-a", SessionState::Ready));
+        obs.held_locks
+            .insert(normalize_path("src/foo.rs"), "sess-holder".to_string());
+
+        let outcome = rule_b(&obs).expect("rule B should fire (deferral)");
+        match outcome.action {
+            CoordinatorAction::AdviseWithText {
+                target_id,
+                reasoning,
+            } => {
+                assert_eq!(target_id.as_deref(), Some("t-1"));
+                assert!(
+                    reasoning.contains("deferred — every candidate session"),
+                    "expected deferral body, got: {}",
+                    reasoning
+                );
+                assert!(
+                    reasoning.contains("src/foo.rs"),
+                    "expected blocker path in reasoning: {}",
+                    reasoning
+                );
+            }
+            _ => panic!("expected AdviseWithText"),
+        }
+    }
+
+    #[test]
+    fn rule_b_holder_session_is_lock_safe() {
+        // The idle session itself holds the lock — that's not a
+        // conflict, the lock is already its own. Expect AssignTask.
+        let mut obs = empty_obs();
+        let mut task = make_task("t-1", "ready");
+        task.expected_file_claims = vec!["src/foo.rs".to_string()];
+        obs.tasks.push(task);
+        obs.live_sessions
+            .push(make_session("sess-a", SessionState::Ready));
+        obs.held_locks
+            .insert(normalize_path("src/foo.rs"), "sess-a".to_string());
+
+        let outcome = rule_b(&obs).expect("rule B should fire");
+        match outcome.action {
+            CoordinatorAction::AssignTask { session_id, .. } => {
+                assert_eq!(session_id, "sess-a");
+            }
+            _ => panic!("expected AssignTask"),
+        }
+    }
+
+    #[test]
+    fn rule_b_composite_tie_break_prefers_lower_breadth() {
+        // Two idle lock-safe candidates, neither holds locks. Heatmap
+        // breadth: a=10, b=2 → b wins.
+        let mut obs = empty_obs();
+        obs.tasks.push(make_task("t-1", "ready"));
+        obs.live_sessions
+            .push(make_session("sess-a", SessionState::Ready));
+        obs.live_sessions
+            .push(make_session("sess-b", SessionState::Ready));
+        obs.heatmap
+            .session_distinct_files
+            .insert("sess-a".to_string(), 10);
+        obs.heatmap
+            .session_distinct_files
+            .insert("sess-b".to_string(), 2);
+
+        let outcome = rule_b(&obs).expect("rule B should fire");
+        match outcome.action {
+            CoordinatorAction::AssignTask {
+                session_id,
+                reasoning,
+                ..
+            } => {
+                assert_eq!(session_id, "sess-b");
+                let r = reasoning.unwrap_or_default();
+                assert!(
+                    r.contains("composite rank"),
+                    "expected composite-rank reasoning: {}",
+                    r
+                );
+            }
+            _ => panic!("expected AssignTask"),
+        }
+    }
+
+    #[test]
+    fn rule_b_composite_tie_break_held_dominates_breadth() {
+        // a: breadth=2, held=2 → rank 10. b: breadth=8, held=0 → rank 8.
+        // Held count is weighted 4x; b should still win on raw rank.
+        let mut obs = empty_obs();
+        obs.tasks.push(make_task("t-1", "ready"));
+        obs.live_sessions
+            .push(make_session("sess-a", SessionState::Ready));
+        obs.live_sessions
+            .push(make_session("sess-b", SessionState::Ready));
+        obs.heatmap
+            .session_distinct_files
+            .insert("sess-a".to_string(), 2);
+        obs.heatmap
+            .session_distinct_files
+            .insert("sess-b".to_string(), 8);
+        obs.heatmap
+            .session_held_count
+            .insert("sess-a".to_string(), 2);
+
+        let outcome = rule_b(&obs).expect("rule B should fire");
+        match outcome.action {
+            CoordinatorAction::AssignTask { session_id, .. } => {
+                assert_eq!(session_id, "sess-b");
+            }
+            _ => panic!("expected AssignTask"),
+        }
+    }
+
+    #[test]
+    fn rule_b_deferral_advisory_is_idempotent() {
+        // Same world as `defers_when_all_candidates_blocked_by_lock`
+        // but with a matching deferral row already in recent_decisions.
+        // Rule B must skip the task (no other ready tasks → None).
+        let mut obs = empty_obs();
+        let mut task = make_task("t-1", "ready");
+        task.expected_file_claims = vec!["src/foo.rs".to_string()];
+        obs.tasks.push(task);
+        obs.live_sessions
+            .push(make_session("sess-a", SessionState::Ready));
+        obs.held_locks
+            .insert(normalize_path("src/foo.rs"), "sess-holder".to_string());
+
+        let mut prior = make_decision("B", "advise-with-text", Some("t-1"));
+        prior.reasoning = format!(
+            "[rule=B v={}] task t-1 deferred — every candidate session would collide with held lock on src/foo.rs",
+            RULE_VERSION
+        );
+        obs.recent_decisions.push(prior);
+
+        assert!(rule_b(&obs).is_none());
+    }
+
+    #[test]
+    fn order_ready_tasks_sorts_by_id_and_drops_non_ready() {
+        let tasks = vec![
+            make_task("t-3", "ready"),
+            make_task("t-1", "ready"),
+            make_task("t-2", "pending"), // dropped
+            make_task("t-4", "ready"),
+        ];
+        let ordered = order_ready_tasks(&tasks);
+        let ids: Vec<&str> = ordered.iter().map(|ot| ot.task.id.as_str()).collect();
+        assert_eq!(ids, vec!["t-1", "t-3", "t-4"]);
+        assert!(ordered.iter().all(|ot| ot.deferred_behind.is_none()));
+    }
+
+    #[test]
+    fn order_ready_tasks_marks_overlapping_with_blocker_id() {
+        let mut t1 = make_task("t-1", "ready");
+        t1.expected_file_claims = vec!["src/foo.rs".to_string()];
+        let mut t2 = make_task("t-2", "ready");
+        t2.expected_file_claims = vec!["src/bar.rs".to_string()];
+        let mut t3 = make_task("t-3", "ready");
+        // t-3 overlaps t-1.
+        t3.expected_file_claims = vec!["src/foo.rs".to_string()];
+
+        let tasks = vec![t3.clone(), t1.clone(), t2.clone()];
+        let ordered = order_ready_tasks(&tasks);
+
+        // After sort-by-id: t-1, t-2, t-3 → t-3 tail-pushed because it
+        // overlaps t-1. Final order: [t-1, t-2, t-3].
+        let ids: Vec<&str> = ordered.iter().map(|ot| ot.task.id.as_str()).collect();
+        assert_eq!(ids, vec!["t-1", "t-2", "t-3"]);
+        assert_eq!(ordered[0].deferred_behind, None);
+        assert_eq!(ordered[1].deferred_behind, None);
+        assert_eq!(ordered[2].deferred_behind.as_deref(), Some("t-1"));
+    }
+
+    #[test]
+    fn order_ready_tasks_no_blocker_when_paths_disjoint() {
+        let mut t1 = make_task("t-1", "ready");
+        t1.expected_file_claims = vec!["src/a.rs".to_string()];
+        let mut t2 = make_task("t-2", "ready");
+        t2.expected_file_claims = vec!["src/b.rs".to_string()];
+
+        let tasks = vec![t1, t2];
+        let ordered = order_ready_tasks(&tasks);
+        assert!(ordered.iter().all(|ot| ot.deferred_behind.is_none()));
+    }
+
+    #[test]
+    fn rule_b_emits_cross_task_deferral_for_overlap() {
+        // t-1 and t-2 both ready, both want src/foo.rs, t-1 was recently
+        // assigned (idempotency-skipped). Rule B walks the ordered list:
+        // t-1 is skipped → falls through to t-2, which is tail-pushed
+        // behind t-1. Expect AdviseWithText for t-2.
+        let mut obs = empty_obs();
+        let mut t1 = make_task("t-1", "ready");
+        t1.expected_file_claims = vec!["src/foo.rs".to_string()];
+        let mut t2 = make_task("t-2", "ready");
+        t2.expected_file_claims = vec!["src/foo.rs".to_string()];
+        obs.tasks.push(t1);
+        obs.tasks.push(t2);
+        obs.live_sessions
+            .push(make_session("sess-a", SessionState::Ready));
+        // recent_assign on t-1 → t-1 is skipped.
+        obs.recent_decisions
+            .push(make_decision("B", "assign-task", Some("t-1")));
+
+        let outcome = rule_b(&obs).expect("rule B should fire");
+        match outcome.action {
+            CoordinatorAction::AdviseWithText {
+                target_id,
+                reasoning,
+            } => {
+                assert_eq!(target_id.as_deref(), Some("t-2"));
+                assert!(
+                    reasoning.contains("deferred behind task t-1"),
+                    "expected cross-task deferral body: {}",
+                    reasoning
+                );
+            }
+            _ => panic!("expected AdviseWithText"),
+        }
+    }
+
+    #[test]
+    fn rule_b_cross_task_deferral_is_idempotent() {
+        // Same setup, but a matching cross-task deferral already exists
+        // in recent_decisions. Rule B should produce None (no other
+        // ready tasks to act on).
+        let mut obs = empty_obs();
+        let mut t1 = make_task("t-1", "ready");
+        t1.expected_file_claims = vec!["src/foo.rs".to_string()];
+        let mut t2 = make_task("t-2", "ready");
+        t2.expected_file_claims = vec!["src/foo.rs".to_string()];
+        obs.tasks.push(t1);
+        obs.tasks.push(t2);
+        obs.live_sessions
+            .push(make_session("sess-a", SessionState::Ready));
+        obs.recent_decisions
+            .push(make_decision("B", "assign-task", Some("t-1")));
+
+        let mut prior = make_decision("B", "advise-with-text", Some("t-2"));
+        prior.reasoning = format!(
+            "[rule=B v={}] task t-2 deferred behind task t-1 — overlaps src/foo.rs",
+            RULE_VERSION
+        );
+        obs.recent_decisions.push(prior);
+
+        assert!(rule_b(&obs).is_none());
+    }
+
+    #[test]
+    fn rule_b_no_double_advisory_when_no_candidates_at_all() {
+        // Path-overlap excludes the only idle session — candidates is
+        // empty. Expect the existing "no suitable idle session"
+        // advisory, NOT the new "deferred" one.
+        let mut obs = empty_obs();
+        let mut task = make_task("t-1", "ready");
+        task.expected_file_claims = vec!["src/foo.rs".to_string()];
+        obs.tasks.push(task);
+        obs.live_sessions
+            .push(make_session("sess-a", SessionState::Ready));
+        obs.session_touched_files
+            .insert("sess-a".to_string(), vec!["src/foo.rs".to_string()]);
+
+        let outcome = rule_b(&obs).expect("rule B should fire");
+        match outcome.action {
+            CoordinatorAction::AdviseWithText { reasoning, .. } => {
+                assert!(
+                    reasoning.contains("no suitable idle session"),
+                    "expected no-suitable advisory body: {}",
+                    reasoning
+                );
+                assert!(
+                    !reasoning.contains("deferred — every candidate session"),
+                    "must not emit the deferral body when candidates are empty"
+                );
+            }
+            _ => panic!("expected AdviseWithText"),
+        }
     }
 
     // --- Rule C ----------------------------------------------------------
