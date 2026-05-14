@@ -119,21 +119,13 @@ fn build_assertion(
 }
 
 fn build_group(state: &IrState) -> LegacyGroup {
-    let parsed_criteria: Vec<IrElementCriteria> = state
-        .assertions
-        .iter()
-        .map(|a| {
-            serde_json::from_value::<IrElementCriteria>(a.target.criteria.clone())
-                .expect("IrState.assertions[].target.criteria must be IrElementCriteria-shaped")
-        })
-        .collect();
-    let assertions: Vec<LegacyAssertion> = if parsed_criteria.is_empty() {
+    let assertions: Vec<LegacyAssertion> = if state.assertions.is_empty() {
         vec![build_assertion(state, 0, None)]
     } else {
-        parsed_criteria
+        state
+            .assertions
             .iter()
-            .enumerate()
-            .map(|(i, c)| build_assertion(state, i, Some(c)))
+            .map(synthesized_assertion_to_legacy)
             .collect()
     };
     let description = state
@@ -242,13 +234,8 @@ fn build_state_machine_state(
         elements: state
             .assertions
             .iter()
-            .map(|a| {
-                let crit: IrElementCriteria = serde_json::from_value(a.target.criteria.clone())
-                    .expect(
-                        "IrState.assertions[].target.criteria must be IrElementCriteria-shaped",
-                    );
-                convert_criteria(&crit)
-            })
+            .filter_map(|a| serde_json::from_value::<IrElementCriteria>(a.target.criteria.clone()).ok())
+            .map(|c| convert_criteria(&c))
             .collect(),
         is_initial,
         transitions: outgoing,

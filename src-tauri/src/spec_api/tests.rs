@@ -29,17 +29,17 @@ fn small_doc() -> IrPageSpec {
                 "description": "Workflow executing",
                 "assertions": [
                     {
-                        "id": "running::req[0]",
+                        "id": "running-elem-0",
                         "description": "Required element 0 for state Running",
                         "category": "element-presence",
                         "severity": "critical",
                         "assertionType": "exists",
                         "target": {
                             "type": "search",
-                            "criteria": { "role": "button", "text": "Stop" },
+                            "criteria": { "role": "button", "textContent": "Stop" },
                             "label": "Required element for Running"
                         },
-                        "source": "test-fixture",
+                        "source": "ai-generated",
                         "reviewed": false,
                         "enabled": true
                     }
@@ -390,5 +390,333 @@ mod handler_tests {
         // reason: "page-not-found" envelope).
         let missing = super::super::storage::read_projection(&root, "nonexistent").unwrap();
         assert!(missing.is_none());
+    }
+
+    // =========================================================================
+    // Plan 04 Phase 3 — distinctness validator integration tests
+    // =========================================================================
+
+    use super::super::handlers::{
+        build_author_response, build_derive_response, build_validate_response, DeriveBody,
+        ValidateBody,
+    };
+    use serde_json::json;
+
+    /// Build a degenerate IR: a single state with one fully-empty `{}`
+    /// criterion. Triggers a single `EmptyCriteria` violation.
+    fn degenerate_doc(id: &str) -> super::IrPageSpec {
+        let raw = json!({
+            "version": "1.0",
+            "id": id,
+            "name": "Degenerate",
+            "states": [
+                {
+                    "id": "degen-state",
+                    "name": "Degen",
+                    "assertions": [
+                        {
+                            "id": "degen-elem-0",
+                            "description": "Empty criterion",
+                            "category": "element-presence",
+                            "severity": "critical",
+                            "assertionType": "exists",
+                            "target": {
+                                "type": "search",
+                                "criteria": {},
+                                "label": "empty"
+                            },
+                            "source": "test",
+                            "reviewed": false,
+                            "enabled": true
+                        }
+                    ]
+                }
+            ],
+            "transitions": []
+        });
+        serde_json::from_value(raw).unwrap()
+    }
+
+    /// Build a clean spec with two distinct, non-empty states.
+    fn clean_doc(id: &str) -> super::IrPageSpec {
+        let raw = json!({
+            "version": "1.0",
+            "id": id,
+            "name": "Clean",
+            "states": [
+                {
+                    "id": "state-a",
+                    "name": "A",
+                    "assertions": [
+                        {
+                            "id": "a-elem-0",
+                            "description": "Button",
+                            "category": "element-presence",
+                            "severity": "critical",
+                            "assertionType": "exists",
+                            "target": {
+                                "type": "search",
+                                "criteria": { "role": "button" },
+                                "label": "button"
+                            },
+                            "source": "test",
+                            "reviewed": false,
+                            "enabled": true
+                        }
+                    ]
+                },
+                {
+                    "id": "state-b",
+                    "name": "B",
+                    "assertions": [
+                        {
+                            "id": "b-elem-0",
+                            "description": "Link",
+                            "category": "element-presence",
+                            "severity": "critical",
+                            "assertionType": "exists",
+                            "target": {
+                                "type": "search",
+                                "criteria": { "role": "link" },
+                                "label": "link"
+                            },
+                            "source": "test",
+                            "reviewed": false,
+                            "enabled": true
+                        }
+                    ]
+                }
+            ],
+            "transitions": []
+        });
+        serde_json::from_value(raw).unwrap()
+    }
+
+    async fn response_to_json(resp: axum::response::Response) -> (axum::http::StatusCode, Value) {
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    // ------------------------------------------------------------------------
+    // 1. post_author_rejects_empty_criterion
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_author_rejects_empty_criterion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resp = build_author_response(tmp.path(), degenerate_doc("test-degen"));
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["reason"], "spec-validation-failed");
+        assert_eq!(v["detail"]["pageId"], "test-degen");
+        let violations = v["detail"]["violations"]
+            .as_array()
+            .expect("violations must be an array");
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0]["reason"], "emptyCriteria");
+        // Per-variant fields ship as camelCase via `rename_all_fields` on
+        // `DistinctnessViolation` (see distinctness.rs).
+        assert_eq!(violations[0]["stateId"], "degen-state");
+        assert_eq!(violations[0]["assertionIndex"], 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // 2. post_author_accepts_clean_spec
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_author_accepts_clean_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resp = build_author_response(tmp.path(), clean_doc("test-clean"));
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "expected 200 OK; got {} body={}",
+            status,
+            v
+        );
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["pageId"], "test-clean");
+    }
+
+    // ------------------------------------------------------------------------
+    // 3. post_validate_returns_full_report
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_validate_returns_full_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = ValidateBody {
+            document: Some(degenerate_doc("test-degen-validate")),
+            page_id: None,
+        };
+        let resp = build_validate_response(tmp.path(), body);
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v["ok"], false);
+        let violations = v["violations"]
+            .as_array()
+            .expect("violations must be an array");
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0]["reason"], "emptyCriteria");
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. post_validate_by_page_id
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_validate_by_page_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed a degenerate IR on disk by writing it directly (bypassing
+        // post_author, which would reject it).
+        let doc = degenerate_doc("seeded-degen");
+        let page_dir = tmp.path().join("pages").join(&doc.id);
+        std::fs::create_dir_all(&page_dir).unwrap();
+        let ir_path = page_dir.join("state-machine.derived.json");
+        std::fs::write(&ir_path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let body = ValidateBody {
+            document: None,
+            page_id: Some("seeded-degen".to_string()),
+        };
+        let resp = build_validate_response(tmp.path(), body);
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v["ok"], false);
+        let violations = v["violations"]
+            .as_array()
+            .expect("violations must be an array");
+        assert!(!violations.is_empty(), "expected at least one violation");
+        assert_eq!(violations[0]["reason"], "emptyCriteria");
+    }
+
+    // ------------------------------------------------------------------------
+    // 5. post_validate_missing_inputs
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_validate_missing_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = ValidateBody {
+            document: None,
+            page_id: None,
+        };
+        let resp = build_validate_response(tmp.path(), body);
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["reason"], "missing-document-or-page-id");
+    }
+
+    // ------------------------------------------------------------------------
+    // 6. get_list_carries_validation_field
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_list_carries_validation_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed a degenerate IR + its projection by hand (write_ir_and_regenerate
+        // would still emit the projection, but to keep the test focused we
+        // seed both ourselves so list_pages discovers the entry).
+        let doc = degenerate_doc("list-degen");
+        let page_dir = tmp.path().join("pages").join(&doc.id);
+        std::fs::create_dir_all(&page_dir).unwrap();
+        std::fs::write(
+            page_dir.join("state-machine.derived.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+        // Minimal projection — get_list falls back to projecting on the fly,
+        // but seeding ensures the test does not depend on the projection
+        // layer producing output for a degenerate doc.
+        std::fs::write(
+            page_dir.join("spec.uibridge.json"),
+            json!({
+                "version": "1.0.0",
+                "description": "Degenerate",
+                "groups": [],
+                "metadata": Value::Null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let resp = super::super::handlers::build_list_response(tmp.path());
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let specs = v["specs"].as_array().expect("specs must be an array");
+        // Find our seeded entry (the embedded snapshot fallback may add other
+        // entries; we look up by specId).
+        let entry = specs
+            .iter()
+            .find(|s| s["specId"] == "list-degen")
+            .expect("list-degen entry must be present");
+        let validation = &entry["validation"];
+        assert!(
+            !validation.is_null(),
+            "validation field should be populated for degenerate spec; entry={}",
+            entry
+        );
+        // Rolled-up SpecValidation shape: pageId + degenerate_state_ids
+        // (camelCase wire) + indistinguishable_state_pairs.
+        assert_eq!(validation["pageId"], "list-degen");
+        let degen_ids = validation["degenerateStateIds"]
+            .as_array()
+            .expect("degenerateStateIds must be present");
+        assert!(
+            degen_ids.iter().any(|id| id == "degen-state"),
+            "expected degen-state in degenerateStateIds; got {:?}",
+            degen_ids
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // 7. post_derive_respects_feature_flag
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_derive_respects_feature_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed a degenerate IR on disk.
+        let doc = degenerate_doc("derive-degen");
+        let page_dir = tmp.path().join("pages").join(&doc.id);
+        std::fs::create_dir_all(&page_dir).unwrap();
+        std::fs::write(
+            page_dir.join("state-machine.derived.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+
+        // Flag OFF — derivation succeeds despite degenerate IR.
+        let body_off = DeriveBody {
+            page_id: "derive-degen".to_string(),
+            derivation: "incomingTransitions".to_string(),
+        };
+        let resp = build_derive_response(tmp.path(), body_off, false);
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "with flag off, derive should succeed; body={}",
+            v
+        );
+        assert_eq!(v["ok"], true);
+
+        // Flag ON — derivation rejects with 422.
+        let body_on = DeriveBody {
+            page_id: "derive-degen".to_string(),
+            derivation: "incomingTransitions".to_string(),
+        };
+        let resp = build_derive_response(tmp.path(), body_on, true);
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["reason"], "spec-validation-failed");
+        assert_eq!(v["detail"]["pageId"], "derive-degen");
     }
 }
