@@ -185,81 +185,28 @@ impl PgDb {
             .await
             .map_err(|e| format!("PostgreSQL connection failed: {}", e))?;
 
-        // Self-bootstrap: create the `runner` schema and `vector` extension
-        // if they don't exist yet. On a first-boot docker volume the
-        // init-scripts/01-create-runner-schema.sql does this; on pre-existing
-        // volumes or non-docker Postgres deployments, those scripts never run,
-        // so we do it ourselves. Idempotent via IF NOT EXISTS.
+        // Self-bootstrap: ensure prerequisites exist regardless of which
+        // deployment substrate the runner is talking to. Two responsibilities
+        // remain in this hot path:
         //
-        // Tables created here are resolved against the active search_path
-        // (`project, public`), so they land in the `project` schema alongside
-        // the alembic-managed tables. The `runner` schema CREATE is kept for
-        // back-compat with any deployment still referencing it.
+        //   1. `CREATE EXTENSION IF NOT EXISTS vector` — pgvector is the
+        //      documented escape hatch from declarative schema management
+        //      (Atlas Community can't declaratively own extensions). Keep it
+        //      imperative; it costs nothing on a warm DB.
+        //   2. `CREATE SCHEMA IF NOT EXISTS runner` — back-compat for any
+        //      deployment still referencing the legacy runner namespace.
+        //
+        // Table-shaped DDL for `project.regression_*` previously lived here as
+        // CREATE TABLE IF NOT EXISTS self-heal. That set is now Atlas-managed
+        // out of `qontinui-runner/atlas/schema.hcl` (Row 3 schema-half pilot,
+        // Wave 1.4). Atlas is invoked out-of-process (CI / migrator container)
+        // against the canonical PG; this hot path no longer enforces the
+        // table shape. The historical alembic migration
+        // `f9d3e8a4c1b6_add_regression_tables.py` remains in
+        // `qontinui-web/backend/alembic/versions/` as frozen history.
         conn.batch_execute(
             "CREATE SCHEMA IF NOT EXISTS runner; \
-             CREATE EXTENSION IF NOT EXISTS vector; \
-             \
-             -- Section 11 / Phase A2: regression suites + runs + diagnoses + \
-             -- per-assertion exercise log for the UI Bridge regression \
-             -- subsystem. The pure `diagnose` lives in ui-bridge-auto; this is \
-             -- the impure persistence shell. \
-             CREATE TABLE IF NOT EXISTS regression_suites ( \
-                 id           UUID PRIMARY KEY, \
-                 ir_doc_id    TEXT NOT NULL, \
-                 suite_json   JSONB NOT NULL, \
-                 created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             ); \
-             CREATE INDEX IF NOT EXISTS regression_suites_ir_doc_id_idx \
-                 ON regression_suites(ir_doc_id); \
-             \
-             CREATE TABLE IF NOT EXISTS regression_runs ( \
-                 id              UUID PRIMARY KEY, \
-                 suite_id        UUID NOT NULL REFERENCES regression_suites(id) ON DELETE CASCADE, \
-                 run_id          TEXT NOT NULL, \
-                 passed          INT NOT NULL, \
-                 failed          INT NOT NULL, \
-                 started_at      TIMESTAMPTZ NOT NULL, \
-                 completed_at    TIMESTAMPTZ NOT NULL, \
-                 run_result_json JSONB NOT NULL \
-             ); \
-             CREATE INDEX IF NOT EXISTS regression_runs_suite_id_idx \
-                 ON regression_runs(suite_id); \
-             \
-             CREATE TABLE IF NOT EXISTS regression_diagnoses ( \
-                 id              UUID PRIMARY KEY, \
-                 run_id          UUID NOT NULL REFERENCES regression_runs(id) ON DELETE CASCADE, \
-                 diagnosis_json  JSONB NOT NULL, \
-                 created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             ); \
-             CREATE INDEX IF NOT EXISTS regression_diagnoses_run_id_idx \
-                 ON regression_diagnoses(run_id); \
-             \
-             CREATE TABLE IF NOT EXISTS regression_assertion_executions ( \
-                 id                    UUID PRIMARY KEY, \
-                 run_id                UUID NOT NULL REFERENCES regression_runs(id) ON DELETE CASCADE, \
-                 case_id               TEXT NOT NULL, \
-                 assertion_id          TEXT NOT NULL, \
-                 assertion_kind        TEXT NOT NULL, \
-                 status                TEXT NOT NULL, \
-                 started_at            TIMESTAMPTZ NOT NULL, \
-                 duration_ms           INT NOT NULL, \
-                 failure_kind          TEXT, \
-                 failure_evidence_json JSONB, \
-                 error_message         TEXT \
-             ); \
-             CREATE INDEX IF NOT EXISTS regression_assertion_executions_run_id_idx \
-                 ON regression_assertion_executions(run_id); \
-             CREATE INDEX IF NOT EXISTS regression_assertion_executions_case_assertion_idx \
-                 ON regression_assertion_executions(case_id, assertion_id, started_at DESC); \
-             CREATE INDEX IF NOT EXISTS regression_assertion_executions_kind_status_idx \
-                 ON regression_assertion_executions(assertion_kind, status); \
-             CREATE INDEX IF NOT EXISTS regression_assertion_executions_failures_idx \
-                 ON regression_assertion_executions(case_id, assertion_id) WHERE status = 'fail'; \
-             \
-             ALTER TABLE regression_runs \
-                 ADD COLUMN IF NOT EXISTS drift_report_json JSONB; \
-             CREATE INDEX IF NOT EXISTS regression_runs_run_id_idx \
-                 ON regression_runs(run_id);",
+             CREATE EXTENSION IF NOT EXISTS vector;",
         )
         .await
         .map_err(|e| format!("Failed to bootstrap runner schema/extension: {}", e))?;
