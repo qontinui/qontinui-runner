@@ -5,6 +5,7 @@
 
 pub mod activity_timeline;
 pub mod adaptive_learning;
+pub mod agent_worktrees;
 pub mod agentic_metrics;
 pub mod ai_sessions;
 pub mod approval_gates;
