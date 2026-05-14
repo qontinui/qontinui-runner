@@ -188,7 +188,20 @@ export function AiGeneratePanel({
   } = useTemplatePopover();
 
   // --- Spec selection state ---
-  const { specs: allSpecs } = useDiscoveredSpecs();
+  // Skip degenerate specs from the AI prompt context — their state machine
+  // can't disambiguate states, so they waste tokens. Plan 04: validation is
+  // null/undefined for clean specs, populated for dirty ones.
+  const { specs: rawSpecs } = useDiscoveredSpecs();
+  const allSpecs = useMemo(
+    () =>
+      rawSpecs.filter(
+        (s) =>
+          !s.validation ||
+          (s.validation.degenerateStateIds.length === 0 &&
+            s.validation.indistinguishableStatePairs.length === 0),
+      ),
+    [rawSpecs],
+  );
   const [showSpecs, setShowSpecs] = useState(false);
   const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
   const [selectedGroupIds, setSelectedGroupIds] = useState<Set<string>>(new Set());
