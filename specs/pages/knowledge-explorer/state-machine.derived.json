@@ -23,36 +23,6 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
-        },
-        {
-          "id": "ke-page-layout-elem-1",
-          "description": "Required element 1 for state Page Layout and Structure",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Page Layout and Structure"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ke-page-layout-elem-2",
-          "description": "Required element 2 for state Page Layout and Structure",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Page Layout and Structure"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
         }
       ],
       "description": "The Knowledge Explorer page occupies the full tab content area with a top tab bar (Search | Stats) and a scrollable content region below. The layout uses flex-col with h-full to fill available space.",
@@ -377,21 +347,6 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
-        },
-        {
-          "id": "ke-empty-and-error-states-elem-2",
-          "description": "Required element 2 for state Empty State and Error Handling",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Empty State and Error Handling"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
         }
       ],
       "description": "Before any search, the results area shows an empty state with a file-search icon and helpful text. After a failed search, a red error banner appears. After a search with no results, a 'No results found' message is shown.",
@@ -404,36 +359,6 @@
       "id": "ke-result-cards",
       "name": "Search Result Cards",
       "assertions": [
-        {
-          "id": "ke-result-cards-elem-0",
-          "description": "Required element 0 for state Search Result Cards",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Search Result Cards"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ke-result-cards-elem-1",
-          "description": "Required element 1 for state Search Result Cards",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Search Result Cards"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "ke-result-cards-elem-2",
           "description": "Required element 2 for state Search Result Cards",
@@ -513,21 +438,6 @@
             "criteria": {
               "textContains": "result"
             },
-            "label": "Required element for Search Result Cards"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ke-result-cards-elem-7",
-          "description": "Required element 7 for state Search Result Cards",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Search Result Cards"
           },
           "source": "migrated",
@@ -809,21 +719,6 @@
           "enabled": true
         },
         {
-          "id": "ke-provider-availability-elem-2",
-          "description": "Required element 2 for state Provider Availability Grid",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Provider Availability Grid"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "ke-provider-availability-elem-3",
           "description": "Required element 3 for state Provider Availability Grid",
           "category": "element-presence",
@@ -851,51 +746,6 @@
       "id": "ke-design-typography",
       "name": "Typography and Visual Design",
       "assertions": [
-        {
-          "id": "ke-design-typography-elem-0",
-          "description": "Required element 0 for state Typography and Visual Design",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Typography and Visual Design"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ke-design-typography-elem-1",
-          "description": "Required element 1 for state Typography and Visual Design",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Typography and Visual Design"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ke-design-typography-elem-2",
-          "description": "Required element 2 for state Typography and Visual Design",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Typography and Visual Design"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "ke-design-typography-elem-3",
           "description": "Required element 3 for state Typography and Visual Design",

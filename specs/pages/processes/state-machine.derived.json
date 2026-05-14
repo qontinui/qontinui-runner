@@ -260,21 +260,6 @@
           "enabled": true
         },
         {
-          "id": "process-output-virtualization-elem-2",
-          "description": "Required element 2 for state Process Output Virtualized Rendering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Process Output Virtualized Rendering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "process-output-virtualization-elem-3",
           "description": "Required element 3 for state Process Output Virtualized Rendering",
           "category": "element-presence",
@@ -584,21 +569,6 @@
             "criteria": {
               "text": "All sessions"
             },
-            "label": "Required element for Visual Design and Text Legibility"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-visual-design-elem-2",
-          "description": "Required element 2 for state Visual Design and Text Legibility",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Visual Design and Text Legibility"
           },
           "source": "migrated",

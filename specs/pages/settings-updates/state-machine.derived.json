@@ -88,36 +88,6 @@
       "name": "Current Version Card",
       "assertions": [
         {
-          "id": "upd-current-version-card-elem-0",
-          "description": "Required element 0 for state Current Version Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Current Version Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-current-version-card-elem-1",
-          "description": "Required element 1 for state Current Version Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Current Version Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "upd-current-version-card-elem-2",
           "description": "Required element 2 for state Current Version Card",
           "category": "element-presence",
@@ -129,21 +99,6 @@
               "role": "button",
               "text": "Check for Updates"
             },
-            "label": "Required element for Current Version Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-current-version-card-elem-3",
-          "description": "Required element 3 for state Current Version Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Current Version Card"
           },
           "source": "migrated",
@@ -242,21 +197,6 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
-        },
-        {
-          "id": "upd-auto-check-on-load-elem-1",
-          "description": "Required element 1 for state Automatic Check on Tab Load",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Automatic Check on Tab Load"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
         }
       ],
       "description": "The UpdateSettings component automatically triggers a `check_for_updates` call via useEffect when it first mounts. The user does not need to click anything — the check runs immediately and the status card populates once it completes.",
@@ -269,21 +209,6 @@
       "id": "upd-dev-mode-state",
       "name": "Development Mode Status Card",
       "assertions": [
-        {
-          "id": "upd-dev-mode-state-elem-0",
-          "description": "Required element 0 for state Development Mode Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Development Mode Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "upd-dev-mode-state-elem-1",
           "description": "Required element 1 for state Development Mode Status Card",
@@ -330,36 +255,6 @@
       "id": "upd-update-available-state",
       "name": "Update Available Status Card",
       "assertions": [
-        {
-          "id": "upd-update-available-state-elem-0",
-          "description": "Required element 0 for state Update Available Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Update Available Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-update-available-state-elem-1",
-          "description": "Required element 1 for state Update Available Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Update Available Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "upd-update-available-state-elem-2",
           "description": "Required element 2 for state Update Available Status Card",
@@ -489,21 +384,6 @@
       "name": "Up to Date Status Card",
       "assertions": [
         {
-          "id": "upd-up-to-date-state-elem-0",
-          "description": "Required element 0 for state Up to Date Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Up to Date Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "upd-up-to-date-state-elem-1",
           "description": "Required element 1 for state Up to Date Status Card",
           "category": "element-presence",
@@ -550,36 +430,6 @@
       "name": "Error State",
       "assertions": [
         {
-          "id": "upd-error-state-elem-0",
-          "description": "Required element 0 for state Error State",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Error State"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-error-state-elem-1",
-          "description": "Required element 1 for state Error State",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Error State"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "upd-error-state-elem-2",
           "description": "Required element 2 for state Error State",
           "category": "element-presence",
@@ -609,21 +459,6 @@
       "name": "Status Card Mutual Exclusion",
       "assertions": [
         {
-          "id": "upd-state-mutual-exclusion-elem-0",
-          "description": "Required element 0 for state Status Card Mutual Exclusion",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Status Card Mutual Exclusion"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "upd-state-mutual-exclusion-elem-1",
           "description": "Required element 1 for state Status Card Mutual Exclusion",
           "category": "element-presence",
@@ -652,21 +487,6 @@
       "id": "upd-ipc-data-model",
       "name": "IPC Response Data Model",
       "assertions": [
-        {
-          "id": "upd-ipc-data-model-elem-0",
-          "description": "Required element 0 for state IPC Response Data Model",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for IPC Response Data Model"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "upd-ipc-data-model-elem-1",
           "description": "Required element 1 for state IPC Response Data Model",

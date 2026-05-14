@@ -149,36 +149,6 @@
           "enabled": true
         },
         {
-          "id": "convergence-bar-chart-elem-1",
-          "description": "Required element 1 for state Mini Bar Chart",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Mini Bar Chart"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "convergence-bar-chart-elem-2",
-          "description": "Required element 2 for state Mini Bar Chart",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Mini Bar Chart"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "convergence-bar-chart-elem-3",
           "description": "Required element 3 for state Mini Bar Chart",
           "category": "element-presence",
@@ -189,21 +159,6 @@
             "criteria": {
               "text": "Iteration \\d+:.*failed.*passed"
             },
-            "label": "Required element for Mini Bar Chart"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "convergence-bar-chart-elem-4",
-          "description": "Required element 4 for state Mini Bar Chart",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Mini Bar Chart"
           },
           "source": "migrated",
