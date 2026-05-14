@@ -537,6 +537,8 @@ pub fn create_router(
         // proj_supervisor_build_pool.md.
         vision_capture_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
         vision_mutation_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // Phase 6 baselines registry — in-process, non-persistent.
+        vision_baselines: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking

@@ -1735,6 +1735,345 @@ async fn vision_health_handler(
 // Router + manifest
 // ============================================================================
 
+// ============================================================================
+// Phase 6: vision/analyze + vision/assert + vision/baseline endpoints
+// ============================================================================
+
+/// One baseline as stored in `ApiState.vision_baselines`. Combines the
+/// vision-core `BaselineEntry` (element bboxes for layout-shift checks)
+/// with provenance.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineRegistryEntry {
+    pub name: String,
+    /// SHA-256 of the captured PNG at baseline time. Echoed in the
+    /// list endpoint so callers can detect mismatches.
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    pub registered_at_unix_ms: i64,
+    pub element_bboxes: std::collections::HashMap<String, qontinui_vision_core::Region>,
+}
+
+impl From<&BaselineRegistryEntry> for qontinui_vision_core::BaselineEntry {
+    fn from(b: &BaselineRegistryEntry) -> Self {
+        qontinui_vision_core::BaselineEntry {
+            element_bboxes: b.element_bboxes.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyzeRequest {
+    pub analyzer: qontinui_vision_core::Analyzer,
+    /// Snapshot supplied by the caller. The runner does not auto-fetch
+    /// from `discover` — callers (skills, tests) bring their own
+    /// snapshot for deterministic input. A future revision can add an
+    /// `auto_snapshot: true` flag that triggers a runner-side discover.
+    #[serde(default)]
+    pub snapshot: Option<qontinui_vision_core::ElementSnapshot>,
+    /// Optional: name of a registered baseline to use as a prior frame
+    /// for the `dynamic` analyzer.
+    #[serde(default)]
+    pub prior_frame_sha256: Option<String>,
+    /// Optional: capture region. If `None`, captures the full window.
+    #[serde(default)]
+    pub region: Option<RegionRequest>,
+    #[serde(default)]
+    pub element: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyzeResponse {
+    pub analyzer: qontinui_vision_core::Analyzer,
+    pub findings: Vec<qontinui_vision_core::Finding>,
+    pub frame: AnalyzedFrameInfo,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyzedFrameInfo {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssertRequest {
+    pub assertions: Vec<qontinui_vision_core::Assertion>,
+    /// Snapshot supplied by the caller.
+    #[serde(default)]
+    pub snapshot: Option<qontinui_vision_core::ElementSnapshot>,
+    /// Optional OCR blocks the caller pre-fetched via `vision/extract`.
+    /// `contains_text` assertions on regions / elements without
+    /// snapshot text fall back to these.
+    #[serde(default)]
+    pub ocr_blocks: Option<Vec<vision_ai::OcrBlock>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssertResponse {
+    pub results: Vec<qontinui_vision_core::AssertionResult>,
+    pub all_passed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineRequest {
+    pub name: String,
+    /// Snapshot to capture as the baseline. Caller supplies because the
+    /// runner doesn't auto-discover here either.
+    pub snapshot: qontinui_vision_core::ElementSnapshot,
+    /// Optional: capture-spec for the baseline image. If absent, captures
+    /// the full window with the PNG-strict contract.
+    #[serde(default)]
+    pub capture: Option<CaptureSpec>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineCreateResponse {
+    pub name: String,
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    pub registered_at_unix_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineListResponse {
+    pub baselines: Vec<BaselineRegistryEntry>,
+}
+
+/// `POST /ui-bridge/vision/analyze` — run a named analyzer over a
+/// captured frame + caller-supplied [`ElementSnapshot`]. Returns
+/// structured findings; never pixels.
+async fn vision_analyze_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<AnalyzeRequest>,
+) -> Result<Json<ApiResponse<AnalyzeResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let frame = capture_runner_window_frame(&state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let width = frame.width;
+    let height = frame.height;
+
+    let snapshot = req.snapshot.as_ref();
+    let prior = None; // future: look up by sha256 in cache
+
+    let input = qontinui_vision_core::AnalyzeInput {
+        frame: Some(&frame),
+        snapshot,
+        prior_frame: prior,
+    };
+    let findings = qontinui_vision_core::analyzers::run(req.analyzer, &input);
+
+    info!(
+        "vision/analyze: analyzer={:?} findings={}",
+        req.analyzer,
+        findings.len()
+    );
+    Ok(Json(ApiResponse::success(AnalyzeResponse {
+        analyzer: req.analyzer,
+        findings,
+        frame: AnalyzedFrameInfo { width, height },
+    })))
+}
+
+/// `POST /ui-bridge/vision/assert` — evaluate a list of declarative
+/// assertions over a captured frame + caller-supplied snapshot/OCR.
+/// Returns per-assertion pass/fail + reason.
+async fn vision_assert_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<AssertRequest>,
+) -> Result<Json<ApiResponse<AssertResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let frame = capture_runner_window_frame(&state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    // Project the registry into the vision-core BaselineEntry map
+    // (matches the assertion DSL's expected shape).
+    let baselines_owned: std::collections::HashMap<String, qontinui_vision_core::BaselineEntry> = {
+        let guard = state.vision_baselines.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error("vision_baselines mutex poisoned")),
+            )
+        })?;
+        guard
+            .iter()
+            .map(|(k, v)| (k.clone(), qontinui_vision_core::BaselineEntry::from(v)))
+            .collect()
+    };
+
+    let ocr_borrowed: Option<Vec<qontinui_vision_core::OcrBlockRef<'_>>> =
+        req.ocr_blocks.as_ref().map(|blocks| {
+            blocks
+                .iter()
+                .map(|b| qontinui_vision_core::OcrBlockRef {
+                    bbox: qontinui_vision_core::Region {
+                        x: b.bbox.x,
+                        y: b.bbox.y,
+                        w: b.bbox.w,
+                        h: b.bbox.h,
+                    },
+                    text: b.text.as_str(),
+                    confidence: b.confidence,
+                })
+                .collect()
+        });
+
+    let ctx = qontinui_vision_core::EvalContext {
+        snapshot: req.snapshot.as_ref(),
+        frame: Some(&frame),
+        ocr_blocks: ocr_borrowed.as_deref(),
+        baselines: Some(&baselines_owned),
+    };
+
+    let results: Vec<_> = req
+        .assertions
+        .iter()
+        .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
+        .collect();
+    let all_passed = results.iter().all(|r| r.passed);
+
+    info!(
+        "vision/assert: {} assertions, {} passed, {} failed",
+        results.len(),
+        results.iter().filter(|r| r.passed).count(),
+        results.iter().filter(|r| !r.passed).count()
+    );
+
+    Ok(Json(ApiResponse::success(AssertResponse {
+        results,
+        all_passed,
+    })))
+}
+
+/// `POST /ui-bridge/vision/baseline` — capture a baseline image + record
+/// the snapshot's bboxes under `name`. Subsequent
+/// `Assertion::NoLayoutShiftSince { baseline: name }` checks compare
+/// against the recorded bboxes.
+async fn vision_baseline_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<BaselineRequest>,
+) -> Result<Json<ApiResponse<BaselineCreateResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let frame = capture_runner_window_frame(&state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    // Encode for storage. Use PNG-strict so the baseline is lossless.
+    let capture_req: CaptureRequest = match req.capture {
+        Some(spec) => spec.into(),
+        None => CaptureRequest {
+            contract: Some("png_strict".into()),
+            ..Default::default()
+        },
+    };
+    let contract = resolve_contract(capture_req.contract.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+    let crop = resolve_crop_region(
+        &state,
+        &capture_req.region,
+        &capture_req.element,
+        frame.width,
+        frame.height,
+    )
+    .await
+    .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+    let pipeline = build_pipeline(contract, crop, Vec::new(), Vec::new());
+    let bytes = pipeline.run(frame).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )
+    })?;
+    let decoded = image::load_from_memory(&bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("decode: {}", e))),
+        )
+    })?;
+    let width = decoded.width();
+    let height = decoded.height();
+
+    // Cache the image under (baseline-name).
+    let cache_key =
+        qontinui_vision_core::sha256_of(format!("v=1|baseline|name={}", req.name).as_bytes());
+    let hit = state
+        .vision_cache
+        .put(&cache_key, &bytes, "png")
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("cache put: {}", e))),
+            )
+        })?;
+
+    let element_bboxes: std::collections::HashMap<String, qontinui_vision_core::Region> = req
+        .snapshot
+        .elements
+        .iter()
+        .map(|e| (e.id.clone(), e.bbox))
+        .collect();
+    let registered_at_unix_ms = chrono::Utc::now().timestamp_millis();
+    let entry = BaselineRegistryEntry {
+        name: req.name.clone(),
+        sha256: hit.sha256_hex.clone(),
+        width,
+        height,
+        registered_at_unix_ms,
+        element_bboxes,
+    };
+
+    {
+        let mut guard = state.vision_baselines.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error("vision_baselines mutex poisoned")),
+            )
+        })?;
+        guard.insert(req.name.clone(), entry);
+    }
+
+    info!(
+        "vision/baseline: name={} sha={} {}x{}",
+        req.name,
+        &hit.sha256_hex[..12],
+        width,
+        height
+    );
+
+    Ok(Json(ApiResponse::success(BaselineCreateResponse {
+        name: req.name,
+        sha256: hit.sha256_hex,
+        width,
+        height,
+        registered_at_unix_ms,
+    })))
+}
+
+/// `GET /ui-bridge/vision/baselines` — list registered baselines for the
+/// current runner instance.
+async fn vision_baselines_list_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<BaselineListResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let guard = state.vision_baselines.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error("vision_baselines mutex poisoned")),
+        )
+    })?;
+    let baselines: Vec<_> = guard.values().cloned().collect();
+    Ok(Json(ApiResponse::success(BaselineListResponse {
+        baselines,
+    })))
+}
+
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/ui-bridge/vision/capture", post(vision_capture_handler))
@@ -1743,6 +2082,13 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/vision/raw", post(vision_raw_handler))
         .route("/ui-bridge/vision/extract", post(vision_extract_handler))
         .route("/ui-bridge/vision/describe", post(vision_describe_handler))
+        .route("/ui-bridge/vision/analyze", post(vision_analyze_handler))
+        .route("/ui-bridge/vision/assert", post(vision_assert_handler))
+        .route("/ui-bridge/vision/baseline", post(vision_baseline_handler))
+        .route(
+            "/ui-bridge/vision/baselines",
+            get(vision_baselines_list_handler),
+        )
         .route(
             "/ui-bridge/vision/cache/{sha256}",
             get(vision_cache_get_handler),
@@ -1762,6 +2108,10 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/vision/raw"),
         ("POST", "/ui-bridge/vision/extract"),
         ("POST", "/ui-bridge/vision/describe"),
+        ("POST", "/ui-bridge/vision/analyze"),
+        ("POST", "/ui-bridge/vision/assert"),
+        ("POST", "/ui-bridge/vision/baseline"),
+        ("GET", "/ui-bridge/vision/baselines"),
         ("GET", "/ui-bridge/vision/cache/{sha256}"),
         ("GET", "/ui-bridge/vision/health"),
         ("POST", "/ui-bridge/vision/mutation-occurred"),
