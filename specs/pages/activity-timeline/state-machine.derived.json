@@ -6,8 +6,22 @@
     {
       "id": "timeline-navigation",
       "name": "Page Navigation",
-      "requiredElements": [
-        {}
+      "assertions": [
+        {
+          "id": "timeline-navigation-elem-0",
+          "description": "Required element 0 for state Page Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Page Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "The Activity Timeline lives under the Observe sidebar group and is a runner-only page. Users navigate to it by clicking 'Activity Timeline' in the sidebar.",
       "provenance": {
@@ -17,9 +31,37 @@
     {
       "id": "timeline-semantic",
       "name": "Page Purpose",
-      "requiredElements": [
-        {},
-        {}
+      "assertions": [
+        {
+          "id": "timeline-semantic-elem-0",
+          "description": "Required element 0 for state Page Purpose",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Page Purpose"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-semantic-elem-1",
+          "description": "Required element 1 for state Page Purpose",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Page Purpose"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "Users come to this page to search through captured screen content. The search input placeholder and overall layout should make it immediately clear that this is a search-first interface for screen capture history.",
       "precondition": "A search has been performed that returned zero results",
@@ -30,16 +72,100 @@
     {
       "id": "timeline-element-presence",
       "name": "Core UI Elements",
-      "requiredElements": [
-        {},
+      "assertions": [
         {
-          "role": "button",
-          "textContains": "Search"
+          "id": "timeline-element-presence-elem-0",
+          "description": "Required element 0 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
-        {},
-        {},
-        {}
+        {
+          "id": "timeline-element-presence-elem-1",
+          "description": "Required element 1 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Search"
+            },
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-element-presence-elem-2",
+          "description": "Required element 2 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-element-presence-elem-3",
+          "description": "Required element 3 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-element-presence-elem-4",
+          "description": "Required element 4 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-element-presence-elem-5",
+          "description": "Required element 5 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "The page always shows a search bar with input, Search button, filter toggle button, and stats button, regardless of whether any data exists in the timeline.",
       "precondition": "The filter toggle button has been activated (showFilters=true)",
@@ -50,11 +176,53 @@
     {
       "id": "timeline-interaction",
       "name": "User Interactions",
-      "requiredElements": [
-        {},
-        {},
+      "assertions": [
         {
-          "textContains": "entries"
+          "id": "timeline-interaction-elem-0",
+          "description": "Required element 0 for state User Interactions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for User Interactions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-interaction-elem-1",
+          "description": "Required element 1 for state User Interactions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for User Interactions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-interaction-elem-2",
+          "description": "Required element 2 for state User Interactions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "entries"
+            },
+            "label": "Required element for User Interactions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users interact with the page by typing queries, clicking Search (or pressing Enter), toggling filters, and loading stats. Each search invokes a Tauri IPC command that runs a PostgreSQL full-text search.",
@@ -66,16 +234,114 @@
     {
       "id": "timeline-data-display",
       "name": "Search Result Display",
-      "requiredElements": [
-        {},
-        {},
-        {},
-        {},
+      "assertions": [
         {
-          "textContains": "rank:"
+          "id": "timeline-data-display-elem-0",
+          "description": "Required element 0 for state Search Result Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Search Result Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
-        {}
+        {
+          "id": "timeline-data-display-elem-1",
+          "description": "Required element 1 for state Search Result Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Search Result Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-data-display-elem-2",
+          "description": "Required element 2 for state Search Result Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Search Result Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-data-display-elem-3",
+          "description": "Required element 3 for state Search Result Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Search Result Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-data-display-elem-4",
+          "description": "Required element 4 for state Search Result Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "rank:"
+            },
+            "label": "Required element for Search Result Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-data-display-elem-5",
+          "description": "Required element 5 for state Search Result Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Search Result Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-data-display-elem-6",
+          "description": "Required element 6 for state Search Result Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Search Result Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "Each search result is a bordered card showing: a source type badge (color-coded span), optional app name, timestamp (right-aligned), optional relevance rank, text preview (3-line clamp), and optional URL with ExternalLink icon. Results are ordered by PostgreSQL ts_rank descending.",
       "precondition": "A search has returned at least one result",
@@ -86,12 +352,54 @@
     {
       "id": "timeline-behavior",
       "name": "Automatic Behaviors",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button"
+          "id": "timeline-behavior-elem-0",
+          "description": "Required element 0 for state Automatic Behaviors",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Automatic Behaviors"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
-        {}
+        {
+          "id": "timeline-behavior-elem-1",
+          "description": "Required element 1 for state Automatic Behaviors",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Automatic Behaviors"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "timeline-behavior-elem-2",
+          "description": "Required element 2 for state Automatic Behaviors",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Automatic Behaviors"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "The page has automatic behaviors: the Search button shows 'Searching...' during queries, results clear on error, and the empty state only appears after a search has been performed (not on initial load).",
       "precondition": "A search has been triggered and the Tauri IPC call is pending",
@@ -102,17 +410,59 @@
     {
       "id": "timeline-state-consistency",
       "name": "State Consistency",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "textContains": "Search"
+          "id": "timeline-state-consistency-elem-0",
+          "description": "Required element 0 for state State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Search"
+            },
+            "label": "Required element for State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Search"
+          "id": "timeline-state-consistency-elem-1",
+          "description": "Required element 1 for state State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Search"
+            },
+            "label": "Required element for State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "timeline-state-consistency-elem-2",
+          "description": "Required element 2 for state State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Search button's disabled state must stay in sync with the input content. Filters panel visibility must toggle correctly.",
@@ -124,7 +474,7 @@
     {
       "id": "timeline-architecture",
       "name": "Architecture and Data Pipeline",
-      "requiredElements": [],
+      "assertions": [],
       "description": "The Activity Timeline is backed by a PostgreSQL table (activity_timeline) with 6 indexes including a GIN full-text search index on to_tsvector('english', text_content). The table is created automatically on PgDb startup via ensure_tables() in database/pg/mod.rs. Queries are generated by Clorinde from queries/activity_timeline.sql with nullable field annotations. The PgDb wrapper (database/pg/activity_timeline.rs) handles SHA-256 content hashing and 30-second deduplication window via find_recent_duplicate(). Search uses PostgreSQL plainto_tsquery + ts_rank for relevance ranking, capped at 50 results with 500-char LEFT() previews. Three data sources feed the timeline: (1) BackgroundObserver (TypeScript, ui-bridge/ai/background-observer.ts) — captures UI Bridge semantic snapshots every 10 seconds with SemanticDiffManager change detection, circuit breaker after 10 consecutive errors, started from App.tsx useEffect with 5-second delay; (2) Python bridge (gui_automation.py) — emits activity_timeline_capture events after each GUI action containing real accessibility tree text (walked recursively with 200-depth guard), intercepted by EventForwarder::handle_timeline_capture() in executor/events.rs; (3) BackgroundCaptureService (Rust, recording/background_capture.rs) — tokio background task for periodic black-box desktop captures with in-memory content-hash dedup.",
       "provenance": {
         "source": "migrated"
@@ -133,7 +483,7 @@
     {
       "id": "timeline-privacy",
       "name": "Privacy and Content Filtering",
-      "requiredElements": [],
+      "assertions": [],
       "description": "All text content is filtered before storage by ContentFilter (recording/content_filter.rs). PII scrubbing uses 7 regex patterns: email addresses → [EMAIL], credit card numbers (starting with 3-6) → [CREDIT_CARD], SSNs (###-##-####) → [SSN], bearer tokens → [BEARER_TOKEN], OpenAI-style sk-* keys → [API_KEY], GitHub ghp_* tokens → [GITHUB_TOKEN], and generic api_key/access_token patterns → [REDACTED_KEY]. Sensitive window detection skips capture entirely for 11 password manager applications (1Password, KeePass, KeePassXC, Bitwarden, LastPass, Dashlane, Enpass, Keeper, NordPass, Credential Manager, Keychain Access) and incognito/private browsing windows. The filter is applied in two locations: the insert_activity_entry Tauri command (commands/activity_timeline.rs) via a OnceLock<ContentFilter> singleton, and the Python event interceptor (EventForwarder::handle_timeline_capture in executor/events.rs) via a separate OnceLock instance. When a sensitive window is detected, the Tauri command returns -1 without storing.",
       "provenance": {
         "source": "migrated"
@@ -142,7 +492,7 @@
     {
       "id": "timeline-implementation",
       "name": "Implementation Details",
-      "requiredElements": [],
+      "assertions": [],
       "description": "Frontend: ActivityTimelinePanel (React, components/activity-timeline/ActivityTimelinePanel.tsx) uses useState for query, results, stats, loading, searched, showFilters, appFilter, sourceFilter. Search invokes Tauri command 'search_activity_timeline' or 'search_activity_timeline_filtered' depending on filter state. Stats fetched via 'get_activity_timeline_stats'. Results rendered as bordered cards with color-coded source badges (blue=ui_bridge, green=accessibility, amber=ocr). The component is lazy-loaded in TabContent.tsx. Tab ID 'activity-timeline' registered in tab-types.ts. Sidebar item in qontinui-navigation/src/groups.ts under OBSERVE_ITEMS with Activity icon and #06B6D4 cyan color. BackgroundObserver service (services/background-observer-service.ts) wraps BackgroundObserver class, calls getGlobalRegistry().captureSnapshot() for control snapshots, and invokes insert_activity_entry Tauri command to persist captures. Hash computation uses crypto.subtle SHA-256 with FNV-1a fallback for non-secure (HTTP) contexts.",
       "provenance": {
         "source": "migrated"

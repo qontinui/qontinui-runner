@@ -6,19 +6,75 @@
     {
       "id": "exec-library-browsing",
       "name": "Workflow Library Browsing",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "searchbox"
+          "id": "exec-library-browsing-elem-0",
+          "description": "Required element 0 for state Workflow Library Browsing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "searchbox"
+            },
+            "label": "Required element for Workflow Library Browsing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "all"
+          "id": "exec-library-browsing-elem-1",
+          "description": "Required element 1 for state Workflow Library Browsing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "all"
+            },
+            "label": "Required element for Workflow Library Browsing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Library"
+          "id": "exec-library-browsing-elem-2",
+          "description": "Required element 2 for state Workflow Library Browsing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Library"
+            },
+            "label": "Required element for Workflow Library Browsing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Refresh"
+          "id": "exec-library-browsing-elem-3",
+          "description": "Required element 3 for state Workflow Library Browsing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Refresh"
+            },
+            "label": "Required element for Workflow Library Browsing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users arrive at the Execute page to select which workflows to run. The left panel presents the full workflow library with search and category filtering. Users should be able to quickly locate workflows by name or description, narrow results by category, and see relevant metadata (step counts, run history) for each workflow before adding it to the queue. The library panel is collapsible to maximize queue space when selection is complete.",
@@ -29,17 +85,59 @@
     {
       "id": "exec-queue-management",
       "name": "Execution Queue Management",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Workflow Queue"
+          "id": "exec-queue-management-elem-0",
+          "description": "Required element 0 for state Execution Queue Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Workflow Queue"
+            },
+            "label": "Required element for Execution Queue Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Queue:"
+          "id": "exec-queue-management-elem-1",
+          "description": "Required element 1 for state Execution Queue Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Queue:"
+            },
+            "label": "Required element for Execution Queue Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Clear"
+          "id": "exec-queue-management-elem-2",
+          "description": "Required element 2 for state Execution Queue Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Clear"
+            },
+            "label": "Required element for Execution Queue Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The right panel is the execution queue where users build an ordered sequence of workflows to run. Users add workflows from the library, reorder them via drag-and-drop to control execution sequence, remove individual items, or clear the entire queue. The queue persists across browser sessions so users do not lose their selections when navigating away. Queue state (count and total steps) is always visible in the bottom bar.",
@@ -50,15 +148,57 @@
     {
       "id": "exec-options-config",
       "name": "Execution Options Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Execution options"
+          "id": "exec-options-config-elem-0",
+          "description": "Required element 0 for state Execution Options Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Execution options"
+            },
+            "label": "Required element for Execution Options Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Stop on failure"
+          "id": "exec-options-config-elem-1",
+          "description": "Required element 1 for state Execution Options Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Stop on failure"
+            },
+            "label": "Required element for Execution Options Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Stop the sequence if any workflow fails"
+          "id": "exec-options-config-elem-2",
+          "description": "Required element 2 for state Execution Options Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Stop the sequence if any workflow fails"
+            },
+            "label": "Required element for Execution Options Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Before launching the queue, users can configure execution behavior through an options panel. The primary option is 'stop on failure' which controls whether the composed workflow should halt when any individual workflow fails or continue through the remaining queue. Options are persisted in localStorage so the user's preference is remembered across sessions. The options panel is accessible from the bottom bar via a settings toggle.",
@@ -69,18 +209,60 @@
     {
       "id": "exec-run-queue",
       "name": "Queue Execution Launch",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Run Queue"
+          "id": "exec-run-queue-elem-0",
+          "description": "Required element 0 for state Queue Execution Launch",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Run Queue"
+            },
+            "label": "Required element for Queue Execution Launch"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Run Queue"
+          "id": "exec-run-queue-elem-1",
+          "description": "Required element 1 for state Queue Execution Launch",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Run Queue"
+            },
+            "label": "Required element for Queue Execution Launch"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Clear"
+          "id": "exec-run-queue-elem-2",
+          "description": "Required element 2 for state Queue Execution Launch",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Clear"
+            },
+            "label": "Required element for Queue Execution Launch"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The primary action on this page is launching the composed workflow. Users click 'Run Queue' to send all queued workflows to the runner for sequential execution. The button is disabled when the queue is empty or when execution is already in progress. During launch, the button shows a loading state to provide feedback. Upon successful launch, the user is automatically navigated to the Active Dashboard to monitor execution progress.",
@@ -91,15 +273,57 @@
     {
       "id": "exec-two-panel-layout",
       "name": "Two-Panel Layout Structure",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Workflow Queue"
+          "id": "exec-two-panel-layout-elem-0",
+          "description": "Required element 0 for state Two-Panel Layout Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Workflow Queue"
+            },
+            "label": "Required element for Two-Panel Layout Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Queue:"
+          "id": "exec-two-panel-layout-elem-1",
+          "description": "Required element 1 for state Two-Panel Layout Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Queue:"
+            },
+            "label": "Required element for Two-Panel Layout Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Library"
+          "id": "exec-two-panel-layout-elem-2",
+          "description": "Required element 2 for state Two-Panel Layout Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Library"
+            },
+            "label": "Required element for Two-Panel Layout Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Execute page uses a two-panel layout optimized for the workflow selection and queuing workflow. The left panel contains the workflow library with search and filtering, while the right panel shows the execution queue. A bottom bar provides queue statistics, execution options, and the primary action buttons (Clear, Run Queue). This layout allows users to see both their available workflows and their current queue simultaneously, supporting an efficient drag-and-select interaction model.",

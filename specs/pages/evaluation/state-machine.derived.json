@@ -6,36 +6,162 @@
     {
       "id": "eval-dataset-management",
       "name": "Dataset Management",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Evaluation Dashboard"
+          "id": "eval-dataset-management-elem-0",
+          "description": "Required element 0 for state Dataset Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Evaluation Dashboard"
+            },
+            "label": "Required element for Dataset Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Datasets"
+          "id": "eval-dataset-management-elem-1",
+          "description": "Required element 1 for state Dataset Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Datasets"
+            },
+            "label": "Required element for Dataset Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "New Dataset"
+          "id": "eval-dataset-management-elem-2",
+          "description": "Required element 2 for state Dataset Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "New Dataset"
+            },
+            "label": "Required element for Dataset Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Dataset Name"
+          "id": "eval-dataset-management-elem-3",
+          "description": "Required element 3 for state Dataset Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Dataset Name"
+            },
+            "label": "Required element for Dataset Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "items"
+          "id": "eval-dataset-management-elem-4",
+          "description": "Required element 4 for state Dataset Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "items"
+            },
+            "label": "Required element for Dataset Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Confirm"
+          "id": "eval-dataset-management-elem-5",
+          "description": "Required element 5 for state Dataset Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Confirm"
+            },
+            "label": "Required element for Dataset Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No datasets yet"
+          "id": "eval-dataset-management-elem-6",
+          "description": "Required element 6 for state Dataset Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No datasets yet"
+            },
+            "label": "Required element for Dataset Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Refresh"
+          "id": "eval-dataset-management-elem-7",
+          "description": "Required element 7 for state Dataset Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Refresh"
+            },
+            "label": "Required element for Dataset Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Failed to load evaluation data"
+          "id": "eval-dataset-management-elem-8",
+          "description": "Required element 8 for state Dataset Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Failed to load evaluation data"
+            },
+            "label": "Required element for Dataset Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users need to create, browse, select, and delete evaluation datasets. The dataset list is the entry point for all evaluation workflows â€” selecting a dataset populates the detail panel and scopes the experiment list. Datasets show name, version badge, item count, and last-updated date. Deletion requires a two-step confirmation (trash icon then Confirm/Cancel) to prevent accidental data loss.",
@@ -47,41 +173,181 @@
     {
       "id": "eval-dataset-items",
       "name": "Dataset Items",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Input"
+          "id": "eval-dataset-items-elem-0",
+          "description": "Required element 0 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Input"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Expected Output"
+          "id": "eval-dataset-items-elem-1",
+          "description": "Required element 1 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Expected Output"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Add Items"
+          "id": "eval-dataset-items-elem-2",
+          "description": "Required element 2 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add Items"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Paste JSON array of items"
+          "id": "eval-dataset-items-elem-3",
+          "description": "Required element 3 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Paste JSON array of items"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Import File"
+          "id": "eval-dataset-items-elem-4",
+          "description": "Required element 4 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Import File"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "JSON"
+          "id": "eval-dataset-items-elem-5",
+          "description": "Required element 5 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "JSON"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "CSV"
+          "id": "eval-dataset-items-elem-6",
+          "description": "Required element 6 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "CSV"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Delete item"
+          "id": "eval-dataset-items-elem-7",
+          "description": "Required element 7 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Delete item"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No items in this dataset"
+          "id": "eval-dataset-items-elem-8",
+          "description": "Required element 8 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No items in this dataset"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Select a dataset to view its items"
+          "id": "eval-dataset-items-elem-9",
+          "description": "Required element 9 for state Dataset Items",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Select a dataset to view its items"
+            },
+            "label": "Required element for Dataset Items"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Once a dataset is selected, users need to view, add, import, export, and delete individual items. Items are displayed in a two-column table (Input / Expected Output). Users can add items by pasting a JSON array, importing a JSON or CSV file, or export existing items as JSON or CSV. Individual items can be deleted with a browser confirmation dialog.",
@@ -93,29 +359,127 @@
     {
       "id": "eval-experiment-management",
       "name": "Experiment Management",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Experiments"
+          "id": "eval-experiment-management-elem-0",
+          "description": "Required element 0 for state Experiment Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Experiments"
+            },
+            "label": "Required element for Experiment Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "New Experiment"
+          "id": "eval-experiment-management-elem-1",
+          "description": "Required element 1 for state Experiment Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "New Experiment"
+            },
+            "label": "Required element for Experiment Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "status",
-          "text": "pending|running|completed|failed"
+          "id": "eval-experiment-management-elem-2",
+          "description": "Required element 2 for state Experiment Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "status",
+              "text": "pending|running|completed|failed"
+            },
+            "label": "Required element for Experiment Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "completed"
+          "id": "eval-experiment-management-elem-3",
+          "description": "Required element 3 for state Experiment Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "completed"
+            },
+            "label": "Required element for Experiment Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Select a dataset to view experiments"
+          "id": "eval-experiment-management-elem-4",
+          "description": "Required element 4 for state Experiment Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Select a dataset to view experiments"
+            },
+            "label": "Required element for Experiment Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No experiments yet"
+          "id": "eval-experiment-management-elem-5",
+          "description": "Required element 5 for state Experiment Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No experiments yet"
+            },
+            "label": "Required element for Experiment Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Experiment name"
+          "id": "eval-experiment-management-elem-6",
+          "description": "Required element 6 for state Experiment Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Experiment name"
+            },
+            "label": "Required element for Experiment Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users create and browse experiments scoped to the selected dataset. Each experiment has a name, optional description, optional prompt variant ID, and a status badge (pending/running/completed/failed) with color coding. The experiment creation form appears inline with fields for name, description, and prompt variant ID. The experiment list shows completion progress (e.g. '3/10 completed') and creation date.",
@@ -127,51 +491,261 @@
     {
       "id": "eval-experiment-results",
       "name": "Experiment Results",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "%"
+          "id": "eval-experiment-results-elem-0",
+          "description": "Required element 0 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "%"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Total Cost"
+          "id": "eval-experiment-results-elem-1",
+          "description": "Required element 1 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Total Cost"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Total Tokens"
+          "id": "eval-experiment-results-elem-2",
+          "description": "Required element 2 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Total Tokens"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Results"
+          "id": "eval-experiment-results-elem-3",
+          "description": "Required element 3 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Results"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Scores"
+          "id": "eval-experiment-results-elem-4",
+          "description": "Required element 4 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Scores"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Duration"
+          "id": "eval-experiment-results-elem-5",
+          "description": "Required element 5 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Duration"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Cost"
+          "id": "eval-experiment-results-elem-6",
+          "description": "Required element 6 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Cost"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Tokens"
+          "id": "eval-experiment-results-elem-7",
+          "description": "Required element 7 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tokens"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "%"
+          "id": "eval-experiment-results-elem-8",
+          "description": "Required element 8 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "%"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Previous"
+          "id": "eval-experiment-results-elem-9",
+          "description": "Required element 9 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Previous"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Next"
+          "id": "eval-experiment-results-elem-10",
+          "description": "Required element 10 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Next"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Evaluate"
+          "id": "eval-experiment-results-elem-11",
+          "description": "Required element 11 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Evaluate"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No results yet"
+          "id": "eval-experiment-results-elem-12",
+          "description": "Required element 12 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No results yet"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Select an experiment to view results"
+          "id": "eval-experiment-results-elem-13",
+          "description": "Required element 13 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Select an experiment to view results"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Select a dataset first"
+          "id": "eval-experiment-results-elem-14",
+          "description": "Required element 14 for state Experiment Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Select a dataset first"
+            },
+            "label": "Required element for Experiment Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When an experiment is selected, users see a detailed results view with summary cards at the top (average scores, total cost, total tokens, results count) and a paginated table below. The table shows Input, Output, Scores (as colored percentage badges), Duration, Cost, and Tokens columns. All numeric columns and individual score names are sortable. Pagination displays 20 results per page with Previous/Next buttons and a 'Showing X-Y of Z results' indicator.",
@@ -183,50 +757,246 @@
     {
       "id": "eval-live-evaluation",
       "name": "Live Evaluation",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Run Evaluation"
+          "id": "eval-live-evaluation-elem-0",
+          "description": "Required element 0 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Run Evaluation"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Evaluate an input/output pair using LLM-as-judge assertions"
+          "id": "eval-live-evaluation-elem-1",
+          "description": "Required element 1 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Evaluate an input/output pair using LLM-as-judge assertions"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Eval Spec"
+          "id": "eval-live-evaluation-elem-2",
+          "description": "Required element 2 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Eval Spec"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Saved"
+          "id": "eval-live-evaluation-elem-3",
+          "description": "Required element 3 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Saved"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Inline JSON"
+          "id": "eval-live-evaluation-elem-4",
+          "description": "Required element 4 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Inline JSON"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Input (prompt / question)"
+          "id": "eval-live-evaluation-elem-5",
+          "description": "Required element 5 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Input (prompt / question)"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Output (LLM response)"
+          "id": "eval-live-evaluation-elem-6",
+          "description": "Required element 6 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Output (LLM response)"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Context"
+          "id": "eval-live-evaluation-elem-7",
+          "description": "Required element 7 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Context"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Evaluate"
+          "id": "eval-live-evaluation-elem-8",
+          "description": "Required element 8 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Evaluate"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Reset"
+          "id": "eval-live-evaluation-elem-9",
+          "description": "Required element 9 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Reset"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Pass|Fail"
+          "id": "eval-live-evaluation-elem-10",
+          "description": "Required element 10 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Pass|Fail"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "passed"
+          "id": "eval-live-evaluation-elem-11",
+          "description": "Required element 11 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "passed"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Evaluation failed"
+          "id": "eval-live-evaluation-elem-12",
+          "description": "Required element 12 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Evaluation failed"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No assertions were evaluated"
+          "id": "eval-live-evaluation-elem-13",
+          "description": "Required element 13 for state Live Evaluation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No assertions were evaluated"
+            },
+            "label": "Required element for Live Evaluation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The live evaluation panel (lazy-loaded under the 'Run Evaluation' tab) lets users run on-demand LLM-as-judge evaluations. Users provide an input (prompt/question), output (LLM response), and optional context (for RAG), select an eval spec (saved or inline JSON), and click Evaluate. Results show pass/fail badges per assertion with actual vs threshold percentages and explanatory messages. A Reset button clears the form and results.",
@@ -238,21 +1008,91 @@
     {
       "id": "eval-cross-panel-navigation",
       "name": "Cross-Panel Navigation",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Select a dataset to view its items"
+          "id": "eval-cross-panel-navigation-elem-0",
+          "description": "Required element 0 for state Cross-Panel Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Select a dataset to view its items"
+            },
+            "label": "Required element for Cross-Panel Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Select a dataset to view experiments"
+          "id": "eval-cross-panel-navigation-elem-1",
+          "description": "Required element 1 for state Cross-Panel Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Select a dataset to view experiments"
+            },
+            "label": "Required element for Cross-Panel Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Select an experiment to view results"
+          "id": "eval-cross-panel-navigation-elem-2",
+          "description": "Required element 2 for state Cross-Panel Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Select an experiment to view results"
+            },
+            "label": "Required element for Cross-Panel Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Evaluate this input/output"
+          "id": "eval-cross-panel-navigation-elem-3",
+          "description": "Required element 3 for state Cross-Panel Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Evaluate this input/output"
+            },
+            "label": "Required element for Cross-Panel Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Experiments"
+          "id": "eval-cross-panel-navigation-elem-4",
+          "description": "Required element 4 for state Cross-Panel Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Experiments"
+            },
+            "label": "Required element for Cross-Panel Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Evaluation Dashboard uses a two-panel layout where selecting items in one panel drives content in others. Selecting a dataset populates the detail panel with items and scopes the experiment list. Selecting an experiment populates the results panel. Clicking 'Evaluate' on a result row switches to the Run Evaluation tab and pre-fills the input/output fields. Tab switching between 'Experiments' and 'Run Evaluation' controls what the right panel displays.",
@@ -263,26 +1103,96 @@
     {
       "id": "eval-behavior-workflows",
       "name": "Behavior â€” Multi-Step Workflows",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Add Items"
+          "id": "eval-behavior-workflows-elem-0",
+          "description": "Required element 0 for state Behavior â€” Multi-Step Workflows",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add Items"
+            },
+            "label": "Required element for Behavior â€” Multi-Step Workflows"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Evaluate"
+          "id": "eval-behavior-workflows-elem-1",
+          "description": "Required element 1 for state Behavior â€” Multi-Step Workflows",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Evaluate"
+            },
+            "label": "Required element for Behavior â€” Multi-Step Workflows"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "JSON"
+          "id": "eval-behavior-workflows-elem-2",
+          "description": "Required element 2 for state Behavior â€” Multi-Step Workflows",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "JSON"
+            },
+            "label": "Required element for Behavior â€” Multi-Step Workflows"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Import File"
+          "id": "eval-behavior-workflows-elem-3",
+          "description": "Required element 3 for state Behavior â€” Multi-Step Workflows",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Import File"
+            },
+            "label": "Required element for Behavior â€” Multi-Step Workflows"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Confirm"
+          "id": "eval-behavior-workflows-elem-4",
+          "description": "Required element 4 for state Behavior â€” Multi-Step Workflows",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Confirm"
+            },
+            "label": "Required element for Behavior â€” Multi-Step Workflows"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "End-to-end behavioral assertions verifying that multi-step user workflows complete correctly: creating a dataset then adding items, running a live evaluation through the full form flow, exporting and importing data files, and deleting datasets with confirmation.",
@@ -293,26 +1203,110 @@
     {
       "id": "eval-state-consistency",
       "name": "State Consistency â€” Data Correctness",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "items"
+          "id": "eval-state-consistency-elem-0",
+          "description": "Required element 0 for state State Consistency â€” Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "items"
+            },
+            "label": "Required element for State Consistency â€” Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "status",
-          "text": "pending|running|completed|failed"
+          "id": "eval-state-consistency-elem-1",
+          "description": "Required element 1 for state State Consistency â€” Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "status",
+              "text": "pending|running|completed|failed"
+            },
+            "label": "Required element for State Consistency â€” Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Input"
+          "id": "eval-state-consistency-elem-2",
+          "description": "Required element 2 for state State Consistency â€” Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Input"
+            },
+            "label": "Required element for State Consistency â€” Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Delete item"
+          "id": "eval-state-consistency-elem-3",
+          "description": "Required element 3 for state State Consistency â€” Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Delete item"
+            },
+            "label": "Required element for State Consistency â€” Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Page"
+          "id": "eval-state-consistency-elem-4",
+          "description": "Required element 4 for state State Consistency â€” Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Page"
+            },
+            "label": "Required element for State Consistency â€” Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "%"
+          "id": "eval-state-consistency-elem-5",
+          "description": "Required element 5 for state State Consistency â€” Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "%"
+            },
+            "label": "Required element for State Consistency â€” Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Assertions verifying that displayed data is consistent across panels, matches backend state, and updates reactively after mutations. Covers item counts, experiment status badges, optimistic table updates after add/delete, pagination math, and score value accuracy.",
@@ -323,22 +1317,92 @@
     {
       "id": "eval-element-presence",
       "name": "Element Presence â€” Critical UI Elements",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "items"
+          "id": "eval-element-presence-elem-0",
+          "description": "Required element 0 for state Element Presence â€” Critical UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "items"
+            },
+            "label": "Required element for Element Presence â€” Critical UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "status",
-          "text": "pending|running|completed|failed"
+          "id": "eval-element-presence-elem-1",
+          "description": "Required element 1 for state Element Presence â€” Critical UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "status",
+              "text": "pending|running|completed|failed"
+            },
+            "label": "Required element for Element Presence â€” Critical UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Input"
+          "id": "eval-element-presence-elem-2",
+          "description": "Required element 2 for state Element Presence â€” Critical UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Input"
+            },
+            "label": "Required element for Element Presence â€” Critical UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Input (prompt / question)"
+          "id": "eval-element-presence-elem-3",
+          "description": "Required element 3 for state Element Presence â€” Critical UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Input (prompt / question)"
+            },
+            "label": "Required element for Element Presence â€” Critical UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Page"
+          "id": "eval-element-presence-elem-4",
+          "description": "Required element 4 for state Element Presence â€” Critical UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Page"
+            },
+            "label": "Required element for Element Presence â€” Critical UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Assertions verifying that critical UI elements are present and correctly structured in the rendered DOM. Covers dataset row composition, experiment row badges, results table column headers, live evaluation input areas, and pagination indicators.",

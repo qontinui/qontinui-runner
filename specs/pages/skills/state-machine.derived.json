@@ -6,16 +6,58 @@
     {
       "id": "skills-semantic-purpose",
       "name": "Page Purpose and Identity",
-      "requiredElements": [
+      "assertions": [
         {
-          "tagName": "h2",
-          "text": "Procedural Skills"
+          "id": "skills-semantic-purpose-elem-0",
+          "description": "Required element 0 for state Page Purpose and Identity",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "h2",
+              "text": "Procedural Skills"
+            },
+            "label": "Required element for Page Purpose and Identity"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Auto-extracted from successful runs"
+          "id": "skills-semantic-purpose-elem-1",
+          "description": "Required element 1 for state Page Purpose and Identity",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Auto-extracted from successful runs"
+            },
+            "label": "Required element for Page Purpose and Identity"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No pending skills to review"
+          "id": "skills-semantic-purpose-elem-2",
+          "description": "Required element 2 for state Page Purpose and Identity",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No pending skills to review"
+            },
+            "label": "Required element for Page Purpose and Identity"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Skills page is the human review gate for auto-extracted procedural memory. It answers: 'What fix patterns has the system learned, and should they be trusted to guide future work?' The page header identifies itself with a lightning bolt (Zap) icon, the title 'Procedural Skills', and a subtitle explaining provenance. The page is empty by default until workflows extract skills -- this is expected, not an error.",
@@ -26,12 +68,40 @@
     {
       "id": "skills-navigation",
       "name": "Page Navigation",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Skills"
+          "id": "skills-navigation-elem-0",
+          "description": "Required element 0 for state Page Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Skills"
+            },
+            "label": "Required element for Page Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Procedural Skills"
+          "id": "skills-navigation-elem-1",
+          "description": "Required element 1 for state Page Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Procedural Skills"
+            },
+            "label": "Required element for Page Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Skills page is reachable from the runner sidebar under the OBSERVE navigation group, positioned after Meta-Optimizer. The sidebar entry uses a Zap icon with amber (#F59E0B) color. The tab ID is 'skills' and the page is lazy-loaded via React.lazy.",
@@ -42,25 +112,95 @@
     {
       "id": "skills-element-presence",
       "name": "Core UI Elements",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button"
+          "id": "skills-element-presence-elem-0",
+          "description": "Required element 0 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Pending"
+          "id": "skills-element-presence-elem-1",
+          "description": "Required element 1 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Pending"
+            },
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Approved"
+          "id": "skills-element-presence-elem-2",
+          "description": "Required element 2 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Approved"
+            },
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Rejected"
+          "id": "skills-element-presence-elem-3",
+          "description": "Required element 3 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Rejected"
+            },
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "All"
+          "id": "skills-element-presence-elem-4",
+          "description": "Required element 4 for state Core UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "All"
+            },
+            "label": "Required element for Core UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The page has a header bar (title + subtitle + refresh button), a filter tab bar (4 buttons: Pending, Approved, Rejected, All), and a scrollable content area showing skill rows or empty state. The refresh button shows a spinning icon during API fetch.",
@@ -71,18 +211,74 @@
     {
       "id": "skills-data-display-rows",
       "name": "Skill Row Data Display",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button"
+          "id": "skills-data-display-rows-elem-0",
+          "description": "Required element 0 for state Skill Row Data Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Skill Row Data Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Auto:"
+          "id": "skills-data-display-rows-elem-1",
+          "description": "Required element 1 for state Skill Row Data Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Auto:"
+            },
+            "label": "Required element for Skill Row Data Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "used"
+          "id": "skills-data-display-rows-elem-2",
+          "description": "Required element 2 for state Skill Row Data Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "used"
+            },
+            "label": "Required element for Skill Row Data Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Auto:"
+          "id": "skills-data-display-rows-elem-3",
+          "description": "Required element 3 for state Skill Row Data Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Auto:"
+            },
+            "label": "Required element for Skill Row Data Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Each skill is rendered as a row with: a chevron toggle (ChevronRight when collapsed, ChevronDown when expanded), a status icon (green CheckCircle for approved, red XCircle for rejected, amber Clock for pending), the skill name (truncated via CSS text-ellipsis), and secondary metadata line showing 'category . vX.Y.Z . used Nx'. Data comes from GET /skills, filtered client-side to source='auto'.",
@@ -94,24 +290,108 @@
     {
       "id": "skills-data-display-expanded",
       "name": "Expanded Skill Detail View",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Description:"
+          "id": "skills-data-display-expanded-elem-0",
+          "description": "Required element 0 for state Expanded Skill Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Description:"
+            },
+            "label": "Required element for Expanded Skill Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Tags:"
+          "id": "skills-data-display-expanded-elem-1",
+          "description": "Required element 1 for state Expanded Skill Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tags:"
+            },
+            "label": "Required element for Expanded Skill Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Phases:"
+          "id": "skills-data-display-expanded-elem-2",
+          "description": "Required element 2 for state Expanded Skill Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Phases:"
+            },
+            "label": "Required element for Expanded Skill Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Created:"
+          "id": "skills-data-display-expanded-elem-3",
+          "description": "Required element 3 for state Expanded Skill Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Created:"
+            },
+            "label": "Required element for Expanded Skill Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Provenance"
+          "id": "skills-data-display-expanded-elem-4",
+          "description": "Required element 4 for state Expanded Skill Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Provenance"
+            },
+            "label": "Required element for Expanded Skill Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Fix ID:"
+          "id": "skills-data-display-expanded-elem-5",
+          "description": "Required element 5 for state Expanded Skill Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Fix ID:"
+            },
+            "label": "Required element for Expanded Skill Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Clicking the chevron expands a detail panel below the skill row, indented to align with the skill name. The panel shows labeled fields: Description (full text), Tags (comma-separated), Phases (comma-separated), and Created (localized datetime). For auto-extracted skills, a Provenance section appears with a muted background showing Fix type (monospace), Source run (monospace, 10px), Fix ID (monospace, 10px), and Effectiveness (green text). Provenance data is parsed from the skill's description field which embeds 'task_run: {id}, fix: {id}' and 'Fix type: {type}' patterns.",
@@ -123,25 +403,95 @@
     {
       "id": "skills-interaction-approval",
       "name": "Approval and Rejection Actions",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Approve"
+          "id": "skills-interaction-approval-elem-0",
+          "description": "Required element 0 for state Approval and Rejection Actions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Approve"
+            },
+            "label": "Required element for Approval and Rejection Actions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Reject"
+          "id": "skills-interaction-approval-elem-1",
+          "description": "Required element 1 for state Approval and Rejection Actions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Reject"
+            },
+            "label": "Required element for Approval and Rejection Actions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Reset to Pending"
+          "id": "skills-interaction-approval-elem-2",
+          "description": "Required element 2 for state Approval and Rejection Actions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Reset to Pending"
+            },
+            "label": "Required element for Approval and Rejection Actions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Approved"
+          "id": "skills-interaction-approval-elem-3",
+          "description": "Required element 3 for state Approval and Rejection Actions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Approved"
+            },
+            "label": "Required element for Approval and Rejection Actions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "skills-interaction-approval-elem-4",
+          "description": "Required element 4 for state Approval and Rejection Actions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Approval and Rejection Actions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Pending skills show inline Approve (green) and Reject (red) buttons in the row. Approved/rejected skills show these buttons in the expanded detail panel instead, along with a 'Reset to Pending' button (amber). All three buttons call POST /skills/{id}/approve with the target status. The UI updates optimistically -- the skill immediately moves to the new filter tab. If the API returns a non-ok response, the update is not applied (no rollback of optimistic state since the API call happens before the state update).",
@@ -153,15 +503,57 @@
     {
       "id": "skills-behavior",
       "name": "Loading, Error, and Refresh Behavior",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Failed to fetch"
+          "id": "skills-behavior-elem-0",
+          "description": "Required element 0 for state Loading, Error, and Refresh Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Failed to fetch"
+            },
+            "label": "Required element for Loading, Error, and Refresh Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "skills-behavior-elem-1",
+          "description": "Required element 1 for state Loading, Error, and Refresh Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Loading, Error, and Refresh Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "skills"
+          "id": "skills-behavior-elem-2",
+          "description": "Required element 2 for state Loading, Error, and Refresh Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "skills"
+            },
+            "label": "Required element for Loading, Error, and Refresh Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The panel fetches skills from GET /skills on mount (via useEffect) and on refresh button click. During fetch, the RefreshCw icon gains the animate-spin CSS class. If the API returns an error or the fetch throws, a red error message appears in the content area. The panel filters the API response client-side to only show skills with source='auto'.",
@@ -172,20 +564,76 @@
     {
       "id": "skills-state-consistency",
       "name": "State Consistency After Mutations",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "textContains": "All"
+          "id": "skills-state-consistency-elem-0",
+          "description": "Required element 0 for state State Consistency After Mutations",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "All"
+            },
+            "label": "Required element for State Consistency After Mutations"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Approved"
+          "id": "skills-state-consistency-elem-1",
+          "description": "Required element 1 for state State Consistency After Mutations",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Approved"
+            },
+            "label": "Required element for State Consistency After Mutations"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Approved"
+          "id": "skills-state-consistency-elem-2",
+          "description": "Required element 2 for state State Consistency After Mutations",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Approved"
+            },
+            "label": "Required element for State Consistency After Mutations"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Pending"
+          "id": "skills-state-consistency-elem-3",
+          "description": "Required element 3 for state State Consistency After Mutations",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Pending"
+            },
+            "label": "Required element for State Consistency After Mutations"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When a skill's approval status is changed, the filter tab counts must update immediately and the skill must appear under the correct filter. The state is managed client-side via React useState -- no page reload occurs. The API mutation (POST /skills/{id}/approve) fires before the state update, so a failed API call prevents the UI from changing.",
@@ -197,13 +645,41 @@
     {
       "id": "skills-design",
       "name": "Visual Design and Layout",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Procedural Skills"
+          "id": "skills-design-elem-0",
+          "description": "Required element 0 for state Visual Design and Layout",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Procedural Skills"
+            },
+            "label": "Required element for Visual Design and Layout"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Pending"
+          "id": "skills-design-elem-1",
+          "description": "Required element 1 for state Visual Design and Layout",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Pending"
+            },
+            "label": "Required element for Visual Design and Layout"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The panel uses a vertical flex layout (flex-col h-full): header bar with border-b, filter tab bar with border-b, and flex-1 overflow-y-auto content area. Skill rows have border-b with last:border-0. Action buttons use 10px font size with semi-transparent colored backgrounds. Status icons are 14px (w-3.5 h-3.5). The expanded detail panel is indented to pl-10 to align with the skill name.",

@@ -6,15 +6,57 @@
     {
       "id": "unified-search-input",
       "name": "Search Input",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Search findings, fixes, rules, errors..."
+          "id": "unified-search-input-elem-0",
+          "description": "Required element 0 for state Search Input",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Search findings, fixes, rules, errors..."
+            },
+            "label": "Required element for Search Input"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Search"
+          "id": "unified-search-input-elem-1",
+          "description": "Required element 1 for state Search Input",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Search"
+            },
+            "label": "Required element for Search Input"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "form"
+          "id": "unified-search-input-elem-2",
+          "description": "Required element 2 for state Search Input",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "form"
+            },
+            "label": "Required element for Search Input"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users need a search input that accepts queries of 2+ characters and returns cross-entity results ranked by relevance.",
@@ -25,15 +67,57 @@
     {
       "id": "unified-search-results",
       "name": "Search Results Display",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "result"
+          "id": "unified-search-results-elem-0",
+          "description": "Required element 0 for state Search Results Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "result"
+            },
+            "label": "Required element for Search Results Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "listitem"
+          "id": "unified-search-results-elem-1",
+          "description": "Required element 1 for state Search Results Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "listitem"
+            },
+            "label": "Required element for Search Results Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "%"
+          "id": "unified-search-results-elem-2",
+          "description": "Required element 2 for state Search Results Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "%"
+            },
+            "label": "Required element for Search Results Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users need search results showing entity type, title, snippet, and relevance score, with color-coded icons distinguishing findings (red), fixes (green), knowledge (blue), errors (orange), rules (purple), and workflows (cyan).",
@@ -44,15 +128,57 @@
     {
       "id": "unified-search-states",
       "name": "Search Feedback States",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Searching..."
+          "id": "unified-search-states-elem-0",
+          "description": "Required element 0 for state Search Feedback States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Searching..."
+            },
+            "label": "Required element for Search Feedback States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Search failed"
+          "id": "unified-search-states-elem-1",
+          "description": "Required element 1 for state Search Feedback States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Search failed"
+            },
+            "label": "Required element for Search Feedback States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No results found"
+          "id": "unified-search-states-elem-2",
+          "description": "Required element 2 for state Search Feedback States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No results found"
+            },
+            "label": "Required element for Search Feedback States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Clear feedback during search states.",
@@ -63,18 +189,74 @@
     {
       "id": "command-palette",
       "name": "Command Palette Modal",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "dialog"
+          "id": "command-palette-elem-0",
+          "description": "Required element 0 for state Command Palette Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "dialog"
+            },
+            "label": "Required element for Command Palette Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "ESC"
+          "id": "command-palette-elem-1",
+          "description": "Required element 1 for state Command Palette Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "ESC"
+            },
+            "label": "Required element for Command Palette Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "textbox"
+          "id": "command-palette-elem-2",
+          "description": "Required element 2 for state Command Palette Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Command Palette Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "dialog"
+          "id": "command-palette-elem-3",
+          "description": "Required element 3 for state Command Palette Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "dialog"
+            },
+            "label": "Required element for Command Palette Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A global command palette accessible via Cmd+K/Ctrl+K from any page, providing the same search functionality in a modal overlay that can be dismissed with Escape.",
@@ -85,15 +267,57 @@
     {
       "id": "command-palette-results",
       "name": "Command Palette Inline Results",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Type at least 2 characters to search"
+          "id": "command-palette-results-elem-0",
+          "description": "Required element 0 for state Command Palette Inline Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Type at least 2 characters to search"
+            },
+            "label": "Required element for Command Palette Inline Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No results"
+          "id": "command-palette-results-elem-1",
+          "description": "Required element 1 for state Command Palette Inline Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No results"
+            },
+            "label": "Required element for Command Palette Inline Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "command-palette-results-elem-2",
+          "description": "Required element 2 for state Command Palette Inline Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Command Palette Inline Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Command palette shows inline results with entity icons and click-to-navigate behavior.",
@@ -104,27 +328,125 @@
     {
       "id": "unified-search-interaction",
       "name": "Search Interaction",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Search"
+          "id": "unified-search-interaction-elem-0",
+          "description": "Required element 0 for state Search Interaction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Search"
+            },
+            "label": "Required element for Search Interaction"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "textbox"
+          "id": "unified-search-interaction-elem-1",
+          "description": "Required element 1 for state Search Interaction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Search Interaction"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "ESC"
+          "id": "unified-search-interaction-elem-2",
+          "description": "Required element 2 for state Search Interaction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "ESC"
+            },
+            "label": "Required element for Search Interaction"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "ESC"
+          "id": "unified-search-interaction-elem-3",
+          "description": "Required element 3 for state Search Interaction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "ESC"
+            },
+            "label": "Required element for Search Interaction"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "ESC"
+          "id": "unified-search-interaction-elem-4",
+          "description": "Required element 4 for state Search Interaction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "ESC"
+            },
+            "label": "Required element for Search Interaction"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "textbox"
+          "id": "unified-search-interaction-elem-5",
+          "description": "Required element 5 for state Search Interaction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Search Interaction"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "unified-search-interaction-elem-6",
+          "description": "Required element 6 for state Search Interaction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Search Interaction"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users interact with the search via text input, form submission, and in the command palette via keyboard shortcuts. The search requires minimum 2 characters and the submit button is disabled until met.",
@@ -136,15 +458,57 @@
     {
       "id": "unified-search-data-display",
       "name": "Search Result Rendering",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "result"
+          "id": "unified-search-data-display-elem-0",
+          "description": "Required element 0 for state Search Result Rendering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "result"
+            },
+            "label": "Required element for Search Result Rendering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "%"
+          "id": "unified-search-data-display-elem-1",
+          "description": "Required element 1 for state Search Result Rendering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "%"
+            },
+            "label": "Required element for Search Result Rendering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "finding|fix|knowledge|error|rule|workflow"
+          "id": "unified-search-data-display-elem-2",
+          "description": "Required element 2 for state Search Result Rendering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "finding|fix|knowledge|error|rule|workflow"
+            },
+            "label": "Required element for Search Result Rendering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Search results display entity type icons with color coding, titles, snippet previews (2-line clamp), relevance scores as percentages, and a summary header with counts per entity type.",
@@ -155,12 +519,40 @@
     {
       "id": "unified-search-navigation",
       "name": "Search Navigation",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Search Everything"
+          "id": "unified-search-navigation-elem-0",
+          "description": "Required element 0 for state Search Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Search Everything"
+            },
+            "label": "Required element for Search Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "ESC"
+          "id": "unified-search-navigation-elem-1",
+          "description": "Required element 1 for state Search Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "ESC"
+            },
+            "label": "Required element for Search Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The unified search is accessible both as a dedicated tab (/unified-search) and as a global command palette (Cmd+K) from any page in the application.",

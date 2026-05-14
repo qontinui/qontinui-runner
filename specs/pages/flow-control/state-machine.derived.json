@@ -6,21 +6,91 @@
     {
       "id": "fc-concurrency",
       "name": "Concurrency Limit Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Concurrency"
+          "id": "fc-concurrency-elem-0",
+          "description": "Required element 0 for state Concurrency Limit Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Concurrency"
+            },
+            "label": "Required element for Concurrency Limit Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "spinbutton"
+          "id": "fc-concurrency-elem-1",
+          "description": "Required element 1 for state Concurrency Limit Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Required element for Concurrency Limit Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "spinbutton"
+          "id": "fc-concurrency-elem-2",
+          "description": "Required element 2 for state Concurrency Limit Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Required element for Concurrency Limit Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Scope key"
+          "id": "fc-concurrency-elem-3",
+          "description": "Required element 3 for state Concurrency Limit Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Scope key"
+            },
+            "label": "Required element for Concurrency Limit Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "spinbutton"
+          "id": "fc-concurrency-elem-4",
+          "description": "Required element 4 for state Concurrency Limit Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Required element for Concurrency Limit Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Controls max simultaneous instances of this workflow. When limit reached, new executions queue and wait (FlowControlDecision::Wait). Optionally scoped by key. Backend: FlowControl.concurrency (ConcurrencyLimit), enforced by FlowControlEnforcer.check(), tracked by record_start/record_end.",
@@ -31,20 +101,76 @@
     {
       "id": "fc-throttle",
       "name": "Throttle Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Throttle"
+          "id": "fc-throttle-elem-0",
+          "description": "Required element 0 for state Throttle Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Throttle"
+            },
+            "label": "Required element for Throttle Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Max runs"
+          "id": "fc-throttle-elem-1",
+          "description": "Required element 1 for state Throttle Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Max runs"
+            },
+            "label": "Required element for Throttle Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "1min"
+          "id": "fc-throttle-elem-2",
+          "description": "Required element 2 for state Throttle Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "1min"
+            },
+            "label": "Required element for Throttle Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "5min"
+          "id": "fc-throttle-elem-3",
+          "description": "Required element 3 for state Throttle Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "5min"
+            },
+            "label": "Required element for Throttle Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Limits workflow throughput over time. Unlike rate limiting, throttled requests queue and wait. Backend: FlowControl.throttle (ThrottleConfig), enforced by FlowControlEnforcer via sliding-window timestamps.",
@@ -55,16 +181,58 @@
     {
       "id": "fc-rate-limit",
       "name": "Rate Limit Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Rate Limit"
+          "id": "fc-rate-limit-elem-0",
+          "description": "Required element 0 for state Rate Limit Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Rate Limit"
+            },
+            "label": "Required element for Rate Limit Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Max runs"
+          "id": "fc-rate-limit-elem-1",
+          "description": "Required element 1 for state Rate Limit Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Max runs"
+            },
+            "label": "Required element for Rate Limit Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "1hr"
+          "id": "fc-rate-limit-elem-2",
+          "description": "Required element 2 for state Rate Limit Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "1hr"
+            },
+            "label": "Required element for Rate Limit Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Hard cap that drops excess requests (unlike throttle which queues). Backend: FlowControl.rate_limit, returns FlowControlDecision::Skip.",
@@ -75,20 +243,76 @@
     {
       "id": "fc-debounce",
       "name": "Debounce Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Debounce"
+          "id": "fc-debounce-elem-0",
+          "description": "Required element 0 for state Debounce Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Debounce"
+            },
+            "label": "Required element for Debounce Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "500ms"
+          "id": "fc-debounce-elem-1",
+          "description": "Required element 1 for state Debounce Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "500ms"
+            },
+            "label": "Required element for Debounce Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "1s"
+          "id": "fc-debounce-elem-2",
+          "description": "Required element 2 for state Debounce Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "1s"
+            },
+            "label": "Required element for Debounce Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Custom"
+          "id": "fc-debounce-elem-3",
+          "description": "Required element 3 for state Debounce Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Custom"
+            },
+            "label": "Required element for Debounce Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Sliding window deduplication â€” only the latest trigger executes. Backend: FlowControl.debounce (DebounceConfig), enforced with saturating_sub for clock safety.",
@@ -99,30 +323,142 @@
     {
       "id": "fc-phase-timeouts",
       "name": "Phase Timeout Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Phase Timeouts"
+          "id": "fc-phase-timeouts-elem-0",
+          "description": "Required element 0 for state Phase Timeout Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Phase Timeouts"
+            },
+            "label": "Required element for Phase Timeout Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Setup"
+          "id": "fc-phase-timeouts-elem-1",
+          "description": "Required element 1 for state Phase Timeout Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Setup"
+            },
+            "label": "Required element for Phase Timeout Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Execution"
+          "id": "fc-phase-timeouts-elem-2",
+          "description": "Required element 2 for state Phase Timeout Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Execution"
+            },
+            "label": "Required element for Phase Timeout Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Verification"
+          "id": "fc-phase-timeouts-elem-3",
+          "description": "Required element 3 for state Phase Timeout Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Verification"
+            },
+            "label": "Required element for Phase Timeout Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Completion"
+          "id": "fc-phase-timeouts-elem-4",
+          "description": "Required element 4 for state Phase Timeout Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Completion"
+            },
+            "label": "Required element for Phase Timeout Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "min"
+          "id": "fc-phase-timeouts-elem-5",
+          "description": "Required element 5 for state Phase Timeout Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "min"
+            },
+            "label": "Required element for Phase Timeout Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Execution"
+          "id": "fc-phase-timeouts-elem-6",
+          "description": "Required element 6 for state Phase Timeout Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Execution"
+            },
+            "label": "Required element for Phase Timeout Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "spinbutton"
+          "id": "fc-phase-timeouts-elem-7",
+          "description": "Required element 7 for state Phase Timeout Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Required element for Phase Timeout Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Per-phase timeout overrides in minutes. Backend: PhaseTimeouts in orchestrator/state.rs, parsed from phase_timeouts_json in types.rs, enforced by check_timeout() in loop_handlers.rs. Defaults: setup=5min, execution=30min, verification=10min, completion=5min.",
@@ -133,18 +469,74 @@
     {
       "id": "fc-persistence",
       "name": "Configuration Persistence and State Consistency",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Concurrency"
+          "id": "fc-persistence-elem-0",
+          "description": "Required element 0 for state Configuration Persistence and State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Concurrency"
+            },
+            "label": "Required element for Configuration Persistence and State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Concurrency"
+          "id": "fc-persistence-elem-1",
+          "description": "Required element 1 for state Configuration Persistence and State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Concurrency"
+            },
+            "label": "Required element for Configuration Persistence and State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Flow Control"
+          "id": "fc-persistence-elem-2",
+          "description": "Required element 2 for state Configuration Persistence and State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Flow Control"
+            },
+            "label": "Required element for Configuration Persistence and State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Flow Control"
+          "id": "fc-persistence-elem-3",
+          "description": "Required element 3 for state Configuration Persistence and State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Flow Control"
+            },
+            "label": "Required element for Configuration Persistence and State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Settings serialize to JSON and persist as flow_control_json and phase_timeouts_json on unified_workflows. On save, WorkflowEditor PATCHes via MCP API. On load, LoopController reads for enforcement. Both SQLite (v147) and PostgreSQL store these fields.",
@@ -155,12 +547,40 @@
     {
       "id": "fc-layout",
       "name": "Panel Layout and Visual Structure",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Flow Control"
+          "id": "fc-layout-elem-0",
+          "description": "Required element 0 for state Panel Layout and Visual Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Flow Control"
+            },
+            "label": "Required element for Panel Layout and Visual Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Concurrency"
+          "id": "fc-layout-elem-1",
+          "description": "Required element 1 for state Panel Layout and Visual Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Concurrency"
+            },
+            "label": "Required element for Panel Layout and Visual Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The FlowControlPanel renders as a collapsible section within the workflow editor settings. Each flow control type (concurrency, throttle, rate limit, debounce) is a distinct subsection with a heading, inputs, and optional scope key. Phase timeouts are a separate subsection with per-phase rows.",
@@ -171,12 +591,40 @@
     {
       "id": "fc-callback-integration",
       "name": "Callback Integration with Workflow Editor",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Concurrency"
+          "id": "fc-callback-integration-elem-0",
+          "description": "Required element 0 for state Callback Integration with Workflow Editor",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Concurrency"
+            },
+            "label": "Required element for Callback Integration with Workflow Editor"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Phase Timeouts"
+          "id": "fc-callback-integration-elem-1",
+          "description": "Required element 1 for state Callback Integration with Workflow Editor",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Phase Timeouts"
+            },
+            "label": "Required element for Callback Integration with Workflow Editor"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The FlowControlPanel communicates changes to its parent (WorkflowEditor) via callbacks. When any flow control value changes, onFlowControlChange fires with the serialized JSON. When any timeout changes, onPhaseTimeoutsChange fires. The parent is responsible for saving via updateWorkflow().",

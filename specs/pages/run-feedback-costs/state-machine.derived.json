@@ -6,35 +6,161 @@
     {
       "id": "feedback-scores-overview",
       "name": "Feedback Scores Overview",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Avg Score"
+          "id": "feedback-scores-overview-elem-0",
+          "description": "Required element 0 for state Feedback Scores Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Avg Score"
+            },
+            "label": "Required element for Feedback Scores Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "scores:"
+          "id": "feedback-scores-overview-elem-1",
+          "description": "Required element 1 for state Feedback Scores Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "scores:"
+            },
+            "label": "Required element for Feedback Scores Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Automated|LLM Judge|Manual"
+          "id": "feedback-scores-overview-elem-2",
+          "description": "Required element 2 for state Feedback Scores Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Automated|LLM Judge|Manual"
+            },
+            "label": "Required element for Feedback Scores Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "%"
+          "id": "feedback-scores-overview-elem-3",
+          "description": "Required element 3 for state Feedback Scores Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "%"
+            },
+            "label": "Required element for Feedback Scores Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Automated|LLM Judge|Manual"
+          "id": "feedback-scores-overview-elem-4",
+          "description": "Required element 4 for state Feedback Scores Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Automated|LLM Judge|Manual"
+            },
+            "label": "Required element for Feedback Scores Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading",
-          "text": "Feedback Scores"
+          "id": "feedback-scores-overview-elem-5",
+          "description": "Required element 5 for state Feedback Scores Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Feedback Scores"
+            },
+            "label": "Required element for Feedback Scores Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No Feedback Scores"
+          "id": "feedback-scores-overview-elem-6",
+          "description": "Required element 6 for state Feedback Scores Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No Feedback Scores"
+            },
+            "label": "Required element for Feedback Scores Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Loading feedback scores..."
+          "id": "feedback-scores-overview-elem-7",
+          "description": "Required element 7 for state Feedback Scores Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Loading feedback scores..."
+            },
+            "label": "Required element for Feedback Scores Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Failed to load feedback scores"
+          "id": "feedback-scores-overview-elem-8",
+          "description": "Required element 8 for state Feedback Scores Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Failed to load feedback scores"
+            },
+            "label": "Required element for Feedback Scores Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Feedback Scores panel shows all quality assessments at a glance. A summary strip displays the average score and count-by-source badges, followed by individual score rows with colored progress bars (green >= 80%, yellow >= 50%, red < 50%) and source badges (Automated, LLM Judge, Manual). This lets users quickly assess overall run quality without expanding individual scores.",
@@ -46,38 +172,150 @@
     {
       "id": "manual-score-creation",
       "name": "Manual Score Creation",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Add Score"
+          "id": "manual-score-creation-elem-0",
+          "description": "Required element 0 for state Manual Score Creation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add Score"
+            },
+            "label": "Required element for Manual Score Creation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Add Score"
+          "id": "manual-score-creation-elem-1",
+          "description": "Required element 1 for state Manual Score Creation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add Score"
+            },
+            "label": "Required element for Manual Score Creation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "textbox",
-          "id": "score-name"
+          "id": "manual-score-creation-elem-2",
+          "description": "Required element 2 for state Manual Score Creation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox",
+              "id": "score-name"
+            },
+            "label": "Required element for Manual Score Creation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "spinbutton",
-          "id": "score-value"
+          "id": "manual-score-creation-elem-3",
+          "description": "Required element 3 for state Manual Score Creation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "spinbutton",
+              "id": "score-value"
+            },
+            "label": "Required element for Manual Score Creation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "textbox",
-          "id": "score-reason"
+          "id": "manual-score-creation-elem-4",
+          "description": "Required element 4 for state Manual Score Creation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox",
+              "id": "score-reason"
+            },
+            "label": "Required element for Manual Score Creation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Submit"
+          "id": "manual-score-creation-elem-5",
+          "description": "Required element 5 for state Manual Score Creation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Submit"
+            },
+            "label": "Required element for Manual Score Creation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Cancel"
+          "id": "manual-score-creation-elem-6",
+          "description": "Required element 6 for state Manual Score Creation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Cancel"
+            },
+            "label": "Required element for Manual Score Creation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Submit"
+          "id": "manual-score-creation-elem-7",
+          "description": "Required element 7 for state Manual Score Creation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Submit"
+            },
+            "label": "Required element for Manual Score Creation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users need the ability to manually add feedback scores to a run to capture subjective quality assessments that cannot be computed automatically. Clicking the 'Add Score' button reveals an inline form with name, value (0-1), and optional reason fields. On submission, the score is created via POST /api/v1/feedback-scores with source 'manual' and the form collapses. This is essential for human-in-the-loop quality tracking workflows.",
@@ -89,18 +327,74 @@
     {
       "id": "score-detail-expansion",
       "name": "Score Detail Expansion",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button"
+          "id": "score-detail-expansion-elem-0",
+          "description": "Required element 0 for state Score Detail Expansion",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Score Detail Expansion"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "score-detail-expansion-elem-1",
+          "description": "Required element 1 for state Score Detail Expansion",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Score Detail Expansion"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": ".*"
+          "id": "score-detail-expansion-elem-2",
+          "description": "Required element 2 for state Score Detail Expansion",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": ".*"
+            },
+            "label": "Required element for Score Detail Expansion"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "generic"
+          "id": "score-detail-expansion-elem-3",
+          "description": "Required element 3 for state Score Detail Expansion",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Required element for Score Detail Expansion"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users need to drill into individual score details to understand the reasoning behind each quality assessment. Score rows that have a reason field are clickable (indicated by a chevron icon) and expand to reveal the reason text with a message icon. Rows without a reason are not interactive. This progressive disclosure keeps the default view clean while allowing detailed investigation.",
@@ -112,37 +406,177 @@
     {
       "id": "llm-cost-breakdown",
       "name": "LLM Cost Breakdown",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Total Cost"
+          "id": "llm-cost-breakdown-elem-0",
+          "description": "Required element 0 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Total Cost"
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Tokens In"
+          "id": "llm-cost-breakdown-elem-1",
+          "description": "Required element 1 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tokens In"
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Tokens Out"
+          "id": "llm-cost-breakdown-elem-2",
+          "description": "Required element 2 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tokens Out"
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "LLM Actions"
+          "id": "llm-cost-breakdown-elem-3",
+          "description": "Required element 3 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "LLM Actions"
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "columnheader",
-          "text": "Model"
+          "id": "llm-cost-breakdown-elem-4",
+          "description": "Required element 4 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "columnheader",
+              "text": "Model"
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "row"
+          "id": "llm-cost-breakdown-elem-5",
+          "description": "Required element 5 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "row"
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "row"
+          "id": "llm-cost-breakdown-elem-6",
+          "description": "Required element 6 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "row"
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No LLM Costs"
+          "id": "llm-cost-breakdown-elem-7",
+          "description": "Required element 7 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No LLM Costs"
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Loading cost breakdown..."
+          "id": "llm-cost-breakdown-elem-8",
+          "description": "Required element 8 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Loading cost breakdown..."
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Failed to load cost breakdown"
+          "id": "llm-cost-breakdown-elem-9",
+          "description": "Required element 9 for state LLM Cost Breakdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Failed to load cost breakdown"
+            },
+            "label": "Required element for LLM Cost Breakdown"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "After a run completes, users need to understand how much their LLM usage cost and where the spend went. The LLM Cost Breakdown panel shows a totals strip (total cost, tokens in, tokens out, LLM action count) followed by a per-model breakdown table sorted by cost descending. Each table row shows model name, provider, token counts, cost in USD, and action count. This helps users optimize their model selection and identify cost-heavy steps.",
@@ -154,19 +588,89 @@
     {
       "id": "tab-navigation",
       "name": "Tab Navigation",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "tab",
-          "text": "Feedback Scores"
+          "id": "tab-navigation-elem-0",
+          "description": "Required element 0 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab",
+              "text": "Feedback Scores"
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "tab",
-          "text": "LLM Costs"
+          "id": "tab-navigation-elem-1",
+          "description": "Required element 1 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab",
+              "text": "LLM Costs"
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
-        {},
         {
-          "role": "tabpanel"
+          "id": "tab-navigation-elem-2",
+          "description": "Required element 2 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "tab-navigation-elem-3",
+          "description": "Required element 3 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "tab-navigation-elem-4",
+          "description": "Required element 4 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tabpanel"
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Feedback Scores and LLM Costs panels are accessed via tabs in the RunRecapTab tabbed content area. Users need to discover and navigate to these tabs alongside the existing tabs (Timeline, Verification, Knowledge, Context, Canvas, Diffs & Replay, Errors). Each tab has an icon and label. Correct tab routing ensures the right panel renders with the current run's data.",
@@ -177,15 +681,85 @@
     {
       "id": "element-presence",
       "name": "Element Presence",
-      "requiredElements": [
-        {},
-        {},
-        {},
+      "assertions": [
         {
-          "role": "columnheader",
-          "text": "Model|Provider|Tokens In|Tokens Out|Cost|Actions"
+          "id": "element-presence-elem-0",
+          "description": "Required element 0 for state Element Presence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Element Presence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {}
+        {
+          "id": "element-presence-elem-1",
+          "description": "Required element 1 for state Element Presence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Element Presence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "element-presence-elem-2",
+          "description": "Required element 2 for state Element Presence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Element Presence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "element-presence-elem-3",
+          "description": "Required element 3 for state Element Presence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "columnheader",
+              "text": "Model|Provider|Tokens In|Tokens Out|Cost|Actions"
+            },
+            "label": "Required element for Element Presence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "element-presence-elem-4",
+          "description": "Required element 4 for state Element Presence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Element Presence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "Verifies that all expected structural elements are present in the Feedback Scores and LLM Cost Breakdown panels. Score rows must contain a name label, score value, and progress bar. Summary strips must contain aggregate indicators. Source badges must appear conditionally. Cost breakdown must render section headers and per-row data columns.",
       "provenance": {
@@ -195,18 +769,88 @@
     {
       "id": "data-display",
       "name": "Data Display Formatting",
-      "requiredElements": [
-        {},
+      "assertions": [
         {
-          "text": "\\d+%"
+          "id": "data-display-elem-0",
+          "description": "Required element 0 for state Data Display Formatting",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Data Display Formatting"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "\\$[0-9]"
+          "id": "data-display-elem-1",
+          "description": "Required element 1 for state Data Display Formatting",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "\\d+%"
+            },
+            "label": "Required element for Data Display Formatting"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "[0-9,]+"
+          "id": "data-display-elem-2",
+          "description": "Required element 2 for state Data Display Formatting",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "\\$[0-9]"
+            },
+            "label": "Required element for Data Display Formatting"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {}
+        {
+          "id": "data-display-elem-3",
+          "description": "Required element 3 for state Data Display Formatting",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "[0-9,]+"
+            },
+            "label": "Required element for Data Display Formatting"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "data-display-elem-4",
+          "description": "Required element 4 for state Data Display Formatting",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Data Display Formatting"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "Verifies that feedback scores and cost data are displayed with correct formatting, proportional sizing, and sort order. Score progress bars must reflect the 0-1 value scale. Numeric values must follow their respective formatting rules (percentages, dollar amounts, comma-separated tokens).",
       "provenance": {
@@ -216,17 +860,59 @@
     {
       "id": "behavior",
       "name": "Behavior",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Submit"
+          "id": "behavior-elem-0",
+          "description": "Required element 0 for state Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Submit"
+            },
+            "label": "Required element for Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "behavior-elem-1",
+          "description": "Required element 1 for state Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Retry"
+          "id": "behavior-elem-2",
+          "description": "Required element 2 for state Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Retry"
+            },
+            "label": "Required element for Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Verifies interactive behaviors: adding a manual score via the inline form, expanding a score row to reveal reason text, and retrying after an error state. These cover the primary user actions beyond simple navigation.",
@@ -237,11 +923,67 @@
     {
       "id": "state-consistency",
       "name": "State Consistency",
-      "requiredElements": [
-        {},
-        {},
-        {},
-        {}
+      "assertions": [
+        {
+          "id": "state-consistency-elem-0",
+          "description": "Required element 0 for state State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "state-consistency-elem-1",
+          "description": "Required element 1 for state State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "state-consistency-elem-2",
+          "description": "Required element 2 for state State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "state-consistency-elem-3",
+          "description": "Required element 3 for state State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "Verifies that derived/aggregated values displayed in the UI are mathematically consistent with the underlying data. Summary averages must match computed averages, badge counts must match filtered score counts, and cost totals must reconcile with per-model breakdowns.",
       "provenance": {

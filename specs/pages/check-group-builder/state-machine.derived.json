@@ -6,16 +6,58 @@
     {
       "id": "cg-list-management",
       "name": "Check Group Library Management",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Check Groups"
+          "id": "cg-list-management-elem-0",
+          "description": "Required element 0 for state Check Group Library Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Groups"
+            },
+            "label": "Required element for Check Group Library Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "New"
+          "id": "cg-list-management-elem-1",
+          "description": "Required element 1 for state Check Group Library Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "New"
+            },
+            "label": "Required element for Check Group Library Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "searchbox"
+          "id": "cg-list-management-elem-2",
+          "description": "Required element 2 for state Check Group Library Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "searchbox"
+            },
+            "label": "Required element for Check Group Library Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The left panel presents all saved check groups in a searchable list following the standard library builder layout. Users can browse existing groups, create new ones, and select a group to load into the editor. Each list item shows the group name, the number of checks it contains, and any tags. The list supports search filtering to help users find specific groups in large libraries. Creating a new group opens a blank editor with default settings (sequential execution, stop on failure).",
@@ -26,19 +68,75 @@
     {
       "id": "cg-check-composition",
       "name": "Check Composition and Ordering",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Check Groups"
+          "id": "cg-check-composition-elem-0",
+          "description": "Required element 0 for state Check Composition and Ordering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Groups"
+            },
+            "label": "Required element for Check Composition and Ordering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Check Groups"
+          "id": "cg-check-composition-elem-1",
+          "description": "Required element 1 for state Check Composition and Ordering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Groups"
+            },
+            "label": "Required element for Check Composition and Ordering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Check Groups"
+          "id": "cg-check-composition-elem-2",
+          "description": "Required element 2 for state Check Composition and Ordering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Groups"
+            },
+            "label": "Required element for Check Composition and Ordering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Save"
+          "id": "cg-check-composition-elem-3",
+          "description": "Required element 3 for state Check Composition and Ordering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save"
+            },
+            "label": "Required element for Check Composition and Ordering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The core function of the check group editor is composing a group from existing checks in the library. Users see a list of available checks they can add to the group, and a list of currently included checks showing their order. The check selector shows check names, types, and tool information so users can identify the right checks. Users can add and remove individual checks from the group, building up a verification suite that covers all necessary validation points.",
@@ -49,18 +147,74 @@
     {
       "id": "cg-execution-config",
       "name": "Execution Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Check Groups"
+          "id": "cg-execution-config-elem-0",
+          "description": "Required element 0 for state Execution Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Groups"
+            },
+            "label": "Required element for Execution Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Check Groups"
+          "id": "cg-execution-config-elem-1",
+          "description": "Required element 1 for state Execution Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Groups"
+            },
+            "label": "Required element for Execution Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Check Groups"
+          "id": "cg-execution-config-elem-2",
+          "description": "Required element 2 for state Execution Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Groups"
+            },
+            "label": "Required element for Execution Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Check Groups"
+          "id": "cg-execution-config-elem-3",
+          "description": "Required element 3 for state Execution Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Groups"
+            },
+            "label": "Required element for Execution Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Check groups support configuring how their constituent checks are executed. Users can choose between sequential execution (checks run one after another) and parallel execution (checks run concurrently for faster verification). The stop-on-failure flag controls whether the group halts at the first failing check or continues to run all checks to collect complete results. These options let users balance between execution speed, early failure detection, and comprehensive reporting depending on their workflow needs.",

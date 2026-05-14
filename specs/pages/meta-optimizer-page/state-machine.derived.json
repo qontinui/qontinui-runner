@@ -6,21 +6,63 @@
     {
       "id": "page-layout-structure",
       "name": "Page Layout & Structure",
-      "requiredElements": [
+      "assertions": [
         {
-          "attributes": {
-            "tutorial-id": "progress-tab"
-          }
+          "id": "page-layout-structure-elem-0",
+          "description": "Required element 0 for state Page Layout & Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "tutorial-id": "progress-tab"
+              }
+            },
+            "label": "Required element for Page Layout & Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "attributes": {
-            "tutorial-id": "progress-tab"
-          }
+          "id": "page-layout-structure-elem-1",
+          "description": "Required element 1 for state Page Layout & Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "tutorial-id": "progress-tab"
+              }
+            },
+            "label": "Required element for Page Layout & Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "attributes": {
-            "tutorial-id": "progress-tab"
-          }
+          "id": "page-layout-structure-elem-2",
+          "description": "Required element 2 for state Page Layout & Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "tutorial-id": "progress-tab"
+              }
+            },
+            "label": "Required element for Page Layout & Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The MetaOptimizerPage renders a horizontal tab bar at the top and a scrollable content area below. The tab bar contains 14 tabs. The page fills the full height of its container.",
@@ -31,26 +73,82 @@
     {
       "id": "tab-navigation",
       "name": "Tab Navigation",
-      "requiredElements": [
+      "assertions": [
         {
-          "attributes": {
-            "tutorial-id": "duel_pools-tab"
-          }
+          "id": "tab-navigation-elem-0",
+          "description": "Required element 0 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "tutorial-id": "duel_pools-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "attributes": {
-            "tutorial-id": "beam_runs-tab"
-          }
+          "id": "tab-navigation-elem-1",
+          "description": "Required element 1 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "tutorial-id": "beam_runs-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "attributes": {
-            "tutorial-id": "span_events-tab"
-          }
+          "id": "tab-navigation-elem-2",
+          "description": "Required element 2 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "tutorial-id": "span_events-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "attributes": {
-            "tutorial-id": "progress-tab"
-          }
+          "id": "tab-navigation-elem-3",
+          "description": "Required element 3 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attributes": {
+                "tutorial-id": "progress-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Clicking any tab button switches the visible content panel. Only one tab's content is rendered at a time.",
@@ -61,16 +159,58 @@
     {
       "id": "duel-pools-layout",
       "name": "Duel Pools — Layout & Empty State",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "textContains": "Duel Pools"
+          "id": "duel-pools-layout-elem-0",
+          "description": "Required element 0 for state Duel Pools — Layout & Empty State",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContains": "Duel Pools"
+            },
+            "label": "Required element for Duel Pools — Layout & Empty State"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "No duel pools yet"
+          "id": "duel-pools-layout-elem-1",
+          "description": "Required element 1 for state Duel Pools — Layout & Empty State",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "No duel pools yet"
+            },
+            "label": "Required element for Duel Pools — Layout & Empty State"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Loading..."
+          "id": "duel-pools-layout-elem-2",
+          "description": "Required element 2 for state Duel Pools — Layout & Empty State",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Loading..."
+            },
+            "label": "Required element for Duel Pools — Layout & Empty State"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The DuelPoolsTab has a two-panel layout: a fixed-width (w-80) pool list sidebar on the left and a flexible detail panel on the right. On initial load it fetches pools from GET /meta-optimizer/duel-pools.",
@@ -82,15 +222,57 @@
     {
       "id": "duel-pools-data-display",
       "name": "Duel Pools — Pool List & Detail",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button"
+          "id": "duel-pools-data-display-elem-0",
+          "description": "Required element 0 for state Duel Pools — Pool List & Detail",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Duel Pools — Pool List & Detail"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "duel-pools-data-display-elem-1",
+          "description": "Required element 1 for state Duel Pools — Pool List & Detail",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Duel Pools — Pool List & Detail"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "tr"
+          "id": "duel-pools-data-display-elem-2",
+          "description": "Required element 2 for state Duel Pools — Pool List & Detail",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "tr"
+            },
+            "label": "Required element for Duel Pools — Pool List & Detail"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When pools exist, the sidebar lists them with status badges, agent type, generation, and timestamps. Clicking a pool loads its candidates in the detail panel with a Copeland ranking table.",
@@ -102,15 +284,57 @@
     {
       "id": "duel-pools-results",
       "name": "Duel Pools — Duel Results",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Duel Results"
+          "id": "duel-pools-results-elem-0",
+          "description": "Required element 0 for state Duel Pools — Duel Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Duel Results"
+            },
+            "label": "Required element for Duel Pools — Duel Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "table"
+          "id": "duel-pools-results-elem-1",
+          "description": "Required element 1 for state Duel Pools — Duel Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Duel Pools — Duel Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "No duel results"
+          "id": "duel-pools-results-elem-2",
+          "description": "Required element 2 for state Duel Pools — Duel Results",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "No duel results"
+            },
+            "label": "Required element for Duel Pools — Duel Results"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The duel results section shows pairwise comparison outcomes. Loaded on demand via a 'Show Duel Results' button.",
@@ -122,15 +346,57 @@
     {
       "id": "duel-pools-copeland-correctness",
       "name": "Duel Pools — Copeland Ranking Correctness",
-      "requiredElements": [
+      "assertions": [
         {
-          "tagName": "table"
+          "id": "duel-pools-copeland-correctness-elem-0",
+          "description": "Required element 0 for state Duel Pools — Copeland Ranking Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Duel Pools — Copeland Ranking Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "table"
+          "id": "duel-pools-copeland-correctness-elem-1",
+          "description": "Required element 1 for state Duel Pools — Copeland Ranking Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Duel Pools — Copeland Ranking Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "table"
+          "id": "duel-pools-copeland-correctness-elem-2",
+          "description": "Required element 2 for state Duel Pools — Copeland Ranking Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Duel Pools — Copeland Ranking Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Copeland ranking displayed in the candidates table must correctly reflect pairwise dominance. This validates the duel engine's ranking algorithm output as displayed on the page.",
@@ -142,13 +408,41 @@
     {
       "id": "beam-runs-layout",
       "name": "Beam Runs — Layout & Empty State",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "textContains": "Beam Search Runs"
+          "id": "beam-runs-layout-elem-0",
+          "description": "Required element 0 for state Beam Runs — Layout & Empty State",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContains": "Beam Search Runs"
+            },
+            "label": "Required element for Beam Runs — Layout & Empty State"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "No beam search runs yet"
+          "id": "beam-runs-layout-elem-1",
+          "description": "Required element 1 for state Beam Runs — Layout & Empty State",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "No beam search runs yet"
+            },
+            "label": "Required element for Beam Runs — Layout & Empty State"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The BeamRunsTab has the same two-panel layout as DuelPoolsTab: fixed-width sidebar with runs list, flexible detail panel showing candidates grouped by generation.",
@@ -160,18 +454,74 @@
     {
       "id": "beam-runs-data-display",
       "name": "Beam Runs — Run List & Candidates",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button"
+          "id": "beam-runs-data-display-elem-0",
+          "description": "Required element 0 for state Beam Runs — Run List & Candidates",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Beam Runs — Run List & Candidates"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Generation"
+          "id": "beam-runs-data-display-elem-1",
+          "description": "Required element 1 for state Beam Runs — Run List & Candidates",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Generation"
+            },
+            "label": "Required element for Beam Runs — Run List & Candidates"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "beam-runs-data-display-elem-2",
+          "description": "Required element 2 for state Beam Runs — Run List & Candidates",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Beam Runs — Run List & Candidates"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "beam-runs-data-display-elem-3",
+          "description": "Required element 3 for state Beam Runs — Run List & Candidates",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Beam Runs — Run List & Candidates"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Run list shows status, agent_type, generation. Selecting a run loads candidates grouped by generation with expandable cards showing critique, changes, and prompt content.",
@@ -183,19 +533,89 @@
     {
       "id": "span-events-filters",
       "name": "Span Events — Filter Controls",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "textContains": "Span Events"
+          "id": "span-events-filters-elem-0",
+          "description": "Required element 0 for state Span Events — Filter Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContains": "Span Events"
+            },
+            "label": "Required element for Span Events — Filter Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
-        {},
         {
-          "role": "button",
-          "text": "Load"
+          "id": "span-events-filters-elem-1",
+          "description": "Required element 1 for state Span Events — Filter Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Span Events — Filter Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "No span events loaded"
+          "id": "span-events-filters-elem-2",
+          "description": "Required element 2 for state Span Events — Filter Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Span Events — Filter Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "span-events-filters-elem-3",
+          "description": "Required element 3 for state Span Events — Filter Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Load"
+            },
+            "label": "Required element for Span Events — Filter Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "span-events-filters-elem-4",
+          "description": "Required element 4 for state Span Events — Filter Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "No span events loaded"
+            },
+            "label": "Required element for Span Events — Filter Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The SpanEventsTab has filter inputs for execution_id and agent_type, plus a Load button. Events are fetched on demand (not on mount).",
@@ -207,21 +627,91 @@
     {
       "id": "span-events-data-display",
       "name": "Span Events — Event Display & Grouping",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button"
+          "id": "span-events-data-display-elem-0",
+          "description": "Required element 0 for state Span Events — Event Display & Grouping",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "table"
+          "id": "span-events-data-display-elem-1",
+          "description": "Required element 1 for state Span Events — Event Display & Grouping",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "table"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "td"
+          "id": "span-events-data-display-elem-2",
+          "description": "Required element 2 for state Span Events — Event Display & Grouping",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "td"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "span-events-data-display-elem-3",
+          "description": "Required element 3 for state Span Events — Event Display & Grouping",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "span-events-data-display-elem-4",
+          "description": "Required element 4 for state Span Events — Event Display & Grouping",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Span Events — Event Display & Grouping"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Loaded events are grouped by execution_id with collapsible sections. Each group shows an event table with type-specific detail rendering.",
@@ -233,19 +723,75 @@
     {
       "id": "visual-design-dark-theme",
       "name": "Visual Design — Dark Theme Compliance",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "textContains": "Duel Pools"
+          "id": "visual-design-dark-theme-elem-0",
+          "description": "Required element 0 for state Visual Design — Dark Theme Compliance",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContains": "Duel Pools"
+            },
+            "label": "Required element for Visual Design — Dark Theme Compliance"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading"
+          "id": "visual-design-dark-theme-elem-1",
+          "description": "Required element 1 for state Visual Design — Dark Theme Compliance",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading"
+            },
+            "label": "Required element for Visual Design — Dark Theme Compliance"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "span"
+          "id": "visual-design-dark-theme-elem-2",
+          "description": "Required element 2 for state Visual Design — Dark Theme Compliance",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "span"
+            },
+            "label": "Required element for Visual Design — Dark Theme Compliance"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "visual-design-dark-theme-elem-3",
+          "description": "Required element 3 for state Visual Design — Dark Theme Compliance",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Visual Design — Dark Theme Compliance"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "All three new tabs follow the runner's dark zinc theme. Background colors, text colors, borders, and interactive states must be consistent with the existing meta-optimizer tabs.",
@@ -257,17 +803,59 @@
     {
       "id": "api-integration",
       "name": "API Integration & Data Flow",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Refresh"
+          "id": "api-integration-elem-0",
+          "description": "Required element 0 for state API Integration & Data Flow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Refresh"
+            },
+            "label": "Required element for API Integration & Data Flow"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading",
-          "textContains": "Beam Search Runs"
+          "id": "api-integration-elem-1",
+          "description": "Required element 1 for state API Integration & Data Flow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContains": "Beam Search Runs"
+            },
+            "label": "Required element for API Integration & Data Flow"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Load"
+          "id": "api-integration-elem-2",
+          "description": "Required element 2 for state API Integration & Data Flow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Load"
+            },
+            "label": "Required element for API Integration & Data Flow"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "All three tabs fetch data from the runner's HTTP API. API failures should not crash the UI.",
@@ -279,12 +867,40 @@
     {
       "id": "accessibility",
       "name": "Accessibility",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button"
+          "id": "accessibility-elem-0",
+          "description": "Required element 0 for state Accessibility",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Accessibility"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "accessibility-elem-1",
+          "description": "Required element 1 for state Accessibility",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Accessibility"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Interactive elements have proper ARIA roles, tabIndex, and keyboard event handlers for accessibility.",

@@ -6,19 +6,75 @@
     {
       "id": "pt-page-structure",
       "name": "Page Structure",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Product Tours"
+          "id": "pt-page-structure-elem-0",
+          "description": "Required element 0 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Product Tours"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading",
-          "text": "Generate New Tours"
+          "id": "pt-page-structure-elem-1",
+          "description": "Required element 1 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Generate New Tours"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
         {
-          "role": "heading",
-          "text": "Product Tours"
+          "id": "pt-page-structure-elem-2",
+          "description": "Required element 2 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "pt-page-structure-elem-3",
+          "description": "Required element 3 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Product Tours"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Core layout and headings that establish the page identity. The page is a flex column with a fixed header and a scrollable content area. The main heading and section heading must be present for the page to be considered loaded.",
@@ -29,19 +85,75 @@
     {
       "id": "pt-spec-selector",
       "name": "Page Spec Selector",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Select Pages"
+          "id": "pt-spec-selector-elem-0",
+          "description": "Required element 0 for state Page Spec Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Select Pages"
+            },
+            "label": "Required element for Page Spec Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Select all"
+          "id": "pt-spec-selector-elem-1",
+          "description": "Required element 1 for state Page Spec Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Select all"
+            },
+            "label": "Required element for Page Spec Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No specs found"
+          "id": "pt-spec-selector-elem-2",
+          "description": "Required element 2 for state Page Spec Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No specs found"
+            },
+            "label": "Required element for Page Spec Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "pt-spec-selector-elem-3",
+          "description": "Required element 3 for state Page Spec Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Page Spec Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Multi-select control that lists all discovered UI Bridge spec files (*.spec.uibridge.json). Users select which pages to generate tours from. Includes a 'Select all' / 'Deselect all' toggle. Specs are discovered via import.meta.glob at build time.",
@@ -53,21 +165,77 @@
     {
       "id": "pt-audience-selector",
       "name": "Target Audience Selector",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Target Audience"
+          "id": "pt-audience-selector-elem-0",
+          "description": "Required element 0 for state Target Audience Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Target Audience"
+            },
+            "label": "Required element for Target Audience Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "option",
-          "text": "New User — basics & common workflows"
+          "id": "pt-audience-selector-elem-1",
+          "description": "Required element 1 for state Target Audience Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "option",
+              "text": "New User — basics & common workflows"
+            },
+            "label": "Required element for Target Audience Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "option",
-          "text": "Power User — advanced features"
+          "id": "pt-audience-selector-elem-2",
+          "description": "Required element 2 for state Target Audience Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "option",
+              "text": "Power User — advanced features"
+            },
+            "label": "Required element for Target Audience Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "option",
-          "text": "Evaluator — differentiators & ROI"
+          "id": "pt-audience-selector-elem-3",
+          "description": "Required element 3 for state Target Audience Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "option",
+              "text": "Evaluator — differentiators & ROI"
+            },
+            "label": "Required element for Target Audience Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A select dropdown that determines the persona the AI uses when generating tour content. Three audiences are available: new-user, power-user, and evaluator. The selected audience also controls how saved tours are grouped and labeled in the catalog.",
@@ -78,28 +246,112 @@
     {
       "id": "pt-generation-controls",
       "name": "Generation Action Controls",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Generate Tour"
+          "id": "pt-generation-controls-elem-0",
+          "description": "Required element 0 for state Generation Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Generate Tour"
+            },
+            "label": "Required element for Generation Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Generate Tour"
+          "id": "pt-generation-controls-elem-1",
+          "description": "Required element 1 for state Generation Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Generate Tour"
+            },
+            "label": "Required element for Generation Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "pt-generation-controls-elem-2",
+          "description": "Required element 2 for state Generation Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Generation Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "pt-generation-controls-elem-3",
+          "description": "Required element 3 for state Generation Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Generation Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Regenerate"
+          "id": "pt-generation-controls-elem-4",
+          "description": "Required element 4 for state Generation Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Regenerate"
+            },
+            "label": "Required element for Generation Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Reset"
+          "id": "pt-generation-controls-elem-5",
+          "description": "Required element 5 for state Generation Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Reset"
+            },
+            "label": "Required element for Generation Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The action buttons in the generation workflow change based on the current phase. In idle/error/done phases the 'Generate Tour(s)' button is shown. In the previewing phase, 'Save' and 'Regenerate' buttons replace it. A 'Reset' button appears in the header whenever the phase is not idle.",
@@ -111,15 +363,57 @@
     {
       "id": "pt-generation-status",
       "name": "Generation Status Messages",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Generating tour(s) with AI..."
+          "id": "pt-generation-status-elem-0",
+          "description": "Required element 0 for state Generation Status Messages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Generating tour(s) with AI..."
+            },
+            "label": "Required element for Generation Status Messages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "alert"
+          "id": "pt-generation-status-elem-1",
+          "description": "Required element 1 for state Generation Status Messages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "alert"
+            },
+            "label": "Required element for Generation Status Messages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "saved"
+          "id": "pt-generation-status-elem-2",
+          "description": "Required element 2 for state Generation Status Messages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "saved"
+            },
+            "label": "Required element for Generation Status Messages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Contextual status indicators appear below the action buttons during active phases. The generating phase shows a spinner and loading text. The error phase shows an error message in a red-bordered box. The done phase shows a success message in green. These messages are mutually exclusive.",
@@ -131,17 +425,59 @@
     {
       "id": "pt-preview-section",
       "name": "Generated Tours Preview",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Preview"
+          "id": "pt-preview-section-elem-0",
+          "description": "Required element 0 for state Generated Tours Preview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Preview"
+            },
+            "label": "Required element for Generated Tours Preview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Start Tour"
+          "id": "pt-preview-section-elem-1",
+          "description": "Required element 1 for state Generated Tours Preview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Start Tour"
+            },
+            "label": "Required element for Generated Tours Preview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Start Tour"
+          "id": "pt-preview-section-elem-2",
+          "description": "Required element 2 for state Generated Tours Preview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Start Tour"
+            },
+            "label": "Required element for Generated Tours Preview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When AI generation completes, the page enters the previewing phase and displays a 'Preview' heading above a grid of TourCard components — one per generated tour. Users review these before deciding to save or regenerate.",
@@ -153,27 +489,111 @@
     {
       "id": "pt-saved-tours-catalog",
       "name": "Saved Tours Catalog",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Saved Tours"
+          "id": "pt-saved-tours-catalog-elem-0",
+          "description": "Required element 0 for state Saved Tours Catalog",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Saved Tours"
+            },
+            "label": "Required element for Saved Tours Catalog"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Getting Started"
+          "id": "pt-saved-tours-catalog-elem-1",
+          "description": "Required element 1 for state Saved Tours Catalog",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Getting Started"
+            },
+            "label": "Required element for Saved Tours Catalog"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Power Features"
+          "id": "pt-saved-tours-catalog-elem-2",
+          "description": "Required element 2 for state Saved Tours Catalog",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Power Features"
+            },
+            "label": "Required element for Saved Tours Catalog"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Product Overview"
+          "id": "pt-saved-tours-catalog-elem-3",
+          "description": "Required element 3 for state Saved Tours Catalog",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Product Overview"
+            },
+            "label": "Required element for Saved Tours Catalog"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Remove"
+          "id": "pt-saved-tours-catalog-elem-4",
+          "description": "Required element 4 for state Saved Tours Catalog",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Remove"
+            },
+            "label": "Required element for Saved Tours Catalog"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading",
-          "text": "Saved Tours"
+          "id": "pt-saved-tours-catalog-elem-5",
+          "description": "Required element 5 for state Saved Tours Catalog",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Saved Tours"
+            },
+            "label": "Required element for Saved Tours Catalog"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The lower section of the page displays all previously saved tours, separated from the generation controls by a divider. Tours are grouped by audience type with labeled category headings. This section only appears when at least one tour has been saved to instanceStorage.",
@@ -185,24 +605,94 @@
     {
       "id": "pt-tour-card",
       "name": "Tour Card Component",
-      "requiredElements": [
+      "assertions": [
         {
-          "tagName": "div"
+          "id": "pt-tour-card-elem-0",
+          "description": "Required element 0 for state Tour Card Component",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Tour Card Component"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Start Tour"
+          "id": "pt-tour-card-elem-1",
+          "description": "Required element 1 for state Tour Card Component",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Start Tour"
+            },
+            "label": "Required element for Tour Card Component"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "min"
+          "id": "pt-tour-card-elem-2",
+          "description": "Required element 2 for state Tour Card Component",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "min"
+            },
+            "label": "Required element for Tour Card Component"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Start Tour"
+          "id": "pt-tour-card-elem-3",
+          "description": "Required element 3 for state Tour Card Component",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Start Tour"
+            },
+            "label": "Required element for Tour Card Component"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "HTML"
+          "id": "pt-tour-card-elem-4",
+          "description": "Required element 4 for state Tour Card Component",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "HTML"
+            },
+            "label": "Required element for Tour Card Component"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "TourCard renders the metadata and actions for a single ProductTour. It appears in both the preview grid and the saved tours catalog. The card layout includes a header (title, subtitle, badge), a metadata row, and action buttons.",
@@ -214,29 +704,127 @@
     {
       "id": "pt-tour-player",
       "name": "Tour Player Modal",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Next"
+          "id": "pt-tour-player-elem-0",
+          "description": "Required element 0 for state Tour Player Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Next"
+            },
+            "label": "Required element for Tour Player Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading"
+          "id": "pt-tour-player-elem-1",
+          "description": "Required element 1 for state Tour Player Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading"
+            },
+            "label": "Required element for Tour Player Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Next"
+          "id": "pt-tour-player-elem-2",
+          "description": "Required element 2 for state Tour Player Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Next"
+            },
+            "label": "Required element for Tour Player Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Next"
+          "id": "pt-tour-player-elem-3",
+          "description": "Required element 3 for state Tour Player Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Next"
+            },
+            "label": "Required element for Tour Player Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Demonstrating..."
+          "id": "pt-tour-player-elem-4",
+          "description": "Required element 4 for state Tour Player Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Demonstrating..."
+            },
+            "label": "Required element for Tour Player Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading",
-          "text": "Tour Complete"
+          "id": "pt-tour-player-elem-5",
+          "description": "Required element 5 for state Tour Player Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Tour Complete"
+            },
+            "label": "Required element for Tour Player Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Next"
+          "id": "pt-tour-player-elem-6",
+          "description": "Required element 6 for state Tour Player Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Next"
+            },
+            "label": "Required element for Tour Player Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "TourPlayer is a fixed-position floating card (bottom-right, z-[9998]) that overlays the current page while playing a tour. It displays one step at a time, executes demo actions automatically, and provides Back/Next navigation. It does not navigate away — the product tours page remains visible behind it.",
@@ -248,23 +836,93 @@
     {
       "id": "pt-ai-generation-quality",
       "name": "AI Tour Generation Output Quality",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "steps"
+          "id": "pt-ai-generation-quality-elem-0",
+          "description": "Required element 0 for state AI Tour Generation Output Quality",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "steps"
+            },
+            "label": "Required element for AI Tour Generation Output Quality"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Start Tour"
+          "id": "pt-ai-generation-quality-elem-1",
+          "description": "Required element 1 for state AI Tour Generation Output Quality",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Start Tour"
+            },
+            "label": "Required element for AI Tour Generation Output Quality"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Start Tour"
+          "id": "pt-ai-generation-quality-elem-2",
+          "description": "Required element 2 for state AI Tour Generation Output Quality",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Start Tour"
+            },
+            "label": "Required element for AI Tour Generation Output Quality"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading"
+          "id": "pt-ai-generation-quality-elem-3",
+          "description": "Required element 3 for state AI Tour Generation Output Quality",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading"
+            },
+            "label": "Required element for AI Tour Generation Output Quality"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Demonstrating..."
+          "id": "pt-ai-generation-quality-elem-4",
+          "description": "Required element 4 for state AI Tour Generation Output Quality",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Demonstrating..."
+            },
+            "label": "Required element for AI Tour Generation Output Quality"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The AI generation process is the core domain logic of this page. It sends a structured prompt containing the spec's assertion data, the page's registered UI elements, and an audience context to the /ai/prompt endpoint. The output must conform to the ProductTour schema and meet specific quality criteria. These assertions define what 'correct' AI output looks like.",
@@ -276,18 +934,60 @@
     {
       "id": "pt-export-functionality",
       "name": "Tour Export",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "JSON"
+          "id": "pt-export-functionality-elem-0",
+          "description": "Required element 0 for state Tour Export",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "JSON"
+            },
+            "label": "Required element for Tour Export"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "MD"
+          "id": "pt-export-functionality-elem-1",
+          "description": "Required element 1 for state Tour Export",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "MD"
+            },
+            "label": "Required element for Tour Export"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "HTML"
+          "id": "pt-export-functionality-elem-2",
+          "description": "Required element 2 for state Tour Export",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "HTML"
+            },
+            "label": "Required element for Tour Export"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Tours in the saved catalog can be exported in three formats: JSON (raw data), Markdown (human-readable documentation), and HTML (standalone dark-themed self-contained page). All exports trigger a browser file download using an ObjectURL blob.",
@@ -299,16 +999,58 @@
     {
       "id": "pt-help-tab-integration",
       "name": "Help Tab Integration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "No tours generated yet"
+          "id": "pt-help-tab-integration-elem-0",
+          "description": "Required element 0 for state Help Tab Integration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No tours generated yet"
+            },
+            "label": "Required element for Help Tab Integration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Interactive tours that demonstrate features automatically"
+          "id": "pt-help-tab-integration-elem-1",
+          "description": "Required element 1 for state Help Tab Integration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Interactive tours that demonstrate features automatically"
+            },
+            "label": "Required element for Help Tab Integration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Start Tour"
+          "id": "pt-help-tab-integration-elem-2",
+          "description": "Required element 2 for state Help Tab Integration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Start Tour"
+            },
+            "label": "Required element for Help Tab Integration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Product Tours feature also appears as a sub-tab in the Help section of the runner, accessible at the 'Product Tours' tab (MapPin icon). This view reads from the same instanceStorage key and supports playback and export. It serves as a launcher for tours discovered elsewhere in the app.",

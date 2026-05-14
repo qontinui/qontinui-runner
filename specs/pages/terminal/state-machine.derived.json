@@ -32,19 +32,75 @@
       "id": "term-multi-tab",
       "name": "Multi-Tab Terminal Sessions",
       "description": "Users work with multiple concurrent terminal sessions organized as tabs. Each tab is an independent PTY session with its own shell, working directory, command history, and scrollback buffer. Users can create new tabs (Ctrl+Shift+T), close tabs (Ctrl+Shift+W), cycle between tabs (Ctrl+Tab), and rename tabs for better organization. Tabs auto-rename from the first command entered. On mount, the terminal attempts to reconnect to existing Rust PTY sessions from previous page visits, preserving shell state across navigation. When all tabs are closed, a helpful empty state guides users on how to create a new terminal.",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "tablist"
+          "id": "term-multi-tab-elem-0",
+          "description": "Required element 0 for state Multi-Tab Terminal Sessions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tablist"
+            },
+            "label": "Required element for Multi-Tab Terminal Sessions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "+"
+          "id": "term-multi-tab-elem-1",
+          "description": "Required element 1 for state Multi-Tab Terminal Sessions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "+"
+            },
+            "label": "Required element for Multi-Tab Terminal Sessions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No terminals open"
+          "id": "term-multi-tab-elem-2",
+          "description": "Required element 2 for state Multi-Tab Terminal Sessions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No terminals open"
+            },
+            "label": "Required element for Multi-Tab Terminal Sessions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Ctrl+Shift+T"
+          "id": "term-multi-tab-elem-3",
+          "description": "Required element 3 for state Multi-Tab Terminal Sessions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Ctrl+Shift+T"
+            },
+            "label": "Required element for Multi-Tab Terminal Sessions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "provenance": {
@@ -55,22 +111,78 @@
       "id": "term-action-bar",
       "name": "Terminal Action Bar",
       "description": "Above the terminal area, an action bar provides quick access to terminal-augmented features: toggling the transcript session sidebar, triggering AI-powered analysis of terminal output, generating workflows from the latest Claude Code session, refreshing the plan file, and toggling the findings panel. The action bar adapts its button states based on context -- showing loading spinners during generation or analysis, indicating the active findings count, and highlighting the active panel mode. This bar transforms the terminal from a simple shell into an intelligent development workbench.",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Sessions"
+          "id": "term-action-bar-elem-0",
+          "description": "Required element 0 for state Terminal Action Bar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Sessions"
+            },
+            "label": "Required element for Terminal Action Bar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Generate"
+          "id": "term-action-bar-elem-1",
+          "description": "Required element 1 for state Terminal Action Bar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Generate"
+            },
+            "label": "Required element for Terminal Action Bar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Analyze"
+          "id": "term-action-bar-elem-2",
+          "description": "Required element 2 for state Terminal Action Bar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Analyze"
+            },
+            "label": "Required element for Terminal Action Bar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Findings"
+          "id": "term-action-bar-elem-3",
+          "description": "Required element 3 for state Terminal Action Bar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Findings"
+            },
+            "label": "Required element for Terminal Action Bar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "provenance": {
@@ -81,20 +193,76 @@
       "id": "term-transcript-sessions",
       "name": "Claude Code Session Transcripts",
       "description": "The left sidebar shows a list of Claude Code session transcripts from the local machine. Users can browse past sessions, view the full conversation transcript in a right-side content panel, and resume sessions in a new terminal tab. Session resumption creates a new tab, sets the working directory, and sends the 'claude --resume' command with the correct config directory. The transcript panel supports generating workflows from session content and generating-and-running workflows in a single action for rapid automation creation.",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Sessions"
+          "id": "term-transcript-sessions-elem-0",
+          "description": "Required element 0 for state Claude Code Session Transcripts",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Sessions"
+            },
+            "label": "Required element for Claude Code Session Transcripts"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Transcript"
+          "id": "term-transcript-sessions-elem-1",
+          "description": "Required element 1 for state Claude Code Session Transcripts",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Transcript"
+            },
+            "label": "Required element for Claude Code Session Transcripts"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Resume"
+          "id": "term-transcript-sessions-elem-2",
+          "description": "Required element 2 for state Claude Code Session Transcripts",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Resume"
+            },
+            "label": "Required element for Claude Code Session Transcripts"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Generate"
+          "id": "term-transcript-sessions-elem-3",
+          "description": "Required element 3 for state Claude Code Session Transcripts",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Generate"
+            },
+            "label": "Required element for Claude Code Session Transcripts"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "provenance": {
@@ -105,21 +273,77 @@
       "id": "term-workflow-preview",
       "name": "Workflow Generation and Preview",
       "description": "When a workflow is generated (from a session transcript, command history, or findings), a preview panel opens on the right side showing the full workflow structure. Users can review the generated workflow's phases and steps, then choose to execute it immediately, save it to the workflow library for later use, edit it in the Workflow Builder for refinement, or regenerate it with different parameters. The panel shows loading state during generation and error messages if generation fails. This workflow enables a rapid 'do it once in the terminal, then automate it' development pattern.",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Workflow"
+          "id": "term-workflow-preview-elem-0",
+          "description": "Required element 0 for state Workflow Generation and Preview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Workflow"
+            },
+            "label": "Required element for Workflow Generation and Preview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Execute"
+          "id": "term-workflow-preview-elem-1",
+          "description": "Required element 1 for state Workflow Generation and Preview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Execute"
+            },
+            "label": "Required element for Workflow Generation and Preview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Save"
+          "id": "term-workflow-preview-elem-2",
+          "description": "Required element 2 for state Workflow Generation and Preview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save"
+            },
+            "label": "Required element for Workflow Generation and Preview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Edit"
+          "id": "term-workflow-preview-elem-3",
+          "description": "Required element 3 for state Workflow Generation and Preview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Edit"
+            },
+            "label": "Required element for Workflow Generation and Preview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "provenance": {
@@ -130,21 +354,77 @@
       "id": "term-findings-tracking",
       "name": "Real-Time Findings Detection",
       "description": "The terminal automatically analyzes output in real time to detect errors, warnings, test failures, and other notable findings. These are tracked per-session and displayed in a dedicated findings panel on the right side. Users can respond to findings (sending text back to the terminal), fix findings by spawning a new Claude Code session with the finding context pre-loaded, or batch-generate a workflow from multiple unresolved findings. The findings count badge on the action bar updates live as new issues are detected, keeping users aware of problems without interrupting their terminal workflow.",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Findings"
+          "id": "term-findings-tracking-elem-0",
+          "description": "Required element 0 for state Real-Time Findings Detection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Findings"
+            },
+            "label": "Required element for Real-Time Findings Detection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Fix"
+          "id": "term-findings-tracking-elem-1",
+          "description": "Required element 1 for state Real-Time Findings Detection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Fix"
+            },
+            "label": "Required element for Real-Time Findings Detection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Generate Workflow"
+          "id": "term-findings-tracking-elem-2",
+          "description": "Required element 2 for state Real-Time Findings Detection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Generate Workflow"
+            },
+            "label": "Required element for Real-Time Findings Detection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Respond"
+          "id": "term-findings-tracking-elem-3",
+          "description": "Required element 3 for state Real-Time Findings Detection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Respond"
+            },
+            "label": "Required element for Real-Time Findings Detection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "provenance": {
@@ -155,15 +435,57 @@
       "id": "term-analysis",
       "name": "AI-Powered Terminal Analysis",
       "description": "The terminal integrates AI analysis capabilities that process terminal scrollback, command history, and plan files to produce structured insights. Analysis types include: session summary (what happened in this terminal session), architecture review (system structure from plan files or terminal context), change impact (what files and systems were affected), progress tracking (how far along is the development plan), cross-tab analysis (correlating activity across multiple terminal sessions), and page architecture (analyzing the runner's own frontend). Analysis results appear in a dedicated panel with structured canvas-style panels. This transforms raw terminal output into actionable development intelligence.",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Architecture"
+          "id": "term-analysis-elem-0",
+          "description": "Required element 0 for state AI-Powered Terminal Analysis",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Architecture"
+            },
+            "label": "Required element for AI-Powered Terminal Analysis"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Summary"
+          "id": "term-analysis-elem-1",
+          "description": "Required element 1 for state AI-Powered Terminal Analysis",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Summary"
+            },
+            "label": "Required element for AI-Powered Terminal Analysis"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Analyzing"
+          "id": "term-analysis-elem-2",
+          "description": "Required element 2 for state AI-Powered Terminal Analysis",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Analyzing"
+            },
+            "label": "Required element for AI-Powered Terminal Analysis"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "provenance": {
@@ -174,21 +496,91 @@
       "id": "term-file-conflict-banner",
       "name": "File Conflict Detection Banner",
       "description": "The Terminal page includes an advisory file conflict detection system that tracks which files are under active development by concurrent sessions (workflows and AI terminal sessions). When multiple sessions edit the same file, a warning banner appears below the notification bar showing conflicting files and which sessions hold them. Real-time toast alerts appear when a new conflict is detected (e.g., session B starts editing a file that session A already registered). The banner is collapsible â€” a summary line shows the count of conflicting files, and expanding reveals the full list with file paths and session names. The system auto-registers files when Claude Code uses Edit or Write tools, polls the runner's file registry API every 30 seconds, and listens for real-time Tauri events. The banner uses warning amber (#e0af68) coloring consistent with the 'needs-input' status style.",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "under concurrent"
+          "id": "term-file-conflict-banner-elem-0",
+          "description": "Required element 0 for state File Conflict Detection Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "under concurrent"
+            },
+            "label": "Required element for File Conflict Detection Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "under concurrent development"
+          "id": "term-file-conflict-banner-elem-1",
+          "description": "Required element 1 for state File Conflict Detection Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "under concurrent development"
+            },
+            "label": "Required element for File Conflict Detection Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "under concurrent development"
+          "id": "term-file-conflict-banner-elem-2",
+          "description": "Required element 2 for state File Conflict Detection Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "under concurrent development"
+            },
+            "label": "Required element for File Conflict Detection Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Conflict:"
+          "id": "term-file-conflict-banner-elem-3",
+          "description": "Required element 3 for state File Conflict Detection Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Conflict:"
+            },
+            "label": "Required element for File Conflict Detection Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "under concurrent"
+          "id": "term-file-conflict-banner-elem-4",
+          "description": "Required element 4 for state File Conflict Detection Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "under concurrent"
+            },
+            "label": "Required element for File Conflict Detection Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "precondition": "No files are registered by multiple sessions in the file registry (GET /file-registry/info returns entries with unique holder_task_run_id per file_path)",
@@ -200,18 +592,74 @@
       "id": "term-session-conflict-indicator",
       "name": "Per-Session File Conflict Indicators",
       "description": "Each session card in the SessionManagerPanel sidebar displays a file conflict warning icon when that session has files overlapping with other active sessions. The indicator shows a FileWarning icon in amber (#e0af68) with a numeric count badge showing how many conflicting files that session has. The count is derived from the file registry: for each file registered by this session, if any OTHER session also has that file registered, it counts as a conflict. The tooltip shows '{N} file(s) shared with other sessions'. Sessions with zero conflicts show no indicator. The conflict count is computed by the useFileConflicts hook's sessionConflictCounts Map, keyed by session task_run_id.",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "shared with other sessions"
+          "id": "term-session-conflict-indicator-elem-0",
+          "description": "Required element 0 for state Per-Session File Conflict Indicators",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "shared with other sessions"
+            },
+            "label": "Required element for Per-Session File Conflict Indicators"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "shared with other sessions"
+          "id": "term-session-conflict-indicator-elem-1",
+          "description": "Required element 1 for state Per-Session File Conflict Indicators",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "shared with other sessions"
+            },
+            "label": "Required element for Per-Session File Conflict Indicators"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "shared with other sessions"
+          "id": "term-session-conflict-indicator-elem-2",
+          "description": "Required element 2 for state Per-Session File Conflict Indicators",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "shared with other sessions"
+            },
+            "label": "Required element for Per-Session File Conflict Indicators"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "shared with other sessions"
+          "id": "term-session-conflict-indicator-elem-3",
+          "description": "Required element 3 for state Per-Session File Conflict Indicators",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "shared with other sessions"
+            },
+            "label": "Required element for Per-Session File Conflict Indicators"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "precondition": "At least one session has files overlapping with another session in the file registry",
@@ -223,28 +671,126 @@
       "id": "term-multi-page",
       "name": "Multiple Terminal Pages",
       "description": "Users can create multiple independent terminal pages, each with its own zone layout, terminals, labels, and saved configurations. A page tab bar at the top of the terminal area shows all pages. Clicking a page tab switches to that page by unmounting the current TerminalPage and remounting a new one connected to that page's PTY sessions. Each page's state (zone layout, labels, notes, pins, zone profiles, workspaces) is stored in page-namespaced localStorage keys. The default page uses un-prefixed keys for backward compatibility. PTY sessions are tagged with a page_id in the Rust backend, so each page only sees its own terminals.",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "tab"
+          "id": "term-multi-page-elem-0",
+          "description": "Required element 0 for state Multiple Terminal Pages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Required element for Multiple Terminal Pages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "accessibleName": "Add terminal page"
+          "id": "term-multi-page-elem-1",
+          "description": "Required element 1 for state Multiple Terminal Pages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "accessibleName": "Add terminal page"
+            },
+            "label": "Required element for Multiple Terminal Pages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "tab"
+          "id": "term-multi-page-elem-2",
+          "description": "Required element 2 for state Multiple Terminal Pages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Required element for Multiple Terminal Pages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "tab"
+          "id": "term-multi-page-elem-3",
+          "description": "Required element 3 for state Multiple Terminal Pages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Required element for Multiple Terminal Pages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "accessibleName": "Close page"
+          "id": "term-multi-page-elem-4",
+          "description": "Required element 4 for state Multiple Terminal Pages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Close page"
+            },
+            "label": "Required element for Multiple Terminal Pages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "tab"
+          "id": "term-multi-page-elem-5",
+          "description": "Required element 5 for state Multiple Terminal Pages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Required element for Multiple Terminal Pages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Loading terminals"
+          "id": "term-multi-page-elem-6",
+          "description": "Required element 6 for state Multiple Terminal Pages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Loading terminals"
+            },
+            "label": "Required element for Multiple Terminal Pages"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "precondition": "At least two pages exist with different numbers of terminals",
@@ -256,17 +802,73 @@
       "id": "term-session-persistence",
       "name": "Session Persistence & Auto-Resume",
       "description": "Claude Code session IDs are persisted alongside terminal tab configurations. When the runner restarts and reconnects to existing PTY sessions, saved claudeSessionId values are merged back into the reconnected tabs and the sessions are auto-resumed with 'claude --resume <id>'. This ensures that Claude Code sessions survive runner restarts without manual intervention. The saved layout includes zone assignments, labels, notes, pins, and Claude session IDs per tab.",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "textbox"
+          "id": "term-session-persistence-elem-0",
+          "description": "Required element 0 for state Session Persistence & Auto-Resume",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Session Persistence & Auto-Resume"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Zone"
+          "id": "term-session-persistence-elem-1",
+          "description": "Required element 1 for state Session Persistence & Auto-Resume",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Zone"
+            },
+            "label": "Required element for Session Persistence & Auto-Resume"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "accessibleName": "Zone profiles"
+          "id": "term-session-persistence-elem-2",
+          "description": "Required element 2 for state Session Persistence & Auto-Resume",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Zone profiles"
+            },
+            "label": "Required element for Session Persistence & Auto-Resume"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {}
+        {
+          "id": "term-session-persistence-elem-3",
+          "description": "Required element 3 for state Session Persistence & Auto-Resume",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Session Persistence & Auto-Resume"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "precondition": "Runner was restarted after Claude sessions were running in terminal zones",
       "provenance": {
@@ -277,15 +879,57 @@
       "id": "term-page-storage-isolation",
       "name": "Per-Page Storage Isolation",
       "description": "Each terminal page has isolated storage for its configuration. Zone layouts, session persistence, zone profiles, workspaces, zone labels/notes/pins, and grid column/row ratios are all namespaced by pageId. The default page uses un-prefixed keys (backward compatible), while non-default pages use 'page:{pageId}:' prefixed keys. This ensures that creating a zone profile on page A does not appear when viewing page B's profiles.",
-      "requiredElements": [
+      "assertions": [
         {
-          "accessibleName": "Zone profiles"
+          "id": "term-page-storage-isolation-elem-0",
+          "description": "Required element 0 for state Per-Page Storage Isolation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Zone profiles"
+            },
+            "label": "Required element for Per-Page Storage Isolation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "tab"
+          "id": "term-page-storage-isolation-elem-1",
+          "description": "Required element 1 for state Per-Page Storage Isolation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Required element for Per-Page Storage Isolation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "tab"
+          "id": "term-page-storage-isolation-elem-2",
+          "description": "Required element 2 for state Per-Page Storage Isolation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Required element for Per-Page Storage Isolation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "precondition": "Multiple pages exist, at least one has saved profiles",
@@ -297,28 +941,112 @@
       "id": "term-plan-implementation",
       "name": "Plan Implementation Workflow",
       "description": "Users can build and execute multi-stage plan implementation workflows directly from the Terminal page. Two entry points exist: (1) from a transcript panel, select messages containing a plan and click Implement to build a workflow with implement/review/next-steps stages per phase, or (2) from the status bar, click Implement next to a detected plan file. The Implement button (amber, Rocket icon) is the primary action; the Verify button (gray, ListChecks icon) builds a lighter verification-only workflow. Both parse the plan markdown into phases and tasks, build a multi-stage UnifiedWorkflow, and show it in the workflow preview panel for execution.",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Implement"
+          "id": "term-plan-implementation-elem-0",
+          "description": "Required element 0 for state Plan Implementation Workflow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Implement"
+            },
+            "label": "Required element for Plan Implementation Workflow"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Verify"
+          "id": "term-plan-implementation-elem-1",
+          "description": "Required element 1 for state Plan Implementation Workflow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Verify"
+            },
+            "label": "Required element for Plan Implementation Workflow"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Implement"
+          "id": "term-plan-implementation-elem-2",
+          "description": "Required element 2 for state Plan Implementation Workflow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Implement"
+            },
+            "label": "Required element for Plan Implementation Workflow"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Verify"
+          "id": "term-plan-implementation-elem-3",
+          "description": "Required element 3 for state Plan Implementation Workflow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Verify"
+            },
+            "label": "Required element for Plan Implementation Workflow"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Plan Implementation"
+          "id": "term-plan-implementation-elem-4",
+          "description": "Required element 4 for state Plan Implementation Workflow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Plan Implementation"
+            },
+            "label": "Required element for Plan Implementation Workflow"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "accessibleName": "Reload plan file from disk"
+          "id": "term-plan-implementation-elem-5",
+          "description": "Required element 5 for state Plan Implementation Workflow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Reload plan file from disk"
+            },
+            "label": "Required element for Plan Implementation Workflow"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "precondition": "Transcript panel is open with messages selected",
@@ -330,15 +1058,57 @@
       "id": "term-plan-cli-script",
       "name": "Plan Implementation CLI Script",
       "description": "A standalone CLI script (scripts/run-plan-implementation.ts) allows launching plan implementation workflows from any Claude Code session without the runner UI. The script parses markdown plan files, builds the same multi-stage workflow as the UI Implement button, and POSTs it to the runner execute-inline endpoint. It supports --dry-run for inspection and --follow for streaming progress.",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Parsed"
+          "id": "term-plan-cli-script-elem-0",
+          "description": "Required element 0 for state Plan Implementation CLI Script",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Parsed"
+            },
+            "label": "Required element for Plan Implementation CLI Script"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "execute-inline"
+          "id": "term-plan-cli-script-elem-1",
+          "description": "Required element 1 for state Plan Implementation CLI Script",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "execute-inline"
+            },
+            "label": "Required element for Plan Implementation CLI Script"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "follow"
+          "id": "term-plan-cli-script-elem-2",
+          "description": "Required element 2 for state Plan Implementation CLI Script",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "follow"
+            },
+            "label": "Required element for Plan Implementation CLI Script"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "provenance": {
@@ -349,10 +1119,24 @@
       "id": "term-commit-traffic-light",
       "name": "Per-Tab Commit Traffic Light",
       "description": "Each terminal tab that hosts an active Claude Code AI session displays a per-tab git \"commit traffic light\" + commit-progress button beside the existing file-lock icon (TerminalTabBar.tsx:~493). The traffic light is a small colored dot rendered by `<CommitTrafficLight>` (qontinui-runner/src/components/terminal/CommitTrafficLight.tsx) reflecting the session's git working-tree state restricted to the files THAT session has touched. Five states: `empty` (gray, default — tracker has no rows yet), `clean` (green — every touched file matches HEAD), `dirty` (yellow — at least one touched file differs from HEAD), `merging` (red — at least one touched repo has MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase-merge/rebase-apply), and `unknown` (no dot rendered — backend probe failed or generated_at_ms is older than 5 minutes). Beside the dot, a GitCommit-icon button labeled \"Commit progress\" (button-commit-progress) is enabled only when status is `dirty`; on click, PTY tabs receive a multi-line `COMMIT_PROMPT_TEMPLATE` typed via `writeToTerminal` that asks the AI to verify-and-commit only its own writes (cross-references its tool-call transcript, runs `git status --porcelain` / `git diff --stat` against the touched paths only, refuses to commit during in-progress merges, omits the Co-Authored-By trailer per the runner pre-commit hook). SDK chat sessions take the equivalent `send_user_message` Tauri invoke path. State source: the Tauri command `get_session_commit_state(taskRunId)` returns `{status, touched_count, dirty_count, repo_roots[], merging_repos[], generated_at_ms}` with lowercase status enum and snake_case fields. The `useCommitState` hook (qontinui-runner/src/components/terminal/useCommitState.ts) listens for `commit-state-changed` Tauri events `{type, task_run_id, state}` keyed by tab.claudeSessionId and additionally polls every 30 seconds. Events are emitted from three sites with a 500 ms per-session debounce: dispatcher.rs after every Edit/Write the SDK reports, mcp/ai_session.rs::commit_session_progress_inner success/no-op branches, and terminal/transcript_watcher.rs after the JSONL watcher records a new TouchedFile via pg.record_file_touched. The watcher backend (terminal/transcript_watcher.rs + extended terminal/transcript.rs parser) populates `coord.session_touched_files` for PTY-launched tabs, since `auto_register_file` in dispatcher.rs only fires for SDK-driven sessions; the watcher tails ~/.claude/projects/<encoded>/<session_id>.jsonl and parses Edit/Write/MultiEdit `tool_use` blocks. Workflow-spawned bypassPermissions sessions are filtered out via `is_workflow_session` so they never pollute the tracker. The `useTabSessionIdCapture` hook (qontinui-runner/src/components/terminal/useTabSessionIdCapture.ts) populates `tab.claudeSessionId` post-spawn by polling the existing `transcript_get_latest` Tauri command for ~15 s after `writeWhenReady` fires (PTY launches don't carry a session-id OSC — verified at `useShellIntegration.ts:67-118` and `TerminalInstance.tsx:699-704`; resumed sessions already have it set via `useShellIntegration.ts:135`). Without `claudeSessionId`, the traffic light wrapper still mounts but the state is treated as `unknown` and the button stays disabled.",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "accessibleName": "Commit progress"
+          "id": "term-commit-traffic-light-elem-0",
+          "description": "Required element 0 for state Per-Tab Commit Traffic Light",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "accessibleName": "Commit progress"
+            },
+            "label": "Required element for Per-Tab Commit Traffic Light"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "precondition": "At least one terminal tab has an active Claude Code AI session (tab.claudeSessionId is populated, either from a resumed session or the post-spawn transcript_get_latest polling)",

@@ -6,15 +6,57 @@
     {
       "id": "findings-category-management",
       "name": "Category Inventory and Organization",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Finding Categories"
+          "id": "findings-category-management-elem-0",
+          "description": "Required element 0 for state Category Inventory and Organization",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Finding Categories"
+            },
+            "label": "Required element for Category Inventory and Organization"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Built-in"
+          "id": "findings-category-management-elem-1",
+          "description": "Required element 1 for state Category Inventory and Organization",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Built-in"
+            },
+            "label": "Required element for Category Inventory and Organization"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "findings-category-management-elem-2",
+          "description": "Required element 2 for state Category Inventory and Organization",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Category Inventory and Organization"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Finding Categories page is where users define the taxonomy used to organize AI-detected findings from automation runs. Users see a list of all categories (both built-in and custom) with their names, descriptions, icons, color coding, and default action types. Built-in categories are locked and cannot be edited or deleted, but custom categories are fully manageable. The ordering of categories matters because it determines the display order in findings views throughout the application. Users can reorder categories using up/down controls, hide categories they do not want to see in reports, and reset everything to defaults if their customizations become unwieldy.",
@@ -25,18 +67,74 @@
     {
       "id": "findings-category-crud",
       "name": "Category Creation and Editing",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "New Category"
+          "id": "findings-category-crud-elem-0",
+          "description": "Required element 0 for state Category Creation and Editing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "New Category"
+            },
+            "label": "Required element for Category Creation and Editing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Category Name"
+          "id": "findings-category-crud-elem-1",
+          "description": "Required element 1 for state Category Creation and Editing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Category Name"
+            },
+            "label": "Required element for Category Creation and Editing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Auto Fix"
+          "id": "findings-category-crud-elem-2",
+          "description": "Required element 2 for state Category Creation and Editing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Auto Fix"
+            },
+            "label": "Required element for Category Creation and Editing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "findings-category-crud-elem-3",
+          "description": "Required element 3 for state Category Creation and Editing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Category Creation and Editing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users who need categories beyond the built-in set can create custom ones. The creation form includes fields for an auto-generated ID, name, description, icon selection from a visual picker, color selection, and a default action type (auto fix, needs user input, manual, informational). A live preview shows how the category will look before saving. Existing custom categories can be edited with the same form, and deleted when no longer needed (with a warning that associated findings will become uncategorized). The form validates that name and ID are provided before allowing save.",
@@ -47,15 +145,57 @@
     {
       "id": "findings-category-visibility",
       "name": "Visibility and Reset Controls",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Hidden categories are not shown in reports"
+          "id": "findings-category-visibility-elem-0",
+          "description": "Required element 0 for state Visibility and Reset Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Hidden categories are not shown in reports"
+            },
+            "label": "Required element for Visibility and Reset Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Reset"
+          "id": "findings-category-visibility-elem-1",
+          "description": "Required element 1 for state Visibility and Reset Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Reset"
+            },
+            "label": "Required element for Visibility and Reset Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Built-in categories cannot be edited or deleted"
+          "id": "findings-category-visibility-elem-2",
+          "description": "Required element 2 for state Visibility and Reset Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Built-in categories cannot be edited or deleted"
+            },
+            "label": "Required element for Visibility and Reset Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Categories can be hidden from reports and views without being deleted, which is useful for temporarily suppressing categories during focused investigations or when built-in categories are not relevant to the current project. The visibility toggle works independently of the category's existence. A reset button restores all categories to their default configuration, removing custom categories and restoring default ordering. The page footer provides legend information explaining built-in category restrictions and the effect of hiding categories.",

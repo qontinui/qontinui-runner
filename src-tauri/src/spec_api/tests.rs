@@ -27,8 +27,22 @@ fn small_doc() -> IrPageSpec {
                 "id": "running",
                 "name": "Running",
                 "description": "Workflow executing",
-                "requiredElements": [
-                    { "role": "button", "text": "Stop" }
+                "assertions": [
+                    {
+                        "id": "running::req[0]",
+                        "description": "Required element 0 for state Running",
+                        "category": "element-presence",
+                        "severity": "critical",
+                        "assertionType": "exists",
+                        "target": {
+                            "type": "search",
+                            "criteria": { "role": "button", "text": "Stop" },
+                            "label": "Required element for Running"
+                        },
+                        "source": "test-fixture",
+                        "reviewed": false,
+                        "enabled": true
+                    }
                 ],
                 "isInitial": false
             }

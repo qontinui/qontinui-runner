@@ -6,19 +6,89 @@
     {
       "id": "dag-page-structure",
       "name": "Page Structure",
-      "requiredElements": [
-        {},
+      "assertions": [
         {
-          "role": "textbox"
+          "id": "dag-page-structure-elem-0",
+          "description": "Required element 0 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "YAML Editor"
+          "id": "dag-page-structure-elem-1",
+          "description": "Required element 1 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "DAG Graph"
+          "id": "dag-page-structure-elem-2",
+          "description": "Required element 2 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "YAML Editor"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "DAG Workflow Editor"
+          "id": "dag-page-structure-elem-3",
+          "description": "Required element 3 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "DAG Graph"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "dag-page-structure-elem-4",
+          "description": "Required element 4 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "DAG Workflow Editor"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The DAG Workflow Editor page is mounted inside the tab system with data-page-id='dag-workflow-editor'. It renders a full-height flex column: toolbar at top, split-pane body in the middle, and a status bar at the bottom.",
@@ -29,23 +99,93 @@
     {
       "id": "dag-toolbar-controls",
       "name": "Toolbar Controls",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "textbox"
+          "id": "dag-toolbar-controls-elem-0",
+          "description": "Required element 0 for state Toolbar Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Toolbar Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Import"
+          "id": "dag-toolbar-controls-elem-1",
+          "description": "Required element 1 for state Toolbar Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Import"
+            },
+            "label": "Required element for Toolbar Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Export"
+          "id": "dag-toolbar-controls-elem-2",
+          "description": "Required element 2 for state Toolbar Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Export"
+            },
+            "label": "Required element for Toolbar Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Valid"
+          "id": "dag-toolbar-controls-elem-3",
+          "description": "Required element 3 for state Toolbar Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Valid"
+            },
+            "label": "Required element for Toolbar Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "textbox"
+          "id": "dag-toolbar-controls-elem-4",
+          "description": "Required element 4 for state Toolbar Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Toolbar Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The toolbar contains a workflow name input field (aria-label='Workflow name'), an Import button, an Export button, and a validation status badge. These are the primary controls for managing a workflow file.",
@@ -57,15 +197,57 @@
     {
       "id": "dag-default-content",
       "name": "Default YAML Template",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "textbox"
+          "id": "dag-default-content-elem-0",
+          "description": "Required element 0 for state Default YAML Template",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Default YAML Template"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "3 nodes"
+          "id": "dag-default-content-elem-1",
+          "description": "Required element 1 for state Default YAML Template",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "3 nodes"
+            },
+            "label": "Required element for Default YAML Template"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "3 nodes · workflow valid"
+          "id": "dag-default-content-elem-2",
+          "description": "Required element 2 for state Default YAML Template",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "3 nodes · workflow valid"
+            },
+            "label": "Required element for Default YAML Template"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "On first load the editor is pre-populated with a three-node example workflow. The graph pane should immediately render this as a valid 3-node linear chain.",
@@ -77,18 +259,74 @@
     {
       "id": "dag-validation-states",
       "name": "Validation Status Badge States",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Checking..."
+          "id": "dag-validation-states-elem-0",
+          "description": "Required element 0 for state Validation Status Badge States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Checking..."
+            },
+            "label": "Required element for Validation Status Badge States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Errors"
+          "id": "dag-validation-states-elem-1",
+          "description": "Required element 1 for state Validation Status Badge States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Errors"
+            },
+            "label": "Required element for Validation Status Badge States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "detected"
+          "id": "dag-validation-states-elem-2",
+          "description": "Required element 2 for state Validation Status Badge States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "detected"
+            },
+            "label": "Required element for Validation Status Badge States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Valid"
+          "id": "dag-validation-states-elem-3",
+          "description": "Required element 3 for state Validation Status Badge States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Valid"
+            },
+            "label": "Required element for Validation Status Badge States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The toolbar validation badge cycles through five states: idle (Code2 icon, 'Not validated'), validating (pulsing icon, 'Checking...'), valid (green, 'Valid'), warning (yellow, 'Warnings'), and error (red, 'Errors'). The status bar also reflects these states with short messages.",
@@ -100,19 +338,75 @@
     {
       "id": "dag-graph-states",
       "name": "Graph Pane Overlay States",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Write a workflow in the editor to see the graph"
+          "id": "dag-graph-states-elem-0",
+          "description": "Required element 0 for state Graph Pane Overlay States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Write a workflow in the editor to see the graph"
+            },
+            "label": "Required element for Graph Pane Overlay States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Fix YAML errors to see the graph"
+          "id": "dag-graph-states-elem-1",
+          "description": "Required element 1 for state Graph Pane Overlay States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Fix YAML errors to see the graph"
+            },
+            "label": "Required element for Graph Pane Overlay States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Parsing workflow..."
+          "id": "dag-graph-states-elem-2",
+          "description": "Required element 2 for state Graph Pane Overlay States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Parsing workflow..."
+            },
+            "label": "Required element for Graph Pane Overlay States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "div",
-          "text": "DAG Graph"
+          "id": "dag-graph-states-elem-3",
+          "description": "Required element 3 for state Graph Pane Overlay States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div",
+              "text": "DAG Graph"
+            },
+            "label": "Required element for Graph Pane Overlay States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The ReactFlow graph pane shows one of three overlay states when the graph cannot be rendered: an empty-content message when the editor has no text, an error message when YAML is invalid, and a parsing spinner when YAML is valid but nodes haven't been laid out yet.",
@@ -124,18 +418,74 @@
     {
       "id": "dag-node-types",
       "name": "Node Type Rendering",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Install dependencies"
+          "id": "dag-node-types-elem-0",
+          "description": "Required element 0 for state Node Type Rendering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Install dependencies"
+            },
+            "label": "Required element for Node Type Rendering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "span"
+          "id": "dag-node-types-elem-1",
+          "description": "Required element 1 for state Node Type Rendering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "span"
+            },
+            "label": "Required element for Node Type Rendering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "div"
+          "id": "dag-node-types-elem-2",
+          "description": "Required element 2 for state Node Type Rendering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Node Type Rendering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "div"
+          "id": "dag-node-types-elem-3",
+          "description": "Required element 3 for state Node Type Rendering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Node Type Rendering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The DAG graph renders 8 distinct node types, each with a unique accent color and icon. Type is inferred from the presence of a type-discriminating YAML field: 'command' (blue, Terminal icon), 'prompt' (purple, MessageSquare), 'check_type' (amber, CheckCircle2), 'ui_bridge_action' (cyan, Layers), 'approval' (orange, ThumbsUp), 'cancel_reason' (red, XCircle), 'workflow_ref' (indigo, GitBranch), 'loop_body' (green, Repeat). Nodes with no recognized discriminator use a slate default.",
@@ -147,15 +497,57 @@
     {
       "id": "dag-graph-layout",
       "name": "Graph Layout and Navigation Controls",
-      "requiredElements": [
+      "assertions": [
         {
-          "tagName": "div"
+          "id": "dag-graph-layout-elem-0",
+          "description": "Required element 0 for state Graph Layout and Navigation Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Graph Layout and Navigation Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "div"
+          "id": "dag-graph-layout-elem-1",
+          "description": "Required element 1 for state Graph Layout and Navigation Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Graph Layout and Navigation Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "div"
+          "id": "dag-graph-layout-elem-2",
+          "description": "Required element 2 for state Graph Layout and Navigation Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Graph Layout and Navigation Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The graph uses dagre top-to-bottom layout (rankdir=TB). ReactFlow controls appear at bottom-left of the graph pane (zoom in/out, fit view). A minimap appears at bottom-right. The graph supports scroll-to-zoom and drag-to-pan.",
@@ -167,12 +559,40 @@
     {
       "id": "dag-resize-handle",
       "name": "Split-Pane Resize Handle",
-      "requiredElements": [
+      "assertions": [
         {
-          "tagName": "div"
+          "id": "dag-resize-handle-elem-0",
+          "description": "Required element 0 for state Split-Pane Resize Handle",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Split-Pane Resize Handle"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "div"
+          "id": "dag-resize-handle-elem-1",
+          "description": "Required element 1 for state Split-Pane Resize Handle",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Split-Pane Resize Handle"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A draggable vertical divider between the YAML editor and graph panes allows the user to adjust the width ratio. The minimum pane width is 20% and the maximum is 80% (of the total container width). The initial split is 50/50.",
@@ -184,17 +604,59 @@
     {
       "id": "dag-import-export",
       "name": "Import and Export",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Import"
+          "id": "dag-import-export-elem-0",
+          "description": "Required element 0 for state Import and Export",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Import"
+            },
+            "label": "Required element for Import and Export"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Export"
+          "id": "dag-import-export-elem-1",
+          "description": "Required element 1 for state Import and Export",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Export"
+            },
+            "label": "Required element for Import and Export"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Saved"
+          "id": "dag-import-export-elem-2",
+          "description": "Required element 2 for state Import and Export",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Saved"
+            },
+            "label": "Required element for Import and Export"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Import button opens a Tauri file-picker dialog filtered to .yaml/.yml files; the selected file's content replaces the editor content and triggers re-validation. The Export button opens a Tauri save dialog with a default filename derived from the workflow name (spaces → underscores, .yaml extension); on save the last-saved timestamp appears in the status bar.",
@@ -206,18 +668,74 @@
     {
       "id": "dag-yaml-schema-correctness",
       "name": "YAML Schema Correctness — Domain Logic",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Errors"
+          "id": "dag-yaml-schema-correctness-elem-0",
+          "description": "Required element 0 for state YAML Schema Correctness — Domain Logic",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Errors"
+            },
+            "label": "Required element for YAML Schema Correctness — Domain Logic"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Errors"
+          "id": "dag-yaml-schema-correctness-elem-1",
+          "description": "Required element 1 for state YAML Schema Correctness — Domain Logic",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Errors"
+            },
+            "label": "Required element for YAML Schema Correctness — Domain Logic"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Errors"
+          "id": "dag-yaml-schema-correctness-elem-2",
+          "description": "Required element 2 for state YAML Schema Correctness — Domain Logic",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Errors"
+            },
+            "label": "Required element for YAML Schema Correctness — Domain Logic"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Errors"
+          "id": "dag-yaml-schema-correctness-elem-3",
+          "description": "Required element 3 for state YAML Schema Correctness — Domain Logic",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Errors"
+            },
+            "label": "Required element for YAML Schema Correctness — Domain Logic"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The DAG workflow YAML schema has well-defined validation rules enforced by both the Rust backend (via 'validate_dag_workflow') and a client-side validator in dag-schema.ts. A workflow is valid if: it has a non-empty 'name' field, a non-null 'nodes' object with at least one node, and each node has exactly one type-discriminating field present (prompt, command, check_type, ui_bridge_action, a11y_action, loop_body, approval, workflow_ref, or cancel_reason). The spec below describes what correct validation output looks like on the page so a workflow can verify the validator is working correctly.",
@@ -229,24 +747,94 @@
     {
       "id": "dag-approval-dialog",
       "name": "Approval Dialog Overlay",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Approval Required"
+          "id": "dag-approval-dialog-elem-0",
+          "description": "Required element 0 for state Approval Dialog Overlay",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Approval Required"
+            },
+            "label": "Required element for Approval Dialog Overlay"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading",
-          "text": "Approval Required"
+          "id": "dag-approval-dialog-elem-1",
+          "description": "Required element 1 for state Approval Dialog Overlay",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Approval Required"
+            },
+            "label": "Required element for Approval Dialog Overlay"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Approve"
+          "id": "dag-approval-dialog-elem-2",
+          "description": "Required element 2 for state Approval Dialog Overlay",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Approve"
+            },
+            "label": "Required element for Approval Dialog Overlay"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Node:"
+          "id": "dag-approval-dialog-elem-3",
+          "description": "Required element 3 for state Approval Dialog Overlay",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Node:"
+            },
+            "label": "Required element for Approval Dialog Overlay"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Approve"
+          "id": "dag-approval-dialog-elem-4",
+          "description": "Required element 4 for state Approval Dialog Overlay",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Approve"
+            },
+            "label": "Required element for Approval Dialog Overlay"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The ApprovalDialog component is mounted at the app level (not inside the DAG editor page) and listens globally for 'dag:approval-requested' Tauri events. When an approval node in a running workflow reaches the user-gate, this dialog appears as a fixed full-screen overlay requiring the user to Approve or Reject before execution can continue.",
@@ -258,15 +846,57 @@
     {
       "id": "dag-graph-correctness",
       "name": "Graph-to-YAML Correspondence — Domain Logic",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "nodes"
+          "id": "dag-graph-correctness-elem-0",
+          "description": "Required element 0 for state Graph-to-YAML Correspondence — Domain Logic",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "nodes"
+            },
+            "label": "Required element for Graph-to-YAML Correspondence — Domain Logic"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "div"
+          "id": "dag-graph-correctness-elem-1",
+          "description": "Required element 1 for state Graph-to-YAML Correspondence — Domain Logic",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Graph-to-YAML Correspondence — Domain Logic"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "div"
+          "id": "dag-graph-correctness-elem-2",
+          "description": "Required element 2 for state Graph-to-YAML Correspondence — Domain Logic",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "div"
+            },
+            "label": "Required element for Graph-to-YAML Correspondence — Domain Logic"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The graph is derived from the YAML by parsing the 'nodes' map and 'depends_on' lists. The graph must accurately reflect the YAML: one node per YAML node key, one edge per depends_on entry, and layout placing dependents below their dependencies. These assertions specify what correct graph-to-YAML mapping looks like so a workflow can verify the parser.",
