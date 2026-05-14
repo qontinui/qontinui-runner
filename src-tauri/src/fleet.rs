@@ -82,8 +82,7 @@ pub fn detect_resources() -> Resources {
     sys.refresh_memory();
     // sysinfo reports bytes. GiB = bytes / 2^30. Saturating math keeps
     // exotic platforms from panicking on overflow.
-    let memory_gb: u32 = (sys.total_memory() / (1024 * 1024 * 1024))
-        .min(u32::MAX as u64) as u32;
+    let memory_gb: u32 = (sys.total_memory() / (1024 * 1024 * 1024)).min(u32::MAX as u64) as u32;
 
     // Disk: sum of all unique mountpoints. Per §3.4 the budget tracks
     // *available local* disk; on Windows that's typically C:\. We
@@ -174,11 +173,7 @@ pub async fn publish_budget(
     let disk_reserved_i: i64 = disk_reserved_gb.min(i64::MAX as u64) as i64;
     let role_str = role.as_str();
 
-    let conn = pg
-        .pool()
-        .get()
-        .await
-        .map_err(|e| format!("PG pool: {e}"))?;
+    let conn = pg.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
 
     // UPSERT: INSERT new row if this is the first time we've seen the
     // machine_id; else UPDATE the budget columns. Matches the pattern
@@ -241,9 +236,7 @@ pub async fn publish_budget(
 pub async fn publish_on_startup(pg: &Arc<PgDb>, role: MachineRole) {
     let resources = detect_resources();
     if let Err(e) = publish_budget(pg, role, resources, 0).await {
-        warn!(
-            "fleet::publish_on_startup failed (non-fatal — runner still boots): {e}"
-        );
+        warn!("fleet::publish_on_startup failed (non-fatal — runner still boots): {e}");
     }
 }
 
@@ -266,7 +259,11 @@ mod tests {
         // least 1 core, 1 GiB RAM, and 1 GiB disk. If this fails the
         // sysinfo / available_parallelism path is broken.
         let r = detect_resources();
-        assert!(r.cpu_cores >= 1, "expected ≥1 cpu_core, got {}", r.cpu_cores);
+        assert!(
+            r.cpu_cores >= 1,
+            "expected ≥1 cpu_core, got {}",
+            r.cpu_cores
+        );
         assert!(r.memory_gb >= 1, "expected ≥1 GiB RAM, got {}", r.memory_gb);
         assert!(
             r.disk_total_gb >= 1,
