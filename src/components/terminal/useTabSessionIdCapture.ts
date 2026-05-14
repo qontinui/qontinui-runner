@@ -27,19 +27,10 @@
  * cannot disambiguate them.
  *
  * Diagnostics: set `localStorage["debug:tabSidCapture"] = "1"` to emit
- * `logger.warn("[tabSidCapture] <tag>", payload)` at every rejection
+ * `logger.debug("[tabSidCapture] <tag>", payload)` at every rejection
  * branch (`tab-not-found`, `already-bound`, `timed-out`, `probe-null`,
  * `already-claimed`, `probe-error`). Off by default; same affordance
  * pattern as `UI_BRIDGE_DEBUG_FIND`.
- *
- * Emission level is `warn` (not `debug`) so the UI Bridge SDK's
- * `installConsoleCapture` picks the lines up — the SDK only wraps
- * `console.warn`/`console.error`/`unhandledrejection`, so debug-level
- * diagnostics are invisible to `/ui-bridge/control/console-errors`. The
- * `localStorage` gate keeps the surface silent in production by default,
- * so the louder level is a no-op for users who haven't opted in.
- * See plans/2026-05-13-ui-bridge-console-capture-extension.md for the
- * strategic fix that lets future diagnostics use `logger.debug` again.
  *
  * On timeout the tab simply stays without a session id — the user can
  * still use the terminal, just no commit indicator.
@@ -154,7 +145,7 @@ export function useTabSessionIdCapture({
         localStorage.getItem("debug:tabSidCapture") === "1";
 
       if (debug()) {
-        logger.warn("[tabSidCapture] start", { tabId, workingDir, configDir, spawnTimestamp });
+        logger.debug("[tabSidCapture] start", { tabId, workingDir, configDir, spawnTimestamp });
       }
 
       // Already polling this tab? Don't double-up.
@@ -171,14 +162,14 @@ export function useTabSessionIdCapture({
         const tab = tabsRef.current.find((t) => t.id === tabId);
         if (!tab) {
           // Tab was closed — stop.
-          if (debug()) logger.warn("[tabSidCapture] tab-not-found", { tabId });
+          if (debug()) logger.debug("[tabSidCapture] tab-not-found", { tabId });
           handle.cancelled = true;
           inFlight.current.delete(tabId);
           return;
         }
         if (tab.claudeSessionId) {
           if (debug()) {
-            logger.warn("[tabSidCapture] already-bound", {
+            logger.debug("[tabSidCapture] already-bound", {
               tabId,
               sessionId: tab.claudeSessionId,
             });
@@ -191,7 +182,7 @@ export function useTabSessionIdCapture({
         // Timed out?
         if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
           if (debug()) {
-            logger.warn("[tabSidCapture] timed-out", {
+            logger.debug("[tabSidCapture] timed-out", {
               tabId,
               elapsedMs: Date.now() - startedAt,
             });
@@ -216,10 +207,10 @@ export function useTabSessionIdCapture({
 
           const data = resp.success ? (resp.data as TranscriptSessionPayload | null) : null;
           if (!data) {
-            if (debug()) logger.warn("[tabSidCapture] probe-null", { tabId });
+            if (debug()) logger.debug("[tabSidCapture] probe-null", { tabId });
           } else if (claimedSessionIds.current.has(data.session_id)) {
             if (debug()) {
-              logger.warn("[tabSidCapture] already-claimed", {
+              logger.debug("[tabSidCapture] already-claimed", {
                 tabId,
                 sessionId: data.session_id,
               });
@@ -236,7 +227,7 @@ export function useTabSessionIdCapture({
           }
         } catch (err) {
           // Probe error: keep trying; runner may be transiently busy.
-          if (debug()) logger.warn("[tabSidCapture] probe-error", { tabId, err });
+          if (debug()) logger.debug("[tabSidCapture] probe-error", { tabId, err });
         }
 
         // Schedule next tick.
