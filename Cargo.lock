@@ -6217,10 +6217,14 @@ name = "qontinui-types"
 version = "0.1.3"
 dependencies = [
  "chrono",
+ "hex",
  "html-escape",
  "schemars 1.2.1",
  "serde",
+ "serde_jcs",
  "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
  "unicode-normalization",
  "uuid",
 ]

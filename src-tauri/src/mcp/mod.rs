@@ -15,6 +15,7 @@
 pub mod accessibility;
 pub mod action_plan_cache;
 pub mod adb_helper;
+pub mod agent_worktrees;
 pub mod ai_generation;
 pub mod ai_network_probe;
 pub mod ai_session;
