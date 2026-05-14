@@ -134,45 +134,22 @@ impl PgDb {
         Ok(row_to_shadow(&row))
     }
 
-    /// Self-heal the shadow table on PG instances where the alembic
-    /// migration hasn't been applied yet. Idempotent. Mirrors the
-    /// self-heal pattern coord tables already use elsewhere via
-    /// `database/pg/mod.rs::PgDb::new`. Called from the scheduler boot
-    /// path so the runner can write shadow rows without waiting for
-    /// qontinui-web's alembic upgrade.
+    /// Previously self-healed `coord.coordinator_shadow_decisions` on PG
+    /// instances where the alembic migration hadn't applied yet. The
+    /// table is now Atlas-managed out of
+    /// `qontinui-runner/atlas/schema.hcl` (Row 3 schema-half pilot,
+    /// Wave 1.4); Atlas is invoked out-of-process at deploy time.
+    ///
+    /// Kept as a no-op stub so existing callers in the scheduler boot
+    /// path don't need to change shape during the migration. Remove the
+    /// callsites and this stub once the pilot is declared stable
+    /// (follow-up tracked in Row 3 schema-half tracker row).
+    ///
+    /// The companion ALTER on `coord.coordinator_decisions`
+    /// (`observation_hash` column) is left alembic-managed — it's an
+    /// additive evolution on a table the runner doesn't own.
     pub async fn ensure_shadow_decisions_table(&self) -> Result<(), String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        conn.batch_execute(
-            r#"
-            CREATE TABLE IF NOT EXISTS coord.coordinator_shadow_decisions (
-                id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                instance_id       TEXT NOT NULL,
-                iteration         BIGINT NOT NULL,
-                observation_hash  TEXT NOT NULL,
-                rule              TEXT NOT NULL,
-                action            TEXT NOT NULL,
-                target_id         TEXT,
-                reasoning         TEXT NOT NULL,
-                would_have_acted  BOOLEAN NOT NULL,
-                taken_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_csd_taken_at
-                ON coord.coordinator_shadow_decisions(taken_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_csd_obs_hash
-                ON coord.coordinator_shadow_decisions(observation_hash);
-            CREATE INDEX IF NOT EXISTS idx_csd_instance
-                ON coord.coordinator_shadow_decisions(instance_id, taken_at DESC);
-            ALTER TABLE coord.coordinator_decisions
-                ADD COLUMN IF NOT EXISTS observation_hash TEXT NOT NULL DEFAULT '';
-            "#,
-        )
-        .await
-        .map_err(|e| format!("Failed to ensure shadow_decisions table: {}", e))
+        Ok(())
     }
 
     /// List recent shadow rows, newest-first. Used by the soak dashboard.
