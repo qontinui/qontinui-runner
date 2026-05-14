@@ -161,9 +161,46 @@ pub struct CaptureRequest {
     /// Per-region pixel obfuscation.
     #[serde(default)]
     pub redact: Option<Vec<RedactSpecRequest>>,
-    /// Bypass cache. Phase 2 has no cache; flag is accepted for forward-compat.
+    /// Bypass the read-side cache (still updates on write).
     #[serde(default)]
     pub force: Option<bool>,
+    /// Multi-output fan-out (plan §3.4): a single xcap capture feeds N
+    /// derived pipelines. When present, the top-level capture fields
+    /// (region, element, etc) are ignored and the response shape becomes
+    /// `{ captures: { name: CaptureResponse } }`.
+    #[serde(default)]
+    pub captures: Option<Vec<NamedCapture>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NamedCapture {
+    pub name: String,
+    #[serde(default)]
+    pub region: Option<RegionRequest>,
+    #[serde(default)]
+    pub element: Option<String>,
+    #[serde(default)]
+    pub contract: Option<String>,
+    #[serde(default)]
+    pub annotations: Option<Vec<AnnotationRequest>>,
+    #[serde(default)]
+    pub redact: Option<Vec<RedactSpecRequest>>,
+}
+
+impl From<&NamedCapture> for CaptureRequest {
+    fn from(n: &NamedCapture) -> Self {
+        CaptureRequest {
+            region: n.region.clone(),
+            element: n.element.clone(),
+            contract: n.contract.clone(),
+            annotations: n.annotations.clone(),
+            annotate_elements: None,
+            redact: n.redact.clone(),
+            force: None,
+            captures: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -179,6 +216,19 @@ pub struct CaptureResponse {
     pub format: String,
     /// Name of the [`OutputContract`] used (`claude_vision_v1`, etc).
     pub contract: String,
+}
+
+/// Response envelope for `vision/capture` and `vision/annotate`. Single-output
+/// requests get a flat [`CaptureResponse`]; multi-output requests (with
+/// `captures: [...]` in the body) get `{ captures: { name: CaptureResponse } }`.
+/// Untagged serialization → clients dispatch on presence of `captures` key.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum VisionCaptureResp {
+    Single(CaptureResponse),
+    Multi {
+        captures: std::collections::HashMap<String, CaptureResponse>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +256,7 @@ impl From<CaptureSpec> for CaptureRequest {
             annotate_elements: None,
             redact: s.redact,
             force: None,
+            captures: None,
         }
     }
 }
@@ -259,6 +310,14 @@ pub struct HealthResponse {
     pub cache_max_bytes: u64,
     /// Current value of the monotonic mutation counter. Bumped by
     /// control/click, control/type, control/navigate.
+    pub mutation_id: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MutationOccurredResponse {
+    /// The new mutation_id after the bump. Caller can pin this to verify
+    /// subsequent captures see post-mutation state.
     pub mutation_id: u64,
 }
 
@@ -551,86 +610,76 @@ fn build_raw_pipeline(crop: Option<Region>) -> Pipeline {
 }
 
 // ============================================================================
-// Cache directory + atomic write
+// Cache directory (for the GET-by-sha256 streaming handler)
 // ============================================================================
 
+/// Path to the on-disk vision cache. Matches the root passed to
+/// `VisionCache::new` in `mcp_api::api_state_init`. Used only by
+/// `vision_cache_get_handler`, which streams files directly without
+/// going through the in-memory LRU index.
 fn cache_dir() -> PathBuf {
     PathBuf::from("tmp_vision_cache")
-}
-
-fn ensure_cache_dir() -> Result<PathBuf, String> {
-    let dir = cache_dir();
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("failed to create {}: {}", dir.display(), e))?;
-    Ok(dir)
-}
-
-/// Atomically write `bytes` into `<dir>/<sha>.<ext>` via
-/// `NamedTempFile::persist`.
-fn persist_atomic(dir: &StdPath, sha: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    use std::io::Write;
-    let target = dir.join(format!("{}.{}", sha, ext));
-    let mut tmp =
-        tempfile::NamedTempFile::new_in(dir).map_err(|e| format!("tempfile create: {}", e))?;
-    tmp.write_all(bytes)
-        .map_err(|e| format!("tempfile write: {}", e))?;
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| format!("tempfile sync: {}", e))?;
-    tmp.persist(&target)
-        .map_err(|e| format!("tempfile persist: {}", e.error))?;
-    Ok(target)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest.iter() {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
 }
 
 // ============================================================================
 // Handlers
 // ============================================================================
 
-/// `POST /ui-bridge/vision/capture` — replaces `/control/screenshot`.
+/// `POST /ui-bridge/vision/capture` — replaces `/control/screenshot`. When
+/// the request body has `captures: [...]`, dispatches to the multi-output
+/// path (single xcap → N pipelines via [`qontinui_vision_core::multi_run`]);
+/// otherwise produces a single output.
 async fn vision_capture_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<CaptureRequest>>,
-) -> Result<Json<ApiResponse<CaptureResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let req = body.map(|b| b.0).unwrap_or_default();
-    do_capture(&state, req, false).await
+) -> Result<Json<ApiResponse<VisionCaptureResp>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut req = body.map(|b| b.0).unwrap_or_default();
+    if let Some(captures) = req.captures.take() {
+        let force = req.force.unwrap_or(false);
+        let captures_map = do_multi_capture(&state, captures, force).await?;
+        return Ok(Json(ApiResponse::success(VisionCaptureResp::Multi {
+            captures: captures_map,
+        })));
+    }
+    let resp = do_capture(&state, req, false).await?;
+    Ok(Json(ApiResponse::success(VisionCaptureResp::Single(resp))))
 }
 
 /// `POST /ui-bridge/vision/annotate` — alias for `capture` with an explicit
 /// annotations array. Phase 2 rejects the `annotate_elements` selector form
-/// (auto-deriving annotations from a `discover` snapshot is Phase 3).
+/// (auto-deriving annotations from a `discover` snapshot is Phase 3+).
 async fn vision_annotate_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<CaptureRequest>>,
-) -> Result<Json<ApiResponse<CaptureResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<VisionCaptureResp>>, (StatusCode, Json<ApiResponse<()>>)> {
     let req = body.map(|b| b.0).unwrap_or_default();
     if req.annotate_elements.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(api_error(
-                "annotate_elements selector is not implemented in Phase 2 — \
+                "annotate_elements selector is not implemented — \
                  pass an explicit `annotations` array instead",
             )),
         ));
     }
-    do_capture(&state, req, true).await
+    if req.captures.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "vision/annotate does not support multi-output `captures` — \
+                 use vision/capture for fan-out",
+            )),
+        ));
+    }
+    let resp = do_capture(&state, req, true).await?;
+    Ok(Json(ApiResponse::success(VisionCaptureResp::Single(resp))))
 }
 
 async fn do_capture(
     state: &Arc<ApiState>,
     req: CaptureRequest,
     require_annotations: bool,
-) -> Result<Json<ApiResponse<CaptureResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<CaptureResponse, (StatusCode, Json<ApiResponse<()>>)> {
     if require_annotations
         && req
             .annotations
@@ -676,7 +725,7 @@ async fn do_capture(
                 &hit.sha256_hex[..12],
                 bytes.len()
             );
-            return Ok(Json(ApiResponse::success(CaptureResponse {
+            return Ok(CaptureResponse {
                 path: hit.path.to_string_lossy().into_owned(),
                 sha256: hit.sha256_hex,
                 width: decoded.width(),
@@ -684,7 +733,7 @@ async fn do_capture(
                 bytes: bytes.len(),
                 format: ext.to_string(),
                 contract: contract.name.to_string(),
-            })));
+            });
         }
     }
 
@@ -748,7 +797,7 @@ async fn do_capture(
         height
     );
 
-    Ok(Json(ApiResponse::success(CaptureResponse {
+    Ok(CaptureResponse {
         path: hit.path.to_string_lossy().into_owned(),
         sha256: hit.sha256_hex,
         width,
@@ -756,7 +805,198 @@ async fn do_capture(
         bytes: bytes.len(),
         format: ext.to_string(),
         contract: contract.name.to_string(),
-    })))
+    })
+}
+
+/// Multi-output capture-once fan-out (plan §3.4). For each [`NamedCapture`]:
+/// compose its cache key, check the cache; build the list of misses. If any
+/// misses, capture the frame ONCE (one xcap, under one permit) and run each
+/// missed pipeline against a clone of the same `Frame`. Hits skip the
+/// pipeline entirely. Result: a single xcap feeds N derived outputs with
+/// at most one cache-write per miss.
+async fn do_multi_capture(
+    state: &Arc<ApiState>,
+    captures: Vec<NamedCapture>,
+    force: bool,
+) -> Result<std::collections::HashMap<String, CaptureResponse>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    use std::collections::HashMap;
+    if captures.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "vision/capture multi-output mode requires a non-empty `captures` array",
+            )),
+        ));
+    }
+    // Reject duplicate names — response is keyed by name and silent overwrites
+    // are confusing.
+    let mut seen = std::collections::HashSet::new();
+    for cap in &captures {
+        if !seen.insert(cap.name.as_str()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("duplicate capture name: {}", cap.name))),
+            ));
+        }
+    }
+
+    // First pass: resolve contracts + cache keys + look up hits.
+    struct Pending {
+        name: String,
+        req: CaptureRequest,
+        contract: OutputContract,
+        ext: &'static str,
+        cache_key: [u8; 32],
+    }
+    let mut results: HashMap<String, CaptureResponse> = HashMap::new();
+    let mut misses: Vec<Pending> = Vec::new();
+    for cap in &captures {
+        let req = CaptureRequest::from(cap);
+        let contract = resolve_contract(req.contract.as_deref())
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+        let format = pick_format(&contract).expect("contract has at least one format");
+        let ext = extension_for(format);
+        let cache_key = compose_capture_cache_key(state, &req);
+
+        if !force {
+            if let Some(hit) = state.vision_cache.get(&cache_key) {
+                let bytes = std::fs::read(&hit.path).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!("read cached: {}", e))),
+                    )
+                })?;
+                let decoded = image::load_from_memory(&bytes).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!("decode cached: {}", e))),
+                    )
+                })?;
+                results.insert(
+                    cap.name.clone(),
+                    CaptureResponse {
+                        path: hit.path.to_string_lossy().into_owned(),
+                        sha256: hit.sha256_hex,
+                        width: decoded.width(),
+                        height: decoded.height(),
+                        bytes: bytes.len(),
+                        format: ext.to_string(),
+                        contract: contract.name.to_string(),
+                    },
+                );
+                continue;
+            }
+        }
+        misses.push(Pending {
+            name: cap.name.clone(),
+            req,
+            contract,
+            ext,
+            cache_key,
+        });
+    }
+
+    // All hits? Skip xcap entirely.
+    if misses.is_empty() {
+        debug!(
+            "vision/capture multi: {} hits, 0 misses → no xcap",
+            results.len()
+        );
+        return Ok(results);
+    }
+
+    // Capture frame once (one xcap, one permit) and run each missed pipeline
+    // against a clone of the same Frame.
+    let frame = capture_runner_window_frame(state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let frame_w = frame.width;
+    let frame_h = frame.height;
+
+    let mut runs: Vec<(
+        String,
+        qontinui_vision_core::Pipeline,
+        OutputContract,
+        &'static str,
+        [u8; 32],
+    )> = Vec::with_capacity(misses.len());
+    for p in misses {
+        let crop = resolve_crop_region(state, &p.req.region, &p.req.element, frame_w, frame_h)
+            .await
+            .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+        let annotations: Vec<Annotation> = p
+            .req
+            .annotations
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let redact: Vec<RedactRegion> = p
+            .req
+            .redact
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let pipeline = build_pipeline(p.contract, crop, annotations, redact);
+        runs.push((p.name, pipeline, p.contract, p.ext, p.cache_key));
+    }
+
+    let pipelines: Vec<(String, qontinui_vision_core::Pipeline)> = runs
+        .iter()
+        .map(|(name, pipeline, _, _, _)| (name.clone(), pipeline.clone()))
+        .collect();
+
+    let multi_results = qontinui_vision_core::multi_run(frame, pipelines);
+    let miss_count = runs.len();
+
+    for ((name, _, contract, ext, cache_key), (_name, result)) in
+        runs.into_iter().zip(multi_results.into_iter())
+    {
+        let bytes = result.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("pipeline '{}': {}", name, e))),
+            )
+        })?;
+        let decoded = image::load_from_memory(&bytes).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("decode '{}': {}", name, e))),
+            )
+        })?;
+        let width = decoded.width();
+        let height = decoded.height();
+        let hit = state
+            .vision_cache
+            .put(&cache_key, &bytes, ext)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("cache put '{}': {}", name, e))),
+                )
+            })?;
+        results.insert(
+            name,
+            CaptureResponse {
+                path: hit.path.to_string_lossy().into_owned(),
+                sha256: hit.sha256_hex,
+                width,
+                height,
+                bytes: bytes.len(),
+                format: ext.to_string(),
+                contract: contract.name.to_string(),
+            },
+        );
+    }
+
+    info!(
+        "vision/capture multi: {} total outputs, {} cache MISS pipelines on a single xcap",
+        results.len(),
+        miss_count
+    );
+    Ok(results)
 }
 
 /// `POST /ui-bridge/vision/diff` — capture twice + naive pixel diff.
@@ -830,11 +1070,23 @@ async fn vision_diff_handler(
         )
     })?;
 
-    let sha = sha256_hex(&bytes);
-    let dir =
-        ensure_cache_dir().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let path = persist_atomic(&dir, &sha, ext, &bytes)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    // Cache the diff under (mutation_id, baseline, comparison, mode).
+    let mut_id = state
+        .vision_mutation_id
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let cache_key_input = format!(
+        "v=1|diff|mut={mut_id}|mode={mode}|baseline={baseline_req:?}|comparison={comparison_req:?}"
+    );
+    let cache_key = qontinui_vision_core::sha256_of(cache_key_input.as_bytes());
+    let hit = state
+        .vision_cache
+        .put(&cache_key, &bytes, ext)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("cache put: {}", e))),
+            )
+        })?;
 
     let changed_regions = bbox
         .map(|r| {
@@ -848,17 +1100,17 @@ async fn vision_diff_handler(
         .unwrap_or_default();
 
     info!(
-        "vision/diff: mode={} ratio={:.4} sha={} bytes={}",
+        "vision/diff: mode={} ratio={:.4} key={} bytes={}",
         mode,
         ratio,
-        &sha[..12],
+        &hit.sha256_hex[..12],
         bytes.len()
     );
 
     Ok(Json(ApiResponse::success(DiffResponse {
         capture: CaptureResponse {
-            path: path.to_string_lossy().into_owned(),
-            sha256: sha,
+            path: hit.path.to_string_lossy().into_owned(),
+            sha256: hit.sha256_hex,
             width: decoded.width(),
             height: decoded.height(),
             bytes: bytes.len(),
@@ -1085,15 +1337,27 @@ async fn vision_raw_handler(
         )
     })?;
 
-    let sha = sha256_hex(&bytes);
-    let dir =
-        ensure_cache_dir().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let path = persist_atomic(&dir, &sha, "png", &bytes)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    // Cache the raw capture under (mutation_id, request, reason). Note: raw
+    // bypasses the contract entirely but still benefits from cache reuse for
+    // the VGA grounding pipeline (same window state → same bytes).
+    let mut_id = state
+        .vision_mutation_id
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let cache_key_input = format!("v=1|raw|mut={mut_id}|reason={reason}|req={req:?}");
+    let cache_key = qontinui_vision_core::sha256_of(cache_key_input.as_bytes());
+    let hit = state
+        .vision_cache
+        .put(&cache_key, &bytes, "png")
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("cache put: {}", e))),
+            )
+        })?;
 
     Ok(Json(ApiResponse::success(CaptureResponse {
-        path: path.to_string_lossy().into_owned(),
-        sha256: sha,
+        path: hit.path.to_string_lossy().into_owned(),
+        sha256: hit.sha256_hex,
         width: decoded.width(),
         height: decoded.height(),
         bytes: bytes.len(),
@@ -1160,6 +1424,25 @@ async fn vision_cache_get_handler(
     Ok((StatusCode::OK, headers, Body::from(bytes)).into_response())
 }
 
+/// `POST /ui-bridge/vision/mutation-occurred` — frontend signal that
+/// rendered pixels have changed via a path the runner can't observe
+/// directly (route change, app-driven re-render, animation settle).
+/// Bumps `vision_mutation_id` so the next capture re-renders instead
+/// of returning a stale cache entry. Intended caller: the SDK's
+/// `window.__UI_BRIDGE__.mutationOccurred()` helper — fire-and-forget;
+/// body is ignored.
+async fn vision_mutation_occurred_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<MutationOccurredResponse>> {
+    bump_mutation_id(&state);
+    let mutation_id = state
+        .vision_mutation_id
+        .load(std::sync::atomic::Ordering::Relaxed);
+    Json(ApiResponse::success(MutationOccurredResponse {
+        mutation_id,
+    }))
+}
+
 /// `GET /ui-bridge/vision/health` — pipeline + cache health.
 async fn vision_health_handler(
     State(state): State<Arc<ApiState>>,
@@ -1183,27 +1466,6 @@ async fn vision_health_handler(
     }))
 }
 
-fn compute_cache_stats(dir: &StdPath) -> (u64, usize) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return (0, 0),
-    };
-    let mut total: u64 = 0;
-    let mut count = 0usize;
-    for entry in entries.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            if meta.is_file() {
-                total += meta.len();
-                count += 1;
-            }
-        }
-    }
-    if count == 0 {
-        warn!("vision_cache dir {} present but empty", dir.display());
-    }
-    (total, count)
-}
-
 // ============================================================================
 // Router + manifest
 // ============================================================================
@@ -1219,6 +1481,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
             get(vision_cache_get_handler),
         )
         .route("/ui-bridge/vision/health", get(vision_health_handler))
+        .route(
+            "/ui-bridge/vision/mutation-occurred",
+            post(vision_mutation_occurred_handler),
+        )
 }
 
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
@@ -1229,5 +1495,6 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/vision/raw"),
         ("GET", "/ui-bridge/vision/cache/{sha256}"),
         ("GET", "/ui-bridge/vision/health"),
+        ("POST", "/ui-bridge/vision/mutation-occurred"),
     ]
 }
