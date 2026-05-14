@@ -14,7 +14,7 @@ fn empty_state(id: &str, name: &str) -> IrState {
         id: id.to_string(),
         name: name.to_string(),
         description: None,
-        required_elements: vec![],
+        assertions: vec![],
         excluded_elements: None,
         conditions: None,
         is_initial: None,

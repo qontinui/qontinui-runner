@@ -125,6 +125,11 @@ pub fn awas_action_to_ui_bridge_element(
         // and the caller falls through to the structured criteria matcher.
         bbox: None,
         visible: None,
+        role: None,
+        tag_name: None,
+        aria_label: None,
+        accessible_name: None,
+        text: None,
     }
 }
 

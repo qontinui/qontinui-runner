@@ -97,7 +97,7 @@ pub fn project_scenarios(ir: &IrPageSpec) -> ScenarioProjection {
         states.push(ProjectedState {
             state_id: s.id.clone(),
             label,
-            required_element_count: s.required_elements.len(),
+            required_element_count: s.assertions.len(),
             outbound_transitions: outbound,
         });
     }
