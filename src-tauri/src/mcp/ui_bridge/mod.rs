@@ -860,6 +860,17 @@ mod manifest_drift_tests {
             // Real subsystem (CLI subprocess orchestration), not a handler;
             // tracked separately.
             ("POST", "/ui-bridge/control/sdk/spawn-headless"),
+            // Vision-family routes — declared by @qontinui/ui-bridge@^0.6.0
+            // SDK but not yet implemented on the runner. Each requires a new
+            // handler module (vision capture, annotation, diff, raw bytes,
+            // cache, health). Tracked for follow-up implementation; until
+            // then, the SDK declarations are aspirational shape contracts.
+            ("GET", "/ui-bridge/vision/cache/{}"),
+            ("GET", "/ui-bridge/vision/health"),
+            ("POST", "/ui-bridge/vision/annotate"),
+            ("POST", "/ui-bridge/vision/capture"),
+            ("POST", "/ui-bridge/vision/diff"),
+            ("POST", "/ui-bridge/vision/raw"),
         ]
         .into_iter()
         .collect();
