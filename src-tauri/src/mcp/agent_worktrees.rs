@@ -146,10 +146,9 @@ fn read_machine_id() -> Result<uuid::Uuid, String> {
     let path = dirs::home_dir()
         .map(|h| h.join(".qontinui").join("machine.json"))
         .ok_or_else(|| "no HOME dir".to_string())?;
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {}", path.display(), e))?;
     let id_str = v
         .get("machine_id")
         .and_then(|s| s.as_str())
