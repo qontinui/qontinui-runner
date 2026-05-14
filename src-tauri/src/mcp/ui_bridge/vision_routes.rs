@@ -1018,7 +1018,7 @@ async fn do_multi_capture(
     let miss_count = runs.len();
 
     for ((name, _, contract, ext, cache_key), (_name, result)) in
-        runs.into_iter().zip(multi_results.into_iter())
+        runs.into_iter().zip(multi_results)
     {
         let bytes = result.map_err(|e| {
             (
