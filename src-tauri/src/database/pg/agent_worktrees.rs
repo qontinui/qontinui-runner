@@ -183,6 +183,45 @@ impl PgDb {
         Ok(rows.iter().map(row_to_aw).collect())
     }
 
+    /// List currently-active agents that declared at least one overlap
+    /// path. Used by the runner's Productivity dashboard to render the
+    /// L2 "Overlapping intents" panel (Phase 1B §4.10).
+    ///
+    /// "Active" = status in ('allocated', 'active') AND
+    /// declared_overlap_paths is non-empty. One row per agent (DISTINCT
+    /// ON agent_id) — multi-repo agents share intent + path set across
+    /// their N worktree rows, so picking any one row gives the same
+    /// answer.
+    ///
+    /// Ordered newest-first so the dashboard surfaces fresh intents
+    /// before stale ones; the panel is capped at `limit` rows.
+    pub async fn list_active_agents_with_paths(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<AgentWorktreeRow>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT DISTINCT ON (agent_id) {SELECT_COLS} \
+                     FROM coord.agent_worktrees \
+                     WHERE status IN ('allocated', 'active') \
+                       AND declared_overlap_paths IS NOT NULL \
+                       AND array_length(declared_overlap_paths, 1) > 0 \
+                     ORDER BY agent_id, updated_at DESC \
+                     LIMIT $1",
+                ),
+                &[&limit],
+            )
+            .await
+            .map_err(|e| format!("Failed to list_active_agents_with_paths: {}", e))?;
+        Ok(rows.iter().map(row_to_aw).collect())
+    }
+
     /// Transition a single worktree row's status. Used by the runner
     /// when it materializes the worktree (`allocated` → `active`) and
     /// when the merge scheduler later advances it. Returns the post-

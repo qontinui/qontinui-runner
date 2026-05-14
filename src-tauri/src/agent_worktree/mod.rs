@@ -151,6 +151,7 @@ pub async fn allocate_and_materialize(
     machine_id: &uuid::Uuid,
     repos: &[RepoRequest],
     intent: Option<&str>,
+    declared_overlap_paths: Option<&[String]>,
     repo_canonical_paths: &std::collections::HashMap<String, PathBuf>,
 ) -> Result<AllocateResult, String> {
     if !worktree_mode_enabled() {
@@ -176,6 +177,9 @@ pub async fn allocate_and_materialize(
         }
     }
 
+    // Phase 1B: declared_overlap_paths is optional; when present, coord
+    // skips its LLM-based derivation step and uses our paths directly.
+    // When absent, coord derives from `intent` (or falls back to empty).
     let body = serde_json::json!({
         "machine_id": machine_id.to_string(),
         "repos": repos.iter().map(|r| serde_json::json!({
@@ -183,6 +187,7 @@ pub async fn allocate_and_materialize(
             "parent_sha": r.parent_sha,
         })).collect::<Vec<_>>(),
         "intent": intent,
+        "declared_overlap_paths": declared_overlap_paths,
     });
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
