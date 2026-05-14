@@ -2628,6 +2628,9 @@ pub async fn ui_bridge_click_by_text_handler(
         ));
     }
 
+    // Bust the vision cache: a click can change rendered pixels.
+    crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
+
     let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
     let match_expr = if exact {
         format!("el.textContent.trim() === '{}'", escaped_text)
@@ -2687,6 +2690,9 @@ pub async fn ui_bridge_click_by_selector_handler(
             Json(api_error("'selector' field is required")),
         ));
     }
+
+    // Bust the vision cache: a click can change rendered pixels.
+    crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
 
     let escaped_selector = selector.replace('\\', "\\\\").replace('\'', "\\'");
 
@@ -2788,6 +2794,10 @@ pub async fn ui_bridge_type_into_handler(
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let clear = body.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
     let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // Bust the vision cache: typing changes rendered pixels (form values,
+    // validation messages, etc).
+    crate::mcp::ui_bridge::vision_routes::bump_mutation_id(&state);
 
     let find_expr = if let Some(sel) = selector {
         let escaped = sel.replace('\\', "\\\\").replace('\'', "\\'");

@@ -1,20 +1,20 @@
 //! Vision-pipeline HTTP handlers under `/ui-bridge/vision/*`.
 //!
-//! Phase 2 of the UI Bridge Vision Pipeline plan
-//! (`plans/2026-05-13-ui-bridge-vision-pipeline-plan.md`). Replaces the
-//! deleted runner-direct screenshot/annotated-screenshot/element-screenshot
-//! family with a single contract-aware capture surface backed by
-//! [`qontinui_vision_core`].
+//! Phase 2+3 of the UI Bridge Vision Pipeline plan
+//! (`plans/2026-05-13-ui-bridge-vision-pipeline-plan.md`).
 //!
-//! The handlers translate Axum extractors into [`Pipeline`] specs, capture a
-//! frame from the runner window via xcap (`capture_runner_window_frame`),
-//! run the pipeline, and persist the verified bytes to
-//! `tmp_vision_cache/<sha256>.<ext>` via `tempfile::NamedTempFile::persist()`
-//! (atomic-write pattern per `proj_cc_switch_patterns.md`).
+//! Phase 2 replaced the deleted runner-direct screenshot/annotated-screenshot/
+//! element-screenshot family with a single contract-aware capture surface
+//! backed by [`qontinui_vision_core`].
 //!
-//! Cache + concurrency are Phase 3; the `force` flag is currently a no-op
-//! (no read-side cache yet) and `available_slots` in `/health` is a fixed
-//! sentinel.
+//! Phase 3 added the read-side cache layer, bounded-concurrency permits, and
+//! mutation-keyed invalidation. The flow is now: compose cache key from
+//! `(mutation_id, request shape)`; on hit, return cached bytes; on miss,
+//! acquire a permit from `state.vision_capture_semaphore` (size 2) around
+//! the xcap `spawn_blocking`, run the pipeline, then `vision_cache.put()`.
+//! `force=true` bypasses the read-side; control handlers (click, type)
+//! bump `vision_mutation_id` so subsequent cache lookups produce a fresh
+//! key and re-render.
 
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
@@ -248,9 +248,18 @@ pub struct RawRequest {
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub pipeline_version: &'static str,
+    /// Live count from `VisionCaptureSemaphore::available_permits()` — 0 to 2.
     pub available_slots: u32,
     pub cache_size_bytes: u64,
     pub cache_entry_count: usize,
+    /// Cumulative since process start.
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_evictions: u64,
+    pub cache_max_bytes: u64,
+    /// Current value of the monotonic mutation counter. Bumped by
+    /// control/click, control/type, control/navigate.
+    pub mutation_id: u64,
 }
 
 // ============================================================================
@@ -320,6 +329,12 @@ fn capture_runner_window_rgba(
 }
 
 /// Capture the runner window and return a vision-core [`Frame`].
+///
+/// Acquires a permit from `state.vision_capture_semaphore` before invoking
+/// xcap. xcap is GDI-bound on Windows and exhibits the "fits-2-parallel-
+/// then-thrashes" pattern documented in `proj_supervisor_build_pool.md` —
+/// the bounded permit pool (size 2) prevents thrash under multi-agent load.
+/// Permit is held for the entire `spawn_blocking` span and released on drop.
 async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result<Frame, String> {
     use tauri::Manager;
 
@@ -340,6 +355,11 @@ async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result<Frame, Str
     let w = size.width;
     let h = size.height;
 
+    let _permit = state
+        .vision_capture_semaphore
+        .acquire()
+        .await
+        .map_err(|e| format!("capture semaphore acquire: {}", e))?;
     let (rgba, monitor_scale) =
         tokio::task::spawn_blocking(move || capture_runner_window_rgba(x, y, w, h, scale))
             .await
@@ -353,6 +373,31 @@ async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result<Frame, Str
             captured_at: chrono::Utc::now(),
         },
     ))
+}
+
+/// Compose the cache key for a capture request. Folds in the current
+/// mutation_id (bumped by control/click/type/navigate) so any state-
+/// changing action transparently busts cache entries — no clock-based
+/// TTL, no time-based staleness window. The pipeline-shape parameters
+/// (contract, region, element, annotations, redact) all participate via
+/// Debug-format hashing so any parameter change flips the key.
+fn compose_capture_cache_key(state: &Arc<ApiState>, req: &CaptureRequest) -> [u8; 32] {
+    let mut_id = state
+        .vision_mutation_id
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let s = format!("v=1|mut={mut_id}|req={req:?}");
+    qontinui_vision_core::sha256_of(s.as_bytes())
+}
+
+/// Bump the mutation counter — call from any handler that performs a UI
+/// action that could move rendered pixels (click, type, navigate). Subsequent
+/// cache lookups produce a different key, so the next `vision/capture`
+/// always re-renders. Uses Relaxed ordering: monotonic counter, no
+/// cross-thread happens-before constraints needed.
+pub fn bump_mutation_id(state: &Arc<ApiState>) {
+    state
+        .vision_mutation_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ============================================================================
@@ -603,7 +648,45 @@ async fn do_capture(
 
     let contract = resolve_contract(req.contract.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
-    let _ = req.force; // Phase 3: cache bypass.
+    let format = pick_format(&contract).expect("contract has at least one format");
+    let ext = extension_for(format);
+
+    // Compose cache key from (mutation_id, request shape). Mutation_id bumps
+    // on every UI-changing action so cache entries auto-invalidate.
+    let force = req.force.unwrap_or(false);
+    let cache_key = compose_capture_cache_key(state, &req);
+
+    // Try cache before capturing. Cache hit → skip xcap + pipeline entirely.
+    if !force {
+        if let Some(hit) = state.vision_cache.get(&cache_key) {
+            let bytes = std::fs::read(&hit.path).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("read cached file: {}", e))),
+                )
+            })?;
+            let decoded = image::load_from_memory(&bytes).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("decode cached: {}", e))),
+                )
+            })?;
+            debug!(
+                "vision/capture: cache HIT key={} bytes={}",
+                &hit.sha256_hex[..12],
+                bytes.len()
+            );
+            return Ok(Json(ApiResponse::success(CaptureResponse {
+                path: hit.path.to_string_lossy().into_owned(),
+                sha256: hit.sha256_hex,
+                width: decoded.width(),
+                height: decoded.height(),
+                bytes: bytes.len(),
+                format: ext.to_string(),
+                contract: contract.name.to_string(),
+            })));
+        }
+    }
 
     let frame = capture_runner_window_frame(state)
         .await
@@ -627,8 +710,6 @@ async fn do_capture(
         .collect();
 
     let pipeline = build_pipeline(contract, crop, annotations, redact);
-    let format = pick_format(&contract).expect("contract has at least one format");
-    let ext = extension_for(format);
 
     let bytes = pipeline.run(frame).map_err(|e| {
         (
@@ -647,25 +728,29 @@ async fn do_capture(
     let width = decoded.width();
     let height = decoded.height();
 
-    let sha = sha256_hex(&bytes);
-    let dir =
-        ensure_cache_dir().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let path = persist_atomic(&dir, &sha, ext, &bytes)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let hit = state
+        .vision_cache
+        .put(&cache_key, &bytes, ext)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("cache put: {}", e))),
+            )
+        })?;
 
     info!(
-        "vision/capture: contract={} format={} sha={} bytes={} {}x{}",
+        "vision/capture: cache MISS key={} contract={} format={} bytes={} {}x{}",
+        &hit.sha256_hex[..12],
         contract.name,
         ext,
-        &sha[..12],
         bytes.len(),
         width,
         height
     );
 
     Ok(Json(ApiResponse::success(CaptureResponse {
-        path: path.to_string_lossy().into_owned(),
-        sha256: sha,
+        path: hit.path.to_string_lossy().into_owned(),
+        sha256: hit.sha256_hex,
         width,
         height,
         bytes: bytes.len(),
@@ -1076,16 +1161,25 @@ async fn vision_cache_get_handler(
 }
 
 /// `GET /ui-bridge/vision/health` — pipeline + cache health.
-async fn vision_health_handler() -> Json<ApiResponse<HealthResponse>> {
-    let dir = cache_dir();
-    let (size, count) = compute_cache_stats(&dir);
+async fn vision_health_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<HealthResponse>> {
+    let stats = state.vision_cache.stats();
+    let permits = state.vision_capture_semaphore.available_permits() as u32;
+    let mutation_id = state
+        .vision_mutation_id
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     Json(ApiResponse::success(HealthResponse {
-        pipeline_version: "0.1.0",
-        // Phase 3 will replace this with the live Semaphore::available_permits.
-        available_slots: 2,
-        cache_size_bytes: size,
-        cache_entry_count: count,
+        pipeline_version: "0.1.1",
+        available_slots: permits,
+        cache_size_bytes: stats.total_bytes,
+        cache_entry_count: stats.entries,
+        cache_hits: stats.hits,
+        cache_misses: stats.misses,
+        cache_evictions: stats.evictions,
+        cache_max_bytes: stats.max_bytes,
+        mutation_id,
     }))
 }
 

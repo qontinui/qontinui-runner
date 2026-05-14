@@ -6232,11 +6232,12 @@ dependencies = [
 
 [[package]]
 name = "qontinui-vision-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "image 0.25.10",
  "serde",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
 ]
 

@@ -258,6 +258,21 @@ pub struct ApiState {
     /// `GET /git-supervision/recent-events` for diagnostics and via the
     /// `git-supervision` Tauri event channel for the frontend hook.
     pub supervision_state: crate::git_supervision::SupervisionState,
+    /// Phase 3 vision pipeline: content-addressed disk cache for encoded
+    /// capture bytes. Key = SHA-256 of (window_handle, scale, mutation_id,
+    /// pipeline_hash); value = the verified bytes from `Pipeline::run`.
+    /// Persisted under `tmp_vision_cache/` (scratch-file whitelisted).
+    pub vision_cache: Arc<qontinui_vision_core::VisionCache>,
+    /// Phase 3 vision pipeline: bounded permits around the xcap
+    /// `spawn_blocking` capture. xcap is GDI-bound on Windows and exhibits
+    /// the "fits-2-parallel-then-thrashes" pattern from the supervisor
+    /// build pool — 2 permits matches that empirical sweet spot.
+    pub vision_capture_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Phase 3 vision pipeline: monotonic mutation counter. Bumped by
+    /// control handlers that can change rendered pixels (click, type,
+    /// navigate). Folded into the cache key so any state-changing action
+    /// transparently busts cache entries — no clock-based TTL needed.
+    pub vision_mutation_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Response for API endpoints

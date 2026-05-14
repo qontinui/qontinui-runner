@@ -517,6 +517,26 @@ pub fn create_router(
         ui_bridge_evaluate_store: Arc::new(crate::ui_bridge_evaluate::EvaluateRequestStore::new()),
         // D5 Phase 1 Git Supervision Channel — bounded ring + Tauri emitter.
         supervision_state: crate::git_supervision::SupervisionState::new(),
+        // Phase 3 vision pipeline (cache + concurrency).
+        // Cache root = `tmp_vision_cache/` under the runner's working dir
+        // (scratch-file whitelist per feedback_scratch_file_paths.md).
+        // Cap = 512 MB per plan §3.5.
+        vision_cache: {
+            let runner_root = crate::mcp::shared::current_runner_path()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                });
+            let root = runner_root.join("tmp_vision_cache");
+            Arc::new(
+                qontinui_vision_core::VisionCache::new(&root, 512 * 1024 * 1024)
+                    .unwrap_or_else(|e| panic!("vision cache init at {}: {e}", root.display())),
+            )
+        },
+        // 2 permits — xcap is GDI-bound, fits-2-parallel pattern per
+        // proj_supervisor_build_pool.md.
+        vision_capture_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+        vision_mutation_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
