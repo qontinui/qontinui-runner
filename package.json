@@ -123,5 +123,10 @@
     "typecheck": "tsc --noEmit"
   },
   "type": "module",
-  "version": "1.0.0-beta.1"
+  "version": "1.0.0-beta.1",
+  "pnpm": {
+    "overrides": {
+      "@qontinui/shared-types": "^0.3.0"
+    }
+  }
 }
