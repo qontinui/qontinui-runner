@@ -6,7 +6,7 @@
     "@qontinui/design-tokens": "^1.0.0",
     "@qontinui/navigation": "^0.1.0",
     "@qontinui/shared-types": "^0.2.5",
-    "@qontinui/ui-bridge": "^0.4.0",
+    "@qontinui/ui-bridge": "^0.7.0",
     "@qontinui/ui-bridge-auto": "^0.1.5",
     "@qontinui/workflow-ui": "^0.1.0",
     "@qontinui/workflow-utils": "^0.1.0",
@@ -91,11 +91,6 @@
   },
   "name": "qontinui-runner",
   "packageManager": "pnpm@10.33.2",
-  "pnpm": {
-    "overrides": {
-      "@qontinui/ui-bridge": "link:../wt-vision-phase2-ui-bridge/packages/ui-bridge"
-    }
-  },
   "private": true,
   "scripts": {
     "build": "tsc && vite build",
