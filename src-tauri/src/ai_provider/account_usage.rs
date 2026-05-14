@@ -60,9 +60,7 @@ pub fn pick_best_account() {
             // All cooled: pick the one with the shortest remaining cooldown.
             config_dirs
                 .iter()
-                .min_by_key(|d| {
-                    super::config::time_until_cooled_down(d).unwrap_or(Duration::ZERO)
-                })
+                .min_by_key(|d| super::config::time_until_cooled_down(d).unwrap_or(Duration::ZERO))
                 .cloned()
         });
 

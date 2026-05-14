@@ -58,7 +58,10 @@ pub fn get_effective_config_dir(cli_settings: &settings::ClaudeCliSettings) -> O
 /// (e.g. the Claude CLI subprocess). API providers should prefer
 /// [`mark_account_rate_limited_with_duration`].
 pub fn mark_account_rate_limited(config_dir: &str) {
-    mark_account_rate_limited_with_duration(config_dir, Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS));
+    mark_account_rate_limited_with_duration(
+        config_dir,
+        Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS),
+    );
 }
 
 /// Mark an account as rate-limited with a specific cooldown duration.
@@ -224,9 +227,8 @@ pub fn time_until_next_account_available() -> Option<Duration> {
                     break;
                 }
                 let remaining = *cooldown - elapsed;
-                earliest_remaining = Some(
-                    earliest_remaining.map_or(remaining, |prev| prev.min(remaining)),
-                );
+                earliest_remaining =
+                    Some(earliest_remaining.map_or(remaining, |prev| prev.min(remaining)));
             } else {
                 // Account was never rate-limited — it's available
                 all_in_cooldown = false;
