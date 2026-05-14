@@ -359,6 +359,29 @@ impl ProcessCaptureManager {
             .map(|p| p.config.id.clone())
     }
 
+    /// Resolve a process identifier (UUID, category slug, or name substring) to a
+    /// canonical process id. Returns `None` if no unambiguous match exists.
+    ///
+    /// HTTP routes like `POST /processes/{id}/restart` accept any of these forms
+    /// so callers can use the convenient slug (`frontend`, `backend`) instead of
+    /// looking up the UUID first. Resolution order: exact id, exact category
+    /// (single match), name substring (single match). Multi-match resolutions
+    /// return `None` to avoid silently restarting the wrong service.
+    pub async fn resolve_process_id(&self, input: &str) -> Option<String> {
+        let processes = self.processes.read().await;
+        let entries: Vec<(&str, &str, &str)> = processes
+            .values()
+            .map(|p| {
+                (
+                    p.config.id.as_str(),
+                    p.config.name.as_str(),
+                    p.config.category.as_str(),
+                )
+            })
+            .collect();
+        resolve_process_id_from_entries(&entries, input)
+    }
+
     /// The event loop for a single process: handles output, errors, health, exit.
     ///
     /// Responsibilities:
@@ -850,5 +873,106 @@ impl ProcessCaptureManager {
 
     fn emit_state_change(&self, status: &ProcessStatus) {
         let _ = tauri::Emitter::emit(&self.app_handle, "process-state-changed", status);
+    }
+}
+
+/// Pure resolution helper backing [`ProcessCaptureManager::resolve_process_id`].
+///
+/// Each entry is `(id, name, category)`. Match precedence:
+/// 1. Exact id (case-sensitive — these are UUIDs)
+/// 2. Exact category (case-insensitive, requires single match)
+/// 3. Name substring (case-insensitive, requires single match)
+fn resolve_process_id_from_entries(entries: &[(&str, &str, &str)], input: &str) -> Option<String> {
+    if let Some((id, _, _)) = entries.iter().find(|(id, _, _)| *id == input) {
+        return Some((*id).to_string());
+    }
+    let input_lower = input.to_lowercase();
+    let category_matches: Vec<&(&str, &str, &str)> = entries
+        .iter()
+        .filter(|(_, _, cat)| cat.to_lowercase() == input_lower)
+        .collect();
+    if category_matches.len() == 1 {
+        return Some(category_matches[0].0.to_string());
+    }
+    let name_matches: Vec<&(&str, &str, &str)> = entries
+        .iter()
+        .filter(|(_, name, _)| name.to_lowercase().contains(&input_lower))
+        .collect();
+    if name_matches.len() == 1 {
+        return Some(name_matches[0].0.to_string());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_process_id_from_entries;
+
+    fn fixture() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![
+            ("uuid-frontend", "Frontend (Next.js)", "frontend"),
+            ("uuid-backend", "FastAPI Backend", "backend"),
+            (
+                "uuid-embed",
+                "Embedding Service (MiniLM-L6-v2)",
+                "infrastructure",
+            ),
+        ]
+    }
+
+    #[test]
+    fn exact_uuid_match_wins() {
+        let e = fixture();
+        assert_eq!(
+            resolve_process_id_from_entries(&e, "uuid-frontend"),
+            Some("uuid-frontend".to_string())
+        );
+    }
+
+    #[test]
+    fn category_slug_resolves_to_unique_match() {
+        let e = fixture();
+        assert_eq!(
+            resolve_process_id_from_entries(&e, "frontend"),
+            Some("uuid-frontend".to_string())
+        );
+        assert_eq!(
+            resolve_process_id_from_entries(&e, "BACKEND"),
+            Some("uuid-backend".to_string())
+        );
+    }
+
+    #[test]
+    fn name_substring_resolves_when_unique() {
+        let e = fixture();
+        assert_eq!(
+            resolve_process_id_from_entries(&e, "fastapi"),
+            Some("uuid-backend".to_string())
+        );
+        assert_eq!(
+            resolve_process_id_from_entries(&e, "MiniLM"),
+            Some("uuid-embed".to_string())
+        );
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        let e = fixture();
+        assert_eq!(resolve_process_id_from_entries(&e, "mobile"), None);
+        assert_eq!(resolve_process_id_from_entries(&e, ""), None);
+    }
+
+    #[test]
+    fn ambiguous_substring_returns_none() {
+        // Two processes whose names share a substring (e.g., "service") must
+        // refuse to resolve rather than restart the wrong one.
+        let e = vec![
+            ("uuid-a", "Auth Service", "backend"),
+            ("uuid-b", "Notification Service", "backend"),
+        ];
+        assert_eq!(resolve_process_id_from_entries(&e, "service"), None);
+        // But the category itself is also ambiguous (both are "backend"),
+        // so the category lookup also returns None.
+        assert_eq!(resolve_process_id_from_entries(&e, "backend"), None);
     }
 }
