@@ -273,6 +273,19 @@ pub struct ApiState {
     /// navigate). Folded into the cache key so any state-changing action
     /// transparently busts cache entries — no clock-based TTL needed.
     pub vision_mutation_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Phase 6 vision baselines: name → snapshot bboxes + provenance.
+    /// Populated by `POST /ui-bridge/vision/baseline`, read by the
+    /// `NoLayoutShiftSince { baseline }` assertion. Lives in-process —
+    /// baselines do not persist across runner restarts (deliberate;
+    /// they're operational, not durable artifacts).
+    pub vision_baselines: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                crate::mcp::ui_bridge::vision_routes::BaselineRegistryEntry,
+            >,
+        >,
+    >,
 }
 
 /// Response for API endpoints
