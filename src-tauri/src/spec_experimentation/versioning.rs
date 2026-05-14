@@ -108,8 +108,8 @@ pub async fn snapshot_spec_version(
     change_summary: Option<&str>,
     change_type: &str,
 ) -> Result<SpecVersion, String> {
-    let parsed: serde_json::Value = serde_json::from_str(spec_json)
-        .unwrap_or(serde_json::Value::Null);
+    let parsed: serde_json::Value =
+        serde_json::from_str(spec_json).unwrap_or(serde_json::Value::Null);
     let content_hash = crate::spec_api::hashing::canonical_hash(&parsed)
         .map_err(|e| format!("hash failed: {e}"))?;
     let (assertion_count, group_count) = count_spec_stats(spec_json);

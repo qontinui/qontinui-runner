@@ -20,8 +20,8 @@ use qontinui_types::ir::IrPageSpec;
 /// Generic canonical content hash. Any `Serialize` → RFC 8785 JCS → SHA-256
 /// → `"sha256-<hex>"`.
 pub fn canonical_hash<T: Serialize>(value: &T) -> Result<String, HashError> {
-    let canonical = serde_jcs::to_string(value)
-        .map_err(|e| HashError::Canonicalize(e.to_string()))?;
+    let canonical =
+        serde_jcs::to_string(value).map_err(|e| HashError::Canonicalize(e.to_string()))?;
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
@@ -126,7 +126,10 @@ mod tests {
             column: Some(1),
             plugin_version: None,
         });
-        assert_eq!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
+        assert_eq!(
+            hash_ir_page_spec(&a).unwrap(),
+            hash_ir_page_spec(&b).unwrap()
+        );
     }
 
     #[test]
@@ -147,7 +150,10 @@ mod tests {
             column: None,
             plugin_version: None,
         });
-        assert_ne!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
+        assert_ne!(
+            hash_ir_page_spec(&a).unwrap(),
+            hash_ir_page_spec(&b).unwrap()
+        );
     }
 
     #[test]
@@ -204,7 +210,10 @@ mod tests {
             }),
             cross_refs: None,
         });
-        assert_eq!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
+        assert_eq!(
+            hash_ir_page_spec(&a).unwrap(),
+            hash_ir_page_spec(&b).unwrap()
+        );
     }
 
     #[test]
@@ -214,6 +223,9 @@ mod tests {
         // demonstrates that explicitly by hashing the same spec twice.
         let a = empty_spec();
         let b = empty_spec();
-        assert_eq!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
+        assert_eq!(
+            hash_ir_page_spec(&a).unwrap(),
+            hash_ir_page_spec(&b).unwrap()
+        );
     }
 }

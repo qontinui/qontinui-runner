@@ -4,7 +4,7 @@
 use serde_json::json;
 
 use crate::spec_api::types::{
-    IrPageSpec, IrElementCriteria, IrState, IrTransition, IrTransitionAction,
+    IrElementCriteria, IrPageSpec, IrState, IrTransition, IrTransitionAction,
 };
 
 use super::projection::project_scenarios;

@@ -37,9 +37,9 @@ pub fn export_all_schemas() -> Value {
         constraints as qc, discovery as qdc, execution as qe, findings as qfn, geometry as qg,
         ir as qir, mcp_config as qmc, orchestration_config as qoc, process_management as qpm,
         rag as qr, runner as qrn, scheduler as qs, spec_check as qsc, state_machine as qsm,
-        targets as qt, task_run as qtr, terminal as qtm, ticket_system as qts,
-        tree_events as qte, ui_bridge as qub, verification as qv, worker_output as qwo,
-        workflow as qw, workflow_step as qws,
+        targets as qt, task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
+        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
+        workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
