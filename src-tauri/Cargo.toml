@@ -230,6 +230,10 @@ path = "src/bin/export_schemas.rs"
 name = "wrappers_mcp"
 path = "src/bin/wrappers_mcp.rs"
 
+[[bin]]
+name = "scan_spec_distinctness"
+path = "src/bin/scan_spec_distinctness.rs"
+
 [lints.rust]
 dead_code = "allow"
 unused_variables = "allow"
