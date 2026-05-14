@@ -117,7 +117,7 @@ impl PgDb {
                 created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
                 PRIMARY KEY (agent_id, repo),
-                CONSTRAINT agent_worktrees_branch_uq UNIQUE (branch)
+                CONSTRAINT agent_worktrees_repo_branch_uq UNIQUE (repo, branch)
             );
 
             DO $$
