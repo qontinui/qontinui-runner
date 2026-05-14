@@ -105,6 +105,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "header-icon-tile-discriminator",
+          "description": "Distinctness discriminator for state Header Icon Tile",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Header Icon Tile"
+            },
+            "label": "Discriminator for Header Icon Tile"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "precondition": "The Wrappers page is active",
@@ -765,6 +782,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "visual-color-scheme-discriminator",
+          "description": "Distinctness discriminator for state Visual Design — Color Scheme",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Visual Design — Color Scheme"
+            },
+            "label": "Discriminator for Visual Design — Color Scheme"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "precondition": "The Installed tab is active",
@@ -808,6 +842,23 @@
               "text": "Wrappers"
             },
             "label": "Required element for Visual Design — Spacing & Layout"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "visual-spacing-layout-discriminator",
+          "description": "Distinctness discriminator for state Visual Design — Spacing & Layout",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Visual Design — Spacing & Layout"
+            },
+            "label": "Discriminator for Visual Design — Spacing & Layout"
           },
           "source": "migrated",
           "reviewed": false,
@@ -1070,6 +1121,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "ai-clients-action-buttons-discriminator",
+          "description": "Distinctness discriminator for state AI Clients Tab — Action Buttons",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "AI Clients Tab — Action Buttons"
+            },
+            "label": "Discriminator for AI Clients Tab — Action Buttons"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "precondition": "AI Clients tab is active",
@@ -1094,6 +1162,23 @@
               "role": "button"
             },
             "label": "Required element for AI Clients Tab — Details Disclosure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ai-clients-details-disclosure-discriminator",
+          "description": "Distinctness discriminator for state AI Clients Tab — Details Disclosure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "AI Clients Tab — Details Disclosure"
+            },
+            "label": "Discriminator for AI Clients Tab — Details Disclosure"
           },
           "source": "migrated",
           "reviewed": false,

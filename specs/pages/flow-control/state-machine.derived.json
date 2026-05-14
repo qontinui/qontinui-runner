@@ -537,6 +537,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "fc-persistence-discriminator",
+          "description": "Distinctness discriminator for state Configuration Persistence and State Consistency",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Configuration Persistence and State Consistency"
+            },
+            "label": "Discriminator for Configuration Persistence and State Consistency"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Settings serialize to JSON and persist as flow_control_json and phase_timeouts_json on unified_workflows. On save, WorkflowEditor PATCHes via MCP API. On load, LoopController reads for enforcement. Both SQLite (v147) and PostgreSQL store these fields.",
@@ -577,6 +594,23 @@
               "text": "Concurrency"
             },
             "label": "Required element for Panel Layout and Visual Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "fc-layout-discriminator",
+          "description": "Distinctness discriminator for state Panel Layout and Visual Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Panel Layout and Visual Structure"
+            },
+            "label": "Discriminator for Panel Layout and Visual Structure"
           },
           "source": "migrated",
           "reviewed": false,

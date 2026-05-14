@@ -508,6 +508,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "ke-search-behavior-discriminator",
+          "description": "Distinctness discriminator for state Search Execution Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Search Execution Behavior"
+            },
+            "label": "Discriminator for Search Execution Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The search flow: user types query → selects mode → clicks Search or presses Enter → loading spinner appears → results populate or error shows. Each search mode calls a different backend endpoint: web→/knowledge/search-web, error→/knowledge/research-error, vulnerability→/knowledge/search-vulnerabilities. After a successful search, the stats are automatically invalidated to reflect the new query.",
@@ -758,6 +775,23 @@
               "role": "textbox"
             },
             "label": "Required element for Typography and Visual Design"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ke-design-typography-discriminator",
+          "description": "Distinctness discriminator for state Typography and Visual Design",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Typography and Visual Design"
+            },
+            "label": "Discriminator for Typography and Visual Design"
           },
           "source": "migrated",
           "reviewed": false,

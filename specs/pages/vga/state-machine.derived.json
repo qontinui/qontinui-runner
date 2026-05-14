@@ -843,6 +843,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "vga-state-view-discriminator",
+          "description": "Distinctness discriminator for state State View Tab",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "State View Tab"
+            },
+            "label": "Discriminator for State View Tab"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The State View tab renders StateViewPanel from @qontinui/workflow-ui/state-machine, showing a list of all states with their elements, element thumbnails, and capture screenshots. Selecting a state updates the shared selectedStateId. The empty state message 'Select a configuration to view states' appears when no config is loaded.",
@@ -884,6 +901,23 @@
               "role": "list"
             },
             "label": "Required element for Transitions Tab"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "vga-transitions-tab-discriminator",
+          "description": "Distinctness discriminator for state Transitions Tab",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Transitions Tab"
+            },
+            "label": "Discriminator for Transitions Tab"
           },
           "source": "migrated",
           "reviewed": false,

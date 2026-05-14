@@ -2152,6 +2152,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "sm-state-model-rules-discriminator",
+          "description": "Distinctness discriminator for state State Model Rules (qontinui/multistate)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "State Model Rules (qontinui/multistate)"
+            },
+            "label": "Discriminator for State Model Rules (qontinui/multistate)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The state machine follows the multistate model (qontinui/multistate), which extends model-based GUI automation theory. These rules define how states, elements, and screenshots relate to each other. The multistate formal model is Ω = (S, T, G, ω, Td) where S is the set of states, T the transitions, G state groups, ω the occlusion function, and Td dynamic transition generation. All state machine features — discovery, graph editing, state view, screenshots, and export — must conform to these rules. Source: https://qontinui.github.io/multistate/",

@@ -165,6 +165,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "ctx-workflow-integration-discriminator",
+          "description": "Distinctness discriminator for state Workflow Integration Goals",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Workflow Integration Goals"
+            },
+            "label": "Discriminator for Workflow Integration Goals"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The primary value of contexts comes from their integration with workflows. Users create contexts so they can attach them to workflow steps, ensuring the AI has the right background information when executing automation tasks.",

@@ -246,6 +246,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "bk-export-options-panel-discriminator",
+          "description": "Distinctness discriminator for state Export Options — Category Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Export Options — Category Selector"
+            },
+            "label": "Discriminator for Export Options — Category Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When the 'Export Options' toggle is expanded, a grid of 13 checkboxes is shown — one per data category. All 13 are checked by default (defaultExportOptions). Each checkbox label shows the category name and its current count in parentheses. Unchecking a category removes it from the export and reduces the N in 'Export (N items)'.",

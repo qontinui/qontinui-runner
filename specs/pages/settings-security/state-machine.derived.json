@@ -390,6 +390,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "ss-custom-resources-policy-discriminator",
+          "description": "Distinctness discriminator for state Custom Policy Editor — Resources Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Custom Policy Editor — Resources Section"
+            },
+            "label": "Discriminator for Custom Policy Editor — Resources Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Resources sub-section controls L2 compute resource limits. It contains a 2×2 grid of number inputs: CPU limit (id: security-cpu-limit, step=0.5, min=0.5, max=16, placeholder='No limit'), Memory in MB (id: security-memory-limit, min=64, max=32768, placeholder='No limit'), PID limit (id: security-pids-limit, min=16, max=4096, placeholder='No limit'), and Timeout in seconds (min=10, max=3600). Empty values mean no limit is applied.",

@@ -280,6 +280,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "graphql-live-loading-discriminator",
+          "description": "Distinctness discriminator for state Loading State",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Loading State"
+            },
+            "label": "Discriminator for Loading State"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Initial data fetch shows a loading indicator.",

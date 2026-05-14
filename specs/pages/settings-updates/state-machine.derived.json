@@ -104,6 +104,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "upd-current-version-card-discriminator",
+          "description": "Distinctness discriminator for state Current Version Card",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Current Version Card"
+            },
+            "label": "Discriminator for Current Version Card"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A card that is always visible showing the currently installed application version and when updates were last checked. Also contains the 'Check for Updates' button.",
@@ -193,6 +210,23 @@
               "text": "Checking..."
             },
             "label": "Required element for Automatic Check on Tab Load"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "upd-auto-check-on-load-discriminator",
+          "description": "Distinctness discriminator for state Automatic Check on Tab Load",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Automatic Check on Tab Load"
+            },
+            "label": "Discriminator for Automatic Check on Tab Load"
           },
           "source": "migrated",
           "reviewed": false,
@@ -446,6 +480,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "upd-error-state-discriminator",
+          "description": "Distinctness discriminator for state Error State",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Error State"
+            },
+            "label": "Discriminator for Error State"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "If `check_for_updates` or `install_update` throws an exception, the component stores the error message in state and renders an error card with an AlertCircle icon and the error text. The status card is not shown when an error card is displayed.",
@@ -475,6 +526,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "upd-state-mutual-exclusion-discriminator",
+          "description": "Distinctness discriminator for state Status Card Mutual Exclusion",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Status Card Mutual Exclusion"
+            },
+            "label": "Discriminator for Status Card Mutual Exclusion"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Only one status card variant can be shown at a time. The four possible status card states (development mode, update available, up to date, and nothing) are mutually exclusive — they are driven by a single `updateInfo` nullable value and a single `error` nullable string. The error card and status card are also mutually exclusive.",
@@ -500,6 +568,23 @@
               "text": "Download and Install Update"
             },
             "label": "Required element for IPC Response Data Model"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "upd-ipc-data-model-discriminator",
+          "description": "Distinctness discriminator for state IPC Response Data Model",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "IPC Response Data Model"
+            },
+            "label": "Discriminator for IPC Response Data Model"
           },
           "source": "migrated",
           "reviewed": false,

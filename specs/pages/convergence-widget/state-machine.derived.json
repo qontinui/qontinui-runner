@@ -40,6 +40,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "convergence-identity-discriminator",
+          "description": "Distinctness discriminator for state Widget Identity and Visibility",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Widget Identity and Visibility"
+            },
+            "label": "Discriminator for Widget Identity and Visibility"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Convergence widget appears on the active dashboard when a workflow run is in progress and has completed at least one verification iteration. It should be immediately recognizable as a convergence monitor and not confused with other metric widgets. The widget renders nothing (returns null) when no metrics have been received yet, avoiding visual noise before the first iteration completes.",

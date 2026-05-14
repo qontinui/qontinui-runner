@@ -274,6 +274,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "element-reliability-badges-discriminator",
+          "description": "Distinctness discriminator for state Reliability Color-Coded Badges",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Reliability Color-Coded Badges"
+            },
+            "label": "Discriminator for Reliability Color-Coded Badges"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Reliability badges use color coding to quickly communicate element health: green for stable (>=95%), yellow for flaky (>=80%), red for unreliable (<80%).",
@@ -375,6 +392,23 @@
               "text": "Stable"
             },
             "label": "Required element for Required UI Elements"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "element-reliability-presence-discriminator",
+          "description": "Distinctness discriminator for state Required UI Elements",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Required UI Elements"
+            },
+            "label": "Discriminator for Required UI Elements"
           },
           "source": "migrated",
           "reviewed": false,

@@ -236,6 +236,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "llm-interaction-time-range-discriminator",
+          "description": "Distinctness discriminator for state Time Range Interaction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Time Range Interaction"
+            },
+            "label": "Discriminator for Time Range Interaction"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The LLM dashboard's existing time range selector (1d/7d/30d/all) controls the days parameter for all cost attribution queries. CostByTargetAppChart fetches from /analytics/token-usage/by-target-app?days=N. CostPerInteractionChart fetches from /analytics/token-usage/cost-per-interaction?days=N. Changing the time range should update all four new charts.",
@@ -259,6 +276,23 @@
               "textContains": "LLM Analytics"
             },
             "label": "Required element for Cost Attribution Pipeline Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "llm-cost-behavior-discriminator",
+          "description": "Distinctness discriminator for state Cost Attribution Pipeline Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Cost Attribution Pipeline Behavior"
+            },
+            "label": "Discriminator for Cost Attribution Pipeline Behavior"
           },
           "source": "migrated",
           "reviewed": false,

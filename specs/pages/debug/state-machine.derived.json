@@ -548,6 +548,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "dbg-save-button-discriminator",
+          "description": "Distinctness discriminator for state Save Debug Settings Button",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Save Debug Settings Button"
+            },
+            "label": "Discriminator for Save Debug Settings Button"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A save button at the bottom right of the debug section persists all debug settings to the backend. It shows different states: default ('Save Debug Settings' with a gear icon), saving ('Saving...' with spinner), and saved ('Saved!' with checkmark). The button is disabled during save operations.",
@@ -1027,6 +1044,23 @@
               "text": "Advanced"
             },
             "label": "Required element for Overall Page Layout"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "dbg-page-layout-discriminator",
+          "description": "Distinctness discriminator for state Overall Page Layout",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Overall Page Layout"
+            },
+            "label": "Discriminator for Overall Page Layout"
           },
           "source": "migrated",
           "reviewed": false,
