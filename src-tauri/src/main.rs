@@ -1221,6 +1221,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::get_task_detail,
             commands::productivity::get_upcoming_claims,
             commands::productivity::launch_coordinator_session,
+            commands::productivity::list_overlapping_intents,
             commands::productivity::list_plans,
             commands::productivity::list_plans_filtered,
             commands::productivity::list_workers,
