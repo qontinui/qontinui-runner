@@ -254,11 +254,7 @@ fn box_close(a: OcrBbox, b: OcrBbox, tol: u32) -> bool {
 }
 
 fn diff(a: u32, b: u32) -> u32 {
-    if a >= b {
-        a - b
-    } else {
-        b - a
-    }
+    a.abs_diff(b)
 }
 
 /// Collapse runs of `\t`, multi-space, and embedded newlines into single
