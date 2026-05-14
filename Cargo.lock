@@ -6428,7 +6428,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "criterion",
- "hex",
  "insta",
  "once_cell",
  "proptest",
@@ -6438,7 +6437,6 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "sha2 0.10.9",
  "strsim",
  "thiserror 2.0.18",
  "uuid",

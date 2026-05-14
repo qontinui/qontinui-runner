@@ -70,18 +70,13 @@ pub fn wrap_snapshot(
     Ok((snapshot, fingerprint, snapshot_id, content_sha256))
 }
 
-/// JCS (RFC 8785) → SHA-256 → `"sha256-<hex>"` per §5.10.
-///
-/// TODO(canonical-hash): this duplicates the canonical_hash<T> primitive at
-/// `qontinui-runner/src-tauri/src/spec_api/hashing.rs:22-28`. Per boundary
-/// rule §5.2 this crate cannot depend on src-tauri; the proper fix is to
-/// promote `canonical_hash` to `qontinui-types` and call it from both sites.
-/// Deferred to a follow-up — v1 ships with the duplicated pipeline below.
+/// JCS (RFC 8785) → SHA-256 → `"sha256-<hex>"` per §5.10. Delegates to
+/// `qontinui_types::canonical_hash` so this crate and the runner share one
+/// implementation (boundary rule §5.2 — the matcher crate cannot depend on
+/// src-tauri; the primitive lives in qontinui-types instead).
 pub(crate) fn compute_content_sha256(value: &serde_json::Value) -> Result<String, SnapshotFetchError> {
-    let canonical = serde_jcs::to_vec(value)
-        .map_err(|e| SnapshotFetchError::Malformed(format!("jcs serialize: {e}")))?;
-    let digest = <sha2::Sha256 as sha2::Digest>::digest(&canonical);
-    Ok(format!("sha256-{}", hex::encode(digest)))
+    qontinui_types::canonical_hash::canonical_hash(value)
+        .map_err(|e| SnapshotFetchError::Malformed(format!("canonical hash: {e}")))
 }
 
 /// Convert Unix-epoch milliseconds to an ISO-8601 UTC string with stable

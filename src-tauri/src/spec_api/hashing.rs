@@ -12,19 +12,16 @@
 //!   must not affect the content hash.
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use qontinui_types::canonical_hash::{self as ct, CanonicalHashError};
 use qontinui_types::ir::IrPageSpec;
 
-/// Generic canonical content hash. Any `Serialize` → RFC 8785 JCS → SHA-256
-/// → `"sha256-<hex>"`.
+/// Generic canonical content hash. Delegates to
+/// [`qontinui_types::canonical_hash::canonical_hash`] — single source of
+/// truth across the workspace. Returns `"sha256-<hex>"`.
 pub fn canonical_hash<T: Serialize>(value: &T) -> Result<String, HashError> {
-    let canonical =
-        serde_jcs::to_string(value).map_err(|e| HashError::Canonicalize(e.to_string()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
-    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+    ct::canonical_hash(value).map_err(Into::into)
 }
 
 /// Spec-IR hash. Walks the spec and clears `IrProvenance.file/line/column`
@@ -58,6 +55,14 @@ fn clear_cosmetic_provenance(prov: &mut Option<qontinui_types::ir::IrProvenance>
 pub enum HashError {
     #[error("canonicalize failed: {0}")]
     Canonicalize(String),
+}
+
+impl From<CanonicalHashError> for HashError {
+    fn from(e: CanonicalHashError) -> Self {
+        match e {
+            CanonicalHashError::Canonicalize(msg) => HashError::Canonicalize(msg),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -128,10 +133,7 @@ mod tests {
             plugin_version: None,
             status: None,
         });
-        assert_eq!(
-            hash_ir_page_spec(&a).unwrap(),
-            hash_ir_page_spec(&b).unwrap()
-        );
+        assert_eq!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
     }
 
     #[test]
@@ -154,10 +156,7 @@ mod tests {
             plugin_version: None,
             status: None,
         });
-        assert_ne!(
-            hash_ir_page_spec(&a).unwrap(),
-            hash_ir_page_spec(&b).unwrap()
-        );
+        assert_ne!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
     }
 
     #[test]
@@ -216,10 +215,7 @@ mod tests {
             }),
             cross_refs: None,
         });
-        assert_eq!(
-            hash_ir_page_spec(&a).unwrap(),
-            hash_ir_page_spec(&b).unwrap()
-        );
+        assert_eq!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
     }
 
     #[test]
@@ -229,9 +225,6 @@ mod tests {
         // demonstrates that explicitly by hashing the same spec twice.
         let a = empty_spec();
         let b = empty_spec();
-        assert_eq!(
-            hash_ir_page_spec(&a).unwrap(),
-            hash_ir_page_spec(&b).unwrap()
-        );
+        assert_eq!(hash_ir_page_spec(&a).unwrap(), hash_ir_page_spec(&b).unwrap());
     }
 }
