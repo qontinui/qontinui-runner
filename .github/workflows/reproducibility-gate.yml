@@ -1,0 +1,198 @@
+name: Reproducibility Gate
+
+# Verifies that two cargo builds of the same SHA produce byte-identical
+# artifacts. Required by the content-addressed build cache (Row 10 /
+# Wave 0): without reproducible builds, the canonical-diff-hash cache
+# key collides while the artifact sha does not, so cross-worktree dedup
+# silently degrades to "always store, never reuse."
+#
+# The reproducibility flags live in src-tauri/.cargo/config.toml
+# (/Brepro on Windows, -Wl,--build-id=none on Linux). This workflow
+# catches regressions where a new dependency, build.rs change, or
+# RUSTFLAGS override re-introduces nondeterminism.
+#
+# Test target: the workspace's mock_claude_cli binary. Small enough to
+# build in a few minutes, real enough that it exercises link.exe / ld
+# end-to-end. We build it once, hash the .exe / ELF, force a relink by
+# removing the artifact and the dep-stamp file, rebuild, hash again,
+# and fail if the hashes differ.
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      # Repro-sensitive files only — kept narrow so the per-PR cost
+      # (~15-30 min Cold + ~5 min relink per platform) only kicks in
+      # when the inputs that govern reproducibility actually change.
+      # The workflow file itself is intentionally NOT in this list so
+      # gate edits land cheaply; the nightly cron + workflow_dispatch
+      # cover post-edit validation.
+      - 'src-tauri/.cargo/config.toml'
+      - 'src-tauri/build.rs'
+      - 'src-tauri/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+  schedule:
+    # 03:17 UTC nightly — catches regressions on main that slip through
+    # the PR path-filter (e.g., a new dep that bakes a timestamp without
+    # touching any of the gated files). Off-hour minute reduces collision
+    # with the dozens of other repos cron-firing at :00.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  repro-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS Mach-O reproducibility isn't wired yet (no LC_UUID flag in
+        # config.toml); skip to keep the gate honest. Add macOS-latest when
+        # the macOS half lands.
+        platform: [ubuntu-22.04, windows-latest]
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same sibling-repo dance as ci.yml — src-tauri/Cargo.toml has a
+      # path = "../../qontinui-schemas/rust" dep that won't resolve
+      # without this checkout.
+      - name: Checkout sibling repos
+        run: |
+          cd "$GITHUB_WORKSPACE/.."
+          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+        shell: bash
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      - name: Configure pagefile (Windows — guard against link-time OOM)
+        if: matrix.platform == 'windows-latest'
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 16GB
+          maximum-size: 16GB
+          disk-root: 'D:'
+
+      - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-repro-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # First build: full compile (cold cache) or relink (warm cache).
+      # Either way, produces target/release/mock_claude_cli{,.exe}.
+      - name: Build #1
+        env:
+          CARGO_BUILD_JOBS: 1
+        run: |
+          cd src-tauri
+          cargo build --release --bin mock_claude_cli
+        shell: bash
+
+      - name: Hash build #1 artifact
+        id: hash1
+        run: |
+          cd src-tauri
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXE=target/release/mock_claude_cli.exe
+          else
+            EXE=target/release/mock_claude_cli
+          fi
+          if [ ! -f "$EXE" ]; then
+            echo "FAIL: expected artifact at $EXE not found"
+            ls -la target/release/ | head -30
+            exit 1
+          fi
+          HASH=$(sha256sum "$EXE" | awk '{print $1}')
+          echo "Build #1 sha256: $HASH"
+          echo "hash1=$HASH" >> "$GITHUB_OUTPUT"
+          # Stash the artifact so we can diff hex if hashes mismatch.
+          cp "$EXE" "$RUNNER_TEMP/build1-mock_claude_cli$([ "$RUNNER_OS" = Windows ] && echo .exe)"
+        shell: bash
+
+      # Force a re-compile + re-link of only the qontinui-runner package
+      # (lib + mock_claude_cli bin), keeping every dep artifact warm in
+      # target/release/deps/. Without this, build #2 is a cargo no-op
+      # ("Finished in 0.05s") and the gate measures nothing. `cargo clean
+      # -p <pkg> --release` is the cheapest way to invalidate the
+      # fingerprint without re-paying for the dep tree.
+      - name: Force rebuild of qontinui-runner package
+        run: |
+          cd src-tauri
+          cargo clean -p qontinui-runner --release
+        shell: bash
+
+      - name: Build #2
+        env:
+          CARGO_BUILD_JOBS: 1
+        run: |
+          cd src-tauri
+          cargo build --release --bin mock_claude_cli
+        shell: bash
+
+      - name: Hash build #2 artifact and compare
+        run: |
+          cd src-tauri
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXE=target/release/mock_claude_cli.exe
+          else
+            EXE=target/release/mock_claude_cli
+          fi
+          HASH2=$(sha256sum "$EXE" | awk '{print $1}')
+          HASH1='${{ steps.hash1.outputs.hash1 }}'
+          echo "Build #1 sha256: $HASH1"
+          echo "Build #2 sha256: $HASH2"
+          if [ "$HASH1" = "$HASH2" ]; then
+            echo
+            echo "Reproducibility gate PASS — two builds of the same SHA produced byte-identical artifacts."
+            exit 0
+          fi
+          echo
+          echo "Reproducibility gate FAIL — artifacts differ between two builds of the same SHA."
+          echo "This usually means /Brepro (Windows) or -Wl,--build-id=none (Linux) regressed,"
+          echo "or a dependency now bakes a timestamp / hostname / random UUID at link time."
+          echo
+          echo "Investigation: diff the two artifacts at the byte level. PE RSDS GUID at offset"
+          echo "107636 (Windows) or the .note.gnu.build-id section (Linux) are the usual suspects."
+          BUILD1="$RUNNER_TEMP/build1-mock_claude_cli$([ "$RUNNER_OS" = Windows ] && echo .exe)"
+          if command -v cmp >/dev/null 2>&1; then
+            echo
+            echo "=== first 20 differing bytes ==="
+            cmp -l "$BUILD1" "$EXE" 2>/dev/null | head -20 || true
+          fi
+          exit 1
+        shell: bash
