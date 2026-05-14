@@ -69,6 +69,11 @@ adb_client = { version = "3", features = ["usb", "mdns"] }
 reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form"] }
 open = "5"
 hostname = "0.4"
+# Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to
+# read RAM / disk / CPU on startup so the runner can publish its
+# MachineBudget per §3.2. `default-features = false` strips the
+# Linux-only `network`/`processes`/`users` collectors we don't need.
+sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
 subtle = "2"
 mime_guess = "2"
 base64 = "0.22"
