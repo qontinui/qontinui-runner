@@ -35,9 +35,6 @@ ipc_handler_post!(
 );
 ipc_handler_post!(ui_bridge_ai_recovery_attempt_handler, "ai_recovery_attempt");
 
-// Media compare
-ipc_handler_post!(ui_bridge_media_compare_handler, "media_compare");
-
 // Pixel-accurate image diff (compareVisualRegression alias)
 ipc_handler_post!(ui_bridge_image_diff_handler, "image_diff");
 
@@ -71,11 +68,6 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/ai/recovery/attempt",
             post(ui_bridge_ai_recovery_attempt_handler),
         )
-        // Media compare
-        .route(
-            "/ui-bridge/ai/media/compare",
-            post(ui_bridge_media_compare_handler),
-        )
         // Pixel-accurate image diff (canonical visual regression)
         .route(
             "/ui-bridge/ai/image-diff",
@@ -96,7 +88,6 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/ai/analyze/structured-data"),
         ("POST", "/ui-bridge/ai/analyze/cross-app-compare"),
         ("POST", "/ui-bridge/ai/recovery/attempt"),
-        ("POST", "/ui-bridge/ai/media/compare"),
         ("POST", "/ui-bridge/ai/image-diff"),
         ("POST", "/ui-bridge/control/ai/image-diff"),
     ]

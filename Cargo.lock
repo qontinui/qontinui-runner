@@ -6152,6 +6152,7 @@ dependencies = [
  "proc-macro2",
  "qontinui-db",
  "qontinui-types",
+ "qontinui-vision-core",
  "rand 0.9.2",
  "regex",
  "reqwest 0.13.2",
@@ -6227,6 +6228,16 @@ dependencies = [
  "thiserror 2.0.18",
  "unicode-normalization",
  "uuid",
+]
+
+[[package]]
+name = "qontinui-vision-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "image 0.25.10",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

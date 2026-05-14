@@ -2418,30 +2418,11 @@ async fn handle_check_health(State(state): State<Arc<ApiState>>) -> Json<serde_j
 }
 
 // =============================================================================
-// Screenshot Capture
+// Screenshot Capture — DELETED in Phase 2 of the UI Bridge Vision Pipeline plan
+// (2026-05-13). The /ui-bridge/sdk/screenshot WS-transport wrapper that lived
+// here is gone; consumers call the direct /ui-bridge/vision/capture endpoint
+// (see `mcp/ui_bridge/vision_routes.rs`).
 // =============================================================================
-
-/// GET /ui-bridge/sdk/screenshot — Capture screenshot for SDK app
-///
-/// Uses xcap for native screen capture. Supports window-specific and monitor capture.
-/// Same query parameters as the control screenshot endpoint.
-///
-/// Query parameters:
-/// - `window_title`: Case-insensitive substring match on window title
-/// - `app_name`: Case-insensitive substring match on app name
-/// - `window_id`: Exact window ID (HWND)
-/// - `monitor`: Monitor index (0-based). If not provided, captures the primary monitor.
-async fn handle_screenshot(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<super::ui_bridge::AnnotatedScreenshotQuery>,
-) -> Json<ApiResponse<super::ui_bridge::AnnotatedScreenshotData>> {
-    // Delegate to the control screenshot handler (same xcap-based implementation)
-    super::ui_bridge::ui_bridge_annotated_screenshot_handler(
-        axum::extract::State(state),
-        axum::extract::Query(query),
-    )
-    .await
-}
 
 // =============================================================================
 // Cross-App Analysis Proxies
@@ -4968,8 +4949,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/console-errors/clear",
             post(handle_clear_console_errors),
         )
-        // Screenshot (monitor capture for SDK apps that can't self-screenshot)
-        .route("/ui-bridge/sdk/screenshot", get(handle_screenshot))
+        // /ui-bridge/sdk/screenshot was removed in Phase 2 of the UI Bridge
+        // Vision Pipeline plan (2026-05-13). Consumers migrate to the direct
+        // /ui-bridge/vision/capture endpoint in `mcp/ui_bridge/vision_routes.rs`.
         // Terminal buffer readback — returns the rendered text rows from
         // the server-side cell grid, so callers can verify content of
         // canvas-rendered terminals without taking a screenshot.

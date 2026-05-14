@@ -405,6 +405,7 @@ async function captureFallbackScreenshot(
 ): Promise<void> {
   try {
     const { getApiBase, tracedFetch } = await import("@/lib/runner-api");
+    const { captureScreenshotBase64 } = await import("@/lib/vision-api");
     const { generateFingerprints } = await import("@/lib/ui-bridge/fingerprintGenerator");
 
     // Use per-page fingerprints from the last presenceMatrix entry,
@@ -413,24 +414,26 @@ async function captureFallbackScreenshot(
     const lastEntry = matrix[matrix.length - 1];
     const visibleHashes = new Set(lastEntry?.fingerprints ?? []);
 
-    // Fetch screenshot and live SDK snapshot in parallel so we get actual element bounds.
-    // Use individual .catch() so a snapshot failure doesn't lose the screenshot.
-    const [ssResp, snapResp] = await Promise.all([
-      tracedFetch(`${getApiBase()}/ui-bridge/sdk/screenshot?runner=true`),
+    // Fetch screenshot (Phase 2 vision/capture, runner window only) and live
+    // SDK snapshot in parallel so we get actual element bounds. Use
+    // individual .catch() so a snapshot failure doesn't lose the screenshot.
+    const [ssResult, snapResp] = await Promise.all([
+      captureScreenshotBase64({ contract: "claude" }).catch(() => null),
       tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot?recency=current`).catch(() => null),
     ]);
-    if (!ssResp.ok) return;
-    const ssJson = await ssResp.json();
-    if (!ssJson.success || !ssJson.data?.screenshot) return;
+    if (!ssResult) return;
 
-    const dpr = ssJson.data.scaleFactor || 1;
-    // ssJson.data.width/height are already in physical pixels (xcap returns
+    // vision/capture has no scaleFactor field; SDK element bounds are
+    // reported in CSS pixels so we use the live window devicePixelRatio to
+    // scale them up to image-pixel space.
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    // ssResult.width/height are already in physical pixels (xcap returns
     // image.width()/height()). The element bounds below ARE multiplied by
     // dpr because the SDK reports them in CSS pixels — but the screenshot
     // dims must NOT be multiplied again. Doing so was the source of the
     // 1.5x metadata-vs-bytes mismatch on HiDPI displays.
-    const imgW = ssJson.data.width || 1920;
-    const imgH = ssJson.data.height || 1080;
+    const imgW = ssResult.width || 1920;
+    const imgH = ssResult.height || 1080;
 
     // Build a hash→rect map from live snapshot elements (actual bounding boxes)
     const liveBounds = new Map<string, { x: number; y: number; width: number; height: number }>();
@@ -486,7 +489,7 @@ async function captureFallbackScreenshot(
       screenshots: [
         {
           captureIndex: 0,
-          screenshotBase64: ssJson.data.screenshot,
+          screenshotBase64: ssResult.screenshot,
           width: Math.round(imgW),
           height: Math.round(imgH),
           elementBoundsJson: JSON.stringify(boundsMap),
