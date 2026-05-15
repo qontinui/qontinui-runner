@@ -145,10 +145,7 @@ impl PusherState {
                 worktree_path: w.worktree_path.clone(),
             })
             .collect();
-        let origin_repo_alias = targets
-            .first()
-            .map(|t| t.repo.clone())
-            .unwrap_or_default();
+        let origin_repo_alias = targets.first().map(|t| t.repo.clone()).unwrap_or_default();
         Some(Self {
             agent_id,
             coord_http_base,
@@ -326,9 +323,7 @@ async fn maybe_refresh_token(state: &Arc<PusherState>) -> Result<()> {
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(
-                "agent_pusher: refresh request failed: {e} — will retry on next tick"
-            );
+            warn!("agent_pusher: refresh request failed: {e} — will retry on next tick");
             return Ok(());
         }
     };
@@ -371,11 +366,7 @@ struct RefreshResponseBody {
 /// Push one branch to coord-origin via `git push`. Returns
 /// `Ok(true)` if anything was pushed, `Ok(false)` for "already up to
 /// date", and `Err` for actual failures.
-async fn push_one(
-    state: &Arc<PusherState>,
-    target: &PushTarget,
-    token: &str,
-) -> Result<bool> {
+async fn push_one(state: &Arc<PusherState>, target: &PushTarget, token: &str) -> Result<bool> {
     let origin_url = build_origin_url(&state.coord_http_base, &target.repo, token)?;
     debug!(
         "agent_pusher: pushing repo={} branch={} from {}",
@@ -401,21 +392,14 @@ async fn push_one(
         if stderr.contains("Everything up-to-date") {
             return Ok(false);
         }
-        anyhow::bail!(
-            "git push exited {:?}: {}",
-            out.status.code(),
-            stderr.trim()
-        );
+        anyhow::bail!("git push exited {:?}: {}", out.status.code(), stderr.trim());
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Same parsing rule as outbound_mirror — count lines whose first
     // non-space char isn't `=` (= meaning "up to date") or markers.
     let pushed = stdout.lines().any(|l| {
         let l = l.trim_start();
-        !l.is_empty()
-            && !l.starts_with('=')
-            && !l.starts_with("To ")
-            && !l.starts_with("Done")
+        !l.is_empty() && !l.starts_with('=') && !l.starts_with("To ") && !l.starts_with("Done")
     });
     Ok(pushed)
 }
