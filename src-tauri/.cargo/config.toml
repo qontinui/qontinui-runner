@@ -1,3 +1,24 @@
+# Row 2 Phase 2 — sccache defaults for the LAN-shared compile-unit
+# cache backed by canonical MinIO. See
+# plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.3.
+#
+# RUSTC_WRAPPER is intentionally NOT pinned here. Opt in by exporting
+# `RUSTC_WRAPPER=sccache` in the invoking shell — dev-start.ps1,
+# cargo-guard.sh, or a CI workflow `env:` block. This shape avoids
+# breaking machines (CI runners especially) that don't have sccache
+# installed, and lets a dev opt out by unsetting the env. When
+# RUSTC_WRAPPER is set, sccache picks up the SCCACHE_* defaults below
+# — same bucket, same region, same prefix, fleet-wide.
+#
+# SCCACHE_ENDPOINT + AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY are
+# also per-machine env (LAN IP varies, creds sensitive). dev-start.ps1
+# and cargo-guard.sh export them from ~/.qontinui/profile.
+[env]
+SCCACHE_BUCKET = { value = "qontinui-sccache", force = false }
+SCCACHE_REGION = { value = "us-east-1", force = false }
+SCCACHE_S3_USE_SSL = { value = "off", force = false }
+SCCACHE_S3_KEY_PREFIX = { value = "sccache", force = false }
+
 # Increase linker stack size to prevent STATUS_STACK_BUFFER_OVERRUN
 # when linking the large test binary on Windows. Default MSVC stack is
 # 1 MB; this binary needs more due to deep async-graphql type expansion
