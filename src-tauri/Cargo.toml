@@ -45,7 +45,7 @@ jsonschema = { version = "0.45", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
-uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.0", features = ["v4", "v5", "v7", "serde"] }
 thiserror = "2"
 anyhow = "1.0"
 async-trait = "0.1"
@@ -217,6 +217,15 @@ custom-protocol = ["tauri/custom-protocol"]
 # `cfg(debug_assertions)`; this feature is the explicit opt-in for
 # release-mode regression / smoke harnesses.
 test-fixtures = []
+# Stream E (Flywheel) — coverage-growth loop. Gates `spec_authoring`,
+# the proposals endpoints, and the supervisor cron. Off by default for
+# spec-check v1.0 ship; the user-facing `--enable-spec-authoring` alias
+# maps to this feature in the runner CLI/env layer.
+spec-authoring = []
+# PG-bound integration tests for the proposals subsystem (Stream E).
+# Off by default; enable with `--features spec-authoring,pg_integration_tests`
+# when a live PG (canonical or local) is available.
+pg_integration_tests = []
 
 [[bin]]
 name = "mock_claude_cli"

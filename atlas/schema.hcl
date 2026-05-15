@@ -233,6 +233,86 @@ table "regression_assertion_executions" {
 }
 
 // ---------------------------------------------------------------
+// project.spec_proposals — Stream E (Flywheel) coverage-growth queue.
+// Stores `fullPage` and `patch` proposals discovered by
+// `/spec/proposals/scan`; lifecycle is driven by the supervisor cron + the
+// `/spec/proposals/{id}/execute` handler.
+// ---------------------------------------------------------------
+
+table "spec_proposals" {
+  schema = schema.project
+  column "id" {
+    null = false
+    type = text
+  }
+  column "kind" {
+    null = false
+    type = text
+  }
+  column "pathname" {
+    null = true
+    type = text
+  }
+  column "spec_id" {
+    null = true
+    type = text
+  }
+  column "status" {
+    null = false
+    type = text
+  }
+  column "created_at" {
+    null    = false
+    type    = timestamptz
+    default = sql("now()")
+  }
+  column "last_attempt_at" {
+    null = true
+    type = timestamptz
+  }
+  column "consecutive_greens" {
+    null    = false
+    type    = integer
+    default = 0
+  }
+  column "last_error" {
+    null = true
+    type = text
+  }
+  column "candidate_ir" {
+    null = true
+    type = jsonb
+  }
+  column "metadata" {
+    null    = false
+    type    = jsonb
+    default = sql("'{}'::jsonb")
+  }
+  primary_key {
+    columns = [column.id]
+  }
+  check "spec_proposals_kind_chk" {
+    expr = "kind IN ('fullPage', 'patch')"
+  }
+  // Dedup: a queued/in-flight proposal for a given target identity. Uses
+  // a functional unique index over (kind, COALESCE(pathname, spec_id)) so
+  // the same pathname (kind='fullPage') or spec_id (kind='patch') cannot
+  // be queued twice. Insertions use ON CONFLICT DO NOTHING.
+  index "spec_proposals_kind_target_uniq" {
+    unique = true
+    on {
+      column = column.kind
+    }
+    on {
+      expr = "COALESCE(pathname, spec_id)"
+    }
+  }
+  index "spec_proposals_status_idx" {
+    columns = [column.status]
+  }
+}
+
+// ---------------------------------------------------------------
 // coord.coordinator_shadow_decisions — soak comparison of shadow vs live
 // scheduler decisions. Created by Rust ensure_shadow_decisions_table; this
 // HCL is now source of truth.
