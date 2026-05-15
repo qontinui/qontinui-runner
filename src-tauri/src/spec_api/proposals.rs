@@ -106,7 +106,10 @@ pub async fn post_scan(
     let scanned_pathnames = full_page_rows.len();
     for pathname in full_page_rows {
         if on_disk_pathnames.contains(&pathname) {
-            debug!("post_scan: pathname {} already has a spec; skipping", pathname);
+            debug!(
+                "post_scan: pathname {} already has a spec; skipping",
+                pathname
+            );
             continue;
         }
         let proposal_id = mint_proposal_id();
@@ -307,7 +310,10 @@ pub async fn post_execute(
     // Transition to inFlight (best-effort; ignore errors so we still try to
     // author rather than wedging the queue).
     if let Err(e) = pg_db.update_proposal_status(&row.id, "inFlight").await {
-        warn!("post_execute: update_proposal_status (inFlight) failed: {}", e);
+        warn!(
+            "post_execute: update_proposal_status (inFlight) failed: {}",
+            e
+        );
     }
     let _ = pg_db.update_proposal_attempt_only(&row.id).await;
 
@@ -354,7 +360,8 @@ pub async fn post_execute(
             // Patch mode requires a fresh drift report — re-scan to get the
             // current delta (the queued row only carries the missing element
             // ids in `metadata`, not the full report shape).
-            let project_root = std::env::var("QONTINUI_PROJECT_ROOT").unwrap_or_else(|_| ".".into());
+            let project_root =
+                std::env::var("QONTINUI_PROJECT_ROOT").unwrap_or_else(|_| ".".into());
             let drift = match crate::commands::spec_drift::scan_spec_drift(project_root).await {
                 Ok(d) => d,
                 Err(e) => {
@@ -428,22 +435,23 @@ pub async fn post_execute(
 
     // TODO(Step 8): replace with full validator gate (round-trip + coverage +
     // b-green) and Step 9: replace with storage::write_pending_ir.
-    let staged_path = match stage_pending_ir_placeholder(&storage::resolve_specs_root(), &outcome.candidate) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = pg_db
-                .update_proposal_status_with_error(&row.id, "failed", &e)
-                .await;
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(SpecError::with_detail(
-                    "stage-pending-failed",
-                    json!({ "proposalId": row.id, "error": e }),
-                )),
-            )
-                .into_response();
-        }
-    };
+    let staged_path =
+        match stage_pending_ir_placeholder(&storage::resolve_specs_root(), &outcome.candidate) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = pg_db
+                    .update_proposal_status_with_error(&row.id, "failed", &e)
+                    .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SpecError::with_detail(
+                        "stage-pending-failed",
+                        json!({ "proposalId": row.id, "error": e }),
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
     // Persist the candidate IR + flip to pendingPromotion (skipping the
     // pendingValidation hop that Step 8 will introduce).
@@ -484,7 +492,9 @@ pub async fn post_execute(
         .into_response()
 }
 
-fn authoring_error_reason(e: &crate::workflow_generation::spec_authoring::AuthoringError) -> &'static str {
+fn authoring_error_reason(
+    e: &crate::workflow_generation::spec_authoring::AuthoringError,
+) -> &'static str {
     use crate::workflow_generation::spec_authoring::AuthoringError::*;
     match e {
         NoDiscoveryArtifact { .. } => "no-discovery-artifact",
@@ -496,7 +506,9 @@ fn authoring_error_reason(e: &crate::workflow_generation::spec_authoring::Author
     }
 }
 
-fn authoring_error_detail(e: &crate::workflow_generation::spec_authoring::AuthoringError) -> String {
+fn authoring_error_detail(
+    e: &crate::workflow_generation::spec_authoring::AuthoringError,
+) -> String {
     use crate::workflow_generation::spec_authoring::AuthoringError::*;
     match e {
         NoDiscoveryArtifact { pathname } => {
@@ -576,10 +588,7 @@ impl From<SpecProposalRow> for ProposalListItem {
     }
 }
 
-pub async fn get_list(
-    State(state): State<Arc<ApiState>>,
-    Query(q): Query<ListQuery>,
-) -> Response {
+pub async fn get_list(State(state): State<Arc<ApiState>>, Query(q): Query<ListQuery>) -> Response {
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
     let pg_db = state.app_state.pg_db.clone();
@@ -740,7 +749,10 @@ mod tests {
 
     #[test]
     fn spec_id_to_pathname_simple() {
-        assert_eq!(spec_id_to_pathname("account-billing").as_deref(), Some("/account/billing"));
+        assert_eq!(
+            spec_id_to_pathname("account-billing").as_deref(),
+            Some("/account/billing")
+        );
         assert_eq!(spec_id_to_pathname("home").as_deref(), Some("/home"));
         assert_eq!(spec_id_to_pathname("index").as_deref(), Some("/"));
         assert_eq!(spec_id_to_pathname(""), None);
@@ -760,7 +772,10 @@ mod tests {
             line: 12,
             suggested_assertion: String::new(),
         };
-        assert_eq!(infer_target_spec_id(&elem).as_deref(), Some("account-billing"));
+        assert_eq!(
+            infer_target_spec_id(&elem).as_deref(),
+            Some("account-billing")
+        );
     }
 
     #[test]
@@ -788,7 +803,10 @@ mod tests {
             line: 12,
             suggested_assertion: String::new(),
         };
-        assert_eq!(infer_target_spec_id(&elem).as_deref(), Some("account-billing"));
+        assert_eq!(
+            infer_target_spec_id(&elem).as_deref(),
+            Some("account-billing")
+        );
     }
 
     #[test]
@@ -824,7 +842,10 @@ mod tests {
             line: 12,
             suggested_assertion: String::new(),
         };
-        assert_eq!(infer_target_spec_id(&elem).as_deref(), Some("account-billing"));
+        assert_eq!(
+            infer_target_spec_id(&elem).as_deref(),
+            Some("account-billing")
+        );
     }
 
     #[test]
@@ -851,7 +872,11 @@ mod tests {
             .join("demo-page")
             .join("_pending")
             .join("state-machine.derived.json");
-        assert!(target.exists(), "target file should exist: {}", target.display());
+        assert!(
+            target.exists(),
+            "target file should exist: {}",
+            target.display()
+        );
         let body = std::fs::read_to_string(&target).unwrap();
         assert!(body.contains("\"id\""));
         assert!(body.contains("demo-page"));
@@ -873,10 +898,9 @@ mod tests {
 
     #[test]
     fn scan_request_parses_full_payload() {
-        let req: ScanRequest = serde_json::from_str(
-            r#"{ "minObservations": 10, "lookbackDays": 30, "limit": 5 }"#,
-        )
-        .unwrap();
+        let req: ScanRequest =
+            serde_json::from_str(r#"{ "minObservations": 10, "lookbackDays": 30, "limit": 5 }"#)
+                .unwrap();
         assert_eq!(req.min_observations, Some(10));
         assert_eq!(req.lookback_days, Some(30));
         assert_eq!(req.limit, Some(5));
@@ -947,7 +971,9 @@ mod tests {
             .await
             .expect("insert");
             let rows = db.list_proposals(10, 0).await.expect("list");
-            assert!(rows.iter().any(|r| r.id == "prop_test_list" && r.status == "queued"));
+            assert!(rows
+                .iter()
+                .any(|r| r.id == "prop_test_list" && r.status == "queued"));
         }
     }
 }

@@ -83,11 +83,7 @@ impl PgDb {
     /// Update only the status of a proposal. Does NOT touch
     /// `last_attempt_at` / `last_error` — use the more specific helpers when
     /// recording attempts or failures.
-    pub async fn update_proposal_status(
-        &self,
-        id: &str,
-        status: &str,
-    ) -> Result<(), String> {
+    pub async fn update_proposal_status(&self, id: &str, status: &str) -> Result<(), String> {
         let conn = self
             .pool
             .get()
@@ -198,10 +194,7 @@ impl PgDb {
     // -------------------------------------------------------------------------
 
     /// Fetch a single proposal by id. Returns `Ok(None)` if missing.
-    pub async fn find_proposal_by_id(
-        &self,
-        id: &str,
-    ) -> Result<Option<SpecProposalRow>, String> {
+    pub async fn find_proposal_by_id(&self, id: &str) -> Result<Option<SpecProposalRow>, String> {
         let conn = self
             .pool
             .get()

@@ -65,7 +65,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
     let r = r
         .route("/spec/proposals/scan", post(proposals::post_scan))
         .route("/spec/proposals", get(proposals::get_list))
-        .route("/spec/proposals/{id}/execute", post(proposals::post_execute));
+        .route(
+            "/spec/proposals/{id}/execute",
+            post(proposals::post_execute),
+        );
 
     r
 }

@@ -1375,8 +1375,7 @@ pub async fn build_spec_priming_context(
 
     // Pull self-improvement + GT-reference sections from the standard path
     // so verifier focus items still come from the workflow corpus.
-    let baseline =
-        build_historical_context_pg(pg_db, &skeleton.name, Some("spec-authoring")).await;
+    let baseline = build_historical_context_pg(pg_db, &skeleton.name, Some("spec-authoring")).await;
 
     let (improvement_section, verifier_focus_items, past_fixes_section, gt_reference_section) =
         match baseline {

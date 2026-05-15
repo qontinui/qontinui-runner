@@ -347,10 +347,7 @@ fn project_cluster_to_state(cluster: &Cluster) -> IrState {
 
     IrState {
         id: cluster.id.clone(),
-        name: cluster
-            .name
-            .clone()
-            .unwrap_or_else(|| cluster.id.clone()),
+        name: cluster.name.clone().unwrap_or_else(|| cluster.id.clone()),
         description: None,
         assertions: Vec::new(),
         excluded_elements: if criteria.is_empty() {
@@ -447,8 +444,7 @@ async fn ai_fill_skeleton(
         parse_meta_workflow_output(&run_result).map_err(AuthoringError::MalformedAiOutput)?;
     stamp_provenance_ai_generated_proposed(&mut filled);
 
-    enforce_skeleton_invariants(&skeleton, &filled)
-        .map_err(AuthoringError::MalformedAiOutput)?;
+    enforce_skeleton_invariants(&skeleton, &filled).map_err(AuthoringError::MalformedAiOutput)?;
 
     Ok(filled)
 }
@@ -518,10 +514,7 @@ fn stamp_provenance_ai_generated_proposed(ir: &mut IrPageSpec) {
 
 /// Skeleton invariants the AI must not violate. The AI may add transitions,
 /// names, descriptions, metadata — but it may NOT delete states.
-fn enforce_skeleton_invariants(
-    skeleton: &IrPageSpec,
-    filled: &IrPageSpec,
-) -> Result<(), String> {
+fn enforce_skeleton_invariants(skeleton: &IrPageSpec, filled: &IrPageSpec) -> Result<(), String> {
     if filled.states.len() != skeleton.states.len() {
         return Err(format!(
             "state count drift: skeleton={}, filled={}",
@@ -809,8 +802,7 @@ pub(crate) async fn execute_meta_workflow_blocking(
     use crate::database::types::CreateTaskRunInput;
     use crate::unified_workflows::UnifiedWorkflowExt;
 
-    let mut create_request =
-        crate::unified_workflows::unified_workflow_to_create_request(&meta_wf);
+    let mut create_request = crate::unified_workflows::unified_workflow_to_create_request(&meta_wf);
     create_request.generated_by_task_run_id = None;
 
     let saved = pg_db
@@ -919,10 +911,7 @@ mod tests {
     fn skeleton_from_artifact(body: &serde_json::Value, observation_count: i32) -> IrPageSpec {
         // Helper that mirrors the projection path without touching PG.
         let clusters = extract_clusters(body).expect("clusters parse");
-        let mut states: Vec<IrState> = clusters
-            .iter()
-            .map(project_cluster_to_state)
-            .collect();
+        let mut states: Vec<IrState> = clusters.iter().map(project_cluster_to_state).collect();
         states.sort_by(|a, b| a.id.cmp(&b.id));
         IrPageSpec {
             version: "1.0".into(),
@@ -982,10 +971,7 @@ mod tests {
         ]);
         let spec = skeleton_from_artifact(&body, 12);
         assert_eq!(spec.states.len(), 3);
-        assert_eq!(
-            spec.provenance.as_ref().unwrap().source,
-            "build-plugin"
-        );
+        assert_eq!(spec.provenance.as_ref().unwrap().source, "build-plugin");
         assert_eq!(
             spec.provenance.as_ref().unwrap().status,
             Some(ProposalStatus::Proposed)
@@ -1084,8 +1070,14 @@ mod tests {
         });
         // ir.states[1].provenance is None initially.
         stamp_provenance_ai_generated_proposed(&mut ir);
-        assert_eq!(ir.states[0].provenance.as_ref().unwrap().source, "hand-authored");
-        assert_eq!(ir.states[1].provenance.as_ref().unwrap().source, "ai-generated");
+        assert_eq!(
+            ir.states[0].provenance.as_ref().unwrap().source,
+            "hand-authored"
+        );
+        assert_eq!(
+            ir.states[1].provenance.as_ref().unwrap().source,
+            "ai-generated"
+        );
         // Document-level always becomes ai-generated.
         assert_eq!(ir.provenance.as_ref().unwrap().source, "ai-generated");
     }
@@ -1217,7 +1209,9 @@ mod tests {
             .transitions
             .push(make_transition("tx-1", "s1", "s2"));
         let mut patch = IrPatch::default();
-        patch.add_transitions.push(make_transition("tx-1", "s1", "s2"));
+        patch
+            .add_transitions
+            .push(make_transition("tx-1", "s1", "s2"));
         let err = merge_patch_into_ir(existing, patch).unwrap_err();
         assert!(err.contains("collides with an existing transition"));
     }
@@ -1226,7 +1220,9 @@ mod tests {
     fn merge_patch_adds_transition_with_ai_generated_provenance() {
         let existing = make_skeleton(&["s1", "s2"]);
         let mut patch = IrPatch::default();
-        patch.add_transitions.push(make_transition("tx-new", "s1", "s2"));
+        patch
+            .add_transitions
+            .push(make_transition("tx-new", "s1", "s2"));
         let result = merge_patch_into_ir(existing, patch).expect("merge ok");
         assert_eq!(result.transitions.len(), 1);
         let prov = result.transitions[0]
@@ -1241,8 +1237,12 @@ mod tests {
     fn merge_patch_intra_patch_duplicate_transition_id_fails() {
         let existing = make_skeleton(&["s1", "s2"]);
         let mut patch = IrPatch::default();
-        patch.add_transitions.push(make_transition("tx-dup", "s1", "s2"));
-        patch.add_transitions.push(make_transition("tx-dup", "s1", "s2"));
+        patch
+            .add_transitions
+            .push(make_transition("tx-dup", "s1", "s2"));
+        patch
+            .add_transitions
+            .push(make_transition("tx-dup", "s1", "s2"));
         let err = merge_patch_into_ir(existing, patch).unwrap_err();
         assert!(err.contains("duplicate transition id"));
     }
