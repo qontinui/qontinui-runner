@@ -45,6 +45,7 @@ pub mod learned_patterns_ops;
 pub mod learning;
 pub mod log_sources;
 pub mod memory_query_cache;
+pub mod merge_proposals;
 pub mod meta_optimizer;
 pub mod misc_crud;
 pub mod observations;
