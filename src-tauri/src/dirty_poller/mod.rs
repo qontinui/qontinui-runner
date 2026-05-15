@@ -70,17 +70,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::agent_token::{self, SharedToken};
+// Re-exported so existing `dirty_poller::TokenSlot` references (incl.
+// this module's tests) keep resolving after the token logic moved to
+// `crate::agent_token` (shared with `agent_pusher`).
+pub use crate::agent_token::TokenSlot;
+
 /// Default cadence — 5 s per §4.8.
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
-
-/// Refresh the JWT proactively when this much time-to-expiry remains.
-/// Mirrors `agent_pusher::TOKEN_REFRESH_MARGIN_SECS` (30 min).
-const TOKEN_REFRESH_MARGIN_SECS: i64 = 30 * 60;
 
 /// One worktree the poller watches.
 #[derive(Debug, Clone)]
@@ -90,25 +92,6 @@ pub struct DirtyTarget {
     pub worktree_path: PathBuf,
 }
 
-/// Mutable token + bookkeeping. Same shape as
-/// `agent_pusher::TokenSlot`; kept local so the poller doesn't depend
-/// on the (not-yet-wired) pusher spawn machinery.
-#[derive(Debug, Clone)]
-pub struct TokenSlot {
-    pub token: String,
-    pub jti: uuid::Uuid,
-    pub exp: i64,
-}
-
-impl TokenSlot {
-    pub fn ttl_secs(&self, now_unix: i64) -> i64 {
-        self.exp - now_unix
-    }
-    pub fn needs_refresh(&self, now_unix: i64) -> bool {
-        self.ttl_secs(now_unix) < TOKEN_REFRESH_MARGIN_SECS
-    }
-}
-
 /// State shared between the poller task and its handle.
 #[derive(Debug)]
 pub struct DirtyPollerState {
@@ -116,7 +99,9 @@ pub struct DirtyPollerState {
     pub machine_id: uuid::Uuid,
     pub coord_http_base: String,
     pub targets: Vec<DirtyTarget>,
-    pub token: RwLock<TokenSlot>,
+    /// Shared with every other daemon spawned for this agent (one
+    /// refresh path, not one per daemon). See [`crate::agent_token`].
+    pub token: SharedToken,
     /// Per-repo fingerprint of the last *sent* state. `tick_once`
     /// compares against this to decide change-vs-heartbeat and to
     /// drive the monotonic `seq`.
@@ -144,9 +129,19 @@ impl DirtyPollerState {
         coord_http_base: String,
         machine_id: uuid::Uuid,
     ) -> Option<Self> {
-        if allocate.token.is_empty() {
-            return None;
-        }
+        let token = agent_token::from_allocate_result(allocate)?;
+        Self::with_shared_token(allocate, coord_http_base, machine_id, token)
+    }
+
+    /// Same as [`from_allocate_result`] but the caller supplies the
+    /// shared token slot — used by `agent_daemons::spawn_for_agent`
+    /// so the poller and the pusher refresh through one slot.
+    pub fn with_shared_token(
+        allocate: &crate::agent_worktree::AllocateResult,
+        coord_http_base: String,
+        machine_id: uuid::Uuid,
+        token: SharedToken,
+    ) -> Option<Self> {
         let agent_id = uuid::Uuid::from_str(&allocate.agent_id).ok()?;
         let targets: Vec<DirtyTarget> = allocate
             .worktrees
@@ -165,11 +160,7 @@ impl DirtyPollerState {
             machine_id,
             coord_http_base,
             targets,
-            token: RwLock::new(TokenSlot {
-                token: allocate.token.clone(),
-                jti: allocate.token_jti,
-                exp: allocate.token_exp,
-            }),
+            token,
             seen: RwLock::new(SeenState::default()),
         })
     }
@@ -210,32 +201,10 @@ impl Drop for DirtyPollerHandle {
     }
 }
 
-/// Process-global registry holding live poller handles so they aren't
-/// `Drop`ped (which would stop the poller) the moment the allocation
-/// handler returns. Agents are long-lived; teardown is best-effort and
-/// dies with the runner — same trade-off `agent_pusher` documents.
-/// Keyed by `agent_id` so a re-allocation of the same agent replaces
-/// (and thereby stops) the prior poller.
-static DIRTY_POLLERS: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<uuid::Uuid, DirtyPollerHandle>>,
-> = std::sync::OnceLock::new();
-
-/// Spawn a poller for `state` and retain its handle for the runner's
-/// lifetime. Replaces any prior poller for the same `agent_id`.
-pub fn spawn_and_register(state: Arc<DirtyPollerState>) {
-    let agent_id = state.agent_id;
-    let handle = spawn(state);
-    let map = DIRTY_POLLERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = map.lock() {
-        // Inserting drops any prior handle → its poller stops cleanly.
-        guard.insert(agent_id, handle);
-        info!(
-            "dirty_poller: registered agent_id={} (live pollers={})",
-            agent_id,
-            guard.len()
-        );
-    }
-}
+// The process-global handle registry moved to `crate::agent_daemons`,
+// which now owns the single per-agent spawn site (pusher + poller).
+// `dirty_poller::spawn` stays the standalone primitive (used by
+// `agent_daemons` and the integration test).
 
 async fn run(state: Arc<DirtyPollerState>, interval_secs: u64, cancel: Arc<tokio::sync::Notify>) {
     info!(
@@ -300,7 +269,13 @@ pub struct DirtyStateReq {
 /// Returns the `heartbeat` flag that was sent (true = no change since
 /// the prior tick) so tests can assert change-detection.
 pub async fn tick_once(state: &Arc<DirtyPollerState>) -> Result<bool> {
-    maybe_refresh_token(state).await?;
+    agent_token::maybe_refresh(
+        &state.token,
+        &state.coord_http_base,
+        state.agent_id,
+        "dirty_poller",
+    )
+    .await?;
 
     let mut worktrees = Vec::with_capacity(state.targets.len());
     let mut new_fps: HashMap<String, u64> = HashMap::new();
@@ -429,62 +404,6 @@ async fn post_dirty_state(state: &Arc<DirtyPollerState>, req: &DirtyStateReq) ->
         req.seq,
         req.worktrees.len()
     );
-    Ok(())
-}
-
-/// Token refresh — same contract as `agent_pusher::maybe_refresh_token`.
-/// Best-effort: a failed refresh logs + returns Ok; next tick retries.
-async fn maybe_refresh_token(state: &Arc<DirtyPollerState>) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
-    if !state.token.read().await.needs_refresh(now) {
-        return Ok(());
-    }
-    let url = format!(
-        "{}/agents/{}/refresh-token",
-        state.coord_http_base.trim_end_matches('/'),
-        state.agent_id
-    );
-    let current = state.token.read().await.token.clone();
-    let resp = match reqwest::Client::new()
-        .post(&url)
-        .bearer_auth(&current)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("dirty_poller: token refresh request failed: {e} — retry next tick");
-            return Ok(());
-        }
-    };
-    if !resp.status().is_success() {
-        warn!(
-            "dirty_poller: token refresh returned {} — retry next tick",
-            resp.status()
-        );
-        return Ok(());
-    }
-    #[derive(Deserialize)]
-    struct RefreshBody {
-        token: String,
-        jti: uuid::Uuid,
-        exp: i64,
-    }
-    match resp.json::<RefreshBody>().await {
-        Ok(b) => {
-            let mut guard = state.token.write().await;
-            *guard = TokenSlot {
-                token: b.token,
-                jti: b.jti,
-                exp: b.exp,
-            };
-            info!(
-                "dirty_poller: agent_id={} token refreshed jti={}",
-                state.agent_id, guard.jti
-            );
-        }
-        Err(e) => warn!("dirty_poller: refresh body decode failed: {e}"),
-    }
     Ok(())
 }
 
