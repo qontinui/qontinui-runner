@@ -244,9 +244,7 @@ impl ObserverRegistry {
             .iter()
             .filter_map(|t| match &t.trigger_config {
                 crate::trigger_system::types::TriggerConfig::GitEvent {
-                    repo_path,
-                    events,
-                    ..
+                    repo_path, events, ..
                 } => {
                     let mut members = vec![repo_path.clone()];
                     for ref_path in GIT_WATCHED_REF_PATHS {
@@ -334,7 +332,10 @@ mod tests {
         assert_eq!(h.kind, "sdk");
         assert!(h.live);
         assert_eq!(h.id, "http://127.0.0.1:3000");
-        assert!(h.scope.members.contains(&"http://127.0.0.1:3000".to_string()));
+        assert!(h
+            .scope
+            .members
+            .contains(&"http://127.0.0.1:3000".to_string()));
         assert!(h.scope.members.contains(&"my-app".to_string()));
     }
 
