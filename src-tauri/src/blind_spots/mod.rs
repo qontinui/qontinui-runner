@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn demand_minus_covered_per_subspace() {
         // Synthetic: demand has one covered path and one uncovered path.
-        let demand = vec!["src/watched.ts".to_string(), "src/blind.rs".to_string()];
+        let demand = ["src/watched.ts".to_string(), "src/blind.rs".to_string()];
         let dom_demand: Vec<&String> = demand.iter().filter(|m| !is_path_shaped(m)).collect();
         let fs_demand: Vec<&String> = demand.iter().filter(|m| is_path_shaped(m)).collect();
         assert_eq!(dom_demand.len(), 0); // both are path-shaped
@@ -561,7 +561,7 @@ mod tests {
             live: false,
             scope: ScopeSet::new(vec!["s1".to_string()]),
         };
-        let r = choose_recommendation(SubSpace::Dom, &blind, &[dormant.clone()], 1.0);
+        let r = choose_recommendation(SubSpace::Dom, &blind, std::slice::from_ref(&dormant), 1.0);
         assert_eq!(r.kind, "reactivate-observer");
 
         // Live observer present but not covering → extend-scope.
@@ -594,7 +594,7 @@ mod tests {
         // through the public live_observers contract directly.
         // (Construction needs an AppState Arc; instead assert the invariant
         // on the region produced for an empty registry-equivalent.)
-        let demand = vec!["anything".to_string(), "src/x.ts".to_string()];
+        let demand = ["anything".to_string(), "src/x.ts".to_string()];
 
         // Directly assert the documented invariant: adapter-less sub-spaces
         // get the full demand at confidence 0.5. enumerate_blind_regions
