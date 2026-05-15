@@ -234,7 +234,9 @@ fn build_state_machine_state(
         elements: state
             .assertions
             .iter()
-            .filter_map(|a| serde_json::from_value::<IrElementCriteria>(a.target.criteria.clone()).ok())
+            .filter_map(|a| {
+                serde_json::from_value::<IrElementCriteria>(a.target.criteria.clone()).ok()
+            })
             .map(|c| convert_criteria(&c))
             .collect(),
         is_initial,

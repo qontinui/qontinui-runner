@@ -205,8 +205,8 @@ fn read_ir(root: &Path, page_id: &str) -> Result<Option<IrPageSpec>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let data = fs::read_to_string(&path)
-        .map_err(|e| format!("read {} failed: {}", path.display(), e))?;
+    let data =
+        fs::read_to_string(&path).map_err(|e| format!("read {} failed: {}", path.display(), e))?;
     let doc: IrPageSpec = serde_json::from_str(&data)
         .map_err(|e| format!("parse {} failed: {}", path.display(), e))?;
     Ok(Some(doc))
@@ -275,9 +275,16 @@ fn matches_filter(entry: &SpecScanEntry, filter: Option<FilterReason>) -> bool {
     entry.violations.iter().any(|v| {
         matches!(
             (f, v),
-            (FilterReason::EmptyCriteria, DistinctnessViolation::EmptyCriteria { .. })
-                | (FilterReason::IdenticalStates, DistinctnessViolation::IdenticalStates { .. })
-                | (FilterReason::SubsetDomination, DistinctnessViolation::SubsetDomination { .. })
+            (
+                FilterReason::EmptyCriteria,
+                DistinctnessViolation::EmptyCriteria { .. }
+            ) | (
+                FilterReason::IdenticalStates,
+                DistinctnessViolation::IdenticalStates { .. }
+            ) | (
+                FilterReason::SubsetDomination,
+                DistinctnessViolation::SubsetDomination { .. }
+            )
         )
     })
 }

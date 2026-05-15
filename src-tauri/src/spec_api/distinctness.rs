@@ -255,7 +255,11 @@ pub struct DistinctnessReport {
 /// `{ "reason": "emptyCriteria" | "identicalStates" | "subsetDomination", ... }`.
 /// Per-variant fields ship as camelCase via `rename_all_fields` (serde ≥ 1.0.157).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "reason", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "reason",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum DistinctnessViolation {
     EmptyCriteria {
         state_id: String,
@@ -429,10 +433,7 @@ mod tests {
     #[test]
     fn whitespace_collapse_to_identical() {
         // Two states with text that normalizes to the same canonical form.
-        let s1 = make_state(
-            "lib-dashboard",
-            vec![json!({"text": "Library Dashboard"})],
-        );
+        let s1 = make_state("lib-dashboard", vec![json!({"text": "Library Dashboard"})]);
         let s2 = make_state(
             "lib-item",
             vec![json!({"text": "  library  dashboard\u{00A0} "})],
@@ -456,7 +457,10 @@ mod tests {
         assert_eq!(identical.len(), 1);
         let (ids, ks) = &identical[0];
         assert_eq!(ks, &1);
-        assert_eq!(ids, &vec!["lib-dashboard".to_string(), "lib-item".to_string()]);
+        assert_eq!(
+            ids,
+            &vec!["lib-dashboard".to_string(), "lib-item".to_string()]
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -727,10 +731,7 @@ mod tests {
         let sub = make_state("sub", vec![json!({"role": "navigation"})]);
         let sup = make_state(
             "sup",
-            vec![
-                json!({"role": "navigation"}),
-                json!({"role": "main"}),
-            ],
+            vec![json!({"role": "navigation"}), json!({"role": "main"})],
         );
         let doc = make_doc(vec![empty_state, dup_a, dup_b, sub, sup]);
         let r = report(&doc);
