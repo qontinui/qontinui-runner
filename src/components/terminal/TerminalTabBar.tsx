@@ -609,7 +609,7 @@ export function TerminalTabBar({
               }}
               className={`
               flex items-center gap-1.5 px-3 py-1 rounded-t text-xs font-medium min-h-[37px]
-              transition-colors whitespace-nowrap max-w-[260px] group cursor-grab active:cursor-grabbing
+              transition-colors whitespace-nowrap min-w-0 max-w-[260px] overflow-hidden group cursor-grab active:cursor-grabbing
               ${
                 isActive
                   ? "bg-[#1a1b26] text-[#c0caf5] border-t border-x border-[#2a2d3d] -mb-px"
