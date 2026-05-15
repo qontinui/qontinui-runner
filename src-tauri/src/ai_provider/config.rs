@@ -1,19 +1,23 @@
 use crate::settings::{self, AccountSelectionMode};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Cached resolved config dir for least-usage account selection.
 /// Set by `set_resolved_config_dir` at startup or when usage is checked.
 static RESOLVED_CONFIG_DIR: Mutex<Option<String>> = Mutex::new(None);
 
-/// Per-account cooldown tracking. When an account hits a rate limit,
-/// it is marked with a cooldown timestamp. The account is skipped until
-/// the cooldown expires.
-static ACCOUNT_COOLDOWNS: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+/// Per-account cooldown tracking. When an account hits a rate limit, it is
+/// marked with `(when_marked, cooldown_duration)`. Each account carries its
+/// own duration so that API providers can honour the precise `Retry-After`
+/// returned by the server (e.g. 600s for a daily-quota 429), while CLI
+/// subprocess paths fall back to the default [`RATE_LIMIT_COOLDOWN_SECS`].
+static ACCOUNT_COOLDOWNS: Mutex<Option<HashMap<String, (Instant, Duration)>>> = Mutex::new(None);
 
-/// How long to cool down a rate-limited account before trying it again (5 minutes).
+/// Default cooldown for rate-limited accounts when no precise `Retry-After`
+/// is available (e.g. the Claude CLI subprocess prints a "rate limit" message
+/// on stdout without a header). Five minutes.
 const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 
 /// Set the resolved config directory (called after usage check).
@@ -48,36 +52,75 @@ pub fn get_effective_config_dir(cli_settings: &settings::ClaudeCliSettings) -> O
     }
 }
 
-/// Mark an account as rate-limited. It will be skipped for `RATE_LIMIT_COOLDOWN_SECS`.
+/// Mark an account as rate-limited with the default cooldown duration.
+///
+/// Used by paths that don't have access to a precise `Retry-After` value
+/// (e.g. the Claude CLI subprocess). API providers should prefer
+/// [`mark_account_rate_limited_with_duration`].
 pub fn mark_account_rate_limited(config_dir: &str) {
+    mark_account_rate_limited_with_duration(
+        config_dir,
+        Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS),
+    );
+}
+
+/// Mark an account as rate-limited with a specific cooldown duration.
+///
+/// API providers should call this with the parsed `Retry-After` header so
+/// the cooldown matches the server's actual recovery window. If the duration
+/// is unknown, callers should fall back to [`mark_account_rate_limited`].
+pub fn mark_account_rate_limited_with_duration(config_dir: &str, cooldown: Duration) {
     if let Ok(mut cooldowns) = ACCOUNT_COOLDOWNS.lock() {
         let map = cooldowns.get_or_insert_with(HashMap::new);
         info!(
             "Marking account '{}' as rate-limited for {}s",
             short_label(config_dir),
-            RATE_LIMIT_COOLDOWN_SECS
+            cooldown.as_secs()
         );
-        map.insert(config_dir.to_string(), Instant::now());
+        map.insert(config_dir.to_string(), (Instant::now(), cooldown));
     }
 }
 
 /// Check if an account is currently in cooldown.
-fn is_account_cooled_down(config_dir: &str) -> bool {
+pub(super) fn is_account_cooled_down(config_dir: &str) -> bool {
     if let Ok(cooldowns) = ACCOUNT_COOLDOWNS.lock() {
         if let Some(map) = cooldowns.as_ref() {
-            if let Some(marked_at) = map.get(config_dir) {
-                return marked_at.elapsed().as_secs() < RATE_LIMIT_COOLDOWN_SECS;
+            if let Some((marked_at, cooldown)) = map.get(config_dir) {
+                return marked_at.elapsed() < *cooldown;
             }
         }
     }
     false
 }
 
+/// How long until this specific account's cooldown expires.
+///
+/// Returns `Some(remaining)` if the account is still cooled down, or `None`
+/// if it is available (either never marked, or the cooldown has expired).
+///
+/// Companion to [`is_account_cooled_down`]; reads `ACCOUNT_COOLDOWNS` under
+/// a single lock acquisition for consistency with other readers in this
+/// module.
+pub fn time_until_cooled_down(config_dir: &str) -> Option<Duration> {
+    let cooldowns = ACCOUNT_COOLDOWNS.lock().ok()?;
+    let map = cooldowns.as_ref()?;
+    let (marked_at, cooldown) = map.get(config_dir)?;
+    let remaining = cooldown.saturating_sub(marked_at.elapsed());
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(remaining)
+    }
+}
+
 /// Rotate to the next available account after a rate-limit hit.
 ///
-/// Marks the current account as rate-limited, then picks the first
-/// non-cooled-down account from the configured `claude_config_dirs`.
-/// Returns `true` if a switch happened, `false` if no alternative is available.
+/// Marks the current account as rate-limited (with the default cooldown,
+/// **but only if it isn't already marked** — so a precise `Retry-After`
+/// duration set by [`mark_account_rate_limited_with_duration`] survives),
+/// then picks the first non-cooled-down account from the configured
+/// `claude_config_dirs`. Returns `true` if a switch happened, `false` if
+/// no alternative is available.
 pub fn rotate_account_on_rate_limit() -> bool {
     let config_dirs = settings::get_claude_config_dirs();
     if config_dirs.len() < 2 {
@@ -85,19 +128,25 @@ pub fn rotate_account_on_rate_limit() -> bool {
     }
 
     let current = get_resolved_config_dir();
+    let default_cooldown = Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS);
 
     // Single lock acquisition: mark current as rate-limited + find best alternative
     let next_dir = if let Ok(mut cooldowns) = ACCOUNT_COOLDOWNS.lock() {
         let map = cooldowns.get_or_insert_with(HashMap::new);
 
-        // Mark the current account as rate-limited
+        // Mark the current account as rate-limited — but only if it isn't
+        // already in the map. API providers may have already inserted a
+        // precise `Retry-After`-derived duration; don't clobber that with
+        // the shorter default.
         if let Some(ref dir) = current {
-            info!(
-                "Marking account '{}' as rate-limited for {}s",
-                short_label(dir),
-                RATE_LIMIT_COOLDOWN_SECS
-            );
-            map.insert(dir.clone(), Instant::now());
+            if !map.contains_key(dir) {
+                info!(
+                    "Marking account '{}' as rate-limited for {}s",
+                    short_label(dir),
+                    default_cooldown.as_secs()
+                );
+                map.insert(dir.clone(), (Instant::now(), default_cooldown));
+            }
         }
 
         // Find the first account that is not in cooldown
@@ -105,21 +154,21 @@ pub fn rotate_account_on_rate_limit() -> bool {
             current.as_ref() != Some(*d)
                 && map
                     .get(*d)
-                    .is_none_or(|t| t.elapsed().as_secs() >= RATE_LIMIT_COOLDOWN_SECS)
+                    .is_none_or(|(marked_at, cooldown)| marked_at.elapsed() >= *cooldown)
         });
 
         if let Some(dir) = available {
             Some(dir.clone())
         } else {
             // All accounts are in cooldown — pick the one closest to expiry
-            // (most elapsed time since it was marked)
+            // (smallest remaining = `cooldown - elapsed`).
             let best = config_dirs
                 .iter()
                 .filter(|d| current.as_ref() != Some(*d))
-                .max_by_key(|d| {
+                .min_by_key(|d| {
                     map.get(*d)
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(u64::MAX) // never rate-limited = best candidate
+                        .map(|(marked_at, cooldown)| cooldown.saturating_sub(marked_at.elapsed()))
+                        .unwrap_or(Duration::ZERO) // never rate-limited = best candidate
                 });
             best.cloned()
         }
@@ -132,7 +181,7 @@ pub fn rotate_account_on_rate_limit() -> bool {
         let was_all_limited = is_account_cooled_down(&dir);
         if was_all_limited {
             warn!(
-                "All accounts rate-limited, switching to least-recently-limited: '{}'",
+                "All accounts rate-limited, switching to closest-to-expiry: '{}'",
                 short_label(&dir)
             );
         } else {
@@ -156,7 +205,7 @@ pub fn rotate_account_on_rate_limit() -> bool {
 /// wait time until the earliest cooldown expires.
 ///
 /// Uses a single lock acquisition to avoid TOCTOU races.
-pub fn time_until_next_account_available() -> Option<std::time::Duration> {
+pub fn time_until_next_account_available() -> Option<Duration> {
     let config_dirs = settings::get_claude_config_dirs();
     if config_dirs.len() < 2 {
         return None;
@@ -167,19 +216,19 @@ pub fn time_until_next_account_available() -> Option<std::time::Duration> {
 
         // Check all accounts under one lock: compute remaining cooldown per account
         let mut all_in_cooldown = true;
-        let mut earliest_remaining: Option<u64> = None;
+        let mut earliest_remaining: Option<Duration> = None;
 
         for dir in &config_dirs {
-            if let Some(marked_at) = map.get(dir) {
-                let elapsed = marked_at.elapsed().as_secs();
-                if elapsed >= RATE_LIMIT_COOLDOWN_SECS {
+            if let Some((marked_at, cooldown)) = map.get(dir) {
+                let elapsed = marked_at.elapsed();
+                if elapsed >= *cooldown {
                     // This account's cooldown has expired — no waiting needed
                     all_in_cooldown = false;
                     break;
                 }
-                let remaining = RATE_LIMIT_COOLDOWN_SECS - elapsed;
+                let remaining = *cooldown - elapsed;
                 earliest_remaining =
-                    Some(earliest_remaining.map_or(remaining, |prev: u64| prev.min(remaining)));
+                    Some(earliest_remaining.map_or(remaining, |prev| prev.min(remaining)));
             } else {
                 // Account was never rate-limited — it's available
                 all_in_cooldown = false;
@@ -188,7 +237,7 @@ pub fn time_until_next_account_available() -> Option<std::time::Duration> {
         }
 
         if all_in_cooldown {
-            earliest_remaining.map(std::time::Duration::from_secs)
+            earliest_remaining
         } else {
             None
         }
@@ -207,13 +256,15 @@ pub fn force_unlock_earliest_account() -> bool {
 
     let best = if let Ok(mut cooldowns) = ACCOUNT_COOLDOWNS.lock() {
         if let Some(map) = cooldowns.as_mut() {
-            // Find account with the oldest cooldown (most elapsed time)
+            // Find account with the oldest cooldown (most elapsed time since marked).
+            // Accounts not in the map count as "infinitely old" — i.e. never cooled,
+            // so they're the best candidates to unlock-and-switch-to.
             let best = config_dirs
                 .iter()
                 .max_by_key(|d| {
                     map.get(*d)
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(u64::MAX)
+                        .map(|(marked_at, _)| marked_at.elapsed())
+                        .unwrap_or(Duration::MAX)
                 })
                 .cloned();
             // Clear its cooldown
@@ -291,4 +342,115 @@ pub fn switch_to_account(config_dir: &str) -> bool {
     );
     set_resolved_config_dir(Some(config_dir.to_string()));
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+
+    /// Remove a specific dir from the static `ACCOUNT_COOLDOWNS` map.
+    ///
+    /// Tests share this static, so each test uses a unique dir path and
+    /// clears only its own entries. Wiping the entire map would race with
+    /// concurrent tests in `account_usage::tests` that mark their own dirs.
+    fn clear_dir(dir: &str) {
+        if let Ok(mut cooldowns) = ACCOUNT_COOLDOWNS.lock() {
+            if let Some(map) = cooldowns.as_mut() {
+                map.remove(dir);
+            }
+        }
+    }
+
+    #[test]
+    fn mark_with_duration_then_is_cooled_then_expires() {
+        let dir = "/test/config/mark_with_duration";
+        clear_dir(dir);
+        mark_account_rate_limited_with_duration(dir, Duration::from_millis(50));
+        assert!(
+            is_account_cooled_down(dir),
+            "account should be cooled immediately after marking"
+        );
+        sleep(Duration::from_millis(80));
+        assert!(
+            !is_account_cooled_down(dir),
+            "account should no longer be cooled after the duration elapses"
+        );
+        clear_dir(dir);
+    }
+
+    #[test]
+    fn time_until_cooled_down_returns_remaining() {
+        let dir = "/test/config/time_remaining";
+        clear_dir(dir);
+        let total = Duration::from_secs(120);
+        mark_account_rate_limited_with_duration(dir, total);
+        let remaining = time_until_cooled_down(dir).expect("should be cooled");
+        // Within a few seconds tolerance — the test exec time is the only delta.
+        assert!(
+            remaining <= total && remaining + Duration::from_secs(5) >= total,
+            "expected ~{}s remaining, got {}s",
+            total.as_secs(),
+            remaining.as_secs()
+        );
+        clear_dir(dir);
+    }
+
+    #[test]
+    fn time_until_cooled_down_returns_none_when_unmarked() {
+        let dir = "/test/config/never_marked";
+        clear_dir(dir);
+        assert!(time_until_cooled_down(dir).is_none());
+    }
+
+    #[test]
+    fn time_until_cooled_down_returns_none_after_expiry() {
+        let dir = "/test/config/expired";
+        clear_dir(dir);
+        mark_account_rate_limited_with_duration(dir, Duration::from_millis(30));
+        sleep(Duration::from_millis(60));
+        assert!(
+            time_until_cooled_down(dir).is_none(),
+            "expired cooldown should report None"
+        );
+        clear_dir(dir);
+    }
+
+    #[test]
+    fn long_cooldown_survives_rotate_default_remark() {
+        // Regression: if a 600s cooldown is set by an API provider via
+        // `mark_account_rate_limited_with_duration`, calling
+        // `rotate_account_on_rate_limit` must NOT overwrite it with the
+        // shorter default (300s).
+        //
+        // This test only exercises the cooldown map itself — we can't invoke
+        // `rotate_account_on_rate_limit` without setting up `settings`. The
+        // protected invariant is the `map.contains_key` branch in
+        // `rotate_account_on_rate_limit`; simulate that branch directly.
+        let dir = "/test/config/long_cooldown";
+        clear_dir(dir);
+        let long = Duration::from_secs(600);
+        mark_account_rate_limited_with_duration(dir, long);
+
+        // Simulate the guarded re-mark logic from `rotate_account_on_rate_limit`.
+        let already_marked = ACCOUNT_COOLDOWNS
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|m| m.contains_key(dir)))
+            .unwrap_or(false);
+        assert!(
+            already_marked,
+            "account should be in the cooldown map before the rotate guard fires"
+        );
+
+        // Verify the original long duration is still in effect (would be the
+        // case after `rotate_account_on_rate_limit` no-ops the re-mark).
+        let remaining = time_until_cooled_down(dir).expect("still cooled");
+        assert!(
+            remaining > Duration::from_secs(500),
+            "long cooldown should still be in effect, got {}s",
+            remaining.as_secs()
+        );
+        clear_dir(dir);
+    }
 }

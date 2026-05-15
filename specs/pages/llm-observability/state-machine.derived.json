@@ -554,21 +554,6 @@
       "name": "Dashboard Loading & Error States",
       "assertions": [
         {
-          "id": "llm-loading-error-states-elem-0",
-          "description": "Required element 0 for state Dashboard Loading & Error States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Dashboard Loading & Error States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "llm-loading-error-states-elem-1",
           "description": "Required element 1 for state Dashboard Loading & Error States",
           "category": "element-presence",
@@ -991,21 +976,6 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
-        },
-        {
-          "id": "llm-navigation-elem-2",
-          "description": "Required element 2 for state Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
         }
       ],
       "description": "Assertions verifying dashboard accessibility via tab navigation, state persistence, and scroll behavior.",
@@ -1159,36 +1129,6 @@
             "criteria": {
               "id": "llm-analytics-time-range"
             },
-            "label": "Required element for UI Bridge Element Registrations"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "llm-ui-bridge-registrations-elem-3",
-          "description": "Required element 3 for state UI Bridge Element Registrations",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for UI Bridge Element Registrations"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "llm-ui-bridge-registrations-elem-4",
-          "description": "Required element 4 for state UI Bridge Element Registrations",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for UI Bridge Element Registrations"
           },
           "source": "migrated",

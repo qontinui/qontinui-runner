@@ -853,21 +853,6 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
-        },
-        {
-          "id": "term-session-persistence-elem-3",
-          "description": "Required element 3 for state Session Persistence & Auto-Resume",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Session Persistence & Auto-Resume"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
         }
       ],
       "precondition": "Runner was restarted after Claude sessions were running in terminal zones",

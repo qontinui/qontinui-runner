@@ -9,6 +9,7 @@
 //! This module should be the ONLY place that spawns AI processes/calls.
 //! Other modules should use this module to interact with AI providers.
 
+pub mod account_usage;
 pub mod cache_aware_builder;
 pub mod circuit_breaker;
 mod claude_api;
@@ -29,6 +30,7 @@ pub(crate) mod routing;
 mod types;
 
 // Re-export public API
+pub use account_usage::pick_best_account;
 pub use cache_aware_builder::StructuredPrompt;
 pub use config::{
     get_account_statuses, get_effective_config_dir, get_resolved_config_dir,

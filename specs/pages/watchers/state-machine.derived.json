@@ -23,6 +23,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "watchers-navigation-discriminator",
+          "description": "Distinctness discriminator for state Page Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Page Navigation"
+            },
+            "label": "Discriminator for Page Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Watchers page is under the Observe sidebar group, adjacent to Activity Timeline. It is a runner-only page.",
@@ -35,36 +52,6 @@
       "name": "Page Purpose",
       "assertions": [
         {
-          "id": "watchers-semantic-elem-0",
-          "description": "Required element 0 for state Page Purpose",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Page Purpose"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-semantic-elem-1",
-          "description": "Required element 1 for state Page Purpose",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Page Purpose"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "watchers-semantic-elem-2",
           "description": "Required element 2 for state Page Purpose",
           "category": "element-presence",
@@ -76,6 +63,23 @@
               "textContains": "("
             },
             "label": "Required element for Page Purpose"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "watchers-semantic-discriminator",
+          "description": "Distinctness discriminator for state Page Purpose",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Page Purpose"
+            },
+            "label": "Discriminator for Page Purpose"
           },
           "source": "migrated",
           "reviewed": false,
@@ -122,36 +126,6 @@
               "role": "button",
               "textContains": "Cancel"
             },
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-2",
-          "description": "Required element 2 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-3",
-          "description": "Required element 3 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Core UI Elements"
           },
           "source": "migrated",
@@ -210,36 +184,6 @@
           "enabled": true
         },
         {
-          "id": "watchers-element-presence-elem-7",
-          "description": "Required element 7 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-8",
-          "description": "Required element 8 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "watchers-element-presence-elem-9",
           "description": "Required element 9 for state Core UI Elements",
           "category": "element-presence",
@@ -251,36 +195,6 @@
               "role": "button",
               "textContains": "Create Watcher"
             },
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-10",
-          "description": "Required element 10 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-11",
-          "description": "Required element 11 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Core UI Elements"
           },
           "source": "migrated",
@@ -298,51 +212,6 @@
       "id": "watchers-data-display",
       "name": "Watcher Card Data Display",
       "assertions": [
-        {
-          "id": "watchers-data-display-elem-0",
-          "description": "Required element 0 for state Watcher Card Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Watcher Card Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-data-display-elem-1",
-          "description": "Required element 1 for state Watcher Card Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Watcher Card Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-data-display-elem-2",
-          "description": "Required element 2 for state Watcher Card Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Watcher Card Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "watchers-data-display-elem-3",
           "description": "Required element 3 for state Watcher Card Data Display",
@@ -393,21 +262,6 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
-        },
-        {
-          "id": "watchers-data-display-elem-6",
-          "description": "Required element 6 for state Watcher Card Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Watcher Card Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
         }
       ],
       "description": "Each watcher is displayed as a bordered card. The card shows the watcher name (font-medium), FTS query in a code element (bg-muted), lookback window with Clock icon, last run timestamp, and optional filter labels.",
@@ -420,36 +274,6 @@
       "id": "watchers-interaction",
       "name": "User Interactions",
       "assertions": [
-        {
-          "id": "watchers-interaction-elem-0",
-          "description": "Required element 0 for state User Interactions",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for User Interactions"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-interaction-elem-1",
-          "description": "Required element 1 for state User Interactions",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for User Interactions"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "watchers-interaction-elem-2",
           "description": "Required element 2 for state User Interactions",
@@ -606,21 +430,6 @@
               "role": "button",
               "textContains": "New Watcher"
             },
-            "label": "Required element for Automatic Behaviors"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-behavior-elem-2",
-          "description": "Required element 2 for state Automatic Behaviors",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Automatic Behaviors"
           },
           "source": "migrated",

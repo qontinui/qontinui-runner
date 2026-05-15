@@ -105,21 +105,6 @@
           "enabled": true
         },
         {
-          "id": "bk-data-summary-elem-2",
-          "description": "Required element 2 for state Your Data — Summary Section",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Your Data — Summary Section"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "bk-data-summary-elem-3",
           "description": "Required element 3 for state Your Data — Summary Section",
           "category": "element-presence",
@@ -257,6 +242,23 @@
               "text": "Export"
             },
             "label": "Required element for Export Options — Category Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bk-export-options-panel-discriminator",
+          "description": "Distinctness discriminator for state Export Options — Category Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Export Options — Category Selector"
+            },
+            "label": "Discriminator for Export Options — Category Selector"
           },
           "source": "migrated",
           "reviewed": false,
@@ -413,21 +415,6 @@
               "role": "button",
               "text": "Cancel"
             },
-            "label": "Required element for Import Preview — File Metadata Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "bk-import-preview-metadata-elem-2",
-          "description": "Required element 2 for state Import Preview — File Metadata Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Import Preview — File Metadata Display"
           },
           "source": "migrated",
@@ -668,51 +655,6 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
-        },
-        {
-          "id": "bk-import-flow-elem-1",
-          "description": "Required element 1 for state Import Flow — End-to-End Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Import Flow — End-to-End Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "bk-import-flow-elem-2",
-          "description": "Required element 2 for state Import Flow — End-to-End Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Import Flow — End-to-End Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "bk-import-flow-elem-3",
-          "description": "Required element 3 for state Import Flow — End-to-End Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Import Flow — End-to-End Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
         }
       ],
       "description": "Clicking 'Import Data' invokes import_all_data with the parsed backup data and current ImportOptions. Per-category import uses INSERT ... ON CONFLICT: 'skip' mode does nothing on conflict, 'overwrite' mode updates existing rows. After completion: importResult is set, importPreview and pendingImportData are cleared, and get_export_summary is called to refresh the data summary counts.",
@@ -726,21 +668,6 @@
       "name": "Import Result — Successful Import",
       "assertions": [
         {
-          "id": "bk-import-result-success-elem-0",
-          "description": "Required element 0 for state Import Result — Successful Import",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Import Result — Successful Import"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "bk-import-result-success-elem-1",
           "description": "Required element 1 for state Import Result — Successful Import",
           "category": "element-presence",
@@ -751,21 +678,6 @@
             "criteria": {
               "text": "Imported:"
             },
-            "label": "Required element for Import Result — Successful Import"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "bk-import-result-success-elem-2",
-          "description": "Required element 2 for state Import Result — Successful Import",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Import Result — Successful Import"
           },
           "source": "migrated",
@@ -783,21 +695,6 @@
       "id": "bk-import-result-errors",
       "name": "Import Result — Import With Errors",
       "assertions": [
-        {
-          "id": "bk-import-result-errors-elem-0",
-          "description": "Required element 0 for state Import Result — Import With Errors",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Import Result — Import With Errors"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "bk-import-result-errors-elem-1",
           "description": "Required element 1 for state Import Result — Import With Errors",

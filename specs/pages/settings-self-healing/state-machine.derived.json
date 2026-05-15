@@ -104,21 +104,6 @@
       "name": "Loading State",
       "assertions": [
         {
-          "id": "sh-loading-state-elem-0",
-          "description": "Required element 0 for state Loading State",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Loading State"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "sh-loading-state-elem-1",
           "description": "Required element 1 for state Loading State",
           "category": "element-presence",
@@ -130,6 +115,23 @@
               "text": "Self-Healing Configuration"
             },
             "label": "Required element for Loading State"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sh-loading-state-discriminator",
+          "description": "Distinctness discriminator for state Loading State",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Loading State"
+            },
+            "label": "Discriminator for Loading State"
           },
           "source": "migrated",
           "reviewed": false,
@@ -401,21 +403,6 @@
       "name": "LLM Assistance — Local Ollama Configuration",
       "assertions": [
         {
-          "id": "sh-llm-local-ollama-elem-0",
-          "description": "Required element 0 for state LLM Assistance — Local Ollama Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for LLM Assistance — Local Ollama Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "sh-llm-local-ollama-elem-1",
           "description": "Required element 1 for state LLM Assistance — Local Ollama Configuration",
           "category": "element-presence",
@@ -426,21 +413,6 @@
             "criteria": {
               "text": "Model Name"
             },
-            "label": "Required element for LLM Assistance — Local Ollama Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "sh-llm-local-ollama-elem-2",
-          "description": "Required element 2 for state LLM Assistance — Local Ollama Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for LLM Assistance — Local Ollama Configuration"
           },
           "source": "migrated",
@@ -459,21 +431,6 @@
       "id": "sh-llm-remote-api",
       "name": "LLM Assistance — Remote API Configuration",
       "assertions": [
-        {
-          "id": "sh-llm-remote-api-elem-0",
-          "description": "Required element 0 for state LLM Assistance — Remote API Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for LLM Assistance — Remote API Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "sh-llm-remote-api-elem-1",
           "description": "Required element 1 for state LLM Assistance — Remote API Configuration",
@@ -507,21 +464,6 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
-        },
-        {
-          "id": "sh-llm-remote-api-elem-3",
-          "description": "Required element 3 for state LLM Assistance — Remote API Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for LLM Assistance — Remote API Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
         }
       ],
       "description": "When LLM Mode is 'Remote API', a sub-section appears labeled 'Remote API Configuration' with a Cloud icon. It contains an API Provider dropdown (OpenAI or Anthropic) and an API key management area. Changing the provider triggers a fresh keychain check. This sub-section is exclusive to Remote API mode.",
@@ -535,21 +477,6 @@
       "id": "sh-api-key-management",
       "name": "API Key Management — Two-State UI",
       "assertions": [
-        {
-          "id": "sh-api-key-management-elem-0",
-          "description": "Required element 0 for state API Key Management — Two-State UI",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for API Key Management — Two-State UI"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
         {
           "id": "sh-api-key-management-elem-1",
           "description": "Required element 1 for state API Key Management — Two-State UI",

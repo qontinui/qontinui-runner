@@ -523,36 +523,6 @@
           "enabled": true
         },
         {
-          "id": "wf-htn-planning-elem-6",
-          "description": "Required element 6 for state HTN Planning Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for HTN Planning Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "wf-htn-planning-elem-7",
-          "description": "Required element 7 for state HTN Planning Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for HTN Planning Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "wf-htn-planning-elem-8",
           "description": "Required element 8 for state HTN Planning Configuration",
           "category": "element-presence",

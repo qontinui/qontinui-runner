@@ -63,6 +63,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "page-layout-structure-discriminator",
+          "description": "Distinctness discriminator for state Page Layout & Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Page Layout & Structure"
+            },
+            "label": "Discriminator for Page Layout & Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The MetaOptimizerPage renders a horizontal tab bar at the top and a scrollable content area below. The tab bar contains 14 tabs. The page fills the full height of its container.",
@@ -397,6 +414,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "duel-pools-copeland-correctness-discriminator",
+          "description": "Distinctness discriminator for state Duel Pools — Copeland Ranking Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Duel Pools — Copeland Ranking Correctness"
+            },
+            "label": "Discriminator for Duel Pools — Copeland Ranking Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Copeland ranking displayed in the candidates table must correctly reflect pairwise dominance. This validates the duel engine's ranking algorithm output as displayed on the page.",
@@ -546,36 +580,6 @@
               "role": "heading",
               "textContains": "Span Events"
             },
-            "label": "Required element for Span Events — Filter Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "span-events-filters-elem-1",
-          "description": "Required element 1 for state Span Events — Filter Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Span Events — Filter Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "span-events-filters-elem-2",
-          "description": "Required element 2 for state Span Events — Filter Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
             "label": "Required element for Span Events — Filter Controls"
           },
           "source": "migrated",
@@ -897,6 +901,23 @@
               "role": "button"
             },
             "label": "Required element for Accessibility"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "accessibility-discriminator",
+          "description": "Distinctness discriminator for state Accessibility",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Accessibility"
+            },
+            "label": "Discriminator for Accessibility"
           },
           "source": "migrated",
           "reviewed": false,

@@ -358,6 +358,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "blame-revert-patterns-discriminator",
+          "description": "Distinctness discriminator for state Revert Pattern Warnings",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Revert Pattern Warnings"
+            },
+            "label": "Discriminator for Revert Pattern Warnings"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Revert patterns are detected when a file is modified in a non-consecutive alternating pattern (present, absent, present) across iterations with at least 2 gaps. This indicates the AI's changes are being undone — possibly by other fixes that conflict, or by the AI itself reverting its previous approach. These are shown separately from oscillation warnings because the behavior pattern (intermittent vs consecutive) and the recommended response differ. Revert patterns are excluded for files already flagged as oscillating to avoid duplicate warnings.",

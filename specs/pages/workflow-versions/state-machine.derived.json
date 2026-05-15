@@ -128,6 +128,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "workflow-versions-triggers-discriminator",
+          "description": "Distinctness discriminator for state Trigger Type Color Coding",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Trigger Type Color Coding"
+            },
+            "label": "Discriminator for Trigger Type Color Coding"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Trigger types are color-coded: green for generation, purple for reflection, blue for manual, orange for fix.",

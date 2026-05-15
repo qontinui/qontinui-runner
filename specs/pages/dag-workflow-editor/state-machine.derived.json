@@ -8,21 +8,6 @@
       "name": "Page Structure",
       "assertions": [
         {
-          "id": "dag-page-structure-elem-0",
-          "description": "Required element 0 for state Page Structure",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Page Structure"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "dag-page-structure-elem-1",
           "description": "Required element 1 for state Page Structure",
           "category": "element-presence",
@@ -548,6 +533,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "dag-graph-layout-discriminator",
+          "description": "Distinctness discriminator for state Graph Layout and Navigation Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Graph Layout and Navigation Controls"
+            },
+            "label": "Discriminator for Graph Layout and Navigation Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The graph uses dagre top-to-bottom layout (rankdir=TB). ReactFlow controls appear at bottom-left of the graph pane (zoom in/out, fit view). A minimap appears at bottom-right. The graph supports scroll-to-zoom and drag-to-pan.",
@@ -589,6 +591,23 @@
               "tagName": "div"
             },
             "label": "Required element for Split-Pane Resize Handle"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "dag-resize-handle-discriminator",
+          "description": "Distinctness discriminator for state Split-Pane Resize Handle",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Split-Pane Resize Handle"
+            },
+            "label": "Discriminator for Split-Pane Resize Handle"
           },
           "source": "migrated",
           "reviewed": false,
@@ -732,6 +751,23 @@
               "text": "Errors"
             },
             "label": "Required element for YAML Schema Correctness — Domain Logic"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "dag-yaml-schema-correctness-discriminator",
+          "description": "Distinctness discriminator for state YAML Schema Correctness — Domain Logic",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "YAML Schema Correctness — Domain Logic"
+            },
+            "label": "Discriminator for YAML Schema Correctness — Domain Logic"
           },
           "source": "migrated",
           "reviewed": false,

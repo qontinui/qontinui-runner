@@ -178,6 +178,16 @@ impl LoopController {
         let all_step_results = Vec::new();
 
         // =====================================================================
+        // PICK BEST CLAUDE ACCOUNT for this workflow run
+        // =====================================================================
+        // Pin the account with the most-available cooldown state (first
+        // non-cooled, else closest-to-expiry). Runs once per workflow so
+        // warm-provider prompt-cache locality is preserved across the
+        // workflow's many AI calls. No-op unless multi-account least-usage
+        // mode is enabled in settings.
+        let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+
+        // =====================================================================
         // PROPAGATE TASK RUN ID to phase executors
         // =====================================================================
         // The execution_id is the task_run_id. Phase executors need it so their

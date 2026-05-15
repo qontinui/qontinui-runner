@@ -215,6 +215,23 @@
           "source": "migrated",
           "reviewed": false,
           "enabled": true
+        },
+        {
+          "id": "cg-execution-config-discriminator",
+          "description": "Distinctness discriminator for state Execution Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Execution Configuration"
+            },
+            "label": "Discriminator for Execution Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Check groups support configuring how their constituent checks are executed. Users can choose between sequential execution (checks run one after another) and parallel execution (checks run concurrently for faster verification). The stop-on-failure flag controls whether the group halts at the first failing check or continues to run all checks to collect complete results. These options let users balance between execution speed, early failure detection, and comprehensive reporting depending on their workflow needs.",

@@ -9,8 +9,36 @@ use super::types::AiResponse;
 use crate::config_facade::ai_keychain;
 use crate::doctor::DoctorHandle;
 use crate::settings;
+use reqwest::StatusCode;
 use serde_json::Value;
+use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Default cooldown applied to a rate-limited account when the server
+/// response omits a `Retry-After` header. Five minutes — same as
+/// `config::RATE_LIMIT_COOLDOWN_SECS`.
+const DEFAULT_RETRY_AFTER_SECS: u64 = 300;
+
+/// Parse `Retry-After` from a 429 response and mark the currently-resolved
+/// Claude account as rate-limited for that duration. The retry layer in
+/// `super::retry` will then rotate to another account (and because
+/// [`super::config::rotate_account_on_rate_limit`] won't re-mark an account
+/// that's already in the cooldown map, the precise duration we set here
+/// survives).
+///
+/// If no account is resolved (manual mode without a resolved dir), this is
+/// a no-op — the generic cooldown rotation handles it on the next pass.
+fn mark_current_account_rate_limited(headers: &reqwest::header::HeaderMap) {
+    let Some(dir) = super::config::get_resolved_config_dir() else {
+        return;
+    };
+    let secs = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RETRY_AFTER_SECS);
+    super::config::mark_account_rate_limited_with_duration(&dir, Duration::from_secs(secs));
+}
 
 /// Run a prompt via Claude API (direct HTTP calls)
 ///
@@ -80,6 +108,9 @@ pub(super) fn run_claude_api(
             Ok(resp) => {
                 if !resp.status().is_success() {
                     let status = resp.status();
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        mark_current_account_rate_limited(resp.headers());
+                    }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!("Claude API error ({}): {}", status, body));
                 }
@@ -183,6 +214,9 @@ pub(super) fn run_claude_api_with_overrides(
             Ok(resp) => {
                 if !resp.status().is_success() {
                     let status = resp.status();
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        mark_current_account_rate_limited(resp.headers());
+                    }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!("Claude API error ({}): {}", status, body));
                 }
@@ -295,6 +329,9 @@ pub(super) fn run_claude_api_multimodal(
             Ok(resp) => {
                 if !resp.status().is_success() {
                     let status = resp.status();
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        mark_current_account_rate_limited(resp.headers());
+                    }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!(
                         "Claude API multimodal error ({}): {}",
@@ -398,6 +435,9 @@ pub(super) fn run_claude_api_cached(
             Ok(resp) => {
                 if !resp.status().is_success() {
                     let status = resp.status();
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        mark_current_account_rate_limited(resp.headers());
+                    }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!(
                         "Claude API cached error ({}): {}",
@@ -540,6 +580,9 @@ pub(super) fn run_claude_api_with_structured_output(
             Ok(resp) => {
                 if !resp.status().is_success() {
                     let status = resp.status();
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        mark_current_account_rate_limited(resp.headers());
+                    }
                     let body = resp.text().unwrap_or_default();
                     return AiResponse::error(format!(
                         "Claude API structured output error ({}): {}",

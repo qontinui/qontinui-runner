@@ -1606,51 +1606,6 @@
           "enabled": true
         },
         {
-          "id": "sm-exploration-discrepancies-elem-1",
-          "description": "Required element 1 for state Exploration Results: Discrepancy Severity Groups",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Exploration Results: Discrepancy Severity Groups"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "sm-exploration-discrepancies-elem-2",
-          "description": "Required element 2 for state Exploration Results: Discrepancy Severity Groups",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Exploration Results: Discrepancy Severity Groups"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "sm-exploration-discrepancies-elem-3",
-          "description": "Required element 3 for state Exploration Results: Discrepancy Severity Groups",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {},
-            "label": "Required element for Exploration Results: Discrepancy Severity Groups"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
           "id": "sm-exploration-discrepancies-elem-4",
           "description": "Required element 4 for state Exploration Results: Discrepancy Severity Groups",
           "category": "element-presence",
@@ -2193,6 +2148,23 @@
               "role": "generic"
             },
             "label": "Required element for State Model Rules (qontinui/multistate)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sm-state-model-rules-discriminator",
+          "description": "Distinctness discriminator for state State Model Rules (qontinui/multistate)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "State Model Rules (qontinui/multistate)"
+            },
+            "label": "Discriminator for State Model Rules (qontinui/multistate)"
           },
           "source": "migrated",
           "reviewed": false,
