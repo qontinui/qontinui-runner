@@ -11,8 +11,27 @@
 # per link), defeating cross-worktree CAS dedup. Spike artifacts at
 # tmp_spike_bazel_remote/ + memory `proj_canonical_diff_hash_recipe`
 # document the empirical proof.
+#
+# --remap-path-prefix collapses the per-worktree absolute prefix in
+# rustc's compile-unit identity so sccache cache keys are path-
+# independent across worktrees on the same machine. Without it,
+# sccache hit rate cross-worktree is 0% (Row 2 Phase 2 baseline
+# 2026-05-14, `qontinui-dev-notes/sccache-baseline-2026-05-14.md`).
+# Order matters: longer prefix (D:/qontinui-root.wt) must come BEFORE
+# shorter prefix (D:/qontinui-root) — rustc applies remaps in given
+# order and first-match wins, otherwise `D:/qontinui-root.wt/agent/`
+# would match `D:/qontinui-root` first and rewrite to `/qontinui.wt/agent`.
+# For variable per-agent worktree paths (e.g. D:/qontinui-root.wt/<id>/),
+# the agent shell additionally sets RUSTFLAGS at invocation time:
+#     $env:RUSTFLAGS = "--remap-path-prefix=$WORKTREE_ROOT=/qontinui-worktree"
+# See plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.5 +
+# Row 2 Phase 3.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-args=/STACK:8388608 /Brepro"]
+rustflags = [
+    "-C", "link-args=/STACK:8388608 /Brepro",
+    "--remap-path-prefix=D:/qontinui-root.wt=/qontinui",
+    "--remap-path-prefix=D:/qontinui-root=/qontinui",
+]
 
 # Linux equivalent of /Brepro. ld embeds a per-link build-id by default,
 # which varies across builds of identical inputs. --build-id=none drops
@@ -21,8 +40,22 @@ rustflags = ["-C", "link-args=/STACK:8388608 /Brepro"]
 # without it run normally, and the workspace profile already strips
 # debuginfo so nothing downstream depends on it. Same Row 10 / Wave 0
 # rationale.
+#
+# Linux path-remap covers the typical CI runner checkout location and
+# the dev-machine `~/qontinui-root.wt/` convention. CI runners use
+# ephemeral workers where path-remap value matters less; entries here
+# stay in sync with the Windows form for cache-key parity. Per-shell
+# RUSTFLAGS still needed for variable worktree-root paths.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,--build-id=none"]
+rustflags = [
+    "-C", "link-arg=-Wl,--build-id=none",
+    "--remap-path-prefix=/home/runner/qontinui-root.wt=/qontinui",
+    "--remap-path-prefix=/home/runner/qontinui-root=/qontinui",
+]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,--build-id=none"]
+rustflags = [
+    "-C", "link-arg=-Wl,--build-id=none",
+    "--remap-path-prefix=/home/runner/qontinui-root.wt=/qontinui",
+    "--remap-path-prefix=/home/runner/qontinui-root=/qontinui",
+]
