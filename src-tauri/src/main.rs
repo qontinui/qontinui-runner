@@ -56,6 +56,10 @@ mod executor;
 mod exploration;
 mod findings;
 mod fixer;
+// Row 2 Phase 1 (fleet topology + per-machine budget). Detects local
+// resources on startup and UPSERTs role + budget onto `coord.machines`
+// so `GET /coord/fleet` can answer "where do I have agent capacity?".
+mod fleet;
 mod flow_control;
 mod follow_up;
 mod fs_atomic;
@@ -379,6 +383,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             .build()
             .expect("Failed to create tokio runtime for online learning init");
         rt.block_on(online_learning::initialize(&ol_pg));
+    }
+
+    // Row 2 Phase 1: publish this runner's MachineBudget to coord.machines
+    // (role = agent, max_concurrent_agents derived from RAM via §3.2 policy).
+    // Best-effort — failures log a warning and the runner still boots.
+    // See `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2
+    // and `fleet.rs::publish_on_startup`.
+    {
+        let fleet_pg = pg_db.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime for fleet publish");
+        rt.block_on(fleet::publish_on_startup(
+            &fleet_pg,
+            fleet::MachineRole::Agent,
+        ));
     }
 
     // Migrate plaintext API keys to secure keychain storage
