@@ -677,13 +677,16 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/invoke/{}"),
             ("POST", "/ui-bridge/pong"),
             ("POST", "/ui-bridge/ipc-response"),
-            ("POST", "/ui-bridge/vision/mutation-occurred"),
-            ("POST", "/ui-bridge/vision/extract"),
-            ("POST", "/ui-bridge/vision/describe"),
-            ("POST", "/ui-bridge/vision/analyze"),
-            ("POST", "/ui-bridge/vision/assert"),
-            ("POST", "/ui-bridge/vision/baseline"),
-            ("GET", "/ui-bridge/vision/baselines"),
+            // NOTE: the Phase 4/6 `/vision/*` routes (extract, describe,
+            // analyze, assert, baseline, baselines, mutation-occurred) used
+            // to be listed here as runner-only extensions. ui-bridge #21
+            // promoted them into UI_BRIDGE_ROUTES, and the runner exposes
+            // them via `vision_routes::route_entries()`. They are now wired
+            // end-to-end, so per the "promote … and remove from this list
+            // when wiring the SDK side" rule above they are no longer
+            // runner-only and must NOT be filtered out of the runner set —
+            // keeping them here re-introduced spurious "SDK declares but
+            // runner does not expose" drift.
             ("POST", "/ui-bridge/batch"),
             ("POST", "/ui-bridge/control/batch"),
             ("POST", "/ui-bridge/render-log"),
