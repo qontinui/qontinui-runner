@@ -31,6 +31,10 @@ pub mod rules;
 pub mod schema_context;
 pub mod self_improve;
 pub mod similar_workflows;
+// Stream E (Flywheel) — coverage-growth loop. Gated behind the
+// `spec-authoring` Cargo feature so default builds never compile it.
+#[cfg(feature = "spec-authoring")]
+pub mod spec_authoring;
 pub mod spec_synthesis;
 pub mod specification;
 pub mod step_type_knowledge;

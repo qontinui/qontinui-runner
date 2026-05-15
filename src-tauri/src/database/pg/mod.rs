@@ -74,6 +74,7 @@ pub mod session_touched_files;
 pub mod settings;
 pub mod skills;
 pub mod spec_experimentation;
+pub mod spec_proposals;
 pub mod state_machine;
 pub mod step_type_knowledge;
 pub mod task_run_events;

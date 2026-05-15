@@ -28,6 +28,9 @@ pub mod responses;
 pub mod storage;
 pub mod types;
 
+#[cfg(feature = "spec-authoring")]
+pub mod proposals;
+
 #[cfg(test)]
 mod tests;
 
@@ -42,7 +45,7 @@ use crate::mcp::types::ApiState;
 /// the Section 2 plan ("Spec API is consumed differently from the UI
 /// Bridge").
 pub fn routes() -> Router<Arc<ApiState>> {
-    Router::new()
+    let r = Router::new()
         .route("/spec/health", get(handlers::get_health))
         .route("/spec/get", get(handlers::get_file))
         .route("/spec/page/{id}", get(handlers::get_page))
@@ -53,5 +56,19 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/spec/diff", get(handlers::get_diff))
         .route("/spec/author", post(handlers::post_author))
         .route("/spec/validate", post(handlers::post_validate))
-        .route("/spec/subscribe", get(handlers::get_subscribe))
+        .route("/spec/subscribe", get(handlers::get_subscribe));
+
+    // Stream E (Flywheel) — coverage-growth queue endpoints. Gated behind
+    // `spec-authoring` so v1.0 release builds don't expose the proposals
+    // queue surface area.
+    #[cfg(feature = "spec-authoring")]
+    let r = r
+        .route("/spec/proposals/scan", post(proposals::post_scan))
+        .route("/spec/proposals", get(proposals::get_list))
+        .route(
+            "/spec/proposals/{id}/execute",
+            post(proposals::post_execute),
+        );
+
+    r
 }

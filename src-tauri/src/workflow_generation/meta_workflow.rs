@@ -1262,6 +1262,148 @@ fn build_past_fixes_section() -> String {
     String::new()
 }
 
+// ---------------------------------------------------------------------------
+// Stream E (Flywheel) — spec-authoring priming context
+// ---------------------------------------------------------------------------
+//
+// Builds a HistoricalContext priming bundle tuned for spec-authoring rather
+// than workflow generation. The `spec_authoring` module composes the
+// skeleton + the AI fill-in via the meta-workflow template; this helper is
+// the priming-corpus loader for that second step. Selection is by Jaccard
+// similarity of cluster element fingerprints (state assertions / element
+// criteria identifiers). Reuses the standard `similar_workflows` formatters
+// so the prompt shape is identical to the workflow-generation path.
+//
+// Gated behind `spec-authoring` so the default build doesn't pull in
+// `spec_api::storage`/IR-walking helpers it doesn't otherwise need.
+#[cfg(feature = "spec-authoring")]
+pub async fn build_spec_priming_context(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    skeleton: &qontinui_types::ir::IrPageSpec,
+    top_k: usize,
+) -> Option<HistoricalContext> {
+    use crate::spec_api::{storage, types::IrPageSpec};
+
+    // Build the skeleton's fingerprint set once. Each IrElementCriteria
+    // contributes its `id`/`aria_label`/`tag_name+text` (whichever is set,
+    // in stable priority order) as a token.
+    fn fingerprint_tokens(spec: &IrPageSpec) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for state in &spec.states {
+            // assertions live in IrAssertion.target.criteria as free-form
+            // JSON; we only extract from `excluded_elements` since the
+            // skeleton stores discovered fingerprints there.
+            if let Some(excluded) = &state.excluded_elements {
+                for crit in excluded {
+                    if let Some(id) = &crit.id {
+                        out.insert(format!("id:{}", id));
+                    } else if let Some(aria) = &crit.aria_label {
+                        out.insert(format!("aria:{}", aria));
+                    } else if let (Some(tag), Some(text)) = (&crit.tag_name, &crit.text) {
+                        out.insert(format!("tag:{}:{}", tag, text));
+                    } else if let Some(role) = &crit.role {
+                        out.insert(format!("role:{}", role));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    let skeleton_tokens = fingerprint_tokens(skeleton);
+    if skeleton_tokens.is_empty() {
+        // Fall back to the standard workflow path so we still get
+        // self-improvement context + GT references.
+        return build_historical_context_pg(pg_db, &skeleton.name, Some("spec-authoring")).await;
+    }
+
+    // List existing IR pages and rank by Jaccard similarity. We do a
+    // best-effort filesystem scan (cheap; <500 pages today) and skip any
+    // page that fails to read.
+    let root = storage::resolve_specs_root();
+    let candidates = storage::list_pages(&root).unwrap_or_default();
+
+    let mut scored: Vec<(f32, IrPageSpec)> = Vec::new();
+    for page_id in candidates {
+        if page_id == skeleton.id {
+            continue;
+        }
+        let Ok(Some(other)) = storage::read_ir(&root, &page_id) else {
+            continue;
+        };
+        let other_tokens = fingerprint_tokens(&other);
+        if other_tokens.is_empty() {
+            continue;
+        }
+        let intersection = skeleton_tokens.intersection(&other_tokens).count() as f32;
+        let union = skeleton_tokens.union(&other_tokens).count() as f32;
+        if union == 0.0 {
+            continue;
+        }
+        let jaccard = intersection / union;
+        if jaccard > 0.0 {
+            scored.push((jaccard, other));
+        }
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(top_k);
+
+    // Reuse the standard similar_workflows formatter — we synthesize a
+    // SimilarWorkflow row per IR so the prompt shape is identical to the
+    // workflow-gen path. Step counts collapse to state/transition counts.
+    let similar: Vec<super::similar_workflows::SimilarWorkflow> = scored
+        .iter()
+        .map(|(score, ir)| super::similar_workflows::SimilarWorkflow {
+            id: ir.id.clone(),
+            name: ir.name.clone(),
+            description: ir.description.clone().unwrap_or_default(),
+            category: "spec-authoring".into(),
+            setup_step_count: ir.states.len(),
+            verification_step_count: 0,
+            agentic_step_count: ir.transitions.len(),
+            completion_step_count: 0,
+            similarity: *score,
+            full_json: None,
+        })
+        .collect();
+
+    let similar_section = if similar.is_empty() {
+        String::new()
+    } else {
+        super::similar_workflows::format_similar_workflows(&similar)
+    };
+
+    // Pull self-improvement + GT-reference sections from the standard path
+    // so verifier focus items still come from the workflow corpus.
+    let baseline = build_historical_context_pg(pg_db, &skeleton.name, Some("spec-authoring")).await;
+
+    let (improvement_section, verifier_focus_items, past_fixes_section, gt_reference_section) =
+        match baseline {
+            Some(b) => (
+                b.improvement_section,
+                b.verifier_focus_items,
+                b.past_fixes_section,
+                b.gt_reference_section,
+            ),
+            None => (String::new(), Vec::new(), String::new(), String::new()),
+        };
+
+    if similar_section.is_empty()
+        && improvement_section.is_empty()
+        && gt_reference_section.is_empty()
+    {
+        return None;
+    }
+
+    Some(HistoricalContext {
+        improvement_section,
+        similar_section,
+        verifier_focus_items,
+        past_fixes_section,
+        gt_reference_section,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
