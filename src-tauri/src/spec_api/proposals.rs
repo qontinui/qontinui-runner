@@ -1,6 +1,6 @@
 //! Spec proposals — Stream E (Flywheel) coverage-growth queue.
 //!
-//! Three endpoints, mounted under `/spec/proposals/...` when the
+//! Four endpoints, mounted under `/spec/proposals/...` when the
 //! `spec-authoring` feature is enabled:
 //!
 //! - `POST /spec/proposals/scan` — discovers eligible `fullPage` candidates
@@ -8,18 +8,25 @@
 //!   `patch` candidates (drift-flagged specs), inserts them into
 //!   `project.spec_proposals` with `status = 'queued'`.
 //! - `POST /spec/proposals/{id}/execute` — drives one queued proposal through
-//!   `spec_authoring::author_candidate` and (in Step 8) the three-gate
-//!   validator. **This PR stubs the validator** — successful authoring lands
-//!   the candidate in `_pending/` via a placeholder writer; failures persist
-//!   the structured `AuthoringError` reason.
+//!   `spec_authoring::author_candidate` then `validator::validate_candidate`
+//!   (Step 8 — distinctness → round-trip → coverage → b-green) and lands
+//!   the candidate in `_pending/` via `storage::write_pending_ir` (Step 9).
+//!   On validator rejection the structured `ValidatorError` reason + detail
+//!   is persisted to `spec_proposals.last_error` and returned as `outcome:
+//!   "validator-rejected"`. Authoring failures stay distinct and surface as
+//!   `outcome: "authoring-failed"`.
+//! - `POST /spec/proposals/sweep-pending` — Step 9's 2-green sweep. Re-runs
+//!   gate-3 (B-green) against every `pendingPromotion` row; on Ok bumps
+//!   `consecutive_greens` and promotes at ≥ 2; on `BExecutionRed` demotes
+//!   immediately back to `queued`; on infra error (snapshot fetch failed
+//!   etc.) only `last_attempt_at` moves.
 //! - `GET /spec/proposals` — paginated list of all proposal rows.
 //!
-//! See `qontinui-dev-notes/spec-check-v1/05-flywheel.md` Steps 6–7 for the
+//! See `qontinui-dev-notes/spec-check-v1/05-flywheel.md` Steps 6–9 for the
 //! design context; the SQL trigger query is verbatim from the plan
 //! (§ Step 7 — "Full-page branch").
 
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::{Path as AxPath, Query, State};
@@ -405,6 +412,7 @@ pub async fn post_execute(
     // Dispatch to spec_authoring. The sibling agent owns this module — at
     // integration time, an unresolved import here means the sibling's PR
     // hasn't landed yet.
+    let app_state_for_validator = app_state.clone();
     let outcome = match crate::workflow_generation::spec_authoring::author_candidate(
         pg_db.clone(),
         app_state,
@@ -433,11 +441,70 @@ pub async fn post_execute(
         }
     };
 
-    // TODO(Step 8): replace with full validator gate (round-trip + coverage +
-    // b-green) and Step 9: replace with storage::write_pending_ir.
-    let staged_path =
-        match stage_pending_ir_placeholder(&storage::resolve_specs_root(), &outcome.candidate) {
-            Ok(p) => p,
+    // Step 8 — three-gate validator (distinctness → round-trip → coverage →
+    // b-green). On Err, surface as `validator-rejected` + persist the
+    // reason in `spec_proposals.last_error`. Authoring failures stay
+    // distinct (`authoring-failed` codepath above).
+    let root = storage::resolve_specs_root();
+    let pathname_for_gate = match row.kind.as_str() {
+        "fullPage" => row.pathname.clone().unwrap_or_default(),
+        "patch" => row.spec_id.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
+    if let Err(verr) = crate::spec_api::validator::validate_candidate(
+        app_state_for_validator,
+        &outcome.candidate,
+        &pathname_for_gate,
+        &root,
+    )
+    .await
+    {
+        let reason = crate::spec_api::validator::validator_error_reason(&verr);
+        let detail = crate::spec_api::validator::validator_error_detail(&verr);
+        let _ = pg_db
+            .update_proposal_status_with_error(&row.id, "failed", &detail)
+            .await;
+        warn!(
+            "post_execute: validator rejected proposal {}: {} — {}",
+            row.id, reason, detail
+        );
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": false,
+                "proposalId": row.id,
+                "outcome": "validator-rejected",
+                "reason": reason,
+                "detail": detail,
+            })),
+        )
+            .into_response();
+    }
+
+    // Step 9 — stage the candidate into `<root>/pages/<id>/_pending/`. The
+    // helper stamps `provenance.status = Pending` and regenerates the
+    // projection sibling, both atomically via temp-rename. The page-level
+    // lock guards against a concurrent sweep promoting / demoting the same
+    // page while we write.
+    let staged_path = {
+        let _guard = match storage::page_lock(&root, &outcome.candidate.id) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = pg_db
+                    .update_proposal_status_with_error(&row.id, "failed", &e)
+                    .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SpecError::with_detail(
+                        "stage-pending-locked",
+                        json!({ "proposalId": row.id, "error": e }),
+                    )),
+                )
+                    .into_response();
+            }
+        };
+        match storage::write_pending_ir(&root, &outcome.candidate) {
+            Ok(p) => p.display().to_string(),
             Err(e) => {
                 let _ = pg_db
                     .update_proposal_status_with_error(&row.id, "failed", &e)
@@ -451,7 +518,8 @@ pub async fn post_execute(
                 )
                     .into_response();
             }
-        };
+        }
+    };
 
     // Persist the candidate IR + flip to pendingPromotion (skipping the
     // pendingValidation hop that Step 8 will introduce).
@@ -522,25 +590,231 @@ fn authoring_error_detail(
     }
 }
 
-/// Placeholder writer for the staged candidate IR. Bypasses the validator
-/// (Step 8) and the canonical `storage::write_pending_ir` helper (Step 9 will
-/// introduce that helper); writes the IR file to
-/// `specs/pages/<id>/_pending/state-machine.derived.json` and stops.
-///
-/// **Do not extend this** — Step 8/9 replace it entirely.
-fn stage_pending_ir_placeholder(
-    root: &Path,
-    candidate: &crate::spec_api::types::IrPageSpec,
-) -> Result<String, String> {
-    let page_dir = root.join("pages").join(&candidate.id).join("_pending");
-    std::fs::create_dir_all(&page_dir)
-        .map_err(|e| format!("create_dir_all {}: {}", page_dir.display(), e))?;
-    let target = page_dir.join("state-machine.derived.json");
-    let json = serde_json::to_string_pretty(candidate)
-        .map_err(|e| format!("serialize candidate: {}", e))?;
-    std::fs::write(&target, json.as_bytes())
-        .map_err(|e| format!("write {}: {}", target.display(), e))?;
-    Ok(target.display().to_string())
+// =============================================================================
+// Sweep-pending endpoint — POST /spec/proposals/sweep-pending
+// =============================================================================
+//
+// Drives the 2-green promotion (and single-red demotion) of every proposal in
+// `status = 'pendingPromotion'`. Invoked by the supervisor cron (Step 10) on
+// the nightly cadence; also usable as a manual ergonomic. Per Step 9 of
+// `05-flywheel.md`:
+//
+//   - Re-runs ONLY gate-3 (B-execution-green). Gates 1 + 2 are pure
+//     properties of the candidate IR and don't change between sweeps.
+//   - Ok ⇒ greens += 1; if ≥ 2, call `storage::promote_pending` + status =
+//     "promoted". Else just bump the greens counter.
+//   - `Err(BExecutionRed)` ⇒ `storage::demote_pending` + reset greens to 0 +
+//     status = "queued" + `last_error = "single-red: <summary>"`.
+//   - `Err(other)` (e.g. SnapshotFetchFailed) ⇒ infra error; only
+//     `last_attempt_at` moves. No state change.
+//
+// Per-proposal critical section is wrapped in `storage::page_lock` so a
+// manual `/execute` overlap can't race the sweep on the same page id.
+
+const SWEEP_BATCH_LIMIT: i64 = 100;
+
+pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response {
+    let pg_db = state.app_state.pg_db.clone();
+    let app_state = state.app_state.clone();
+    let root = storage::resolve_specs_root();
+
+    let rows = match pg_db
+        .list_proposals_by_status("pendingPromotion", SWEEP_BATCH_LIMIT)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("post_sweep_pending: list_proposals_by_status failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "sweep-list-failed",
+                    json!({ "error": e }),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let total = rows.len();
+    let mut promoted = 0usize;
+    let mut demoted = 0usize;
+    let mut infra_errors = 0usize;
+
+    for prop in rows {
+        // Use spec_id when present (canonical page id); fall back to pathname
+        // for fullPage rows that haven't been canonicalized yet. The same
+        // value is used both as the page id for storage helpers AND as the
+        // pathname forwarded to `gate_b_execution_green` (the SDK treats it
+        // as a `route` hint on the fingerprint — non-load-bearing in v1.0).
+        let spec_id = prop
+            .spec_id
+            .clone()
+            .or_else(|| prop.pathname.clone())
+            .unwrap_or_default();
+        if spec_id.is_empty() {
+            warn!(
+                "post_sweep_pending: skip {} — no spec_id or pathname",
+                prop.id
+            );
+            infra_errors += 1;
+            let _ = pg_db.update_proposal_attempt_only(&prop.id).await;
+            continue;
+        }
+
+        // Acquire the per-page lock for the duration of the read-and-gate +
+        // promote/demote critical section.
+        let _guard = match storage::page_lock(&root, &spec_id) {
+            Ok(g) => g,
+            Err(e) => {
+                // Treat lock contention as an infra error — the next sweep
+                // tick will retry. Bump last_attempt_at and move on.
+                warn!(
+                    "post_sweep_pending: page_lock({}) failed: {} — treating as infra error",
+                    spec_id, e
+                );
+                infra_errors += 1;
+                let _ = pg_db.update_proposal_attempt_only(&prop.id).await;
+                continue;
+            }
+        };
+
+        let pending_ir = match storage::read_pending_ir(&root, &spec_id) {
+            Ok(Some(ir)) => ir,
+            Ok(None) => {
+                // The _pending/ artefact has been swept out from under us —
+                // the row is stale. Demote the row in PG so the queue moves
+                // on, but don't increment `demoted` (no green/red verdict
+                // was reached).
+                warn!(
+                    "post_sweep_pending: pending IR missing on disk for {}; resetting",
+                    prop.id
+                );
+                let _ = pg_db
+                    .update_proposal_status_with_error(
+                        &prop.id,
+                        "queued",
+                        "pending IR missing on disk during sweep",
+                    )
+                    .await;
+                let _ = pg_db.update_proposal_greens(&prop.id, 0).await;
+                infra_errors += 1;
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    "post_sweep_pending: read_pending_ir({}) failed: {}",
+                    spec_id, e
+                );
+                infra_errors += 1;
+                let _ = pg_db.update_proposal_attempt_only(&prop.id).await;
+                continue;
+            }
+        };
+
+        let gate_result = crate::spec_api::validator::gate_b_execution_green(
+            app_state.clone(),
+            &pending_ir,
+            &spec_id,
+        )
+        .await;
+
+        match gate_result {
+            Ok(_) => {
+                let new_greens = prop.consecutive_greens.saturating_add(1);
+                if new_greens >= 2 {
+                    // Promote.
+                    match storage::promote_pending(&root, &spec_id) {
+                        Ok(()) => {
+                            let _ = pg_db.update_proposal_status(&prop.id, "promoted").await;
+                            let _ = pg_db.update_proposal_attempt_only(&prop.id).await;
+                            promoted += 1;
+                            info!(
+                                "post_sweep_pending: promoted {} (spec_id={})",
+                                prop.id, spec_id
+                            );
+                        }
+                        Err(e) => {
+                            // Promote-time IO error — leave greens at +1
+                            // count so the next sweep retries.
+                            warn!(
+                                "post_sweep_pending: promote_pending({}) failed: {}",
+                                spec_id, e
+                            );
+                            let _ = pg_db.update_proposal_greens(&prop.id, new_greens).await;
+                            let _ = pg_db.update_proposal_attempt_only(&prop.id).await;
+                            infra_errors += 1;
+                        }
+                    }
+                } else {
+                    let _ = pg_db.update_proposal_greens(&prop.id, new_greens).await;
+                    let _ = pg_db.update_proposal_attempt_only(&prop.id).await;
+                    info!(
+                        "post_sweep_pending: {} greens advanced to {}",
+                        prop.id, new_greens
+                    );
+                }
+            }
+            Err(crate::spec_api::validator::ValidatorError::BExecutionRed {
+                result_summary,
+                ..
+            }) => {
+                let detail = format!(
+                    "single-red: critical={} error={} warning={} info={}",
+                    result_summary.severity_counts.critical,
+                    result_summary.severity_counts.error,
+                    result_summary.severity_counts.warning,
+                    result_summary.severity_counts.info,
+                );
+                // Demote — rm -rf _pending/, reset greens, requeue.
+                if let Err(e) = storage::demote_pending(&root, &spec_id) {
+                    warn!(
+                        "post_sweep_pending: demote_pending({}) failed: {}",
+                        spec_id, e
+                    );
+                    // Continue — PG-side demotion is still useful even if
+                    // the FS cleanup fails (the row will re-run next sweep
+                    // and the FS layer is idempotent).
+                }
+                let _ = pg_db
+                    .update_proposal_status_with_error(&prop.id, "queued", &detail)
+                    .await;
+                let _ = pg_db.update_proposal_greens(&prop.id, 0).await;
+                demoted += 1;
+                info!(
+                    "post_sweep_pending: demoted {} (spec_id={}): {}",
+                    prop.id, spec_id, detail
+                );
+            }
+            Err(other) => {
+                // SnapshotFetchFailed et al. — infra error, no state change
+                // beyond last_attempt_at.
+                let _ = pg_db.update_proposal_attempt_only(&prop.id).await;
+                infra_errors += 1;
+                warn!(
+                    "post_sweep_pending: infra error for {} (spec_id={}): {:?}",
+                    prop.id, spec_id, other
+                );
+            }
+        }
+    }
+
+    info!(
+        "post_sweep_pending: swept={} promoted={} demoted={} infra_errors={}",
+        total, promoted, demoted, infra_errors
+    );
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "swept": total,
+            "promoted": promoted,
+            "demoted": demoted,
+            "infraErrors": infra_errors,
+        })),
+    )
+        .into_response()
 }
 
 // =============================================================================
@@ -849,7 +1123,11 @@ mod tests {
     }
 
     #[test]
-    fn stage_pending_ir_placeholder_writes_to_pending_dir() {
+    fn write_pending_ir_round_trips_through_proposals_path() {
+        // Smoke-test that the canonical Step 9 staging helper writes a
+        // candidate to `<root>/pages/<id>/_pending/state-machine.derived.json`
+        // with the expected on-disk shape. The deeper provenance-stamping +
+        // projection-sibling behavior is covered by storage::pending_tests.
         use crate::spec_api::types::IrPageSpec;
         let tmp = tempfile::tempdir().unwrap();
         let candidate = IrPageSpec {
@@ -864,8 +1142,9 @@ mod tests {
             synthesized_groups: None,
             initial_state: None,
         };
-        let path = stage_pending_ir_placeholder(tmp.path(), &candidate).unwrap();
-        assert!(path.contains("_pending"));
+        let path = storage::write_pending_ir(tmp.path(), &candidate).unwrap();
+        let path_str = path.display().to_string();
+        assert!(path_str.contains("_pending"));
         let target = tmp
             .path()
             .join("pages")
@@ -880,6 +1159,18 @@ mod tests {
         let body = std::fs::read_to_string(&target).unwrap();
         assert!(body.contains("\"id\""));
         assert!(body.contains("demo-page"));
+        // Projection sibling is written too.
+        let projection = tmp
+            .path()
+            .join("pages")
+            .join("demo-page")
+            .join("_pending")
+            .join("spec.uibridge.json");
+        assert!(
+            projection.exists(),
+            "projection sibling missing: {}",
+            projection.display()
+        );
     }
 
     #[test]

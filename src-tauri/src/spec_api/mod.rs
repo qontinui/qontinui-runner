@@ -30,6 +30,8 @@ pub mod types;
 
 #[cfg(feature = "spec-authoring")]
 pub mod proposals;
+#[cfg(feature = "spec-authoring")]
+pub mod validator;
 
 #[cfg(test)]
 mod tests;
@@ -68,6 +70,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/spec/proposals/{id}/execute",
             post(proposals::post_execute),
+        )
+        .route(
+            "/spec/proposals/sweep-pending",
+            post(proposals::post_sweep_pending),
         );
 
     r

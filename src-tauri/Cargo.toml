@@ -105,6 +105,9 @@ deadpool-postgres = "0.14"
 qontinui-db = { path = "./clorinde" }
 qontinui-types = { path = "../../qontinui-schemas/rust", version = "^0.1.2" }
 qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core", version = "^0.1.0" }
+# Spec-Check (B) matcher — feature-gated; only the Stream E (Flywheel) validator
+# consumes it. Workspace member at `../crates/spec-check/`.
+qontinui-spec-check = { path = "../crates/spec-check", optional = true }
 socket2 = "0.6"
 cron = "0.15"
 chrono-tz = "0.10"
@@ -221,7 +224,7 @@ test-fixtures = []
 # the proposals endpoints, and the supervisor cron. Off by default for
 # spec-check v1.0 ship; the user-facing `--enable-spec-authoring` alias
 # maps to this feature in the runner CLI/env layer.
-spec-authoring = []
+spec-authoring = ["qontinui-spec-check"]
 # PG-bound integration tests for the proposals subsystem (Stream E).
 # Off by default; enable with `--features spec-authoring,pg_integration_tests`
 # when a live PG (canonical or local) is available.
