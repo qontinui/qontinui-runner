@@ -1079,8 +1079,31 @@ pub async fn spawn_worker_session(
         terminal_manager.clone(),
     );
     let worker_arc = Arc::new(worker);
-    if let Err(e) = session_manager.register_worker(worker_arc.clone()) {
-        warn!("spawn_worker_session: register_worker failed: {}", e);
+    let register_ok = match session_manager.register_worker(worker_arc.clone()) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("spawn_worker_session: register_worker failed: {}", e);
+            false
+        }
+    };
+
+    // Phase 2 frontend mirror of `set_title_unless_worker`: tell the
+    // React tree which terminalId is worker-backed so `ZoneGrid::onTitleChange`
+    // can skip OSC 0/2 `renameTab` (and the paired `terminal_set_title`
+    // invoke) for this tab. The backend gate alone keeps `/terminals` and
+    // `GET /workers` pinned at `Worker N`, but without this event the
+    // operator-facing tab strip drifts to the Claude CLI's OSC 0 title
+    // because the FE has no listener for `terminal-title-changed`.
+    // Race-safe: the FE's `useTerminalManager` buffers marks that arrive
+    // before their `terminal-created` event lands.
+    if register_ok {
+        let payload = serde_json::json!({
+            "terminalId": info.id.clone(),
+            "taskRunId": task_run_id.clone(),
+        });
+        if let Err(e) = app_handle.emit("worker-registered", &payload) {
+            warn!("spawn_worker_session: emit worker-registered failed: {}", e);
+        }
     }
 
     // "Coord as Deconflicter, not Dispatcher" Phase 1 (§4.3): create an

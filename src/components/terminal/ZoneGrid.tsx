@@ -161,11 +161,25 @@ export function ZoneGrid({
    * Skip empty / whitespace-only titles defensively. The TerminalInstance
    * de-dupes against its last-reported value, so this fires at most once
    * per real title change despite the 200ms idle repaint cadence.
+   *
+   * Worker tabs (presence of `taskRunId`) are pinned at `Worker N` per the
+   * Phase 1 backend gate (`set_title_unless_worker`); skip the local rename
+   * *and* the backend invoke for those so OSC 0 emissions from the embedded
+   * Claude CLI don't clobber the operator-facing identifier.
    */
+  // tabsRef keeps the worker-marker lookup current without re-creating
+  // onTitleChange on every tab mutation (TerminalInstance refs onto the
+  // latest callback, so this ref pattern also avoids re-render thrash).
+  const tabsRef = useRef(tabs);
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
   const onTitleChange = useCallback(
     (tabId: string, title: string) => {
       const trimmed = title.trim();
       if (!trimmed) return;
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (tab?.taskRunId) return;
       renameTab(tabId, trimmed);
       // Phase 2: bi-directional title sync. The local React rename above
       // updates UI immediately; fire-and-forget the backend write so other
