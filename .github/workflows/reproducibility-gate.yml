@@ -102,6 +102,30 @@ jobs:
           sudo mkswap /swapfile
           sudo swapon /swapfile
 
+      # The runner's lib.rs calls tauri::generate_context!() at compile
+      # time, which reads tauri.conf.json and panics if frontendDist
+      # (../dist) is missing. mock_claude_cli is in the same package as
+      # the lib, so building --bin mock_claude_cli still triggers the lib
+      # compile path. Build the frontend first so dist/ exists. Same
+      # pattern as ci.yml's "Build frontend" step.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (creates dist/ for tauri::generate_context!)
+        run: pnpm run build
+
       - name: Cache Rust dependencies
         uses: actions/cache@v3
         with:
