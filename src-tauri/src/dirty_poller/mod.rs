@@ -255,7 +255,10 @@ async fn run(state: Arc<DirtyPollerState>, interval_secs: u64, cancel: Arc<tokio
             }
         }
         if let Err(e) = tick_once(&state).await {
-            warn!("dirty_poller: agent_id={} tick failed: {e:#}", state.agent_id);
+            warn!(
+                "dirty_poller: agent_id={} tick failed: {e:#}",
+                state.agent_id
+            );
         }
     }
 }
@@ -611,7 +614,10 @@ mod tests {
             parse_shortstat(" 1 file changed, 2 insertions(+)"),
             (1, 2, 0)
         );
-        assert_eq!(parse_shortstat(" 1 file changed, 5 deletions(-)"), (1, 0, 5));
+        assert_eq!(
+            parse_shortstat(" 1 file changed, 5 deletions(-)"),
+            (1, 0, 5)
+        );
         assert_eq!(parse_shortstat(""), (0, 0, 0));
     }
 
@@ -621,8 +627,16 @@ mod tests {
             repo: "r".into(),
             branch: "b".into(),
             files: vec![
-                DirtyFile { path: "a".into(), status: "M".into(), orig_path: None },
-                DirtyFile { path: "b".into(), status: "M".into(), orig_path: None },
+                DirtyFile {
+                    path: "a".into(),
+                    status: "M".into(),
+                    orig_path: None,
+                },
+                DirtyFile {
+                    path: "b".into(),
+                    status: "M".into(),
+                    orig_path: None,
+                },
             ],
             files_changed: 2,
             insertions: 0,
@@ -640,9 +654,17 @@ mod tests {
     #[test]
     fn token_slot_refresh_threshold() {
         let now = 1_700_000_000;
-        let fresh = TokenSlot { token: "x".into(), jti: uuid::Uuid::nil(), exp: now + 4 * 3600 };
+        let fresh = TokenSlot {
+            token: "x".into(),
+            jti: uuid::Uuid::nil(),
+            exp: now + 4 * 3600,
+        };
         assert!(!fresh.needs_refresh(now));
-        let stale = TokenSlot { token: "x".into(), jti: uuid::Uuid::nil(), exp: now + 600 };
+        let stale = TokenSlot {
+            token: "x".into(),
+            jti: uuid::Uuid::nil(),
+            exp: now + 600,
+        };
         assert!(stale.needs_refresh(now));
     }
 }
