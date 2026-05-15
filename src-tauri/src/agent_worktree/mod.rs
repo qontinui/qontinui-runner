@@ -81,6 +81,23 @@ pub struct MaterializedWorktree {
     pub branch: String,
     pub parent_sha: String,
     pub worktree_path: PathBuf,
+    /// Coordination Phase 5 / bottleneck Row 4 — the non-`heads`
+    /// remote ref this worktree's branch pushes to
+    /// (`refs/agent/<m>-<a>`). Source of truth is coord's allocate
+    /// response; [`remote_agent_ref`] recomputes it as a fallback
+    /// when talking to a pre-Phase-5 coord.
+    pub push_ref: String,
+}
+
+/// Mirror of `qontinui-coord::ref_namespace::remote_agent_ref` — kept
+/// in lockstep (no shared crate). Logical branch `agent/<m>-<a>` maps
+/// to the non-`heads` remote ref `refs/agent/<m>-<a>` so the default
+/// `+refs/heads/*:...` fetch refspec skips the ~10K agent refs at
+/// fleet scale (Row 4). A non-agent branch maps verbatim under the
+/// prefix (defensive — allocated agents always start with `agent/`).
+pub fn remote_agent_ref(branch: &str) -> String {
+    let rest = branch.strip_prefix("agent/").unwrap_or(branch);
+    format!("refs/agent/{rest}")
 }
 
 /// Result of a full allocate + materialize round-trip.
@@ -115,6 +132,19 @@ struct CoordAllocateResponse {
     token_jti: Option<uuid::Uuid>,
     #[serde(default)]
     token_exp: Option<i64>,
+    /// Coordination Phase 5 — per-agent out-of-tree Cargo path-dep
+    /// override. Absent (pre-Phase-5 coord) or null (single-repo
+    /// agent) → no override written.
+    #[serde(default)]
+    cargo_config: Option<CoordCargoConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoordCargoConfig {
+    /// Absolute target path —
+    /// `<COORD_WORKTREE_ROOT>/<agent_id>/.cargo/config.toml`.
+    path: String,
+    contents: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +155,12 @@ struct CoordAllocatedWorktree {
     worktree_path: String,
     #[allow(dead_code)]
     status: String,
+    /// Coordination Phase 5 — non-`heads` push ref. `#[serde(default)]`
+    /// so a pre-Phase-5 coord (no field) still deserializes; the
+    /// empty string triggers the [`remote_agent_ref`] fallback at
+    /// materialization.
+    #[serde(default)]
+    push_ref: String,
 }
 
 /// Call coord's `/agents/allocate` and then `git worktree add` for each
@@ -274,12 +310,46 @@ pub async fn allocate_and_materialize(
             }
         }
 
+        let push_ref = if w.push_ref.is_empty() {
+            remote_agent_ref(&w.branch)
+        } else {
+            w.push_ref
+        };
         materialized.push(MaterializedWorktree {
             repo: w.repo,
             branch: w.branch,
             parent_sha: w.parent_sha,
             worktree_path: target,
+            push_ref,
         });
+    }
+
+    // Coordination Phase 5 / Row 5 — write coord's per-agent Cargo
+    // path-dep override. It lands at
+    // <COORD_WORKTREE_ROOT>/<agent_id>/.cargo/config.toml, i.e. the
+    // PARENT of the per-repo worktree dirs — outside every git repo,
+    // so it never merges and pre-commit cargo hooks never see it
+    // (feedback_worktree_path_dep_hooks). Best-effort: a write
+    // failure logs + continues (the agent then builds against the
+    // canonical sibling, i.e. today's non-deterministic behaviour —
+    // degraded, not broken).
+    if let Some(cc) = &coord_resp.cargo_config {
+        if let Some(parent) = std::path::Path::new(&cc.path).parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!(
+                    "phase5 cargo override: mkdir {} failed: {e}",
+                    parent.display()
+                );
+            }
+        }
+        match std::fs::write(&cc.path, &cc.contents) {
+            Ok(()) => info!(
+                "phase5 cargo override written: {} ({} bytes)",
+                cc.path,
+                cc.contents.len()
+            ),
+            Err(e) => warn!("phase5 cargo override: write {} failed: {e}", cc.path),
+        }
     }
 
     Ok(AllocateResult {
@@ -328,5 +398,17 @@ mod tests {
         assert_eq!(coord_ws_to_http("wss://h:9870"), "https://h:9870");
         assert_eq!(coord_ws_to_http("http://h:9870"), "http://h:9870");
         assert_eq!(coord_ws_to_http("https://h:9870"), "https://h:9870");
+    }
+
+    #[test]
+    fn remote_agent_ref_mirrors_coord_mapping() {
+        // Must stay byte-identical to
+        // qontinui-coord::ref_namespace::remote_agent_ref.
+        assert_eq!(remote_agent_ref("agent/m12-a34"), "refs/agent/m12-a34");
+        // No redundant agent/agent/ segment.
+        assert!(!remote_agent_ref("agent/x-y").contains("agent/agent"));
+        // Result is outside refs/heads/* — the whole Row 4 point.
+        assert!(!remote_agent_ref("agent/x-y").starts_with("refs/heads/"));
+        assert_eq!(remote_agent_ref("weird"), "refs/agent/weird");
     }
 }
