@@ -1636,3 +1636,84 @@ pub async fn add_task_dependency(
     .await
     .map_err(|(_, msg)| msg)
 }
+
+// ---------------------------------------------------------------------------
+// Row 9 Phase 4 — fleet health + alerts (CoordinatorDashboard panel).
+//
+// coord publishes the latest per-machine snapshot to the `fleet-health`
+// JetStream KV bucket *and* fans `events.fleet.health.<id>` over the
+// Redis/JS bridge on each 30s poll. The browser can't speak NATS, so the
+// dashboard reads coord's HTTP rollup instead: `/coord/fleet/health`
+// (per-machine state + active-alert severity counts) + `/coord/alerts`
+// (the firing list). This command is a thin proxy so the panel doesn't
+// need to know the coord URL or handle CORS.
+// ---------------------------------------------------------------------------
+
+/// Resolve coord's HTTP base. Same source-of-truth chain as
+/// `mcp::agent_worktrees::coord_http_base`: env `COORD_HTTP_URL` →
+/// profile `coord_url` (ws→http via `coord_ws_to_http`) → default
+/// `http://localhost:9870`.
+fn coord_http_base_for_fleet() -> String {
+    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    // `qontinui_runner_lib::profiles` (not `crate::profiles`) — same
+    // proven path as mcp::agent_worktrees::coord_http_base; `crate::`
+    // doesn't resolve `profiles` from this lib compilation unit.
+    if let Some(ws) = qontinui_runner_lib::profiles::load().coord_url.as_deref() {
+        return crate::agent_worktree::coord_ws_to_http(ws);
+    }
+    "http://localhost:9870".to_string()
+}
+
+/// `get_fleet_health` — fetch coord's fleet-health rollup + active
+/// alerts in one call for the dashboard panel. Returns the merged JSON
+/// `{ health: <coord /fleet/health>, alerts: [...], coordBase }`.
+/// Errors are returned as `Err(String)` so the panel can render a
+/// retriable error state (coord down ≠ runner down).
+#[tauri::command]
+pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
+    let base = coord_http_base_for_fleet();
+    let base = base.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
+
+    let health: serde_json::Value = client
+        .get(format!("{base}/coord/fleet/health"))
+        .send()
+        .await
+        .map_err(|e| format!("GET /coord/fleet/health: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("/coord/fleet/health status: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("parse /coord/fleet/health: {e}"))?;
+
+    // Alerts are best-effort: a failure here still renders the machine
+    // grid (the more load-bearing half).
+    let alerts: serde_json::Value = match client
+        .get(format!("{base}/coord/alerts"))
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(r) => r
+            .json()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({"alerts": []})),
+        Err(e) => {
+            warn!("get_fleet_health: /coord/alerts failed: {e}");
+            serde_json::json!({"alerts": []})
+        }
+    };
+
+    Ok(serde_json::json!({
+        "health": health,
+        "alerts": alerts.get("alerts").cloned().unwrap_or(serde_json::json!([])),
+        "coordBase": base,
+    }))
+}

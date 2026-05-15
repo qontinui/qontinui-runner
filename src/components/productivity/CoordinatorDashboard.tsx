@@ -58,6 +58,7 @@ import { acknowledgeAdvisory } from "./reflectionApi";
 import { PlanRecommendations } from "./PlanRecommendations";
 import { WorkersPanel } from "./WorkersPanel";
 import { FileActivityPanel } from "./FileActivityPanel";
+import { FleetHealthPanel } from "./FleetHealthPanel";
 
 const DECISION_LOG_LIMIT = 200;
 
@@ -1547,6 +1548,15 @@ export function CoordinatorDashboard() {
          * the same PR to keep the human-readable narrative accurate.
          */}
         <FileActivityPanel />
+
+        {/*
+         * Fleet Health panel — Row 9 Phase 4. Same placement rationale
+         * as FileActivityPanel: below the spec-locked five-panel block,
+         * which asserts `exists` per panel (not order). The spec
+         * narrative in productivity/spec.uibridge.json gets a parallel
+         * one-line update in the same commit.
+         */}
+        <FleetHealthPanel />
       </div>
     </div>
   );
