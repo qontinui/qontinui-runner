@@ -6,15 +6,57 @@
     {
       "id": "hooks-management-overview",
       "name": "Hook Inventory and Status",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Lifecycle Hooks"
+          "id": "hooks-management-overview-elem-0",
+          "description": "Required element 0 for state Hook Inventory and Status",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Lifecycle Hooks"
+            },
+            "label": "Required element for Hook Inventory and Status"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Configure actions to run at specific execution events"
+          "id": "hooks-management-overview-elem-1",
+          "description": "Required element 1 for state Hook Inventory and Status",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Configure actions to run at specific execution events"
+            },
+            "label": "Required element for Hook Inventory and Status"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No lifecycle hooks"
+          "id": "hooks-management-overview-elem-2",
+          "description": "Required element 2 for state Hook Inventory and Status",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No lifecycle hooks"
+            },
+            "label": "Required element for Hook Inventory and Status"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Lifecycle Hooks page allows users to configure actions that execute automatically at specific points during workflow execution (e.g., on workflow start, completion, failure). Users need to see all configured hooks at a glance with their names, event triggers, enabled/disabled state, and any recent execution results. The page header shows the hook count and provides quick access to creating new hooks and refreshing the list. When no hooks exist, an informative empty state guides users to create their first hook rather than leaving them on a blank page.",
@@ -25,15 +67,57 @@
     {
       "id": "hooks-crud",
       "name": "Hook Creation and Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "New Hook"
+          "id": "hooks-crud-elem-0",
+          "description": "Required element 0 for state Hook Creation and Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "New Hook"
+            },
+            "label": "Required element for Hook Creation and Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "hooks-crud-elem-1",
+          "description": "Required element 1 for state Hook Creation and Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Hook Creation and Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Delete Hook"
+          "id": "hooks-crud-elem-2",
+          "description": "Required element 2 for state Hook Creation and Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Delete Hook"
+            },
+            "label": "Required element for Hook Creation and Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users need to create new hooks by specifying a name, URL endpoint, event triggers, custom headers, and payload configuration. The hook editor should open as a modal or panel when creating a new hook or editing an existing one. The save operation should validate the hook configuration and provide clear feedback on success or failure. Editing an existing hook should pre-populate the form with current values. The system should support both creating new hooks and updating existing ones through the same editor interface.",
@@ -44,15 +128,57 @@
     {
       "id": "hooks-operations",
       "name": "Hook Testing and Toggle Controls",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Test"
+          "id": "hooks-operations-elem-0",
+          "description": "Required element 0 for state Hook Testing and Toggle Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Test"
+            },
+            "label": "Required element for Hook Testing and Toggle Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "hooks-operations-elem-1",
+          "description": "Required element 1 for state Hook Testing and Toggle Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Hook Testing and Toggle Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "alert"
+          "id": "hooks-operations-elem-2",
+          "description": "Required element 2 for state Hook Testing and Toggle Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "alert"
+            },
+            "label": "Required element for Hook Testing and Toggle Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Before relying on hooks in production workflows, users need to verify that their hook configurations work correctly. The test feature sends a sample payload to the configured URL and reports success/failure along with response details and execution duration. Additionally, hooks can be individually enabled or disabled without deletion, allowing users to temporarily suspend hook execution during maintenance or debugging without losing their configuration. These operational controls are essential for building confidence in the hook system and managing it in real development workflows.",

@@ -6,15 +6,57 @@
     {
       "id": "ka-provider-status",
       "name": "Provider Availability and Status",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "duckduckgo"
+          "id": "ka-provider-status-elem-0",
+          "description": "Required element 0 for state Provider Availability and Status",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "duckduckgo"
+            },
+            "label": "Required element for Provider Availability and Status"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "available"
+          "id": "ka-provider-status-elem-1",
+          "description": "Required element 1 for state Provider Availability and Status",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "available"
+            },
+            "label": "Required element for Provider Availability and Status"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "requires_api_key"
+          "id": "ka-provider-status-elem-2",
+          "description": "Required element 2 for state Provider Availability and Status",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "requires_api_key"
+            },
+            "label": "Required element for Provider Availability and Status"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The /knowledge/providers endpoint reports which search providers are available and whether they require API keys. Free providers (DuckDuckGo, Sploitus, OSV.dev) are always available. Paid providers (Tavily, Perplexity) require API keys via environment variables. UI Bridge availability is checked dynamically at search time. This information helps users understand what search capabilities are active and what configuration is needed to unlock additional providers.",
@@ -25,18 +67,74 @@
     {
       "id": "ka-search-tiered-routing",
       "name": "Tiered Search Routing and Escalation",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "local_knowledge"
+          "id": "ka-search-tiered-routing-elem-0",
+          "description": "Required element 0 for state Tiered Search Routing and Escalation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "local_knowledge"
+            },
+            "label": "Required element for Tiered Search Routing and Escalation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "provider_used"
+          "id": "ka-search-tiered-routing-elem-1",
+          "description": "Required element 1 for state Tiered Search Routing and Escalation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "provider_used"
+            },
+            "label": "Required element for Tiered Search Routing and Escalation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "results_ingested"
+          "id": "ka-search-tiered-routing-elem-2",
+          "description": "Required element 2 for state Tiered Search Routing and Escalation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "results_ingested"
+            },
+            "label": "Required element for Tiered Search Routing and Escalation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "budget"
+          "id": "ka-search-tiered-routing-elem-3",
+          "description": "Required element 3 for state Tiered Search Routing and Escalation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "budget"
+            },
+            "label": "Required element for Tiered Search Routing and Escalation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The knowledge acquisition coordinator implements a 4-tier escalation strategy. Tier 0 checks local task_knowledge via hybrid_search (cosine similarity ≥0.5). If matches found, returns immediately (cache hit). Tier 1 queries UI Bridge if a connected app is available. Tier 2 escalates through web search providers: DuckDuckGo first (free, fast), then Tavily if <2 results and API key available, then Perplexity as last resort if still empty. Tier 3 stores results via the ingestor. This architecture ensures the system learns from every search — subsequent identical queries are served from local cache.",
@@ -47,15 +145,57 @@
     {
       "id": "ka-web-search",
       "name": "Web Search Results (DuckDuckGo / Tavily)",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "results"
+          "id": "ka-web-search-elem-0",
+          "description": "Required element 0 for state Web Search Results (DuckDuckGo / Tavily)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "results"
+            },
+            "label": "Required element for Web Search Results (DuckDuckGo / Tavily)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "url"
+          "id": "ka-web-search-elem-1",
+          "description": "Required element 1 for state Web Search Results (DuckDuckGo / Tavily)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "url"
+            },
+            "label": "Required element for Web Search Results (DuckDuckGo / Tavily)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "AI Answer"
+          "id": "ka-web-search-elem-2",
+          "description": "Required element 2 for state Web Search Results (DuckDuckGo / Tavily)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "AI Answer"
+            },
+            "label": "Required element for Web Search Results (DuckDuckGo / Tavily)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The /knowledge/search-web endpoint performs general web search. DuckDuckGo results are parsed from HTML using cached regexes — titles, URLs (with DDG redirect URL decoding), and snippets are extracted. Tavily results include AI-synthesized answers with raw page content. Each result is formatted as markdown with title, snippet, and source URL. Results include provider identification so consumers know which source produced each result.",
@@ -67,12 +207,40 @@
     {
       "id": "ka-error-research",
       "name": "Error Research Compound Search",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "research-error"
+          "id": "ka-error-research-elem-0",
+          "description": "Required element 0 for state Error Research Compound Search",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "research-error"
+            },
+            "label": "Required element for Error Research Compound Search"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "External Research Context"
+          "id": "ka-error-research-elem-1",
+          "description": "Required element 1 for state Error Research Compound Search",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "External Research Context"
+            },
+            "label": "Required element for Error Research Compound Search"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The /knowledge/research-error endpoint performs compound search optimized for error resolution. It builds a search query from the error message, optional framework context, and the first meaningful line from a stack trace (skipping 'at ' frames and node_modules). Uses KnowledgeDomain::ErrorResolution which triggers Tier 0 cache lookup and Tier 3 storage via the knowledge flywheel. This is the highest-value integration point — the fix agent calls it automatically when encountering unfamiliar errors.",
@@ -84,18 +252,74 @@
     {
       "id": "ka-vulnerability-search",
       "name": "Vulnerability Intelligence (Sploitus / OSV.dev)",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "CVSS"
+          "id": "ka-vulnerability-search-elem-0",
+          "description": "Required element 0 for state Vulnerability Intelligence (Sploitus / OSV.dev)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "CVSS"
+            },
+            "label": "Required element for Vulnerability Intelligence (Sploitus / OSV.dev)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "packages"
+          "id": "ka-vulnerability-search-elem-1",
+          "description": "Required element 1 for state Vulnerability Intelligence (Sploitus / OSV.dev)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "packages"
+            },
+            "label": "Required element for Vulnerability Intelligence (Sploitus / OSV.dev)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "manifest"
+          "id": "ka-vulnerability-search-elem-2",
+          "description": "Required element 2 for state Vulnerability Intelligence (Sploitus / OSV.dev)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "manifest"
+            },
+            "label": "Required element for Vulnerability Intelligence (Sploitus / OSV.dev)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "vulnerability_enrichment"
+          "id": "ka-vulnerability-search-elem-3",
+          "description": "Required element 3 for state Vulnerability Intelligence (Sploitus / OSV.dev)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "vulnerability_enrichment"
+            },
+            "label": "Required element for Vulnerability Intelligence (Sploitus / OSV.dev)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The /knowledge/search-vulnerabilities endpoint queries Sploitus for exploit data by software name, version, or CVE ID. Results include exploit source code (capped at 50KB), CVSS scores with severity classification (Critical ≥9.0, High ≥7.0, Medium ≥4.0, Low), publication dates, and links to original sources. The /knowledge/audit-dependencies and /knowledge/audit-manifest endpoints query OSV.dev for structured vulnerability data by package ecosystem and version. Supported ecosystems: npm, PyPI, crates.io, Go, Maven, NuGet.",
@@ -107,15 +331,57 @@
     {
       "id": "ka-observability-stats",
       "name": "Observability and Statistics",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "providers"
+          "id": "ka-observability-stats-elem-0",
+          "description": "Required element 0 for state Observability and Statistics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "providers"
+            },
+            "label": "Required element for Observability and Statistics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "cache_hit_rate"
+          "id": "ka-observability-stats-elem-1",
+          "description": "Required element 1 for state Observability and Statistics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "cache_hit_rate"
+            },
+            "label": "Required element for Observability and Statistics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "injection_detections"
+          "id": "ka-observability-stats-elem-2",
+          "description": "Required element 2 for state Observability and Statistics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "injection_detections"
+            },
+            "label": "Required element for Observability and Statistics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The /knowledge/stats endpoint returns a point-in-time snapshot of all knowledge acquisition metrics accumulated since process start. This includes per-provider query counts, success/failure/timeout rates, total searches, cache hit rate (Tier 0 hits / total searches), ingestion counts, dedup skip counts, and prompt injection detection counts. All counters use atomic operations for thread safety. The stats are served from the global singleton coordinator instance, so they reflect all search activity across the process.",
@@ -126,15 +392,57 @@
     {
       "id": "ka-database-backend",
       "name": "Dual-Database Backend (SQLite + PostgreSQL)",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "providers"
+          "id": "ka-database-backend-elem-0",
+          "description": "Required element 0 for state Dual-Database Backend (SQLite + PostgreSQL)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "providers"
+            },
+            "label": "Required element for Dual-Database Backend (SQLite + PostgreSQL)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "embedding"
+          "id": "ka-database-backend-elem-1",
+          "description": "Required element 1 for state Dual-Database Backend (SQLite + PostgreSQL)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "embedding"
+            },
+            "label": "Required element for Dual-Database Backend (SQLite + PostgreSQL)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "created_at"
+          "id": "ka-database-backend-elem-2",
+          "description": "Required element 2 for state Dual-Database Backend (SQLite + PostgreSQL)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "created_at"
+            },
+            "label": "Required element for Dual-Database Backend (SQLite + PostgreSQL)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The knowledge acquisition system supports both SQLite (CheckpointDb) and PostgreSQL (PgDb) backends. When DATABASE_URL is set, SearchContext attempts a PG connection at creation time. All operations (Tier 0 hybrid search, Tier 3 insert/embed/dedup) prefer PG when available and fall back to SQLite. The PG schema includes task_knowledge table with content_embedding BYTEA column. Hybrid search uses the same rank_results algorithm on both backends: fetch recent candidates with embeddings, compute cosine similarity in-memory (MiniLM-L6-v2, 384-dim), rank by 30% SQL position + 70% vector similarity.",
@@ -145,12 +453,40 @@
     {
       "id": "ka-mcp-tool-definitions",
       "name": "MCP Tool Registrations for AI Agents",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "knowledge"
+          "id": "ka-mcp-tool-definitions-elem-0",
+          "description": "Required element 0 for state MCP Tool Registrations for AI Agents",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "knowledge"
+            },
+            "label": "Required element for MCP Tool Registrations for AI Agents"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "description"
+          "id": "ka-mcp-tool-definitions-elem-1",
+          "description": "Required element 1 for state MCP Tool Registrations for AI Agents",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "description"
+            },
+            "label": "Required element for MCP Tool Registrations for AI Agents"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Six knowledge acquisition tools are registered in the AgentToolRegistry for autonomous use by Claude sessions during workflows. Each tool has a descriptive LLM-friendly description that helps the AI decide which tool to use: search_web (quick facts), research_error (error debugging with escalation), search_vulnerabilities (exploit/CVE lookup), audit_dependencies (batch OSV check), lookup_api_docs (deep documentation search), audit_manifest (parse manifest + audit). Tools are tagged with 'knowledge' plus role-specific tags (search, debugging, security, documentation).",
@@ -161,9 +497,23 @@
     {
       "id": "ka-query-tool-web",
       "name": "Query Tool Web Integration",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "web"
+          "id": "ka-query-tool-web-elem-0",
+          "description": "Required element 0 for state Query Tool Web Integration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "web"
+            },
+            "label": "Required element for Query Tool Web Integration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The existing /query endpoint's QueryType enum includes a 'web' variant that delegates to the knowledge acquisition coordinator. This allows Claude sessions to search the web through the same query_runner_data interface used for SQL, vector, and hybrid database queries. The web variant accepts search_text (required), limit, and an optional filters.domain ('vulnerability', 'error', 'api', or defaults to 'general') to classify the search. Results are returned in the standard QueryRunnerDataResponse format with provider, title, content, url, and relevance_score fields.",
@@ -174,12 +524,40 @@
     {
       "id": "ka-security-prompt-injection",
       "name": "Prompt Injection Detection on Ingested Content",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "INJECTION_WARNING"
+          "id": "ka-security-prompt-injection-elem-0",
+          "description": "Required element 0 for state Prompt Injection Detection on Ingested Content",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "INJECTION_WARNING"
+            },
+            "label": "Required element for Prompt Injection Detection on Ingested Content"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "invisible_unicode"
+          "id": "ka-security-prompt-injection-elem-1",
+          "description": "Required element 1 for state Prompt Injection Detection on Ingested Content",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "invisible_unicode"
+            },
+            "label": "Required element for Prompt Injection Detection on Ingested Content"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "All content ingested from external sources passes through a prompt injection scanner before storage. The scanner detects: injection phrases (21 patterns including 'ignore previous instructions', 'system prompt:', 'jailbreak', 'developer mode'), credential exfiltration attempts (6 patterns like 'exfiltrate', 'send api key to'), and invisible Unicode characters (16 types including zero-width spaces, RTL overrides, word joiners). Flagged content is NOT dropped — it is prefixed with [INJECTION_WARNING: N suspicious patterns detected: ...] for transparency. This allows downstream consumers to make informed decisions while preserving the content for analysis.",
@@ -191,12 +569,40 @@
     {
       "id": "ka-api-endpoints",
       "name": "HTTP API Endpoints",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "success"
+          "id": "ka-api-endpoints-elem-0",
+          "description": "Required element 0 for state HTTP API Endpoints",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "success"
+            },
+            "label": "Required element for HTTP API Endpoints"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "results"
+          "id": "ka-api-endpoints-elem-1",
+          "description": "Required element 1 for state HTTP API Endpoints",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "results"
+            },
+            "label": "Required element for HTTP API Endpoints"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Nine HTTP endpoints exposed under /knowledge/*: GET /knowledge/providers (list provider availability), GET /knowledge/stats (observability metrics), POST /knowledge/search-web (general web search), POST /knowledge/research-error (error research with escalation), POST /knowledge/fetch-page (UI Bridge snapshot), POST /knowledge/lookup-api-docs (deep API docs search), POST /knowledge/search-vulnerabilities (exploit/CVE search), POST /knowledge/audit-dependencies (batch package audit), POST /knowledge/audit-manifest (parse manifest + audit). All POST endpoints return {success, data: {results, provider_used}} wrapped in ApiResponse.",
@@ -207,12 +613,40 @@
     {
       "id": "ka-singleton-architecture",
       "name": "Singleton Coordinator Architecture",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "rate_limit"
+          "id": "ka-singleton-architecture-elem-0",
+          "description": "Required element 0 for state Singleton Coordinator Architecture",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "rate_limit"
+            },
+            "label": "Required element for Singleton Coordinator Architecture"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "uptime_secs"
+          "id": "ka-singleton-architecture-elem-1",
+          "description": "Required element 1 for state Singleton Coordinator Architecture",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "uptime_secs"
+            },
+            "label": "Required element for Singleton Coordinator Architecture"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The KnowledgeAcquisition coordinator is a global singleton (OnceLock<Arc<...>>), shared across all call sites in the process. This ensures: (1) the DuckDuckGo 2-second rate limiter is globally effective, (2) reqwest::Client connection pools are shared, (3) stats counters accumulate correctly across all API handlers and background tasks, (4) provider initialization (env var reads, health checks) happens once. The singleton is created on first access via KnowledgeAcquisition::new().",

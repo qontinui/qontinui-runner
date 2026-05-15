@@ -6,13 +6,41 @@
     {
       "id": "graphql-dash-controls",
       "name": "Mutation-Backed Lifecycle Controls",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Stop"
+          "id": "graphql-dash-controls-elem-0",
+          "description": "Required element 0 for state Mutation-Backed Lifecycle Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Stop"
+            },
+            "label": "Required element for Mutation-Backed Lifecycle Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "graphql-dash-controls-elem-1",
+          "description": "Required element 1 for state Mutation-Backed Lifecycle Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Mutation-Backed Lifecycle Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The dashboard control bar's stop, pause, and resume actions use GraphQL mutations. The mutation result automatically updates the cache.",
@@ -24,12 +52,40 @@
     {
       "id": "graphql-dash-updates",
       "name": "Subscription-Driven Updates",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "complete|failed|stopped"
+          "id": "graphql-dash-updates-elem-0",
+          "description": "Required element 0 for state Subscription-Driven Updates",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "complete|failed|stopped"
+            },
+            "label": "Required element for Subscription-Driven Updates"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "stopped"
+          "id": "graphql-dash-updates-elem-1",
+          "description": "Required element 1 for state Subscription-Driven Updates",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "stopped"
+            },
+            "label": "Required element for Subscription-Driven Updates"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Dashboard data refreshes when events arrive via subscription, not on a fixed polling interval.",
@@ -40,15 +96,57 @@
     {
       "id": "graphql-dash-loop",
       "name": "Orchestration Loop Banner",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Building|Executing|Reflecting|Fixing|Evaluating|Complete|Stopped"
+          "id": "graphql-dash-loop-elem-0",
+          "description": "Required element 0 for state Orchestration Loop Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Building|Executing|Reflecting|Fixing|Evaluating|Complete|Stopped"
+            },
+            "label": "Required element for Orchestration Loop Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "/"
+          "id": "graphql-dash-loop-elem-1",
+          "description": "Required element 1 for state Orchestration Loop Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "/"
+            },
+            "label": "Required element for Orchestration Loop Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Building|Executing|Reflecting"
+          "id": "graphql-dash-loop-elem-2",
+          "description": "Required element 2 for state Orchestration Loop Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Building|Executing|Reflecting"
+            },
+            "label": "Required element for Orchestration Loop Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A banner appears at the top of the dashboard when an orchestration loop is running. Shows phase, iteration progress, and control buttons. Phase updates are driven by a GraphQL subscription.",
@@ -60,9 +158,23 @@
     {
       "id": "graphql-dash-connection",
       "name": "Connection Health Badge",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Connected|Disconnected"
+          "id": "graphql-dash-connection-elem-0",
+          "description": "Required element 0 for state Connection Health Badge",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Connected|Disconnected"
+            },
+            "label": "Required element for Connection Health Badge"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The bottom bar shows a connection status indicator powered by a GraphQL health subscription. Falls back to REST polling if the subscription is unavailable.",

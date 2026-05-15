@@ -6,18 +6,74 @@
     {
       "id": "llm-ui-bridge-elements",
       "name": "UI Bridge Cost Components Presence",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Cost by Target App"
+          "id": "llm-ui-bridge-elements-elem-0",
+          "description": "Required element 0 for state UI Bridge Cost Components Presence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Cost by Target App"
+            },
+            "label": "Required element for UI Bridge Cost Components Presence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Cost per Successful Interaction"
+          "id": "llm-ui-bridge-elements-elem-1",
+          "description": "Required element 1 for state UI Bridge Cost Components Presence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Cost per Successful Interaction"
+            },
+            "label": "Required element for UI Bridge Cost Components Presence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Page Complexity"
+          "id": "llm-ui-bridge-elements-elem-2",
+          "description": "Required element 2 for state UI Bridge Cost Components Presence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Page Complexity"
+            },
+            "label": "Required element for UI Bridge Cost Components Presence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Model x Action Success Matrix"
+          "id": "llm-ui-bridge-elements-elem-3",
+          "description": "Required element 3 for state UI Bridge Cost Components Presence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Model x Action Success Matrix"
+            },
+            "label": "Required element for UI Bridge Cost Components Presence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Four new components are conditionally rendered in the LLM Observability Dashboard when target_app data exists in phase_token_usage: CostByTargetAppChart (horizontal bar), CostPerInteractionChart (vertical bar), PageComplexityTable (ranked table), and ModelActionMatrix (heatmap). All components are lazy-loaded.",
@@ -29,12 +85,40 @@
     {
       "id": "llm-cost-data-display",
       "name": "Cost Attribution Data Display",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Cost by Target App"
+          "id": "llm-cost-data-display-elem-0",
+          "description": "Required element 0 for state Cost Attribution Data Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Cost by Target App"
+            },
+            "label": "Required element for Cost Attribution Data Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Avg/Call"
+          "id": "llm-cost-data-display-elem-1",
+          "description": "Required element 1 for state Cost Attribution Data Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Avg/Call"
+            },
+            "label": "Required element for Cost Attribution Data Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "CostByTargetAppChart shows a horizontal bar chart sorted by cost descending. Custom tooltip shows app name, cost ($X.XX), calls, input/output tokens, and avg duration. Uses hsl(var(--chart-3)) fill. CostPerInteractionChart shows vertical bars with first 20 task runs, x-axis shows truncated run IDs, y-axis shows cost ($X.XX). PageComplexityTable has 4 columns: Page URL (monospace truncated), Calls, Total Cost, Avg/Call (bold). Sorted by avg cost descending. Sticky header with max-h-64 scroll.",
@@ -45,12 +129,40 @@
     {
       "id": "llm-matrix-semantics",
       "name": "Model-Action Matrix Color Semantics",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Model x Action"
+          "id": "llm-matrix-semantics-elem-0",
+          "description": "Required element 0 for state Model-Action Matrix Color Semantics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Model x Action"
+            },
+            "label": "Required element for Model-Action Matrix Color Semantics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Model x Action"
+          "id": "llm-matrix-semantics-elem-1",
+          "description": "Required element 1 for state Model-Action Matrix Color Semantics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Model x Action"
+            },
+            "label": "Required element for Model-Action Matrix Color Semantics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The heatmap matrix uses color coding to communicate model/action effectiveness: green (>= 95% success), yellow (>= 80%), orange (>= 50%), red (< 50%). Each cell shows success rate (bold %) and attempt count (muted Nx). Empty cells show '-'. Rows are model names (font-mono), columns are action types (font-mono). Only cells with >= 3 attempts are shown to ensure statistical significance.",
@@ -62,12 +174,40 @@
     {
       "id": "llm-state-consistency",
       "name": "Empty and Loading States",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "LLM Analytics"
+          "id": "llm-state-consistency-elem-0",
+          "description": "Required element 0 for state Empty and Loading States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "LLM Analytics"
+            },
+            "label": "Required element for Empty and Loading States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "No model-action data"
+          "id": "llm-state-consistency-elem-1",
+          "description": "Required element 1 for state Empty and Loading States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "No model-action data"
+            },
+            "label": "Required element for Empty and Loading States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Each component handles empty and loading states independently. CostByTargetAppChart: 'No UI Bridge cost data available' (only shown when target_app data exists, otherwise hidden entirely). CostPerInteractionChart: 'No interaction cost data'. PageComplexityTable: 'No page cost data'. ModelActionMatrix: 'No model-action data'. All show 'Loading...' during fetch.",
@@ -79,9 +219,23 @@
     {
       "id": "llm-interaction-time-range",
       "name": "Time Range Interaction",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "LLM Analytics"
+          "id": "llm-interaction-time-range-elem-0",
+          "description": "Required element 0 for state Time Range Interaction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "LLM Analytics"
+            },
+            "label": "Required element for Time Range Interaction"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The LLM dashboard's existing time range selector (1d/7d/30d/all) controls the days parameter for all cost attribution queries. CostByTargetAppChart fetches from /analytics/token-usage/by-target-app?days=N. CostPerInteractionChart fetches from /analytics/token-usage/cost-per-interaction?days=N. Changing the time range should update all four new charts.",
@@ -92,9 +246,23 @@
     {
       "id": "llm-cost-behavior",
       "name": "Cost Attribution Pipeline Behavior",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "LLM Analytics"
+          "id": "llm-cost-behavior-elem-0",
+          "description": "Required element 0 for state Cost Attribution Pipeline Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "LLM Analytics"
+            },
+            "label": "Required element for Cost Attribution Pipeline Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Cost attribution data flows from the agentic phase executor. When a workflow step involves UI Bridge actions, get_active_sdk_app_name() extracts the connected app name via try_lock on the SDK connection manager, and record_phase_token_usage_with_target() writes it to phase_token_usage.target_app. This means cost attribution only appears for workflows that interact with SDK-connected apps during their agentic phase.",

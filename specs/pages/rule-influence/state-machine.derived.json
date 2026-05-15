@@ -6,18 +6,74 @@
     {
       "id": "rule-influence-overview",
       "name": "Rule Influence Overview",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Rule Influence"
+          "id": "rule-influence-overview-elem-0",
+          "description": "Required element 0 for state Rule Influence Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Rule Influence"
+            },
+            "label": "Required element for Rule Influence Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Loaded"
+          "id": "rule-influence-overview-elem-1",
+          "description": "Required element 1 for state Rule Influence Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Loaded"
+            },
+            "label": "Required element for Rule Influence Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No effect"
+          "id": "rule-influence-overview-elem-2",
+          "description": "Required element 2 for state Rule Influence Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No effect"
+            },
+            "label": "Required element for Rule Influence Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Prevented"
+          "id": "rule-influence-overview-elem-3",
+          "description": "Required element 3 for state Rule Influence Overview",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Prevented"
+            },
+            "label": "Required element for Rule Influence Overview"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users need to see which generation rules are ineffective, with load counts and prevention rates, to decide which rules should be disabled or improved.",
@@ -28,12 +84,40 @@
     {
       "id": "rule-influence-effectiveness",
       "name": "Rule Effectiveness Ratio",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "%"
+          "id": "rule-influence-effectiveness-elem-0",
+          "description": "Required element 0 for state Rule Effectiveness Ratio",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "%"
+            },
+            "label": "Required element for Rule Effectiveness Ratio"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "effective"
+          "id": "rule-influence-effectiveness-elem-1",
+          "description": "Required element 1 for state Rule Effectiveness Ratio",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "effective"
+            },
+            "label": "Required element for Rule Effectiveness Ratio"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users need a clear effectiveness ratio for each rule to quickly assess which rules contribute value.",
@@ -44,9 +128,23 @@
     {
       "id": "rule-influence-alerts",
       "name": "High No-Effect Warning Badges",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "high no-effect"
+          "id": "rule-influence-alerts-elem-0",
+          "description": "Required element 0 for state High No-Effect Warning Badges",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "high no-effect"
+            },
+            "label": "Required element for High No-Effect Warning Badges"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Rules with high no-effect counts are flagged with an orange warning badge.",
@@ -57,12 +155,40 @@
     {
       "id": "rule-influence-states",
       "name": "Loading and Empty States",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Loading rules..."
+          "id": "rule-influence-states-elem-0",
+          "description": "Required element 0 for state Loading and Empty States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Loading rules..."
+            },
+            "label": "Required element for Loading and Empty States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "All rules appear effective"
+          "id": "rule-influence-states-elem-1",
+          "description": "Required element 1 for state Loading and Empty States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "All rules appear effective"
+            },
+            "label": "Required element for Loading and Empty States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Empty state communicates that all rules appear healthy.",
@@ -73,12 +199,40 @@
     {
       "id": "rule-influence-data-display",
       "name": "Rule Data Rendering",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Loaded"
+          "id": "rule-influence-data-display-elem-0",
+          "description": "Required element 0 for state Rule Data Rendering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Loaded"
+            },
+            "label": "Required element for Rule Data Rendering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "effective"
+          "id": "rule-influence-data-display-elem-1",
+          "description": "Required element 1 for state Rule Data Rendering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "effective"
+            },
+            "label": "Required element for Rule Data Rendering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Each rule row must accurately render the rule ID (first 16 chars, monospace), total loaded count, no-effect count, prevented-error count, and calculated effectiveness ratio.",
@@ -89,9 +243,23 @@
     {
       "id": "rule-influence-state-consistency",
       "name": "Rule State Transitions",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "All rules appear effective"
+          "id": "rule-influence-state-consistency-elem-0",
+          "description": "Required element 0 for state Rule State Transitions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "All rules appear effective"
+            },
+            "label": "Required element for Rule State Transitions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The panel transitions between loading, error, empty ('All rules appear effective'), and populated states without visual glitches.",

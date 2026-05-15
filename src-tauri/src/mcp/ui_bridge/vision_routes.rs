@@ -1018,7 +1018,7 @@ async fn do_multi_capture(
     let miss_count = runs.len();
 
     for ((name, _, contract, ext, cache_key), (_name, result)) in
-        runs.into_iter().zip(multi_results.into_iter())
+        runs.into_iter().zip(multi_results)
     {
         let bytes = result.map_err(|e| {
             (
@@ -1613,9 +1613,8 @@ async fn capture_and_encode_png(
     let frame = capture_runner_window_frame(state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let crop = resolve_crop_region(state, region_req, element_id, frame.width, frame.height)
-        .await
-        .map_err(|(code, msg)| (code, msg))?;
+    let crop =
+        resolve_crop_region(state, region_req, element_id, frame.width, frame.height).await?;
     // PNG-only pipeline. No alpha policy here — we want lossless bytes to
     // feed the model; the model handles its own preprocessing.
     let mut pipeline = qontinui_vision_core::Pipeline::new();

@@ -6,29 +6,113 @@
     {
       "id": "page-structure",
       "name": "Page Structure and View Modes",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Specs"
+          "id": "page-structure-elem-0",
+          "description": "Required element 0 for state Page Structure and View Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Specs"
+            },
+            "label": "Required element for Page Structure and View Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "viewer"
+          "id": "page-structure-elem-1",
+          "description": "Required element 1 for state Page Structure and View Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "viewer"
+            },
+            "label": "Required element for Page Structure and View Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Editor"
+          "id": "page-structure-elem-2",
+          "description": "Required element 2 for state Page Structure and View Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Editor"
+            },
+            "label": "Required element for Page Structure and View Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Contracts"
+          "id": "page-structure-elem-3",
+          "description": "Required element 3 for state Page Structure and View Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Contracts"
+            },
+            "label": "Required element for Page Structure and View Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Experimentation"
+          "id": "page-structure-elem-4",
+          "description": "Required element 4 for state Page Structure and View Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Experimentation"
+            },
+            "label": "Required element for Page Structure and View Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Contracts"
+          "id": "page-structure-elem-5",
+          "description": "Required element 5 for state Page Structure and View Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Contracts"
+            },
+            "label": "Required element for Page Structure and View Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Specs page header contains a ShieldCheck icon, the 'Specs' title, a mode badge ('viewer' or 'editor'), and three view-mode toggle buttons on the right: Editor (default), Contracts, and Experimentation. The initial view mode is 'Editor'. Each button activates its mode and the selected button gets a highlighted background.",
@@ -39,13 +123,97 @@
     {
       "id": "connection-bar-load",
       "name": "Connection Bar — Spec Loading Controls",
-      "requiredElements": [
-        {},
-        {},
-        {},
-        {},
-        {},
-        {}
+      "assertions": [
+        {
+          "id": "connection-bar-load-elem-0",
+          "description": "Required element 0 for state Connection Bar — Spec Loading Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Loading Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-load-elem-1",
+          "description": "Required element 1 for state Connection Bar — Spec Loading Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Loading Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-load-elem-2",
+          "description": "Required element 2 for state Connection Bar — Spec Loading Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Loading Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-load-elem-3",
+          "description": "Required element 3 for state Connection Bar — Spec Loading Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Loading Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-load-elem-4",
+          "description": "Required element 4 for state Connection Bar — Spec Loading Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Loading Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-load-elem-5",
+          "description": "Required element 5 for state Connection Bar — Spec Loading Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Loading Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "Below the page header, the connection bar provides controls for loading specs. 'Bundled' (purple, BookOpen icon) loads all pre-packaged specs shipped with the runner. 'File' (emerald, FolderOpen icon) opens a file dialog to load spec files from disk. A URL input (defaulting to http://localhost:3001) and 'Discover' (cyan, Search icon) button connect to a running application via UI Bridge to discover its specs. These controls are always visible regardless of current spec selection state.",
       "provenance": {
@@ -55,14 +223,98 @@
     {
       "id": "connection-bar-actions",
       "name": "Connection Bar — Spec Action Controls",
-      "requiredElements": [
-        {},
-        {},
-        {},
-        {},
-        {},
+      "assertions": [
         {
-          "text": "specs"
+          "id": "connection-bar-actions-elem-0",
+          "description": "Required element 0 for state Connection Bar — Spec Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-actions-elem-1",
+          "description": "Required element 1 for state Connection Bar — Spec Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-actions-elem-2",
+          "description": "Required element 2 for state Connection Bar — Spec Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-actions-elem-3",
+          "description": "Required element 3 for state Connection Bar — Spec Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-actions-elem-4",
+          "description": "Required element 4 for state Connection Bar — Spec Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Connection Bar — Spec Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "connection-bar-actions-elem-5",
+          "description": "Required element 5 for state Connection Bar — Spec Action Controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "specs"
+            },
+            "label": "Required element for Connection Bar — Spec Action Controls"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When a spec is selected, additional action buttons appear in the connection bar. 'Edit'/'Done' (amber, Pencil/PencilOff icon) toggles edit mode for page specs. 'Save' (Save icon) exports the selected spec to disk. 'AI Eval' (Brain icon, amber when active) forces all assertions to be AI-evaluated instead of using fast deterministic checks. 'Regression (N)' (Bug icon, purple) appears only when known issues exist and N > 0. 'Generate with AI (spec brief)' (Sparkles, fuchsia when on, id=specs-ai-toggle, role=switch) toggles the AI workflow-generation pipeline. 'Build Workflow'/'Generating…' (orange Hammer/Loader2) builds a verification workflow. 'Sync All Specs' (teal RefreshCw) re-syncs all stale specs with AI. 'Check Drift' (SpecDriftButton) scans source for unspecced elements. 'Compile State Machine' (violet Network) compiles stateMachine sections into the runtime engine.",
@@ -74,12 +326,40 @@
     {
       "id": "connection-status-row",
       "name": "Connection Status Row",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Connecting"
+          "id": "connection-status-row-elem-0",
+          "description": "Required element 0 for state Connection Status Row",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Connecting"
+            },
+            "label": "Required element for Connection Status Row"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Connected"
+          "id": "connection-status-row-elem-1",
+          "description": "Required element 1 for state Connection Status Row",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Connected"
+            },
+            "label": "Required element for Connection Status Row"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A second row below the connection bar buttons appears when the connection status is not 'disconnected'. It shows real-time discovery status: cyan spinner and 'Connecting…' while in flight, green CheckCircle2 and the app name when connected, red AlertCircle and the error message when discovery failed. The row is absent when disconnected.",
@@ -91,14 +371,56 @@
     {
       "id": "sync-progress-banner",
       "name": "Sync Progress Banner",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Analyzing specs"
+          "id": "sync-progress-banner-elem-0",
+          "description": "Required element 0 for state Sync Progress Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Analyzing specs"
+            },
+            "label": "Required element for Sync Progress Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Sync complete"
+          "id": "sync-progress-banner-elem-1",
+          "description": "Required element 1 for state Sync Progress Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Sync complete"
+            },
+            "label": "Required element for Sync Progress Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {}
+        {
+          "id": "sync-progress-banner-elem-2",
+          "description": "Required element 2 for state Sync Progress Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Sync Progress Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "When 'Sync All Specs' is triggered, a teal-tinted banner appears below the connection bar showing real-time sync progress. Phase labels cycle through: 'Analyzing specs…', 'Syncing N+1/M' (with a progress bar and current spec name truncated to 200px), 'Compiling state machine…', and 'Sync complete'. On completion the banner shows counts: green 'N updated' (CheckCircle2), muted 'M skipped', optional red 'K failed' (AlertTriangle), optional amber 'J warnings'. An X button cancels in-progress syncs or dismisses the completed banner.",
       "precondition": "Sync All Specs was clicked with at least one spec loaded",
@@ -109,21 +431,91 @@
     {
       "id": "spec-tree",
       "name": "Spec Tree — Navigation Sidebar",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Specifications"
+          "id": "spec-tree-elem-0",
+          "description": "Required element 0 for state Spec Tree — Navigation Sidebar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Specifications"
+            },
+            "label": "Required element for Spec Tree — Navigation Sidebar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No specs loaded"
+          "id": "spec-tree-elem-1",
+          "description": "Required element 1 for state Spec Tree — Navigation Sidebar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No specs loaded"
+            },
+            "label": "Required element for Spec Tree — Navigation Sidebar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Specifications"
+          "id": "spec-tree-elem-2",
+          "description": "Required element 2 for state Spec Tree — Navigation Sidebar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Specifications"
+            },
+            "label": "Required element for Spec Tree — Navigation Sidebar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Specifications"
+          "id": "spec-tree-elem-3",
+          "description": "Required element 3 for state Spec Tree — Navigation Sidebar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Specifications"
+            },
+            "label": "Required element for Spec Tree — Navigation Sidebar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Specifications"
+          "id": "spec-tree-elem-4",
+          "description": "Required element 4 for state Spec Tree — Navigation Sidebar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Specifications"
+            },
+            "label": "Required element for Spec Tree — Navigation Sidebar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The left sidebar shows a hierarchical tree of all loaded specs under a 'Specifications' heading. Specs are grouped by application name when specs from multiple apps are loaded. Each node shows a type-specific icon (Shield for page-spec, Server for architecture, Globe for API, Database for data, GitBranch for dependency, Gauge for constraint), a truncated label, and a child-item count in muted text. Page specs expand via a ChevronRight/ChevronDown chevron to show child group nodes. data-ui-id attributes follow the pattern 'spec-tree-{specId}'.",
@@ -135,14 +527,42 @@
     {
       "id": "detail-panel-empty",
       "name": "Detail Panel — No Selection",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Generate Spec"
+          "id": "detail-panel-empty-elem-0",
+          "description": "Required element 0 for state Detail Panel — No Selection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Generate Spec"
+            },
+            "label": "Required element for Detail Panel — No Selection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Generate Spec"
+          "id": "detail-panel-empty-elem-1",
+          "description": "Required element 1 for state Detail Panel — No Selection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Generate Spec"
+            },
+            "label": "Required element for Detail Panel — No Selection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When no spec is selected, the center detail panel renders the GlobalIssuesPanel component. When an unspecced-page node is selected, a centered view appears with an amber Shield icon, the page label as a heading, the expected spec ID in a code element (amber text), and a 'Generate Spec' button (purple Plus icon) that triggers AI spec creation.",
@@ -154,22 +574,78 @@
     {
       "id": "detail-panel-tabs",
       "name": "Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Assertions"
+          "id": "detail-panel-tabs-elem-0",
+          "description": "Required element 0 for state Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Assertions"
+            },
+            "label": "Required element for Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Issues"
+          "id": "detail-panel-tabs-elem-1",
+          "description": "Required element 1 for state Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Issues"
+            },
+            "label": "Required element for Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Triage"
+          "id": "detail-panel-tabs-elem-2",
+          "description": "Required element 2 for state Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Triage"
+            },
+            "label": "Required element for Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Issues"
+          "id": "detail-panel-tabs-elem-3",
+          "description": "Required element 3 for state Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Issues"
+            },
+            "label": "Required element for Detail Panel — Page Spec Tabs (Assertions / Issues / Triage)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When a page-spec is selected at the spec level (not a group), the center panel shows three tabs: 'Assertions' (Shield icon, default active) renders PageSpecOverview. 'Issues' (Bug icon) renders SpecIssuesPanel showing known issues filtered by specId and pageUrl. 'Triage' (AlertTriangle icon) renders SpecTriageView for regression triage. The active tab has a highlighted border-b-0 rounded-t style. Tab state is local to SpecDetailPanel and resets when a new spec is selected.",
@@ -181,15 +657,57 @@
     {
       "id": "detail-panel-spec-overview",
       "name": "Detail Panel — Page Spec Overview (Assertions Tab)",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Groups"
+          "id": "detail-panel-spec-overview-elem-0",
+          "description": "Required element 0 for state Detail Panel — Page Spec Overview (Assertions Tab)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Groups"
+            },
+            "label": "Required element for Detail Panel — Page Spec Overview (Assertions Tab)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Categories"
+          "id": "detail-panel-spec-overview-elem-1",
+          "description": "Required element 1 for state Detail Panel — Page Spec Overview (Assertions Tab)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Categories"
+            },
+            "label": "Required element for Detail Panel — Page Spec Overview (Assertions Tab)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Groups"
+          "id": "detail-panel-spec-overview-elem-2",
+          "description": "Required element 2 for state Detail Panel — Page Spec Overview (Assertions Tab)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Groups"
+            },
+            "label": "Required element for Detail Panel — Page Spec Overview (Assertions Tab)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Assertions tab for a selected page-spec renders PageSpecOverview: the spec ID as a heading, description text, a 'Categories' section listing unique assertion categories used, and a 'Groups' section listing all groups. Each group row shows its category badge, name, and enabled assertion count. Clicking a group row navigates to GroupDetail for that group. In edit mode, groups show trash icons and an 'Add group' form appears at the bottom.",
@@ -201,12 +719,40 @@
     {
       "id": "detail-panel-group-detail",
       "name": "Detail Panel — Group Detail View",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "critical"
+          "id": "detail-panel-group-detail-elem-0",
+          "description": "Required element 0 for state Detail Panel — Group Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "critical"
+            },
+            "label": "Required element for Detail Panel — Group Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "critical"
+          "id": "detail-panel-group-detail-elem-1",
+          "description": "Required element 1 for state Detail Panel — Group Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "critical"
+            },
+            "label": "Required element for Detail Panel — Group Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When a group node is selected, the center panel shows GroupDetail: the group name as a heading with a category badge, the group description, and a scrollable list of all assertions. Each assertion row shows a severity badge (red=critical, yellow=warning, blue=info), eye icon for enabled state (full opacity=enabled, dimmed=disabled), description text, assertionType badge, category badge, and source badge. A precondition tag appears when set. In edit mode, eye icons are clickable and trash icons appear.",
@@ -218,20 +764,76 @@
     {
       "id": "edit-mode",
       "name": "Edit Mode — Inline Assertion and Group Management",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "editor"
+          "id": "edit-mode-elem-0",
+          "description": "Required element 0 for state Edit Mode — Inline Assertion and Group Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "editor"
+            },
+            "label": "Required element for Edit Mode — Inline Assertion and Group Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Done"
+          "id": "edit-mode-elem-1",
+          "description": "Required element 1 for state Edit Mode — Inline Assertion and Group Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Done"
+            },
+            "label": "Required element for Edit Mode — Inline Assertion and Group Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Add assertion"
+          "id": "edit-mode-elem-2",
+          "description": "Required element 2 for state Edit Mode — Inline Assertion and Group Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add assertion"
+            },
+            "label": "Required element for Edit Mode — Inline Assertion and Group Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Add group"
+          "id": "edit-mode-elem-3",
+          "description": "Required element 3 for state Edit Mode — Inline Assertion and Group Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add group"
+            },
+            "label": "Required element for Edit Mode — Inline Assertion and Group Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Edit mode is activated by clicking 'Edit' in the connection bar (only available for page-spec selections). The mode badge changes from 'viewer' to 'editor', and the Edit button shows 'Done' in amber. In group detail: eye icons become clickable toggles, trash icons appear on each assertion, and an 'Add assertion' button reveals an inline form. In spec overview: group rows show trash icons and an 'Add group' button reveals a creation form. Clicking 'Done' exits edit mode.",
@@ -243,19 +845,75 @@
     {
       "id": "ai-chat-panel",
       "name": "AI Chat Panel",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "AI Chat"
+          "id": "ai-chat-panel-elem-0",
+          "description": "Required element 0 for state AI Chat Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "AI Chat"
+            },
+            "label": "Required element for AI Chat Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "New"
+          "id": "ai-chat-panel-elem-1",
+          "description": "Required element 1 for state AI Chat Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "New"
+            },
+            "label": "Required element for AI Chat Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Apply as"
+          "id": "ai-chat-panel-elem-2",
+          "description": "Required element 2 for state AI Chat Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Apply as"
+            },
+            "label": "Required element for AI Chat Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "AI Chat"
+          "id": "ai-chat-panel-elem-3",
+          "description": "Required element 3 for state AI Chat Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "AI Chat"
+            },
+            "label": "Required element for AI Chat Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The right panel is the AI Chat interface. It shows an 'AI Chat' heading, a scrollable message history, a textarea input, and a send/stop button. User messages show a cyan User icon in a small circle with cyan-tinted background. AI responses show a purple Bot icon with dark background and full markdown rendering (code blocks, lists, inline code). System messages appear centered in italic muted text. A session status indicator and a 'New' button reset the session and clear history. When the AI generates a spec JSON in a ```json block, an 'Apply as [type] spec' button appears below the message with data-testid='apply-{kind}-{specId}'.",
@@ -267,26 +925,96 @@
     {
       "id": "ai-chat-modes",
       "name": "AI Chat — Review and Create Modes",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Review"
+          "id": "ai-chat-modes-elem-0",
+          "description": "Required element 0 for state AI Chat — Review and Create Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Review"
+            },
+            "label": "Required element for AI Chat — Review and Create Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Create"
+          "id": "ai-chat-modes-elem-1",
+          "description": "Required element 1 for state AI Chat — Review and Create Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Create"
+            },
+            "label": "Required element for AI Chat — Review and Create Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Review spec quality"
+          "id": "ai-chat-modes-elem-2",
+          "description": "Required element 2 for state AI Chat — Review and Create Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Review spec quality"
+            },
+            "label": "Required element for AI Chat — Review and Create Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Build verification workflow"
+          "id": "ai-chat-modes-elem-3",
+          "description": "Required element 3 for state AI Chat — Review and Create Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Build verification workflow"
+            },
+            "label": "Required element for AI Chat — Review and Create Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "New Page Spec"
+          "id": "ai-chat-modes-elem-4",
+          "description": "Required element 4 for state AI Chat — Review and Create Modes",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "New Page Spec"
+            },
+            "label": "Required element for AI Chat — Review and Create Modes"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The chat panel has two toggle modes: 'Review' and 'Create'. In Review mode, four quick-action buttons appear ('Review spec quality', 'Find gaps', 'Suggest improvements', 'Generate assertions'), and for page specs a 'Build verification workflow' button (Hammer) also appears. In Create mode, template buttons appear ('New Page Spec', 'New Architecture Spec', 'New API Spec', 'New Data Spec'). The modes are mutually exclusive toggles — clicking the active mode's button deactivates it. Input placeholder text reflects the active mode.",
@@ -298,10 +1026,52 @@
     {
       "id": "workflow-pipeline",
       "name": "Build Workflow Pipeline",
-      "requiredElements": [
-        {},
-        {},
-        {}
+      "assertions": [
+        {
+          "id": "workflow-pipeline-elem-0",
+          "description": "Required element 0 for state Build Workflow Pipeline",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Build Workflow Pipeline"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "workflow-pipeline-elem-1",
+          "description": "Required element 1 for state Build Workflow Pipeline",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Build Workflow Pipeline"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "workflow-pipeline-elem-2",
+          "description": "Required element 2 for state Build Workflow Pipeline",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Build Workflow Pipeline"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "The 'Build Workflow' button triggers workflow generation from the selected spec. Two paths exist: AI path (toggle on, default) calls buildSpecBrief() → generateFromBrief() to produce a richer workflow with setup/navigation steps; deterministic path (toggle off) calls buildSpecWorkflow() for a straightforward assertion verification workflow. For non-page specs, the workflow embeds the full spec JSON as an agentic step prompt. All workflows are POSTed to /unified-workflows with category='spec-generated' and tags=['spec','auto-generated'], then the user is navigated to the workflow builder tab.",
       "precondition": "A page-spec is selected and AI toggle is on (aria-pressed=true)",
@@ -312,12 +1082,40 @@
     {
       "id": "spec-drift",
       "name": "Spec Drift Detection",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Check Drift"
+          "id": "spec-drift-elem-0",
+          "description": "Required element 0 for state Spec Drift Detection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Drift"
+            },
+            "label": "Required element for Spec Drift Detection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Check Drift"
+          "id": "spec-drift-elem-1",
+          "description": "Required element 1 for state Spec Drift Detection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Check Drift"
+            },
+            "label": "Required element for Spec Drift Detection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The SpecDriftButton in the connection bar invokes the Tauri 'scan_spec_drift' command with the runner project root (D:/qontinui-root/qontinui-runner). It scans source files for useUIElement({ id: '...' }) registrations and compares them against assertion target IDs in all loaded .spec.uibridge.json files. The resulting DriftReport has two lists: missing_from_spec (elements in code but not in specs) and orphans_in_spec (assertion targets not matching any useUIElement registration). Results are shown in a modal with suggested assertion JSON for copy-paste.",
@@ -328,9 +1126,37 @@
     {
       "id": "compile-state-machine",
       "name": "Compile State Machine",
-      "requiredElements": [
-        {},
-        {}
+      "assertions": [
+        {
+          "id": "compile-state-machine-elem-0",
+          "description": "Required element 0 for state Compile State Machine",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Compile State Machine"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "compile-state-machine-elem-1",
+          "description": "Required element 1 for state Compile State Machine",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Compile State Machine"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "The 'Compile State Machine' button (violet Network icon, id=specs-btn-compile-sm) compiles the stateMachine sections from all loaded .spec.uibridge.json files into a single runtime state machine via compileStateMachineFromSpecs(). It then persists the result to the backend DB via persistCompiledStateMachine() and loads it into the UI Bridge engine so the pathfinder can navigate by state ID. Specs without a stateMachine section are skipped. This is distinct from the State Machine page's 'Generate for Runner' which reverse-engineers from React source.",
       "precondition": "At least one spec with a stateMachine section is loaded",
@@ -341,10 +1167,52 @@
     {
       "id": "file-operations",
       "name": "File Loading and Saving",
-      "requiredElements": [
-        {},
-        {},
-        {}
+      "assertions": [
+        {
+          "id": "file-operations-elem-0",
+          "description": "Required element 0 for state File Loading and Saving",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for File Loading and Saving"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "file-operations-elem-1",
+          "description": "Required element 1 for state File Loading and Saving",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for File Loading and Saving"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "file-operations-elem-2",
+          "description": "Required element 2 for state File Loading and Saving",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for File Loading and Saving"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "Specs can be loaded from and saved to disk via Tauri file dialogs. Loading supports six extensions: .spec.uibridge.json (page-spec), .architecture.uibridge.json, .api.uibridge.json, .data.uibridge.json, .deps.uibridge.json, .constraints.uibridge.json. Kind detection is from filename extension first, then content structure (groups array → page-spec, endpoints → api, entities → data, modules → dependency, budgets/techStack → constraint/architecture). Loaded file specs appear under 'File' in the tree and are auto-selected. Saving exports the config as indented JSON with the correct extension.",
       "precondition": "Any spec is selected",
@@ -355,13 +1223,55 @@
     {
       "id": "ai-generation-toggle",
       "name": "AI Spec-Brief Toggle",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "switch"
+          "id": "ai-generation-toggle-elem-0",
+          "description": "Required element 0 for state AI Spec-Brief Toggle",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "switch"
+            },
+            "label": "Required element for AI Spec-Brief Toggle"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
         {
-          "text": "Generating"
+          "id": "ai-generation-toggle-elem-1",
+          "description": "Required element 1 for state AI Spec-Brief Toggle",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for AI Spec-Brief Toggle"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ai-generation-toggle-elem-2",
+          "description": "Required element 2 for state AI Spec-Brief Toggle",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Generating"
+            },
+            "label": "Required element for AI Spec-Brief Toggle"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The 'Generate with AI (spec brief)' switch (id=specs-ai-toggle, role=switch) controls which pipeline runs when 'Build Workflow' is clicked. On by default (aria-pressed=true, fuchsia). Off state (aria-pressed=false, muted) routes to deterministic buildSpecWorkflow(). State persists via instanceStorage key 'specs.useAiGeneration'. The Sparkles icon always shows regardless of state.",

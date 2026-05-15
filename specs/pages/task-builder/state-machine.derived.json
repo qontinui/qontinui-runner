@@ -6,19 +6,75 @@
     {
       "id": "task-list-management",
       "name": "Task Library Management",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Tasks"
+          "id": "task-list-management-elem-0",
+          "description": "Required element 0 for state Task Library Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tasks"
+            },
+            "label": "Required element for Task Library Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "New"
+          "id": "task-list-management-elem-1",
+          "description": "Required element 1 for state Task Library Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "New"
+            },
+            "label": "Required element for Task Library Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "searchbox"
+          "id": "task-list-management-elem-2",
+          "description": "Required element 2 for state Task Library Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "searchbox"
+            },
+            "label": "Required element for Task Library Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Tasks"
+          "id": "task-list-management-elem-3",
+          "description": "Required element 3 for state Task Library Management",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tasks"
+            },
+            "label": "Required element for Task Library Management"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The left panel displays all saved tasks in a searchable list following the standard library builder layout. Each task item shows its name, category badge, a content preview (first 60 characters of the prompt text), and tag count. Users can browse the list, search by name, create new tasks, and select a task to load into the editor. The UI labels this as 'Tasks' though the underlying API uses 'prompts' as the resource name.",
@@ -29,19 +85,75 @@
     {
       "id": "task-editor-config",
       "name": "Task Editor and Content",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Tasks"
+          "id": "task-editor-config-elem-0",
+          "description": "Required element 0 for state Task Editor and Content",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tasks"
+            },
+            "label": "Required element for Task Editor and Content"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Tasks"
+          "id": "task-editor-config-elem-1",
+          "description": "Required element 1 for state Task Editor and Content",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tasks"
+            },
+            "label": "Required element for Task Editor and Content"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Save"
+          "id": "task-editor-config-elem-2",
+          "description": "Required element 2 for state Task Editor and Content",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save"
+            },
+            "label": "Required element for Task Editor and Content"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Tasks"
+          "id": "task-editor-config-elem-3",
+          "description": "Required element 3 for state Task Editor and Content",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tasks"
+            },
+            "label": "Required element for Task Editor and Content"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The right-panel editor provides fields for defining a task. The name field identifies the task in lists and pickers. The content field is a textarea for entering the full prompt text or AI instructions -- this is the most important field as it defines what the AI should do when this task is used in a workflow. An optional category field supports organizational grouping. Tags can be added for flexible labeling. The editor toolbar includes save and delete actions.",
@@ -52,16 +164,58 @@
     {
       "id": "task-organization",
       "name": "Organization and Discovery",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Tasks"
+          "id": "task-organization-elem-0",
+          "description": "Required element 0 for state Organization and Discovery",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tasks"
+            },
+            "label": "Required element for Organization and Discovery"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Delete"
+          "id": "task-organization-elem-1",
+          "description": "Required element 1 for state Organization and Discovery",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Delete"
+            },
+            "label": "Required element for Organization and Discovery"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Tasks"
+          "id": "task-organization-elem-2",
+          "description": "Required element 2 for state Organization and Discovery",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tasks"
+            },
+            "label": "Required element for Organization and Discovery"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Tasks support tags for flexible cross-cutting labeling that enhances discovery through the library dashboard and search. The tag input allows adding multiple tags using an enter-to-add pattern and individual tag removal. Combined with categories, tags create a rich organizational system that scales with library growth. The delete action allows users to remove outdated or unused task definitions.",

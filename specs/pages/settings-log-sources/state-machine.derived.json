@@ -6,17 +6,73 @@
     {
       "id": "ls-page-structure",
       "name": "Page Structure",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Log Sources"
+          "id": "ls-page-structure-elem-0",
+          "description": "Required element 0 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Log Sources"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Configure global log sources shared across all projects"
+          "id": "ls-page-structure-elem-1",
+          "description": "Required element 1 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Configure global log sources shared across all projects"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
         {
-          "role": "img"
+          "id": "ls-page-structure-elem-2",
+          "description": "Required element 2 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-page-structure-elem-3",
+          "description": "Required element 3 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "img"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Log Sources tab renders a SectionHeader followed by an action row (Import from Projects + Save Changes), then three collapsible card sections: AI Source Selection, Log Sources, and Profiles. All sections are expanded by default on load.",
@@ -28,22 +84,78 @@
     {
       "id": "ls-action-buttons",
       "name": "Page Action Buttons",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Save Changes"
+          "id": "ls-action-buttons-elem-0",
+          "description": "Required element 0 for state Page Action Buttons",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save Changes"
+            },
+            "label": "Required element for Page Action Buttons"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Import from Projects"
+          "id": "ls-action-buttons-elem-1",
+          "description": "Required element 1 for state Page Action Buttons",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Import from Projects"
+            },
+            "label": "Required element for Page Action Buttons"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Save Changes"
+          "id": "ls-action-buttons-elem-2",
+          "description": "Required element 2 for state Page Action Buttons",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save Changes"
+            },
+            "label": "Required element for Page Action Buttons"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Import from Projects"
+          "id": "ls-action-buttons-elem-3",
+          "description": "Required element 3 for state Page Action Buttons",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Import from Projects"
+            },
+            "label": "Required element for Page Action Buttons"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The action bar below the SectionHeader contains two buttons: 'Import from Projects' on the left and 'Save Changes' on the right. Save Changes persists all pending source/profile/settings changes via save_global_log_sources IPC. Changes are NOT auto-saved; they accumulate in local state until Save is clicked.",
@@ -54,13 +166,69 @@
     {
       "id": "ls-ai-selection-section",
       "name": "AI Source Selection Section",
-      "requiredElements": [
-        {},
-        {},
+      "assertions": [
         {
-          "role": "radio"
+          "id": "ls-ai-selection-section-elem-0",
+          "description": "Required element 0 for state AI Source Selection Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for AI Source Selection Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {}
+        {
+          "id": "ls-ai-selection-section-elem-1",
+          "description": "Required element 1 for state AI Source Selection Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for AI Source Selection Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-ai-selection-section-elem-2",
+          "description": "Required element 2 for state AI Source Selection Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "radio"
+            },
+            "label": "Required element for AI Source Selection Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-ai-selection-section-elem-3",
+          "description": "Required element 3 for state AI Source Selection Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for AI Source Selection Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "The AI Source Selection section controls how the AI picks relevant log sources during workflow execution. It contains three radio button options: Dynamic (re-evaluate each verification round), Static (select once at workflow start), Disabled (use profiles or all enabled sources). The section is collapsible via its header button. The Sparkles icon accompanies the heading.",
       "precondition": "AI Source Selection section is expanded",
@@ -71,17 +239,87 @@
     {
       "id": "ls-sources-section",
       "name": "Log Sources Section",
-      "requiredElements": [
-        {},
+      "assertions": [
         {
-          "role": "button",
-          "text": "Add Source"
+          "id": "ls-sources-section-elem-0",
+          "description": "Required element 0 for state Log Sources Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Log Sources Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No log sources configured"
+          "id": "ls-sources-section-elem-1",
+          "description": "Required element 1 for state Log Sources Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add Source"
+            },
+            "label": "Required element for Log Sources Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
-        {}
+        {
+          "id": "ls-sources-section-elem-2",
+          "description": "Required element 2 for state Log Sources Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No log sources configured"
+            },
+            "label": "Required element for Log Sources Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-sources-section-elem-3",
+          "description": "Required element 3 for state Log Sources Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Log Sources Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-sources-section-elem-4",
+          "description": "Required element 4 for state Log Sources Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Log Sources Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "The Log Sources section lists all configured global log sources. The heading shows the count: 'Log Sources (N)'. Each source row shows a color dot, enable/disable checkbox, name, path, format/parser badges, type badge, and category badge, plus Edit and Delete icon buttons. When empty, a placeholder message is shown. An 'Add Source' button opens the SourceEditor modal.",
       "precondition": "The sources list is empty",
@@ -92,15 +330,71 @@
     {
       "id": "ls-profiles-section",
       "name": "Profiles Section",
-      "requiredElements": [
-        {},
+      "assertions": [
         {
-          "text": "No profiles configured"
+          "id": "ls-profiles-section-elem-0",
+          "description": "Required element 0 for state Profiles Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Profiles Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
         {
-          "role": "button",
-          "text": "Set Default"
+          "id": "ls-profiles-section-elem-1",
+          "description": "Required element 1 for state Profiles Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No profiles configured"
+            },
+            "label": "Required element for Profiles Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-profiles-section-elem-2",
+          "description": "Required element 2 for state Profiles Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Profiles Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-profiles-section-elem-3",
+          "description": "Required element 3 for state Profiles Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Set Default"
+            },
+            "label": "Required element for Profiles Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Profiles section lists named groups of log sources. The heading shows 'Profiles (N)'. Each profile row shows the profile name, a 'Default' badge if it is the active default, and an enabled/total source count (e.g. '3/5 sources enabled'). Row actions include 'Set Default' (only shown for non-default profiles), Edit, and Delete. When empty, a placeholder message is shown. An 'Add Profile' button opens the ProfileEditor modal.",
@@ -112,25 +406,95 @@
     {
       "id": "ls-add-source-modal",
       "name": "Add Source Modal",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Add Source"
+          "id": "ls-add-source-modal-elem-0",
+          "description": "Required element 0 for state Add Source Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Add Source"
+            },
+            "label": "Required element for Add Source Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Add"
+          "id": "ls-add-source-modal-elem-1",
+          "description": "Required element 1 for state Add Source Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add"
+            },
+            "label": "Required element for Add Source Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading",
-          "text": "Add Source"
+          "id": "ls-add-source-modal-elem-2",
+          "description": "Required element 2 for state Add Source Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Add Source"
+            },
+            "label": "Required element for Add Source Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Error Monitoring"
+          "id": "ls-add-source-modal-elem-3",
+          "description": "Required element 3 for state Add Source Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Error Monitoring"
+            },
+            "label": "Required element for Add Source Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Add"
+          "id": "ls-add-source-modal-elem-4",
+          "description": "Required element 4 for state Add Source Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add"
+            },
+            "label": "Required element for Add Source Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The SourceEditor modal opens when 'Add Source' is clicked. The modal title reads 'Add Source'. It contains required fields Name and Path, plus optional: Description, Category (select with 9 options), Type (select: File/Glob/Directory), Tail Lines (10-10000), Color, Keywords (comma-separated). An 'Error Monitoring' collapsible subsection contains Format, Parser, Timestamp Pattern, Timezone, Poll Interval, and three pattern textareas. The 'Add' submit button is disabled until Name and Path are both non-empty.",
@@ -142,18 +506,60 @@
     {
       "id": "ls-edit-source-modal",
       "name": "Edit Source Modal",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Edit Source"
+          "id": "ls-edit-source-modal-elem-0",
+          "description": "Required element 0 for state Edit Source Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Edit Source"
+            },
+            "label": "Required element for Edit Source Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Update"
+          "id": "ls-edit-source-modal-elem-1",
+          "description": "Required element 1 for state Edit Source Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Update"
+            },
+            "label": "Required element for Edit Source Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Cancel"
+          "id": "ls-edit-source-modal-elem-2",
+          "description": "Required element 2 for state Edit Source Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Cancel"
+            },
+            "label": "Required element for Edit Source Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The SourceEditor modal opens in edit mode when the pencil icon on a source row is clicked. The title reads 'Edit Source'. All fields are pre-populated with the source's current values. The submit button reads 'Update'. Saving replaces the existing source in the list without changing its position.",
@@ -165,18 +571,60 @@
     {
       "id": "ls-add-profile-modal",
       "name": "Add/Edit Profile Modal",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Add Profile"
+          "id": "ls-add-profile-modal-elem-0",
+          "description": "Required element 0 for state Add/Edit Profile Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Add Profile"
+            },
+            "label": "Required element for Add/Edit Profile Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading",
-          "text": "Add Profile"
+          "id": "ls-add-profile-modal-elem-1",
+          "description": "Required element 1 for state Add/Edit Profile Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Add Profile"
+            },
+            "label": "Required element for Add/Edit Profile Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Add"
+          "id": "ls-add-profile-modal-elem-2",
+          "description": "Required element 2 for state Add/Edit Profile Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add"
+            },
+            "label": "Required element for Add/Edit Profile Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The ProfileEditor modal opens when 'Add Profile' or a profile's edit icon is clicked. Add mode title: 'Add Profile'; edit mode: 'Edit Profile'. Fields: Name* (required), Description (optional), and a scrollable sources checklist. Category quick-select buttons '+ frontend', '+ backend', '+ mobile' add all sources of that category without removing existing selections. The submit button ('Add' or 'Update') is disabled until Name is non-empty.",
@@ -188,18 +636,60 @@
     {
       "id": "ls-delete-confirmation-modal",
       "name": "Delete Confirmation Modal",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Delete Source"
+          "id": "ls-delete-confirmation-modal-elem-0",
+          "description": "Required element 0 for state Delete Confirmation Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Delete Source"
+            },
+            "label": "Required element for Delete Confirmation Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading",
-          "text": "Delete Profile"
+          "id": "ls-delete-confirmation-modal-elem-1",
+          "description": "Required element 1 for state Delete Confirmation Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Delete Profile"
+            },
+            "label": "Required element for Delete Confirmation Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Delete"
+          "id": "ls-delete-confirmation-modal-elem-2",
+          "description": "Required element 2 for state Delete Confirmation Modal",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Delete"
+            },
+            "label": "Required element for Delete Confirmation Modal"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When the trash icon is clicked on any source row or profile row, a confirmation modal appears. The modal title reads 'Delete Source' or 'Delete Profile' respectively. The body names the item in bold and warns. Two buttons: 'Cancel' (dismisses modal, no change) and 'Delete' (red background). The change is held in local state until 'Save Changes' is clicked.",
@@ -211,10 +701,52 @@
     {
       "id": "ls-ai-selection-semantics",
       "name": "AI Source Selection — Runtime Semantics",
-      "requiredElements": [
-        {},
-        {},
-        {}
+      "assertions": [
+        {
+          "id": "ls-ai-selection-semantics-elem-0",
+          "description": "Required element 0 for state AI Source Selection — Runtime Semantics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for AI Source Selection — Runtime Semantics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-ai-selection-semantics-elem-1",
+          "description": "Required element 1 for state AI Source Selection — Runtime Semantics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for AI Source Selection — Runtime Semantics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-ai-selection-semantics-elem-2",
+          "description": "Required element 2 for state AI Source Selection — Runtime Semantics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for AI Source Selection — Runtime Semantics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "The AI selection mode setting controls how the runner backend selects which log sources to include during workflow execution. This group specifies the expected behavior of each mode as it manifests in the UI and in workflow execution outcomes.",
       "precondition": "AI Source Selection section is expanded and Dynamic is selected",
@@ -225,10 +757,52 @@
     {
       "id": "ls-profile-default-semantics",
       "name": "Profile Default and Count Semantics",
-      "requiredElements": [
-        {},
-        {},
-        {}
+      "assertions": [
+        {
+          "id": "ls-profile-default-semantics-elem-0",
+          "description": "Required element 0 for state Profile Default and Count Semantics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Profile Default and Count Semantics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-profile-default-semantics-elem-1",
+          "description": "Required element 1 for state Profile Default and Count Semantics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Profile Default and Count Semantics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-profile-default-semantics-elem-2",
+          "description": "Required element 2 for state Profile Default and Count Semantics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Profile Default and Count Semantics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "The default profile determines which sources are active when ai_selection_mode is 'disabled' and a default is set. This group specifies the expected data-model behavior of profile default management and source count accuracy.",
       "precondition": "At least one profile is configured",
@@ -239,10 +813,52 @@
     {
       "id": "ls-source-data-model",
       "name": "Log Source Data Model",
-      "requiredElements": [
-        {},
-        {},
-        {}
+      "assertions": [
+        {
+          "id": "ls-source-data-model-elem-0",
+          "description": "Required element 0 for state Log Source Data Model",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Log Source Data Model"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-source-data-model-elem-1",
+          "description": "Required element 1 for state Log Source Data Model",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Log Source Data Model"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ls-source-data-model-elem-2",
+          "description": "Required element 2 for state Log Source Data Model",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Log Source Data Model"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "Each log source is a configuration record with required fields (id, name, path, category, type) and optional error-monitoring fields. This group specifies how source data fields are rendered in the UI and what correct source configuration looks like.",
       "precondition": "At least one source with non-plaintext format or non-generic parser is configured",

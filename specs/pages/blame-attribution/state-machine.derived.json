@@ -6,14 +6,42 @@
     {
       "id": "blame-page-identity",
       "name": "Page Identity and Navigation",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "tab",
-          "text": "Blame|Attribution"
+          "id": "blame-page-identity-elem-0",
+          "description": "Required element 0 for state Page Identity and Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab",
+              "text": "Blame|Attribution"
+            },
+            "label": "Required element for Page Identity and Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "tab",
-          "text": "Blame|Attribution"
+          "id": "blame-page-identity-elem-1",
+          "description": "Required element 1 for state Page Identity and Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab",
+              "text": "Blame|Attribution"
+            },
+            "label": "Required element for Page Identity and Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Blame Attribution tab lives within the Run Recap page's tabbed interface, alongside Timeline, Verification, Knowledge, Context, Canvas, and Errors tabs. Users reach it by clicking the tab after a workflow run completes (or during a run, for live blame data). The tab should clearly communicate its purpose: explaining WHY failures happened, complementing the Verification tab which shows WHAT failed.",
@@ -25,18 +53,74 @@
     {
       "id": "blame-summary-statistics",
       "name": "Blame Summary Statistics",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "attribution|blamed"
+          "id": "blame-summary-statistics-elem-0",
+          "description": "Required element 0 for state Blame Summary Statistics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "attribution|blamed"
+            },
+            "label": "Required element for Blame Summary Statistics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "oscillat"
+          "id": "blame-summary-statistics-elem-1",
+          "description": "Required element 1 for state Blame Summary Statistics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "oscillat"
+            },
+            "label": "Required element for Blame Summary Statistics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "revert"
+          "id": "blame-summary-statistics-elem-2",
+          "description": "Required element 2 for state Blame Summary Statistics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "revert"
+            },
+            "label": "Required element for Blame Summary Statistics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "iteration"
+          "id": "blame-summary-statistics-elem-3",
+          "description": "Required element 3 for state Blame Summary Statistics",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "iteration"
+            },
+            "label": "Required element for Blame Summary Statistics"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "At the top of the Blame tab, aggregate statistics give users an at-a-glance understanding of how many failures were attributed, how many files are oscillating, and how many revert patterns were detected. These numbers come from the GET /task-runs/{id}/blame response fields: total_attributions, total_oscillating_files, total_revert_patterns. Users use these to gauge the severity of convergence problems before diving into per-iteration details.",
@@ -48,24 +132,108 @@
     {
       "id": "blame-per-iteration-detail",
       "name": "Per-Iteration Blame Detail",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Iteration \\d+"
+          "id": "blame-per-iteration-detail-elem-0",
+          "description": "Required element 0 for state Per-Iteration Blame Detail",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Iteration \\d+"
+            },
+            "label": "Required element for Per-Iteration Blame Detail"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "FAILED|failed"
+          "id": "blame-per-iteration-detail-elem-1",
+          "description": "Required element 1 for state Per-Iteration Blame Detail",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "FAILED|failed"
+            },
+            "label": "Required element for Per-Iteration Blame Detail"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Iteration \\d+"
+          "id": "blame-per-iteration-detail-elem-2",
+          "description": "Required element 2 for state Per-Iteration Blame Detail",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Iteration \\d+"
+            },
+            "label": "Required element for Per-Iteration Blame Detail"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "High|Medium|Low"
+          "id": "blame-per-iteration-detail-elem-3",
+          "description": "Required element 3 for state Per-Iteration Blame Detail",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "High|Medium|Low"
+            },
+            "label": "Required element for Per-Iteration Blame Detail"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "\\.(tsx?|jsx?|rs|py|go|css|scss)"
+          "id": "blame-per-iteration-detail-elem-4",
+          "description": "Required element 4 for state Per-Iteration Blame Detail",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "\\.(tsx?|jsx?|rs|py|go|css|scss)"
+            },
+            "label": "Required element for Per-Iteration Blame Detail"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "modified|referenced|error output"
+          "id": "blame-per-iteration-detail-elem-5",
+          "description": "Required element 5 for state Per-Iteration Blame Detail",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "modified|referenced|error output"
+            },
+            "label": "Required element for Per-Iteration Blame Detail"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The core of the Blame tab: a chronological list of iterations that produced blame data. Each iteration section shows which verification steps failed and which previous iteration's changes caused each failure. The data comes from the blame_reports array in the GET /task-runs/{id}/blame response. Each report contains attributions (step name, blamed iteration, implicated files with line ranges, confidence score, explanation). Users read this to understand the causal chain: 'Iteration 3's TypeScript check failed because iteration 2 modified Card.tsx.'",
@@ -77,18 +245,74 @@
     {
       "id": "blame-oscillation-warnings",
       "name": "File Oscillation Warnings",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Oscillat"
+          "id": "blame-oscillation-warnings-elem-0",
+          "description": "Required element 0 for state File Oscillation Warnings",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Oscillat"
+            },
+            "label": "Required element for File Oscillation Warnings"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "\\.(tsx?|jsx?|rs|py)"
+          "id": "blame-oscillation-warnings-elem-1",
+          "description": "Required element 1 for state File Oscillation Warnings",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "\\.(tsx?|jsx?|rs|py)"
+            },
+            "label": "Required element for File Oscillation Warnings"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "\\d+.*consecutive"
+          "id": "blame-oscillation-warnings-elem-2",
+          "description": "Required element 2 for state File Oscillation Warnings",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "\\d+.*consecutive"
+            },
+            "label": "Required element for File Oscillation Warnings"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Oscillat"
+          "id": "blame-oscillation-warnings-elem-3",
+          "description": "Required element 3 for state File Oscillation Warnings",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Oscillat"
+            },
+            "label": "Required element for File Oscillation Warnings"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When the blame engine detects that a file has been modified in 3 or more consecutive iterations, it surfaces an oscillation warning. This is a strong signal that the AI is stuck: it keeps changing the same file but the fix never sticks. The UI should make these warnings visually prominent (they represent the most actionable finding in the blame data). The oscillating_files array in each BlameReport contains the file path, the number of consecutive iterations (consecutive_blames), and the specific iteration numbers involved.",
@@ -100,12 +324,40 @@
     {
       "id": "blame-revert-patterns",
       "name": "Revert Pattern Warnings",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Revert"
+          "id": "blame-revert-patterns-elem-0",
+          "description": "Required element 0 for state Revert Pattern Warnings",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Revert"
+            },
+            "label": "Required element for Revert Pattern Warnings"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "iteration"
+          "id": "blame-revert-patterns-elem-1",
+          "description": "Required element 1 for state Revert Pattern Warnings",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "iteration"
+            },
+            "label": "Required element for Revert Pattern Warnings"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Revert patterns are detected when a file is modified in a non-consecutive alternating pattern (present, absent, present) across iterations with at least 2 gaps. This indicates the AI's changes are being undone — possibly by other fixes that conflict, or by the AI itself reverting its previous approach. These are shown separately from oscillation warnings because the behavior pattern (intermittent vs consecutive) and the recommended response differ. Revert patterns are excluded for files already flagged as oscillating to avoid duplicate warnings.",
@@ -117,12 +369,40 @@
     {
       "id": "blame-empty-state",
       "name": "Empty and Loading States",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "no blame|passed|first attempt|no attribution"
+          "id": "blame-empty-state-elem-0",
+          "description": "Required element 0 for state Empty and Loading States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "no blame|passed|first attempt|no attribution"
+            },
+            "label": "Required element for Empty and Loading States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "progressbar"
+          "id": "blame-empty-state-elem-1",
+          "description": "Required element 1 for state Empty and Loading States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "progressbar"
+            },
+            "label": "Required element for Empty and Loading States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Blame tab must gracefully handle cases where no blame data exists — either because the run completed on the first iteration (no failures to attribute), the run is still in its initial verification phase, or blame analysis produced no attributions (all failures had generic error messages with no extractable file paths).",
@@ -134,12 +414,40 @@
     {
       "id": "blame-live-updates",
       "name": "Live Blame Updates During Active Runs",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Iteration"
+          "id": "blame-live-updates-elem-0",
+          "description": "Required element 0 for state Live Blame Updates During Active Runs",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Iteration"
+            },
+            "label": "Required element for Live Blame Updates During Active Runs"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "\\d+"
+          "id": "blame-live-updates-elem-1",
+          "description": "Required element 1 for state Live Blame Updates During Active Runs",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "\\d+"
+            },
+            "label": "Required element for Live Blame Updates During Active Runs"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "During an active run, blame data is emitted in real-time via the AppEvent::BlameAttribution Tauri event (event name: 'blame-attribution'). The event payload includes task_run_id, iteration, attributed_failures count, oscillating_files count, revert_patterns count, and the full blame_json. The tab should update incrementally as new iterations complete, without requiring a manual page refresh. This allows users to observe blame accumulation in real-time and intervene early if they see oscillation forming.",
@@ -151,15 +459,57 @@
     {
       "id": "blame-escalation-status",
       "name": "Escalation Policy Status",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "warn|escalat"
+          "id": "blame-escalation-status-elem-0",
+          "description": "Required element 0 for state Escalation Policy Status",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "warn|escalat"
+            },
+            "label": "Required element for Escalation Policy Status"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "rethink|step back"
+          "id": "blame-escalation-status-elem-1",
+          "description": "Required element 1 for state Escalation Policy Status",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "rethink|step back"
+            },
+            "label": "Required element for Escalation Policy Status"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "timeout|time limit"
+          "id": "blame-escalation-status-elem-2",
+          "description": "Required element 2 for state Escalation Policy Status",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "timeout|time limit"
+            },
+            "label": "Required element for Escalation Policy Status"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The escalation policy (EscalationPolicy struct on LoopConfig) controls warnings and 'rethink' prompts when the loop fails to make progress. warn_after (default: 3) triggers a warning log. rethink_after (default: 5) injects a meta-prompt telling the AI to step back and reconsider its approach — it fires at the threshold, then every 3 iterations after. time_limit_secs enforces a wall-clock deadline checked in CheckPreconditions. The Blame tab should surface escalation events so users understand when and why the system intervened.",
@@ -171,12 +521,40 @@
     {
       "id": "blame-cross-referencing",
       "name": "Cross-Tab Referencing",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Iteration \\d+"
+          "id": "blame-cross-referencing-elem-0",
+          "description": "Required element 0 for state Cross-Tab Referencing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Iteration \\d+"
+            },
+            "label": "Required element for Cross-Tab Referencing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "compilation|check|test|lint|build"
+          "id": "blame-cross-referencing-elem-1",
+          "description": "Required element 1 for state Cross-Tab Referencing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "compilation|check|test|lint|build"
+            },
+            "label": "Required element for Cross-Tab Referencing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Blame tab's value is amplified when users can cross-reference blame data with other Run Recap tabs. Iteration numbers in blame attributions should correlate with the Timeline tab. Failed step names should match entries in the Verification tab. File paths in implicated changes can be correlated with the git diff context shown in the Context tab. This cross-referencing is architectural — it does not require explicit navigation links, but the naming and numbering must be consistent across tabs.",
@@ -188,9 +566,23 @@
     {
       "id": "blame-causal-learning",
       "name": "Cross-Run Learning Integration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "recurring|previous run|systemic"
+          "id": "blame-causal-learning-elem-0",
+          "description": "Required element 0 for state Cross-Run Learning Integration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "recurring|previous run|systemic"
+            },
+            "label": "Required element for Cross-Run Learning Integration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Blame attributions are recorded as causal events in SQLite via record_blame_as_causal_events() — each attribution becomes a causal edge with cause_type 'iteration_change' and effect_type 'verification_failure', relationship 'caused_by_change'. Oscillation patterns are stored as cause_type 'file_oscillation' / effect_type 'convergence_stuck'. The cross_run_learning.rs module queries these events to detect systemic patterns across runs (e.g., the same file is blamed across multiple independent runs). This is a backend-only integration but the Blame tab should document it for architectural awareness.",

@@ -6,13 +6,41 @@
     {
       "id": "sec-page-header",
       "name": "Page Header & Title",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "textContains": "Security"
+          "id": "sec-page-header-elem-0",
+          "description": "Required element 0 for state Page Header & Title",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContains": "Security"
+            },
+            "label": "Required element for Page Header & Title"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "sandbox constraints"
+          "id": "sec-page-header-elem-1",
+          "description": "Required element 1 for state Page Header & Title",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "sandbox constraints"
+            },
+            "label": "Required element for Page Header & Title"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The page header shows the Shield icon, title 'Security & Sandboxing', and subtitle description.",
@@ -23,21 +51,91 @@
     {
       "id": "sec-profile-selector",
       "name": "Security Profile Selector",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Security Profile"
+          "id": "sec-profile-selector-elem-0",
+          "description": "Required element 0 for state Security Profile Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Security Profile"
+            },
+            "label": "Required element for Security Profile Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "combobox"
+          "id": "sec-profile-selector-elem-1",
+          "description": "Required element 1 for state Security Profile Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Security Profile Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "restrictions"
+          "id": "sec-profile-selector-elem-2",
+          "description": "Required element 2 for state Security Profile Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "restrictions"
+            },
+            "label": "Required element for Security Profile Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "AST Fingerprint"
+          "id": "sec-profile-selector-elem-3",
+          "description": "Required element 3 for state Security Profile Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "AST Fingerprint"
+            },
+            "label": "Required element for Security Profile Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "combobox"
+          "id": "sec-profile-selector-elem-4",
+          "description": "Required element 4 for state Security Profile Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Security Profile Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Dropdown to select the active security profile. Options: Permissive, Standard, Strict, Custom. Selecting a built-in profile shows its description and AST fingerprint.",
@@ -49,15 +147,57 @@
     {
       "id": "sec-posture-visualization",
       "name": "Security Posture Visualization",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Security Posture"
+          "id": "sec-posture-visualization-elem-0",
+          "description": "Required element 0 for state Security Posture Visualization",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Security Posture"
+            },
+            "label": "Required element for Security Posture Visualization"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "L1:Compute"
+          "id": "sec-posture-visualization-elem-1",
+          "description": "Required element 1 for state Security Posture Visualization",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "L1:Compute"
+            },
+            "label": "Required element for Security Posture Visualization"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "L4:Network"
+          "id": "sec-posture-visualization-elem-2",
+          "description": "Required element 2 for state Security Posture Visualization",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "L4:Network"
+            },
+            "label": "Required element for Security Posture Visualization"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A 7-layer bar chart showing the current profile's security scores. Each layer (L1:Compute through L7:Audit) has a colored bar indicating enforcement level: None (red), Cooperative (orange), Software (yellow), Kernel (green).",
@@ -69,21 +209,91 @@
     {
       "id": "sec-custom-profile-editor",
       "name": "Custom Profile Editor",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Custom Policy Editor"
+          "id": "sec-custom-profile-editor-elem-0",
+          "description": "Required element 0 for state Custom Profile Editor",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Custom Policy Editor"
+            },
+            "label": "Required element for Custom Profile Editor"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Network"
+          "id": "sec-custom-profile-editor-elem-1",
+          "description": "Required element 1 for state Custom Profile Editor",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Network"
+            },
+            "label": "Required element for Custom Profile Editor"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Block destructive"
+          "id": "sec-custom-profile-editor-elem-2",
+          "description": "Required element 2 for state Custom Profile Editor",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Block destructive"
+            },
+            "label": "Required element for Custom Profile Editor"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "CPU limit"
+          "id": "sec-custom-profile-editor-elem-3",
+          "description": "Required element 3 for state Custom Profile Editor",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "CPU limit"
+            },
+            "label": "Required element for Custom Profile Editor"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Direct (current behavior)"
+          "id": "sec-custom-profile-editor-elem-4",
+          "description": "Required element 4 for state Custom Profile Editor",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Direct (current behavior)"
+            },
+            "label": "Required element for Custom Profile Editor"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When 'Custom' profile is selected, a full sub-policy editor appears with sections for Network, Actions, Filesystem, Resources, and Credentials. Each section has appropriate form controls.",
@@ -95,21 +305,91 @@
     {
       "id": "sec-features-section",
       "name": "Features Section",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Features"
+          "id": "sec-features-section-elem-0",
+          "description": "Required element 0 for state Features Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Features"
+            },
+            "label": "Required element for Features Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Credential Proxy"
+          "id": "sec-features-section-elem-1",
+          "description": "Required element 1 for state Features Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Credential Proxy"
+            },
+            "label": "Required element for Features Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Network Mediation"
+          "id": "sec-features-section-elem-2",
+          "description": "Required element 2 for state Features Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Network Mediation"
+            },
+            "label": "Required element for Features Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Security Audit Log"
+          "id": "sec-features-section-elem-3",
+          "description": "Required element 3 for state Features Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Security Audit Log"
+            },
+            "label": "Required element for Features Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Audit Retention"
+          "id": "sec-features-section-elem-4",
+          "description": "Required element 4 for state Features Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Audit Retention"
+            },
+            "label": "Required element for Features Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Toggle switches for the three main security features: Credential Proxy, Network Mediation, and Security Audit Log.",
@@ -121,24 +401,108 @@
     {
       "id": "sec-audit-log-viewer",
       "name": "Audit Log Viewer",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Audit Log"
+          "id": "sec-audit-log-viewer-elem-0",
+          "description": "Required element 0 for state Audit Log Viewer",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Audit Log"
+            },
+            "label": "Required element for Audit Log Viewer"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "combobox"
+          "id": "sec-audit-log-viewer-elem-1",
+          "description": "Required element 1 for state Audit Log Viewer",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Audit Log Viewer"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "table"
+          "id": "sec-audit-log-viewer-elem-2",
+          "description": "Required element 2 for state Audit Log Viewer",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "table"
+            },
+            "label": "Required element for Audit Log Viewer"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "table"
+          "id": "sec-audit-log-viewer-elem-3",
+          "description": "Required element 3 for state Audit Log Viewer",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "table"
+            },
+            "label": "Required element for Audit Log Viewer"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "No audit events"
+          "id": "sec-audit-log-viewer-elem-4",
+          "description": "Required element 4 for state Audit Log Viewer",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "No audit events"
+            },
+            "label": "Required element for Audit Log Viewer"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "sec-audit-log-viewer-elem-5",
+          "description": "Required element 5 for state Audit Log Viewer",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Audit Log Viewer"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When audit logging is enabled, a scrollable table shows recent security audit events with summary badges, filter dropdown, refresh button, and JSON export button.",
@@ -150,9 +514,23 @@
     {
       "id": "sec-ast-info-banner",
       "name": "AST 7-Layer Info Banner",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Agent Sandbox Taxonomy"
+          "id": "sec-ast-info-banner-elem-0",
+          "description": "Required element 0 for state AST 7-Layer Info Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Agent Sandbox Taxonomy"
+            },
+            "label": "Required element for AST 7-Layer Info Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "An informational banner explaining the Agent Sandbox Taxonomy (AST) 7-layer model at the bottom of the page.",
@@ -163,22 +541,78 @@
     {
       "id": "sec-action-buttons",
       "name": "Action Buttons",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "textContains": "Reset to Defaults"
+          "id": "sec-action-buttons-elem-0",
+          "description": "Required element 0 for state Action Buttons",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Reset to Defaults"
+            },
+            "label": "Required element for Action Buttons"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Save Security Settings"
+          "id": "sec-action-buttons-elem-1",
+          "description": "Required element 1 for state Action Buttons",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Save Security Settings"
+            },
+            "label": "Required element for Action Buttons"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Save"
+          "id": "sec-action-buttons-elem-2",
+          "description": "Required element 2 for state Action Buttons",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Save"
+            },
+            "label": "Required element for Action Buttons"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Reset"
+          "id": "sec-action-buttons-elem-3",
+          "description": "Required element 3 for state Action Buttons",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Reset"
+            },
+            "label": "Required element for Action Buttons"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Reset to Defaults and Save Security Settings buttons at the bottom of the page.",
@@ -189,19 +623,75 @@
     {
       "id": "sec-visual-design",
       "name": "Visual Design & Typography",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Security Profile"
+          "id": "sec-visual-design-elem-0",
+          "description": "Required element 0 for state Visual Design & Typography",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Security Profile"
+            },
+            "label": "Required element for Visual Design & Typography"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "heading"
+          "id": "sec-visual-design-elem-1",
+          "description": "Required element 1 for state Visual Design & Typography",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading"
+            },
+            "label": "Required element for Visual Design & Typography"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "sec-visual-design-elem-2",
+          "description": "Required element 2 for state Visual Design & Typography",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Visual Design & Typography"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Save"
+          "id": "sec-visual-design-elem-3",
+          "description": "Required element 3 for state Visual Design & Typography",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Save"
+            },
+            "label": "Required element for Visual Design & Typography"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Dark theme styling with neutral-800 card backgrounds, blue-400 accents, and consistent text hierarchy.",
@@ -212,15 +702,57 @@
     {
       "id": "sec-loading-error-states",
       "name": "Loading & Error States",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Loading security settings"
+          "id": "sec-loading-error-states-elem-0",
+          "description": "Required element 0 for state Loading & Error States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Loading security settings"
+            },
+            "label": "Required element for Loading & Error States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Failed"
+          "id": "sec-loading-error-states-elem-1",
+          "description": "Required element 1 for state Loading & Error States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Failed"
+            },
+            "label": "Required element for Loading & Error States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Settings saved"
+          "id": "sec-loading-error-states-elem-2",
+          "description": "Required element 2 for state Loading & Error States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Settings saved"
+            },
+            "label": "Required element for Loading & Error States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The page handles loading, error, and success states appropriately.",

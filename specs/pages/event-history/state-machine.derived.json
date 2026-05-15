@@ -6,15 +6,57 @@
     {
       "id": "evh-header",
       "name": "Page Header and Identity",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Workflow Event History"
+          "id": "evh-header-elem-0",
+          "description": "Required element 0 for state Page Header and Identity",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Workflow Event History"
+            },
+            "label": "Required element for Page Header and Identity"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "event"
+          "id": "evh-header-elem-1",
+          "description": "Required element 1 for state Page Header and Identity",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "event"
+            },
+            "label": "Required element for Page Header and Identity"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "subscription"
+          "id": "evh-header-elem-2",
+          "description": "Required element 2 for state Page Header and Identity",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "subscription"
+            },
+            "label": "Required element for Page Header and Identity"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The page header establishes the Workflow Event History identity with a Radio icon, shows aggregate counts (event count, subscription count), and auto-refreshes data every 5 seconds.",
@@ -25,18 +67,74 @@
     {
       "id": "evh-filter",
       "name": "Event Filtering",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "textbox"
+          "id": "evh-filter-elem-0",
+          "description": "Required element 0 for state Event Filtering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Event Filtering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Filter by event name or source"
+          "id": "evh-filter-elem-1",
+          "description": "Required element 1 for state Event Filtering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Filter by event name or source"
+            },
+            "label": "Required element for Event Filtering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "textbox"
+          "id": "evh-filter-elem-2",
+          "description": "Required element 2 for state Event Filtering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Required element for Event Filtering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No events match the filter"
+          "id": "evh-filter-elem-3",
+          "description": "Required element 3 for state Event Filtering",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No events match the filter"
+            },
+            "label": "Required element for Event Filtering"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A search/filter bar allows users to narrow down events by name pattern or source workflow. Essential when the event history is busy during multi-workflow orchestration.",
@@ -48,27 +146,125 @@
     {
       "id": "evh-queue-status",
       "name": "Durable Queue Status Dashboard",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Pending"
+          "id": "evh-queue-status-elem-0",
+          "description": "Required element 0 for state Durable Queue Status Dashboard",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Pending"
+            },
+            "label": "Required element for Durable Queue Status Dashboard"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Running"
+          "id": "evh-queue-status-elem-1",
+          "description": "Required element 1 for state Durable Queue Status Dashboard",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Running"
+            },
+            "label": "Required element for Durable Queue Status Dashboard"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Max Concurrent"
+          "id": "evh-queue-status-elem-2",
+          "description": "Required element 2 for state Durable Queue Status Dashboard",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Max Concurrent"
+            },
+            "label": "Required element for Durable Queue Status Dashboard"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Max Depth"
+          "id": "evh-queue-status-elem-3",
+          "description": "Required element 3 for state Durable Queue Status Dashboard",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Max Depth"
+            },
+            "label": "Required element for Durable Queue Status Dashboard"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Durable"
+          "id": "evh-queue-status-elem-4",
+          "description": "Required element 4 for state Durable Queue Status Dashboard",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Durable"
+            },
+            "label": "Required element for Durable Queue Status Dashboard"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Pending"
+          "id": "evh-queue-status-elem-5",
+          "description": "Required element 5 for state Durable Queue Status Dashboard",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Pending"
+            },
+            "label": "Required element for Durable Queue Status Dashboard"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Pending"
+          "id": "evh-queue-status-elem-6",
+          "description": "Required element 6 for state Durable Queue Status Dashboard",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Pending"
+            },
+            "label": "Required element for Durable Queue Status Dashboard"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Compact widget displaying real-time state of the durable workflow queue. Data from GET /inngest/queue reflecting WorkflowQueue semaphore state and crash-recovery status. Backend: workflow_queue.rs, database/queue_ops.rs (SQLite + PG), main.rs (startup recovery).",
@@ -79,21 +275,91 @@
     {
       "id": "evh-circuit-breaker",
       "name": "Circuit Breaker Health Widget",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Circuit"
+          "id": "evh-circuit-breaker-elem-0",
+          "description": "Required element 0 for state Circuit Breaker Health Widget",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Circuit"
+            },
+            "label": "Required element for Circuit Breaker Health Widget"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Circuit"
+          "id": "evh-circuit-breaker-elem-1",
+          "description": "Required element 1 for state Circuit Breaker Health Widget",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Circuit"
+            },
+            "label": "Required element for Circuit Breaker Health Widget"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Failures"
+          "id": "evh-circuit-breaker-elem-2",
+          "description": "Required element 2 for state Circuit Breaker Health Widget",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Failures"
+            },
+            "label": "Required element for Circuit Breaker Health Widget"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Cooldown"
+          "id": "evh-circuit-breaker-elem-3",
+          "description": "Required element 3 for state Circuit Breaker Health Widget",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Cooldown"
+            },
+            "label": "Required element for Circuit Breaker Health Widget"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Circuit"
+          "id": "evh-circuit-breaker-elem-4",
+          "description": "Required element 4 for state Circuit Breaker Health Widget",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Circuit"
+            },
+            "label": "Required element for Circuit Breaker Health Widget"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Displays state of the global circuit breaker (orchestrator/retry.rs). Shows: state (Closed=green, Open=red, Half-Open=yellow), failure count vs threshold, cooldown. When Open, all retries are rejected. After cooldown, a probe request is allowed (Half-Open). Backend: CircuitBreaker in AppState, queried via GET /inngest/circuit-breaker from mcp/inngest.rs.",
@@ -104,42 +370,210 @@
     {
       "id": "evh-event-table",
       "name": "Event History Table",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Timestamp"
+          "id": "evh-event-table-elem-0",
+          "description": "Required element 0 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Timestamp"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Event Name"
+          "id": "evh-event-table-elem-1",
+          "description": "Required element 1 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Event Name"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Source"
+          "id": "evh-event-table-elem-2",
+          "description": "Required element 2 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Source"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Data Preview"
+          "id": "evh-event-table-elem-3",
+          "description": "Required element 3 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Data Preview"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "workflow.completed"
+          "id": "evh-event-table-elem-4",
+          "description": "Required element 4 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "workflow.completed"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "workflow"
+          "id": "evh-event-table-elem-5",
+          "description": "Required element 5 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "workflow"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Timestamp"
+          "id": "evh-event-table-elem-6",
+          "description": "Required element 6 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Timestamp"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Data Preview"
+          "id": "evh-event-table-elem-7",
+          "description": "Required element 7 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Data Preview"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "row"
+          "id": "evh-event-table-elem-8",
+          "description": "Required element 8 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "row"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Full Payload"
+          "id": "evh-event-table-elem-9",
+          "description": "Required element 9 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Full Payload"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Task Run ID"
+          "id": "evh-event-table-elem-10",
+          "description": "Required element 10 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Task Run ID"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "row"
+          "id": "evh-event-table-elem-11",
+          "description": "Required element 11 for state Event History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "row"
+            },
+            "label": "Required element for Event History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Reverse-chronological table of workflow events. Each row: timestamp, color-coded event name, source workflow, truncated data preview. Rows are expandable to show full JSON payload and metadata. Events emitted by workflow_event_bus.rs at lifecycle transitions in task_lifecycle.rs.",
@@ -151,21 +585,91 @@
     {
       "id": "evh-subscriptions",
       "name": "Active Subscriptions Panel",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Active Subscriptions"
+          "id": "evh-subscriptions-elem-0",
+          "description": "Required element 0 for state Active Subscriptions Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Active Subscriptions"
+            },
+            "label": "Required element for Active Subscriptions Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "workflow"
+          "id": "evh-subscriptions-elem-1",
+          "description": "Required element 1 for state Active Subscriptions Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "workflow"
+            },
+            "label": "Required element for Active Subscriptions Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Active Subscriptions"
+          "id": "evh-subscriptions-elem-2",
+          "description": "Required element 2 for state Active Subscriptions Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Active Subscriptions"
+            },
+            "label": "Required element for Active Subscriptions Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "once"
+          "id": "evh-subscriptions-elem-3",
+          "description": "Required element 3 for state Active Subscriptions Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "once"
+            },
+            "label": "Required element for Active Subscriptions Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Active Subscriptions"
+          "id": "evh-subscriptions-elem-4",
+          "description": "Required element 4 for state Active Subscriptions Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Active Subscriptions"
+            },
+            "label": "Required element for Active Subscriptions Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Grid of active event subscriptions below the event table. Each card shows event pattern (monospace), green active dot, and 'once' badge. Subscriptions registered by trigger_system for WorkflowChain triggers. Polls GET /inngest/subscriptions every 15 seconds.",
@@ -177,18 +681,74 @@
     {
       "id": "evh-empty-error-states",
       "name": "Empty, Loading, and Error States",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Runner not connected"
+          "id": "evh-empty-error-states-elem-0",
+          "description": "Required element 0 for state Empty, Loading, and Error States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Runner not connected"
+            },
+            "label": "Required element for Empty, Loading, and Error States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "error"
+          "id": "evh-empty-error-states-elem-1",
+          "description": "Required element 1 for state Empty, Loading, and Error States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "error"
+            },
+            "label": "Required element for Empty, Loading, and Error States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Loading event history"
+          "id": "evh-empty-error-states-elem-2",
+          "description": "Required element 2 for state Empty, Loading, and Error States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Loading event history"
+            },
+            "label": "Required element for Empty, Loading, and Error States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "No events recorded yet"
+          "id": "evh-empty-error-states-elem-3",
+          "description": "Required element 3 for state Empty, Loading, and Error States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No events recorded yet"
+            },
+            "label": "Required element for Empty, Loading, and Error States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The page handles edge cases: offline runner (yellow warning), API errors (red banner), loading (spinner message), empty history (centered icon + message). These ensure users always understand system state.",
@@ -200,9 +760,23 @@
     {
       "id": "evh-navigation",
       "name": "Navigation and Page Access",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Workflow Event History"
+          "id": "evh-navigation-elem-0",
+          "description": "Required element 0 for state Navigation and Page Access",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Workflow Event History"
+            },
+            "label": "Required element for Navigation and Page Access"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Event History page is accessible from the main app navigation at /event-history. It should load independently without requiring other pages to be visited first.",
@@ -213,15 +787,57 @@
     {
       "id": "evh-data-freshness",
       "name": "Auto-Refresh and Data Freshness",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Workflow Event History"
+          "id": "evh-data-freshness-elem-0",
+          "description": "Required element 0 for state Auto-Refresh and Data Freshness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Workflow Event History"
+            },
+            "label": "Required element for Auto-Refresh and Data Freshness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Active Subscriptions"
+          "id": "evh-data-freshness-elem-1",
+          "description": "Required element 1 for state Auto-Refresh and Data Freshness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Active Subscriptions"
+            },
+            "label": "Required element for Auto-Refresh and Data Freshness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Workflow Event History"
+          "id": "evh-data-freshness-elem-2",
+          "description": "Required element 2 for state Auto-Refresh and Data Freshness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Workflow Event History"
+            },
+            "label": "Required element for Auto-Refresh and Data Freshness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "All data auto-refreshes via polling through useRunnerQuery. Events + queue + circuit-breaker poll every 5s; subscriptions every 15s. Polling is deduplicated by shared API client.",

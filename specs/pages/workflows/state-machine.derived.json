@@ -6,22 +6,92 @@
     {
       "id": "wf-ai-generation",
       "name": "AI Workflow Generation",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Generate Workflow with AI"
+          "id": "wf-ai-generation-elem-0",
+          "description": "Required element 0 for state AI Workflow Generation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Generate Workflow with AI"
+            },
+            "label": "Required element for AI Workflow Generation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Generate"
+          "id": "wf-ai-generation-elem-1",
+          "description": "Required element 1 for state AI Workflow Generation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Generate"
+            },
+            "label": "Required element for AI Workflow Generation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Generate & Run"
+          "id": "wf-ai-generation-elem-2",
+          "description": "Required element 2 for state AI Workflow Generation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Generate & Run"
+            },
+            "label": "Required element for AI Workflow Generation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Spec"
+          "id": "wf-ai-generation-elem-3",
+          "description": "Required element 3 for state AI Workflow Generation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Spec"
+            },
+            "label": "Required element for AI Workflow Generation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Provider"
+          "id": "wf-ai-generation-elem-4",
+          "description": "Required element 4 for state AI Workflow Generation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Provider"
+            },
+            "label": "Required element for AI Workflow Generation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The default landing experience centers on AI-powered workflow generation. When no workflow is selected, users see a prominent panel inviting them to describe what they want to automate in natural language. The system generates a complete multi-phase workflow from the description, optionally incorporating page specs for spec-driven verification, attached contexts for additional AI guidance, and generation templates for common patterns. Users can select the AI provider and model, configure advanced options like max iterations and discovery mode, and choose between Generate (create and review) or Generate & Run (create and immediately execute). The prompt text persists across sessions via localStorage so users can refine their description over time.",
@@ -32,19 +102,75 @@
     {
       "id": "wf-sidebar-library",
       "name": "Workflow Sidebar Library",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "searchbox"
+          "id": "wf-sidebar-library-elem-0",
+          "description": "Required element 0 for state Workflow Sidebar Library",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "searchbox"
+            },
+            "label": "Required element for Workflow Sidebar Library"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "New"
+          "id": "wf-sidebar-library-elem-1",
+          "description": "Required element 1 for state Workflow Sidebar Library",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "New"
+            },
+            "label": "Required element for Workflow Sidebar Library"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Workflows"
+          "id": "wf-sidebar-library-elem-2",
+          "description": "Required element 2 for state Workflow Sidebar Library",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Workflows"
+            },
+            "label": "Required element for Workflow Sidebar Library"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "wf-sidebar-library-elem-3",
+          "description": "Required element 3 for state Workflow Sidebar Library",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Workflow Sidebar Library"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The sidebar provides a persistent library of all saved workflows, allowing users to browse, search, create, duplicate, and delete workflows. It serves as the primary navigation mechanism for switching between workflows in the editor. Users can search by name to quickly locate a specific workflow, create new blank workflows, and manage their collection. The sidebar shows workflow names and metadata, and selecting a workflow loads it into the main editor panel. The sidebar can be toggled to maximize editor space.",
@@ -55,22 +181,92 @@
     {
       "id": "wf-phase-editor",
       "name": "Phase Editor — Multi-Phase Workflow Editing",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Setup"
+          "id": "wf-phase-editor-elem-0",
+          "description": "Required element 0 for state Phase Editor — Multi-Phase Workflow Editing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Setup"
+            },
+            "label": "Required element for Phase Editor — Multi-Phase Workflow Editing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Verification"
+          "id": "wf-phase-editor-elem-1",
+          "description": "Required element 1 for state Phase Editor — Multi-Phase Workflow Editing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Verification"
+            },
+            "label": "Required element for Phase Editor — Multi-Phase Workflow Editing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Agentic"
+          "id": "wf-phase-editor-elem-2",
+          "description": "Required element 2 for state Phase Editor — Multi-Phase Workflow Editing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Agentic"
+            },
+            "label": "Required element for Phase Editor — Multi-Phase Workflow Editing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Completion"
+          "id": "wf-phase-editor-elem-3",
+          "description": "Required element 3 for state Phase Editor — Multi-Phase Workflow Editing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Completion"
+            },
+            "label": "Required element for Phase Editor — Multi-Phase Workflow Editing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Add"
+          "id": "wf-phase-editor-elem-4",
+          "description": "Required element 4 for state Phase Editor — Multi-Phase Workflow Editing",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Add"
+            },
+            "label": "Required element for Phase Editor — Multi-Phase Workflow Editing"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When a workflow is loaded, the main content area displays a structured editor organized into four execution phases: Setup (environment preparation commands), Verification (checks and tests run between AI iterations), Agentic (AI prompts and instructions that drive the automation), and Completion (cleanup and finalization steps). Each phase section supports adding, removing, reordering, and configuring individual steps with type-specific editors. Users can expand and collapse phase sections to focus on the phase they are editing. The phase structure ensures workflows follow a predictable execution pattern.",
@@ -81,18 +277,60 @@
     {
       "id": "wf-execution-controls",
       "name": "Workflow Execution and Persistence",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Run"
+          "id": "wf-execution-controls-elem-0",
+          "description": "Required element 0 for state Workflow Execution and Persistence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Run"
+            },
+            "label": "Required element for Workflow Execution and Persistence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Save"
+          "id": "wf-execution-controls-elem-1",
+          "description": "Required element 1 for state Workflow Execution and Persistence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save"
+            },
+            "label": "Required element for Workflow Execution and Persistence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Export"
+          "id": "wf-execution-controls-elem-2",
+          "description": "Required element 2 for state Workflow Execution and Persistence",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Export"
+            },
+            "label": "Required element for Workflow Execution and Persistence"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The editor toolbar provides essential workflow lifecycle controls. Users can run the currently loaded workflow directly from the editor, save changes back to the library, export the workflow as a JSON file for sharing or backup, and import previously exported workflows. The Run button launches workflow execution and transitions the view to show execution progress. Save persists all step configurations, settings, and metadata. Export produces a portable JSON file that can be imported into another runner instance.",
@@ -103,18 +341,74 @@
     {
       "id": "wf-settings-configuration",
       "name": "Workflow Settings and Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Name"
+          "id": "wf-settings-configuration-elem-0",
+          "description": "Required element 0 for state Workflow Settings and Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Name"
+            },
+            "label": "Required element for Workflow Settings and Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Max Iterations"
+          "id": "wf-settings-configuration-elem-1",
+          "description": "Required element 1 for state Workflow Settings and Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Max Iterations"
+            },
+            "label": "Required element for Workflow Settings and Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Reflection"
+          "id": "wf-settings-configuration-elem-2",
+          "description": "Required element 2 for state Workflow Settings and Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Reflection"
+            },
+            "label": "Required element for Workflow Settings and Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "wf-settings-configuration-elem-3",
+          "description": "Required element 3 for state Workflow Settings and Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Workflow Settings and Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Each workflow has configurable settings that control execution behavior. Users can name and describe the workflow, select the AI provider and model, set max iterations for the verification loop, enable or disable reflection mode for self-improving workflows, configure timeouts, enable health checks for target services, and toggle various execution options. Settings are organized into logical sections and use toggle switches, dropdowns, and number inputs appropriate for each setting type. The settings panel is accessible via a gear icon when a workflow is loaded.",
@@ -125,32 +419,172 @@
     {
       "id": "wf-htn-planning",
       "name": "HTN Planning Configuration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "HTN Planning"
+          "id": "wf-htn-planning-elem-0",
+          "description": "Required element 0 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "HTN Planning"
+            },
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "HTN Planning"
+          "id": "wf-htn-planning-elem-1",
+          "description": "Required element 1 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "HTN Planning"
+            },
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Enable HTN Planning"
+          "id": "wf-htn-planning-elem-2",
+          "description": "Required element 2 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Enable HTN Planning"
+            },
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "switch"
+          "id": "wf-htn-planning-elem-3",
+          "description": "Required element 3 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "switch"
+            },
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "HTN Planning"
+          "id": "wf-htn-planning-elem-4",
+          "description": "Required element 4 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "HTN Planning"
+            },
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Enable HTN Planning"
+          "id": "wf-htn-planning-elem-5",
+          "description": "Required element 5 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Enable HTN Planning"
+            },
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
-        {},
         {
-          "text": "HTN Planning"
+          "id": "wf-htn-planning-elem-6",
+          "description": "Required element 6 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "HTN Planning"
+          "id": "wf-htn-planning-elem-7",
+          "description": "Required element 7 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-planning-elem-8",
+          "description": "Required element 8 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "HTN Planning"
+            },
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "wf-htn-planning-elem-9",
+          "description": "Required element 9 for state HTN Planning Configuration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "HTN Planning"
+            },
+            "label": "Required element for HTN Planning Configuration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The HTN (Hierarchical Task Network) Planning section within workflow settings allows users to enable structured plan-based fixes that run before the AI agentic session. When enabled, the verification loop attempts to find and execute a deterministic plan using a state machine and method library before falling back to AI. The section has three controls: an enable toggle (off by default), a UI Bridge URL text input (for connecting to the target app's UI Bridge during plan execution), and a state machine path input (for specifying a custom state machine JSON file; defaults to the bundled runner state machine). The URL and path inputs are conditionally visible — they only appear when HTN is enabled.",
@@ -162,15 +596,57 @@
     {
       "id": "wf-step-configuration",
       "name": "Step Configuration and Library Integration",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Setup"
+          "id": "wf-step-configuration-elem-0",
+          "description": "Required element 0 for state Step Configuration and Library Integration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Setup"
+            },
+            "label": "Required element for Step Configuration and Library Integration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Workflows"
+          "id": "wf-step-configuration-elem-1",
+          "description": "Required element 1 for state Step Configuration and Library Integration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Workflows"
+            },
+            "label": "Required element for Step Configuration and Library Integration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Setup"
+          "id": "wf-step-configuration-elem-2",
+          "description": "Required element 2 for state Step Configuration and Library Integration",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Setup"
+            },
+            "label": "Required element for Step Configuration and Library Integration"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Individual workflow steps can be configured with type-specific settings. Command steps have shell commands, working directories, and timeouts. Prompt steps have AI instruction text and context attachments. Check and check group steps reference items from the check library. Playwright test steps reference saved test scripts. Users can also pick steps from library pickers that show saved prompts, shell commands, checks, check groups, tests, and MCP server tools. The step configuration panel opens when a step is selected, showing all relevant fields for that step type. This tight integration with the asset library enables reuse across workflows.",

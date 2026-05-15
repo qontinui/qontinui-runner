@@ -6,17 +6,59 @@
     {
       "id": "gui-config-loading",
       "name": "Configuration Loading",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Config"
+          "id": "gui-config-loading-elem-0",
+          "description": "Required element 0 for state Configuration Loading",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Config"
+            },
+            "label": "Required element for Configuration Loading"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Load"
+          "id": "gui-config-loading-elem-1",
+          "description": "Required element 1 for state Configuration Loading",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Load"
+            },
+            "label": "Required element for Configuration Loading"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Last"
+          "id": "gui-config-loading-elem-2",
+          "description": "Required element 2 for state Configuration Loading",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Last"
+            },
+            "label": "Required element for Configuration Loading"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Before any GUI automation can run, users must load a configuration file that defines the visual automation environment: image targets, states, transitions, workflows, and monitors. The header area shows the current configuration status with an animated indicator when a config is loaded. Users can load a new configuration from a file picker or reload the last-used configuration. The configuration status indicator provides visual feedback (animated ping, active badge) so users immediately know whether a valid config is loaded and which one it is.",
@@ -27,22 +69,92 @@
     {
       "id": "gui-workflow-runner",
       "name": "Workflow Runner Panel",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Workflow"
+          "id": "gui-workflow-runner-elem-0",
+          "description": "Required element 0 for state Workflow Runner Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Workflow"
+            },
+            "label": "Required element for Workflow Runner Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Monitor"
+          "id": "gui-workflow-runner-elem-1",
+          "description": "Required element 1 for state Workflow Runner Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Monitor"
+            },
+            "label": "Required element for Workflow Runner Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Start"
+          "id": "gui-workflow-runner-elem-2",
+          "description": "Required element 2 for state Workflow Runner Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Start"
+            },
+            "label": "Required element for Workflow Runner Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "minimize"
+          "id": "gui-workflow-runner-elem-3",
+          "description": "Required element 3 for state Workflow Runner Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "minimize"
+            },
+            "label": "Required element for Workflow Runner Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Initial"
+          "id": "gui-workflow-runner-elem-4",
+          "description": "Required element 4 for state Workflow Runner Panel",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Initial"
+            },
+            "label": "Required element for Workflow Runner Panel"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The main panel (left 2/3) is the workflow runner where users select and start GUI automation workflows. It includes a searchable workflow dropdown populated from the loaded config, monitor selection controls for choosing which state monitors to activate, an auto-minimize toggle for the runner window during execution, state initialization overrides for testing specific starting states, and a large start/stop button for execution control. The panel is disabled when no configuration is loaded, and users must select at least one workflow and monitor combination before starting.",
@@ -53,15 +165,57 @@
     {
       "id": "gui-toolkit-sidebar",
       "name": "Automation Toolkit Sidebar",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Macro"
+          "id": "gui-toolkit-sidebar-elem-0",
+          "description": "Required element 0 for state Automation Toolkit Sidebar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Macro"
+            },
+            "label": "Required element for Automation Toolkit Sidebar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Quick"
+          "id": "gui-toolkit-sidebar-elem-1",
+          "description": "Required element 1 for state Automation Toolkit Sidebar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Quick"
+            },
+            "label": "Required element for Automation Toolkit Sidebar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Refresh"
+          "id": "gui-toolkit-sidebar-elem-2",
+          "description": "Required element 2 for state Automation Toolkit Sidebar",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Refresh"
+            },
+            "label": "Required element for Automation Toolkit Sidebar"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The right sidebar (1/3 width) provides the automation toolkit with quick actions and saved macros. Quick actions are one-click convenience operations for common automation tasks. Macros are saved sequences of automation steps that can be executed independently of full workflows -- useful for repetitive setup tasks, quick verifications, or testing specific interaction sequences. Users can run macros directly from the sidebar, with loading states and result feedback shown inline. The sidebar also includes a refresh control for reloading the macro list from the runner backend.",
@@ -72,15 +226,57 @@
     {
       "id": "gui-two-column-layout",
       "name": "Page Layout and Navigation",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "GUI Automation"
+          "id": "gui-two-column-layout-elem-0",
+          "description": "Required element 0 for state Page Layout and Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "GUI Automation"
+            },
+            "label": "Required element for Page Layout and Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button"
+          "id": "gui-two-column-layout-elem-1",
+          "description": "Required element 1 for state Page Layout and Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Required element for Page Layout and Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Toolkit"
+          "id": "gui-two-column-layout-elem-2",
+          "description": "Required element 2 for state Page Layout and Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Toolkit"
+            },
+            "label": "Required element for Page Layout and Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The GUI Automation page uses a responsive two-column grid layout: the workflow runner occupies 2/3 of the width and the automation toolkit sidebar takes the remaining 1/3. A header bar at the top shows the configuration status and load controls. The page is a dev-only feature hidden in production, accessible through the runner's navigation system. A tutorial menu provides contextual help for new users. The page scrolls vertically when content exceeds viewport height, with the header remaining visible.",

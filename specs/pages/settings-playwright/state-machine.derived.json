@@ -6,16 +6,58 @@
     {
       "id": "pw-page-structure",
       "name": "Page Structure",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Playwright Tests"
+          "id": "pw-page-structure-elem-0",
+          "description": "Required element 0 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Playwright Tests"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Configure authentication credentials and environment for Playwright test execution."
+          "id": "pw-page-structure-elem-1",
+          "description": "Required element 1 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Configure authentication credentials and environment for Playwright test execution."
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Playwright Tests"
+          "id": "pw-page-structure-elem-2",
+          "description": "Required element 2 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Playwright Tests"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Playwright settings tab renders a SectionHeader with title 'Playwright Tests' and a description about authentication credentials and environment configuration, followed by two card sections ('Test Authentication' and 'Environment'), a Save Settings button row, and an informational 'How it works' box. There are no sub-tabs or nested navigation within this tab.",
@@ -26,22 +68,92 @@
     {
       "id": "pw-auth-section",
       "name": "Test Authentication Section",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Test Authentication"
+          "id": "pw-auth-section-elem-0",
+          "description": "Required element 0 for state Test Authentication Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Test Authentication"
+            },
+            "label": "Required element for Test Authentication Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "input"
+          "id": "pw-auth-section-elem-1",
+          "description": "Required element 1 for state Test Authentication Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "input"
+            },
+            "label": "Required element for Test Authentication Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "input"
+          "id": "pw-auth-section-elem-2",
+          "description": "Required element 2 for state Test Authentication Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "input"
+            },
+            "label": "Required element for Test Authentication Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "tagName": "button"
+          "id": "pw-auth-section-elem-3",
+          "description": "Required element 3 for state Test Authentication Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "tagName": "button"
+            },
+            "label": "Required element for Test Authentication Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "PLAYWRIGHT_TEST_USERNAME"
+          "id": "pw-auth-section-elem-4",
+          "description": "Required element 4 for state Test Authentication Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "PLAYWRIGHT_TEST_USERNAME"
+            },
+            "label": "Required element for Test Authentication Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The 'Test Authentication' card contains a description explaining that credentials are passed as PLAYWRIGHT_TEST_USERNAME and PLAYWRIGHT_TEST_PASSWORD environment variables, a Username or Email text input, and a Password input with a show/hide toggle button.",
@@ -53,21 +165,91 @@
     {
       "id": "pw-environment-section",
       "name": "Environment Section",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Environment"
+          "id": "pw-environment-section-elem-0",
+          "description": "Required element 0 for state Environment Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Environment"
+            },
+            "label": "Required element for Environment Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "input"
+          "id": "pw-environment-section-elem-1",
+          "description": "Required element 1 for state Environment Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "input"
+            },
+            "label": "Required element for Environment Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "PLAYWRIGHT_BASE_URL"
+          "id": "pw-environment-section-elem-2",
+          "description": "Required element 2 for state Environment Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "PLAYWRIGHT_BASE_URL"
+            },
+            "label": "Required element for Environment Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Skip Web Server Startup"
+          "id": "pw-environment-section-elem-3",
+          "description": "Required element 3 for state Environment Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Skip Web Server Startup"
+            },
+            "label": "Required element for Environment Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Skip Web Server Startup"
+          "id": "pw-environment-section-elem-4",
+          "description": "Required element 4 for state Environment Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Skip Web Server Startup"
+            },
+            "label": "Required element for Environment Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The 'Environment' card contains a Base URL optional text input (passed as PLAYWRIGHT_BASE_URL) and a 'Skip Web Server Startup' toggle switch (sets SKIP_WEB_SERVER=1 when enabled). The Base URL field has a helper text explaining the fallback to playwright.config.ts. The Skip Web Server toggle defaults to enabled (on).",
@@ -79,26 +261,96 @@
     {
       "id": "pw-save-button",
       "name": "Save Settings Action",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Save Settings"
+          "id": "pw-save-button-elem-0",
+          "description": "Required element 0 for state Save Settings Action",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save Settings"
+            },
+            "label": "Required element for Save Settings Action"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Save Settings"
+          "id": "pw-save-button-elem-1",
+          "description": "Required element 1 for state Save Settings Action",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save Settings"
+            },
+            "label": "Required element for Save Settings Action"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Save Settings"
+          "id": "pw-save-button-elem-2",
+          "description": "Required element 2 for state Save Settings Action",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save Settings"
+            },
+            "label": "Required element for Save Settings Action"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Save Settings"
+          "id": "pw-save-button-elem-3",
+          "description": "Required element 3 for state Save Settings Action",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Save Settings"
+            },
+            "label": "Required element for Save Settings Action"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Saving..."
+          "id": "pw-save-button-elem-4",
+          "description": "Required element 4 for state Save Settings Action",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Saving..."
+            },
+            "label": "Required element for Save Settings Action"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A 'Save Settings' button at the bottom of the form persists all four settings via the save_playwright_settings Tauri IPC command. The button is disabled when no changes have been made (hasChanges=false) or while saving is in progress (isSaving=true). After any field is modified, the button becomes enabled. On successful save, 'Playwright settings saved' is emitted as a success log, and the button returns to the disabled state.",
@@ -110,15 +362,57 @@
     {
       "id": "pw-password-security",
       "name": "Password Security Model",
-      "requiredElements": [
+      "assertions": [
         {
-          "tagName": "input"
+          "id": "pw-password-security-elem-0",
+          "description": "Required element 0 for state Password Security Model",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "input"
+            },
+            "label": "Required element for Password Security Model"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "tagName": "input"
+          "id": "pw-password-security-elem-1",
+          "description": "Required element 1 for state Password Security Model",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "input"
+            },
+            "label": "Required element for Password Security Model"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Test Authentication"
+          "id": "pw-password-security-elem-2",
+          "description": "Required element 2 for state Password Security Model",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Test Authentication"
+            },
+            "label": "Required element for Password Security Model"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The password field has special security behavior: the actual password is stored in the OS keychain (Windows Credential Manager, macOS Keychain, Linux Secret Service), never in the plaintext settings.json file. When loading settings, the Rust backend returns '********' in the test_password field if a password is stored. Saving '********' unchanged does not overwrite the real password. Saving null/empty clears the password from the keychain.",
@@ -130,12 +424,40 @@
     {
       "id": "pw-info-box",
       "name": "How It Works Info Box",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "How it works:"
+          "id": "pw-info-box-elem-0",
+          "description": "Required element 0 for state How It Works Info Box",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "How it works:"
+            },
+            "label": "Required element for How It Works Info Box"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "process.env.PLAYWRIGHT_TEST_USERNAME"
+          "id": "pw-info-box-elem-1",
+          "description": "Required element 1 for state How It Works Info Box",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "process.env.PLAYWRIGHT_TEST_USERNAME"
+            },
+            "label": "Required element for How It Works Info Box"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "An informational box at the bottom of the form (below the Save button) explains how the settings are used at test runtime. It references the process.env variable names and mentions the auth.setup.ts file that reads these variables to log in and save the browser session.",
@@ -146,12 +468,40 @@
     {
       "id": "pw-settings-load",
       "name": "Settings Load on Mount",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Playwright Tests"
+          "id": "pw-settings-load-elem-0",
+          "description": "Required element 0 for state Settings Load on Mount",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Playwright Tests"
+            },
+            "label": "Required element for Settings Load on Mount"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Playwright Tests"
+          "id": "pw-settings-load-elem-1",
+          "description": "Required element 1 for state Settings Load on Mount",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Playwright Tests"
+            },
+            "label": "Required element for Settings Load on Mount"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When the Playwright settings tab is first rendered, it automatically calls get_playwright_settings via Tauri IPC to populate the form with previously saved values. This runs asynchronously on mount. If the call fails, an error is logged but the form remains functional with default values.",
@@ -163,12 +513,40 @@
     {
       "id": "pw-env-var-mapping",
       "name": "Environment Variable Mapping",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Playwright Tests"
+          "id": "pw-env-var-mapping-elem-0",
+          "description": "Required element 0 for state Environment Variable Mapping",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Playwright Tests"
+            },
+            "label": "Required element for Environment Variable Mapping"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Sets SKIP_WEB_SERVER=1"
+          "id": "pw-env-var-mapping-elem-1",
+          "description": "Required element 1 for state Environment Variable Mapping",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Sets SKIP_WEB_SERVER=1"
+            },
+            "label": "Required element for Environment Variable Mapping"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Each of the four settings fields maps to an environment variable that is injected when Playwright tests run. The spec defines this mapping so workflows can verify the correct env vars are documented and the correct fields are present. The UI descriptions on the page itself expose this mapping to the user.",

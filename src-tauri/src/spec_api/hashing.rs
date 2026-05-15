@@ -117,6 +117,7 @@ mod tests {
             line: Some(10),
             column: Some(5),
             plugin_version: None,
+            status: None,
         });
         let mut b = empty_spec();
         b.provenance = Some(IrProvenance {
@@ -125,6 +126,7 @@ mod tests {
             line: Some(99),
             column: Some(1),
             plugin_version: None,
+            status: None,
         });
         assert_eq!(
             hash_ir_page_spec(&a).unwrap(),
@@ -141,6 +143,7 @@ mod tests {
             line: None,
             column: None,
             plugin_version: None,
+            status: None,
         });
         let mut b = empty_spec();
         b.provenance = Some(IrProvenance {
@@ -149,6 +152,7 @@ mod tests {
             line: None,
             column: None,
             plugin_version: None,
+            status: None,
         });
         assert_ne!(
             hash_ir_page_spec(&a).unwrap(),
@@ -163,7 +167,7 @@ mod tests {
             id: "s1".to_string(),
             name: "S1".to_string(),
             description: None,
-            required_elements: vec![],
+            assertions: vec![],
             excluded_elements: None,
             conditions: None,
             is_initial: None,
@@ -181,6 +185,7 @@ mod tests {
                 line: Some(10),
                 column: None,
                 plugin_version: None,
+                status: None,
             }),
             cross_refs: None,
         });
@@ -189,7 +194,7 @@ mod tests {
             id: "s1".to_string(),
             name: "S1".to_string(),
             description: None,
-            required_elements: vec![],
+            assertions: vec![],
             excluded_elements: None,
             conditions: None,
             is_initial: None,
@@ -207,6 +212,7 @@ mod tests {
                 line: Some(99),
                 column: Some(7),
                 plugin_version: None,
+                status: None,
             }),
             cross_refs: None,
         });

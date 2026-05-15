@@ -6,12 +6,40 @@
     {
       "id": "help-purpose",
       "name": "Page Purpose",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Help"
+          "id": "help-purpose-elem-0",
+          "description": "Required element 0 for state Page Purpose",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Help"
+            },
+            "label": "Required element for Page Purpose"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "tablist"
+          "id": "help-purpose-elem-1",
+          "description": "Required element 1 for state Page Purpose",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tablist"
+            },
+            "label": "Required element for Page Purpose"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Help page is the primary learning and support resource within the runner application.",
@@ -22,13 +50,41 @@
     {
       "id": "help-tutorials",
       "name": "Tutorial Goals",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Tutorials"
+          "id": "help-tutorials-elem-0",
+          "description": "Required element 0 for state Tutorial Goals",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Tutorials"
+            },
+            "label": "Required element for Tutorial Goals"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Start"
+          "id": "help-tutorials-elem-1",
+          "description": "Required element 1 for state Tutorial Goals",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Start"
+            },
+            "label": "Required element for Tutorial Goals"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Users need interactive guided tutorials that walk them through key workflows step by step.",
@@ -39,9 +95,23 @@
     {
       "id": "help-shortcuts",
       "name": "Keyboard Shortcuts Goals",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Shortcuts"
+          "id": "help-shortcuts-elem-0",
+          "description": "Required element 0 for state Keyboard Shortcuts Goals",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Shortcuts"
+            },
+            "label": "Required element for Keyboard Shortcuts Goals"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Power users need quick reference to all keyboard shortcuts organized by feature area.",
@@ -52,12 +122,40 @@
     {
       "id": "help-troubleshooting",
       "name": "Troubleshooting and Support Goals",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Troubleshooting"
+          "id": "help-troubleshooting-elem-0",
+          "description": "Required element 0 for state Troubleshooting and Support Goals",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Troubleshooting"
+            },
+            "label": "Required element for Troubleshooting and Support Goals"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "About"
+          "id": "help-troubleshooting-elem-1",
+          "description": "Required element 1 for state Troubleshooting and Support Goals",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "About"
+            },
+            "label": "Required element for Troubleshooting and Support Goals"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When users encounter problems they need quick access to common issue solutions and debugging guidance.",

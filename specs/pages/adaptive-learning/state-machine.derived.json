@@ -6,31 +6,87 @@
     {
       "id": "tab-navigation",
       "name": "Tab Navigation",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Adaptive Learning",
-          "attributes": {
-            "tutorial-id": "learning-tab"
-          }
+          "id": "tab-navigation-elem-0",
+          "description": "Required element 0 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Adaptive Learning",
+              "attributes": {
+                "tutorial-id": "learning-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Playbook",
-          "attributes": {
-            "tutorial-id": "playbook-tab"
-          }
+          "id": "tab-navigation-elem-1",
+          "description": "Required element 1 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Playbook",
+              "attributes": {
+                "tutorial-id": "playbook-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Prompt Evolution",
-          "attributes": {
-            "tutorial-id": "prompt_evolution-tab"
-          }
+          "id": "tab-navigation-elem-2",
+          "description": "Required element 2 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Prompt Evolution",
+              "attributes": {
+                "tutorial-id": "prompt_evolution-tab"
+              }
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Adaptive Learning"
+          "id": "tab-navigation-elem-3",
+          "description": "Required element 3 for state Tab Navigation",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Adaptive Learning"
+            },
+            "label": "Required element for Tab Navigation"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The three adaptive learning tabs in the Meta-Optimizer page tab bar: Adaptive Learning, Playbook, and Prompt Evolution.",
@@ -41,21 +97,91 @@
     {
       "id": "dashboard-stat-cards",
       "name": "Learning Dashboard — Stat Cards",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Playbook Lessons"
+          "id": "dashboard-stat-cards-elem-0",
+          "description": "Required element 0 for state Learning Dashboard — Stat Cards",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Playbook Lessons"
+            },
+            "label": "Required element for Learning Dashboard — Stat Cards"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Curated Examples"
+          "id": "dashboard-stat-cards-elem-1",
+          "description": "Required element 1 for state Learning Dashboard — Stat Cards",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Curated Examples"
+            },
+            "label": "Required element for Learning Dashboard — Stat Cards"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Templates Tracked"
+          "id": "dashboard-stat-cards-elem-2",
+          "description": "Required element 2 for state Learning Dashboard — Stat Cards",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Templates Tracked"
+            },
+            "label": "Required element for Learning Dashboard — Stat Cards"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "GEPA Optimizations"
+          "id": "dashboard-stat-cards-elem-3",
+          "description": "Required element 3 for state Learning Dashboard — Stat Cards",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "GEPA Optimizations"
+            },
+            "label": "Required element for Learning Dashboard — Stat Cards"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Playbook Lessons"
+          "id": "dashboard-stat-cards-elem-4",
+          "description": "Required element 4 for state Learning Dashboard — Stat Cards",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Playbook Lessons"
+            },
+            "label": "Required element for Learning Dashboard — Stat Cards"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Adaptive Learning tab displays four stat cards at the top showing aggregate counts from the adaptive learning system.",
@@ -67,15 +193,57 @@
     {
       "id": "dashboard-charts",
       "name": "Learning Dashboard — Trend Charts",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Lesson Growth"
+          "id": "dashboard-charts-elem-0",
+          "description": "Required element 0 for state Learning Dashboard — Trend Charts",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Lesson Growth"
+            },
+            "label": "Required element for Learning Dashboard — Trend Charts"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Domain Distribution"
+          "id": "dashboard-charts-elem-1",
+          "description": "Required element 1 for state Learning Dashboard — Trend Charts",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Domain Distribution"
+            },
+            "label": "Required element for Learning Dashboard — Trend Charts"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Helpfulness Trend"
+          "id": "dashboard-charts-elem-2",
+          "description": "Required element 2 for state Learning Dashboard — Trend Charts",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Helpfulness Trend"
+            },
+            "label": "Required element for Learning Dashboard — Trend Charts"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "SVG-based charts showing lesson growth, domain distribution, and helpfulness trends over the last 30 days.",
@@ -87,15 +255,57 @@
     {
       "id": "dashboard-template-table",
       "name": "Learning Dashboard — Template Performance Table",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Template Performance"
+          "id": "dashboard-template-table-elem-0",
+          "description": "Required element 0 for state Learning Dashboard — Template Performance Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Template Performance"
+            },
+            "label": "Required element for Learning Dashboard — Template Performance Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Confidence"
+          "id": "dashboard-template-table-elem-1",
+          "description": "Required element 1 for state Learning Dashboard — Template Performance Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Confidence"
+            },
+            "label": "Required element for Learning Dashboard — Template Performance Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Confidence"
+          "id": "dashboard-template-table-elem-2",
+          "description": "Required element 2 for state Learning Dashboard — Template Performance Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Confidence"
+            },
+            "label": "Required element for Learning Dashboard — Template Performance Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Table showing verification template performance data with success/failure counts, confidence, and quality scores.",
@@ -107,12 +317,40 @@
     {
       "id": "dashboard-error-state",
       "name": "Learning Dashboard — Error & Empty States",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Loading dashboard"
+          "id": "dashboard-error-state-elem-0",
+          "description": "Required element 0 for state Learning Dashboard — Error & Empty States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Loading dashboard"
+            },
+            "label": "Required element for Learning Dashboard — Error & Empty States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Retry"
+          "id": "dashboard-error-state-elem-1",
+          "description": "Required element 1 for state Learning Dashboard — Error & Empty States",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Retry"
+            },
+            "label": "Required element for Learning Dashboard — Error & Empty States"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Error handling and empty states for the Learning Dashboard.",
@@ -124,21 +362,77 @@
     {
       "id": "playbook-header",
       "name": "Playbook Panel — Header & Filters",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "textContains": "Playbook Lessons"
+          "id": "playbook-header-elem-0",
+          "description": "Required element 0 for state Playbook Panel — Header & Filters",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContains": "Playbook Lessons"
+            },
+            "label": "Required element for Playbook Panel — Header & Filters"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "combobox",
-          "textContains": "All Domains"
+          "id": "playbook-header-elem-1",
+          "description": "Required element 1 for state Playbook Panel — Header & Filters",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox",
+              "textContains": "All Domains"
+            },
+            "label": "Required element for Playbook Panel — Header & Filters"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "combobox"
+          "id": "playbook-header-elem-2",
+          "description": "Required element 2 for state Playbook Panel — Header & Filters",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Playbook Panel — Header & Filters"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Refresh"
+          "id": "playbook-header-elem-3",
+          "description": "Required element 3 for state Playbook Panel — Header & Filters",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Refresh"
+            },
+            "label": "Required element for Playbook Panel — Header & Filters"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Playbook tab header with title, domain filter, status filter, and refresh button.",
@@ -150,15 +444,57 @@
     {
       "id": "playbook-severity-groups",
       "name": "Playbook Panel — Severity Groups",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "CRITICAL"
+          "id": "playbook-severity-groups-elem-0",
+          "description": "Required element 0 for state Playbook Panel — Severity Groups",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "CRITICAL"
+            },
+            "label": "Required element for Playbook Panel — Severity Groups"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "IMPORTANT"
+          "id": "playbook-severity-groups-elem-1",
+          "description": "Required element 1 for state Playbook Panel — Severity Groups",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "IMPORTANT"
+            },
+            "label": "Required element for Playbook Panel — Severity Groups"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "No playbook entries found"
+          "id": "playbook-severity-groups-elem-2",
+          "description": "Required element 2 for state Playbook Panel — Severity Groups",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "No playbook entries found"
+            },
+            "label": "Required element for Playbook Panel — Severity Groups"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Lessons are organized into three severity groups: Critical (red), Important (yellow), Minor (gray). Each group has an uppercase header with count.",
@@ -170,15 +506,57 @@
     {
       "id": "playbook-lesson-row",
       "name": "Playbook Panel — Lesson Row Content",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "DO"
+          "id": "playbook-lesson-row-elem-0",
+          "description": "Required element 0 for state Playbook Panel — Lesson Row Content",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "DO"
+            },
+            "label": "Required element for Playbook Panel — Lesson Row Content"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Construction"
+          "id": "playbook-lesson-row-elem-1",
+          "description": "Required element 1 for state Playbook Panel — Lesson Row Content",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Construction"
+            },
+            "label": "Required element for Playbook Panel — Lesson Row Content"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "%"
+          "id": "playbook-lesson-row-elem-2",
+          "description": "Required element 2 for state Playbook Panel — Lesson Row Content",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "%"
+            },
+            "label": "Required element for Playbook Panel — Lesson Row Content"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Each lesson row displays a DO/DON'T prefix, lesson text, category label, helpfulness ratio, and action buttons.",
@@ -190,18 +568,60 @@
     {
       "id": "playbook-actions",
       "name": "Playbook Panel — Lesson Actions",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Activate"
+          "id": "playbook-actions-elem-0",
+          "description": "Required element 0 for state Playbook Panel — Lesson Actions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Activate"
+            },
+            "label": "Required element for Playbook Panel — Lesson Actions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Retire"
+          "id": "playbook-actions-elem-1",
+          "description": "Required element 1 for state Playbook Panel — Lesson Actions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Retire"
+            },
+            "label": "Required element for Playbook Panel — Lesson Actions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "textContains": "Delete"
+          "id": "playbook-actions-elem-2",
+          "description": "Required element 2 for state Playbook Panel — Lesson Actions",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContains": "Delete"
+            },
+            "label": "Required element for Playbook Panel — Lesson Actions"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Interactive controls for managing playbook entries: activate, retire, delete with confirmation.",
@@ -213,15 +633,57 @@
     {
       "id": "playbook-detail-panel",
       "name": "Playbook Panel — Expanded Detail View",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "DO"
+          "id": "playbook-detail-panel-elem-0",
+          "description": "Required element 0 for state Playbook Panel — Expanded Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "DO"
+            },
+            "label": "Required element for Playbook Panel — Expanded Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Applied"
+          "id": "playbook-detail-panel-elem-1",
+          "description": "Required element 1 for state Playbook Panel — Expanded Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Applied"
+            },
+            "label": "Required element for Playbook Panel — Expanded Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Source Run"
+          "id": "playbook-detail-panel-elem-2",
+          "description": "Required element 2 for state Playbook Panel — Expanded Detail View",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Source Run"
+            },
+            "label": "Required element for Playbook Panel — Expanded Detail View"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Clicking a lesson row expands it to show metadata and source run context.",
@@ -233,16 +695,58 @@
     {
       "id": "evolution-header",
       "name": "Prompt Evolution Panel — Header & Filter",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "textContains": "Prompt Evolution"
+          "id": "evolution-header-elem-0",
+          "description": "Required element 0 for state Prompt Evolution Panel — Header & Filter",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "textContains": "Prompt Evolution"
+            },
+            "label": "Required element for Prompt Evolution Panel — Header & Filter"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "combobox"
+          "id": "evolution-header-elem-1",
+          "description": "Required element 1 for state Prompt Evolution Panel — Header & Filter",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Required element for Prompt Evolution Panel — Header & Filter"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "No GEPA optimization runs yet"
+          "id": "evolution-header-elem-2",
+          "description": "Required element 2 for state Prompt Evolution Panel — Header & Filter",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "No GEPA optimization runs yet"
+            },
+            "label": "Required element for Prompt Evolution Panel — Header & Filter"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Prompt Evolution tab header with title, domain filter, and refresh button.",
@@ -254,12 +758,40 @@
     {
       "id": "evolution-domain-cards",
       "name": "Prompt Evolution Panel — Domain Summary Cards",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "improved"
+          "id": "evolution-domain-cards-elem-0",
+          "description": "Required element 0 for state Prompt Evolution Panel — Domain Summary Cards",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "improved"
+            },
+            "label": "Required element for Prompt Evolution Panel — Domain Summary Cards"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "improved"
+          "id": "evolution-domain-cards-elem-1",
+          "description": "Required element 1 for state Prompt Evolution Panel — Domain Summary Cards",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "improved"
+            },
+            "label": "Required element for Prompt Evolution Panel — Domain Summary Cards"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Summary cards showing per-domain GEPA optimization stats with total improvement.",
@@ -271,15 +803,57 @@
     {
       "id": "evolution-run-table",
       "name": "Prompt Evolution Panel — Run History Table",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Old Score"
+          "id": "evolution-run-table-elem-0",
+          "description": "Required element 0 for state Prompt Evolution Panel — Run History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Old Score"
+            },
+            "label": "Required element for Prompt Evolution Panel — Run History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "%"
+          "id": "evolution-run-table-elem-1",
+          "description": "Required element 1 for state Prompt Evolution Panel — Run History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "%"
+            },
+            "label": "Required element for Prompt Evolution Panel — Run History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "completed"
+          "id": "evolution-run-table-elem-2",
+          "description": "Required element 2 for state Prompt Evolution Panel — Run History Table",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "completed"
+            },
+            "label": "Required element for Prompt Evolution Panel — Run History Table"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Table of GEPA optimization runs with columns for date, domain, old score, new score, improvement, and status.",
@@ -291,15 +865,57 @@
     {
       "id": "evolution-prompt-diff",
       "name": "Prompt Evolution Panel — Before/After Prompt Diff",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Old Score"
+          "id": "evolution-prompt-diff-elem-0",
+          "description": "Required element 0 for state Prompt Evolution Panel — Before/After Prompt Diff",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Old Score"
+            },
+            "label": "Required element for Prompt Evolution Panel — Before/After Prompt Diff"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Before"
+          "id": "evolution-prompt-diff-elem-1",
+          "description": "Required element 1 for state Prompt Evolution Panel — Before/After Prompt Diff",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Before"
+            },
+            "label": "Required element for Prompt Evolution Panel — Before/After Prompt Diff"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "improvement"
+          "id": "evolution-prompt-diff-elem-2",
+          "description": "Required element 2 for state Prompt Evolution Panel — Before/After Prompt Diff",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "improvement"
+            },
+            "label": "Required element for Prompt Evolution Panel — Before/After Prompt Diff"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Expanded GEPA run detail showing the old and new generation instructions side-by-side with score delta.",
@@ -311,15 +927,57 @@
     {
       "id": "auto-refresh",
       "name": "Auto-Refresh Behavior",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Playbook"
+          "id": "auto-refresh-elem-0",
+          "description": "Required element 0 for state Auto-Refresh Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Playbook"
+            },
+            "label": "Required element for Auto-Refresh Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Playbook Lessons"
+          "id": "auto-refresh-elem-1",
+          "description": "Required element 1 for state Auto-Refresh Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Playbook Lessons"
+            },
+            "label": "Required element for Auto-Refresh Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Adaptive Learning"
+          "id": "auto-refresh-elem-2",
+          "description": "Required element 2 for state Auto-Refresh Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Adaptive Learning"
+            },
+            "label": "Required element for Auto-Refresh Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "All three adaptive learning panels auto-refresh on learning-update events and periodic timers.",
@@ -331,16 +989,58 @@
     {
       "id": "visual-design",
       "name": "Visual Design — Colors & Typography",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Playbook"
+          "id": "visual-design-elem-0",
+          "description": "Required element 0 for state Visual Design — Colors & Typography",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Playbook"
+            },
+            "label": "Required element for Visual Design — Colors & Typography"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "Lessons"
+          "id": "visual-design-elem-1",
+          "description": "Required element 1 for state Visual Design — Colors & Typography",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Lessons"
+            },
+            "label": "Required element for Visual Design — Colors & Typography"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Refresh"
+          "id": "visual-design-elem-2",
+          "description": "Required element 2 for state Visual Design — Colors & Typography",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Refresh"
+            },
+            "label": "Required element for Visual Design — Colors & Typography"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Consistent dark theme design across all adaptive learning panels.",
@@ -351,18 +1051,74 @@
     {
       "id": "learning-loop-correctness",
       "name": "Learning Loop — Data Correctness",
-      "requiredElements": [
+      "assertions": [
         {
-          "textContains": "Playbook Lessons"
+          "id": "learning-loop-correctness-elem-0",
+          "description": "Required element 0 for state Learning Loop — Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Playbook Lessons"
+            },
+            "label": "Required element for Learning Loop — Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "CRITICAL"
+          "id": "learning-loop-correctness-elem-1",
+          "description": "Required element 1 for state Learning Loop — Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "CRITICAL"
+            },
+            "label": "Required element for Learning Loop — Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "%"
+          "id": "learning-loop-correctness-elem-2",
+          "description": "Required element 2 for state Learning Loop — Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "%"
+            },
+            "label": "Required element for Learning Loop — Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "textContains": "improved"
+          "id": "learning-loop-correctness-elem-3",
+          "description": "Required element 3 for state Learning Loop — Data Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "improved"
+            },
+            "label": "Required element for Learning Loop — Data Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Semantic assertions verifying that the adaptive learning system produces correct, consistent data across its three panels.",

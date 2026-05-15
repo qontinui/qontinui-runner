@@ -6,16 +6,58 @@
     {
       "id": "bk-page-structure",
       "name": "Page Structure",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "heading",
-          "text": "Backup & Restore"
+          "id": "bk-page-structure-elem-0",
+          "description": "Required element 0 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "heading",
+              "text": "Backup & Restore"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "comprehensive backups"
+          "id": "bk-page-structure-elem-1",
+          "description": "Required element 1 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "comprehensive backups"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Backup & Restore"
+          "id": "bk-page-structure-elem-2",
+          "description": "Required element 2 for state Page Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Backup & Restore"
+            },
+            "label": "Required element for Page Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Backup & Restore tab renders a SectionHeader titled 'Backup & Restore' with a description about creating and restoring backups, followed by four card sections: Your Data, Export All Data, Import Data, and a bottom info panel. All four sections are always rendered — none are conditionally hidden based on state.",
@@ -26,18 +68,74 @@
     {
       "id": "bk-data-summary",
       "name": "Your Data — Summary Section",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Your Data"
+          "id": "bk-data-summary-elem-0",
+          "description": "Required element 0 for state Your Data — Summary Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Your Data"
+            },
+            "label": "Required element for Your Data — Summary Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Refresh"
+          "id": "bk-data-summary-elem-1",
+          "description": "Required element 1 for state Your Data — Summary Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Refresh"
+            },
+            "label": "Required element for Your Data — Summary Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
         {
-          "role": "button",
-          "text": "Refresh"
+          "id": "bk-data-summary-elem-2",
+          "description": "Required element 2 for state Your Data — Summary Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Your Data — Summary Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bk-data-summary-elem-3",
+          "description": "Required element 3 for state Your Data — Summary Section",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Refresh"
+            },
+            "label": "Required element for Your Data — Summary Section"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The 'Your Data' card displays the current item count for each of the 13 data categories as a responsive grid. Each cell shows the human-readable category label and its integer count. A 'Refresh' button re-runs get_export_summary. The summary is fetched automatically on mount and the button is disabled while loading (showing 'Loading...').",
@@ -49,16 +147,58 @@
     {
       "id": "bk-export-section",
       "name": "Export All Data — Section Structure",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Export All Data"
+          "id": "bk-export-section-elem-0",
+          "description": "Required element 0 for state Export All Data — Section Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Export All Data"
+            },
+            "label": "Required element for Export All Data — Section Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Export Options"
+          "id": "bk-export-section-elem-1",
+          "description": "Required element 1 for state Export All Data — Section Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Export Options"
+            },
+            "label": "Required element for Export All Data — Section Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Export"
+          "id": "bk-export-section-elem-2",
+          "description": "Required element 2 for state Export All Data — Section Structure",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Export"
+            },
+            "label": "Required element for Export All Data — Section Structure"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The 'Export All Data' card contains: a section heading 'Export All Data' with a Download icon; a description paragraph about exporting to a JSON file; an 'Export Options' toggle button with a Settings icon and a chevron; and the 'Export (N items)' action button. All elements are always present within this card.",
@@ -69,16 +209,58 @@
     {
       "id": "bk-export-options-panel",
       "name": "Export Options — Category Selector",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Export Options"
+          "id": "bk-export-options-panel-elem-0",
+          "description": "Required element 0 for state Export Options — Category Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Export Options"
+            },
+            "label": "Required element for Export Options — Category Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Export Options"
+          "id": "bk-export-options-panel-elem-1",
+          "description": "Required element 1 for state Export Options — Category Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Export Options"
+            },
+            "label": "Required element for Export Options — Category Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Export"
+          "id": "bk-export-options-panel-elem-2",
+          "description": "Required element 2 for state Export Options — Category Selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Export"
+            },
+            "label": "Required element for Export Options — Category Selector"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When the 'Export Options' toggle is expanded, a grid of 13 checkboxes is shown — one per data category. All 13 are checked by default (defaultExportOptions). Each checkbox label shows the category name and its current count in parentheses. Unchecking a category removes it from the export and reduces the N in 'Export (N items)'.",
@@ -90,14 +272,42 @@
     {
       "id": "bk-export-flow",
       "name": "Export Flow — File Download",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Exporting"
+          "id": "bk-export-flow-elem-0",
+          "description": "Required element 0 for state Export Flow — File Download",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Exporting"
+            },
+            "label": "Required element for Export Flow — File Download"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Export"
+          "id": "bk-export-flow-elem-1",
+          "description": "Required element 1 for state Export Flow — File Download",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Export"
+            },
+            "label": "Required element for Export Flow — File Download"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Clicking the 'Export (N items)' button invokes the Tauri export_all_data command with the current export options, creates a Blob from the returned JSON, and triggers a browser file download. The downloaded file is named qontinui-backup-YYYY-MM-DD.json where the date is today's UTC date. During export, the button shows a spinner and progress text ('Exporting data from database...' then 'Preparing download...').",
@@ -109,17 +319,59 @@
     {
       "id": "bk-import-idle",
       "name": "Import Data — Idle State (No File Selected)",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Import Data"
+          "id": "bk-import-idle-elem-0",
+          "description": "Required element 0 for state Import Data — Idle State (No File Selected)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Import Data"
+            },
+            "label": "Required element for Import Data — Idle State (No File Selected)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Select Backup File"
+          "id": "bk-import-idle-elem-1",
+          "description": "Required element 1 for state Import Data — Idle State (No File Selected)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Select Backup File"
+            },
+            "label": "Required element for Import Data — Idle State (No File Selected)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Select Backup File"
+          "id": "bk-import-idle-elem-2",
+          "description": "Required element 2 for state Import Data — Idle State (No File Selected)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Select Backup File"
+            },
+            "label": "Required element for Import Data — Idle State (No File Selected)"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When no backup file has been selected (and no import result is showing), the Import Data section shows only a 'Select Backup File' button with an Upload icon. A hidden <input type='file' accept='.json'> is present but not visible. After a file is selected and preview is shown, this button disappears. If a file is being read, a small spinner with 'Reading file...' text appears in place of the button.",
@@ -131,18 +383,74 @@
     {
       "id": "bk-import-preview-metadata",
       "name": "Import Preview — File Metadata Display",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Import Preview"
+          "id": "bk-import-preview-metadata-elem-0",
+          "description": "Required element 0 for state Import Preview — File Metadata Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Import Preview"
+            },
+            "label": "Required element for Import Preview — File Metadata Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Cancel"
+          "id": "bk-import-preview-metadata-elem-1",
+          "description": "Required element 1 for state Import Preview — File Metadata Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Cancel"
+            },
+            "label": "Required element for Import Preview — File Metadata Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
         {
-          "role": "button",
-          "text": "Cancel"
+          "id": "bk-import-preview-metadata-elem-2",
+          "description": "Required element 2 for state Import Preview — File Metadata Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Import Preview — File Metadata Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bk-import-preview-metadata-elem-3",
+          "description": "Required element 3 for state Import Preview — File Metadata Display",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Cancel"
+            },
+            "label": "Required element for Import Preview — File Metadata Display"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "After selecting a .json backup file, the page calls get_import_preview and shows an 'Import Preview' panel. The panel displays three metadata fields: Version (from manifest.version, e.g. '2.0.0'), App Version (from manifest.app_version), and Created (manifest.created_at formatted via toLocaleString()). A 'Cancel' button is visible to dismiss the preview and return to the idle state.",
@@ -154,13 +462,41 @@
     {
       "id": "bk-import-compatibility",
       "name": "Import Compatibility Check",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Compatibility issues"
+          "id": "bk-import-compatibility-elem-0",
+          "description": "Required element 0 for state Import Compatibility Check",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Compatibility issues"
+            },
+            "label": "Required element for Import Compatibility Check"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Import Data"
+          "id": "bk-import-compatibility-elem-1",
+          "description": "Required element 1 for state Import Compatibility Check",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Import Data"
+            },
+            "label": "Required element for Import Compatibility Check"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "get_import_preview checks the backup's manifest.version. Versions starting with '2.' or '1.' are compatible. An incompatible backup shows a red error banner listing the compatibility issues. The 'Import Data' button is disabled for incompatible backups.",
@@ -172,15 +508,57 @@
     {
       "id": "bk-import-options-panel",
       "name": "Import Options — Conflict Resolution and Category Selection",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Import Options"
+          "id": "bk-import-options-panel-elem-0",
+          "description": "Required element 0 for state Import Options — Conflict Resolution and Category Selection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Import Options"
+            },
+            "label": "Required element for Import Options — Conflict Resolution and Category Selection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Conflict Resolution"
+          "id": "bk-import-options-panel-elem-1",
+          "description": "Required element 1 for state Import Options — Conflict Resolution and Category Selection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Conflict Resolution"
+            },
+            "label": "Required element for Import Options — Conflict Resolution and Category Selection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Import Options"
+          "id": "bk-import-options-panel-elem-2",
+          "description": "Required element 2 for state Import Options — Conflict Resolution and Category Selection",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Import Options"
+            },
+            "label": "Required element for Import Options — Conflict Resolution and Category Selection"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "Within the Import Preview panel, an 'Import Options' toggle button (Settings icon, chevron) expands a sub-panel with two controls: (1) Conflict Resolution radio group with 'Skip existing' (default) and 'Overwrite' options; (2) a grid of 13 category checkboxes with defaults — enabled: flows, learning_outcomes, learning_patterns, settings, prompts, unified_workflows, verification_tests, task_hooks, scheduled_tasks, saved_api_requests, configs; disabled: flow_executions, checkpoints.",
@@ -192,19 +570,75 @@
     {
       "id": "bk-import-preview-grid-and-warning",
       "name": "Import Preview — Data Grid and Warning Banner",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Import Preview"
+          "id": "bk-import-preview-grid-and-warning-elem-0",
+          "description": "Required element 0 for state Import Preview — Data Grid and Warning Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Import Preview"
+            },
+            "label": "Required element for Import Preview — Data Grid and Warning Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Existing items will be skipped"
+          "id": "bk-import-preview-grid-and-warning-elem-1",
+          "description": "Required element 1 for state Import Preview — Data Grid and Warning Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Existing items will be skipped"
+            },
+            "label": "Required element for Import Preview — Data Grid and Warning Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Existing items will be overwritten"
+          "id": "bk-import-preview-grid-and-warning-elem-2",
+          "description": "Required element 2 for state Import Preview — Data Grid and Warning Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Existing items will be overwritten"
+            },
+            "label": "Required element for Import Preview — Data Grid and Warning Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "role": "button",
-          "text": "Import Data"
+          "id": "bk-import-preview-grid-and-warning-elem-3",
+          "description": "Required element 3 for state Import Preview — Data Grid and Warning Banner",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Import Data"
+            },
+            "label": "Required element for Import Preview — Data Grid and Warning Banner"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The Import Preview panel shows a grid of 13 data-count cells (same layout as the Your Data summary) and an amber warning banner. Selected categories are highlighted with a primary/10 background; deselected categories have 50% opacity. The warning banner text changes based on conflict_mode: 'overwrite' shows 'Existing items will be overwritten. This cannot be undone.' and 'skip' shows 'Existing items will be skipped. Only new items will be imported.'",
@@ -216,14 +650,70 @@
     {
       "id": "bk-import-flow",
       "name": "Import Flow — End-to-End Behavior",
-      "requiredElements": [
+      "assertions": [
         {
-          "role": "button",
-          "text": "Importing"
+          "id": "bk-import-flow-elem-0",
+          "description": "Required element 0 for state Import Flow — End-to-End Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "text": "Importing"
+            },
+            "label": "Required element for Import Flow — End-to-End Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {},
-        {},
-        {}
+        {
+          "id": "bk-import-flow-elem-1",
+          "description": "Required element 1 for state Import Flow — End-to-End Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Import Flow — End-to-End Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bk-import-flow-elem-2",
+          "description": "Required element 2 for state Import Flow — End-to-End Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Import Flow — End-to-End Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bk-import-flow-elem-3",
+          "description": "Required element 3 for state Import Flow — End-to-End Behavior",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Import Flow — End-to-End Behavior"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "Clicking 'Import Data' invokes import_all_data with the parsed backup data and current ImportOptions. Per-category import uses INSERT ... ON CONFLICT: 'skip' mode does nothing on conflict, 'overwrite' mode updates existing rows. After completion: importResult is set, importPreview and pendingImportData are cleared, and get_export_summary is called to refresh the data summary counts.",
       "precondition": "Import Data has been clicked and is in progress",
@@ -234,12 +724,54 @@
     {
       "id": "bk-import-result-success",
       "name": "Import Result — Successful Import",
-      "requiredElements": [
-        {},
+      "assertions": [
         {
-          "text": "Imported:"
+          "id": "bk-import-result-success-elem-0",
+          "description": "Required element 0 for state Import Result — Successful Import",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Import Result — Successful Import"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
-        {}
+        {
+          "id": "bk-import-result-success-elem-1",
+          "description": "Required element 1 for state Import Result — Successful Import",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Imported:"
+            },
+            "label": "Required element for Import Result — Successful Import"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bk-import-result-success-elem-2",
+          "description": "Required element 2 for state Import Result — Successful Import",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Import Result — Successful Import"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        }
       ],
       "description": "When import_all_data returns success: true (total_errors = 0), a green result panel is shown with a CheckCircle icon and the text 'Import Successful'. Below it, a summary line 'Imported: X | Skipped: Y | Errors: Z' is shown, followed by per-category detail lines (e.g., 'Flows: 3 imported, 1 skipped'). The data-content-label='import result' element contains 'Import Successful'.",
       "precondition": "Import has completed with no errors",
@@ -250,10 +782,38 @@
     {
       "id": "bk-import-result-errors",
       "name": "Import Result — Import With Errors",
-      "requiredElements": [
-        {},
+      "assertions": [
         {
-          "text": "errors"
+          "id": "bk-import-result-errors-elem-0",
+          "description": "Required element 0 for state Import Result — Import With Errors",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {},
+            "label": "Required element for Import Result — Import With Errors"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "bk-import-result-errors-elem-1",
+          "description": "Required element 1 for state Import Result — Import With Errors",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "errors"
+            },
+            "label": "Required element for Import Result — Import With Errors"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "When import_all_data returns success: false (total_errors > 0), an amber result panel is shown with an AlertCircle icon and the text 'Import Completed with Errors'. The totals line and per-category breakdown are the same as the success case, but categories with errors show a red error count in parentheses.",
@@ -265,15 +825,57 @@
     {
       "id": "bk-info-section",
       "name": "Info Panel — What's Included",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "What's included in a comprehensive backup"
+          "id": "bk-info-section-elem-0",
+          "description": "Required element 0 for state Info Panel — What's Included",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "What's included in a comprehensive backup"
+            },
+            "label": "Required element for Info Panel — What's Included"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "API keys stored in the system keychain are not included"
+          "id": "bk-info-section-elem-1",
+          "description": "Required element 1 for state Info Panel — What's Included",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "API keys stored in the system keychain are not included"
+            },
+            "label": "Required element for Info Panel — What's Included"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "JSON format"
+          "id": "bk-info-section-elem-2",
+          "description": "Required element 2 for state Info Panel — What's Included",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "JSON format"
+            },
+            "label": "Required element for Info Panel — What's Included"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "A static info panel at the bottom of the page (light primary/5 background) lists what's included in a comprehensive backup: flows and flow executions, checkpoints, learning outcomes and patterns, settings and configurations, prompts and AI workflows, verification tests and scheduled tasks, saved API requests and task hooks. A footnote explicitly states that API keys stored in the system keychain are not included for security reasons, and that the backup file is in JSON format and can be inspected before importing.",
@@ -284,15 +886,57 @@
     {
       "id": "bk-data-model",
       "name": "Backup Data Model — Coverage and Correctness",
-      "requiredElements": [
+      "assertions": [
         {
-          "text": "Import Preview"
+          "id": "bk-data-model-elem-0",
+          "description": "Required element 0 for state Backup Data Model — Coverage and Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Import Preview"
+            },
+            "label": "Required element for Backup Data Model — Coverage and Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "Import Preview"
+          "id": "bk-data-model-elem-1",
+          "description": "Required element 1 for state Backup Data Model — Coverage and Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "Import Preview"
+            },
+            "label": "Required element for Backup Data Model — Coverage and Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         },
         {
-          "text": "API keys stored in the system keychain are not included"
+          "id": "bk-data-model-elem-2",
+          "description": "Required element 2 for state Backup Data Model — Coverage and Correctness",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "API keys stored in the system keychain are not included"
+            },
+            "label": "Required element for Backup Data Model — Coverage and Correctness"
+          },
+          "source": "migrated",
+          "reviewed": false,
+          "enabled": true
         }
       ],
       "description": "The backup format (version 2.0.0) is a single JSON object with a manifest and 13 category arrays. The manifest contains version (string starting with '2.'), created_at (ISO8601 timestamp), and app_version. The 13 categories cover all persistent user data in the runner database. API keys are explicitly excluded. A version '1.x' backup is accepted for import (backward compatible). Anything else is rejected as incompatible.",
