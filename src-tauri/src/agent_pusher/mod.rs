@@ -82,6 +82,13 @@ pub struct PushTarget {
     pub repo: String,
     pub branch: String,
     pub worktree_path: PathBuf,
+    /// Coordination Phase 5 / bottleneck Row 4 — the non-`heads`
+    /// remote ref to push to (`refs/agent/<m>-<a>`). The local side
+    /// stays `refs/heads/<branch>` (a normal checked-out branch); only
+    /// the origin side moves namespace so default `refs/heads/*`
+    /// fetches skip the ~10K agent refs.
+    #[serde(default)]
+    pub push_ref: String,
 }
 
 /// State shared between the pusher task and any caller that needs to
@@ -143,6 +150,11 @@ impl PusherState {
                 repo: w.repo.clone(),
                 branch: w.branch.clone(),
                 worktree_path: w.worktree_path.clone(),
+                push_ref: if w.push_ref.is_empty() {
+                    crate::agent_worktree::remote_agent_ref(&w.branch)
+                } else {
+                    w.push_ref.clone()
+                },
             })
             .collect();
         let origin_repo_alias = targets.first().map(|t| t.repo.clone()).unwrap_or_default();
@@ -368,10 +380,21 @@ struct RefreshResponseBody {
 /// date", and `Err` for actual failures.
 async fn push_one(state: &Arc<PusherState>, target: &PushTarget, token: &str) -> Result<bool> {
     let origin_url = build_origin_url(&state.coord_http_base, &target.repo, token)?;
+    // Coordination Phase 5 / Row 4: push the local branch
+    // (`refs/heads/<branch>` — a normal checked-out branch in the
+    // worktree) to the non-`heads` remote ref `refs/agent/<m>-<a>`.
+    // Defensive fallback if push_ref is somehow empty (older
+    // serialized PushTarget).
+    let push_ref = if target.push_ref.is_empty() {
+        crate::agent_worktree::remote_agent_ref(&target.branch)
+    } else {
+        target.push_ref.clone()
+    };
+    let refspec = format!("refs/heads/{}:{}", target.branch, push_ref);
     debug!(
-        "agent_pusher: pushing repo={} branch={} from {}",
+        "agent_pusher: pushing repo={} refspec={} from {}",
         target.repo,
-        target.branch,
+        refspec,
         target.worktree_path.display()
     );
     let out = Command::new("git")
@@ -381,7 +404,7 @@ async fn push_one(state: &Arc<PusherState>, target: &PushTarget, token: &str) ->
         .arg("--porcelain")
         .arg("--no-verify")
         .arg(&origin_url)
-        .arg(format!("{}:{}", target.branch, target.branch))
+        .arg(&refspec)
         .output()
         .await
         .with_context(|| format!("invoking git push for {}", target.branch))?;
@@ -488,6 +511,44 @@ mod tests {
     fn build_origin_url_rejects_non_http() {
         assert!(build_origin_url("ws://h:9870", "qontinui-coord", "x").is_err());
         assert!(build_origin_url("ftp://h", "r", "t").is_err());
+    }
+
+    #[test]
+    fn push_target_refspec_is_heads_to_agent_namespace() {
+        // Coordination Phase 5 / Row 4: local refs/heads/<branch>
+        // (a real checked-out branch) → remote refs/agent/<m>-<a>.
+        let t = PushTarget {
+            repo: "qontinui-coord".into(),
+            branch: "agent/m12-a34".into(),
+            worktree_path: PathBuf::from("/tmp/wt"),
+            push_ref: crate::agent_worktree::remote_agent_ref("agent/m12-a34"),
+        };
+        let effective = if t.push_ref.is_empty() {
+            crate::agent_worktree::remote_agent_ref(&t.branch)
+        } else {
+            t.push_ref.clone()
+        };
+        let refspec = format!("refs/heads/{}:{}", t.branch, effective);
+        assert_eq!(refspec, "refs/heads/agent/m12-a34:refs/agent/m12-a34");
+        let (src, dst) = refspec.split_once(':').unwrap();
+        assert!(src.starts_with("refs/heads/"));
+        assert!(dst.starts_with("refs/agent/") && !dst.starts_with("refs/heads/"));
+    }
+
+    #[test]
+    fn push_target_empty_push_ref_falls_back() {
+        let t = PushTarget {
+            repo: "qontinui-coord".into(),
+            branch: "agent/x-y".into(),
+            worktree_path: PathBuf::from("/tmp/wt"),
+            push_ref: String::new(), // pre-Phase-5 coord
+        };
+        let effective = if t.push_ref.is_empty() {
+            crate::agent_worktree::remote_agent_ref(&t.branch)
+        } else {
+            t.push_ref.clone()
+        };
+        assert_eq!(effective, "refs/agent/x-y");
     }
 
     #[test]
