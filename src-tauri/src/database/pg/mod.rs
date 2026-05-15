@@ -245,9 +245,7 @@ impl PgDb {
              $cr5$;",
         )
         .await
-        .map_err(|e| {
-            format!("CR-5 result_json text→jsonb self-heal failed: {}", e)
-        })?;
+        .map_err(|e| format!("CR-5 result_json text→jsonb self-heal failed: {}", e))?;
 
         // Plan 06 Step 3 (G.3): expression indexes for the workflow-verification dashboard hot paths. Each runs at every PgDb::new() boot — IF NOT EXISTS makes them no-ops after the first run.
         conn.batch_execute(

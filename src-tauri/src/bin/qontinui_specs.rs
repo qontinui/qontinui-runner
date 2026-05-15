@@ -38,7 +38,11 @@ use tokio_postgres::Client;
 // ============================================================================
 
 #[derive(Parser)]
-#[command(name = "qontinui-specs", version, about = "Spec-Check observability CLI")]
+#[command(
+    name = "qontinui-specs",
+    version,
+    about = "Spec-Check observability CLI"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -134,8 +138,7 @@ async fn main() -> ExitCode {
 /// names in the queries resolve to `project.*` first — same convention as the
 /// runner's `database/pg/mod.rs::new` pool post-create hook.
 async fn open_pg() -> Result<Client, String> {
-    let profile =
-        load_strict().map_err(|e| format!("active profile lacks database_url: {}", e))?;
+    let profile = load_strict().map_err(|e| format!("active profile lacks database_url: {}", e))?;
     let (client, conn) = tokio_postgres::connect(&profile.database_url, tokio_postgres::NoTls)
         .await
         .map_err(|e| format!("connect to PG failed: {}", e))?;
@@ -261,10 +264,7 @@ async fn run_coverage(client: &Client, args: &CoverageArgs) -> Result<(), String
             },
         );
         obj.insert("window_days".to_string(), json!(args.days));
-        obj.insert(
-            "min_observations".to_string(),
-            json!(args.min_observations),
-        );
+        obj.insert("min_observations".to_string(), json!(args.min_observations));
         obj.insert("backlog".to_string(), json!(backlog));
         println!(
             "{}",
@@ -784,10 +784,7 @@ async fn query_drift_event_count(
 async fn table_exists(client: &Client, schema: &str, name: &str) -> Result<bool, String> {
     let qualified = format!("{}.{}", schema, name);
     let row = client
-        .query_one(
-            "SELECT to_regclass($1::text) IS NOT NULL",
-            &[&qualified],
-        )
+        .query_one("SELECT to_regclass($1::text) IS NOT NULL", &[&qualified])
         .await
         .map_err(|e| format!("to_regclass({}) failed: {}", qualified, e))?;
     Ok(row.get(0))
