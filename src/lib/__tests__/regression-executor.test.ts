@@ -14,6 +14,8 @@ import type { IRDocument } from "@qontinui/shared-types/ui-bridge-ir";
 import type { QueryableElement, RegistryLike } from "@qontinui/ui-bridge-auto/runtime";
 import type { ScreenshotAssertionManager } from "@qontinui/ui-bridge-auto/visual";
 
+import { makeTestAssertion } from "../__test-helpers__/ir-fixtures";
+
 // ---------------------------------------------------------------------------
 // Tauri invoke mock — must be set up before importing the executor module.
 // ---------------------------------------------------------------------------
@@ -44,13 +46,13 @@ const FIXTURE_IR: IRDocument = {
     {
       id: "state-a",
       name: "State A",
-      requiredElements: [{ role: "button", text: "Submit" }],
+      assertions: [makeTestAssertion("state-a", 0, { role: "button", text: "Submit" })],
       provenance: { source: "build-plugin", file: "src/page-a.tsx" },
     },
     {
       id: "state-b",
       name: "State B",
-      requiredElements: [{ role: "heading", text: "Welcome" }],
+      assertions: [makeTestAssertion("state-b", 0, { role: "heading", text: "Welcome" })],
       provenance: { source: "build-plugin", file: "src/page-b.tsx" },
     },
   ],

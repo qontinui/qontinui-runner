@@ -1,5 +1,5 @@
 [workspace]
-members = ["src-tauri", "src-tauri/clorinde"]
+members = ["src-tauri", "src-tauri/clorinde", "crates/spec-check"]
 resolver = "2"
 
 # Workspace-level profile overrides. Cargo only honors [profile.*] in the

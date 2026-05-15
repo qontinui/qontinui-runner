@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Direct pre-commit hook (replaces broken pre_commit Python module)
+# Runs the same checks defined in .pre-commit-config.yaml
+
+set -e
+
+# Get list of staged files
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -z "$STAGED_FILES" ]; then
+  exit 0
+fi
+
+# Check if we have Rust or TypeScript files
+HAS_RUST=false
+HAS_TS=false
+HAS_FRONTEND_ANY=false
+STAGED_TS_FILES=""
+STAGED_PRETTIER_FILES=""
+
+for f in $STAGED_FILES; do
+  case "$f" in
+    *.rs)
+      HAS_RUST=true
+      ;;
+    *.ts|*.tsx|*.js|*.jsx)
+      HAS_TS=true
+      HAS_FRONTEND_ANY=true
+      STAGED_TS_FILES="$STAGED_TS_FILES $f"
+      STAGED_PRETTIER_FILES="$STAGED_PRETTIER_FILES $f"
+      ;;
+    *.json|*.css|*.md)
+      HAS_FRONTEND_ANY=true
+      STAGED_PRETTIER_FILES="$STAGED_PRETTIER_FILES $f"
+      ;;
+  esac
+done
+
+FAILED=false
+
+# --- Cargo clippy (Rust) ---
+if [ "$HAS_RUST" = true ]; then
+  echo "Running cargo clippy..."
+  if ! (cd src-tauri && cargo clippy -- -D warnings 2>&1); then
+    echo "Cargo clippy failed"
+    FAILED=true
+  fi
+fi
+
+# --- ESLint (staged TypeScript files only) ---
+if [ "$HAS_TS" = true ] && [ -n "$STAGED_TS_FILES" ]; then
+  echo "Running ESLint..."
+  if ! npx eslint $STAGED_TS_FILES --no-warn-ignored --max-warnings=-1 2>/dev/null; then
+    echo "ESLint failed"
+    FAILED=true
+  fi
+fi
+
+# --- TypeScript type check ---
+if [ "$HAS_TS" = true ]; then
+  echo "Running TypeScript check..."
+  if ! npx tsc --noEmit; then
+    echo "TypeScript check failed"
+    FAILED=true
+  fi
+fi
+
+# --- Block Claude attribution (precise trailer + signature patterns) ---
+# Scope to ADDED lines (^+) and require trailer-format syntax (`Co-Authored-By:`
+# with colon followed by whitespace) so descriptions that happen to mention both
+# words across paragraphs don't false-positive.
+if git diff --cached -- ':!examples/' \
+  | grep -qiE '^\+.*(co-authored-by:[[:space:]]+.*claude|co-authored-by:[[:space:]]+.*<noreply@anthropic|generated with \[claude|🤖 generated with \[claude)'; then
+  echo "ERROR: Claude/Anthropic attribution trailer detected in staged additions"
+  FAILED=true
+fi
+
+if [ "$FAILED" = true ]; then
+  echo ""
+  echo "Pre-commit checks failed. Fix the issues above and try again."
+  exit 1
+fi
+
+echo "All pre-commit checks passed."

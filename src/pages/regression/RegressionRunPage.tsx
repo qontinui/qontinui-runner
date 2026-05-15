@@ -39,12 +39,44 @@ const DEMO_IR: IRDocument = {
     {
       id: "state-root",
       name: "Root",
-      requiredElements: [{ tagName: "body" }],
+      assertions: [
+        {
+          id: "state-root-elem-0",
+          description: "Required element 0",
+          category: "element-presence",
+          severity: "critical",
+          assertionType: "exists",
+          target: {
+            type: "search",
+            criteria: { tagName: "body" } as Record<string, unknown>,
+            label: "Required element 0",
+          },
+          source: "demo-fixture",
+          reviewed: false,
+          enabled: true,
+        },
+      ],
     },
     {
       id: "state-with-button",
       name: "With Button",
-      requiredElements: [{ role: "button" }],
+      assertions: [
+        {
+          id: "state-with-button-elem-0",
+          description: "Required element 0",
+          category: "element-presence",
+          severity: "critical",
+          assertionType: "exists",
+          target: {
+            type: "search",
+            criteria: { role: "button" } as Record<string, unknown>,
+            label: "Required element 0",
+          },
+          source: "demo-fixture",
+          reviewed: false,
+          enabled: true,
+        },
+      ],
     },
   ],
   transitions: [

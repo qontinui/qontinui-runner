@@ -29,7 +29,7 @@ function makeIr(
     states: stateFiles.map((file, i) => ({
       id: `state-${i}`,
       name: `State ${i}`,
-      requiredElements: [],
+      assertions: [],
       ...(file !== undefined ? { provenance: { source: "build-plugin" as const, file } } : {}),
     })),
     transitions: transitionFiles.map((file, i) => ({

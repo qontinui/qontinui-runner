@@ -5,9 +5,9 @@
     "@monaco-editor/react": "^4.7.0",
     "@qontinui/design-tokens": "^1.0.0",
     "@qontinui/navigation": "^0.1.0",
-    "@qontinui/shared-types": "^0.2.5",
+    "@qontinui/shared-types": "^0.3.0",
     "@qontinui/ui-bridge": "^0.8.0",
-    "@qontinui/ui-bridge-auto": "^0.1.5",
+    "@qontinui/ui-bridge-auto": "^0.1.6",
     "@qontinui/workflow-ui": "^0.1.0",
     "@qontinui/workflow-utils": "^0.1.0",
     "@radix-ui/react-dialog": "^1.1.15",
@@ -123,5 +123,10 @@
     "typecheck": "tsc --noEmit"
   },
   "type": "module",
-  "version": "1.0.0-beta.1"
+  "version": "1.0.0-beta.1",
+  "pnpm": {
+    "overrides": {
+      "@qontinui/shared-types": "^0.3.0"
+    }
+  }
 }
