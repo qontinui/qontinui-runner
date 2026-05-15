@@ -134,11 +134,13 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            src-tauri/target/
+            target/
           key: ${{ runner.os }}-repro-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      # First build: full compile (cold cache) or relink (warm cache).
-      # Either way, produces target/release/mock_claude_cli{,.exe}.
+      # qontinui-runner/Cargo.toml is the workspace root with src-tauri/
+      # as a member, so cargo invoked from src-tauri/ resolves the
+      # workspace upward and outputs to <workspace_root>/target/, NOT
+      # src-tauri/target/. All subsequent steps reference $GITHUB_WORKSPACE/target.
       - name: Build #1
         env:
           CARGO_BUILD_JOBS: 1
@@ -150,15 +152,14 @@ jobs:
       - name: Hash build #1 artifact
         id: hash1
         run: |
-          cd src-tauri
           if [ "$RUNNER_OS" = "Windows" ]; then
-            EXE=target/release/mock_claude_cli.exe
+            EXE="$GITHUB_WORKSPACE/target/release/mock_claude_cli.exe"
           else
-            EXE=target/release/mock_claude_cli
+            EXE="$GITHUB_WORKSPACE/target/release/mock_claude_cli"
           fi
           if [ ! -f "$EXE" ]; then
             echo "FAIL: expected artifact at $EXE not found"
-            ls -la target/release/ | head -30
+            ls -la "$GITHUB_WORKSPACE/target/release/" | head -30 || true
             exit 1
           fi
           HASH=$(sha256sum "$EXE" | awk '{print $1}')
@@ -190,11 +191,10 @@ jobs:
 
       - name: Hash build #2 artifact and compare
         run: |
-          cd src-tauri
           if [ "$RUNNER_OS" = "Windows" ]; then
-            EXE=target/release/mock_claude_cli.exe
+            EXE="$GITHUB_WORKSPACE/target/release/mock_claude_cli.exe"
           else
-            EXE=target/release/mock_claude_cli
+            EXE="$GITHUB_WORKSPACE/target/release/mock_claude_cli"
           fi
           HASH2=$(sha256sum "$EXE" | awk '{print $1}')
           HASH1='${{ steps.hash1.outputs.hash1 }}'
