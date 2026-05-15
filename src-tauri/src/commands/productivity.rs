@@ -1636,7 +1636,10 @@ fn coord_http_base_for_fleet() -> String {
             return v;
         }
     }
-    if let Some(ws) = crate::profiles::load().coord_url.as_deref() {
+    // `qontinui_runner_lib::profiles` (not `crate::profiles`) — same
+    // proven path as mcp::agent_worktrees::coord_http_base; `crate::`
+    // doesn't resolve `profiles` from this lib compilation unit.
+    if let Some(ws) = qontinui_runner_lib::profiles::load().coord_url.as_deref() {
         return crate::agent_worktree::coord_ws_to_http(ws);
     }
     "http://localhost:9870".to_string()
