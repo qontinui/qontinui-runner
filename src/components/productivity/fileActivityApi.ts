@@ -161,6 +161,134 @@ export async function fetchLockInfo(
   return (await resp.json()) as FileLockInfoEntry[];
 }
 
+// ---------------------------------------------------------------------------
+// Coordination Phase 6 (§4.8) — live-state heatmap.
+//
+// Replaces the `coord.session_touched_files`-derived data above with
+// the *real working-tree state* of each agent's worktree: coord caches
+// per-agent `git status` (key `agent:<id>:dirty`, 30s TTL) and fans it
+// out on `events.worktree.dirty.*`. The runner proxies coord's Redis
+// snapshot at `GET /file-activity/heatmap-live`. Properties the legacy
+// signal lacked (`proj_arch_coord_session_touched_files_signal`): reads
+// never appear, deletes/renames count, in-flight stash is visible.
+//
+// The legacy `fetchHeatmap` + its types stay exported — Phase 6 is the
+// pivot, not the deletion (Phase 7 removes them).
+// ---------------------------------------------------------------------------
+
+/** One agent currently modifying a `(repo, file)` cell. */
+export interface LiveAgentTouch {
+  agent_id: string;
+  machine_id: string;
+  branch: string;
+  /** Raw `git status --porcelain` code: `M`, `D`, `??`, `R`, ... */
+  status: string;
+}
+
+/** One heatmap cell: a `(repo, file)` and every agent on it. */
+export interface LiveHeatCell {
+  repo: string;
+  file: string;
+  agents: LiveAgentTouch[];
+}
+
+export interface LiveDirtyHeatmapResponse {
+  /** Per-agent raw snapshots (cold-start fallback / drill-down). */
+  agents: unknown[];
+  heatmap: LiveHeatCell[];
+  count: number;
+  /** True when coord was unreachable — keep last good, age the panel. */
+  degraded?: boolean;
+  error?: string;
+}
+
+export async function fetchLiveHeatmap(
+  signal?: AbortSignal,
+): Promise<LiveDirtyHeatmapResponse> {
+  const url = `http://127.0.0.1:${resolvePort()}/file-activity/heatmap-live`;
+  const resp = await fetch(url, { signal });
+  if (!resp.ok) {
+    throw new Error(`live heatmap fetch failed: HTTP ${resp.status}`);
+  }
+  const body = (await resp.json()) as LiveDirtyHeatmapResponse;
+  return {
+    agents: Array.isArray(body.agents) ? body.agents : [],
+    heatmap: Array.isArray(body.heatmap) ? body.heatmap : [],
+    count: typeof body.count === "number" ? body.count : 0,
+    degraded: body.degraded === true,
+    error: body.error,
+  };
+}
+
+export interface UseLiveDirtyHeatmapResult {
+  data: LiveDirtyHeatmapResponse | null;
+  error: string | null;
+  /** Fetch failed/slow OR coord reported `degraded`. */
+  isStale: boolean;
+  refresh: () => void;
+}
+
+/**
+ * Visibility-gated 5s poll of the live dirty-state heatmap. Same
+ * "keep last good snapshot, never flip to a loading state" contract
+ * as {@link useFileActivity}; additionally treats coord's `degraded`
+ * flag as stale so a coord outage ages the panel rather than blanking
+ * it.
+ */
+export function useLiveDirtyHeatmap(
+  enabled = true,
+  pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+): UseLiveDirtyHeatmapResult {
+  const [data, setData] = useState<LiveDirtyHeatmapResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isStale, setIsStale] = useState<boolean>(false);
+  const [tick, setTick] = useState<number>(0);
+  const [visible, setVisible] = useState<boolean>(
+    typeof document === "undefined" || document.visibilityState === "visible",
+  );
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVis = () => setVisible(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
+  useEffect(() => {
+    if (!enabled || !visible) return;
+    let cancelled = false;
+    const ac = new AbortController();
+    const poll = async () => {
+      const start = performance.now();
+      try {
+        const v = await fetchLiveHeatmap(ac.signal);
+        if (cancelled || ac.signal.aborted) return;
+        const elapsed = performance.now() - start;
+        setData(v);
+        setError(v.error ?? null);
+        setIsStale(v.degraded === true || elapsed > SLOW_FETCH_THRESHOLD_MS);
+      } catch (e) {
+        if (cancelled || ac.signal.aborted) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setIsStale(true); // keep prior `data` — Phase 3 contract
+      }
+    };
+    poll();
+    const id = window.setInterval(poll, pollIntervalMs);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      ac.abort();
+    };
+  }, [enabled, visible, pollIntervalMs, tick]);
+
+  const refresh = useCallback(() => setTick((t) => t + 1), []);
+  return useMemo(
+    () => ({ data, error, isStale, refresh }),
+    [data, error, isStale, refresh],
+  );
+}
+
 export interface UseFileActivityResult {
   data: HeatmapResponse | null;
   /** Companion snapshot of currently-held exclusive locks, fetched on

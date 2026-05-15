@@ -432,6 +432,76 @@ async fn get_heatmap(
     }))
 }
 
+/// GET /file-activity/heatmap-live
+///
+/// Coordination Phase 6 (§4.8) — the live-state replacement for
+/// `/file-activity/heatmap`. Proxies coord's
+/// `GET /coord/worktree-dirty?heatmap=true` (the Redis snapshot of
+/// per-agent `git status`, fed by the `events.worktree.dirty.*`
+/// dual-publish) and passes the `{ agents, heatmap, count,
+/// generated_at }` body through verbatim. The frontend's
+/// `useLiveDirtyHeatmap` hook polls this on the same 5s cadence the
+/// legacy heatmap used.
+///
+/// Why a runner-side proxy rather than the dashboard subscribing to
+/// coord directly: bottleneck-tracker Row 6 — one aggregation point
+/// per machine's dashboard instead of every dashboard joining the
+/// full fleet fanout. Fail-soft: coord unreachable → 200 with empty
+/// lists + `degraded: true` so the panel ages gracefully instead of
+/// erroring (same "keep last good, don't flip to loading" contract
+/// as the legacy heatmap).
+///
+/// Phase 6 is the *pivot*: `/file-activity/heatmap` (above) and its
+/// `coord.session_touched_files` substrate stay live until Phase 7's
+/// deletion sweep.
+async fn get_heatmap_live(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let base = match crate::mcp::agent_worktrees::coord_http_base() {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Json(serde_json::json!({
+                "agents": [],
+                "heatmap": [],
+                "count": 0,
+                "degraded": true,
+                "error": format!("coord URL not configured: {e}"),
+            })));
+        }
+    };
+    let url = format!(
+        "{}/coord/worktree-dirty?heatmap=true",
+        base.trim_end_matches('/')
+    );
+    match reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("degraded".into(), serde_json::Value::Bool(false));
+                }
+                Ok(Json(v))
+            }
+            Err(e) => Ok(Json(serde_json::json!({
+                "agents": [], "heatmap": [], "count": 0,
+                "degraded": true, "error": format!("decode: {e}"),
+            }))),
+        },
+        Ok(resp) => Ok(Json(serde_json::json!({
+            "agents": [], "heatmap": [], "count": 0,
+            "degraded": true, "error": format!("coord HTTP {}", resp.status()),
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "agents": [], "heatmap": [], "count": 0,
+            "degraded": true, "error": format!("coord unreachable: {e}"),
+        }))),
+    }
+}
+
 /// GET /file-locks/info
 ///
 /// Get a snapshot of all currently held exclusive file locks.
@@ -1078,6 +1148,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/file-locks/yield-request", post(request_yield))
         .route("/file-locks/signal-long-wait", post(signal_long_wait))
         .route("/file-activity/heatmap", get(get_heatmap))
+        // Coordination Phase 6 — live-state heatmap (§4.8). The legacy
+        // route above stays live until Phase 7's deletion sweep.
+        .route("/file-activity/heatmap-live", get(get_heatmap_live))
 }
 
 // =============================================================================
