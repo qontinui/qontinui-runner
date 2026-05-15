@@ -677,24 +677,13 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/invoke/{}"),
             ("POST", "/ui-bridge/pong"),
             ("POST", "/ui-bridge/ipc-response"),
-            ("POST", "/ui-bridge/vision/mutation-occurred"),
-            ("POST", "/ui-bridge/vision/extract"),
-            ("POST", "/ui-bridge/vision/describe"),
-            ("POST", "/ui-bridge/vision/analyze"),
-            ("POST", "/ui-bridge/vision/assert"),
-            ("POST", "/ui-bridge/vision/baseline"),
-            ("GET", "/ui-bridge/vision/baselines"),
-            // Vision-family runner-only IPC routes — main's #134/#135/#136
-            // (vision-pipeline Phase 3.3/4/6.3) added these on the runner side
-            // but the SDK at ^0.7.0 doesn't declare them. Cache/health are
-            // diagnostic; annotate/capture/diff/raw are internal capture-path
-            // helpers consumed by the runner's own vision subsystem.
-            ("GET", "/ui-bridge/vision/cache/{}"),
-            ("GET", "/ui-bridge/vision/health"),
-            ("POST", "/ui-bridge/vision/annotate"),
-            ("POST", "/ui-bridge/vision/capture"),
-            ("POST", "/ui-bridge/vision/diff"),
-            ("POST", "/ui-bridge/vision/raw"),
+            // NOTE: vision/* routes are intentionally NOT in any baseline.
+            // ui-bridge@^0.8.0 SDK declares all 13 vision routes AND main's
+            // #134/#135/#136 (vision-pipeline Phase 3.3/4/6.3) exposes them
+            // runner-side. They're aligned on both sides — no allow-list
+            // entry needed. (Earlier commits placed them in sdk_only_baseline
+            // then runner_only_baseline; both were wrong polarity once the
+            // ^0.8.0 bump landed the SDK declarations.)
             ("POST", "/ui-bridge/batch"),
             ("POST", "/ui-bridge/control/batch"),
             ("POST", "/ui-bridge/render-log"),
