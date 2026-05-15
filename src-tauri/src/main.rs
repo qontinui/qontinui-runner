@@ -43,6 +43,7 @@ mod database;
 mod debug_lifecycle;
 mod demo_workflows;
 mod dev_services;
+mod dirty_poller;
 mod discoveries;
 mod display;
 mod doctor;

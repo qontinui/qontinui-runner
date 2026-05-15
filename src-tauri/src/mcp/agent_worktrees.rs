@@ -127,6 +127,24 @@ pub async fn post_allocate_local(
                 result.agent_id,
                 result.worktrees.len()
             );
+            // Coordination Phase 6 — spawn the per-worktree live-state
+            // poller for this agent (5s `git status` → coord
+            // dirty-state). No-op when the allocation carried no JWT
+            // (dev fallback, coord JWT keys unconfigured) — the
+            // dirty-state endpoint is JWT-gated, so there's nothing to
+            // push without a token. Best-effort: a missing poller
+            // degrades the heatmap, never correctness.
+            match crate::dirty_poller::DirtyPollerState::from_allocate_result(
+                &result,
+                coord_http_base.clone(),
+                machine_id,
+            ) {
+                Some(st) => crate::dirty_poller::spawn_and_register(std::sync::Arc::new(st)),
+                None => info!(
+                    "/agents/allocate-local: dirty_poller skipped for agent_id={} (no token)",
+                    result.agent_id
+                ),
+            }
             Ok(Json(ApiResponse::success(json!({
                 "agent_id": result.agent_id,
                 "worktrees": result.worktrees.iter().map(|w| json!({
@@ -161,7 +179,7 @@ fn read_machine_id() -> Result<uuid::Uuid, String> {
     uuid::Uuid::parse_str(id_str).map_err(|e| format!("invalid UUID: {}", e))
 }
 
-fn coord_http_base() -> Result<String, String> {
+pub(crate) fn coord_http_base() -> Result<String, String> {
     // Source-of-truth chain: env `COORD_HTTP_URL` → profile `coord_url`
     // (ws→http) → default `http://localhost:9870`.
     if let Ok(v) = std::env::var("COORD_HTTP_URL") {
