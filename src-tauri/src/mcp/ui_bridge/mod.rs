@@ -684,6 +684,17 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/vision/assert"),
             ("POST", "/ui-bridge/vision/baseline"),
             ("GET", "/ui-bridge/vision/baselines"),
+            // Vision-family runner-only IPC routes — main's #134/#135/#136
+            // (vision-pipeline Phase 3.3/4/6.3) added these on the runner side
+            // but the SDK at ^0.7.0 doesn't declare them. Cache/health are
+            // diagnostic; annotate/capture/diff/raw are internal capture-path
+            // helpers consumed by the runner's own vision subsystem.
+            ("GET", "/ui-bridge/vision/cache/{}"),
+            ("GET", "/ui-bridge/vision/health"),
+            ("POST", "/ui-bridge/vision/annotate"),
+            ("POST", "/ui-bridge/vision/capture"),
+            ("POST", "/ui-bridge/vision/diff"),
+            ("POST", "/ui-bridge/vision/raw"),
             ("POST", "/ui-bridge/batch"),
             ("POST", "/ui-bridge/control/batch"),
             ("POST", "/ui-bridge/render-log"),
@@ -860,17 +871,6 @@ mod manifest_drift_tests {
             // Real subsystem (CLI subprocess orchestration), not a handler;
             // tracked separately.
             ("POST", "/ui-bridge/control/sdk/spawn-headless"),
-            // Vision-family routes — declared by @qontinui/ui-bridge@^0.6.0
-            // SDK but not yet implemented on the runner. Each requires a new
-            // handler module (vision capture, annotation, diff, raw bytes,
-            // cache, health). Tracked for follow-up implementation; until
-            // then, the SDK declarations are aspirational shape contracts.
-            ("GET", "/ui-bridge/vision/cache/{}"),
-            ("GET", "/ui-bridge/vision/health"),
-            ("POST", "/ui-bridge/vision/annotate"),
-            ("POST", "/ui-bridge/vision/capture"),
-            ("POST", "/ui-bridge/vision/diff"),
-            ("POST", "/ui-bridge/vision/raw"),
         ]
         .into_iter()
         .collect();
