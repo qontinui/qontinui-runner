@@ -37,6 +37,8 @@ import {
   loadStoredWindowSecs,
   storeWindowSecs,
   useFileActivity,
+  useLiveDirtyHeatmap,
+  type LiveHeatCell,
   type FileLockInfoEntry,
   type FileRegistryInfoEntry,
   type HotFileRow,
@@ -500,11 +502,64 @@ export interface FileActivityPanelProps {
   onJumpToHolder?: (holderName: string) => void;
 }
 
+/**
+ * Coordination Phase 6 (§4.8) — the live-state heatmap. Renders
+ * `(repo, file) → agents-currently-modifying` from real `git status`
+ * working-tree state (coord's `events.worktree.dirty.*` snapshot),
+ * not the lossy `coord.session_touched_files` tool-intercept signal.
+ * Deletes/renames count; reads never appear; in-flight stash shows.
+ */
+function LiveDirtyHeatmapSection({ cells }: { cells: LiveHeatCell[] }) {
+  if (cells.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground italic">
+        No agents with dirty worktrees right now.
+      </p>
+    );
+  }
+  // Hot cells first (most agents contending), then repo/file.
+  const sorted = [...cells].sort(
+    (a, b) =>
+      b.agents.length - a.agents.length ||
+      a.repo.localeCompare(b.repo) ||
+      a.file.localeCompare(b.file),
+  );
+  return (
+    <ul className="flex flex-col gap-0.5" data-ui-bridge-id="productivity.file-activity-live-heatmap-list">
+      {sorted.map((c) => (
+        <li
+          key={`${c.repo}:${c.file}`}
+          className="flex items-center justify-between gap-2 text-xs"
+        >
+          <span className="truncate font-mono" title={`${c.repo}/${c.file}`}>
+            <span className="text-muted-foreground">{c.repo}/</span>
+            {c.file}
+          </span>
+          <span className="flex items-center gap-1 shrink-0">
+            {c.agents.length > 1 && (
+              <Flame className="w-3 h-3 text-orange-500" />
+            )}
+            <span className="text-muted-foreground">
+              {c.agents.length} agent{c.agents.length === 1 ? "" : "s"}
+            </span>
+            <span className="font-mono text-[10px] text-muted-foreground">
+              [{[...new Set(c.agents.map((a) => a.status))].sort().join(",")}]
+            </span>
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function FileActivityPanel({
   initialDataForTest,
   initialLockInfoForTest,
   onJumpToHolder,
 }: FileActivityPanelProps) {
+  // Phase 6 live heatmap — the primary file-activity surface. Disabled
+  // under the test seam (deterministic snapshot rendering).
+  const liveHeatmap = useLiveDirtyHeatmap(initialDataForTest == null);
   const [windowSecs, setWindowSecsState] = useState<number>(() =>
     initialDataForTest ? DEFAULT_WINDOW_SECS : loadStoredWindowSecs(),
   );
@@ -554,6 +609,29 @@ export function FileActivityPanel({
       />
 
       <div className="flex flex-col gap-3">
+        {/* Phase 6 primary surface: live `git status` heatmap. */}
+        <section
+          aria-label="Live worktree heatmap"
+          data-ui-bridge-id="productivity.file-activity-live-heatmap-section"
+        >
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">
+            <Flame className="w-3 h-3" />
+            Live worktree heatmap
+            {liveHeatmap.isStale && (
+              <span title={liveHeatmap.error ?? "coord degraded — showing last good"}>
+                <Clock className="w-3 h-3 text-amber-500" />
+              </span>
+            )}
+          </div>
+          <LiveDirtyHeatmapSection cells={liveHeatmap.data?.heatmap ?? []} />
+        </section>
+
+        {/* Legacy `coord.session_touched_files` sections below — kept
+            live during the Phase 6 pivot; Phase 7 removes them. */}
+        <p className="text-[10px] text-muted-foreground italic">
+          Legacy session-touched-files view (deprecated — Phase 7 removes;
+          misses reads-vs-edits, deletes, and renames):
+        </p>
         <section
           aria-label="Live file holdings"
           data-ui-bridge-id="productivity.file-activity-live-section"
