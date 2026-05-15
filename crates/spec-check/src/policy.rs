@@ -34,6 +34,15 @@ struct ScopedAssertion<'a> {
 /// if any conjunct is indeterminate and none failed; otherwise pass. An
 /// empty `policy.conjuncts` vector vacuously passes — this is the
 /// `observation_only()` factory's intended behavior.
+#[tracing::instrument(
+    name = "spec_check.policy_evaluate",
+    skip(result, policy),
+    fields(
+        snapshot_id = %result.snapshot_id,
+        overall_status = tracing::field::Empty,
+        conjunct_count = policy.conjuncts.len(),
+    ),
+)]
 pub fn apply_policy(result: &SpecCheckResult, policy: &SpecCheckPolicy) -> PolicyEvaluation {
     let conjunct_results: Vec<ConjunctEvaluation> = policy
         .conjuncts
@@ -63,10 +72,17 @@ pub fn apply_policy(result: &SpecCheckResult, policy: &SpecCheckPolicy) -> Polic
         PolicyStatus::Pass
     };
 
-    PolicyEvaluation {
+    let evaluation = PolicyEvaluation {
         overall_status,
         conjunct_results,
-    }
+    };
+
+    tracing::Span::current().record(
+        "overall_status",
+        tracing::field::debug(&evaluation.overall_status),
+    );
+
+    evaluation
 }
 
 /// Apply the four AND-combined scope filters to every assertion in the

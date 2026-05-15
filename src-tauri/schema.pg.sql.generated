@@ -10472,6 +10472,21 @@ CREATE TABLE project.workflow_verification_phase_results (
 
 
 --
+-- Name: proposal_events; Type: TABLE; Schema: project; Owner: -
+--
+
+CREATE TABLE project.proposal_events (
+    id text NOT NULL,
+    proposal_id text NOT NULL,
+    event_type text NOT NULL,
+    snapshot_id text,
+    failing_assertion_id text,
+    at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT proposal_events_type_chk CHECK ((event_type = ANY (ARRAY['scanned'::text, 'executed'::text, 'promoted'::text, 'demoted'::text, 'failed'::text])))
+);
+
+
+--
 -- Name: workflow_versions; Type: TABLE; Schema: project; Owner: -
 --
 
@@ -14314,6 +14329,14 @@ ALTER TABLE ONLY project.workflow_variables
 
 ALTER TABLE ONLY project.workflow_verification_phase_results
     ADD CONSTRAINT workflow_verification_phase_results_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: proposal_events proposal_events_pkey; Type: CONSTRAINT; Schema: project; Owner: -
+--
+
+ALTER TABLE ONLY project.proposal_events
+    ADD CONSTRAINT proposal_events_pkey PRIMARY KEY (id);
 
 
 --
@@ -18525,6 +18548,62 @@ CREATE INDEX idx_wf_ver_phase_task_run ON project.workflow_verification_phase_re
 --
 
 CREATE UNIQUE INDEX idx_wf_ver_phase_unique ON project.workflow_verification_phase_results USING btree (task_run_id, iteration);
+
+
+--
+-- Name: idx_wf_ver_phase_match_outcome; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX idx_wf_ver_phase_match_outcome ON project.workflow_verification_phase_results USING btree (((result_json->'summary'->>'match_outcome')));
+
+
+--
+-- Name: idx_wf_ver_phase_overall_match_rate; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX idx_wf_ver_phase_overall_match_rate ON project.workflow_verification_phase_results USING btree ((((result_json->'summary'->>'overall_match_rate'))::double precision));
+
+
+--
+-- Name: idx_wf_ver_phase_spec_version; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX idx_wf_ver_phase_spec_version ON project.workflow_verification_phase_results USING btree (((result_json->>'spec_version')));
+
+
+--
+-- Name: idx_wf_ver_phase_recommendation_reason; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX idx_wf_ver_phase_recommendation_reason ON project.workflow_verification_phase_results USING btree (((result_json->'recommendation_recommended_state'->>'recommendation_reason')));
+
+
+--
+-- Name: idx_wf_ver_phase_snapshot_id; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX idx_wf_ver_phase_snapshot_id ON project.workflow_verification_phase_results USING btree (((result_json->>'snapshot_id')));
+
+
+--
+-- Name: idx_wf_ver_phase_severity_gin; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX idx_wf_ver_phase_severity_gin ON project.workflow_verification_phase_results USING gin (((result_json->'summary'->'assertions_failed_by_severity')));
+
+
+--
+-- Name: proposal_events_proposal_at_idx; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX proposal_events_proposal_at_idx ON project.proposal_events USING btree (proposal_id, at);
+
+
+--
+-- Name: proposal_events_type_at_idx; Type: INDEX; Schema: project; Owner: -
+--
+
+CREATE INDEX proposal_events_type_at_idx ON project.proposal_events USING btree (event_type, at);
 
 
 --

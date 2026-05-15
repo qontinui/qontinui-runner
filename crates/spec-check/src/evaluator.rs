@@ -14,6 +14,7 @@
 //! no Tauri types.
 
 use std::cmp::Ordering;
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -55,22 +56,61 @@ const SENTINEL_APP_ID: &str = "internal-evaluator";
 /// Single-spec evaluation. Builds the [`IndexedSnapshot`] once and forces
 /// the [`crate::diff::SelectivityIndex`] init on the main thread before any
 /// rayon fan-out (so worker threads never race on the OnceCell).
+#[tracing::instrument(
+    name = "spec_check.evaluate",
+    skip(snapshot, spec),
+    fields(
+        page_id = %spec.id,
+        snapshot_id = tracing::field::Empty,
+        spec_version = %spec.version,
+        match_outcome = tracing::field::Empty,
+        evaluation_duration_ms = tracing::field::Empty,
+    ),
+)]
 pub fn evaluate(snapshot: &UIBridgeSnapshot, spec: &IrPageSpec) -> SpecCheckResult {
+    let started = Instant::now();
     let indexed = IndexedSnapshot::new(snapshot);
     let _ = indexed.selectivity();
-    evaluate_with_indexed(&indexed, spec)
+    let result = evaluate_with_indexed(&indexed, spec);
+    let span = tracing::Span::current();
+    span.record("snapshot_id", tracing::field::display(&result.snapshot_id));
+    span.record(
+        "match_outcome",
+        tracing::field::debug(&result.summary.match_outcome),
+    );
+    span.record(
+        "evaluation_duration_ms",
+        started.elapsed().as_millis() as u64,
+    );
+    result
 }
 
 /// Multi-spec evaluation against a single snapshot. Builds [`IndexedSnapshot`]
 /// once — shared read-only across all specs — then fan-outs across `specs`
 /// via rayon. Load-bearing for the §5.14 batch endpoint.
+#[tracing::instrument(
+    name = "spec_check.evaluate_batch",
+    skip(snapshot, specs),
+    fields(
+        page_count = specs.len(),
+        snapshot_id = tracing::field::Empty,
+        total_duration_ms = tracing::field::Empty,
+    ),
+)]
 pub fn evaluate_batch(snapshot: &UIBridgeSnapshot, specs: &[IrPageSpec]) -> Vec<SpecCheckResult> {
+    let started = Instant::now();
     let indexed = IndexedSnapshot::new(snapshot);
     let _ = indexed.selectivity();
-    specs
+    let results: Vec<SpecCheckResult> = specs
         .par_iter()
         .map(|spec| evaluate_with_indexed(&indexed, spec))
-        .collect()
+        .collect();
+    let span = tracing::Span::current();
+    if let Some(first) = results.first() {
+        span.record("snapshot_id", tracing::field::display(&first.snapshot_id));
+    }
+    span.record("total_duration_ms", started.elapsed().as_millis() as u64);
+    results
 }
 
 // ===========================================================================

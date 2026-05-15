@@ -36,10 +36,10 @@ pub fn export_all_schemas() -> Value {
         accessibility as qa, ai_workflows as qaw, app_events as qae, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn, geometry as qg,
         ir as qir, mcp_config as qmc, orchestration_config as qoc, process_management as qpm,
-        rag as qr, runner as qrn, scheduler as qs, spec_check as qsc, state_machine as qsm,
-        targets as qt, task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
-        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
-        workflow_step as qws,
+        rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
+        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm, ticket_system as qts,
+        tree_events as qte, ui_bridge as qub, verification as qv, worker_output as qwo,
+        workflow as qw, workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -672,6 +672,9 @@ pub fn export_all_schemas() -> Value {
     add!("PolicyEvaluation", qsc::PolicyEvaluation);
     add!("ConjunctEvaluation", qsc::ConjunctEvaluation);
     add!("PolicyStatus", qsc::PolicyStatus);
+
+    // ── qontinui-types: spec_api_events (Plan 06 broadcast taxonomy) ──
+    add!("SpecApiEvent", qsae::SpecApiEvent);
 
     // ── qontinui-types: ui_bridge ──
     add!("ElementBbox", qub::ElementBbox);

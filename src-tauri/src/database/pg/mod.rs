@@ -59,6 +59,7 @@ pub mod process_sessions;
 pub mod productivity_knowledge;
 pub mod prompt_evolution;
 pub mod prompt_registry;
+pub mod proposal_events;
 pub mod q_routing;
 pub mod queued_workflows;
 pub mod reasoning_traces;
@@ -212,6 +213,120 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("Failed to bootstrap runner schema/extension: {}", e))?;
+
+        // CR-5 (Plan 03): convert `project.workflow_verification_phase_results
+        // .result_json` from `text` to `jsonb` so design-context §5.16's
+        // indexable JSONB-path expressions work and Plan 06's JSONB indexes
+        // have a valid target. Idempotent: the `USING` cast is a no-op if the
+        // column is already jsonb, and the whole statement is skipped when the
+        // column type is already `jsonb` (re-running `ALTER COLUMN … TYPE
+        // jsonb` against a jsonb column is itself a no-op but the explicit
+        // guard avoids the rewrite cost on every runner start). The table is
+        // alembic-owned (qontinui-web); this runner-side self-heal applies the
+        // change on the next user-controlled runner startup without an
+        // out-of-band `ALTER TABLE` against the live DB. The alembic chain
+        // and `schema.pg.sql.generated` carry the same `jsonb` shape so the
+        // CI schema-fresh / clorinde-fresh gates agree with this runtime
+        // contract.
+        conn.batch_execute(
+            "DO $cr5$ \
+             BEGIN \
+               IF EXISTS ( \
+                 SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'project' \
+                   AND table_name = 'workflow_verification_phase_results' \
+                   AND column_name = 'result_json' \
+                   AND data_type <> 'jsonb' \
+               ) THEN \
+                 ALTER TABLE project.workflow_verification_phase_results \
+                   ALTER COLUMN result_json TYPE jsonb USING result_json::jsonb; \
+               END IF; \
+             END \
+             $cr5$;",
+        )
+        .await
+        .map_err(|e| {
+            format!("CR-5 result_json text→jsonb self-heal failed: {}", e)
+        })?;
+
+        // Plan 06 Step 3 (G.3): expression indexes for the workflow-verification dashboard hot paths. Each runs at every PgDb::new() boot — IF NOT EXISTS makes them no-ops after the first run.
+        conn.batch_execute(
+            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_match_outcome \
+                 ON project.workflow_verification_phase_results \
+                 ((result_json->'summary'->>'match_outcome'));",
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Plan 06 Step 3 idx_wf_ver_phase_match_outcome create failed: {}",
+                e
+            )
+        })?;
+
+        conn.batch_execute(
+            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_overall_match_rate \
+                 ON project.workflow_verification_phase_results \
+                 (((result_json->'summary'->>'overall_match_rate')::float));",
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Plan 06 Step 3 idx_wf_ver_phase_overall_match_rate create failed: {}",
+                e
+            )
+        })?;
+
+        conn.batch_execute(
+            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_spec_version \
+                 ON project.workflow_verification_phase_results \
+                 ((result_json->>'spec_version'));",
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Plan 06 Step 3 idx_wf_ver_phase_spec_version create failed: {}",
+                e
+            )
+        })?;
+
+        conn.batch_execute(
+            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_recommendation_reason \
+                 ON project.workflow_verification_phase_results \
+                 ((result_json->'recommendation_recommended_state'->>'recommendation_reason'));",
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Plan 06 Step 3 idx_wf_ver_phase_recommendation_reason create failed: {}",
+                e
+            )
+        })?;
+
+        conn.batch_execute(
+            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_snapshot_id \
+                 ON project.workflow_verification_phase_results \
+                 ((result_json->>'snapshot_id'));",
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Plan 06 Step 3 idx_wf_ver_phase_snapshot_id create failed: {}",
+                e
+            )
+        })?;
+
+        conn.batch_execute(
+            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_severity_gin \
+                 ON project.workflow_verification_phase_results \
+                 USING GIN ((result_json->'summary'->'assertions_failed_by_severity'));",
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Plan 06 Step 3 idx_wf_ver_phase_severity_gin create failed: {}",
+                e
+            )
+        })?;
 
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 
