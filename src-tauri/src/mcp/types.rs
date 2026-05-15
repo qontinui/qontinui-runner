@@ -258,6 +258,10 @@ pub struct ApiState {
     /// `GET /git-supervision/recent-events` for diagnostics and via the
     /// `git-supervision` Tauri event channel for the frontend hook.
     pub supervision_state: crate::git_supervision::SupervisionState,
+    /// D4+D6 Blind-Spot Recommender (Phase 2) — read-through facade over
+    /// the per-sub-space observer surfaces (SDK connections, file/git
+    /// watchers). Holds clones of the same shared Arcs `ApiState` holds.
+    pub observer_registry: crate::observer_registry::ObserverRegistry,
     /// Phase 3 vision pipeline: content-addressed disk cache for encoded
     /// capture bytes. Key = SHA-256 of (window_handle, scale, mutation_id,
     /// pipeline_hash); value = the verified bytes from `Pipeline::run`.

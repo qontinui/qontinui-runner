@@ -56,6 +56,7 @@ import {
 } from "./reviewsApi";
 import { acknowledgeAdvisory } from "./reflectionApi";
 import { PlanRecommendations } from "./PlanRecommendations";
+import { BlindSpotsPanel } from "./BlindSpotsPanel";
 import { WorkersPanel } from "./WorkersPanel";
 import { FileActivityPanel } from "./FileActivityPanel";
 import { FleetHealthPanel } from "./FleetHealthPanel";
@@ -1489,6 +1490,19 @@ export function CoordinatorDashboard() {
          * spec assertion in the same PR.
          */}
         <PlanRecommendations />
+
+        {/*
+         * Blind-Spot Recommender — mounted directly below
+         * PlanRecommendations. It's a cheap-rule recommendation card in
+         * the same family as PlanRecommendations (own `GET /blind-spots`
+         * endpoint, no LLM), not one of the five productivity-stack
+         * spec-locked panels (Recommendations → Advisories → Escalations
+         * → Decision Log). The spec's order-invariant asserts the
+         * relative top-to-bottom order of those five named panels; an
+         * extra card between PlanRecommendations and Recommendations does
+         * not change their relative order.
+         */}
+        <BlindSpotsPanel />
 
         <RecommendationsPanel
           rows={recommendationRows}
