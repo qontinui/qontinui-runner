@@ -127,24 +127,15 @@ pub async fn post_allocate_local(
                 result.agent_id,
                 result.worktrees.len()
             );
-            // Coordination Phase 6 — spawn the per-worktree live-state
-            // poller for this agent (5s `git status` → coord
-            // dirty-state). No-op when the allocation carried no JWT
-            // (dev fallback, coord JWT keys unconfigured) — the
-            // dirty-state endpoint is JWT-gated, so there's nothing to
-            // push without a token. Best-effort: a missing poller
-            // degrades the heatmap, never correctness.
-            match crate::dirty_poller::DirtyPollerState::from_allocate_result(
-                &result,
-                coord_http_base.clone(),
-                machine_id,
-            ) {
-                Some(st) => crate::dirty_poller::spawn_and_register(std::sync::Arc::new(st)),
-                None => info!(
-                    "/agents/allocate-local: dirty_poller skipped for agent_id={} (no token)",
-                    result.agent_id
-                ),
-            }
+            // Spawn this agent's long-lived daemons (Row 9 Phase 3
+            // pusher + Coordination Phase 6 dirty-poller) through the
+            // single unified site. One shared, self-refreshing token
+            // serves both. No-op when the allocation carried no JWT
+            // (dev fallback / coord JWT keys unconfigured) — both
+            // daemons' coord calls are JWT-gated. Best-effort: a
+            // missing daemon degrades observability/durability, never
+            // correctness.
+            crate::agent_daemons::spawn_for_agent(&result, coord_http_base.clone(), machine_id);
             Ok(Json(ApiResponse::success(json!({
                 "agent_id": result.agent_id,
                 "worktrees": result.worktrees.iter().map(|w| json!({

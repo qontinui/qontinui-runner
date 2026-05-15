@@ -58,8 +58,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+use crate::agent_token::{self, SharedToken};
+// Re-exported so existing `agent_pusher::TokenSlot` /
+// `TOKEN_REFRESH_MARGIN_SECS` references (incl. this module's tests)
+// keep resolving after the token logic moved to `crate::agent_token`.
+pub use crate::agent_token::{TokenSlot, TOKEN_REFRESH_MARGIN_SECS};
 
 /// Default cadence — 5 minutes per §3.2. Tunable for tests.
 const DEFAULT_PUSH_INTERVAL_SECS: u64 = 300;
@@ -67,12 +72,6 @@ const DEFAULT_PUSH_INTERVAL_SECS: u64 = 300;
 /// ±jitter window applied to each tick. §3.2's "spread to ~1/sec
 /// sustained at 300 agents" math depends on this.
 const DEFAULT_JITTER_SECS: u64 = 60;
-
-/// Refresh the JWT proactively when this much time-to-expiry remains.
-/// Tokens are 4h per §3.3; refreshing at 30min remaining means the
-/// pusher gets ~7 refresh opportunities per token's lifetime in the
-/// happy path.
-const TOKEN_REFRESH_MARGIN_SECS: i64 = 30 * 60;
 
 /// One worktree the pusher pushes for. Mirrors the shape coord
 /// returns from `POST /agents/allocate`, less the suggested-path
@@ -101,29 +100,9 @@ pub struct PusherState {
     pub coord_http_base: String,
     pub origin_repo_alias: String,
     pub targets: Vec<PushTarget>,
-    pub token: RwLock<TokenSlot>,
-}
-
-/// Mutable token + bookkeeping. Lives behind an `RwLock` so the
-/// pusher can refresh without dropping in-flight push attempts.
-#[derive(Debug, Clone)]
-pub struct TokenSlot {
-    pub token: String,
-    pub jti: uuid::Uuid,
-    /// Unix-seconds expiry. Refresh fires when `exp - now() <
-    /// TOKEN_REFRESH_MARGIN_SECS`.
-    pub exp: i64,
-}
-
-impl TokenSlot {
-    /// Seconds until expiry from `now`.
-    pub fn ttl_secs(&self, now_unix: i64) -> i64 {
-        self.exp - now_unix
-    }
-
-    pub fn needs_refresh(&self, now_unix: i64) -> bool {
-        self.ttl_secs(now_unix) < TOKEN_REFRESH_MARGIN_SECS
-    }
+    /// Shared with every other daemon spawned for this agent (one
+    /// refresh path, not one per daemon). See [`crate::agent_token`].
+    pub token: SharedToken,
 }
 
 impl PusherState {
@@ -136,9 +115,18 @@ impl PusherState {
         allocate: &crate::agent_worktree::AllocateResult,
         coord_http_base: String,
     ) -> Option<Self> {
-        if allocate.token.is_empty() {
-            return None;
-        }
+        let token = agent_token::from_allocate_result(allocate)?;
+        Self::with_shared_token(allocate, coord_http_base, token)
+    }
+
+    /// Same as [`from_allocate_result`] but the caller supplies the
+    /// shared token slot — used by `agent_daemons::spawn_for_agent`
+    /// so the pusher and the dirty-poller refresh through one slot.
+    pub fn with_shared_token(
+        allocate: &crate::agent_worktree::AllocateResult,
+        coord_http_base: String,
+        token: SharedToken,
+    ) -> Option<Self> {
         let agent_id = uuid::Uuid::from_str(&allocate.agent_id).ok()?;
         // §3.4 pilot has only qontinui-coord.git; the alias is the
         // repo slug. We collect targets from the materialized worktree
@@ -163,11 +151,7 @@ impl PusherState {
             coord_http_base,
             origin_repo_alias,
             targets,
-            token: RwLock::new(TokenSlot {
-                token: allocate.token.clone(),
-                jti: allocate.token_jti,
-                exp: allocate.token_exp,
-            }),
+            token,
         })
     }
 }
@@ -280,7 +264,13 @@ async fn run(
 /// Public for the integration test — doesn't depend on the spawn
 /// machinery.
 pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
-    maybe_refresh_token(state).await?;
+    agent_token::maybe_refresh(
+        &state.token,
+        &state.coord_http_base,
+        state.agent_id,
+        "agent_pusher",
+    )
+    .await?;
     let token_clone = {
         let guard = state.token.read().await;
         guard.clone()
@@ -302,77 +292,6 @@ pub async fn tick_once(state: &Arc<PusherState>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Refresh the cached token if it's within `TOKEN_REFRESH_MARGIN_SECS`
-/// of expiry. Best-effort: a failed refresh logs a warning and
-/// returns Ok — the next tick will retry.
-async fn maybe_refresh_token(state: &Arc<PusherState>) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
-    let needs = {
-        let guard = state.token.read().await;
-        guard.needs_refresh(now)
-    };
-    if !needs {
-        return Ok(());
-    }
-    info!(
-        "agent_pusher: agent_id={} refreshing token (ttl_secs={})",
-        state.agent_id,
-        state.token.read().await.ttl_secs(now)
-    );
-    let url = format!(
-        "{}/agents/{}/refresh-token",
-        state.coord_http_base.trim_end_matches('/'),
-        state.agent_id
-    );
-    let current = state.token.read().await.token.clone();
-    let resp = match reqwest::Client::new()
-        .post(&url)
-        .bearer_auth(&current)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("agent_pusher: refresh request failed: {e} — will retry on next tick");
-            return Ok(());
-        }
-    };
-    if !resp.status().is_success() {
-        warn!(
-            "agent_pusher: refresh returned {} — will retry next tick",
-            resp.status()
-        );
-        return Ok(());
-    }
-    let body: RefreshResponseBody = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("agent_pusher: refresh body decode failed: {e}");
-            return Ok(());
-        }
-    };
-    let mut guard = state.token.write().await;
-    *guard = TokenSlot {
-        token: body.token,
-        jti: body.jti,
-        exp: body.exp,
-    };
-    info!(
-        "agent_pusher: agent_id={} token refreshed jti={} exp={}",
-        state.agent_id, guard.jti, guard.exp
-    );
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct RefreshResponseBody {
-    token: String,
-    #[allow(dead_code)]
-    agent_id: uuid::Uuid,
-    jti: uuid::Uuid,
-    exp: i64,
 }
 
 /// Push one branch to coord-origin via `git push`. Returns
@@ -580,11 +499,11 @@ mod tests {
             coord_http_base: "http://invalid:1".into(),
             origin_repo_alias: "qontinui-coord".into(),
             targets: vec![],
-            token: RwLock::new(TokenSlot {
+            token: Arc::new(tokio::sync::RwLock::new(TokenSlot {
                 token: "x".into(),
                 jti: uuid::Uuid::nil(),
                 exp: chrono::Utc::now().timestamp() + 4 * 3600,
-            }),
+            })),
         });
         let handle = spawn(state);
         // Drop immediately — should not hang or panic.
