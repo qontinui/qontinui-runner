@@ -10466,7 +10466,7 @@ CREATE TABLE project.workflow_verification_phase_results (
     skipped_steps integer NOT NULL,
     total_duration_ms bigint NOT NULL,
     critical_failure boolean DEFAULT false NOT NULL,
-    result_json text NOT NULL,
+    result_json jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 

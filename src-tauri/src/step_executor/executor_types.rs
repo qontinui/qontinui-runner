@@ -604,6 +604,47 @@ pub struct ExecutionStepConfig {
     pub wrapper_result_variable: Option<String>,
 
     // ========================================================================
+    // Spec-Check Step Fields (Plan 03 Step 8)
+    // ========================================================================
+    /// Spec-Check: The page id whose spec should be evaluated.
+    #[serde(alias = "specCheckPageId", alias = "spec_check_page_id", default)]
+    pub spec_check_page_id: Option<String>,
+
+    /// Spec-Check: AND-conjunct policy (per §5.7). Carried verbatim as JSON;
+    /// reconstituted into a typed `SpecCheckPolicy` inside the handler.
+    #[serde(alias = "specCheckPolicy", alias = "spec_check_policy", default)]
+    pub spec_check_policy: Option<serde_json::Value>,
+
+    /// Spec-Check: Step status when the app is unreachable (SDK not connected,
+    /// etc.). Default: true (no-app → step fails). When false, no-app → step
+    /// passes with a warning.
+    #[serde(
+        alias = "specCheckFailWhenNoApp",
+        alias = "spec_check_fail_when_no_app",
+        default
+    )]
+    pub spec_check_fail_when_no_app: Option<bool>,
+
+    /// Spec-Check: Step status when the spec is missing (§5.13 un-spec'd
+    /// page). Default: true. When false, un-spec'd → step passes with a
+    /// warning.
+    #[serde(
+        alias = "specCheckFailWhenNoSpec",
+        alias = "spec_check_fail_when_no_spec",
+        default
+    )]
+    pub spec_check_fail_when_no_spec: Option<bool>,
+
+    /// Spec-Check: SnapshotFetchError variants that should cause this step to
+    /// fail. Strings match the variant names in lower-snake_case:
+    ///   "not_connected" | "timeout" | "partial" | "stale" | "network" |
+    ///   "forbidden" | "malformed".
+    /// Default: ["not_connected", "timeout", "network", "forbidden",
+    /// "malformed"] (Partial and Stale do not fail the step by default).
+    #[serde(alias = "specCheckFailOn", alias = "spec_check_fail_on", default)]
+    pub spec_check_fail_on: Option<Vec<String>>,
+
+    // ========================================================================
     // Console Error Handling
     // ========================================================================
     /// If true, step fails when console errors are captured during execution
