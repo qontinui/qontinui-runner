@@ -269,6 +269,69 @@ export async function getCoordinatorState(): Promise<CoordinatorState> {
 export type DispatchCoordinatorAction =
   | { type: "assign-task"; taskId: string; sessionId: string; reasoning?: string };
 
+// ---------------------------------------------------------------------------
+// Row 9 Phase 4 — fleet health + alerts (FleetHealthPanel).
+//
+// `get_fleet_health` is a thin Tauri proxy to coord's
+// `/coord/fleet/health` + `/coord/alerts` (the browser can't watch the
+// `fleet-health` NATS KV bucket directly). coord republishes each 30s
+// poll over the Redis/JS bridge, so a ~1s panel poll renders fleet
+// state well inside the "<1s after KV update" target without a
+// browser-side NATS client.
+// ---------------------------------------------------------------------------
+
+/** One machine's latest health snapshot (coord
+ *  `MachineHealthSnapshot`; snake_case on the wire — coord serializes
+ *  the Rust struct field names verbatim). */
+export interface FleetMachineSnapshot {
+  machine_id: string;
+  hostname: string;
+  state: "healthy" | "degraded" | "partitioned" | "abandoned";
+  state_changed_at: string;
+  last_probe_at: string | null;
+  last_probe_ok: boolean | null;
+  consecutive_failures: number;
+  agents_active: number;
+  updated_at: string;
+}
+
+/** One active/firing alert row from `coord.alerts`. */
+export interface FleetAlert {
+  id: number;
+  alert_key: string;
+  severity: "info" | "warning" | "critical";
+  kind: string;
+  machine_id: string | null;
+  summary: string;
+  detail: Record<string, unknown>;
+  first_seen_at: string;
+  last_seen_at: string;
+  occurrences: number;
+  resolved_at: string | null;
+  page_due_at: string | null;
+}
+
+/** Merged payload from the `get_fleet_health` command. */
+export interface FleetHealth {
+  health: {
+    machines: FleetMachineSnapshot[];
+    count: number;
+    by_state: Record<string, number>;
+    alerts: { critical: number; warning: number; info: number };
+    kv_bucket: string;
+    as_of: string;
+  };
+  alerts: FleetAlert[];
+  coordBase: string;
+}
+
+/** Fetch coord's fleet-health rollup + active alerts via the runner
+ *  proxy command. Throws on coord-unreachable so the panel can show a
+ *  retriable error (coord down ≠ runner down). */
+export async function getFleetHealth(): Promise<FleetHealth> {
+  return invoke<FleetHealth>("get_fleet_health");
+}
+
 /** Fire an arbitrary CoordinatorAction through the manual dispatch path.
  *  Audited as `rule = "manual"`, `sessionId = "manual-<uuid>"`. */
 export async function dispatchCoordinatorAction(
