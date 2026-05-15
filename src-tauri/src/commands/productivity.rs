@@ -1675,7 +1675,10 @@ pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
         .await
         .and_then(|r| r.error_for_status())
     {
-        Ok(r) => r.json().await.unwrap_or_else(|_| serde_json::json!({"alerts": []})),
+        Ok(r) => r
+            .json()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({"alerts": []})),
         Err(e) => {
             warn!("get_fleet_health: /coord/alerts failed: {e}");
             serde_json::json!({"alerts": []})
