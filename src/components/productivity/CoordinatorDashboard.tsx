@@ -38,6 +38,7 @@ import {
   getCoordinatorState,
   getEscalations,
   launchCoordinatorSession,
+  listOverlappingIntents,
   resolveEscalation,
   spawnWorkerSession,
   stopCoordinatorSession,
@@ -47,6 +48,7 @@ import {
   type Escalation,
   type LeaderResponse,
   type LiveSession,
+  type OverlappingIntentPair,
 } from "./coordinatorApi";
 import {
   approveRecommendation,
@@ -983,6 +985,120 @@ function CoordinatorLeaseStatusPill({ status, leader }: CoordinatorLeaseStatusPi
 }
 
 // ---------------------------------------------------------------------------
+// Overlapping intents panel — Coordination Phase 1B (§4.10)
+//
+// Read-only L2 visibility surface. Lists active agent pairs whose
+// declared_overlap_paths intersect, with both agents' free-text intents
+// and the overlapping path set. Drives no actions — per §4.10 the
+// visibility layer is informational, not authoritative; agents reading
+// this panel decide whether to continue, pivot, or coordinate manually.
+// ---------------------------------------------------------------------------
+
+interface OverlapPanelProps {
+  rows: OverlappingIntentPair[];
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+}
+
+function OverlapPanel({ rows, loading, error, onRefresh }: OverlapPanelProps) {
+  return (
+    <section
+      role="region"
+      aria-labelledby="productivity-coord-overlap-heading"
+      className="flex flex-col rounded-lg border border-border bg-card/30 p-4 gap-3"
+      data-ui-bridge-id="productivity.coord-overlapping-intents"
+    >
+      <header className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-sky-400" />
+          <h2
+            id="productivity-coord-overlap-heading"
+            className="text-sm font-semibold text-foreground"
+          >
+            Overlapping intents
+          </h2>
+          <span className="text-xs text-muted-foreground">{rows.length} active</span>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={loading}
+          data-ui-bridge-id="productivity.coord-overlapping-intents-refresh"
+          className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 disabled:opacity-50"
+        >
+          <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
+          Refresh
+        </button>
+      </header>
+
+      {error ? (
+        <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-400">
+          {error}
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="rounded-md border border-border/40 bg-muted/10 p-3 text-xs text-muted-foreground">
+          No overlapping agent intents detected. Agents declare paths at allocation; coord
+          flags pairs whose declared sets intersect. Empty here = no L2 contention right now.
+        </div>
+      ) : (
+        <ul className="flex flex-col gap-2">
+          {rows.map((row) => (
+            <li
+              key={`${row.agentA}-${row.agentB}`}
+              className="rounded-md border border-sky-500/30 bg-sky-500/5 p-3"
+              data-ui-bridge-id="productivity.coord-overlapping-intent-card"
+              data-agent-a={row.agentA}
+              data-agent-b={row.agentB}
+            >
+              <div className="flex flex-col gap-2 min-w-0">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-0.5 min-w-0">
+                    <div className="text-[11px] text-muted-foreground font-mono truncate">
+                      {row.agentA}
+                    </div>
+                    <p className="text-xs text-foreground/90 whitespace-pre-wrap break-words">
+                      {row.intentA || (
+                        <span className="text-muted-foreground italic">no intent declared</span>
+                      )}
+                    </p>
+                  </div>
+                  <div className="flex flex-col gap-0.5 min-w-0">
+                    <div className="text-[11px] text-muted-foreground font-mono truncate">
+                      {row.agentB}
+                    </div>
+                    <p className="text-xs text-foreground/90 whitespace-pre-wrap break-words">
+                      {row.intentB || (
+                        <span className="text-muted-foreground italic">no intent declared</span>
+                      )}
+                    </p>
+                  </div>
+                </div>
+                <div className="border-t border-border/40 pt-2">
+                  <div className="text-[11px] text-muted-foreground mb-1">
+                    Overlapping paths ({row.overlappingPaths.length})
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {row.overlappingPaths.map((p) => (
+                      <code
+                        key={p}
+                        className="rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[11px] font-mono text-sky-300"
+                      >
+                        {p}
+                      </code>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Top-level dashboard
 // ---------------------------------------------------------------------------
 
@@ -991,6 +1107,9 @@ export function CoordinatorDashboard() {
   const [escalations, setEscalations] = useState<Escalation[]>([]);
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [advisories, setAdvisories] = useState<CoordinatorDecision[]>([]);
+  const [overlapPairs, setOverlapPairs] = useState<OverlappingIntentPair[]>([]);
+  const [overlapLoading, setOverlapLoading] = useState(false);
+  const [overlapError, setOverlapError] = useState<string | null>(null);
   const [decisionsLoading, setDecisionsLoading] = useState(false);
   const [escalationsLoading, setEscalationsLoading] = useState(false);
   const [recommendationsLoading, setRecommendationsLoading] = useState(false);
@@ -1057,6 +1176,22 @@ export function CoordinatorDashboard() {
     }
   }, []);
 
+  const loadOverlap = useCallback(async () => {
+    setOverlapLoading(true);
+    setOverlapError(null);
+    try {
+      const rows = await listOverlappingIntents();
+      setOverlapPairs(rows);
+    } catch (err) {
+      // Phase 1B may not yet be applied on this runner build — render
+      // the empty state rather than crashing.
+      setOverlapError(err instanceof Error ? err.message : "Failed to load overlap pairs");
+      setOverlapPairs([]);
+    } finally {
+      setOverlapLoading(false);
+    }
+  }, []);
+
   // Load advisories: `advise-with-text` rows from the last hour that
   // haven't been acknowledged. Filter client-side from the
   // action-filtered decision feed so we don't add a sibling endpoint.
@@ -1119,6 +1254,19 @@ export function CoordinatorDashboard() {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- async data load on dependency change
     void loadAdvisories();
   }, [loadAdvisories]);
+
+  // Refresh the overlapping-intents snapshot on mount and every 30s.
+  // Lightweight read — bounded by `limit` on the Tauri side and the
+  // panel is informational so we can poll comfortably. A future
+  // iteration could swap to a WS subscription on
+  // events.coord.overlap.detected for sub-second freshness.
+  useEffect(() => {
+    void loadOverlap();
+    const id = setInterval(() => {
+      void loadOverlap();
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [loadOverlap]);
 
   // Subscribe to `review-completed` so a finished /auto-review surfaces
   // here without forcing the user to refresh. Tauri may not be present in
@@ -1557,6 +1705,20 @@ export function CoordinatorDashboard() {
          * one-line update in the same commit.
          */}
         <FleetHealthPanel />
+
+        {/*
+         * Overlapping intents panel — Coordination Phase 1B (§4.10).
+         * L2 visibility surface. Read-only; informational. Adjacent to
+         * FileActivityPanel because both are "what are other agents
+         * touching" displays — one shows real dirty state, this shows
+         * declared future intent.
+         */}
+        <OverlapPanel
+          rows={overlapPairs}
+          loading={overlapLoading}
+          error={overlapError}
+          onRefresh={loadOverlap}
+        />
       </div>
     </div>
   );

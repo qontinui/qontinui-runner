@@ -57,13 +57,18 @@ pub struct AgentWorktreeRow {
     pub worktree_path: String,
     pub status: String,
     pub intent: Option<String>,
+    /// Per Phase 1B (§4.10): file/glob paths the agent declared at
+    /// allocation time. Populated by agent input, falling back to LLM
+    /// derivation from `intent`; `None` for pre-1B rows.
+    pub declared_overlap_paths: Option<Vec<String>>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const SELECT_COLS: &str = r#"
     agent_id::text, machine_id::text, repo, branch, parent_sha,
-    worktree_path, status, intent, created_at::text, updated_at::text
+    worktree_path, status, intent, declared_overlap_paths,
+    created_at::text, updated_at::text
 "#;
 
 fn row_to_aw(r: &tokio_postgres::Row) -> AgentWorktreeRow {
@@ -76,8 +81,9 @@ fn row_to_aw(r: &tokio_postgres::Row) -> AgentWorktreeRow {
         worktree_path: r.get(5),
         status: r.get(6),
         intent: r.get(7),
-        created_at: r.get(8),
-        updated_at: r.get(9),
+        declared_overlap_paths: r.get(8),
+        created_at: r.get(9),
+        updated_at: r.get(10),
     }
 }
 
@@ -137,6 +143,12 @@ impl PgDb {
             CREATE INDEX IF NOT EXISTS idx_agent_worktrees_machine_status
                 ON coord.agent_worktrees (machine_id, status)
                 WHERE machine_id IS NOT NULL;
+
+            ALTER TABLE coord.agent_worktrees
+                ADD COLUMN IF NOT EXISTS declared_overlap_paths TEXT[];
+
+            CREATE INDEX IF NOT EXISTS idx_agent_worktrees_overlap_paths_gin
+                ON coord.agent_worktrees USING gin (declared_overlap_paths);
             "#,
         )
         .await
@@ -168,6 +180,45 @@ impl PgDb {
             )
             .await
             .map_err(|e| format!("Failed to list agent_worktrees: {}", e))?;
+        Ok(rows.iter().map(row_to_aw).collect())
+    }
+
+    /// List currently-active agents that declared at least one overlap
+    /// path. Used by the runner's Productivity dashboard to render the
+    /// L2 "Overlapping intents" panel (Phase 1B §4.10).
+    ///
+    /// "Active" = status in ('allocated', 'active') AND
+    /// declared_overlap_paths is non-empty. One row per agent (DISTINCT
+    /// ON agent_id) — multi-repo agents share intent + path set across
+    /// their N worktree rows, so picking any one row gives the same
+    /// answer.
+    ///
+    /// Ordered newest-first so the dashboard surfaces fresh intents
+    /// before stale ones; the panel is capped at `limit` rows.
+    pub async fn list_active_agents_with_paths(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<AgentWorktreeRow>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT DISTINCT ON (agent_id) {SELECT_COLS} \
+                     FROM coord.agent_worktrees \
+                     WHERE status IN ('allocated', 'active') \
+                       AND declared_overlap_paths IS NOT NULL \
+                       AND array_length(declared_overlap_paths, 1) > 0 \
+                     ORDER BY agent_id, updated_at DESC \
+                     LIMIT $1",
+                ),
+                &[&limit],
+            )
+            .await
+            .map_err(|e| format!("Failed to list_active_agents_with_paths: {}", e))?;
         Ok(rows.iter().map(row_to_aw).collect())
     }
 

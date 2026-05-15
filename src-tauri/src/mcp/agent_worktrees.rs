@@ -44,6 +44,10 @@ pub struct AllocateLocalRequest {
     /// `coord.agent_worktrees.intent`.
     #[serde(default)]
     pub intent: Option<String>,
+    /// Phase 1B: optional pre-derived overlap paths. When supplied,
+    /// coord persists them verbatim (skipping LLM derivation).
+    #[serde(default)]
+    pub declared_overlap_paths: Option<Vec<String>>,
     /// Optional override of the canonical-checkout path for each repo.
     /// Map of `repo` slug to absolute path. When not provided for a
     /// given repo, defaults to `D:/qontinui-root/<repo>/` (Windows)
@@ -112,6 +116,7 @@ pub async fn post_allocate_local(
         &machine_id,
         &repo_reqs,
         req.intent.as_deref(),
+        req.declared_overlap_paths.as_deref(),
         &canonical_paths,
     )
     .await

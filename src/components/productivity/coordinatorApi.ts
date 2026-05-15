@@ -350,3 +350,30 @@ export async function dispatchCoordinatorAction(
     throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Coordination Phase 1B (§4.10) — Overlapping intents
+// ---------------------------------------------------------------------------
+
+/** Unordered pair of agents whose declared_overlap_paths intersect.
+ *  `agentA` <= `agentB` lexically so the pair is stable across calls.
+ *  `intentA` / `intentB` are free-text strings shown in the dashboard;
+ *  `overlappingPaths` is the de-duplicated intersection (literal +
+ *  glob-expanded — same shape coord publishes on
+ *  `events.coord.overlap.detected`). */
+export interface OverlappingIntentPair {
+  agentA: string;
+  agentB: string;
+  intentA: string | null;
+  intentB: string | null;
+  overlappingPaths: string[];
+}
+
+/** Fetch the L2 overlapping-intents snapshot from coord.agent_worktrees.
+ *  Read-only — the panel is informational, no actions taken from
+ *  client-side. */
+export async function listOverlappingIntents(
+  limit = 200,
+): Promise<OverlappingIntentPair[]> {
+  return invoke<OverlappingIntentPair[]>("list_overlapping_intents", { limit });
+}

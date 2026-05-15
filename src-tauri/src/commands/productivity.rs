@@ -1717,3 +1717,150 @@ pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
         "coordBase": base,
     }))
 }
+
+// ============================================================================
+// Coordination Phase 1B (§4.10) — Overlapping intents panel
+// ============================================================================
+
+/// One pair of agents whose declared_overlap_paths intersect. Computed
+/// in-process from the active-agents list so the dashboard reads a
+/// single coherent snapshot per refresh — no race between "list" and
+/// "for each, compute peer overlaps."
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlappingIntentPair {
+    pub agent_a: String,
+    pub agent_b: String,
+    pub intent_a: Option<String>,
+    pub intent_b: Option<String>,
+    pub overlapping_paths: Vec<String>,
+}
+
+/// List unique unordered pairs of active agents whose declared
+/// overlap-path sets intersect. Drives the Productivity dashboard's
+/// "Overlapping intents" panel (Phase 1B §4.10).
+///
+/// Each pair is reported once: agents are ordered lexically so
+/// (agent_a, agent_b) is stable across calls.
+///
+/// `limit` caps the underlying active-agents fetch — the panel is
+/// informational and bounding it keeps the dashboard cheap even at
+/// 300+ agents.
+#[tauri::command]
+pub async fn list_overlapping_intents(
+    app_handle: tauri::AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<OverlappingIntentPair>, String> {
+    let app_state = require_app_state(&app_handle)?;
+    let cap = limit.unwrap_or(200);
+    let agents = app_state.pg_db.list_active_agents_with_paths(cap).await?;
+
+    let mut pairs: Vec<OverlappingIntentPair> = Vec::new();
+    for i in 0..agents.len() {
+        for j in (i + 1)..agents.len() {
+            let a = &agents[i];
+            let b = &agents[j];
+            let Some(a_paths) = a.declared_overlap_paths.as_ref() else {
+                continue;
+            };
+            let Some(b_paths) = b.declared_overlap_paths.as_ref() else {
+                continue;
+            };
+            let overlap = compute_overlap(a_paths, b_paths);
+            if overlap.is_empty() {
+                continue;
+            }
+            // Stable lexical pair ordering.
+            let (agent_a, agent_b, intent_a, intent_b) = if a.agent_id <= b.agent_id {
+                (
+                    a.agent_id.clone(),
+                    b.agent_id.clone(),
+                    a.intent.clone(),
+                    b.intent.clone(),
+                )
+            } else {
+                (
+                    b.agent_id.clone(),
+                    a.agent_id.clone(),
+                    b.intent.clone(),
+                    a.intent.clone(),
+                )
+            };
+            pairs.push(OverlappingIntentPair {
+                agent_a,
+                agent_b,
+                intent_a,
+                intent_b,
+                overlapping_paths: overlap,
+            });
+        }
+    }
+    Ok(pairs)
+}
+
+/// Two-pass glob-set intersection — same shape as the coord-side
+/// `detect_overlap` so the dashboard's view matches what coord
+/// publishes on `events.coord.overlap.detected`.
+fn compute_overlap(a_paths: &[String], b_paths: &[String]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let a_set: BTreeSet<&String> = a_paths.iter().collect();
+    let mut hits: BTreeSet<String> = BTreeSet::new();
+    for p in b_paths {
+        if a_set.contains(p) {
+            hits.insert(p.clone());
+        }
+    }
+    if hits.is_empty() {
+        // Glob expansion: each a-side glob tested against each
+        // b-side literal, and vice versa. Uses the same `glob-match`
+        // crate as the trigger-system file watchers, so glob semantics
+        // are consistent across the runner.
+        for a_pat in a_paths {
+            for p in b_paths {
+                if glob_match::glob_match(a_pat, p) {
+                    hits.insert(p.clone());
+                }
+            }
+        }
+        for b_pat in b_paths {
+            for p in a_paths {
+                if glob_match::glob_match(b_pat, p) {
+                    hits.insert(p.clone());
+                }
+            }
+        }
+    }
+    hits.into_iter().collect()
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+
+    #[test]
+    fn literal_intersection() {
+        let r = compute_overlap(
+            &["a/b.rs".to_string(), "c/d.rs".to_string()],
+            &["x.rs".to_string(), "a/b.rs".to_string()],
+        );
+        assert_eq!(r, vec!["a/b.rs".to_string()]);
+    }
+
+    #[test]
+    fn glob_intersection() {
+        let r = compute_overlap(
+            &["qontinui-web/backend/app/auth/**".to_string()],
+            &["qontinui-web/backend/app/auth/token.py".to_string()],
+        );
+        assert_eq!(
+            r,
+            vec!["qontinui-web/backend/app/auth/token.py".to_string()]
+        );
+    }
+
+    #[test]
+    fn disjoint_empty() {
+        let r = compute_overlap(&["a/b.rs".to_string()], &["x/y.rs".to_string()]);
+        assert!(r.is_empty());
+    }
+}
