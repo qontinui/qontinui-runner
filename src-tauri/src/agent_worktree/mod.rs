@@ -84,10 +84,20 @@ pub struct MaterializedWorktree {
 }
 
 /// Result of a full allocate + materialize round-trip.
+///
+/// Row 9 Phase 2 added `token`/`token_jti`/`token_exp`: the scoped
+/// JWT coord issued at allocation. Phase 3's pusher daemon
+/// (`crate::agent_pusher`) consumes these to authenticate
+/// pushes to the coord-hosted git origin. Empty `token` (JWT keys
+/// not configured on coord) means "skip pusher spawn for this
+/// allocation."
 #[derive(Debug, Clone, Serialize)]
 pub struct AllocateResult {
     pub agent_id: String,
     pub worktrees: Vec<MaterializedWorktree>,
+    pub token: String,
+    pub token_jti: uuid::Uuid,
+    pub token_exp: i64,
 }
 
 /// Coord's JSON response shape for `POST /agents/allocate`. Mirrored
@@ -96,6 +106,15 @@ pub struct AllocateResult {
 struct CoordAllocateResponse {
     agent_id: String,
     worktrees: Vec<CoordAllocatedWorktree>,
+    /// Row 9 Phase 2 — scoped JWT covering all branches in this
+    /// allocation. Empty when coord's JWT keys aren't configured
+    /// (dev fallback).
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    token_jti: Option<uuid::Uuid>,
+    #[serde(default)]
+    token_exp: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,6 +280,9 @@ pub async fn allocate_and_materialize(
     Ok(AllocateResult {
         agent_id: coord_resp.agent_id,
         worktrees: materialized,
+        token: coord_resp.token,
+        token_jti: coord_resp.token_jti.unwrap_or(uuid::Uuid::nil()),
+        token_exp: coord_resp.token_exp.unwrap_or(0),
     })
 }
 
