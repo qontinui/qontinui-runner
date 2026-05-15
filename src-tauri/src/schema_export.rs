@@ -211,6 +211,7 @@ pub fn export_all_schemas() -> Value {
     add!("IrPageSpec", qir::IrPageSpec);
     add!("IrElementCriteria", qir::IrElementCriteria);
     add!("IrProvenance", qir::IrProvenance);
+    add!("ProposalStatus", qir::ProposalStatus);
     add!("IrMetadata", qir::IrMetadata);
     add!("IrCrossRef", qir::IrCrossRef);
     add!("IrWaitSpec", qir::IrWaitSpec);
