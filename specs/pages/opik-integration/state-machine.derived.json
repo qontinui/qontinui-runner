@@ -42,7 +42,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "status",
+              "textContains": "Opik"
+            },
             "label": "Required element for Semantic — Purpose & Communication"
           },
           "source": "migrated",
@@ -57,7 +60,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "traces"
+            },
             "label": "Required element for Semantic — Purpose & Communication"
           },
           "source": "migrated",
@@ -72,7 +77,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "$"
+            },
             "label": "Required element for Semantic — Purpose & Communication"
           },
           "source": "migrated",
@@ -98,7 +105,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "heading"
+            },
             "label": "Required element for Element Presence — Required UI Controls"
           },
           "source": "migrated",
@@ -130,7 +139,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "combobox"
+            },
             "label": "Required element for Element Presence — Required UI Controls"
           },
           "source": "migrated",
@@ -145,7 +156,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "table"
+            },
             "label": "Required element for Element Presence — Required UI Controls"
           },
           "source": "migrated",
@@ -160,7 +173,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "columnheader"
+            },
             "label": "Required element for Element Presence — Required UI Controls"
           },
           "source": "migrated",
@@ -175,7 +190,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "complementary"
+            },
             "label": "Required element for Element Presence — Required UI Controls"
           },
           "source": "migrated",
@@ -235,7 +252,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "$"
+            },
             "label": "Required element for Data Display — Formatting & Presentation"
           },
           "source": "migrated",
@@ -250,7 +269,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "ms"
+            },
             "label": "Required element for Data Display — Formatting & Presentation"
           },
           "source": "migrated",
@@ -265,7 +286,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "tokens"
+            },
             "label": "Required element for Data Display — Formatting & Presentation"
           },
           "source": "migrated",
@@ -280,7 +303,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "tree"
+            },
             "label": "Required element for Data Display — Formatting & Presentation"
           },
           "source": "migrated",
@@ -295,7 +320,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "treeitem"
+            },
             "label": "Required element for Data Display — Formatting & Presentation"
           },
           "source": "migrated",
@@ -310,7 +337,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "tagName": "code"
+            },
             "label": "Required element for Data Display — Formatting & Presentation"
           },
           "source": "migrated",
@@ -325,7 +354,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "ago"
+            },
             "label": "Required element for Data Display — Formatting & Presentation"
           },
           "source": "migrated",
@@ -351,7 +382,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "searchbox"
+            },
             "label": "Required element for Interaction — User Actions & Responses"
           },
           "source": "migrated",
@@ -366,7 +399,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "combobox"
+            },
             "label": "Required element for Interaction — User Actions & Responses"
           },
           "source": "migrated",
@@ -381,7 +416,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "row"
+            },
             "label": "Required element for Interaction — User Actions & Responses"
           },
           "source": "migrated",
@@ -396,7 +433,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "treeitem"
+            },
             "label": "Required element for Interaction — User Actions & Responses"
           },
           "source": "migrated",
@@ -411,7 +450,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "ariaLabel": "Add feedback"
+            },
             "label": "Required element for Interaction — User Actions & Responses"
           },
           "source": "migrated",
@@ -426,7 +468,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "ariaLabel": "Close"
+            },
             "label": "Required element for Interaction — User Actions & Responses"
           },
           "source": "migrated",
@@ -441,7 +486,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "ariaLabel": "Refresh"
+            },
             "label": "Required element for Interaction — User Actions & Responses"
           },
           "source": "migrated",
@@ -484,7 +532,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "progressbar"
+            },
             "label": "Required element for Behavior — Loading, Empty, Error, & Auto-refresh States"
           },
           "source": "migrated",
@@ -499,7 +549,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "alert",
+              "textContains": "Opik unavailable"
+            },
             "label": "Required element for Behavior — Loading, Empty, Error, & Auto-refresh States"
           },
           "source": "migrated",
@@ -514,7 +567,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "Auto-refresh"
+            },
             "label": "Required element for Behavior — Loading, Empty, Error, & Auto-refresh States"
           },
           "source": "migrated",
@@ -540,7 +595,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "status",
+              "textContains": "Synced"
+            },
             "label": "Required element for State Consistency — Local ↔ Opik Data Agreement"
           },
           "source": "migrated",
@@ -555,7 +613,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "fallback"
+            },
             "label": "Required element for State Consistency — Local ↔ Opik Data Agreement"
           },
           "source": "migrated",
@@ -570,7 +630,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "Last synced"
+            },
             "label": "Required element for State Consistency — Local ↔ Opik Data Agreement"
           },
           "source": "migrated",
@@ -614,7 +676,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "navigation"
+            },
             "label": "Required element for Navigation — Page Access & Internal Navigation"
           },
           "source": "migrated",
@@ -629,7 +693,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "complementary",
+              "ariaLabel": "Trace detail panel"
+            },
             "label": "Required element for Navigation — Page Access & Internal Navigation"
           },
           "source": "migrated",
@@ -655,7 +722,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "main"
+            },
             "label": "Required element for Style — Visual Design & Theming"
           },
           "source": "migrated",
@@ -670,7 +739,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "heading",
+              "tag": "h1"
+            },
             "label": "Required element for Style — Visual Design & Theming"
           },
           "source": "migrated",
@@ -685,7 +757,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "row"
+            },
             "label": "Required element for Style — Visual Design & Theming"
           },
           "source": "migrated",

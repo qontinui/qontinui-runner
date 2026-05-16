@@ -132,7 +132,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "text": "Bundled"
+            },
             "label": "Required element for Connection Bar — Spec Loading Controls"
           },
           "source": "migrated",
@@ -147,7 +150,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "text": "File"
+            },
             "label": "Required element for Connection Bar — Spec Loading Controls"
           },
           "source": "migrated",
@@ -162,7 +168,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "textbox",
+              "textContains": "localhost:3001"
+            },
             "label": "Required element for Connection Bar — Spec Loading Controls"
           },
           "source": "migrated",
@@ -177,7 +186,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "text": "Discover"
+            },
             "label": "Required element for Connection Bar — Spec Loading Controls"
           },
           "source": "migrated",
@@ -192,7 +204,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "ariaLabel": "BookOpen"
+            },
             "label": "Required element for Connection Bar — Spec Loading Controls"
           },
           "source": "migrated",
@@ -207,7 +221,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "ariaLabel": "FolderOpen"
+            },
             "label": "Required element for Connection Bar — Spec Loading Controls"
           },
           "source": "migrated",
@@ -232,7 +248,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "text": "Edit"
+            },
             "label": "Required element for Connection Bar — Spec Action Controls"
           },
           "source": "migrated",
@@ -247,7 +266,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "text": "Save"
+            },
             "label": "Required element for Connection Bar — Spec Action Controls"
           },
           "source": "migrated",
@@ -262,7 +284,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "text": "AI Eval"
+            },
             "label": "Required element for Connection Bar — Spec Action Controls"
           },
           "source": "migrated",
@@ -277,7 +302,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "textContains": "Regression"
+            },
             "label": "Required element for Connection Bar — Spec Action Controls"
           },
           "source": "migrated",
@@ -292,7 +320,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "switch",
+              "id": "specs-ai-toggle"
+            },
             "label": "Required element for Connection Bar — Spec Action Controls"
           },
           "source": "migrated",
@@ -414,7 +445,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "Compiling state machine"
+            },
             "label": "Required element for Sync Progress Banner"
           },
           "source": "migrated",
@@ -1035,7 +1068,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "text": "Build Workflow"
+            },
             "label": "Required element for Build Workflow Pipeline"
           },
           "source": "migrated",
@@ -1050,7 +1086,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "switch",
+              "id": "specs-ai-toggle"
+            },
             "label": "Required element for Build Workflow Pipeline"
           },
           "source": "migrated",
@@ -1065,7 +1104,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "Generating"
+            },
             "label": "Required element for Build Workflow Pipeline"
           },
           "source": "migrated",
@@ -1135,7 +1176,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "id": "specs-btn-compile-sm"
+            },
             "label": "Required element for Compile State Machine"
           },
           "source": "migrated",
@@ -1150,7 +1194,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "text": "Compile State Machine"
+            },
             "label": "Required element for Compile State Machine"
           },
           "source": "migrated",
@@ -1176,7 +1222,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "text": "File"
+            },
             "label": "Required element for File Loading and Saving"
           },
           "source": "migrated",
@@ -1191,7 +1240,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "text": "Save"
+            },
             "label": "Required element for File Loading and Saving"
           },
           "source": "migrated",
@@ -1206,7 +1258,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "File"
+            },
             "label": "Required element for File Loading and Saving"
           },
           "source": "migrated",
@@ -1249,7 +1303,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "id": "specs-ai-toggle"
+            },
             "label": "Required element for AI Spec-Brief Toggle"
           },
           "source": "migrated",

@@ -15,7 +15,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "banner"
+            },
             "label": "Required element for Page Structure — Fixed Bars and Content Area"
           },
           "source": "migrated",
@@ -30,7 +32,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "main"
+            },
             "label": "Required element for Page Structure — Fixed Bars and Content Area"
           },
           "source": "migrated",
@@ -45,7 +49,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "contentinfo"
+            },
             "label": "Required element for Page Structure — Fixed Bars and Content Area"
           },
           "source": "migrated",
@@ -188,7 +194,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "banner"
+            },
             "label": "Required element for Control Bar — Task Name and Phase"
           },
           "source": "migrated",
@@ -203,7 +211,11 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "attributes": {
+                "data-content-label": "task name"
+              }
+            },
             "label": "Required element for Control Bar — Task Name and Phase"
           },
           "source": "migrated",
@@ -218,7 +230,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "RUNNING"
+            },
             "label": "Required element for Control Bar — Task Name and Phase"
           },
           "source": "migrated",
@@ -244,7 +258,11 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "attributes": {
+                "data-content-label": "setup stage"
+              }
+            },
             "label": "Required element for Control Bar — Orchestrated Workflow Stage Pills"
           },
           "source": "migrated",
@@ -259,7 +277,11 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "attributes": {
+                "data-content-label": "agentic stage"
+              }
+            },
             "label": "Required element for Control Bar — Orchestrated Workflow Stage Pills"
           },
           "source": "migrated",
@@ -274,7 +296,11 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "attributes": {
+                "data-content-label": "verification stage"
+              }
+            },
             "label": "Required element for Control Bar — Orchestrated Workflow Stage Pills"
           },
           "source": "migrated",
@@ -417,7 +443,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "contentinfo"
+            },
             "label": "Required element for Bottom Bar — Real-Time Status Metrics"
           },
           "source": "migrated",
@@ -432,7 +460,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "Elapsed"
+            },
             "label": "Required element for Bottom Bar — Real-Time Status Metrics"
           },
           "source": "migrated",
@@ -447,7 +477,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "Orchestrator"
+            },
             "label": "Required element for Bottom Bar — Real-Time Status Metrics"
           },
           "source": "migrated",
@@ -462,7 +494,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "Updated"
+            },
             "label": "Required element for Bottom Bar — Real-Time Status Metrics"
           },
           "source": "migrated",
@@ -477,7 +511,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "status"
+            },
             "label": "Required element for Bottom Bar — Real-Time Status Metrics"
           },
           "source": "migrated",
@@ -699,7 +735,11 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "attributes": {
+                "data-content-label": "breakpoint step"
+              }
+            },
             "label": "Required element for Control Bar — Breakpoint Pause Indicator"
           },
           "source": "migrated",
@@ -1002,7 +1042,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "tooltip"
+            },
             "label": "Required element for Keyboard Shortcuts"
           },
           "source": "migrated",

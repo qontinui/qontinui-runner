@@ -37,15 +37,6 @@ use super::storage::{self, ReadWithinRootError};
 use super::types::IrPageSpec;
 use qontinui_types::spec_check::SpecValidation;
 
-/// Feature flag for `POST /spec/derive`: when set, the endpoint hard-stops
-/// on distinctness violations. Default off for the first 30 days post-ship
-/// per Plan 04 Step 5 — gives the corpus cleanup pass (Path A) runway.
-fn enforce_distinctness_on_derive() -> bool {
-    std::env::var("QONTINUI_SPEC_DISTINCTNESS_ENFORCE_ON_DERIVE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 // ---------------------------------------------------------------------------
 // GET /spec/get?path=<rel>
 // ---------------------------------------------------------------------------
@@ -454,21 +445,12 @@ pub async fn post_derive(
     State(_state): State<Arc<ApiState>>,
     Json(body): Json<DeriveBody>,
 ) -> Response {
-    build_derive_response(
-        &storage::resolve_specs_root(),
-        body,
-        enforce_distinctness_on_derive(),
-    )
+    build_derive_response(&storage::resolve_specs_root(), body)
 }
 
 /// Inner implementation of `post_derive` parameterized by the storage root
-/// and the distinctness-enforce toggle (tests pass the flag explicitly to
-/// avoid env-var races under cargo's parallel test runner).
-pub(crate) fn build_derive_response(
-    root: &std::path::Path,
-    body: DeriveBody,
-    enforce_distinctness: bool,
-) -> Response {
+/// so tests can inject a temp directory.
+pub(crate) fn build_derive_response(root: &std::path::Path, body: DeriveBody) -> Response {
     let doc = match storage::read_ir(root, &body.page_id) {
         Ok(Some(d)) => d,
         Ok(None) => {
@@ -493,22 +475,18 @@ pub(crate) fn build_derive_response(
         }
     };
 
-    // Plan 04 Step 5 — feature-flagged distinctness enforcement on derive.
-    // Default off; flipped to on after the corpus cleanup pass (Step 9) lands.
-    if enforce_distinctness {
-        if let Err(report) = distinctness::validate(&doc) {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(SpecError::with_detail(
-                    "spec-validation-failed",
-                    json!({
-                        "pageId": body.page_id,
-                        "violations": report.violations,
-                    }),
-                )),
-            )
-                .into_response();
-        }
+    if let Err(report) = distinctness::validate(&doc) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(SpecError::with_detail(
+                "spec-validation-failed",
+                json!({
+                    "pageId": body.page_id,
+                    "violations": report.violations,
+                }),
+            )),
+        )
+            .into_response();
     }
 
     match body.derivation.as_str() {
