@@ -34,6 +34,7 @@ pub mod awas;
 pub mod awas_bridge;
 pub mod backend_relay;
 pub mod backup_restore;
+pub mod blind_spots_api;
 pub mod bridges;
 pub mod canvas;
 pub mod cascade;

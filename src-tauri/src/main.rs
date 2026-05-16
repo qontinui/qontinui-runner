@@ -72,6 +72,9 @@ mod git_status_subset;
 // and routes them into a bounded in-process ring buffer + Tauri event
 // channel for the frontend supervision hook.
 mod git_supervision;
+// D4+D6 Blind-Spot Recommender (Phase 2): proactive enumeration of regions
+// no live observer's scope covers, ranked by information value.
+mod blind_spots;
 mod graphql;
 mod health_monitor;
 mod heartbeat;
@@ -94,6 +97,7 @@ mod mcp_embedded;
 mod memory;
 mod meta_optimizer;
 mod middleware;
+mod observer_registry;
 mod online_learning;
 mod orchestration_loop;
 mod orchestration_loop_configs;

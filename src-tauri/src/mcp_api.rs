@@ -474,6 +474,14 @@ pub fn create_router(
         );
     }
 
+    // D4+D6 Blind-Spot Recommender (Phase 2): read-through facade. Holds
+    // clones of the SAME shared Arcs `ApiState` holds (`shared_sdk_connection`
+    // and `app_state`) so its reads are live, not snapshots.
+    let observer_registry = crate::observer_registry::ObserverRegistry::new(
+        shared_sdk_connection.clone(),
+        app_state.clone(),
+    );
+
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
@@ -517,6 +525,8 @@ pub fn create_router(
         ui_bridge_evaluate_store: Arc::new(crate::ui_bridge_evaluate::EvaluateRequestStore::new()),
         // D5 Phase 1 Git Supervision Channel — bounded ring + Tauri emitter.
         supervision_state: crate::git_supervision::SupervisionState::new(),
+        // D4+D6 Blind-Spot Recommender Phase 2 — read-through observer facade.
+        observer_registry,
         // Phase 3 vision pipeline (cache + concurrency).
         // Cache root = `tmp_vision_cache/` under the runner's working dir
         // (scratch-file whitelist per feedback_scratch_file_paths.md).
@@ -1584,6 +1594,8 @@ pub fn create_router(
         .merge(crate::mcp::findings_api::routes())
         // D5 Phase 1 — Git Supervision Channel diagnostic endpoint.
         .merge(crate::mcp::git_supervision_api::routes())
+        // D4+D6 Phase 2 — Blind-Spot Recommender endpoint (GET /blind-spots).
+        .merge(crate::mcp::blind_spots_api::routes())
         .merge(crate::mcp::debug_builder_prompt::routes())
         .merge(crate::mcp::generation_rules_api::routes())
         .merge(crate::mcp::meta_optimizer_api::routes())
