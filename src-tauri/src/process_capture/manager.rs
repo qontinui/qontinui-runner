@@ -157,11 +157,13 @@ impl ProcessCaptureManager {
         let processes_ref = self.processes.clone();
         let error_monitor = self.error_monitor.clone();
         let app_handle = self.app_handle.clone();
+        let process_id_for_event_loop = process_id.clone();
+        let process_name_for_event_loop = process_name.clone();
         // Spawn the event loop for this process
         tokio::spawn(async move {
             Self::process_event_loop(
-                process_id,
-                process_name,
+                process_id_for_event_loop,
+                process_name_for_event_loop,
                 health_port,
                 output_buffer,
                 buffer_size,
@@ -173,6 +175,52 @@ impl ProcessCaptureManager {
             )
             .await;
         });
+
+        // Spawn the port-health polling loop if a health port is configured.
+        // The outer spawned PID is a shell wrapper (`cmd → poetry → python → uvicorn`
+        // on Windows); the actual service can die inside while the wrapper keeps
+        // running. The event loop only sees `Exited` from the wrapper, so without
+        // this probe `port_healthy` stays `None` forever and the Processes page
+        // can't tell "alive but not serving" from "alive and healthy".
+        if let Some(port) = health_port {
+            let processes_ref = self.processes.clone();
+            let app_handle = self.app_handle.clone();
+            let process_id_for_health = process_id.clone();
+            let process_name_for_health = process_name.clone();
+            tokio::spawn(async move {
+                Self::port_health_loop(
+                    process_id_for_health,
+                    process_name_for_health,
+                    port,
+                    processes_ref,
+                    app_handle,
+                )
+                .await;
+            });
+        }
+
+        // Spawn the descendant-tree discovery task. After ~3s the spawned
+        // child has typically forked its full wrapper chain
+        // (`cmd → poetry → python → uvicorn`); we enumerate it once so
+        // Phase 2's port_health_loop can probe the inner service PID and
+        // §3.5 can persist descendants for orphan reclaim.
+        {
+            let processes_ref = self.processes.clone();
+            let app_handle = self.app_handle.clone();
+            let process_id_for_tree = process_id.clone();
+            let process_name_for_tree = process_name.clone();
+            let health_port_for_tree = health_port;
+            tokio::spawn(async move {
+                Self::descendant_discovery_once(
+                    process_id_for_tree,
+                    process_name_for_tree,
+                    health_port_for_tree,
+                    processes_ref,
+                    app_handle,
+                )
+                .await;
+            });
+        }
 
         // Emit state change event
         let status = process.status();
@@ -199,7 +247,24 @@ impl ProcessCaptureManager {
     }
 
     /// Restart a process: stop → wait for port free → start.
+    ///
+    /// Phase 5: when `QONTINUI_REAP_RESTART=1` is set, also walks the
+    /// previously-tracked descendant tree and force-kills each PID. This
+    /// catches the case where `stop()` (which calls `taskkill /F /T`)
+    /// fails to take down a late-forked uvicorn worker — without the
+    /// explicit reap, the next `start_process` fights the orphan for the
+    /// health port and lands in the `Bound`-not-`Listen` half-bound state
+    /// that triggered this whole plan.
     pub async fn restart_process(&self, id: &str) -> Result<(), String> {
+        // Snapshot the descendant tree BEFORE `stop()` clears it.
+        let descendant_pids: Vec<u32> = {
+            let processes = self.processes.read().await;
+            processes
+                .get(id)
+                .map(|p| p.runtime.descendant_pids.iter().map(|d| d.pid).collect())
+                .unwrap_or_default()
+        };
+
         {
             let mut processes = self.processes.write().await;
             let process = processes
@@ -215,6 +280,30 @@ impl ProcessCaptureManager {
                     warn!("Port {} still occupied after restart stop phase", port);
                 }
             }
+        }
+
+        // Reap any descendant PIDs `stop()` may have missed. Gated behind
+        // an env flag for the first release cycle so the existing
+        // port-kill fallback (in `start_process`) stays armed and the new
+        // behavior is opt-in until validated in dev.
+        if std::env::var("QONTINUI_REAP_RESTART")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+            && !descendant_pids.is_empty()
+        {
+            let reaped: usize = futures::future::join_all(
+                descendant_pids
+                    .iter()
+                    .copied()
+                    .map(|pid| async move { health::kill_descendant_tree(pid).await }),
+            )
+            .await
+            .into_iter()
+            .sum();
+            info!(
+                "restart_process '{}': reaped {} descendants from prior generation",
+                id, reaped
+            );
         }
 
         // Small delay between stop and start
@@ -497,6 +586,9 @@ impl ProcessCaptureManager {
                                 if let Some(p) = procs.get_mut(&process_id) {
                                     p.runtime.state = ProcessState::Stopped;
                                     p.runtime.pid = None;
+                                    p.runtime.port_healthy = None;
+                                    p.runtime.descendant_pids.clear();
+                                    p.runtime.service_pid = None;
                                     let status = p.status();
                                     let _ = tauri::Emitter::emit(
                                         &app_handle,
@@ -558,6 +650,223 @@ impl ProcessCaptureManager {
         }
 
         info!("Event loop ended for process '{}'", process_name);
+    }
+
+    /// Periodically probe a managed process's health port and update its
+    /// `port_healthy` + `state` fields. Transitions `Running ↔ Healthy` based
+    /// on the probe; emits `process-state-changed` only when something
+    /// actually changes.
+    ///
+    /// Stops when the process leaves the `Running`/`Healthy` states (i.e. on
+    /// stop, restart, exit, or rebuild). No explicit cancellation needed —
+    /// the loop self-terminates on the next tick.
+    async fn port_health_loop(
+        process_id: String,
+        process_name: String,
+        port: u16,
+        processes: Arc<RwLock<HashMap<String, ManagedProcess>>>,
+        app_handle: tauri::AppHandle,
+    ) {
+        const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            // Bail if the process is no longer in a state we should probe;
+            // also snapshot the inner service PID so we can probe its
+            // liveness this tick (cheap `OpenProcess`/`kill(_,0)` check).
+            let service_pid = {
+                let procs = processes.read().await;
+                let Some(p) = procs.get(&process_id) else {
+                    break;
+                };
+                if !matches!(
+                    p.runtime.state,
+                    ProcessState::Running | ProcessState::Healthy
+                ) {
+                    break;
+                }
+                p.runtime.service_pid
+            };
+
+            // Service-PID liveness branch. The outer `child.wait().await` in
+            // process.rs only fires `Exited` for the cmd.exe shim; an inner
+            // uvicorn worker that crashes on import leaves the shim alive,
+            // so without this branch the runner reports `running` forever.
+            if let Some(pid) = service_pid {
+                let alive_check = tokio::task::spawn_blocking(move || health::pid_alive(pid)).await;
+                let alive = matches!(alive_check, Ok(true));
+                if !alive {
+                    let emit = {
+                        let mut procs = processes.write().await;
+                        let Some(p) = procs.get_mut(&process_id) else {
+                            break;
+                        };
+                        if !matches!(
+                            p.runtime.state,
+                            ProcessState::Running | ProcessState::Healthy
+                        ) {
+                            break;
+                        }
+                        p.runtime.state = ProcessState::Failed;
+                        p.runtime.port_healthy = Some(false);
+                        Some(p.status())
+                    };
+                    if let Some(status) = emit {
+                        tracing::warn!(
+                            "Service PID {} for '{}' is no longer alive (outer shim PID still tracked); marking Failed",
+                            pid,
+                            process_name
+                        );
+                        let _ = tauri::Emitter::emit(&app_handle, "process-state-changed", &status);
+                    }
+                    break;
+                }
+            }
+
+            // TCP connect probe with internal 500ms timeout. Runs on a
+            // blocking thread because `socket2::Socket::connect_timeout` is
+            // synchronous; otherwise it would stall the tokio worker.
+            let healthy =
+                match tokio::task::spawn_blocking(move || health::is_port_in_use(port)).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+            // Apply the result + decide whether to emit.
+            let new_status = {
+                let mut procs = processes.write().await;
+                let Some(p) = procs.get_mut(&process_id) else {
+                    break;
+                };
+                // State may have flipped during the probe (race with stop()
+                // or Exited). Don't clobber a terminal state with our update.
+                if !matches!(
+                    p.runtime.state,
+                    ProcessState::Running | ProcessState::Healthy
+                ) {
+                    break;
+                }
+
+                let prev_state = p.runtime.state;
+                let prev_healthy = p.runtime.port_healthy;
+                p.runtime.port_healthy = Some(healthy);
+                p.runtime.state = if healthy {
+                    ProcessState::Healthy
+                } else {
+                    ProcessState::Running
+                };
+
+                if prev_state != p.runtime.state || prev_healthy != Some(healthy) {
+                    Some(p.status())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(status) = new_status {
+                let _ = tauri::Emitter::emit(&app_handle, "process-state-changed", &status);
+            }
+        }
+
+        tracing::debug!(
+            "Port-health loop ended for process '{}' (port {})",
+            process_name,
+            port
+        );
+    }
+
+    /// One-shot descendant-tree discovery 3s after spawn.
+    ///
+    /// The spawned PID is the outer wrapper (`cmd.exe` on Windows). Within
+    /// ~3s it has forked the full chain down to the service worker. We
+    /// snapshot the descendant tree once, identify the inner service PID,
+    /// and write both onto `ProcessRuntime` so Phase 2 can probe the
+    /// service-PID directly and Phase 4 can persist the tracked set for
+    /// orphan reclaim. If the process leaves `Running`/`Healthy` before the
+    /// discovery query returns, we drop the result rather than clobber the
+    /// terminal state.
+    async fn descendant_discovery_once(
+        process_id: String,
+        process_name: String,
+        health_port: Option<u16>,
+        processes: Arc<RwLock<HashMap<String, ManagedProcess>>>,
+        app_handle: tauri::AppHandle,
+    ) {
+        use super::process_tree;
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Capture the spawned PID under a brief read lock; bail if state moved on.
+        let spawned_pid = {
+            let procs = processes.read().await;
+            let Some(p) = procs.get(&process_id) else {
+                return;
+            };
+            if !matches!(
+                p.runtime.state,
+                ProcessState::Running | ProcessState::Healthy
+            ) {
+                return;
+            }
+            match p.runtime.pid {
+                Some(pid) => pid,
+                None => return,
+            }
+        };
+
+        let (descendants, parent_map) =
+            process_tree::discover_descendants_with_parent_map(spawned_pid).await;
+        let service_pid =
+            process_tree::identify_service_pid(&descendants, &parent_map, health_port, spawned_pid);
+
+        let emit_status = {
+            let mut procs = processes.write().await;
+            let Some(p) = procs.get_mut(&process_id) else {
+                return;
+            };
+            // Re-check state — discovery query is async; the process may
+            // have stopped/failed while we were waiting for PowerShell.
+            if !matches!(
+                p.runtime.state,
+                ProcessState::Running | ProcessState::Healthy
+            ) {
+                return;
+            }
+            let changed = p.runtime.service_pid != service_pid
+                || p.runtime.descendant_pids.len() != descendants.len();
+            p.runtime.descendant_pids = descendants.clone();
+            p.runtime.service_pid = service_pid;
+            if changed {
+                Some(p.status())
+            } else {
+                None
+            }
+        };
+
+        info!(
+            "Discovered {} descendants for '{}' (spawned_pid={}), service_pid={:?}",
+            descendants.len(),
+            process_name,
+            spawned_pid,
+            service_pid
+        );
+
+        // Persist for §3.5 startup orphan-reclaim. Phase 4 — record the
+        // tracked root PID so a crashed-without-shutdown runner can find
+        // and reap its prior generation's orphan trees on next boot.
+        let root_entry = super::process_tree::PidWithSpawnedAt {
+            pid: spawned_pid,
+            spawned_at_unix: chrono::Utc::now().timestamp(),
+        };
+        let mut to_persist = Vec::with_capacity(descendants.len() + 1);
+        to_persist.push(root_entry);
+        to_persist.extend(descendants.iter().copied());
+        super::orphan_state::record_tree(&process_id, &to_persist);
+
+        if let Some(status) = emit_status {
+            let _ = tauri::Emitter::emit(&app_handle, "process-state-changed", &status);
+        }
     }
 
     /// Flush a batch of output lines to PG. Best-effort: failures are logged, batch is cleared.

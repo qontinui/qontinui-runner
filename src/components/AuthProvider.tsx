@@ -150,13 +150,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
       log.debug(`refreshAuth() #${callNum} - completed successfully`);
     } catch (err) {
       log.warn(`refreshAuth() #${callNum} - Token refresh failed:`, err);
-      // Don't immediately log the user out. The current access token may still be
-      // valid — a refresh failure alone (e.g., transient network issue, backend
-      // momentarily unavailable) should not destroy the user's session and cause
-      // the entire app tree (including terminal sessions) to unmount.
-      // The next refresh cycle will try again. If the token truly expired,
-      // subsequent API calls will return 401 and the user can re-authenticate.
-      setError(err as string);
+      // Don't immediately log the user out. The current access token may still
+      // be valid — a refresh failure alone (network blip, backend momentarily
+      // unavailable, 5xx) should not destroy the user's session.
+      //
+      // We also deliberately do NOT `setError(err)` here. A non-null `error`
+      // is read by `PromptHomePage`'s "Sign-in required" banner as "session
+      // expired", which it isn't — the next refresh cycle will retry. The
+      // backend's `refresh_token_impl` clears tokens itself on a true 401/403,
+      // so a real expiry surfaces through `authStatus.authenticated = false`
+      // on the next `checkAuthStatus`, not through this catch.
     }
   }, [checkAuthStatus]);
 

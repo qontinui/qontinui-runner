@@ -79,6 +79,14 @@ impl ManagedProcess {
         }
 
         self.runtime.state = ProcessState::Starting;
+        // Reset port-health each spawn so a restarted process doesn't briefly
+        // inherit the prior generation's `port_healthy` value. The manager's
+        // port-health loop overwrites this within one poll interval.
+        self.runtime.port_healthy = None;
+        // Descendant tree and inner service PID are repopulated by the
+        // post-spawn discovery task ~3s after Running.
+        self.runtime.descendant_pids.clear();
+        self.runtime.service_pid = None;
 
         let (msg_tx, msg_rx) = mpsc::channel::<ProcessMessage>(500);
 
@@ -90,6 +98,26 @@ impl ManagedProcess {
 
         let pid = child.id();
         info!("Spawned process '{}' (PID: {:?})", self.config.name, pid);
+
+        // Assign the spawned child to the singleton Job Object so it (and
+        // — via `KILL_ON_JOB_CLOSE` on the parent JobObject's lifetime —
+        // its descendant tree) auto-terminates when the runner exits, even
+        // on crash. Mirrors `claude_session/runner.rs::assign_process_to_job`
+        // and `terminal/session.rs:522`. Best-effort: if the JobObject
+        // failed to initialize at boot, this is a silent no-op.
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(handle) = child.raw_handle() {
+                crate::job_object::assign_process_to_job(
+                    handle as windows_sys::Win32::Foundation::HANDLE,
+                );
+            } else {
+                tracing::warn!(
+                    "Spawned process '{}' has no raw handle; skipping Job Object assignment",
+                    self.config.name
+                );
+            }
+        }
 
         self.runtime.pid = pid;
         self.runtime.state = ProcessState::Running;
@@ -255,6 +283,9 @@ impl ManagedProcess {
 
         self.runtime.state = ProcessState::Stopped;
         self.runtime.pid = None;
+        self.runtime.port_healthy = None;
+        self.runtime.descendant_pids.clear();
+        self.runtime.service_pid = None;
 
         info!("Process '{}' stopped", self.config.name);
     }
@@ -285,6 +316,23 @@ impl ManagedProcess {
         {
             cmd = crate::process_helpers::tokio_no_window(&self.config.command);
             cmd.args(&self.config.args);
+            // Unix analog to the Windows Job Object KILL_ON_JOB_CLOSE: ask
+            // the kernel to deliver SIGKILL to this child if our process
+            // (the runner) dies. Combined with the descendant-tree reap on
+            // graceful shutdown, this keeps orphan dev servers from
+            // accumulating across crashes.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                cmd.pre_exec(|| {
+                    // PR_SET_PDEATHSIG = 1; SIGKILL = 9.
+                    let r = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+                    if r != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
 
         cmd.current_dir(&self.config.cwd);
