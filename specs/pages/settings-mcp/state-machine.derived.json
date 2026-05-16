@@ -202,7 +202,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "ariaLabel": "Expand server card"
+            },
             "label": "Required element for Server Card Structure"
           },
           "source": "migrated",
@@ -217,7 +220,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "ariaLabel": "Edit server"
+            },
             "label": "Required element for Server Card Structure"
           },
           "source": "migrated",
@@ -232,7 +238,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "ariaLabel": "Delete server"
+            },
             "label": "Required element for Server Card Structure"
           },
           "source": "migrated",
@@ -258,7 +267,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "accessibleName": "Connected"
+            },
             "label": "Required element for Connection Status Indicators"
           },
           "source": "migrated",
@@ -273,7 +284,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "accessibleName": "Disconnected"
+            },
             "label": "Required element for Connection Status Indicators"
           },
           "source": "migrated",
@@ -288,7 +301,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "accessibleName": "Error"
+            },
             "label": "Required element for Connection Status Indicators"
           },
           "source": "migrated",
@@ -303,7 +318,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "accessibleName": "Connection status indicator"
+            },
             "label": "Required element for Connection Status Indicators"
           },
           "source": "migrated",
@@ -391,7 +408,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "ariaLabel": "Connect server"
+            },
             "label": "Required element for Connect / Disconnect Actions"
           },
           "source": "migrated",
@@ -406,7 +426,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "ariaLabel": "Disconnect server"
+            },
             "label": "Required element for Connect / Disconnect Actions"
           },
           "source": "migrated",
@@ -421,7 +444,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "accessibleName": "Connecting"
+            },
             "label": "Required element for Connect / Disconnect Actions"
           },
           "source": "migrated",
@@ -447,7 +472,11 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "attributes": {
+                "data-content-label": "tool name"
+              }
+            },
             "label": "Required element for Expanded Server Tools List"
           },
           "source": "migrated",
@@ -462,7 +491,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "No tools available"
+            },
             "label": "Required element for Expanded Server Tools List"
           },
           "source": "migrated",
@@ -494,7 +525,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "accessibleName": "Expanded Server Tools List"
+            },
             "label": "Required element for Expanded Server Tools List"
           },
           "source": "migrated",
@@ -806,7 +839,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "button",
+              "ariaLabel": "Edit server"
+            },
             "label": "Required element for Edit Server Flow"
           },
           "source": "migrated",
@@ -972,7 +1008,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "accessibleName": "MCP server configuration"
+            },
             "label": "Required element for MCP Server Data Model"
           },
           "source": "migrated",

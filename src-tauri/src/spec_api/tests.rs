@@ -681,11 +681,11 @@ mod handler_tests {
     }
 
     // ------------------------------------------------------------------------
-    // 7. post_derive_respects_feature_flag
+    // 7. post_derive_rejects_degenerate_ir
     // ------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn post_derive_respects_feature_flag() {
+    async fn post_derive_rejects_degenerate_ir() {
         let tmp = tempfile::tempdir().unwrap();
         // Seed a degenerate IR on disk.
         let doc = degenerate_doc("derive-degen");
@@ -697,27 +697,11 @@ mod handler_tests {
         )
         .unwrap();
 
-        // Flag OFF — derivation succeeds despite degenerate IR.
-        let body_off = DeriveBody {
+        let body = DeriveBody {
             page_id: "derive-degen".to_string(),
             derivation: "incomingTransitions".to_string(),
         };
-        let resp = build_derive_response(tmp.path(), body_off, false);
-        let (status, v) = response_to_json(resp).await;
-        assert_eq!(
-            status,
-            axum::http::StatusCode::OK,
-            "with flag off, derive should succeed; body={}",
-            v
-        );
-        assert_eq!(v["ok"], true);
-
-        // Flag ON — derivation rejects with 422.
-        let body_on = DeriveBody {
-            page_id: "derive-degen".to_string(),
-            derivation: "incomingTransitions".to_string(),
-        };
-        let resp = build_derive_response(tmp.path(), body_on, true);
+        let resp = build_derive_response(tmp.path(), body);
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(v["ok"], false);

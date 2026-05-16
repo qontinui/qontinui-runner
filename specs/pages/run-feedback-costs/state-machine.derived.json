@@ -633,7 +633,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "tab"
+            },
             "label": "Required element for Tab Navigation"
           },
           "source": "migrated",
@@ -648,7 +650,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "tablist"
+            },
             "label": "Required element for Tab Navigation"
           },
           "source": "migrated",
@@ -690,7 +694,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "generic"
+            },
             "label": "Required element for Element Presence"
           },
           "source": "migrated",
@@ -705,7 +711,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "progressbar"
+            },
             "label": "Required element for Element Presence"
           },
           "source": "migrated",
@@ -720,7 +728,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "status"
+            },
             "label": "Required element for Element Presence"
           },
           "source": "migrated",
@@ -753,7 +763,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "cell"
+            },
             "label": "Required element for Element Presence"
           },
           "source": "migrated",
@@ -778,7 +790,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "progressbar"
+            },
             "label": "Required element for Data Display Formatting"
           },
           "source": "migrated",
@@ -844,7 +858,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "row"
+            },
             "label": "Required element for Data Display Formatting"
           },
           "source": "migrated",
@@ -932,7 +948,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "text": "Avg Score"
+            },
             "label": "Required element for State Consistency"
           },
           "source": "migrated",
@@ -947,7 +965,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "text": "Total Cost"
+            },
             "label": "Required element for State Consistency"
           },
           "source": "migrated",
@@ -962,7 +982,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "textContains": "Automated"
+            },
             "label": "Required element for State Consistency"
           },
           "source": "migrated",
@@ -977,7 +999,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": {},
+            "criteria": {
+              "role": "row"
+            },
             "label": "Required element for State Consistency"
           },
           "source": "migrated",
