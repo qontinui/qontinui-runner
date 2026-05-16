@@ -1,5 +1,14 @@
 import { cn } from "../../lib/utils";
-import { Circle, Loader2, CheckCircle2, XCircle, Square, ArrowDown, Hammer } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowDown,
+  CheckCircle2,
+  Circle,
+  Hammer,
+  Loader2,
+  Square,
+  XCircle,
+} from "lucide-react";
 
 type ProcessState =
   | "stopped"
@@ -12,8 +21,24 @@ type ProcessState =
 
 interface ProcessStatusBadgeProps {
   state: ProcessState;
+  /**
+   * Result of the manager's TCP probe against `health_port`. `null` if no
+   * port is configured or the first probe hasn't fired yet (the loop ticks
+   * every 3s). `false` after the first failing probe means "alive, but
+   * nothing accepting connections on the port".
+   */
+  portHealthy?: boolean | null;
+  /**
+   * Process uptime in seconds. Used for the port-dead grace window — we
+   * suppress the amber badge for the first 30s after start so normal
+   * Python/Node startup time doesn't paint the row yellow.
+   */
+  uptimeSecs?: number | null;
   className?: string;
 }
+
+/** Seconds after spawn before `port_healthy: false` is treated as a problem. */
+const PORT_DEAD_GRACE_SECS = 30;
 
 const stateConfig: Record<ProcessState, { icon: React.ReactNode; label: string; classes: string }> =
   {
@@ -54,8 +79,24 @@ const stateConfig: Record<ProcessState, { icon: React.ReactNode; label: string; 
     },
   };
 
-export function ProcessStatusBadge({ state, className }: ProcessStatusBadgeProps) {
-  const config = stateConfig[state] || stateConfig.stopped;
+export function ProcessStatusBadge({
+  state,
+  portHealthy,
+  uptimeSecs,
+  className,
+}: ProcessStatusBadgeProps) {
+  const portDead =
+    state === "running" &&
+    portHealthy === false &&
+    (uptimeSecs ?? 0) > PORT_DEAD_GRACE_SECS;
+
+  const config = portDead
+    ? {
+        icon: <AlertTriangle className="w-3 h-3" />,
+        label: "Running (port dead)",
+        classes: "bg-amber-900/30 text-amber-400 border-amber-800",
+      }
+    : stateConfig[state] || stateConfig.stopped;
 
   return (
     <span
@@ -64,6 +105,11 @@ export function ProcessStatusBadge({ state, className }: ProcessStatusBadgeProps
         config.classes,
         className,
       )}
+      title={
+        portDead
+          ? "The configured health port stopped accepting connections. The process is alive but not serving — typically a worker crash inside the wrapper. Restart to recover."
+          : undefined
+      }
     >
       {config.icon}
       {config.label}
