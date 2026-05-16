@@ -41,6 +41,109 @@ fn invoke_emit(snapshot_id: &str, page_ids: Vec<String>, invoked_via: &str) {
     });
 }
 
+/// Adapt a snapshot payload that may be in either the canonical
+/// [`UIBridgeSnapshot`] shape OR the SDK control-mode shape returned by
+/// `GET /ui-bridge/control/snapshot`. Tries strict parse first; on failure
+/// walks the elements array and fills in the canonical required fields
+/// (`identifier`, `state`, `registeredAt`, `mounted`, `type`) from whatever
+/// the control-mode element carries, then re-parses.
+///
+/// The two shapes differ because the SDK control-mode serializer emits
+/// elements without the canonical `identifier` / `state` / `registeredAt` /
+/// `mounted` fields. Pre-2026-05-17, callers couldn't round-trip
+/// `/control/snapshot` → `/spec-check.snapshot` (422 missing field). This
+/// adapter is the boundary fix; a v1.1 follow-up unifies the SDK shape
+/// upstream in ui-bridge-auto.
+pub(crate) fn adapt_supplied_snapshot(
+    value: serde_json::Value,
+) -> Result<UIBridgeSnapshot, String> {
+    // Path 1: strict canonical parse.
+    if let Ok(snap) = serde_json::from_value::<UIBridgeSnapshot>(value.clone()) {
+        return Ok(snap);
+    }
+
+    // Path 2: walk elements and synthesize missing canonical fields.
+    let mut root = match value {
+        serde_json::Value::Object(m) => m,
+        _ => return Err("snapshot payload must be a JSON object".into()),
+    };
+    let timestamp = root.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+    let elements_arr = root
+        .get_mut("elements")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| "snapshot.elements must be a JSON array".to_string())?;
+    for el in elements_arr.iter_mut() {
+        let obj = match el {
+            serde_json::Value::Object(m) => m,
+            _ => continue,
+        };
+
+        // `type` (renamed serde field; raw JSON key is "type")
+        obj.entry("type")
+            .or_insert_with(|| serde_json::Value::String("generic".into()));
+
+        // `identifier` — synthesize from `id` if absent
+        if !obj.contains_key("identifier") {
+            let id_str = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            obj.insert(
+                "identifier".into(),
+                serde_json::json!({
+                    "uiId": id_str,
+                    "xpath": "",
+                    "selector": "",
+                }),
+            );
+        }
+
+        // `state` — synthesize from `bbox` + visibility hints if absent
+        if !obj.contains_key("state") {
+            let (x, y, width, height) = obj
+                .get("bbox")
+                .and_then(|b| b.as_object())
+                .map(|b| {
+                    (
+                        b.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        b.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        b.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        b.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    )
+                })
+                .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let visible = obj
+                .get("visible")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(width > 0.0 && height > 0.0);
+            obj.insert(
+                "state".into(),
+                serde_json::json!({
+                    "visible": visible,
+                    "enabled": true,
+                    "focused": false,
+                    "rect": {
+                        "x": x, "y": y, "width": width, "height": height,
+                        "top": y, "left": x,
+                        "right": x + width, "bottom": y + height,
+                    },
+                }),
+            );
+        }
+
+        // `registeredAt` — fall back to snapshot timestamp, then 0
+        obj.entry("registeredAt")
+            .or_insert_with(|| serde_json::Value::from(timestamp));
+
+        // `mounted` — default true
+        obj.entry("mounted")
+            .or_insert_with(|| serde_json::Value::Bool(true));
+    }
+    serde_json::from_value::<UIBridgeSnapshot>(serde_json::Value::Object(root))
+        .map_err(|e| format!("snapshot adapt failed after fill: {e}"))
+}
+
 /// Roll up a single `SpecCheckResult` (or many) into the `SpecCheckCompleted`
 /// counts. `page_count` is the input count — `eval_error_count` is the
 /// difference between input and successfully-evaluated results (only meaningful
@@ -110,7 +213,13 @@ pub(crate) async fn fetch_fresh_snapshot(
                 None,
                 c.app_info.framework.clone(),
             ),
-            None => return Err(spec_check::SnapshotFetchError::NotConnected),
+            // Self-snapshot fallback (Issue 4 / 2026-05-17 remediation).
+            // No external SDK is connected, but the runner's OWN React
+            // webview is auto-instrumented and serves `/control/snapshot`
+            // directly via its own handlers. Loop back over HTTP to that
+            // local endpoint so callers can spec-check the runner UI
+            // without having to spin up an external SDK client.
+            None => return fetch_self_snapshot().await,
         }
     };
     match crate::mcp::sdk_client::dispatch_app_request(
@@ -126,6 +235,80 @@ pub(crate) async fn fetch_fresh_snapshot(
         Ok(value) => spec_check::wrap_snapshot(value, app_id, app_version, route, bridge_version),
         Err(e) => Err(classify_sdk_error(&e)),
     }
+}
+
+/// Loop back to the runner's own `/ui-bridge/control/snapshot` when no
+/// external SDK client is connected. Issue 4 / 2026-05-17 remediation —
+/// previously, `fetch_fresh_snapshot` returned `NotConnected` unconditionally
+/// in this case, leaving the runner unable to spec-check its own UI.
+///
+/// The SDK control-mode shape differs from the canonical [`UIBridgeSnapshot`];
+/// we route the response through [`adapt_supplied_snapshot`] (Issue 2 adapter)
+/// before wrapping. App identity is synthesized — `app_id = "self"`.
+async fn fetch_self_snapshot() -> Result<
+    (
+        UIBridgeSnapshot,
+        qontinui_types::spec_check::BridgeFingerprint,
+        String,
+        String,
+    ),
+    spec_check::SnapshotFetchError,
+> {
+    use spec_check::SnapshotFetchError as E;
+
+    let port = crate::mcp::types::get_mcp_api_port();
+    let url = format!("http://127.0.0.1:{port}/ui-bridge/control/snapshot");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| E::Network(format!("reqwest client init: {e}")))?;
+
+    let resp = client.get(&url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            E::Timeout { elapsed_ms: 5000 }
+        } else {
+            E::Network(format!("self-snapshot fetch: {e}"))
+        }
+    })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(E::Network(format!(
+            "self-snapshot fetch returned HTTP {status}"
+        )));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| E::Malformed(format!("self-snapshot body parse: {e}")))?;
+
+    // The `/ui-bridge/control/snapshot` endpoint wraps payloads in
+    // `{success, data}`. The inner `data` is the snapshot shape.
+    let inner = body.get("data").cloned().unwrap_or(body);
+
+    let snapshot = adapt_supplied_snapshot(inner)
+        .map_err(|e| E::Malformed(format!("self-snapshot adapt: {e}")))?;
+
+    let fingerprint = qontinui_types::spec_check::BridgeFingerprint {
+        app_id: "self".to_string(),
+        app_version: None,
+        route: None,
+        bridge_version: None,
+        snapshot_timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+            snapshot.timestamp,
+        )
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default(),
+        element_count: snapshot.elements.len() as u32,
+    };
+    Ok((
+        snapshot,
+        fingerprint,
+        format!("scs_self_{}", uuid::Uuid::now_v7()),
+        String::new(),
+    ))
 }
 
 /// Classify the stringly-typed error from `dispatch_app_request` into a
@@ -194,10 +377,15 @@ fn invalid_page_id(page_id: &str) -> bool {
 // ===========================================================================
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SpecCheckRequest {
     pub page_id: String,
+    /// Optional caller-supplied snapshot. Accepted in either the canonical
+    /// [`UIBridgeSnapshot`] shape OR the SDK control-mode shape (the output
+    /// of `GET /ui-bridge/control/snapshot`); converted via
+    /// [`adapt_supplied_snapshot`] before evaluation.
     #[serde(default)]
-    pub snapshot: Option<UIBridgeSnapshot>,
+    pub snapshot: Option<serde_json::Value>,
 }
 
 /// `POST /spec-check` — evaluate one page spec against a fresh (or supplied)
@@ -248,10 +436,25 @@ pub async fn post_spec_check(
 
     // Fetch snapshot (fresh or supplied).
     let (snapshot, _fingerprint, snapshot_id, _content_hash) = match req.snapshot {
-        Some(s) => {
-            // Caller-supplied path: skip wrap_snapshot, synthesize the
-            // fingerprint locally. Snapshot identity for replay is the
-            // caller's responsibility.
+        Some(raw) => {
+            // Caller-supplied path: try-strict-then-adapt to accept both the
+            // canonical UIBridgeSnapshot shape and the SDK control-mode shape
+            // out of GET /ui-bridge/control/snapshot. Skip wrap_snapshot;
+            // synthesize the fingerprint locally. Snapshot identity for
+            // replay is the caller's responsibility.
+            let s = match adapt_supplied_snapshot(raw) {
+                Ok(s) => s,
+                Err(detail) => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(SpecError::with_detail(
+                            "snapshot-malformed",
+                            json!({ "pageId": req.page_id, "detail": detail }),
+                        )),
+                    )
+                        .into_response();
+                }
+            };
             let fp = qontinui_types::spec_check::BridgeFingerprint {
                 app_id: "supplied".to_string(),
                 app_version: None,
@@ -310,27 +513,32 @@ pub async fn post_spec_check(
 // ===========================================================================
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BatchRequest {
     pub snapshot: BatchSnapshot,
     pub pages: Vec<BatchPageEntry>,
-    #[serde(default, rename = "sharedPolicy")]
+    #[serde(default)]
     pub shared_policy: Option<SpecCheckPolicy>,
     #[serde(default)]
     pub stream: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BatchSnapshot {
     pub source: String, // "fresh" | "supplied"
+    /// Optional supplied snapshot. Same wire-shape flexibility as
+    /// [`SpecCheckRequest::snapshot`] — canonical [`UIBridgeSnapshot`] or
+    /// SDK control-mode output; adapted via [`adapt_supplied_snapshot`].
     #[serde(default)]
-    pub blob: Option<UIBridgeSnapshot>,
+    pub blob: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BatchPageEntry {
-    #[serde(rename = "pageId")]
     pub page_id: String,
-    #[serde(default, rename = "policyOverride")]
+    #[serde(default)]
     pub policy_override: Option<SpecCheckPolicy>,
 }
 
@@ -365,10 +573,22 @@ pub async fn post_spec_check_batch(
             Err(err) => return snapshot_error_to_response(err),
         },
         "supplied" => match req.snapshot.blob {
-            Some(s) => (
-                Arc::new(s),
-                format!("scs_supplied_{}", uuid::Uuid::now_v7()),
-            ),
+            Some(raw) => match adapt_supplied_snapshot(raw) {
+                Ok(s) => (
+                    Arc::new(s),
+                    format!("scs_supplied_{}", uuid::Uuid::now_v7()),
+                ),
+                Err(detail) => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(SpecError::with_detail(
+                            "snapshot-malformed",
+                            json!({ "cause": "supplied-snapshot-adapt-failed", "detail": detail }),
+                        )),
+                    )
+                        .into_response();
+                }
+            },
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -864,9 +1084,123 @@ mod tests {
     #[test]
     fn spec_check_request_snapshot_is_optional() {
         let req: SpecCheckRequest =
-            serde_json::from_value(json!({ "page_id": "settings-general" })).unwrap();
+            serde_json::from_value(json!({ "pageId": "settings-general" })).unwrap();
         assert_eq!(req.page_id, "settings-general");
         assert!(req.snapshot.is_none());
+    }
+
+    #[test]
+    fn spec_check_request_rejects_snake_case_page_id() {
+        // Post-remediation: wire is camelCase. snake_case must NOT silently
+        // succeed — would mask caller mistakes (the very class of bug this
+        // PR fixes).
+        let result: Result<SpecCheckRequest, _> =
+            serde_json::from_value(json!({ "page_id": "settings-general" }));
+        assert!(
+            result.is_err(),
+            "snake_case page_id must be rejected; got {:?}",
+            result
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // adapt_supplied_snapshot — try-strict-then-adapt
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn adapt_supplied_snapshot_passes_through_canonical_shape() {
+        // A snapshot already in the canonical shape should round-trip
+        // without modification.
+        let s: UIBridgeSnapshot =
+            serde_json::from_value(minimal_snapshot_json()).expect("fixture parses");
+        let raw = serde_json::to_value(&s).expect("serialize");
+        let adapted = adapt_supplied_snapshot(raw).expect("strict-parse path");
+        assert_eq!(adapted.timestamp, s.timestamp);
+        assert_eq!(adapted.elements.len(), s.elements.len());
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_fills_missing_fields_from_control_mode() {
+        // Mimic the SDK control-mode element shape: `id`, `actions`, `bbox`,
+        // `category` present; `identifier`, `state`, `registeredAt`,
+        // `mounted`, `type` absent. Adapter must synthesize.
+        let raw = json!({
+            "timestamp": 1_700_000_000_000_i64,
+            "elements": [
+                {
+                    "id": "button-submit",
+                    "category": "interactive",
+                    "actions": ["focus", "click", "hover"],
+                    "bbox": { "x": 100.0, "y": 200.0, "width": 80.0, "height": 24.0 },
+                    "role": "button",
+                    "text": "Submit",
+                }
+            ],
+            "components": []
+        });
+        let adapted = adapt_supplied_snapshot(raw).expect("control-mode adapt");
+        assert_eq!(adapted.elements.len(), 1);
+        let el = &adapted.elements[0];
+        assert_eq!(el.id, "button-submit");
+        assert_eq!(el.element_type, "generic"); // synthesized default
+        assert_eq!(el.identifier.ui_id.as_deref(), Some("button-submit"));
+        assert!(el.mounted);
+        assert!(el.state.visible); // 80x24 bbox → derived visible=true
+        assert_eq!(el.state.rect.x, 100.0);
+        assert_eq!(el.state.rect.width, 80.0);
+        assert_eq!(el.state.rect.right, 180.0);
+        assert_eq!(el.state.rect.bottom, 224.0);
+        assert_eq!(el.role.as_deref(), Some("button")); // preserved from input
+        assert_eq!(el.text.as_deref(), Some("Submit"));
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_marks_invisible_when_bbox_zero() {
+        // Zero-bbox should derive state.visible = false (matches the SDK's
+        // `bbox.width > 0 && bbox.height > 0` convention).
+        let raw = json!({
+            "timestamp": 0i64,
+            "elements": [{
+                "id": "hidden",
+                "bbox": { "x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0 },
+            }],
+        });
+        let adapted = adapt_supplied_snapshot(raw).expect("adapt");
+        assert!(!adapted.elements[0].state.visible);
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_rejects_non_object_payload() {
+        let raw = json!([1, 2, 3]);
+        assert!(adapt_supplied_snapshot(raw).is_err());
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_accepts_missing_elements_as_empty() {
+        // Canonical UIBridgeSnapshot.elements carries #[serde(default)], so
+        // a payload with `timestamp` but no `elements` is a valid empty
+        // snapshot at the strict-parse layer. The adapter must NOT reject
+        // it (it never reaches the fill-path).
+        let raw = json!({ "timestamp": 42 });
+        let snap = adapt_supplied_snapshot(raw).expect("missing elements is valid empty");
+        assert_eq!(snap.timestamp, 42);
+        assert!(snap.elements.is_empty());
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_preserves_explicit_visible_flag() {
+        // If the SDK emits `visible: false` even with a non-zero bbox,
+        // honor the explicit value.
+        let raw = json!({
+            "timestamp": 0i64,
+            "elements": [{
+                "id": "off-screen-but-sized",
+                "bbox": { "x": 0.0, "y": 0.0, "width": 50.0, "height": 50.0 },
+                "visible": false,
+            }],
+        });
+        let adapted = adapt_supplied_snapshot(raw).expect("adapt");
+        assert!(!adapted.elements[0].state.visible);
     }
 
     // ------------------------------------------------------------------------
