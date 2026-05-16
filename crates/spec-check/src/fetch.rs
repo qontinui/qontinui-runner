@@ -44,6 +44,15 @@ pub enum SnapshotFetchError {
 ///   `SpecCheckResult.spec_content_hash`.
 /// - `fingerprint.snapshot_timestamp` is the snapshot's Unix-epoch millis
 ///   converted to ISO-8601 UTC with millisecond precision.
+#[tracing::instrument(
+    name = "spec_check.fetch_snapshot",
+    skip(raw),
+    fields(
+        app_id = %app_id,
+        bridge_version = ?bridge_version,
+        snapshot_id = tracing::field::Empty,
+    ),
+)]
 pub fn wrap_snapshot(
     raw: serde_json::Value,
     app_id: String,
@@ -66,6 +75,8 @@ pub fn wrap_snapshot(
         snapshot_timestamp,
         element_count: snapshot.elements.len() as u32,
     };
+
+    tracing::Span::current().record("snapshot_id", tracing::field::display(&snapshot_id));
 
     Ok((snapshot, fingerprint, snapshot_id, content_sha256))
 }

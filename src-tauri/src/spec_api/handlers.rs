@@ -679,11 +679,11 @@ pub(crate) fn build_author_response(root: &std::path::Path, doc: IrPageSpec) -> 
                 .into_response();
         }
     };
-    events::emit(SpecChanged {
+    events::emit(events::SpecApiEvent::SpecChanged(SpecChanged {
         page_id: doc.id.clone(),
         kind: "ir-and-projection".to_string(),
         at_ms: events::now_ms(),
-    });
+    }));
     (
         StatusCode::OK,
         Json(json!({
@@ -705,10 +705,29 @@ pub async fn get_subscribe(
     let rx = events::subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|res| async move {
         match res {
-            Ok(ev) => match Event::default().event("spec.changed").json_data(&ev) {
-                Ok(e) => Some(Ok::<Event, Infallible>(e)),
-                Err(_) => None,
-            },
+            Ok(ev) => {
+                // Use the variant's kebab-case discriminator (matches the
+                // `#[serde(tag = "type", rename_all = "kebab-case")]` shape)
+                // as the SSE event name.
+                let event_name = match &ev {
+                    events::SpecApiEvent::SpecChanged(_) => "spec-changed",
+                    events::SpecApiEvent::SpecCheckInvoked { .. } => "spec-check-invoked",
+                    events::SpecApiEvent::SpecCheckCompleted { .. } => "spec-check-completed",
+                    events::SpecApiEvent::SpecCheckPolicyViolation { .. } => {
+                        "spec-check-policy-violation"
+                    }
+                    events::SpecApiEvent::FlywheelProposalPromoted { .. } => {
+                        "flywheel-proposal-promoted"
+                    }
+                    events::SpecApiEvent::FlywheelProposalDemoted { .. } => {
+                        "flywheel-proposal-demoted"
+                    }
+                };
+                match Event::default().event(event_name).json_data(&ev) {
+                    Ok(e) => Some(Ok::<Event, Infallible>(e)),
+                    Err(_) => None,
+                }
+            }
             Err(_) => None,
         }
     });

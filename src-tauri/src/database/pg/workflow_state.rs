@@ -302,8 +302,12 @@ impl PgDb {
             .get("critical_failure")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let result_json = serde_json::to_string(result)
-            .map_err(|e| format!("Failed to serialize verification result: {}", e))?;
+        // CR-5: `workflow_verification_phase_results.result_json` is `jsonb`
+        // after `PgDb::new()`'s self-bootstrap (`mod.rs` CR-5 block). Bind
+        // the `serde_json::Value` directly so tokio-postgres maps it via the
+        // `with-serde_json-1` ToSql impl — NOT `to_string(...)` (which would
+        // store an escaped string literal and break §5.16 JSONB-path indexes).
+        let result_json: &serde_json::Value = result;
         let iter_i32 = iteration as i32;
 
         // Check for existing record

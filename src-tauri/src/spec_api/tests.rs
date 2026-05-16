@@ -291,17 +291,22 @@ mod handler_tests {
     async fn sse_receives_emitted_event() {
         // Exercise the broadcaster directly: subscribe, emit, await event.
         let mut rx = events::subscribe();
-        events::emit(events::SpecChanged {
+        events::emit(events::SpecApiEvent::SpecChanged(events::SpecChanged {
             page_id: "active".to_string(),
             kind: "ir-and-projection".to_string(),
             at_ms: events::now_ms(),
-        });
+        }));
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("subscriber should receive within timeout")
             .expect("event must arrive");
-        assert_eq!(received.page_id, "active");
-        assert_eq!(received.kind, "ir-and-projection");
+        match received {
+            events::SpecApiEvent::SpecChanged(payload) => {
+                assert_eq!(payload.page_id, "active");
+                assert_eq!(payload.kind, "ir-and-projection");
+            }
+            other => panic!("expected SpecChanged variant, got {other:?}"),
+        }
     }
 
     #[tokio::test]

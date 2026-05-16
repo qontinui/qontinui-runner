@@ -20,6 +20,7 @@ once_cell = "1.19"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 strsim = "0.11"
+tracing = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -29,6 +30,14 @@ insta = { version = "1", features = ["json"] }
 # production code routes through qontinui_types::canonical_hash, which
 # returns a hash rather than canonical bytes — different purpose).
 serde_jcs = "0.1"
+# Plan 06 Step 7: capture tracing output in observability_smoke.rs to verify
+# spec_check.evaluate / evaluate_batch spans round-trip with snapshot_id.
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[features]
+# Plan 06 Step 7: the integration smoke test is gated behind this feature so
+# day-to-day `cargo test` skips it. CI runs `cargo test --features integration`.
+integration = []
 
 [[bench]]
 name = "matcher"

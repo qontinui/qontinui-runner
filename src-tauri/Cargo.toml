@@ -53,6 +53,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "chrono"] }
 tracing-appender = "0.2"
 chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
 url = "2"
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "anyhow", "reqwest", "rustls"] }
 dirs = "6.0"
@@ -245,6 +246,10 @@ path = "src/bin/wrappers_mcp.rs"
 [[bin]]
 name = "scan_spec_distinctness"
 path = "src/bin/scan_spec_distinctness.rs"
+
+[[bin]]
+name = "qontinui_specs"
+path = "src/bin/qontinui_specs.rs"
 
 [lints.rust]
 dead_code = "allow"

@@ -313,6 +313,55 @@ table "spec_proposals" {
 }
 
 // ---------------------------------------------------------------
+// project.proposal_events — Plan 06 Step 6 (G.6) flywheel observability.
+// Append-only log of state transitions on spec_proposals rows. Written
+// alongside the corresponding SpecApiEvent broadcast (Plan 06 Step 2).
+// Decouples durable history from broadcast; a subscriber that drops events
+// still gets full history from this table.
+// ---------------------------------------------------------------
+
+table "proposal_events" {
+  schema = schema.project
+  column "id" {
+    null = false
+    type = text
+  }
+  column "proposal_id" {
+    null = false
+    type = text
+  }
+  column "event_type" {
+    null = false
+    type = text
+  }
+  column "snapshot_id" {
+    null = true
+    type = text
+  }
+  column "failing_assertion_id" {
+    null = true
+    type = text
+  }
+  column "at" {
+    null    = false
+    type    = timestamptz
+    default = sql("now()")
+  }
+  primary_key {
+    columns = [column.id]
+  }
+  check "proposal_events_type_chk" {
+    expr = "event_type IN ('scanned','executed','promoted','demoted','failed')"
+  }
+  index "proposal_events_proposal_at_idx" {
+    columns = [column.proposal_id, column.at]
+  }
+  index "proposal_events_type_at_idx" {
+    columns = [column.event_type, column.at]
+  }
+}
+
+// ---------------------------------------------------------------
 // coord.coordinator_shadow_decisions — soak comparison of shadow vs live
 // scheduler decisions. Created by Rust ensure_shadow_decisions_table; this
 // HCL is now source of truth.
