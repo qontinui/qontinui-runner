@@ -40,8 +40,10 @@ use tracing::{debug, info, warn};
 use crate::commands::spec_drift::RegisteredElement;
 use crate::database::pg::spec_proposals::SpecProposalRow;
 use crate::mcp::types::ApiState;
+use crate::spec_api::events;
 use crate::spec_api::responses::SpecError;
 use crate::spec_api::storage;
+use qontinui_types::spec_api_events::SpecApiEvent;
 
 // =============================================================================
 // Scan endpoint — POST /spec/proposals/scan
@@ -720,7 +722,7 @@ pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response 
         .await;
 
         match gate_result {
-            Ok(_) => {
+            Ok(green_result) => {
                 let new_greens = prop.consecutive_greens.saturating_add(1);
                 if new_greens >= 2 {
                     // Promote.
@@ -729,6 +731,15 @@ pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response 
                             let _ = pg_db.update_proposal_status(&prop.id, "promoted").await;
                             let _ = pg_db.update_proposal_attempt_only(&prop.id).await;
                             promoted += 1;
+                            // Plan 06: Promoted emit — joins via snapshot_id
+                            // against the green run that triggered it.
+                            events::emit(SpecApiEvent::FlywheelProposalPromoted {
+                                proposal_id: prop.id.clone(),
+                                page_id: spec_id.clone(),
+                                consecutive_greens: new_greens.max(0) as u32,
+                                snapshot_id: green_result.snapshot_id.clone(),
+                                at_ms: events::now_ms(),
+                            });
                             info!(
                                 "post_sweep_pending: promoted {} (spec_id={})",
                                 prop.id, spec_id
@@ -757,6 +768,8 @@ pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response 
             }
             Err(crate::spec_api::validator::ValidatorError::BExecutionRed {
                 result_summary,
+                snapshot_id: red_snapshot_id,
+                failing_assertion,
                 ..
             }) => {
                 let detail = format!(
@@ -781,6 +794,20 @@ pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response 
                     .await;
                 let _ = pg_db.update_proposal_greens(&prop.id, 0).await;
                 demoted += 1;
+                // Plan 06: Demoted emit. `failing_assertion` is `None` only
+                // when the red came from policy `Indeterminate` over an
+                // empty-in-scope assertion set — emit empty-string locator
+                // in that case so the wire shape stays uniform.
+                let (failing_state_id, failing_assertion_id) =
+                    failing_assertion.unwrap_or_default();
+                events::emit(SpecApiEvent::FlywheelProposalDemoted {
+                    proposal_id: prop.id.clone(),
+                    page_id: spec_id.clone(),
+                    failing_assertion_id,
+                    failing_state_id,
+                    snapshot_id: red_snapshot_id,
+                    at_ms: events::now_ms(),
+                });
                 info!(
                     "post_sweep_pending: demoted {} (spec_id={}): {}",
                     prop.id, spec_id, detail
