@@ -21,7 +21,7 @@ import {
   Settings2,
 } from "lucide-react";
 
-import { ProcessStatusBadge } from "./ProcessStatusBadge";
+import { ProcessStatusBadge, isPortDead } from "./ProcessStatusBadge";
 import { ProcessOutputViewer } from "./ProcessOutputViewer";
 import { ProcessConfigEditor } from "./ProcessConfigEditor";
 import { ScanProjectsModal } from "./ScanProjectsModal";
@@ -91,6 +91,13 @@ export function ProcessManagerTab() {
   const [loading, setLoading] = useState(true);
   const unlistenRef = useRef<UnlistenFn | null>(null);
   const [identity, setIdentity] = useState<RunnerIdentity | null>(null);
+  /**
+   * Last few stderr lines per port-dead process, populated on a 6s cadence
+   * for any process matching `isPortDead()`. Surfaces inline on the badge
+   * tooltip so the user sees the inner uvicorn traceback without having to
+   * click into the row.
+   */
+  const [stderrTails, setStderrTails] = useState<Record<string, string>>({});
 
   // AI Fix session state
   const [aiFixActive, setAiFixActive] = useState(false);
@@ -162,6 +169,65 @@ export function ProcessManagerTab() {
     const interval = setInterval(loadProcesses, 5000);
     return () => clearInterval(interval);
   }, [loadProcesses]);
+
+  // Pull a tail of stderr for every process currently in the amber
+  // "port dead" state. Runs on a 6s cadence — half the rate of the
+  // backend's 3s port_health probe, which is fast enough that the tooltip
+  // catches up to a fresh traceback within one render but slow enough to
+  // not hammer the IPC layer. Cleared automatically when the process
+  // leaves port-dead state.
+  useEffect(() => {
+    const portDeadIds = processes
+      .filter((p) => isPortDead(p.state, p.port_healthy, p.uptime_secs))
+      .map((p) => p.id);
+
+    if (portDeadIds.length === 0) {
+      setStderrTails((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+      return;
+    }
+
+    let cancelled = false;
+    const fetchTails = async () => {
+      const updates: Record<string, string> = {};
+      await Promise.all(
+        portDeadIds.map(async (id) => {
+          try {
+            const lines = await invoke<OutputLine[]>("get_process_output", {
+              id,
+              tail: 80,
+            });
+            const stderrText = lines
+              .filter((l) => l.stream === "stderr")
+              .slice(-5)
+              .map((l) => l.line)
+              .join("\n");
+            updates[id] = stderrText;
+          } catch {
+            // Best-effort — leave the previous tail in place on transient
+            // IPC errors. Don't overwrite with empty so a momentarily-slow
+            // fetch doesn't blank the tooltip mid-render.
+          }
+        }),
+      );
+      if (!cancelled) {
+        setStderrTails((prev) => {
+          // Drop entries for processes that have left port-dead state and
+          // merge in fresh tails for the current set.
+          const next: Record<string, string> = {};
+          for (const id of portDeadIds) {
+            next[id] = updates[id] ?? prev[id] ?? "";
+          }
+          return next;
+        });
+      }
+    };
+    void fetchTails();
+    const interval = setInterval(fetchTails, 6000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [processes]);
 
   const handleStart = useCallback(
     async (id: string, e: React.MouseEvent) => {
@@ -595,7 +661,12 @@ Be concise and actionable.`;
                       <ChevronRight className="w-3 h-3 text-zinc-500 shrink-0" />
                     )}
                     <span className="text-sm text-zinc-200 truncate">{proc.name}</span>
-                    <ProcessStatusBadge state={proc.state} />
+                    <ProcessStatusBadge
+                      state={proc.state}
+                      portHealthy={proc.port_healthy}
+                      uptimeSecs={proc.uptime_secs}
+                      stderrTail={stderrTails[proc.id]}
+                    />
                   </div>
                   <div className="flex items-center gap-3 mt-1 ml-5 text-xs text-zinc-500">
                     {proc.pid && <span>PID: {proc.pid}</span>}
@@ -629,8 +700,17 @@ Be concise and actionable.`;
                     <>
                       <button
                         onClick={(e) => handleRestart(proc.id, e)}
-                        className="p-1.5 text-yellow-500 hover:text-yellow-400 hover:bg-yellow-500/10 rounded transition-colors"
-                        title="Restart"
+                        className={cn(
+                          "p-1.5 rounded transition-colors",
+                          isPortDead(proc.state, proc.port_healthy, proc.uptime_secs)
+                            ? "text-amber-400 hover:text-amber-300 hover:bg-amber-400/10 animate-pulse"
+                            : "text-yellow-500 hover:text-yellow-400 hover:bg-yellow-500/10",
+                        )}
+                        title={
+                          isPortDead(proc.state, proc.port_healthy, proc.uptime_secs)
+                            ? "Restart (port dead — inner service is not responding)"
+                            : "Restart"
+                        }
                       >
                         <RotateCcw className="w-3.5 h-3.5" />
                       </button>

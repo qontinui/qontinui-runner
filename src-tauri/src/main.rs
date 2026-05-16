@@ -2179,6 +2179,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 if is_secondary {
                     info!("Secondary instance — skipping managed process auto-start");
                 } else {
+                    // Reclaim any orphan descendant trees left behind by a
+                    // prior runner session that crashed without a graceful
+                    // shutdown (Phase 4). PID-reuse-safe via per-PID
+                    // creation-time fingerprint; clears the persisted state
+                    // file after running so a crash mid-loop doesn't loop.
+                    process_capture::orphan_state::reclaim_orphans().await;
                     manager.start_auto_processes().await;
                 }
 

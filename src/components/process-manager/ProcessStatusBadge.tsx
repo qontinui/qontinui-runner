@@ -1,7 +1,16 @@
 import { cn } from "../../lib/utils";
-import { Circle, Loader2, CheckCircle2, XCircle, Square, ArrowDown, Hammer } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowDown,
+  CheckCircle2,
+  Circle,
+  Hammer,
+  Loader2,
+  Square,
+  XCircle,
+} from "lucide-react";
 
-type ProcessState =
+export type ProcessState =
   | "stopped"
   | "starting"
   | "building"
@@ -12,7 +21,45 @@ type ProcessState =
 
 interface ProcessStatusBadgeProps {
   state: ProcessState;
+  /**
+   * Result of the manager's TCP probe against `health_port`. `null` if no
+   * port is configured or the first probe hasn't fired yet (the loop ticks
+   * every 3s). `false` after the first failing probe means "alive, but
+   * nothing accepting connections on the port".
+   */
+  portHealthy?: boolean | null;
+  /**
+   * Process uptime in seconds. Used for the port-dead grace window — we
+   * suppress the amber badge for the first 30s after start so normal
+   * Python/Node startup time doesn't paint the row yellow.
+   */
+  uptimeSecs?: number | null;
+  /**
+   * Tail of recent stderr lines for this process (last ~5, joined with
+   * newlines). Surfaced verbatim in the tooltip when the badge is in the
+   * amber port-dead state, so the user sees the uvicorn traceback /
+   * import error inline without having to click into the row. When
+   * empty/undefined the tooltip falls back to the static "worker crash"
+   * copy.
+   */
+  stderrTail?: string;
   className?: string;
+}
+
+/** Seconds after spawn before `port_healthy: false` is treated as a problem. */
+export const PORT_DEAD_GRACE_SECS = 30;
+
+/** Shared predicate matching the badge's amber-state condition. */
+export function isPortDead(
+  state: ProcessState,
+  portHealthy: boolean | null | undefined,
+  uptimeSecs: number | null | undefined,
+): boolean {
+  return (
+    state === "running" &&
+    portHealthy === false &&
+    (uptimeSecs ?? 0) > PORT_DEAD_GRACE_SECS
+  );
 }
 
 const stateConfig: Record<ProcessState, { icon: React.ReactNode; label: string; classes: string }> =
@@ -54,8 +101,35 @@ const stateConfig: Record<ProcessState, { icon: React.ReactNode; label: string; 
     },
   };
 
-export function ProcessStatusBadge({ state, className }: ProcessStatusBadgeProps) {
-  const config = stateConfig[state] || stateConfig.stopped;
+const PORT_DEAD_STATIC_TOOLTIP =
+  "The configured health port stopped accepting connections. The process is alive but not serving — typically a worker crash inside the wrapper. Restart to recover.";
+
+export function ProcessStatusBadge({
+  state,
+  portHealthy,
+  uptimeSecs,
+  stderrTail,
+  className,
+}: ProcessStatusBadgeProps) {
+  const portDead = isPortDead(state, portHealthy, uptimeSecs);
+
+  const config = portDead
+    ? {
+        icon: <AlertTriangle className="w-3 h-3" />,
+        label: "Running (port dead)",
+        classes: "bg-amber-900/30 text-amber-400 border-amber-800",
+      }
+    : stateConfig[state] || stateConfig.stopped;
+
+  // When port-dead, prefer the stderr tail (concrete traceback) over the
+  // static "worker crash" copy. The browser native `title` attribute is
+  // monospace-ish in most platforms and preserves newlines, which is what
+  // we want for stack traces.
+  const tooltip = portDead
+    ? stderrTail && stderrTail.trim().length > 0
+      ? `Port dead — recent stderr:\n${stderrTail}`
+      : PORT_DEAD_STATIC_TOOLTIP
+    : undefined;
 
   return (
     <span
@@ -64,6 +138,7 @@ export function ProcessStatusBadge({ state, className }: ProcessStatusBadgeProps
         config.classes,
         className,
       )}
+      title={tooltip}
     >
       {config.icon}
       {config.label}

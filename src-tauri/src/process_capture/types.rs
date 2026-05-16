@@ -20,6 +20,8 @@ pub use qontinui_types::process_management::*;
 
 use std::time::Instant;
 
+use super::process_tree::PidWithSpawnedAt;
+
 // ============================================================================
 // ProcessConfig behavior (extension trait)
 // ============================================================================
@@ -119,6 +121,13 @@ pub(crate) struct ProcessRuntime {
     pub session_id: Option<String>,
     /// Whether specs have been auto-discovered for this process start
     pub specs_discovered: bool,
+    /// Descendant PIDs discovered after spawn. Empty until the post-spawn
+    /// discovery pass completes (~3s after Running).
+    pub descendant_pids: Vec<PidWithSpawnedAt>,
+    /// Inner "service" PID identified from descendants. None until
+    /// discovery completes; then either the port-owner / leaf / or the
+    /// outer spawned PID as fallback.
+    pub service_pid: Option<u32>,
 }
 
 impl Default for ProcessRuntime {
@@ -132,6 +141,8 @@ impl Default for ProcessRuntime {
             port_healthy: None,
             session_id: None,
             specs_discovered: false,
+            descendant_pids: Vec::new(),
+            service_pid: None,
         }
     }
 }

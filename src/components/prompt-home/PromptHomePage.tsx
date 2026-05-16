@@ -66,14 +66,18 @@ export function PromptHomePage() {
   //   - dev auto-login is not still in flight (devAutoLoginPending === false)
   //   - mount-time check happened (authStatus !== null) — avoids flash on
   //     cold mount
-  //   - AND either authStatus.authenticated === false OR there is a
-  //     non-empty error string from the auth provider
+  //   - authStatus.authenticated is explicitly false
+  //
+  // `auth.error` is deliberately NOT consulted. A non-empty error from a
+  // transient refresh failure (backend down for a moment) used to flip this
+  // banner to "Your session has expired" even though the session was fine
+  // — the backend clears tokens itself on a real 401/403, so an actual expiry
+  // shows up as `authStatus.authenticated === false`.
   const isUnauthenticated =
     !auth.loading &&
     !auth.devAutoLoginPending &&
     auth.authStatus !== null &&
-    (auth.authStatus.authenticated === false ||
-      (auth.error !== null && auth.error.length > 0));
+    auth.authStatus.authenticated === false;
 
   // Focus input on mount
   useEffect(() => {
