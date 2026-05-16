@@ -69,6 +69,15 @@ pub enum ValidatorError {
     BExecutionRed {
         result_summary: SpecCheckSummary,
         policy_eval: PolicyEvaluation,
+        /// The snapshot id of the result that produced the red. Populated
+        /// so downstream emit sites (Plan 06 `FlywheelProposalDemoted`) can
+        /// join against tracing spans / `workflow_verification_phase_results`.
+        snapshot_id: String,
+        /// First failing assertion's `(state_id, assertion_id)`. None when
+        /// the red came from policy `Indeterminate` over a fully-passing
+        /// result set (e.g. empty in-scope assertions); the demote emit
+        /// substitutes an empty string in that case.
+        failing_assertion: Option<(String, String)>,
     },
 }
 
@@ -105,6 +114,7 @@ pub fn validator_error_detail(e: &ValidatorError) -> String {
         ValidatorError::BExecutionRed {
             result_summary,
             policy_eval,
+            ..
         } => {
             let sc = &result_summary.severity_counts;
             let misses = sc.critical + sc.error + sc.warning + sc.info;
@@ -219,12 +229,31 @@ pub(crate) fn gate_b_execution_green_with_snapshot(
     // both reject. Per the plan's "could not evaluate is not a green signal"
     // rule (see § Step 8 + the vet-pass correction at the head of the doc).
     if !matches!(eval.overall_status, PolicyStatus::Pass) {
+        let failing_assertion = first_failing_assertion(&result);
         return Err(ValidatorError::BExecutionRed {
             result_summary: result.summary.clone(),
             policy_eval: eval,
+            snapshot_id: result.snapshot_id.clone(),
+            failing_assertion,
         });
     }
     Ok(result)
+}
+
+/// Locate the first assertion with a `Fail` outcome in result-iteration
+/// order. Returns `Some((state_id, assertion_id))` or `None` if every
+/// assertion passed (the red came from policy `Indeterminate` rather than
+/// a structural failure).
+fn first_failing_assertion(result: &SpecCheckResult) -> Option<(String, String)> {
+    use qontinui_types::spec_check::AssertionOutcome;
+    for state in &result.state_results {
+        for assertion in &state.assertions {
+            if matches!(assertion.outcome, AssertionOutcome::Fail { .. }) {
+                return Some((state.state_id.clone(), assertion.assertion_id.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// Pull a fresh UI Bridge snapshot for the active app via the WS dispatch
@@ -602,6 +631,7 @@ mod tests {
             Err(ValidatorError::BExecutionRed {
                 result_summary,
                 policy_eval,
+                ..
             }) => {
                 // strict_all_pass treats every miss as a Fail.
                 assert!(

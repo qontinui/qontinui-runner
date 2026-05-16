@@ -20,11 +20,55 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::mcp::types::ApiState;
+use crate::spec_api::events;
 use crate::spec_api::responses::SpecError;
 use crate::spec_api::storage;
 use qontinui_spec_check as spec_check; // crate name = "qontinui-spec-check"
-use qontinui_types::spec_check::{PolicyEvaluation, SpecCheckPolicy, SpecCheckResult};
+use qontinui_types::spec_api_events::SpecApiEvent;
+use qontinui_types::spec_check::{
+    MatchOutcome, PolicyEvaluation, SpecCheckPolicy, SpecCheckResult,
+};
 use qontinui_types::ui_bridge::UIBridgeSnapshot; // capital UI; lives in ui_bridge
+
+/// Wall-clock at evaluator entry → end. Carried into `SpecCheckCompleted`'s
+/// `total_duration_ms` field. Sync-only — the evaluator itself is sync.
+fn invoke_emit(snapshot_id: &str, page_ids: Vec<String>, invoked_via: &str) {
+    events::emit(SpecApiEvent::SpecCheckInvoked {
+        snapshot_id: snapshot_id.to_string(),
+        page_ids,
+        invoked_via: invoked_via.to_string(),
+        at_ms: events::now_ms(),
+    });
+}
+
+/// Roll up a single `SpecCheckResult` (or many) into the `SpecCheckCompleted`
+/// counts. `page_count` is the input count — `eval_error_count` is the
+/// difference between input and successfully-evaluated results (only meaningful
+/// for the batch path).
+fn completion_counts(
+    results: &[&SpecCheckResult],
+    input_page_count: usize,
+) -> (usize, usize, usize, usize, f32) {
+    let mut perfect = 0;
+    let mut partial = 0;
+    let mut no_match = 0;
+    let mut rate_sum = 0f32;
+    for r in results {
+        match r.summary.match_outcome {
+            MatchOutcome::FullMatch => perfect += 1,
+            MatchOutcome::PartialMatch => partial += 1,
+            MatchOutcome::NoMatch => no_match += 1,
+        }
+        rate_sum += r.summary.overall_match_rate;
+    }
+    let eval_error = input_page_count.saturating_sub(results.len());
+    let overall = if results.is_empty() {
+        0.0
+    } else {
+        rate_sum / results.len() as f32
+    };
+    (perfect, partial, no_match, eval_error, overall)
+}
 
 // ===========================================================================
 // Shared snapshot fetch + error mapping
@@ -229,6 +273,11 @@ pub async fn post_spec_check(
         },
     };
 
+    // Plan 06: emit Invoked before the (potentially slow) evaluator runs so
+    // subscribers can correlate `snapshot_id` against tracing spans.
+    invoke_emit(&snapshot_id, vec![req.page_id.clone()], "http");
+    let started_ms = events::now_ms();
+
     // Evaluate — pure crate call, no logic here.
     let result = spec_check::evaluate(&snapshot, &ir);
 
@@ -236,6 +285,22 @@ pub async fn post_spec_check(
         "spec_check page_id={} snapshot_id={} match_outcome={:?} match_rate={:.3}",
         req.page_id, snapshot_id, result.summary.match_outcome, result.summary.overall_match_rate
     );
+
+    // Plan 06: emit Completed after the evaluator returns. The full result
+    // body stays out of the broadcast (subscribers join by snapshot_id).
+    let (perfect, partial, no_match, eval_error, overall_rate) = completion_counts(&[&result], 1);
+    let completed_ms = events::now_ms();
+    events::emit(SpecApiEvent::SpecCheckCompleted {
+        snapshot_id: snapshot_id.clone(),
+        page_count: 1,
+        overall_match_rate: overall_rate,
+        perfect_match_count: perfect,
+        partial_match_count: partial,
+        no_match_count: no_match,
+        eval_error_count: eval_error,
+        total_duration_ms: completed_ms.saturating_sub(started_ms),
+        at_ms: completed_ms,
+    });
 
     (StatusCode::OK, Json(result)).into_response()
 }
@@ -336,6 +401,13 @@ pub async fn post_spec_check_batch(
         snapshot_id
     );
 
+    // Plan 06: emit Invoked once for the batch. Both the streaming and
+    // collected paths reach the evaluator below.
+    let input_page_count = req.pages.len();
+    let page_ids: Vec<String> = req.pages.iter().map(|p| p.page_id.clone()).collect();
+    invoke_emit(&snapshot_id, page_ids, "http");
+    let batch_started_ms = events::now_ms();
+
     if req.stream {
         return stream_batch_results(snapshot, snapshot_id, root, req.pages, req.shared_policy)
             .await;
@@ -363,6 +435,28 @@ pub async fn post_spec_check_batch(
     }
     // Stable order by input pageId for determinism.
     results.sort_by(|a, b| a.page_id.cmp(&b.page_id));
+
+    // Plan 06: emit Completed once after all per-element evaluations have
+    // landed. The `eval_error_count` derives from input vs successfully-evaluated.
+    let ok_results: Vec<&SpecCheckResult> = results
+        .iter()
+        .filter(|r| r.status == "ok")
+        .filter_map(|r| r.result.as_ref())
+        .collect();
+    let (perfect, partial, no_match, eval_error, overall_rate) =
+        completion_counts(&ok_results, input_page_count);
+    let completed_ms = events::now_ms();
+    events::emit(SpecApiEvent::SpecCheckCompleted {
+        snapshot_id: snapshot_id.clone(),
+        page_count: input_page_count,
+        overall_match_rate: overall_rate,
+        perfect_match_count: perfect,
+        partial_match_count: partial,
+        no_match_count: no_match,
+        eval_error_count: eval_error,
+        total_duration_ms: completed_ms.saturating_sub(batch_started_ms),
+        at_ms: completed_ms,
+    });
 
     (
         StatusCode::OK,
@@ -480,13 +574,78 @@ async fn stream_batch_results(
     pages: Vec<BatchPageEntry>,
     shared_policy: Option<SpecCheckPolicy>,
 ) -> Response {
-    let body_stream = stream::unfold(pages.into_iter(), move |mut it| {
+    // Plan 06: stream-path Completed emission. Accumulate counts as we
+    // walk each item, then emit on stream end (when the inner iterator is
+    // exhausted). The `started_ms` is captured outside the unfold so it's
+    // consistent with the Invoked emit in the caller.
+    let input_page_count = pages.len();
+    let started_ms = events::now_ms();
+    let snapshot_id_for_completion = snapshot_id.clone();
+    struct StreamState {
+        iter: std::vec::IntoIter<BatchPageEntry>,
+        perfect: usize,
+        partial: usize,
+        no_match: usize,
+        eval_error: usize,
+        rate_sum: f32,
+        ok_count: usize,
+        emitted: bool,
+    }
+    let initial = StreamState {
+        iter: pages.into_iter(),
+        perfect: 0,
+        partial: 0,
+        no_match: 0,
+        eval_error: 0,
+        rate_sum: 0.0,
+        ok_count: 0,
+        emitted: false,
+    };
+    let body_stream = stream::unfold(initial, move |mut st| {
         let snapshot = snapshot.clone();
         let root = root.clone();
         let shared_policy = shared_policy.clone();
+        let snap_id = snapshot_id_for_completion.clone();
         async move {
-            let entry = it.next()?;
+            let entry = match st.iter.next() {
+                Some(e) => e,
+                None => {
+                    if !st.emitted {
+                        let overall = if st.ok_count == 0 {
+                            0.0
+                        } else {
+                            st.rate_sum / st.ok_count as f32
+                        };
+                        let completed_ms = events::now_ms();
+                        events::emit(SpecApiEvent::SpecCheckCompleted {
+                            snapshot_id: snap_id,
+                            page_count: input_page_count,
+                            overall_match_rate: overall,
+                            perfect_match_count: st.perfect,
+                            partial_match_count: st.partial,
+                            no_match_count: st.no_match,
+                            eval_error_count: st.eval_error,
+                            total_duration_ms: completed_ms.saturating_sub(started_ms),
+                            at_ms: completed_ms,
+                        });
+                        st.emitted = true;
+                    }
+                    return None;
+                }
+            };
             let r = evaluate_one(&root, &entry, &snapshot, shared_policy.as_ref()).await;
+            match (r.status, r.result.as_ref()) {
+                ("ok", Some(res)) => {
+                    st.ok_count += 1;
+                    st.rate_sum += res.summary.overall_match_rate;
+                    match res.summary.match_outcome {
+                        MatchOutcome::FullMatch => st.perfect += 1,
+                        MatchOutcome::PartialMatch => st.partial += 1,
+                        MatchOutcome::NoMatch => st.no_match += 1,
+                    }
+                }
+                _ => st.eval_error += 1,
+            }
             let mut line = match serde_json::to_vec(&r) {
                 Ok(v) => v,
                 Err(e) => {
@@ -495,7 +654,7 @@ async fn stream_batch_results(
                 }
             };
             line.push(b'\n');
-            Some((Ok::<_, std::io::Error>(line), it))
+            Some((Ok::<_, std::io::Error>(line), st))
         }
     });
     match Response::builder()
@@ -708,5 +867,101 @@ mod tests {
             serde_json::from_value(json!({ "page_id": "settings-general" })).unwrap();
         assert_eq!(req.page_id, "settings-general");
         assert!(req.snapshot.is_none());
+    }
+
+    // ------------------------------------------------------------------------
+    // Plan 06 — emit-callsite helpers
+    // ------------------------------------------------------------------------
+
+    /// Drain any pre-existing events on the broadcast (cross-test
+    /// contamination) and recv up to `max_attempts` items, returning the
+    /// first one whose `snapshot_id` matches the supplied marker.
+    /// Defensive against parallel-test interference on the singleton.
+    fn recv_matching_invoked(
+        rx: &mut tokio::sync::broadcast::Receiver<SpecApiEvent>,
+        marker: &str,
+        max_attempts: usize,
+    ) -> Option<SpecApiEvent> {
+        for _ in 0..max_attempts {
+            match rx.try_recv() {
+                Ok(ev) => match &ev {
+                    SpecApiEvent::SpecCheckInvoked { snapshot_id, .. }
+                    | SpecApiEvent::SpecCheckCompleted { snapshot_id, .. }
+                        if snapshot_id == marker =>
+                    {
+                        return Some(ev)
+                    }
+                    _ => continue,
+                },
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn invoke_emit_publishes_spec_check_invoked() {
+        let mut rx = events::subscribe();
+        let marker = "scs_test_invoke_emit_1";
+        invoke_emit(marker, vec!["settings-general".into()], "http");
+        let event = recv_matching_invoked(&mut rx, marker, 32)
+            .expect("SpecCheckInvoked with marker must arrive");
+        match event {
+            SpecApiEvent::SpecCheckInvoked {
+                page_ids,
+                invoked_via,
+                ..
+            } => {
+                assert_eq!(page_ids, vec!["settings-general".to_string()]);
+                assert_eq!(invoked_via, "http");
+            }
+            other => panic!("expected SpecCheckInvoked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_counts_rolls_up_match_outcomes() {
+        // Hand-construct three SpecCheckResults with deterministic outcomes
+        // to exercise the rate-mean + outcome-bucket math.
+        let mk = |outcome: MatchOutcome, rate: f32| SpecCheckResult {
+            result_schema_version: 1,
+            snapshot_id: String::new(),
+            spec_content_hash: String::new(),
+            spec_version: "1.0".into(),
+            page_id: "p".into(),
+            state_results: vec![],
+            summary: qontinui_types::spec_check::SpecCheckSummary {
+                match_outcome: outcome,
+                overall_match_rate: rate,
+                severity_counts: Default::default(),
+                recommended_state: None,
+                recommendation_reason: None,
+            },
+            bridge_fingerprint: qontinui_types::spec_check::BridgeFingerprint {
+                app_id: "test".into(),
+                app_version: None,
+                route: None,
+                bridge_version: None,
+                snapshot_timestamp: String::new(),
+                element_count: 0,
+            },
+            evaluated_at: String::new(),
+            warnings: vec![],
+        };
+        let a = mk(MatchOutcome::FullMatch, 1.0);
+        let b = mk(MatchOutcome::PartialMatch, 0.5);
+        let c = mk(MatchOutcome::NoMatch, 0.0);
+        let results = vec![&a, &b, &c];
+        let (perfect, partial, no_match, eval_error, overall) = completion_counts(&results, 4); // 4 inputs, 3 evaluated → 1 eval_error
+        assert_eq!(perfect, 1);
+        assert_eq!(partial, 1);
+        assert_eq!(no_match, 1);
+        assert_eq!(eval_error, 1);
+        assert!((overall - 0.5).abs() < f32::EPSILON);
+
+        // Empty results bucket: zero across the board, overall = 0.0.
+        let (p, q, n, e, o) = completion_counts(&[], 0);
+        assert_eq!((p, q, n, e), (0, 0, 0, 0));
+        assert_eq!(o, 0.0);
     }
 }
