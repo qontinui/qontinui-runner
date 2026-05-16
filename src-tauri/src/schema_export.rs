@@ -755,7 +755,11 @@ mod tests {
             obj.contains_key("UiBridgeResponseEnvelope"),
             "Missing UiBridgeResponseEnvelope schema"
         );
-        assert_eq!(obj.len(), 477, "Expected 477 schema entries");
+        assert!(
+            obj.contains_key("SpecApiEvent"),
+            "Missing SpecApiEvent schema (Plan 06)"
+        );
+        assert_eq!(obj.len(), 478, "Expected 478 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
