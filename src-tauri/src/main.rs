@@ -187,6 +187,12 @@ mod workflow_event_bus;
 mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
+
+// Stream E (Flywheel) Step 11 — end-to-end integration test module. The
+// file-level `#![cfg(all(test, feature = "spec-authoring"))]` ensures it
+// only compiles when running tests with the feature enabled.
+#[cfg(test)]
+mod flywheel_e2e_tests;
 mod worktree;
 mod wrappers;
 mod zombie_sweep;

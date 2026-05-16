@@ -562,11 +562,11 @@ fn parse_meta_workflow_output(value: &serde_json::Value) -> Result<IrPageSpec, S
 
 /// Per-state required-element additions + new transitions. RFC 7396-style.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct IrPatch {
+pub(crate) struct IrPatch {
     #[serde(default)]
-    add_required_elements: BTreeMap<String, Vec<IrElementCriteria>>,
+    pub(crate) add_required_elements: BTreeMap<String, Vec<IrElementCriteria>>,
     #[serde(default)]
-    add_transitions: Vec<IrTransition>,
+    pub(crate) add_transitions: Vec<IrTransition>,
 }
 
 async fn author_patch(
@@ -667,7 +667,10 @@ fn parse_patch_output(value: &serde_json::Value) -> Result<IrPatch, String> {
 ///   are PINNED — patch additions hard-fail.
 /// - Newly added IrTransition / IrElementCriteria get
 ///   `provenance: { source: "ai-generated", status: Proposed }`.
-fn merge_patch_into_ir(mut existing: IrPageSpec, patch: IrPatch) -> Result<IrPageSpec, String> {
+pub(crate) fn merge_patch_into_ir(
+    mut existing: IrPageSpec,
+    patch: IrPatch,
+) -> Result<IrPageSpec, String> {
     // Validate transition ids first so we don't half-apply.
     let mut existing_tx_ids: BTreeSet<String> =
         existing.transitions.iter().map(|t| t.id.clone()).collect();
