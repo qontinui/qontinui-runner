@@ -27,9 +27,14 @@ use crate::fetch::{compute_content_sha256, millis_to_iso8601};
 use crate::snapshot::{ElementIdx, IndexedSnapshot};
 use crate::{
     AssertionMiss, AssertionOutcome, AssertionResult, AssertionSeverityCounts, BridgeFingerprint,
-    MatchOutcome, MatchedElement, SpecCheckResult, SpecCheckSummary, StateMatchResult,
-    UIBridgeSnapshot,
+    MatchOutcome, MatchedElement, SpecCheckResult, SpecCheckSummary, SpecValidation,
+    StateMatchResult, UIBridgeSnapshot,
 };
+
+/// `recommendation_reason` value set when the matcher refuses to recommend
+/// a state because the spec failed distinctness validation. See
+/// design context §5.12.
+pub const REASON_SPEC_VALIDATION_FAILED: &str = "spec_validation_failed";
 
 // ===========================================================================
 // Constants
@@ -53,25 +58,44 @@ const SENTINEL_APP_ID: &str = "internal-evaluator";
 // Public API
 // ===========================================================================
 
-/// Single-spec evaluation. Builds the [`IndexedSnapshot`] once and forces
-/// the [`crate::diff::SelectivityIndex`] init on the main thread before any
-/// rayon fan-out (so worker threads never race on the OnceCell).
+/// Single-spec evaluation. Convenience wrapper over
+/// [`evaluate_with_validation`] that passes `None` — use this when no
+/// distinctness validation has been computed for the spec.
+pub fn evaluate(snapshot: &UIBridgeSnapshot, spec: &IrPageSpec) -> SpecCheckResult {
+    evaluate_with_validation(snapshot, spec, None)
+}
+
+/// Same as [`evaluate`] but accepts a pre-computed [`SpecValidation`]
+/// summary. When `validation` flags any violation (a degenerate state or
+/// an indistinguishable-state pair, per Plan 04 / design context §5.12),
+/// the result's `summary.recommended_state` is forced to `None` and
+/// `summary.recommendation_reason` is set to
+/// [`REASON_SPEC_VALIDATION_FAILED`] — the matcher refuses to recommend a
+/// state for a spec that can't reliably distinguish between them.
+///
+/// `validation == None` is the legacy "trust the spec" path used by
+/// existing callers and the [`evaluate`] convenience wrapper.
 #[tracing::instrument(
-    name = "spec_check.evaluate",
-    skip(snapshot, spec),
+    name = "spec_check.evaluate_with_validation",
+    skip(snapshot, spec, validation),
     fields(
         page_id = %spec.id,
         snapshot_id = tracing::field::Empty,
         spec_version = %spec.version,
         match_outcome = tracing::field::Empty,
         evaluation_duration_ms = tracing::field::Empty,
+        has_validation = validation.is_some(),
     ),
 )]
-pub fn evaluate(snapshot: &UIBridgeSnapshot, spec: &IrPageSpec) -> SpecCheckResult {
+pub fn evaluate_with_validation(
+    snapshot: &UIBridgeSnapshot,
+    spec: &IrPageSpec,
+    validation: Option<&SpecValidation>,
+) -> SpecCheckResult {
     let started = Instant::now();
     let indexed = IndexedSnapshot::new(snapshot);
     let _ = indexed.selectivity();
-    let result = evaluate_with_indexed(&indexed, spec);
+    let result = evaluate_with_indexed(&indexed, spec, validation);
     let span = tracing::Span::current();
     span.record("snapshot_id", tracing::field::display(&result.snapshot_id));
     span.record(
@@ -103,7 +127,7 @@ pub fn evaluate_batch(snapshot: &UIBridgeSnapshot, specs: &[IrPageSpec]) -> Vec<
     let _ = indexed.selectivity();
     let results: Vec<SpecCheckResult> = specs
         .par_iter()
-        .map(|spec| evaluate_with_indexed(&indexed, spec))
+        .map(|spec| evaluate_with_indexed(&indexed, spec, None))
         .collect();
     let span = tracing::Span::current();
     if let Some(first) = results.first() {
@@ -117,14 +141,18 @@ pub fn evaluate_batch(snapshot: &UIBridgeSnapshot, specs: &[IrPageSpec]) -> Vec<
 // Core orchestration
 // ===========================================================================
 
-fn evaluate_with_indexed(indexed: &IndexedSnapshot, spec: &IrPageSpec) -> SpecCheckResult {
+fn evaluate_with_indexed(
+    indexed: &IndexedSnapshot,
+    spec: &IrPageSpec,
+    validation: Option<&SpecValidation>,
+) -> SpecCheckResult {
     let state_results: Vec<StateMatchResult> = spec
         .states
         .par_iter()
         .map(|s| evaluate_state(indexed, s))
         .collect();
 
-    let summary = build_summary(spec, &state_results);
+    let summary = build_summary(spec, &state_results, validation);
     let bridge_fingerprint = build_internal_fingerprint(indexed);
     let evaluated_at = now_iso8601();
     let spec_content_hash = hash_spec(spec);
@@ -243,26 +271,47 @@ fn matched_from(indexed: &IndexedSnapshot, idx: ElementIdx) -> MatchedElement {
 // Summary aggregation
 // ===========================================================================
 
-fn build_summary(spec: &IrPageSpec, state_results: &[StateMatchResult]) -> SpecCheckSummary {
+fn build_summary(
+    spec: &IrPageSpec,
+    state_results: &[StateMatchResult],
+    validation: Option<&SpecValidation>,
+) -> SpecCheckSummary {
     let overall_match_rate = mean_match_rate(state_results);
     let match_outcome = match_outcome_for(state_results);
     let severity_counts = aggregate_severity_counts(state_results);
 
-    // recommend_state needs an is_initial lookup over the IR.
-    let recommended_state = recommend_state(state_results, |sid| {
-        spec.states
-            .iter()
-            .find(|s| s.id == sid)
-            .and_then(|s| s.is_initial)
-            .unwrap_or(false)
-    });
+    // §5.12: if the caller computed a SpecValidation and it flags any
+    // violation (degenerate state OR indistinguishable-state pair), B
+    // refuses to recommend a state — the matcher can't reliably tell
+    // them apart, so any pick would be misleading. Surface the reason
+    // so callers can distinguish this from "every state scored below
+    // the confidence floor".
+    let (recommended_state, recommendation_reason) =
+        if validation.is_some_and(has_validation_violations) {
+            (None, Some(REASON_SPEC_VALIDATION_FAILED.to_string()))
+        } else {
+            // recommend_state needs an is_initial lookup over the IR.
+            let rec = recommend_state(state_results, |sid| {
+                spec.states
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .and_then(|s| s.is_initial)
+                    .unwrap_or(false)
+            });
+            (rec, None)
+        };
 
     SpecCheckSummary {
         match_outcome,
         overall_match_rate,
         severity_counts,
         recommended_state,
+        recommendation_reason,
     }
+}
+
+fn has_validation_violations(v: &SpecValidation) -> bool {
+    !v.degenerate_state_ids.is_empty() || !v.indistinguishable_state_pairs.is_empty()
 }
 
 fn mean_match_rate(state_results: &[StateMatchResult]) -> f32 {
@@ -705,6 +754,85 @@ mod tests {
 
         let rec = result.summary.recommended_state.expect("must recommend");
         assert_eq!(rec.state_id, "s2");
+        assert!(result.summary.recommendation_reason.is_none());
+    }
+
+    #[test]
+    fn evaluate_with_validation_refuses_recommendation_on_degenerate_state() {
+        // Same shape as the test above — would normally recommend s2 —
+        // but s1 is flagged degenerate. Expect: recommended_state: None,
+        // recommendation_reason: "spec_validation_failed".
+        let s = snap(vec![elem(
+            "ok", "#ok", Some("button"), Some("Save"), true,
+        )]);
+        let a1 = assertion("a1", "info", json!({ "role": "nope" }), true);
+        let st1 = state("s1", "Idle", None, vec![a1]);
+        let a2 = assertion("a2", "info", json!({ "role": "button" }), true);
+        let st2 = state("s2", "Loaded", Some(true), vec![a2]);
+
+        let spec = page_spec("page-1", vec![st1, st2]);
+        let validation = SpecValidation {
+            page_id: spec.id.clone(),
+            degenerate_state_ids: vec!["s1".to_string()],
+            indistinguishable_state_pairs: vec![],
+        };
+        let result = evaluate_with_validation(&s, &spec, Some(&validation));
+
+        assert!(
+            result.summary.recommended_state.is_none(),
+            "matcher must refuse to recommend when spec validation fails",
+        );
+        assert_eq!(
+            result.summary.recommendation_reason.as_deref(),
+            Some(REASON_SPEC_VALIDATION_FAILED),
+        );
+    }
+
+    #[test]
+    fn evaluate_with_validation_refuses_recommendation_on_indistinguishable_pair() {
+        let s = snap(vec![elem(
+            "ok", "#ok", Some("button"), Some("Save"), true,
+        )]);
+        let a = assertion("a", "info", json!({ "role": "button" }), true);
+        let st = state("s1", "Idle", Some(true), vec![a]);
+        let spec = page_spec("page-1", vec![st]);
+        let validation = SpecValidation {
+            page_id: spec.id.clone(),
+            degenerate_state_ids: vec![],
+            indistinguishable_state_pairs: vec![["s1".to_string(), "s2".to_string()]],
+        };
+        let result = evaluate_with_validation(&s, &spec, Some(&validation));
+
+        assert!(result.summary.recommended_state.is_none());
+        assert_eq!(
+            result.summary.recommendation_reason.as_deref(),
+            Some(REASON_SPEC_VALIDATION_FAILED),
+        );
+    }
+
+    #[test]
+    fn evaluate_with_validation_passes_clean_validation_through() {
+        // Empty SpecValidation (no violations) should NOT block recommendation.
+        let s = snap(vec![elem(
+            "ok", "#ok", Some("button"), Some("Save"), true,
+        )]);
+        let a = assertion("a", "info", json!({ "role": "button" }), true);
+        let st = state("s1", "Idle", Some(true), vec![a]);
+        let spec = page_spec("page-1", vec![st]);
+        let validation = SpecValidation {
+            page_id: spec.id.clone(),
+            degenerate_state_ids: vec![],
+            indistinguishable_state_pairs: vec![],
+        };
+        let result = evaluate_with_validation(&s, &spec, Some(&validation));
+
+        let rec = result
+            .summary
+            .recommended_state
+            .as_ref()
+            .expect("clean validation must allow recommendation");
+        assert_eq!(rec.state_id, "s1");
+        assert!(result.summary.recommendation_reason.is_none());
     }
 
     #[test]

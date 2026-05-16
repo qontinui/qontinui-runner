@@ -486,6 +486,7 @@ mod tests {
                 overall_match_rate: 0.5,
                 severity_counts: AssertionSeverityCounts::default(),
                 recommended_state: None,
+                recommendation_reason: None,
             },
             bridge_fingerprint: BridgeFingerprint {
                 app_id: "app".to_string(),

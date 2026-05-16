@@ -90,6 +90,7 @@ mod tests {
                 overall_match_rate: 1.0,
                 severity_counts: AssertionSeverityCounts::default(),
                 recommended_state: None,
+                recommendation_reason: None,
             },
             bridge_fingerprint: BridgeFingerprint {
                 app_id: "qontinui-web".to_string(),
