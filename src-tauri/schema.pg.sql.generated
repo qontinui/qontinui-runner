@@ -1356,6 +1356,67 @@ ALTER SEQUENCE cloud.subscriptions_id_seq OWNED BY cloud.subscriptions.id;
 
 
 --
+-- Name: agent_worktrees; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.agent_worktrees (
+    agent_id uuid NOT NULL,
+    machine_id uuid,
+    repo text NOT NULL,
+    branch text NOT NULL,
+    parent_sha text NOT NULL,
+    worktree_path text NOT NULL,
+    status text DEFAULT 'allocated'::text NOT NULL,
+    intent text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    declared_overlap_paths text[],
+    CONSTRAINT agent_worktrees_status_chk CHECK ((status = ANY (ARRAY['allocated'::text, 'active'::text, 'merging'::text, 'merged'::text, 'abandoned'::text])))
+);
+
+
+--
+-- Name: alerts; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.alerts (
+    id bigint NOT NULL,
+    alert_key text NOT NULL,
+    severity text NOT NULL,
+    kind text NOT NULL,
+    machine_id uuid,
+    summary text NOT NULL,
+    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    occurrences integer DEFAULT 1 NOT NULL,
+    resolved_at timestamp with time zone,
+    page_due_at timestamp with time zone,
+    paged_at timestamp with time zone,
+    CONSTRAINT alerts_severity_chk CHECK ((severity = ANY (ARRAY['info'::text, 'warning'::text, 'critical'::text])))
+);
+
+
+--
+-- Name: alerts_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+CREATE SEQUENCE coord.alerts_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: alerts_id_seq; Type: SEQUENCE OWNED BY; Schema: coord; Owner: -
+--
+
+ALTER SEQUENCE coord.alerts_id_seq OWNED BY coord.alerts.id;
+
+
+--
 -- Name: build_events; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -1562,7 +1623,79 @@ CREATE TABLE coord.machines (
     last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
     current_branches jsonb DEFAULT '{}'::jsonb NOT NULL,
     last_alembic_head text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    state text DEFAULT 'healthy'::text NOT NULL,
+    state_changed_at timestamp with time zone DEFAULT now() NOT NULL,
+    consecutive_failed_probes integer DEFAULT 0 NOT NULL,
+    last_probe_at timestamp with time zone,
+    last_probe_ok boolean,
+    health_url text,
+    role text DEFAULT 'agent'::text NOT NULL,
+    cpu_cores integer,
+    memory_gb integer,
+    disk_total_gb bigint,
+    disk_reserved_gb bigint DEFAULT 0 NOT NULL,
+    max_concurrent_agents integer,
+    max_concurrent_builds integer,
+    budget_updated_at timestamp with time zone,
+    CONSTRAINT machines_role_chk CHECK ((role = ANY (ARRAY['agent'::text, 'build'::text, 'cache'::text, 'coord'::text]))),
+    CONSTRAINT machines_state_chk CHECK ((state = ANY (ARRAY['healthy'::text, 'degraded'::text, 'partitioned'::text, 'abandoned'::text])))
+);
+
+
+--
+-- Name: merge_batches; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.merge_batches (
+    batch_id uuid NOT NULL,
+    parent_batch_id uuid,
+    status text NOT NULL,
+    candidate_ref text,
+    combined_tip text,
+    ci_attempt integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    error text,
+    CONSTRAINT merge_batches_status_chk CHECK ((status = ANY (ARRAY['awaiting-ci'::text, 'landing'::text, 'merged'::text, 'bisecting'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: merge_proposal_repos; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.merge_proposal_repos (
+    proposal_id uuid NOT NULL,
+    repo text NOT NULL,
+    branch text NOT NULL,
+    head_sha text NOT NULL,
+    rebase_result jsonb,
+    conflict_diff text,
+    ci_run_url text,
+    overlap_paths text[],
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: merge_proposals; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.merge_proposals (
+    proposal_id uuid NOT NULL,
+    agent_id uuid NOT NULL,
+    description text,
+    requires_clean_ci boolean DEFAULT true NOT NULL,
+    status text DEFAULT 'queued'::text NOT NULL,
+    error text,
+    cancelled_at timestamp with time zone,
+    merged_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    spec_check_run_id text,
+    batch_id uuid,
+    CONSTRAINT merge_proposals_status_chk CHECK ((status = ANY (ARRAY['queued'::text, 'dry-rebasing'::text, 'awaiting-ci'::text, 'landing'::text, 'blocked-by-overlap'::text, 'conflict'::text, 'merged'::text, 'cancelled'::text])))
 );
 
 
@@ -1706,6 +1839,20 @@ CREATE TABLE coord.reviews (
     user_decision text,
     user_decided_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: revoked_tokens; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.revoked_tokens (
+    jti uuid NOT NULL,
+    agent_id uuid NOT NULL,
+    machine_id uuid,
+    revoked_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    reason text
 );
 
 
@@ -10419,7 +10566,7 @@ CREATE TABLE project.workflow_triggers (
     description text,
     trigger_type text NOT NULL,
     trigger_config text NOT NULL,
-    workflow_id text NOT NULL,
+    workflow_id text,
     workflow_overrides text,
     conditions text DEFAULT '[]'::text,
     debounce_ms bigint DEFAULT 1000,
@@ -10466,7 +10613,7 @@ CREATE TABLE project.workflow_verification_phase_results (
     skipped_steps integer NOT NULL,
     total_duration_ms bigint NOT NULL,
     critical_failure boolean DEFAULT false NOT NULL,
-    result_json jsonb NOT NULL,
+    result_json text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
@@ -10765,6 +10912,13 @@ ALTER TABLE ONLY auth.usage_metrics ALTER COLUMN id SET DEFAULT nextval('auth.us
 --
 
 ALTER TABLE ONLY cloud.subscriptions ALTER COLUMN id SET DEFAULT nextval('cloud.subscriptions_id_seq'::regclass);
+
+
+--
+-- Name: alerts id; Type: DEFAULT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.alerts ALTER COLUMN id SET DEFAULT nextval('coord.alerts_id_seq'::regclass);
 
 
 --
@@ -11349,6 +11503,30 @@ ALTER TABLE ONLY cloud.subscriptions
 
 
 --
+-- Name: agent_worktrees agent_worktrees_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.agent_worktrees
+    ADD CONSTRAINT agent_worktrees_pkey PRIMARY KEY (agent_id, repo);
+
+
+--
+-- Name: agent_worktrees agent_worktrees_repo_branch_uq; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.agent_worktrees
+    ADD CONSTRAINT agent_worktrees_repo_branch_uq UNIQUE (repo, branch);
+
+
+--
+-- Name: alerts alerts_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.alerts
+    ADD CONSTRAINT alerts_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: build_events build_events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -11437,6 +11615,30 @@ ALTER TABLE ONLY coord.machines
 
 
 --
+-- Name: merge_batches merge_batches_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.merge_batches
+    ADD CONSTRAINT merge_batches_pkey PRIMARY KEY (batch_id);
+
+
+--
+-- Name: merge_proposal_repos merge_proposal_repos_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.merge_proposal_repos
+    ADD CONSTRAINT merge_proposal_repos_pkey PRIMARY KEY (proposal_id, repo);
+
+
+--
+-- Name: merge_proposals merge_proposals_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.merge_proposals
+    ADD CONSTRAINT merge_proposals_pkey PRIMARY KEY (proposal_id);
+
+
+--
 -- Name: plans plans_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -11482,6 +11684,14 @@ ALTER TABLE ONLY coord.repo_branches
 
 ALTER TABLE ONLY coord.reviews
     ADD CONSTRAINT reviews_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: revoked_tokens revoked_tokens_pk; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.revoked_tokens
+    ADD CONSTRAINT revoked_tokens_pk PRIMARY KEY (jti);
 
 
 --
@@ -14867,6 +15077,41 @@ CREATE INDEX build_events_repo_idx ON coord.build_events USING btree (repo, star
 
 
 --
+-- Name: idx_agent_worktrees_machine_status; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_agent_worktrees_machine_status ON coord.agent_worktrees USING btree (machine_id, status) WHERE (machine_id IS NOT NULL);
+
+
+--
+-- Name: idx_agent_worktrees_overlap_paths_gin; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_agent_worktrees_overlap_paths_gin ON coord.agent_worktrees USING gin (declared_overlap_paths);
+
+
+--
+-- Name: idx_agent_worktrees_status; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_agent_worktrees_status ON coord.agent_worktrees USING btree (status, updated_at DESC);
+
+
+--
+-- Name: idx_alerts_active_severity; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_alerts_active_severity ON coord.alerts USING btree (severity, last_seen_at) WHERE (resolved_at IS NULL);
+
+
+--
+-- Name: idx_alerts_machine; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_alerts_machine ON coord.alerts USING btree (machine_id) WHERE (machine_id IS NOT NULL);
+
+
+--
 -- Name: idx_cd_created; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -14993,6 +15238,62 @@ CREATE INDEX idx_machines_last_seen ON coord.machines USING btree (last_seen_at 
 
 
 --
+-- Name: idx_machines_role; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_machines_role ON coord.machines USING btree (role);
+
+
+--
+-- Name: idx_machines_state_unhealthy; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_machines_state_unhealthy ON coord.machines USING btree (state, state_changed_at) WHERE (state <> 'healthy'::text);
+
+
+--
+-- Name: idx_merge_batches_parent; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_merge_batches_parent ON coord.merge_batches USING btree (parent_batch_id) WHERE (parent_batch_id IS NOT NULL);
+
+
+--
+-- Name: idx_merge_batches_status; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_merge_batches_status ON coord.merge_batches USING btree (status);
+
+
+--
+-- Name: idx_merge_proposal_repos_head_sha; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_merge_proposal_repos_head_sha ON coord.merge_proposal_repos USING btree (repo, head_sha);
+
+
+--
+-- Name: idx_merge_proposals_agent_id; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_merge_proposals_agent_id ON coord.merge_proposals USING btree (agent_id);
+
+
+--
+-- Name: idx_merge_proposals_batch; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_merge_proposals_batch ON coord.merge_proposals USING btree (batch_id) WHERE (batch_id IS NOT NULL);
+
+
+--
+-- Name: idx_merge_proposals_status; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_merge_proposals_status ON coord.merge_proposals USING btree (status, proposal_id DESC);
+
+
+--
 -- Name: idx_plans_path; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -15088,6 +15389,20 @@ CREATE INDEX idx_reviews_task ON coord.reviews USING btree (task_id);
 --
 
 CREATE INDEX idx_reviews_verdict ON coord.reviews USING btree (verdict);
+
+
+--
+-- Name: idx_revoked_tokens_agent_id; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_revoked_tokens_agent_id ON coord.revoked_tokens USING btree (agent_id);
+
+
+--
+-- Name: idx_revoked_tokens_expires_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_revoked_tokens_expires_at ON coord.revoked_tokens USING btree (expires_at);
 
 
 --
@@ -15200,6 +15515,13 @@ CREATE INDEX idx_worktrees_status ON coord.worktrees USING btree (status);
 --
 
 CREATE INDEX idx_worktrees_task_run ON coord.worktrees USING btree (task_run_id);
+
+
+--
+-- Name: uq_alerts_active_key; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_alerts_active_key ON coord.alerts USING btree (alert_key) WHERE (resolved_at IS NULL);
 
 
 --
@@ -21727,6 +22049,14 @@ ALTER TABLE ONLY cloud.subscriptions
 
 
 --
+-- Name: agent_worktrees agent_worktrees_machine_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.agent_worktrees
+    ADD CONSTRAINT agent_worktrees_machine_id_fkey FOREIGN KEY (machine_id) REFERENCES coord.machines(machine_id) ON DELETE SET NULL;
+
+
+--
 -- Name: build_events build_events_machine_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -21772,6 +22102,14 @@ ALTER TABLE ONLY coord.gui_lock
 
 ALTER TABLE ONLY coord.machine_status
     ADD CONSTRAINT machine_status_machine_id_fkey FOREIGN KEY (machine_id) REFERENCES coord.machines(machine_id) ON DELETE CASCADE;
+
+
+--
+-- Name: merge_proposal_repos merge_proposal_repos_proposal_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.merge_proposal_repos
+    ADD CONSTRAINT merge_proposal_repos_proposal_id_fkey FOREIGN KEY (proposal_id) REFERENCES coord.merge_proposals(proposal_id) ON DELETE CASCADE;
 
 
 --
