@@ -139,9 +139,8 @@ pub async fn kill_descendant_tree(root_pid: u32) -> usize {
                         to_kill.insert(pid);
                         break;
                     }
-                    Some(p) if p == 0 => break,
+                    Some(0) | None => break,
                     Some(p) => cur = p,
-                    None => break,
                 }
             }
         }
