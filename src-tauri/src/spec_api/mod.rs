@@ -25,6 +25,7 @@ pub mod handlers;
 pub mod hashing;
 pub mod projection;
 pub mod responses;
+pub mod spec_check;
 pub mod storage;
 pub mod types;
 
@@ -58,7 +59,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/spec/diff", get(handlers::get_diff))
         .route("/spec/author", post(handlers::post_author))
         .route("/spec/validate", post(handlers::post_validate))
-        .route("/spec/subscribe", get(handlers::get_subscribe));
+        .route("/spec/subscribe", get(handlers::get_subscribe))
+        // Core spec-check surface (Plan 03 Steps 1-3) — NOT feature-gated.
+        .route("/spec-check", post(spec_check::post_spec_check))
+        .route("/spec-check/batch", post(spec_check::post_spec_check_batch));
 
     // Stream E (Flywheel) — coverage-growth queue endpoints. Gated behind
     // `spec-authoring` so v1.0 release builds don't expose the proposals
