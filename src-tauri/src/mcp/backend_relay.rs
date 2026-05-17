@@ -758,6 +758,23 @@ async fn handle_relay_command(
         }
 
         // --------------------------------------------------------------
+        // Web -> runner WS bridge commands. The web side's
+        // `dispatch_and_wait` helper publishes JSON payloads with a
+        // top-level `type` matching the command name; we forward to
+        // the Python dispatcher and return a `command_response` frame
+        // carrying the same `request_id` so the web HTTP handler can
+        // correlate the reply. Per
+        // `plans/2026-05-17-web-runner-ws-bridge-plan-b.md` Phase 2,
+        // this is the foundational arm — Phases 3-7 extend the match
+        // (one new arm per new command type) and
+        // `ws_bridge_dispatch::is_supported_command`.
+        // --------------------------------------------------------------
+        cmd if crate::mcp::ws_bridge_dispatch::is_supported_command(cmd) => {
+            let response = crate::mcp::ws_bridge_dispatch::dispatch_command(cmd, data).await;
+            Some(response)
+        }
+
+        // --------------------------------------------------------------
         // Mobile chat session relay (carry-over from legacy relay)
         // --------------------------------------------------------------
         "chat_message" => handle_chat_message(api_state, data).await,
