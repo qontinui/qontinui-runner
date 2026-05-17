@@ -12,7 +12,7 @@
       "name": "Scan corpus for distinctness violations",
       "phase": "setup",
       "shell_command": "cargo run --bin scan_spec_distinctness -- --json > /tmp/distinctness-report.json",
-      "shell_command_working_directory": "C:\\Users\\jspin\\Documents\\qontinui_parent\\qontinui-runner\\src-tauri",
+      "shell_command_working_directory": "C:\\Users\\jspin\\Documents\\qontinui-root\\qontinui-runner\\src-tauri",
       "shell_command_fail_on_error": true
     }
   ],
@@ -25,7 +25,7 @@
       "phase": "verification",
       "check_type": "custom_command",
       "check_command": "python -c \"import json,sys; r=json.load(open('/tmp/distinctness-report.json')); sys.exit(0 if r['summary']['any_violation']==0 else 1)\"",
-      "check_working_directory": "C:\\Users\\jspin\\Documents\\qontinui_parent\\qontinui-runner"
+      "check_working_directory": "C:\\Users\\jspin\\Documents\\qontinui-root\\qontinui-runner"
     }
   ],
 
@@ -45,7 +45,7 @@
       "name": "Re-scan corpus after cleanup",
       "phase": "completion",
       "shell_command": "cargo run --bin scan_spec_distinctness -- --json > /tmp/distinctness-report-final.json",
-      "shell_command_working_directory": "C:\\Users\\jspin\\Documents\\qontinui_parent\\qontinui-runner\\src-tauri",
+      "shell_command_working_directory": "C:\\Users\\jspin\\Documents\\qontinui-root\\qontinui-runner\\src-tauri",
       "shell_command_fail_on_error": true
     },
     {
@@ -55,7 +55,7 @@
       "phase": "completion",
       "check_type": "custom_command",
       "check_command": "python -c \"import json,sys; r=json.load(open('/tmp/distinctness-report-final.json')); sys.exit(0 if r['summary']['any_violation']==0 else 1)\"",
-      "check_working_directory": "C:\\Users\\jspin\\Documents\\qontinui_parent\\qontinui-runner"
+      "check_working_directory": "C:\\Users\\jspin\\Documents\\qontinui-root\\qontinui-runner"
     }
   ],
 

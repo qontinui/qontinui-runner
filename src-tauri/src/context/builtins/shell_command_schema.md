@@ -38,7 +38,7 @@ The `command` step type executes shell commands, API requests, checks, and MCP c
 
 - Always set this for commands that depend on project structure (npm, cargo, poetry, etc.)
 - Must be a real absolute path — never `/path/to/project` or similar placeholders
-- Example: `C:/Users/jspin/Documents/qontinui_parent/qontinui-web/frontend`
+- Example: `C:/Users/jspin/Documents/qontinui-root/qontinui-web/frontend`
 
 **`timeout_seconds`** (optional, default: 60)
 
@@ -65,7 +65,7 @@ The `command` step type executes shell commands, API requests, checks, and MCP c
   "name": "Install npm dependencies",
   "phase": "setup",
   "command": "npm install",
-  "working_directory": "C:/Users/jspin/Documents/qontinui_parent/qontinui-web/frontend",
+  "working_directory": "C:/Users/jspin/Documents/qontinui-root/qontinui-web/frontend",
   "timeout_seconds": 120,
   "fail_on_error": true
 }
@@ -80,7 +80,7 @@ The `command` step type executes shell commands, API requests, checks, and MCP c
   "name": "Start dev server",
   "phase": "setup",
   "command": "npm run dev &",
-  "working_directory": "C:/Users/jspin/Documents/qontinui_parent/qontinui-web/frontend",
+  "working_directory": "C:/Users/jspin/Documents/qontinui-root/qontinui-web/frontend",
   "timeout_seconds": 10,
   "fail_on_error": false
 }
@@ -95,7 +95,7 @@ The `command` step type executes shell commands, API requests, checks, and MCP c
   "name": "Production build verification",
   "phase": "completion",
   "command": "npx next build",
-  "working_directory": "C:/Users/jspin/Documents/qontinui_parent/qontinui-web/frontend",
+  "working_directory": "C:/Users/jspin/Documents/qontinui-root/qontinui-web/frontend",
   "timeout_seconds": 300,
   "fail_on_error": true
 }

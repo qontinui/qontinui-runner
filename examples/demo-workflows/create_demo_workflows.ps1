@@ -25,7 +25,7 @@ function Create-Workflow {
     }
 }
 
-$setupScriptDir = "C:\Users\jspin\Documents\qontinui_parent\qontinui-runner\examples\demo-workflows"
+$setupScriptDir = "C:\Users\jspin\Documents\qontinui-root\qontinui-runner\examples\demo-workflows"
 
 # ============================================================
 # Demo 1: Fix Buggy Calculator

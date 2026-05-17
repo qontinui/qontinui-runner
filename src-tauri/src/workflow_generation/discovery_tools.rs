@@ -1806,7 +1806,7 @@ mod tests {
     #[test]
     fn test_parse_description_windows_path() {
         let desc =
-            r"Run lint checks on C:\Users\jspin\Documents\qontinui_parent\qontinui-runner project";
+            r"Run lint checks on C:\Users\jspin\Documents\qontinui-root\qontinui-runner project";
         let input = parse_description(desc);
         assert_eq!(input.project_paths.len(), 1);
         assert!(input.project_paths[0].contains("qontinui-runner"));

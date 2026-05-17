@@ -39,7 +39,7 @@ const SKIP_DIRS = new Set([
   ".next",
   ".dev-logs",
 ]);
-const DEFAULT_ROOT = "C:\\Users\\jspin\\Documents\\qontinui_parent";
+const DEFAULT_ROOT = "C:\\Users\\jspin\\Documents\\qontinui-root";
 
 const SEARCH_ITEM_HEIGHT = 50;
 const CONTENT_ITEM_HEIGHT = 66;

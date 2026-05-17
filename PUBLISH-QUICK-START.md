@@ -7,7 +7,7 @@
 ## Step 1: Build (10 min)
 
 ```powershell
-cd D:\qontinui_parent_directory\qontinui-runner
+cd D:\qontinui-root\qontinui-runner
 npm run tauri build
 ```
 

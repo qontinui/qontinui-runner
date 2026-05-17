@@ -17,7 +17,7 @@
 //! ```json
 //! {
 //!   "paths": {
-//!     "dev_logs_dir": "D:\\qontinui_parent_directory\\.dev-logs"
+//!     "dev_logs_dir": "D:\\qontinui-root\\.dev-logs"
 //!   }
 //! }
 //! ```

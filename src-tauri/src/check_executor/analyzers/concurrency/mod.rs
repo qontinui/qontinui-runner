@@ -175,7 +175,7 @@ mod tests {
     #[ignore] // Run with: cargo test test_analyze_qontinui_codebase -- --ignored --nocapture
     fn test_analyze_qontinui_codebase() {
         // Analyze the qontinui Python library
-        let qontinui_path = "D:/qontinui_parent_directory/qontinui";
+        let qontinui_path = "D:/qontinui-root/qontinui";
 
         println!("\n=== Analyzing qontinui codebase for race conditions ===\n");
 
