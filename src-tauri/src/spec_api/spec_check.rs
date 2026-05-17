@@ -85,6 +85,9 @@ pub(crate) fn adapt_supplied_snapshot(
             }
         }
     }
+    if let Some(serde_json::Value::Object(undo)) = root.get_mut("undoRedo") {
+        adapt_undo_redo_object(undo);
+    }
 
     serde_json::from_value::<UIBridgeSnapshot>(serde_json::Value::Object(root))
         .map_err(|e| format!("snapshot adapt failed after fill: {e}"))
@@ -156,6 +159,26 @@ fn adapt_element_object(obj: &mut serde_json::Map<String, serde_json::Value>, ti
     // `mounted` — default true
     obj.entry("mounted")
         .or_insert_with(|| serde_json::Value::Bool(true));
+}
+
+/// Patch the SDK control-mode `undoRedo` sub-object into the canonical
+/// [`qontinui_types::ui_bridge::UIBridgeUndoContext`] shape:
+///  - `undoAvailable` → `canUndo`, `redoAvailable` → `canRedo` (same data,
+///    different wire names).
+///  - Leaves `summary` and any matching optional fields alone.
+///  - Does NOT rename if the canonical names are already present (caller
+///    sent a canonical-shape blob).
+fn adapt_undo_redo_object(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if !obj.contains_key("canUndo") {
+        if let Some(v) = obj.remove("undoAvailable") {
+            obj.insert("canUndo".into(), v);
+        }
+    }
+    if !obj.contains_key("canRedo") {
+        if let Some(v) = obj.remove("redoAvailable") {
+            obj.insert("canRedo".into(), v);
+        }
+    }
 }
 
 /// Patch a single SDK control-mode component object into the canonical
@@ -1464,6 +1487,50 @@ mod tests {
         assert_eq!(c.actions.len(), 1);
         assert_eq!(c.actions[0].id, "do-thing");
         assert_eq!(c.actions[0].label.as_deref(), Some("Do It"));
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_renames_undo_redo_wire_names() {
+        // Bug iter-3 / 2026-05-17: wire emits `undoAvailable` + `redoAvailable`;
+        // canonical UIBridgeUndoContext expects `canUndo` + `canRedo`.
+        // Without the rename, /spec-check returns 502 with
+        // "missing field `canUndo`" any time the supplied snapshot (or the
+        // self-snapshot fallback) carries an undoRedo block.
+        let raw = json!({
+            "timestamp": 0i64,
+            "elements": [],
+            "components": [],
+            "undoRedo": {
+                "undoAvailable": true,
+                "redoAvailable": false,
+                "summary": "Undo: Foo",
+            }
+        });
+        let adapted = adapt_supplied_snapshot(raw).expect("undoRedo must adapt");
+        let undo = adapted.undo_redo.expect("undo_redo populated");
+        assert!(undo.can_undo);
+        assert!(!undo.can_redo);
+        assert_eq!(undo.summary, "Undo: Foo");
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_preserves_canonical_undo_redo_names() {
+        // If the caller already sends canUndo/canRedo, the adapter must
+        // not double-rename or clobber.
+        let raw = json!({
+            "timestamp": 0i64,
+            "elements": [],
+            "components": [],
+            "undoRedo": {
+                "canUndo": true,
+                "canRedo": true,
+                "summary": "Canonical input",
+            }
+        });
+        let adapted = adapt_supplied_snapshot(raw).expect("canonical passes through");
+        let undo = adapted.undo_redo.expect("undo_redo populated");
+        assert!(undo.can_undo);
+        assert!(undo.can_redo);
     }
 
     #[test]
