@@ -18,7 +18,7 @@
 //! The "Connect with web login" OAuth-style flow is independent of the WS
 //! relay and lives in [`token_flow`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -104,6 +104,13 @@ pub struct ServerModeState {
     /// command calls [`ServerModeState::shutdown`] to flip this to `true`;
     /// the relay loop checks between iterations and returns cleanly.
     shutdown: Arc<AtomicBool>,
+    /// Number of backend-side subscribers currently interested in terminal
+    /// output frames. The backend sends `terminal_subscribe` /
+    /// `terminal_unsubscribe` messages over the relay; the outbound forwarder
+    /// reads this and *skips* sending `terminal-output` / `terminal-exit`
+    /// frames entirely when this is `0`, preventing a WS flood when no
+    /// consumer is attached.
+    terminal_subscriber_count: Arc<AtomicUsize>,
 }
 
 impl ServerModeState {
@@ -115,6 +122,7 @@ impl ServerModeState {
             connection_error: Arc::new(RwLock::new(None)),
             ws_connected: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            terminal_subscriber_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -179,5 +187,88 @@ impl ServerModeState {
     /// Whether shutdown has been requested.
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Current number of backend-side terminal-output subscribers.
+    ///
+    /// The outbound relay forwarder consults this before forwarding a
+    /// `terminal-output` / `terminal-exit` frame; when it is `0` the frame
+    /// is dropped (never serialized or sent) so an unattended terminal
+    /// session cannot flood the relay WebSocket.
+    pub fn terminal_subscriber_count(&self) -> usize {
+        self.terminal_subscriber_count.load(Ordering::SeqCst)
+    }
+
+    /// Register one additional backend-side terminal subscriber. Called by
+    /// the relay command handler on an inbound `terminal_subscribe`.
+    pub fn incr_terminal_subscribers(&self) {
+        self.terminal_subscriber_count
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Remove one backend-side terminal subscriber, saturating at `0` so a
+    /// stray / duplicate `terminal_unsubscribe` can never make the count
+    /// underflow (which would re-enable the flood forever).
+    pub fn decr_terminal_subscribers(&self) {
+        let _ = self.terminal_subscriber_count.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |cur| {
+                if cur == 0 {
+                    None
+                } else {
+                    Some(cur - 1)
+                }
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> ServerModeState {
+        ServerModeState::new(ServerModeConfig {
+            web_backend_url: "https://example.test".to_string(),
+            runner_token: "qontinui_runner_test".to_string(),
+        })
+    }
+
+    #[test]
+    fn terminal_subscriber_count_starts_at_zero() {
+        let s = test_state();
+        assert_eq!(s.terminal_subscriber_count(), 0);
+    }
+
+    #[test]
+    fn incr_decr_terminal_subscribers_roundtrip() {
+        let s = test_state();
+        s.incr_terminal_subscribers();
+        s.incr_terminal_subscribers();
+        assert_eq!(s.terminal_subscriber_count(), 2);
+        s.decr_terminal_subscribers();
+        assert_eq!(s.terminal_subscriber_count(), 1);
+        s.decr_terminal_subscribers();
+        assert_eq!(s.terminal_subscriber_count(), 0);
+    }
+
+    #[test]
+    fn decr_terminal_subscribers_saturates_at_zero() {
+        let s = test_state();
+        s.decr_terminal_subscribers();
+        s.decr_terminal_subscribers();
+        assert_eq!(s.terminal_subscriber_count(), 0);
+        // and a subsequent incr still works correctly (no underflow wrap).
+        s.incr_terminal_subscribers();
+        assert_eq!(s.terminal_subscriber_count(), 1);
+    }
+
+    #[test]
+    fn terminal_subscriber_count_shared_across_clones() {
+        let s = test_state();
+        let c = s.clone();
+        s.incr_terminal_subscribers();
+        assert_eq!(c.terminal_subscriber_count(), 1);
     }
 }
