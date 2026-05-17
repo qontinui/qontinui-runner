@@ -156,4 +156,5 @@ pub mod web_backend_workflows;
 pub mod websocket;
 pub mod window_manager;
 pub mod worktrees;
+pub mod ws_bridge_dispatch;
 pub mod ws_relay;
