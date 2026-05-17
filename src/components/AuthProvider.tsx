@@ -17,6 +17,15 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import type { AuthStatus, AuthContextValue, LoginResponse } from "../types";
 import { createLogger } from "@/lib/logger";
+import { withTimeout } from "@/lib/withTimeout";
+
+// Defensive timeout for the initial-mount Tauri-invoke calls in AuthProvider.
+// If the IPC channel is mid-setup on the first webview render and the
+// invoke Promise never settles, the effect chain stays stuck and auto-login
+// never fires. A 5s cap unsticks the chain so the existing catch handlers
+// run their normal cleanup. See
+// qontinui-dev-notes/plans/2026-05-17-runner-auto-login-initial-mount.md.
+const AUTH_PROBE_TIMEOUT_MS = 5000;
 
 const log = createLogger("Auth");
 
@@ -105,7 +114,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
     log.debug("checkAuthStatus() called");
     try {
       setError(null);
-      const status = await invoke<AuthStatus>("check_auth_status");
+      const status = await withTimeout(
+        invoke<AuthStatus>("check_auth_status"),
+        AUTH_PROBE_TIMEOUT_MS,
+        "check_auth_status",
+      );
       log.debug("checkAuthStatus() result:", status);
       setAuthStatus(status);
       return status;
@@ -242,7 +255,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
    */
   useEffect(() => {
     let cancelled = false;
-    invoke<{ email: string; password: string } | null>("get_test_auto_login")
+    withTimeout(
+      invoke<{ email: string; password: string } | null>("get_test_auto_login"),
+      AUTH_PROBE_TIMEOUT_MS,
+      "get_test_auto_login",
+    )
       .then((creds) => {
         if (cancelled) return;
         if (creds && creds.email && creds.password) {
