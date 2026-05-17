@@ -5,7 +5,7 @@ import * as fs from "fs";
 
 describe("ConfigurationParserService Integration", () => {
   it("should load and parse the bdo_latest_config (5).json correctly", () => {
-    const configPath = "d:/qontinui_parent_directory/configurations/bdo_latest_config (5).json";
+    const configPath = "d:/qontinui-root/configurations/bdo_latest_config (5).json";
 
     // Skip if the fixture file doesn't exist on this machine
     if (!fs.existsSync(configPath)) {

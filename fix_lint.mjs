@@ -3,7 +3,7 @@
 import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
-const BASE = 'C:/Users/jspin/Documents/qontinui_parent/qontinui-runner';
+const BASE = 'C:/Users/jspin/Documents/qontinui-root/qontinui-runner';
 
 // SUPPRESSIONS: [relative_path, line_number (1-based error line), rule]
 // For multi-error lines: the script deduplicates them

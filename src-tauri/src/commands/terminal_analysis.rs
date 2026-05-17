@@ -531,7 +531,7 @@ pub async fn analyze_page_architecture() -> Result<CommandResponse, String> {
 /// Find and return the content of the most recently modified plan file.
 ///
 /// Search order:
-/// 1. Workspace root (e.g. `qontinui_parent/`)
+/// 1. Workspace root (e.g. `qontinui-root/`)
 /// 2. Sibling `qontinui-dev-notes/` directory (per project conventions)
 /// 3. Parent of workspace root (one level up)
 #[tauri::command]

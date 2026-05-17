@@ -208,7 +208,7 @@ macro_rules! log_debug {
 pub fn get_crash_dump_dir() -> PathBuf {
     // Try to use the .dev-logs directory in the parent directory
     let base = if let Ok(exe_path) = std::env::current_exe() {
-        // Navigate from exe to qontinui_parent_directory/.dev-logs
+        // Navigate from exe to qontinui-root/.dev-logs
         exe_path
             .parent()
             .and_then(|p| p.parent())

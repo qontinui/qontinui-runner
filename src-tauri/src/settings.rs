@@ -666,7 +666,7 @@ pub struct PathSettings {
     /// - macOS: `~/Library/Application Support/qontinui-runner/dev-logs`
     /// - Linux: `~/.local/share/qontinui-runner/dev-logs`
     ///
-    /// Override example: `D:\qontinui_parent_directory\.dev-logs`
+    /// Override example: `D:\qontinui-root\.dev-logs`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_logs_dir: Option<String>,
 

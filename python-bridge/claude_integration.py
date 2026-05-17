@@ -45,7 +45,7 @@ def get_automation_results_dir() -> Path:
 
     # Default: look for results in the parent directory of the runner
     runner_dir = Path(__file__).parent.parent  # qontinui-runner
-    parent_dir = runner_dir.parent  # qontinui_parent_directory
+    parent_dir = runner_dir.parent  # qontinui-root
     return parent_dir / DEFAULT_RESULTS_DIR
 
 
@@ -183,7 +183,7 @@ def trigger_analysis(
         cwd = str(Path(working_directory))
     else:
         runner_dir = Path(__file__).parent.parent
-        cwd = str(runner_dir.parent)  # qontinui_parent_directory
+        cwd = str(runner_dir.parent)  # qontinui-root
 
     # Execute Claude Code using the shared runner
     logger.info("Starting Claude Code analysis...")
