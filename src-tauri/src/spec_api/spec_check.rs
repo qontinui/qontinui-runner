@@ -639,9 +639,17 @@ pub async fn post_spec_check_batch(
         let snapshot = snapshot.clone();
         let root = root.clone();
         let shared_policy = req.shared_policy.clone();
-        set.spawn(
-            async move { evaluate_one(&root, &entry, &snapshot, shared_policy.as_ref()).await },
-        );
+        let snapshot_id_owned = snapshot_id.clone();
+        set.spawn(async move {
+            evaluate_one(
+                &root,
+                &entry,
+                &snapshot,
+                &snapshot_id_owned,
+                shared_policy.as_ref(),
+            )
+            .await
+        });
     }
     let mut results = Vec::with_capacity(set.len());
     while let Some(joined) = set.join_next().await {
@@ -761,6 +769,7 @@ async fn evaluate_one(
     root: &std::path::Path,
     entry: &BatchPageEntry,
     snapshot: &Arc<UIBridgeSnapshot>,
+    snapshot_id: &str,
     shared_policy: Option<&SpecCheckPolicy>,
 ) -> BatchElementResult {
     if invalid_page_id(&entry.page_id) {
@@ -780,6 +789,16 @@ async fn evaluate_one(
     // Per-entry override wins over the shared policy.
     let policy = entry.policy_override.as_ref().or(shared_policy);
     let policy_eval = policy.map(|p| spec_check::apply_policy(&result, p));
+
+    // Plan 06 / Issue 3 (2026-05-17): emit SpecCheckPolicyViolation per
+    // failing conjunct. Carries the batch's *shared* snapshot_id (not the
+    // crate's internal sentinel from `result.snapshot_id`) so subscribers
+    // can join all per-element violations under one batch run. The
+    // workflow-step handler does the same emit, but it self-calls
+    // /spec-check (single), not /spec-check/batch, so no double-counting.
+    if let (Some(pol), Some(eval)) = (policy, policy_eval.as_ref()) {
+        events::emit_policy_violations(snapshot_id, &entry.page_id, pol, eval);
+    }
 
     BatchElementResult::ok(entry.page_id.clone(), result, policy_eval)
 }
@@ -853,7 +872,7 @@ async fn stream_batch_results(
                     return None;
                 }
             };
-            let r = evaluate_one(&root, &entry, &snapshot, shared_policy.as_ref()).await;
+            let r = evaluate_one(&root, &entry, &snapshot, &snap_id, shared_policy.as_ref()).await;
             match (r.status, r.result.as_ref()) {
                 ("ok", Some(res)) => {
                     st.ok_count += 1;
@@ -982,7 +1001,7 @@ mod tests {
             page_id: "no-such-page".to_string(),
             policy_override: None,
         };
-        let r = evaluate_one(&root, &entry, &snapshot, None).await;
+        let r = evaluate_one(&root, &entry, &snapshot, "scs_test", None).await;
         assert_eq!(r.status, "spec-not-found");
         assert!(r.result.is_none());
         assert_eq!(r.page_id, "no-such-page");
@@ -998,7 +1017,7 @@ mod tests {
             page_id: "../escape".to_string(),
             policy_override: None,
         };
-        let r = evaluate_one(&root, &entry, &snapshot, None).await;
+        let r = evaluate_one(&root, &entry, &snapshot, "scs_test", None).await;
         assert_eq!(r.status, "eval-error");
         assert_eq!(r.error.as_deref(), Some("invalid-page-id"));
     }
@@ -1055,11 +1074,104 @@ mod tests {
             page_id: "batch-page".to_string(),
             policy_override: None,
         };
-        let r = evaluate_one(root, &entry, &snapshot, None).await;
+        let r = evaluate_one(root, &entry, &snapshot, "scs_test", None).await;
         assert_eq!(r.status, "ok");
         let result = r.result.expect("ok status carries a result");
         assert_eq!(result.page_id, "batch-page");
         assert_eq!(result.result_schema_version, 1);
+    }
+
+    #[tokio::test]
+    async fn evaluate_one_emits_policy_violation_with_batch_snapshot_id() {
+        // Issue 3 (2026-05-17): when /spec-check/batch's evaluate_one applies
+        // a failing policy, it must emit SpecCheckPolicyViolation tagged with
+        // the BATCH's shared snapshot_id (not the crate's internal sentinel).
+        use qontinui_types::spec_api_events::SpecApiEvent;
+        use qontinui_types::spec_check::{AssertionScope, ConjunctRule, PolicyConjunct};
+        // Seed an IR with one critical assertion that will not match an
+        // empty snapshot — guarantees the policy's all_pass fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let page_dir = root.join("pages").join("batch-violation-page");
+        std::fs::create_dir_all(&page_dir).unwrap();
+        let ir = serde_json::json!({
+            "version": "1.0",
+            "id": "batch-violation-page",
+            "name": "Batch Violation Test",
+            "states": [{
+                "id": "s1",
+                "name": "Sole State",
+                "assertions": [{
+                    "id": "must-have-button",
+                    "description": "must have a Submit button",
+                    "category": "element-presence",
+                    "severity": "critical",
+                    "assertionType": "exists",
+                    "target": {
+                        "type": "search",
+                        "criteria": { "role": "button", "text": "Submit" },
+                        "label": "Submit button"
+                    },
+                    "source": "ai-generated",
+                    "reviewed": false,
+                    "enabled": true
+                }]
+            }],
+            "transitions": []
+        });
+        std::fs::write(
+            page_dir.join("state-machine.derived.json"),
+            serde_json::to_string_pretty(&ir).unwrap(),
+        )
+        .unwrap();
+
+        let snapshot: UIBridgeSnapshot = serde_json::from_value(minimal_snapshot_json()).unwrap();
+        let snapshot = Arc::new(snapshot);
+        let entry = BatchPageEntry {
+            page_id: "batch-violation-page".into(),
+            policy_override: None,
+        };
+        let policy = SpecCheckPolicy {
+            conjuncts: vec![PolicyConjunct {
+                name: "critical-all-pass".into(),
+                scope: AssertionScope::default(),
+                rule: ConjunctRule::AllPass,
+            }],
+        };
+
+        let mut rx = events::subscribe();
+        let marker = "scs_batch_emit_test_marker_xyz";
+        let r = evaluate_one(root, &entry, &snapshot, marker, Some(&policy)).await;
+        assert_eq!(r.status, "ok");
+        let pe = r.policy_evaluation.as_ref().expect("policy_evaluation set");
+        assert_eq!(
+            pe.overall_status,
+            qontinui_types::spec_check::PolicyStatus::Fail
+        );
+
+        // Drain; find the violation event tagged with our marker.
+        let mut found = None;
+        for _ in 0..64 {
+            match rx.try_recv() {
+                Ok(SpecApiEvent::SpecCheckPolicyViolation {
+                    snapshot_id,
+                    page_id,
+                    conjunct_name,
+                    rule_kind,
+                    ..
+                }) if snapshot_id == marker => {
+                    found = Some((page_id, conjunct_name, rule_kind));
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        let (page_id, conjunct_name, rule_kind) =
+            found.expect("violation emit must arrive with batch snapshot_id");
+        assert_eq!(page_id, "batch-violation-page");
+        assert_eq!(conjunct_name, "critical-all-pass");
+        assert_eq!(rule_kind, "all_pass");
     }
 
     #[test]

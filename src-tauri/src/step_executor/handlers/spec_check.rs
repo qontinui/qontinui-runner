@@ -24,56 +24,9 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use super::{ExecutionStepConfig, HandlerContext, StepHandler, StepHandlerResult};
-use crate::spec_api::events;
+use crate::spec_api::events::emit_policy_violations;
 use qontinui_spec_check as spec_check; // crate name = "qontinui-spec-check"
-use qontinui_types::spec_api_events::SpecApiEvent;
-use qontinui_types::spec_check::{
-    ConjunctRule, MatchOutcome, PolicyConjunct, PolicyEvaluation, PolicyStatus, SpecCheckPolicy,
-};
-
-/// Wire name for the `ConjunctRule` variant — mirrors the
-/// `#[serde(tag = "kind", rename_all = "snake_case")]` discriminator.
-fn rule_kind_str(rule: &ConjunctRule) -> &'static str {
-    match rule {
-        ConjunctRule::AllPass => "all_pass",
-        ConjunctRule::MaxFailures { .. } => "max_failures",
-        ConjunctRule::FailureRateBelow { .. } => "failure_rate_below",
-        ConjunctRule::StateMatchRateAtLeast { .. } => "state_match_rate_at_least",
-        ConjunctRule::AnyStateMatchRateAtLeast { .. } => "any_state_match_rate_at_least",
-        ConjunctRule::MatchOutcomeAtLeast { .. } => "match_outcome_at_least",
-    }
-}
-
-/// Emit one `SpecCheckPolicyViolation` per failing `ConjunctEvaluation`.
-/// Looks up each evaluation by `name` in the originating policy so the
-/// emit carries the structural `rule_kind` discriminator alongside the
-/// evidence string. Indeterminate conjuncts are NOT emitted — only `Fail`.
-fn emit_policy_violations(
-    snapshot_id: &str,
-    page_id: &str,
-    policy: &SpecCheckPolicy,
-    eval: &PolicyEvaluation,
-) {
-    for conjunct_eval in &eval.conjunct_results {
-        if conjunct_eval.status != PolicyStatus::Fail {
-            continue;
-        }
-        let rule_kind = policy
-            .conjuncts
-            .iter()
-            .find(|c: &&PolicyConjunct| c.name == conjunct_eval.name)
-            .map(|c| rule_kind_str(&c.rule))
-            .unwrap_or("unknown");
-        events::emit(SpecApiEvent::SpecCheckPolicyViolation {
-            snapshot_id: snapshot_id.to_string(),
-            page_id: page_id.to_string(),
-            conjunct_name: conjunct_eval.name.clone(),
-            rule_kind: rule_kind.to_string(),
-            observed: serde_json::Value::String(conjunct_eval.evidence.clone()),
-            at_ms: events::now_ms(),
-        });
-    }
-}
+use qontinui_types::spec_check::{MatchOutcome, PolicyStatus, SpecCheckPolicy};
 
 pub struct SpecCheckHandler;
 
@@ -462,110 +415,7 @@ mod tests {
         assert!(d.spec_check_fail_on.is_none());
     }
 
-    // ------------------------------------------------------------------------
-    // Plan 06 — emit-callsite helpers
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn rule_kind_str_covers_every_variant() {
-        // Locks the snake_case discriminator strings against accidental
-        // drift from `#[serde(tag = "kind", rename_all = "snake_case")]`.
-        assert_eq!(rule_kind_str(&ConjunctRule::AllPass), "all_pass");
-        assert_eq!(
-            rule_kind_str(&ConjunctRule::MaxFailures { count: 0 }),
-            "max_failures"
-        );
-        assert_eq!(
-            rule_kind_str(&ConjunctRule::FailureRateBelow { rate: 0.0 }),
-            "failure_rate_below"
-        );
-        assert_eq!(
-            rule_kind_str(&ConjunctRule::StateMatchRateAtLeast { rate: 0.0 }),
-            "state_match_rate_at_least"
-        );
-        assert_eq!(
-            rule_kind_str(&ConjunctRule::AnyStateMatchRateAtLeast { rate: 0.0 }),
-            "any_state_match_rate_at_least"
-        );
-        assert_eq!(
-            rule_kind_str(&ConjunctRule::MatchOutcomeAtLeast {
-                outcome: MatchOutcome::FullMatch
-            }),
-            "match_outcome_at_least"
-        );
-    }
-
-    #[test]
-    fn emit_policy_violations_publishes_one_per_failing_conjunct() {
-        use qontinui_types::spec_api_events::SpecApiEvent;
-        use qontinui_types::spec_check::{AssertionScope, ConjunctEvaluation, PolicyConjunct};
-        let mut rx = events::subscribe();
-        let marker = "scs_test_policy_violation_emit_1";
-        let page_id = "settings-test-violation";
-        let policy = SpecCheckPolicy {
-            conjuncts: vec![
-                PolicyConjunct {
-                    name: "critical-all-pass".into(),
-                    scope: AssertionScope::default(),
-                    rule: ConjunctRule::AllPass,
-                },
-                PolicyConjunct {
-                    name: "max-three-failures".into(),
-                    scope: AssertionScope::default(),
-                    rule: ConjunctRule::MaxFailures { count: 3 },
-                },
-                PolicyConjunct {
-                    name: "passing-conjunct".into(),
-                    scope: AssertionScope::default(),
-                    rule: ConjunctRule::AllPass,
-                },
-            ],
-        };
-        let eval = qontinui_types::spec_check::PolicyEvaluation {
-            overall_status: PolicyStatus::Fail,
-            conjunct_results: vec![
-                ConjunctEvaluation {
-                    name: "critical-all-pass".into(),
-                    status: PolicyStatus::Fail,
-                    evidence: "2 of 17 assertions failed".into(),
-                },
-                ConjunctEvaluation {
-                    name: "max-three-failures".into(),
-                    status: PolicyStatus::Fail,
-                    evidence: "5 failures > 3 budget".into(),
-                },
-                ConjunctEvaluation {
-                    name: "passing-conjunct".into(),
-                    status: PolicyStatus::Pass,
-                    evidence: "all green".into(),
-                },
-            ],
-        };
-        emit_policy_violations(marker, page_id, &policy, &eval);
-        // Two failing conjuncts → expect two emits with our marker.
-        // Drain up to 64 events from the broadcast, filter by marker.
-        let mut violations = Vec::new();
-        for _ in 0..64 {
-            match rx.try_recv() {
-                Ok(SpecApiEvent::SpecCheckPolicyViolation {
-                    snapshot_id,
-                    page_id: pid,
-                    conjunct_name,
-                    rule_kind,
-                    ..
-                }) if snapshot_id == marker => {
-                    violations.push((conjunct_name, rule_kind, pid));
-                }
-                Ok(_) => continue,
-                Err(_) => break,
-            }
-        }
-        assert_eq!(violations.len(), 2, "expected exactly 2 violation emits");
-        // Order is policy declaration order; first failing conjunct first.
-        assert_eq!(violations[0].0, "critical-all-pass");
-        assert_eq!(violations[0].1, "all_pass");
-        assert_eq!(violations[0].2, page_id);
-        assert_eq!(violations[1].0, "max-three-failures");
-        assert_eq!(violations[1].1, "max_failures");
-    }
+    // Plan 06 emit-callsite helper tests (rule_kind_str + emit_policy_violations)
+    // moved to qontinui-runner/src-tauri/src/spec_api/events.rs alongside the
+    // helpers themselves (which now back both this handler and /spec-check/batch).
 }
