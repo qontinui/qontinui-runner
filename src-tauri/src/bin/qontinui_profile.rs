@@ -487,13 +487,13 @@ fn cmd_machine_init() -> ExitCode {
         );
     }
 
-    // Register with coord by UPSERTing coord.machines on the active profile's
-    // PG. File creation succeeds even if coord registration fails — the local
-    // identity is the canonical record; coord.machines is a derived view
+    // Register with coord via HTTP `POST /coord/machine/register`. File
+    // creation succeeds even if coord registration fails — the local
+    // machine.json is the canonical record; coord.machines is a derived view
     // (qontinui-coord re-syncs from machine.json on next /coord/status POST).
     match register_with_coord(&file.machine_id, &file.hostname) {
         Ok(()) => {
-            println!("registered with coord (UPSERT into coord.machines)");
+            println!("registered with coord via HTTP (POST /coord/machine/register)");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -549,44 +549,70 @@ fn cmd_machine_show() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// UPSERT into the active profile's `coord.machines`. Constructs a one-shot
-/// tokio runtime since the rest of this CLI is sync — keeps the binary
-/// otherwise unchanged. Uses NoTls (LAN/loopback dev posture; staging+ via
-/// stunnel or pgbouncer-tls if it ships later).
+/// Register this machine with coord via `POST /coord/machine/register`.
+/// The endpoint (added in qontinui-coord PR #37) UPSERTs `coord.machines`
+/// and returns the resulting row. Replaces the prior direct-PG INSERT path
+/// so the runner no longer needs PG credentials to coord's database.
+///
+/// The CLI bootstrap doesn't know its health URL — that's the supervisor's
+/// job (Phase 3 of the fleet-health-url advertisement plan). We pass
+/// `health_url: null`; coord's endpoint treats missing/null as "leave the
+/// stored health_url as-is" (UPSERT semantics).
 fn register_with_coord(machine_id: &str, hostname: &str) -> Result<(), String> {
-    let id = uuid::Uuid::parse_str(machine_id)
+    // Validate UUID shape up front so a malformed machine.json fails fast
+    // with a clear error instead of bouncing off a 400 from coord.
+    let _ = uuid::Uuid::parse_str(machine_id)
         .map_err(|e| format!("machine_id is not a valid UUID: {}", e))?;
-    let dsn = active_profile_dsn()?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+    let base = coord_http_base()?;
+    let url = format!("{}/coord/machine/register", base);
+    let body = serde_json::json!({
+        "machine_id": machine_id,
+        "hostname": hostname,
+        "health_url": serde_json::Value::Null,
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| format!("tokio runtime build failed: {}", e))?;
-    rt.block_on(async move {
-        let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| format!("connect to coord PG failed: {}", e))?;
-        let join = tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::debug!("pg connection ended: {}", e);
-            }
-        });
-        let res = client
-            .execute(
-                "INSERT INTO coord.machines (machine_id, hostname) \
-                 VALUES ($1, $2) \
-                 ON CONFLICT (machine_id) DO UPDATE \
-                 SET hostname = EXCLUDED.hostname, last_seen_at = now()",
-                &[&id, &hostname],
-            )
-            .await
-            .map_err(|e| format!("UPSERT coord.machines failed: {}", e))?;
-        drop(client);
-        let _ = join.await;
-        if res == 0 {
-            return Err("UPSERT coord.machines affected 0 rows".to_string());
-        }
-        Ok(())
-    })
+        .map_err(|e| format!("reqwest client build failed: {}", e))?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("POST {} failed (coord unreachable?): {}", url, e))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body_text = resp
+        .text()
+        .unwrap_or_else(|_| "<unable to read response body>".to_string());
+    Err(format!(
+        "POST {} returned HTTP {}: {}",
+        url, status, body_text
+    ))
+}
+
+/// Resolve the coord HTTP base from the active profile's `coord_url`.
+/// Profiles store `ws://host:9870/ws` (the WebSocket upgrade URL); we
+/// convert that to `http://host:9870` so reqwest can POST to
+/// `/coord/machine/register`. Mirrors `qontinui-supervisor/src/fleet.rs`
+/// `coord_http_base` so both registration paths follow the same recipe.
+fn coord_http_base() -> Result<String, String> {
+    let coord_url = load_strict()
+        .map_err(|e| format!("active profile load failed: {}", e))?
+        .coord_url
+        .ok_or_else(|| "active profile has no coord_url".to_string())?;
+    let trimmed = coord_url.trim_end_matches("/ws");
+    let with_http = trimmed
+        .strip_prefix("wss://")
+        .map(|rest| format!("https://{rest}"))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("ws://")
+                .map(|rest| format!("http://{rest}"))
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    Ok(with_http)
 }
 
 fn query_coord_registration(machine_id: &str) -> Result<Option<(String, String)>, String> {
