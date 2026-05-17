@@ -26,9 +26,15 @@ describe("withTimeout", () => {
     // Inner promise that never resolves — simulates the Tauri IPC hang.
     const hanging = new Promise<string>(() => {});
     const racing = withTimeout(hanging, 5000, "check_auth_status");
-    // Advance past the timeout window.
+    // Pre-attach a catch handler so the race rejection is observed
+    // synchronously when the fake timer fires; otherwise vitest+Node-22
+    // logs a spurious PromiseRejectionHandledWarning even though the
+    // rejection IS handled below.
+    const captured = racing.catch((e: unknown) => e as Error);
     await vi.advanceTimersByTimeAsync(5001);
-    await expect(racing).rejects.toThrow("check_auth_status timed out after 5000ms");
+    const err = await captured;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe("check_auth_status timed out after 5000ms");
   });
 
   it("propagates the inner promise's rejection unchanged when it rejects before the timeout", async () => {
