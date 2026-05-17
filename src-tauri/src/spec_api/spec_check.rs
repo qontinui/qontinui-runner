@@ -62,86 +62,148 @@ pub(crate) fn adapt_supplied_snapshot(
         return Ok(snap);
     }
 
-    // Path 2: walk elements and synthesize missing canonical fields.
+    // Path 2: walk elements + components and synthesize missing canonical
+    // fields. Either array may need fixup independently — strict parse can
+    // fail because of either, so don't require the other to be present.
     let mut root = match value {
         serde_json::Value::Object(m) => m,
         _ => return Err("snapshot payload must be a JSON object".into()),
     };
     let timestamp = root.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-    let elements_arr = root
-        .get_mut("elements")
-        .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| "snapshot.elements must be a JSON array".to_string())?;
-    for el in elements_arr.iter_mut() {
-        let obj = match el {
-            serde_json::Value::Object(m) => m,
-            _ => continue,
-        };
 
-        // `type` (renamed serde field; raw JSON key is "type")
-        obj.entry("type")
-            .or_insert_with(|| serde_json::Value::String("generic".into()));
-
-        // `identifier` — synthesize from `id` if absent
-        if !obj.contains_key("identifier") {
-            let id_str = obj
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            obj.insert(
-                "identifier".into(),
-                serde_json::json!({
-                    "uiId": id_str,
-                    "xpath": "",
-                    "selector": "",
-                }),
-            );
+    if let Some(elements_arr) = root.get_mut("elements").and_then(|v| v.as_array_mut()) {
+        for el in elements_arr.iter_mut() {
+            if let serde_json::Value::Object(obj) = el {
+                adapt_element_object(obj, timestamp);
+            }
         }
-
-        // `state` — synthesize from `bbox` + visibility hints if absent
-        if !obj.contains_key("state") {
-            let (x, y, width, height) = obj
-                .get("bbox")
-                .and_then(|b| b.as_object())
-                .map(|b| {
-                    (
-                        b.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        b.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        b.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        b.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    )
-                })
-                .unwrap_or((0.0, 0.0, 0.0, 0.0));
-            let visible = obj
-                .get("visible")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(width > 0.0 && height > 0.0);
-            obj.insert(
-                "state".into(),
-                serde_json::json!({
-                    "visible": visible,
-                    "enabled": true,
-                    "focused": false,
-                    "rect": {
-                        "x": x, "y": y, "width": width, "height": height,
-                        "top": y, "left": x,
-                        "right": x + width, "bottom": y + height,
-                    },
-                }),
-            );
-        }
-
-        // `registeredAt` — fall back to snapshot timestamp, then 0
-        obj.entry("registeredAt")
-            .or_insert_with(|| serde_json::Value::from(timestamp));
-
-        // `mounted` — default true
-        obj.entry("mounted")
-            .or_insert_with(|| serde_json::Value::Bool(true));
     }
+    if let Some(components_arr) = root.get_mut("components").and_then(|v| v.as_array_mut()) {
+        for c in components_arr.iter_mut() {
+            if let serde_json::Value::Object(obj) = c {
+                adapt_component_object(obj, timestamp);
+            }
+        }
+    }
+
     serde_json::from_value::<UIBridgeSnapshot>(serde_json::Value::Object(root))
         .map_err(|e| format!("snapshot adapt failed after fill: {e}"))
+}
+
+/// Patch a single SDK control-mode element object into the canonical
+/// [`qontinui_types::ui_bridge::UIBridgeElement`] shape: synthesize the
+/// required structural fields (`type`, `identifier`, `state`,
+/// `registeredAt`, `mounted`) from whatever the wire carries.
+fn adapt_element_object(obj: &mut serde_json::Map<String, serde_json::Value>, timestamp: i64) {
+    // `type` (renamed serde field; raw JSON key is "type")
+    obj.entry("type")
+        .or_insert_with(|| serde_json::Value::String("generic".into()));
+
+    // `identifier` — synthesize from `id` if absent
+    if !obj.contains_key("identifier") {
+        let id_str = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        obj.insert(
+            "identifier".into(),
+            serde_json::json!({
+                "uiId": id_str,
+                "xpath": "",
+                "selector": "",
+            }),
+        );
+    }
+
+    // `state` — synthesize from `bbox` + visibility hints if absent
+    if !obj.contains_key("state") {
+        let (x, y, width, height) = obj
+            .get("bbox")
+            .and_then(|b| b.as_object())
+            .map(|b| {
+                (
+                    b.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    b.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    b.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    b.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let visible = obj
+            .get("visible")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(width > 0.0 && height > 0.0);
+        obj.insert(
+            "state".into(),
+            serde_json::json!({
+                "visible": visible,
+                "enabled": true,
+                "focused": false,
+                "rect": {
+                    "x": x, "y": y, "width": width, "height": height,
+                    "top": y, "left": x,
+                    "right": x + width, "bottom": y + height,
+                },
+            }),
+        );
+    }
+
+    // `registeredAt` — fall back to snapshot timestamp, then 0
+    obj.entry("registeredAt")
+        .or_insert_with(|| serde_json::Value::from(timestamp));
+
+    // `mounted` — default true
+    obj.entry("mounted")
+        .or_insert_with(|| serde_json::Value::Bool(true));
+}
+
+/// Patch a single SDK control-mode component object into the canonical
+/// [`qontinui_types::ui_bridge::UIBridgeComponent`] shape:
+///  - `actions: ["str", ...]` → `actions: [{ id: "str" }, ...]` (the canonical
+///    type wants `Vec<ComponentActionInfo>` with `id`, optional `label`,
+///    optional `description`; the SDK wire carries bare action-name strings).
+///  - Synthesize `registeredAt` from the snapshot timestamp + `mounted: true`.
+///  - Strip every wire field outside the canonical set so
+///    `#[schemars(deny_unknown_fields)]` doesn't reject. Observed
+///    wire-only field on the runner today: `actionInvocationPath`. Whitelist
+///    rather than blacklist so future SDK additions don't silently break us.
+fn adapt_component_object(obj: &mut serde_json::Map<String, serde_json::Value>, timestamp: i64) {
+    // 1. Convert `actions: [str]` to `actions: [{id: str}]`.
+    if let Some(serde_json::Value::Array(arr)) = obj.get_mut("actions") {
+        let needs_conversion = arr.iter().any(|v| v.is_string());
+        if needs_conversion {
+            let converted: Vec<serde_json::Value> = arr
+                .iter()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => serde_json::json!({ "id": s }),
+                    serde_json::Value::Object(_) => v.clone(), // already canonical
+                    _ => serde_json::json!({ "id": v.to_string() }),
+                })
+                .collect();
+            *arr = converted;
+        }
+    }
+
+    // 2. Defaults for required fields.
+    obj.entry("registeredAt")
+        .or_insert_with(|| serde_json::Value::from(timestamp));
+    obj.entry("mounted")
+        .or_insert_with(|| serde_json::Value::Bool(true));
+
+    // 3. Whitelist-prune: keep only the canonical key set. The schema is
+    //    `#[schemars(deny_unknown_fields)]`, so any extra wire key (e.g.
+    //    the observed `actionInvocationPath`) trips deserialize.
+    const CANONICAL_COMPONENT_KEYS: &[&str] = &[
+        "id",
+        "name",
+        "description",
+        "actions",
+        "elementIds",
+        "registeredAt",
+        "mounted",
+    ];
+    obj.retain(|k, _| CANONICAL_COMPONENT_KEYS.contains(&k.as_str()));
 }
 
 /// Roll up a single `SpecCheckResult` (or many) into the `SpecCheckCompleted`
@@ -358,7 +420,13 @@ fn snapshot_error_to_response(err: spec_check::SnapshotFetchError) -> Response {
             StatusCode::BAD_GATEWAY,
             json!({ "cause": "upstream-forbidden" }),
         ),
-        E::Malformed(_) => (StatusCode::BAD_GATEWAY, json!({ "cause": "malformed" })),
+        // Forward the inner String so debugging doesn't require server-side
+        // logs (it does carry the underlying adapter / parse error from
+        // `fetch_self_snapshot`). Bug C / 2026-05-17 remediation.
+        E::Malformed(inner) => (
+            StatusCode::BAD_GATEWAY,
+            json!({ "cause": "malformed", "detail": inner }),
+        ),
     };
     (
         status,
@@ -985,6 +1053,27 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
+    #[tokio::test]
+    async fn snapshot_error_malformed_forwards_inner_detail() {
+        // Bug C / 2026-05-17: the user-facing envelope must carry the inner
+        // String so /spec-check (and self-snapshot) callers don't lose the
+        // adapter's "snapshot adapt failed after fill: ..." message under
+        // the opaque "malformed" label.
+        let inner = "self-snapshot adapt: invalid type: string \"x\", expected struct Foo";
+        let resp = snapshot_error_to_response(spec_check::SnapshotFetchError::Malformed(
+            inner.to_string(),
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("body parses");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["reason"], "snapshot-unavailable");
+        assert_eq!(v["detail"]["cause"], "malformed");
+        assert_eq!(v["detail"]["detail"], inner);
+    }
+
     #[test]
     #[should_panic(expected = "Stale is folded into success warnings")]
     fn snapshot_error_stale_is_unreachable() {
@@ -1313,6 +1402,87 @@ mod tests {
         });
         let adapted = adapt_supplied_snapshot(raw).expect("adapt");
         assert!(!adapted.elements[0].state.visible);
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_adapts_components_action_strings_and_strips_unknown_fields() {
+        // Bug A / 2026-05-17: live /control/snapshot components have:
+        //  - `actions: ["create-terminal", "list-terminals"]` (strings, not
+        //    ComponentActionInfo objects)
+        //  - extra wire field `actionInvocationPath` (not on the canonical
+        //    `UIBridgeComponent`; `#[schemars(deny_unknown_fields)]` rejects)
+        //  - no `registeredAt` or `mounted`
+        // The adapter must fix all three.
+        let raw = json!({
+            "timestamp": 1_700_000_000_000_i64,
+            "elements": [],
+            "components": [
+                {
+                    "id": "terminal-page",
+                    "name": "TerminalPage",
+                    "description": "main terminal view",
+                    "actions": ["create-terminal", "list-terminals"],
+                    "elementIds": ["btn-1", "btn-2"],
+                    // wire-only field; deny_unknown_fields would reject:
+                    "actionInvocationPath": "/terminal-page",
+                }
+            ]
+        });
+        let adapted = adapt_supplied_snapshot(raw).expect("components must adapt");
+        assert_eq!(adapted.components.len(), 1);
+        let c = &adapted.components[0];
+        assert_eq!(c.id, "terminal-page");
+        assert_eq!(c.name, "TerminalPage");
+        assert_eq!(c.actions.len(), 2);
+        assert_eq!(c.actions[0].id, "create-terminal");
+        assert!(c.actions[0].label.is_none());
+        assert_eq!(c.actions[1].id, "list-terminals");
+        assert_eq!(c.registered_at, 1_700_000_000_000_i64);
+        assert!(c.mounted);
+        assert_eq!(
+            c.element_ids.as_deref(),
+            Some(&["btn-1".to_string(), "btn-2".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_preserves_canonical_component_actions() {
+        // If a caller already sends actions in the canonical
+        // ComponentActionInfo[] shape (id + optional label/description),
+        // the adapter must not double-wrap.
+        let raw = json!({
+            "timestamp": 0i64,
+            "elements": [],
+            "components": [{
+                "id": "x",
+                "name": "X",
+                "actions": [{ "id": "do-thing", "label": "Do It" }],
+            }]
+        });
+        let adapted = adapt_supplied_snapshot(raw).expect("canonical actions pass through");
+        let c = &adapted.components[0];
+        assert_eq!(c.actions.len(), 1);
+        assert_eq!(c.actions[0].id, "do-thing");
+        assert_eq!(c.actions[0].label.as_deref(), Some("Do It"));
+    }
+
+    #[test]
+    fn adapt_supplied_snapshot_walks_components_when_elements_absent() {
+        // Regression for the pre-Bug-A behavior where the walker required
+        // an `elements` array even when only `components` needed fixup.
+        let raw = json!({
+            "timestamp": 0i64,
+            "components": [{
+                "id": "c1",
+                "name": "C1",
+                "actions": ["only-action"],
+                "actionInvocationPath": "drops me",
+            }]
+        });
+        let adapted = adapt_supplied_snapshot(raw).expect("missing elements is fine");
+        assert!(adapted.elements.is_empty());
+        assert_eq!(adapted.components.len(), 1);
+        assert_eq!(adapted.components[0].actions[0].id, "only-action");
     }
 
     // ------------------------------------------------------------------------
