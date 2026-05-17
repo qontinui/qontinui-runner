@@ -592,14 +592,37 @@ async fn handle_outbound<S>(
     write: Arc<
         Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
     >,
-    _api_state: Arc<ApiState>,
+    api_state: Arc<ApiState>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // The WS relay is per-connection and the ServerModeState clone is a
+    // cheap Arc-backed handle that lives for the connection's lifetime, so
+    // fetch it once up front. If it's absent at connection start (state not
+    // yet installed) we re-fetch lazily below.
+    let mut server_mode = api_state.app_state.current_server_mode().await;
+
     loop {
         match event_rx.recv().await {
             Ok(event) => {
                 let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+
+                // Flood control: only forward terminal-output / terminal-exit
+                // frames when the backend has an active terminal subscriber.
+                // Never gate phase-result / ui-error / recent-crash /
+                // ai-output / session-state.
+                if channel == "terminal-output" || channel == "terminal-exit" {
+                    if server_mode.is_none() {
+                        server_mode = api_state.app_state.current_server_mode().await;
+                    }
+                    let subscribed = server_mode
+                        .as_ref()
+                        .map(|sm| sm.terminal_subscriber_count() > 0)
+                        .unwrap_or(false);
+                    if !subscribed {
+                        continue;
+                    }
+                }
 
                 // Wire shapes are defined in `qontinui_runner_lib::relay_envelopes`
                 // (lib-side so the schema_export aggregator can register them) —
@@ -758,6 +781,49 @@ async fn handle_relay_command(
         "terminal_buffer" => handle_terminal_buffer(api_state, data),
 
         "heartbeat" => Some(serde_json::json!({"type": "heartbeat_ack"})),
+
+        // --------------------------------------------------------------
+        // Terminal-output flow control. The backend opens/closes interest
+        // in terminal frames so the runner can suppress the
+        // `terminal-output` / `terminal-exit` WS flood when nobody is
+        // attached. Wire contract (other repos depend on it):
+        //   {"type":"terminal_subscribe","runner_id":"<uuid>"}
+        //   {"type":"terminal_unsubscribe","runner_id":"<uuid>"}
+        // runner_id is informational — the WS is already runner-scoped.
+        // Fire-and-forget: no response is sent.
+        // --------------------------------------------------------------
+        "terminal_subscribe" => {
+            if let Some(sm) = api_state.app_state.current_server_mode().await {
+                sm.incr_terminal_subscribers();
+                info!(
+                    "terminal_subscribe: terminal-output relay enabled \
+                     (subscribers={})",
+                    sm.terminal_subscriber_count()
+                );
+            } else {
+                warn!(
+                    "terminal_subscribe received but no ServerModeState is \
+                     installed; terminal-output relay stays suppressed"
+                );
+            }
+            None
+        }
+
+        "terminal_unsubscribe" => {
+            if let Some(sm) = api_state.app_state.current_server_mode().await {
+                sm.decr_terminal_subscribers();
+                info!(
+                    "terminal_unsubscribe: subscribers now {}",
+                    sm.terminal_subscriber_count()
+                );
+            } else {
+                warn!(
+                    "terminal_unsubscribe received but no ServerModeState is \
+                     installed"
+                );
+            }
+            None
+        }
 
         _ => {
             warn!("Unknown relay command type: {}", msg_type);
