@@ -595,7 +595,11 @@ Be concise and actionable.`;
                       <ChevronRight className="w-3 h-3 text-zinc-500 shrink-0" />
                     )}
                     <span className="text-sm text-zinc-200 truncate">{proc.name}</span>
-                    <ProcessStatusBadge state={proc.state} />
+                    <ProcessStatusBadge
+                      state={proc.state}
+                      portHealthy={proc.port_healthy}
+                      uptimeSecs={proc.uptime_secs}
+                    />
                   </div>
                   <div className="flex items-center gap-3 mt-1 ml-5 text-xs text-zinc-500">
                     {proc.pid && <span>PID: {proc.pid}</span>}

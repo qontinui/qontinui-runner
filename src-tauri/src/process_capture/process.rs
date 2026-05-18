@@ -79,6 +79,10 @@ impl ManagedProcess {
         }
 
         self.runtime.state = ProcessState::Starting;
+        // Reset port-health each spawn so a restarted process doesn't briefly
+        // inherit the prior generation's `port_healthy` value. The manager's
+        // port-health loop overwrites this within one poll interval.
+        self.runtime.port_healthy = None;
 
         let (msg_tx, msg_rx) = mpsc::channel::<ProcessMessage>(500);
 
@@ -255,6 +259,7 @@ impl ManagedProcess {
 
         self.runtime.state = ProcessState::Stopped;
         self.runtime.pid = None;
+        self.runtime.port_healthy = None;
 
         info!("Process '{}' stopped", self.config.name);
     }

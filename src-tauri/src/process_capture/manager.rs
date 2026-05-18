@@ -157,11 +157,13 @@ impl ProcessCaptureManager {
         let processes_ref = self.processes.clone();
         let error_monitor = self.error_monitor.clone();
         let app_handle = self.app_handle.clone();
+        let process_id_for_event_loop = process_id.clone();
+        let process_name_for_event_loop = process_name.clone();
         // Spawn the event loop for this process
         tokio::spawn(async move {
             Self::process_event_loop(
-                process_id,
-                process_name,
+                process_id_for_event_loop,
+                process_name_for_event_loop,
                 health_port,
                 output_buffer,
                 buffer_size,
@@ -173,6 +175,29 @@ impl ProcessCaptureManager {
             )
             .await;
         });
+
+        // Spawn the port-health polling loop if a health port is configured.
+        // The outer spawned PID is a shell wrapper (`cmd → poetry → python → uvicorn`
+        // on Windows); the actual service can die inside while the wrapper keeps
+        // running. The event loop only sees `Exited` from the wrapper, so without
+        // this probe `port_healthy` stays `None` forever and the Processes page
+        // can't tell "alive but not serving" from "alive and healthy".
+        if let Some(port) = health_port {
+            let processes_ref = self.processes.clone();
+            let app_handle = self.app_handle.clone();
+            let process_id_for_health = process_id.clone();
+            let process_name_for_health = process_name.clone();
+            tokio::spawn(async move {
+                Self::port_health_loop(
+                    process_id_for_health,
+                    process_name_for_health,
+                    port,
+                    processes_ref,
+                    app_handle,
+                )
+                .await;
+            });
+        }
 
         // Emit state change event
         let status = process.status();
@@ -497,6 +522,7 @@ impl ProcessCaptureManager {
                                 if let Some(p) = procs.get_mut(&process_id) {
                                     p.runtime.state = ProcessState::Stopped;
                                     p.runtime.pid = None;
+                                    p.runtime.port_healthy = None;
                                     let status = p.status();
                                     let _ = tauri::Emitter::emit(
                                         &app_handle,
@@ -558,6 +584,93 @@ impl ProcessCaptureManager {
         }
 
         info!("Event loop ended for process '{}'", process_name);
+    }
+
+    /// Periodically probe a managed process's health port and update its
+    /// `port_healthy` + `state` fields. Transitions `Running ↔ Healthy` based
+    /// on the probe; emits `process-state-changed` only when something
+    /// actually changes.
+    ///
+    /// Stops when the process leaves the `Running`/`Healthy` states (i.e. on
+    /// stop, restart, exit, or rebuild). No explicit cancellation needed —
+    /// the loop self-terminates on the next tick.
+    async fn port_health_loop(
+        process_id: String,
+        process_name: String,
+        port: u16,
+        processes: Arc<RwLock<HashMap<String, ManagedProcess>>>,
+        app_handle: tauri::AppHandle,
+    ) {
+        const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            // Bail if the process is no longer in a state we should probe.
+            // Read lock kept brief so we don't contend with the event loop.
+            {
+                let procs = processes.read().await;
+                let still_polling = procs.get(&process_id).is_some_and(|p| {
+                    matches!(
+                        p.runtime.state,
+                        ProcessState::Running | ProcessState::Healthy
+                    )
+                });
+                if !still_polling {
+                    break;
+                }
+            }
+
+            // TCP connect probe with internal 500ms timeout. Runs on a
+            // blocking thread because `socket2::Socket::connect_timeout` is
+            // synchronous; otherwise it would stall the tokio worker.
+            let healthy =
+                match tokio::task::spawn_blocking(move || health::is_port_in_use(port)).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+            // Apply the result + decide whether to emit.
+            let new_status = {
+                let mut procs = processes.write().await;
+                let Some(p) = procs.get_mut(&process_id) else {
+                    break;
+                };
+                // State may have flipped during the probe (race with stop()
+                // or Exited). Don't clobber a terminal state with our update.
+                if !matches!(
+                    p.runtime.state,
+                    ProcessState::Running | ProcessState::Healthy
+                ) {
+                    break;
+                }
+
+                let prev_state = p.runtime.state;
+                let prev_healthy = p.runtime.port_healthy;
+                p.runtime.port_healthy = Some(healthy);
+                p.runtime.state = if healthy {
+                    ProcessState::Healthy
+                } else {
+                    ProcessState::Running
+                };
+
+                if prev_state != p.runtime.state || prev_healthy != Some(healthy) {
+                    Some(p.status())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(status) = new_status {
+                let _ = tauri::Emitter::emit(&app_handle, "process-state-changed", &status);
+            }
+        }
+
+        tracing::debug!(
+            "Port-health loop ended for process '{}' (port {})",
+            process_name,
+            port
+        );
     }
 
     /// Flush a batch of output lines to PG. Best-effort: failures are logged, batch is cleared.
