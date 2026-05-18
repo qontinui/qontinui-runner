@@ -143,6 +143,7 @@ mod tests {
             token: token.to_string(),
             token_jti: Uuid::nil(),
             token_exp: chrono::Utc::now().timestamp() + 4 * 3600,
+            active_claim: None,
         }
     }
 

@@ -49,6 +49,8 @@ import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration
 
 import { ToastContainer } from "./components/ToastContainer";
 import { BuildRefreshBanner } from "./components/BuildRefreshBanner";
+import { ConflictModal } from "./components/ConflictModal";
+import { StolenBanner } from "./components/StolenBanner";
 import { WebIntegrationAuthBanner } from "./components/WebIntegrationAuthBanner";
 import { ApprovalDialog } from "./components/dag-workflow-editor";
 import StatusIndicator from "./components/StatusIndicator";
@@ -614,6 +616,14 @@ function AppContent() {
           <GiantSCCFixture />
           <CommandPalette />
           <GlobalKnowledgeBrowser />
+          {/*
+            Plan 2026-05-18-agent-spawn-coordination Phase 3 — spawn-time
+            claim-conflict modal + post-acquire stolen-claim banner.
+            Both listen for runner-side Tauri events; they render nothing
+            until those events fire.
+          */}
+          <ConflictModal />
+          <StolenBanner />
         </div>
       </RenderLogWrapper>
     </ProfilerWrapper>

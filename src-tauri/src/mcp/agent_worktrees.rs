@@ -29,7 +29,8 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::agent_worktree::{
-    allocate_and_materialize, coord_ws_to_http, worktree_mode_enabled, RepoRequest,
+    allocate_and_materialize_with_claim, coord_ws_to_http, worktree_mode_enabled, AllocateError,
+    RepoRequest,
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -54,6 +55,21 @@ pub struct AllocateLocalRequest {
     /// or `$HOME/qontinui-root/<repo>/` (POSIX).
     #[serde(default)]
     pub repo_canonical_paths: HashMap<String, String>,
+    /// Plan 2026-05-18-agent-spawn-coordination Phase 3 — optional plan
+    /// id used to derive a `ClaimKind::Phase` pre-flight claim. When
+    /// supplied together with `phase`, the runner calls
+    /// `POST /claims/acquire` with
+    /// `kind=phase, resource_key=plan:<plan_id>:phase:<phase>` BEFORE
+    /// `/agents/allocate`. On `Held` the response is `409 Conflict` with
+    /// a structured body so the caller can surface the
+    /// abort/wait/steal modal.
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    /// Phase 3 — sibling of `plan_id`. When both are present the claim
+    /// kind is `Phase`; when only `declared_overlap_paths` is present,
+    /// falls back to `FileGlob`; otherwise no pre-flight claim.
+    #[serde(default)]
+    pub phase: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,13 +127,15 @@ pub async fn post_allocate_local(
         })
         .collect();
 
-    match allocate_and_materialize(
+    match allocate_and_materialize_with_claim(
         &coord_http_base,
         &machine_id,
         &repo_reqs,
         req.intent.as_deref(),
         req.declared_overlap_paths.as_deref(),
         &canonical_paths,
+        req.plan_id.as_deref(),
+        req.phase.as_deref(),
     )
     .await
     {
@@ -127,6 +145,19 @@ pub async fn post_allocate_local(
                 result.agent_id,
                 result.worktrees.len()
             );
+            // Plan 2026-05-18-agent-spawn-coordination Phase 3 — spawn
+            // a heartbeat task for the pre-acquired claim, if any. The
+            // handle is registered in a process-global map keyed by
+            // agent_id so the agent-completion path can release the
+            // claim by lookup.
+            if let Some(claim) = &result.active_claim {
+                crate::agent_claims::register_active_claim(
+                    &result.agent_id,
+                    coord_http_base.clone(),
+                    machine_id,
+                    claim,
+                );
+            }
             // Spawn this agent's long-lived daemons (Row 9 Phase 3
             // pusher + Coordination Phase 6 dirty-poller) through the
             // single unified site. One shared, self-refreshing token
@@ -144,9 +175,33 @@ pub async fn post_allocate_local(
                     "parent_sha": w.parent_sha,
                     "worktree_path": w.worktree_path.to_string_lossy(),
                 })).collect::<Vec<_>>(),
+                "active_claim": result.active_claim,
             }))))
         }
-        Err(e) => {
+        Err(AllocateError::ClaimConflict(conflict)) => {
+            warn!(
+                "/agents/allocate-local claim held: kind={} key={} current_holder={}",
+                conflict.kind, conflict.resource_key, conflict.current_holder
+            );
+            // 409 Conflict with structured body so the caller (orchestrator
+            // or runner-side IPC translator) can surface the abort/wait/
+            // steal modal. Per plan 2026-05-18-agent-spawn-coordination
+            // Phase 3.
+            Err((
+                StatusCode::CONFLICT,
+                Json(api_error(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": "claim_conflict",
+                        "kind": conflict.kind,
+                        "resource_key": conflict.resource_key,
+                        "current_holder": conflict.current_holder,
+                        "intent": conflict.intent,
+                    }))
+                    .unwrap_or_else(|_| "claim_conflict".into()),
+                )),
+            ))
+        }
+        Err(AllocateError::Other(e)) => {
             warn!("/agents/allocate-local failed: {e}");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
