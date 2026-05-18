@@ -76,6 +76,7 @@ pub fn is_supported_command(command_name: &str) -> bool {
             | "recording_pipeline.merge"
             | "vision.compute_perceptual_hash"
             | "vision.compare_screenshots"
+            | "discovery.background_removal"
     )
 }
 
@@ -342,9 +343,15 @@ mod tests {
     }
 
     #[test]
+    fn is_supported_command_recognises_phase_6_discovery() {
+        assert!(is_supported_command("discovery.background_removal"));
+    }
+
+    #[test]
     fn is_supported_command_rejects_unknown() {
         assert!(!is_supported_command("state_machine.unknown"));
         assert!(!is_supported_command("recording_pipeline.unknown"));
+        assert!(!is_supported_command("discovery.unknown"));
         assert!(!is_supported_command(""));
     }
 
@@ -387,6 +394,12 @@ mod tests {
         );
         assert_eq!(
             dispatch_timeout_for("state_machine.ui_bridge.pathfind"),
+            COMMAND_DISPATCH_TIMEOUT_S
+        );
+        // Phase 6 discovery.background_removal is sub-5-second per the
+        // plan; default timeout suffices.
+        assert_eq!(
+            dispatch_timeout_for("discovery.background_removal"),
             COMMAND_DISPATCH_TIMEOUT_S
         );
         // Unknown commands also fall through to the default; the
