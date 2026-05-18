@@ -105,7 +105,7 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_j
 deadpool-postgres = "0.14"
 qontinui-db = { path = "./clorinde" }
 qontinui-spec-check = { path = "../crates/spec-check" }
-qontinui-types = { path = "../../qontinui-schemas/rust", version = "^0.1.2" }
+qontinui-types = { path = "../../qontinui-schemas/rust", version = ">=0.1.2, <0.3.0" }
 qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core", version = "^0.1.0" }
 socket2 = "0.6"
 cron = "0.15"
