@@ -104,7 +104,7 @@ pub async fn post_allocate_local(
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!(
-                "machine_id not available: {} — run `qontinui_profile machine init`",
+                "machine_id not available: {} — run `qontinui_profile device init`",
                 e
             ))),
         )

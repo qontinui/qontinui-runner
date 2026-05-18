@@ -3,16 +3,29 @@
 //! See `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2.
 //! On every runner boot, this module:
 //!
-//! 1. Reads the local machine identity from `~/.qontinui/machine.json`
-//!    (already minted by `qontinui_profile machine init`).
+//! 1. Reads the local device identity from `~/.qontinui/machine.json`
+//!    (already minted by `qontinui_profile device init`).
 //! 2. Detects local resources (cpu_cores, memory_gb, disk_total_gb)
 //!    via `sysinfo`.
 //! 3. Derives the agent-side budget per §3.2:
 //!    `max_concurrent_agents = floor((memory_gb - 4) / 4)`.
-//! 4. UPSERTs role + budget columns onto `coord.machines` via direct
-//!    PG. Direct PG UPSERT matches the existing identity-registration
-//!    path in `qontinui_profile machine init::register_with_coord` —
-//!    keeps the runner bootable when qontinui-coord HTTP is down.
+//! 4. POSTs role + budget columns to `POST /coord/devices/{device_id}/budget`
+//!    via coord HTTP — Phase 3 (Unified Devices Registry) replaces the
+//!    direct-PG UPSERT path so the runner no longer needs PG credentials
+//!    to coord's database.
+//!
+//! ## Runner-bootable-when-coord-down property
+//!
+//! The original direct-PG path was chosen specifically to keep the
+//! runner bootable when qontinui-coord HTTP is down. We preserve that
+//! property in the HTTP variant via:
+//!
+//! - **Exponential backoff retry** (2s → 60s, capped at 60s, ~6 attempts
+//!   then we give up for this boot cycle and return Ok(()).
+//! - **Last-budget cache** at `~/.qontinui/last_budget.json` so an operator
+//!   can inspect the most-recent payload even when coord is unreachable.
+//! - **Best-effort semantics**: terminal failures log a warning and
+//!   return Ok(()), so `publish_on_startup` never blocks the runner.
 //!
 //! Phase 1 is visibility-only — the row appears in `GET /coord/fleet`
 //! but the coord doesn't enforce caps yet (Phase 5). Failures here log
@@ -22,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::database::pg::PgDb;
@@ -108,57 +121,198 @@ pub fn detect_resources() -> Resources {
 }
 
 /// `~/.qontinui/machine.json` shape — mirrors
-/// `bin/qontinui_profile.rs::MachineFile` so we don't need to expose
+/// `bin/qontinui_profile.rs::DeviceFile` so we don't need to expose
 /// it from the binary crate.
+///
+/// `device_id` is serde-aliased to `machine_id` so a pre-Phase-3
+/// machine.json (which used the old field name) still deserializes
+/// without manual migration.
 #[derive(Debug, Clone, Deserialize)]
-struct MachineFile {
-    machine_id: String,
+struct DeviceFile {
+    #[serde(alias = "machine_id")]
+    device_id: String,
     hostname: String,
 }
 
-fn machine_file_path() -> Option<PathBuf> {
+fn device_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
 }
 
-fn load_machine_file() -> Option<MachineFile> {
-    let path = machine_file_path()?;
+fn load_device_file() -> Option<DeviceFile> {
+    let path = device_file_path()?;
     let bytes = std::fs::read(&path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Publish role + budget to `coord.machines`. Best-effort: failures
-/// log a warning and return Ok(()) so they don't break startup.
+/// Cache file for the last successful budget payload. Inspectable when
+/// coord is unreachable; lets operators verify "what was advertised" from
+/// the runner side without coord access. Path: `~/.qontinui/last_budget.json`.
+fn last_budget_cache_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".qontinui").join("last_budget.json"))
+}
+
+/// Wire shape of `POST /coord/devices/{device_id}/budget`.
+///
+/// Mirrors `qontinui_profile::register_with_coord`; both go through coord
+/// HTTP, replacing the prior split between direct-PG fleet writes and
+/// HTTP identity registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceBudgetRequest {
+    hostname: String,
+    role: String,
+    cpu_cores: i32,
+    memory_gb: i32,
+    disk_total_gb: i64,
+    disk_reserved_gb: i64,
+    max_concurrent_agents: i32,
+    max_concurrent_builds: i32,
+}
+
+/// Resolve the coord HTTP base from `~/.qontinui/profiles.json` active
+/// profile's `coord_url`. Mirrors the CLI helper of the same name.
+fn coord_http_base() -> Option<String> {
+    let coord_url = qontinui_runner_lib::profiles::load_strict()
+        .ok()?
+        .coord_url?;
+    let trimmed = coord_url.trim_end_matches("/ws");
+    let with_http = trimmed
+        .strip_prefix("wss://")
+        .map(|rest| format!("https://{rest}"))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("ws://")
+                .map(|rest| format!("http://{rest}"))
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    Some(with_http)
+}
+
+/// POST the budget payload with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s).
+/// Returns Ok on first success; returns Err with the last error if every
+/// attempt fails. The caller decides whether to surface or swallow.
+///
+/// Per the runner-bootable-when-coord-down property, this is the ONLY
+/// place we busy-wait on coord HTTP; the caller wraps this in
+/// `publish_budget` which logs+swallows on failure.
+async fn post_budget_with_retry(
+    coord_base: &str,
+    device_id: &str,
+    body: &DeviceBudgetRequest,
+) -> Result<(), String> {
+    let url = format!("{}/coord/devices/{}/budget", coord_base, device_id);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("reqwest client build: {e}"))?;
+    let mut last_err = String::new();
+    let backoff_ms: [u64; 6] = [2_000, 4_000, 8_000, 16_000, 32_000, 60_000];
+    for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
+        match client.post(&url).json(body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(());
+                }
+                let body_text = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<unable to read response body>".to_string());
+                last_err = format!("POST {url} -> HTTP {status}: {body_text}");
+            }
+            Err(e) => {
+                last_err = format!("POST {url} failed: {e}");
+            }
+        }
+        // Don't sleep after the final attempt.
+        if attempt + 1 < backoff_ms.len() {
+            warn!(
+                "fleet::publish_budget: attempt {} failed ({}); retrying in {}s",
+                attempt + 1,
+                last_err,
+                delay_ms / 1000
+            );
+            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+        }
+    }
+    Err(last_err)
+}
+
+fn write_last_budget_cache(body: &DeviceBudgetRequest, device_id: &str) {
+    let Some(path) = last_budget_cache_path() else {
+        return;
+    };
+    let payload = serde_json::json!({
+        "device_id": device_id,
+        "captured_at": chrono::Utc::now().to_rfc3339(),
+        "payload": body,
+    });
+    let pretty = match serde_json::to_vec_pretty(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!("fleet::publish_budget: cache serialize failed: {e}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::debug!("fleet::publish_budget: cache mkdir failed: {e}");
+            return;
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &pretty) {
+        tracing::debug!("fleet::publish_budget: cache write failed: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        tracing::debug!("fleet::publish_budget: cache rename failed: {e}");
+    }
+}
+
+/// Publish role + budget to `coord.devices` via `POST
+/// /coord/devices/{device_id}/budget`. Best-effort: failures log a
+/// warning and return Ok(()) so they don't break startup.
 ///
 /// `disk_reserved_gb` defaults to 0 in Phase 1 — Phase 5 of the
-/// fleet plan will add per-machine overrides for system + non-fleet
+/// fleet plan will add per-device overrides for system + non-fleet
 /// reservation. Callers can pass a non-zero value if their config
 /// already knows the reservation.
+///
+/// Phase 3 (Unified Devices Registry): this replaces the prior direct-PG
+/// UPSERT on `coord.machines` with a coord HTTP call. The exponential-backoff
+/// retry + last-budget cache (see module docs) preserve the
+/// runner-bootable-when-coord-down property of the old direct-PG path.
+///
+/// The `_pg` parameter is retained for now — call sites pass the connection
+/// pool from `main.rs::run_app()`. Once coord HTTP is universally available
+/// the parameter can be removed in a follow-up cleanup PR.
 pub async fn publish_budget(
-    pg: &Arc<PgDb>,
+    _pg: &Arc<PgDb>,
     role: MachineRole,
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
-    let machine = match load_machine_file() {
-        Some(m) => m,
+    let device = match load_device_file() {
+        Some(d) => d,
         None => {
             warn!(
                 "fleet::publish_budget: ~/.qontinui/machine.json missing — \
-                 run `qontinui_profile machine init` to register identity. Skipping budget publish."
+                 run `qontinui_profile device init` to register identity. Skipping budget publish."
             );
             return Ok(());
         }
     };
 
-    let machine_id = match uuid::Uuid::parse_str(&machine.machine_id) {
+    let device_id_uuid = match uuid::Uuid::parse_str(&device.device_id) {
         Ok(id) => id,
         Err(e) => {
             warn!(
-                "fleet::publish_budget: machine.json machine_id is not a valid UUID ({e}). Skipping."
+                "fleet::publish_budget: machine.json device_id is not a valid UUID ({e}). Skipping."
             );
             return Ok(());
         }
     };
+    let device_id_str = device_id_uuid.to_string();
 
     let max_concurrent_agents: i32 = match role {
         MachineRole::Agent => derive_max_agents(resources.memory_gb) as i32,
@@ -172,64 +326,53 @@ pub async fn publish_budget(
     let memory_gb_i: i32 = resources.memory_gb.min(i32::MAX as u32) as i32;
     let disk_total_i: i64 = resources.disk_total_gb.min(i64::MAX as u64) as i64;
     let disk_reserved_i: i64 = disk_reserved_gb.min(i64::MAX as u64) as i64;
-    let role_str = role.as_str();
+    let role_str = role.as_str().to_string();
 
-    let conn = pg.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+    let body = DeviceBudgetRequest {
+        hostname: device.hostname.clone(),
+        role: role_str.clone(),
+        cpu_cores: cpu_cores_i,
+        memory_gb: memory_gb_i,
+        disk_total_gb: disk_total_i,
+        disk_reserved_gb: disk_reserved_i,
+        max_concurrent_agents,
+        max_concurrent_builds,
+    };
 
-    // UPSERT: INSERT new row if this is the first time we've seen the
-    // machine_id; else UPDATE the budget columns. Matches the pattern
-    // in `bin/qontinui_profile.rs::register_with_coord` so the
-    // identity-only registration path stays compatible.
-    //
-    // search_path is `project, public` (set by the post_create hook),
-    // so `coord.machines` MUST be schema-qualified — we never want PG
-    // to silently resolve to a `project.machines` table that doesn't
-    // exist.
-    let affected = conn
-        .execute(
-            "INSERT INTO coord.machines \
-                 (machine_id, hostname, role, cpu_cores, memory_gb, \
-                  disk_total_gb, disk_reserved_gb, \
-                  max_concurrent_agents, max_concurrent_builds, \
-                  budget_updated_at, last_seen_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now()) \
-             ON CONFLICT (machine_id) DO UPDATE SET \
-                 hostname = EXCLUDED.hostname, \
-                 role = EXCLUDED.role, \
-                 cpu_cores = EXCLUDED.cpu_cores, \
-                 memory_gb = EXCLUDED.memory_gb, \
-                 disk_total_gb = EXCLUDED.disk_total_gb, \
-                 disk_reserved_gb = EXCLUDED.disk_reserved_gb, \
-                 max_concurrent_agents = EXCLUDED.max_concurrent_agents, \
-                 max_concurrent_builds = EXCLUDED.max_concurrent_builds, \
-                 budget_updated_at = now(), \
-                 last_seen_at = now()",
-            &[
-                &machine_id,
-                &machine.hostname,
-                &role_str,
-                &cpu_cores_i,
-                &memory_gb_i,
-                &disk_total_i,
-                &disk_reserved_i,
-                &max_concurrent_agents,
-                &max_concurrent_builds,
-            ],
-        )
-        .await
-        .map_err(|e| format!("UPSERT coord.machines: {e}"))?;
+    // Cache the payload regardless of whether the POST succeeds — this is
+    // the operator's lifeline when coord is unreachable.
+    write_last_budget_cache(&body, &device_id_str);
 
-    if affected == 0 {
-        warn!("fleet::publish_budget: UPSERT affected 0 rows (unexpected)");
-    } else {
-        info!(
-            "fleet::publish_budget: machine_id={machine_id} hostname={} role={role_str} \
-             cpu_cores={cpu_cores_i} memory_gb={memory_gb_i} disk_total_gb={disk_total_i} \
-             max_concurrent_agents={max_concurrent_agents}",
-            machine.hostname
-        );
+    let coord_base = match coord_http_base() {
+        Some(b) => b,
+        None => {
+            warn!(
+                "fleet::publish_budget: active profile has no coord_url; skipping budget publish (cache written)"
+            );
+            return Ok(());
+        }
+    };
+
+    match post_budget_with_retry(&coord_base, &device_id_str, &body).await {
+        Ok(()) => {
+            info!(
+                "fleet::publish_budget: device_id={device_id_str} hostname={} role={role_str} \
+                 cpu_cores={cpu_cores_i} memory_gb={memory_gb_i} disk_total_gb={disk_total_i} \
+                 max_concurrent_agents={max_concurrent_agents}",
+                device.hostname
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                "fleet::publish_budget: terminal failure after retries ({e}); \
+                 runner continues, payload cached at ~/.qontinui/last_budget.json"
+            );
+            // Return Ok so callers don't treat HTTP unreachability as fatal.
+            // The boot-when-coord-down property is the load-bearing contract.
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Convenience: detect + publish in one call with default reservations.
@@ -244,97 +387,52 @@ pub async fn publish_on_startup(pg: &Arc<PgDb>, role: MachineRole) {
 // =============================================================================
 // HTTP heartbeat to coord (plan 2026-05-18-push-aware-fleet-liveness.md §5).
 //
-// The direct-PG `publish_budget` path above is a one-shot at boot. To keep
-// `coord.machines.last_seen_at` fresh under coord's new push-aware liveness
-// model, the runner periodically POSTs `{machine_id, hostname}` to coord's
-// `/coord/machine/register` endpoint. The handler's UPSERT refreshes
+// The HTTP `publish_budget` path above is a one-shot at boot. To keep
+// `coord.devices.last_seen_at` fresh under coord's new push-aware liveness
+// model, the runner periodically POSTs `{device_id, hostname}` to coord's
+// `/coord/devices/register` endpoint. The handler's UPSERT refreshes
 // `last_seen_at` and `COALESCE`s a previously-advertised `health_url`, so
 // heartbeating from the runner side is a clean, side-effect-free refresh.
 //
-// The HTTP heartbeat path is intentionally additive: it never touches the
-// direct-PG publisher and tolerates missing identity, missing profile, or
-// network failure with `info!`/`warn!` and a retry on the next tick.
+// The HTTP heartbeat path is intentionally additive: it tolerates missing
+// identity, missing profile, or network failure with `info!`/`warn!` and a
+// retry on the next tick.
+//
+// Phase 3 (Unified Devices Registry) renames: the heartbeat now uses the
+// `DeviceFile` struct + `load_device_file` helper from §3.2 above, and the
+// URL flipped from `/coord/machine/register` to `/coord/devices/register`
+// to match `register_with_coord` in `bin/qontinui_profile.rs`.
 // =============================================================================
-
-/// `~/.qontinui/profiles.json` — minimum subset we need (the active
-/// profile's `coord_url`). Mirrors the supervisor's shape at
-/// `qontinui-supervisor/src/fleet.rs:96-107` verbatim so the same
-/// active-profile + trim-`/ws` logic applies on both sides.
-#[derive(Debug, Clone, Deserialize)]
-struct Profiles {
-    #[serde(default)]
-    active: Option<String>,
-    #[serde(default)]
-    profiles: std::collections::HashMap<String, Profile>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Profile {
-    #[serde(default)]
-    coord_url: Option<String>,
-}
-
-fn profiles_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
-}
-
-/// Resolve the coord HTTP base from the active profile's `coord_url`.
-/// Profile stores `ws://host:9870/ws` or `wss://host:9870/ws` (the
-/// WebSocket upgrade URL); convert that to `http://host:9870` /
-/// `https://host:9870` so reqwest can POST to `/coord/machine/register`.
-/// Returns `None` if profiles.json is missing or the active profile has
-/// no coord_url. Mirrors `qontinui-supervisor/src/fleet.rs:122-138`.
-///
-/// Re-read each tick — `profiles.json` is tiny and the active profile
-/// may change between ticks; caching would defeat that.
-fn coord_http_base() -> Option<String> {
-    let bytes = std::fs::read(profiles_path()?).ok()?;
-    let pf: Profiles = serde_json::from_slice(&bytes).ok()?;
-    let active = pf.active.as_deref().unwrap_or("dev");
-    let coord_url = pf.profiles.get(active)?.coord_url.as_deref()?;
-
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http)
-}
 
 #[derive(Debug, serde::Serialize)]
 struct HeartbeatPayload {
-    machine_id: uuid::Uuid,
+    device_id: uuid::Uuid,
     hostname: String,
 }
 
-/// POST `{machine_id, hostname}` to `<base>/coord/machine/register`.
+/// POST `{device_id, hostname}` to `<base>/coord/devices/register`.
 ///
-/// `health_url` is deliberately omitted — coord's `register_machine`
+/// `health_url` is deliberately omitted — coord's `register_device`
 /// handler `COALESCE`s `EXCLUDED.health_url` with the existing value,
-/// so omitting from the heartbeat preserves any URL the machine
+/// so omitting from the heartbeat preserves any URL the device
 /// previously advertised. Failures are reported as `Err(String)` so
 /// the caller can log them; the loop never panics.
 pub async fn heartbeat_to_coord() -> Result<(), String> {
-    let machine = match load_machine_file() {
-        Some(m) => m,
+    let device = match load_device_file() {
+        Some(d) => d,
         None => {
             info!(
                 "fleet::heartbeat: ~/.qontinui/machine.json missing — \
-                 run `qontinui_profile machine init` to enable fleet visibility. Skipping."
+                 run `qontinui_profile device init` to enable fleet visibility. Skipping."
             );
             return Ok(());
         }
     };
 
-    let machine_id = match uuid::Uuid::parse_str(&machine.machine_id) {
+    let device_id = match uuid::Uuid::parse_str(&device.device_id) {
         Ok(id) => id,
         Err(e) => {
-            warn!("fleet::heartbeat: machine.json machine_id is not a valid UUID ({e}). Skipping.");
+            warn!("fleet::heartbeat: machine.json device_id is not a valid UUID ({e}). Skipping.");
             return Ok(());
         }
     };
@@ -351,10 +449,10 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
     };
 
     let payload = HeartbeatPayload {
-        machine_id,
-        hostname: machine.hostname.clone(),
+        device_id,
+        hostname: device.hostname.clone(),
     };
-    let url = format!("{base}/coord/machine/register");
+    let url = format!("{base}/coord/devices/register");
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -373,8 +471,8 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         // 30s cadence — `info!` would be noisy, debug! keeps the
         // happy path quiet while still discoverable.
         debug!(
-            "fleet::heartbeat: ok machine_id={machine_id} hostname={} status={}",
-            machine.hostname, status
+            "fleet::heartbeat: ok device_id={device_id} hostname={} status={}",
+            device.hostname, status
         );
         Ok(())
     } else {

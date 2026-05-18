@@ -14,10 +14,23 @@
 //! qontinui_profile init                       # write starter profiles.json (host=localhost)
 //! qontinui_profile init --host 192.168.1.x    # ... pointing at a remote canonical-stack host
 //! qontinui_profile path                       # print the profiles.json path
-//! qontinui_profile machine init               # mint ~/.qontinui/machine.json + register in coord.machines
-//! qontinui_profile machine show               # print machine_id + coord registration status
-//! qontinui_profile machine path               # print the machine.json path
+//! qontinui_profile device init                # mint ~/.qontinui/machine.json + register in coord.devices
+//! qontinui_profile device show                # print device_id + coord registration status
+//! qontinui_profile device path                # print the machine.json path
+//! qontinui_profile device pair                # pair the device with a web user (browser or --auth-token)
 //! ```
+//!
+//! ## Unified Devices Registry — naming
+//!
+//! The on-disk identity file is still `~/.qontinui/machine.json` (the legacy
+//! filename is preserved to avoid churn); inside, the field is now `device_id`
+//! (renamed from `machine_id`), but the file is read with backward-compatible
+//! deserialization so any pre-rename machine.json still loads. The coord table
+//! `coord.machines` has been renamed to `coord.devices`; the runner POSTs to
+//! `POST /coord/devices/register` (was `/coord/machine/register`).
+//!
+//! The legacy `machine` subcommand is kept as an alias for `device` so scripts
+//! and operator muscle memory keep working.
 //!
 //! `init --host` is the LAN-client setup path: an MSI laptop / third
 //! machine runs `qontinui_profile init --host <PC-LAN-IP>` once and is
@@ -61,8 +74,8 @@ use std::process::ExitCode;
     name = "qontinui_profile",
     about = "Manage ~/.qontinui/profiles.json and ~/.qontinui/machine.json",
     long_about = "Manage ~/.qontinui/profiles.json (DB/Redis/blob/coord connection \
-                  config) and ~/.qontinui/machine.json (per-machine UUID used as a \
-                  foreign key in coord.machines / coord.claims_audit).\n\n\
+                  config) and ~/.qontinui/machine.json (per-device UUID used as a \
+                  foreign key in coord.devices / coord.claims_audit).\n\n\
                   When invoked with no subcommand, prints the resolved active profile \
                   (equivalent to `qontinui_profile show`)."
 )]
@@ -91,25 +104,51 @@ enum Cmd {
     },
     /// Print the absolute profiles.json path.
     Path,
-    /// Manage ~/.qontinui/machine.json (per-machine identity for coord.machines
+    /// Manage ~/.qontinui/machine.json (per-device identity for coord.devices
     /// registration; required for /coord/status POSTs and non-NULL claims_audit
-    /// rows).
+    /// rows). Phase 3 (Unified Devices Registry) canonical name.
+    Device {
+        #[command(subcommand)]
+        sub: DeviceCmd,
+    },
+    /// Legacy alias for `device` — kept so scripts and operator muscle memory
+    /// keep working. Dispatches to the same handlers as `device`. The on-disk
+    /// filename `~/.qontinui/machine.json` is also preserved for compat.
     Machine {
         #[command(subcommand)]
-        sub: MachineCmd,
+        sub: DeviceCmd,
     },
 }
 
 #[derive(Subcommand, Debug)]
-enum MachineCmd {
+enum DeviceCmd {
     /// Mint UUID v4 + hostname to machine.json (atomic), then UPSERT into the
-    /// active profile's coord.machines via POST /coord/machine/register.
+    /// active profile's coord.devices via POST /coord/devices/register.
     /// Idempotent: re-runs re-use the existing UUID and refresh hostname.
-    Init,
-    /// Print machine_id + coord.machines registration timestamps as JSON.
+    /// `--name` picks a user-friendly display name (defaults to hostname).
+    Init {
+        /// Optional display name; defaults to hostname.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Print device_id + coord.devices registration timestamps as JSON.
     Show,
     /// Print the absolute machine.json path.
     Path,
+    /// Bind this device to a web-backend user. Default mode opens
+    /// /connect-runner in the system browser and waits for the user's
+    /// confirmation; `--auth-token <token>` takes a pre-issued OAuth token
+    /// and headlessly POSTs to coord. On success persists the device-token
+    /// JWT + paired user_id locally.
+    Pair {
+        /// Headless mode: use a pre-issued OAuth token. Mutually exclusive
+        /// with `--browser`.
+        #[arg(long, value_name = "OAUTH_TOKEN")]
+        auth_token: Option<String>,
+        /// Browser mode (default). Mutually exclusive with `--auth-token`.
+        #[arg(long)]
+        browser: bool,
+    },
 }
 
 // ============================================================================
@@ -125,13 +164,23 @@ fn main() -> ExitCode {
         Cmd::Use { name } => cmd_use(&name),
         Cmd::Init { host } => cmd_init(&host),
         Cmd::Path => cmd_path(),
-        Cmd::Machine { sub } => match sub {
-            MachineCmd::Init => cmd_machine_init(),
-            MachineCmd::Show => cmd_machine_show(),
-            MachineCmd::Path => cmd_machine_path(),
+        // `machine` is a legacy alias — both variants dispatch to the same
+        // device handlers. Phase 3 unified the canonical name on `device`.
+        Cmd::Device { sub } | Cmd::Machine { sub } => match sub {
+            DeviceCmd::Init { name } => cmd_device_init(name.as_deref()),
+            DeviceCmd::Show => cmd_device_show(),
+            DeviceCmd::Path => cmd_device_path(),
+            DeviceCmd::Pair {
+                auth_token,
+                browser,
+            } => cmd_device_pair(auth_token.as_deref(), browser),
         },
     }
 }
+
+// ============================================================================
+// profile-level helpers
+// ============================================================================
 
 fn cmd_path() -> ExitCode {
     match profiles_path() {
@@ -302,59 +351,42 @@ fn cmd_init(host: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    let dev = Profile {
-        // Defaults match qontinui-stack/.env.example. `host` defaults to
-        // `localhost` for PC-local dev; LAN clients pass `--host <PC-IP>`.
+
+    let mut profiles = HashMap::new();
+    let canonical = Profile {
         database_url: Some(format!(
-            "host={host} port=5433 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db"
+            "postgresql://qontinui:qontinui@{host}:6543/qontinui_canonical"
         )),
-        redis_url: Some(format!("redis://:qontinui_dev_redis@{host}:6380/0")),
+        redis_url: Some(format!("redis://{host}:6379/0")),
         blob: Some(BlobConfig {
-            kind: "s3-compatible".to_string(),
-            endpoint: Some(format!("http://{host}:9100")),
+            kind: "minio".to_string(),
+            endpoint: Some(format!("http://{host}:9000")),
             region: Some("us-east-1".to_string()),
-            access_key: Some("minioadmin".to_string()),
-            secret_key: Some("minioadmin".to_string()),
-            bucket: Some("qontinui-dev".to_string()),
+            bucket: Some("qontinui-blobs".to_string()),
+            access_key: Some("qontinui".to_string()),
+            secret_key: Some("qontinui-dev-secret".to_string()),
         }),
-        // Coord service runs at qontinui-stack's :9870 — see qontinui-coord.
-        // ws:// (not wss://) for dev because there's no TLS termination on
-        // the LAN. AWS staging flips to wss:// via the ALB.
         coord_url: Some(format!("ws://{host}:9870/ws")),
         auth: Some(AuthConfig {
-            kind: "static-dev-token".to_string(),
-            token: Some("dev-token-replace-me".to_string()),
-            issuer: None,
-            client_id: None,
+            kind: "issuer".to_string(),
+            issuer: Some(format!("http://{host}:8000")),
+            client_id: Some("qontinui-runner".to_string()),
+            token: None,
         }),
     };
-    let mut profiles = HashMap::new();
-    profiles.insert("dev".to_string(), dev);
+    profiles.insert("canonical".to_string(), canonical);
     let file = ProfilesFile {
-        active: Some("dev".to_string()),
+        active: Some("canonical".to_string()),
         profiles,
     };
     if let Err(e) = atomic_write(&path, &file) {
-        eprintln!("write failed: {}", e);
+        eprintln!("write {} failed: {}", path.display(), e);
         return ExitCode::from(2);
     }
-    println!(
-        "wrote starter profiles.json to {}\n\
-         active profile: dev (host={host}, ports 5433/6380/9100/9870)",
-        path.display()
-    );
-    if host == "localhost" {
-        println!(
-            "\nTo wire a laptop / third machine into the PC's canonical stack:\n\
-             \x20 qontinui_profile init --host <PC-LAN-IP>"
-        );
-    }
+    println!("wrote {} (active=canonical, host={})", path.display(), host);
     ExitCode::SUCCESS
 }
 
-/// Write `file` atomically: serialize to a sibling `.tmp`, then rename.
-/// Avoids a partial-write window where a reader could observe an
-/// invalid-JSON profiles.json.
 fn atomic_write(path: &Path, file: &ProfilesFile) -> std::io::Result<()> {
     let pretty = serde_json::to_vec_pretty(file)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -365,36 +397,48 @@ fn atomic_write(path: &Path, file: &ProfilesFile) -> std::io::Result<()> {
 }
 
 // ============================================================================
-// machine subcommand
+// device subcommand
 // ============================================================================
 //
-// Per topology plan §3, every runner has a stable machine identity stored at
-// ~/.qontinui/machine.json. The active profile's coord service uses this UUID
-// as the foreign key in coord.claims_audit / coord.machine_status / etc.
-// `qontinui_profile init` writes profiles.json but NOT machine.json — this
-// gap left new machines with NULL machine_id audit rows and rejected
-// /coord/status POSTs (qontinui-coord/src/status.rs:116-122).
+// Per topology plan §3, every runner has a stable device identity stored at
+// ~/.qontinui/machine.json (legacy filename). The active profile's coord
+// service uses this UUID as the foreign key in coord.claims_audit /
+// coord.device_status / etc.  `qontinui_profile init` writes profiles.json
+// but NOT machine.json — this gap left new devices with NULL device_id audit
+// rows and rejected /coord/status POSTs (qontinui-coord/src/status.rs:116-122).
+//
+// Phase 3 (Unified Devices Registry): `coord.machines` → `coord.devices`.
+// The HTTP endpoint moved to `POST /coord/devices/register`; the on-disk
+// field renamed from `machine_id` to `device_id` (with a `machine_id` serde
+// alias for back-compat with pre-rename machine.json files).
 
 /// Shape of `~/.qontinui/machine.json`. UUID v4 + hostname only — additional
-/// per-machine state (current_branches, last_alembic_head) lives in
-/// coord.machines, not this file.
+/// per-device state (current_branches, last_alembic_head) lives in
+/// coord.devices, not this file. `name` is optional and defaults to hostname
+/// at register-time when absent.
+///
+/// `device_id` is serde-aliased to `machine_id` so a pre-Phase-3 machine.json
+/// (which writes `"machine_id": "..."`) deserializes without manual migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MachineFile {
-    machine_id: String,
+struct DeviceFile {
+    #[serde(alias = "machine_id")]
+    device_id: String,
     hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
-fn machine_path() -> Option<PathBuf> {
+fn device_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
 }
 
-fn read_machine_file(path: &Path) -> std::io::Result<MachineFile> {
+fn read_device_file(path: &Path) -> std::io::Result<DeviceFile> {
     let bytes = std::fs::read(path)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-fn atomic_write_machine(path: &Path, file: &MachineFile) -> std::io::Result<()> {
+fn atomic_write_device(path: &Path, file: &DeviceFile) -> std::io::Result<()> {
     let pretty = serde_json::to_vec_pretty(file)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("json.tmp");
@@ -410,8 +454,44 @@ fn detect_hostname() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn cmd_machine_path() -> ExitCode {
-    match machine_path() {
+/// Per the platform docs: `std::env::consts::OS` is one of {"linux",
+/// "macos", "windows", "ios", "android", "freebsd", "dragonfly", "netbsd",
+/// "openbsd", "solaris"}. Always available; no dependency required.
+fn detect_os() -> String {
+    std::env::consts::OS.to_string()
+}
+
+/// OS version string via the already-present `sysinfo = "0.32"` crate
+/// (`src-tauri/Cargo.toml:77`). `sysinfo::System::long_os_version()` returns
+/// e.g. "Windows 11 Pro 23H2 (build 22631)" or "macOS 14.4 Sonoma". `None`
+/// on platforms where sysinfo can't probe; the runner is fine sending None.
+fn detect_os_version() -> Option<String> {
+    use sysinfo::System;
+    System::long_os_version().or_else(System::os_version)
+}
+
+/// Path to the paired-user JSON written by `device pair` and read by `device
+/// init` to attach a `user_id` to the register payload. Living under the
+/// Tauri app's local data directory (alongside `auth_tokens.enc`) keeps the
+/// CLI bin and the GUI runner reading the same file.
+fn paired_user_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("com.qontinui.runner").join("paired_user.json"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairedUserFile {
+    user_id: String,
+}
+
+fn load_paired_user_id() -> Option<String> {
+    let path = paired_user_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let parsed: PairedUserFile = serde_json::from_slice(&bytes).ok()?;
+    Some(parsed.user_id)
+}
+
+fn cmd_device_path() -> ExitCode {
+    match device_file_path() {
         Some(p) => {
             println!("{}", p.display());
             ExitCode::SUCCESS
@@ -423,8 +503,8 @@ fn cmd_machine_path() -> ExitCode {
     }
 }
 
-fn cmd_machine_init() -> ExitCode {
-    let path = match machine_path() {
+fn cmd_device_init(name_arg: Option<&str>) -> ExitCode {
+    let path = match device_file_path() {
         Some(p) => p,
         None => {
             eprintln!("could not resolve home directory");
@@ -437,9 +517,12 @@ fn cmd_machine_init() -> ExitCode {
     // laptop can rename between boots and the file should reflect current.
     let hostname_now = detect_hostname();
     let (file, was_new) = if path.exists() {
-        match read_machine_file(&path) {
+        match read_device_file(&path) {
             Ok(mut existing) => {
                 existing.hostname = hostname_now.clone();
+                if let Some(n) = name_arg {
+                    existing.name = Some(n.to_string());
+                }
                 (existing, false)
             }
             Err(e) => {
@@ -455,9 +538,10 @@ fn cmd_machine_init() -> ExitCode {
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         (
-            MachineFile {
-                machine_id: id,
+            DeviceFile {
+                device_id: id,
                 hostname: hostname_now.clone(),
+                name: name_arg.map(|s| s.to_string()),
             },
             true,
         )
@@ -469,35 +553,42 @@ fn cmd_machine_init() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    if let Err(e) = atomic_write_machine(&path, &file) {
+    if let Err(e) = atomic_write_device(&path, &file) {
         eprintln!("write {} failed: {}", path.display(), e);
         return ExitCode::from(2);
     }
     if was_new {
         println!(
             "wrote machine.json: {} (host={})",
-            file.machine_id, file.hostname
+            file.device_id, file.hostname
         );
     } else {
         println!(
             "re-using existing machine.json: {} (host={})",
-            file.machine_id, file.hostname
+            file.device_id, file.hostname
         );
     }
 
-    // Register with coord via HTTP `POST /coord/machine/register`. File
+    // Register with coord via HTTP `POST /coord/devices/register`. File
     // creation succeeds even if coord registration fails — the local
-    // machine.json is the canonical record; coord.machines is a derived view
+    // machine.json is the canonical record; coord.devices is a derived view
     // (qontinui-coord re-syncs from machine.json on next /coord/status POST).
-    match register_with_coord(&file.machine_id, &file.hostname) {
+    let display_name = file.name.clone().unwrap_or_else(|| file.hostname.clone());
+    let paired_user_id = load_paired_user_id();
+    match register_with_coord(
+        &file.device_id,
+        &file.hostname,
+        &display_name,
+        paired_user_id.as_deref(),
+    ) {
         Ok(()) => {
-            println!("registered with coord via HTTP (POST /coord/machine/register)");
+            println!("registered with coord via HTTP (POST /coord/devices/register)");
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!(
                 "warning: coord registration failed: {}\n\
-                 (machine.json was still written; re-run `qontinui_profile machine init` once coord is reachable)",
+                 (machine.json was still written; re-run `qontinui_profile device init` once coord is reachable)",
                 e
             );
             ExitCode::SUCCESS
@@ -505,8 +596,8 @@ fn cmd_machine_init() -> ExitCode {
     }
 }
 
-fn cmd_machine_show() -> ExitCode {
-    let path = match machine_path() {
+fn cmd_device_show() -> ExitCode {
+    let path = match device_file_path() {
         Some(p) => p,
         None => {
             eprintln!("could not resolve home directory");
@@ -516,12 +607,12 @@ fn cmd_machine_show() -> ExitCode {
     if !path.exists() {
         eprintln!(
             "machine.json not found at {}\n\
-             Run 'qontinui_profile machine init' to mint identity and register with coord.",
+             Run 'qontinui_profile device init' to mint identity and register with coord.",
             path.display()
         );
         return ExitCode::from(1);
     }
-    let file = match read_machine_file(&path) {
+    let file = match read_device_file(&path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("read failed: {}", e);
@@ -529,7 +620,7 @@ fn cmd_machine_show() -> ExitCode {
         }
     };
 
-    let coord_status = match query_coord_registration(&file.machine_id) {
+    let coord_status = match query_coord_registration(&file.device_id) {
         Ok(Some((created_at, last_seen_at))) => {
             json!({ "registered": true, "created_at": created_at, "last_seen_at": last_seen_at })
         }
@@ -538,35 +629,452 @@ fn cmd_machine_show() -> ExitCode {
     };
 
     let out = json!({
-        "machine_id": file.machine_id,
-        "hostname":   file.hostname,
-        "path":       path.display().to_string(),
-        "coord":      coord_status,
+        "device_id": file.device_id,
+        "hostname":  file.hostname,
+        "name":      file.name,
+        "path":      path.display().to_string(),
+        "coord":     coord_status,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
     ExitCode::SUCCESS
 }
 
-/// Register this machine with coord via `POST /coord/machine/register`.
-/// The endpoint (added in qontinui-coord PR #37) UPSERTs `coord.machines`
-/// and returns the resulting row. Replaces the prior direct-PG INSERT path
-/// so the runner no longer needs PG credentials to coord's database.
+// ============================================================================
+// device pair — bind this device to a web-backend user
+// ============================================================================
+//
+// Two modes:
+//
+// 1. `--browser` (default): opens `{web_backend}/connect-runner?state=<nonce>
+//    &callback=http://127.0.0.1:<port>/auth/runner-token-callback
+//    &device_name=<hostname>` in the user's default browser. We spin up a
+//    one-shot localhost axum server, wait for the redirect, capture
+//    `(state, token, token_id=device_id)`, POST `(state, token)` to coord's
+//    `POST /coord/devices/pair-complete`, and receive a device-token JWT.
+//
+// 2. `--auth-token <oauth>`: headless. POSTs `Authorization: Bearer <oauth>`
+//    to coord's `POST /coord/devices/pair-cli`; receives the device-token JWT
+//    directly.
+//
+// On success we persist:
+//
+// - The device-token JWT via the runner's existing `AuthManager` /
+//   `SecureStorage` (AES-256-GCM at `{data_local_dir}/com.qontinui.runner/
+//   auth_tokens.enc`). The same file may already hold a pre-Phase-3
+//   `qontinui_runner_<random>` bearer; this overwrites it with the JWT (see
+//   the comment in `secure_storage.rs` documenting the format change).
+//
+// - The paired user_id to `paired_user.json` (under the same data_local_dir),
+//   so the next `device init` carries it on the register payload.
+
+enum PairMode {
+    Browser,
+    AuthToken(String),
+}
+
+fn select_pair_mode(auth_token: Option<&str>, _browser: bool) -> Result<PairMode, String> {
+    // clap's `Pair` variant carries both `--browser` and `--auth-token`. The
+    // mutually-exclusive constraint is enforced here (we can't use clap's
+    // `conflicts_with` because `browser` is a bool flag with a default of
+    // false). If `--auth-token` is set, that wins; otherwise browser is the
+    // default mode (whether or not `--browser` was explicitly passed).
+    match auth_token {
+        Some(token) => {
+            if token.is_empty() {
+                return Err("--auth-token requires a value: --auth-token <oauth-token>".to_string());
+            }
+            Ok(PairMode::AuthToken(token.to_string()))
+        }
+        None => Ok(PairMode::Browser),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PairCompleteResponse {
+    device_token: String,
+    user_id: String,
+    #[serde(default)]
+    device_id: Option<String>,
+}
+
+fn cmd_device_pair(auth_token: Option<&str>, browser: bool) -> ExitCode {
+    // clap can't express "exactly one of browser/auth_token"; reject the
+    // combination by hand.
+    if auth_token.is_some() && browser {
+        eprintln!("error: --browser and --auth-token are mutually exclusive");
+        return ExitCode::from(2);
+    }
+    let mode = match select_pair_mode(auth_token, browser) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+    let base = match coord_http_base() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: could not resolve coord_url: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+    let result: Result<PairCompleteResponse, String> = match mode {
+        PairMode::AuthToken(token) => pair_with_auth_token(&base, &token),
+        PairMode::Browser => pair_via_browser(&base),
+    };
+    match result {
+        Ok(resp) => {
+            if let Err(e) = persist_pairing(&resp) {
+                eprintln!(
+                    "error: pairing succeeded but persisting locally failed: {}",
+                    e
+                );
+                return ExitCode::from(2);
+            }
+            println!(
+                "device paired: user_id={} (device-token JWT saved to auth_tokens.enc)",
+                resp.user_id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: pairing failed: {}", e);
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// POST `Authorization: Bearer <oauth-token>` to `POST /coord/devices/pair-cli`
+/// (headless mode). Coord verifies the OAuth token and returns the
+/// device-token JWT + paired user_id.
+fn pair_with_auth_token(base: &str, oauth_token: &str) -> Result<PairCompleteResponse, String> {
+    let url = format!("{}/coord/devices/pair-cli", base);
+    let body = serde_json::json!({
+        "hostname": detect_hostname(),
+        "name":     detect_hostname(),
+        "os":       detect_os(),
+        "os_version": detect_os_version(),
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {}", e))?;
+    let resp = client
+        .post(&url)
+        .bearer_auth(oauth_token)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("POST {} failed: {}", url, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp
+            .text()
+            .unwrap_or_else(|_| "<unable to read response body>".to_string());
+        return Err(format!("POST {} -> HTTP {}: {}", url, status, body_text));
+    }
+    resp.json::<PairCompleteResponse>()
+        .map_err(|e| format!("decode pair-cli response failed: {}", e))
+}
+
+/// Browser-mediated pair. Spins up a localhost axum server, opens the
+/// browser to `/connect-runner?state=…&callback=…`, waits for the user's
+/// click + redirect, then exchanges the captured `(state, token)` with
+/// coord's `POST /coord/devices/pair-complete` for the device-token JWT.
+fn pair_via_browser(coord_base: &str) -> Result<PairCompleteResponse, String> {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    // Generate state nonce. 32 bytes of randomness; hex-encoded so it
+    // survives a URL round-trip without escaping.
+    let mut state_bytes = [0u8; 32];
+    use rand::TryRngCore;
+    rand::rng()
+        .try_fill_bytes(&mut state_bytes)
+        .map_err(|e| format!("rand fill failed: {e}"))?;
+    let state_nonce = hex::encode(state_bytes);
+
+    // Web backend URL is read from the active profile's `coord_url` host
+    // (assuming web + coord co-locate in dev). If they diverge, the user
+    // can override with QONTINUI_WEB_BASE.
+    let web_base = std::env::var("QONTINUI_WEB_BASE")
+        .ok()
+        .unwrap_or_else(|| derive_web_base_from_coord(coord_base));
+    let hostname_now = detect_hostname();
+
+    // Bind a port for the callback. Use 0 to let the OS pick — then read it
+    // back. We use std::net::TcpListener first to capture the chosen port,
+    // then hand it to axum via from_tcp.
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("bind localhost callback failed: {e}"))?;
+    let port = std_listener
+        .local_addr()
+        .map_err(|e| format!("local_addr failed: {e}"))?
+        .port();
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking failed: {e}"))?;
+
+    let received: Arc<Mutex<Option<CallbackCapture>>> = Arc::new(Mutex::new(None));
+    let received_clone = received.clone();
+    let state_expected = state_nonce.clone();
+
+    // Build the redirect URL the browser will land back on. The state
+    // round-trips so we can reject mismatched callbacks.
+    let callback_url = format!("http://127.0.0.1:{}/auth/runner-token-callback", port);
+    let connect_url = format!(
+        "{}/connect-runner?state={}&callback={}&device_name={}",
+        web_base.trim_end_matches('/'),
+        urlencoding::encode(&state_nonce),
+        urlencoding::encode(&callback_url),
+        urlencoding::encode(&hostname_now),
+    );
+
+    // Spawn a current-thread tokio runtime + axum server on a worker thread.
+    // We could use the existing src/mcp/auth_callback.rs route, but it
+    // depends on Tauri-side state (ApiState/AppState); for the CLI we want
+    // an independent server.
+    let (server_done_tx, server_done_rx) = std::sync::mpsc::channel::<()>();
+    let server_handle = std::thread::spawn(move || -> Result<(), String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime build failed: {e}"))?;
+        rt.block_on(async move {
+            use axum::{extract::Query, response::Html, routing::get, Router};
+            let state_for_route = state_expected.clone();
+            let received_for_route = received_clone.clone();
+            let app = Router::new().route(
+                "/auth/runner-token-callback",
+                get(move |Query(q): Query<CallbackQuery>| {
+                    let state_for_route = state_for_route.clone();
+                    let received_for_route = received_for_route.clone();
+                    async move {
+                        if q.state != state_for_route {
+                            return Html(
+                                "<h1>State mismatch</h1><p>The callback state did \
+                                 not match the pending flow. Restart the pairing.</p>"
+                                    .to_string(),
+                            );
+                        }
+                        *received_for_route.lock().expect("mutex") = Some(CallbackCapture {
+                            token: q.token.clone(),
+                            token_id: q.token_id.clone(),
+                        });
+                        Html(
+                            "<h1>&#10003; Runner paired</h1>\
+                             <p>You can close this tab.</p>\
+                             <script>setTimeout(()=>window.close(),2000);</script>"
+                                .to_string(),
+                        )
+                    }
+                }),
+            );
+            let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+                .map_err(|e| format!("tokio listener wrap failed: {e}"))?;
+            // Run until our flag flips, with a 5-minute hard timeout.
+            let serve = axum::serve(tokio_listener, app);
+            let timeout = tokio::time::sleep(Duration::from_secs(300));
+            tokio::pin!(timeout);
+            tokio::select! {
+                res = serve => {
+                    res.map_err(|e| format!("axum serve failed: {e}"))?;
+                }
+                _ = &mut timeout => {
+                    return Err("pair: timed out after 5 minutes waiting for browser callback".to_string());
+                }
+            }
+            let _ = server_done_tx.send(());
+            Ok(())
+        })
+    });
+
+    println!(
+        "opening browser to {} (callback {})",
+        connect_url, callback_url
+    );
+    if let Err(e) = open::that(&connect_url) {
+        eprintln!(
+            "warning: failed to open browser ({}). Open this URL manually:\n  {}",
+            e, connect_url
+        );
+    }
+
+    // Poll the received slot up to 5 minutes. The axum runtime is on a
+    // background thread; we just block here until we see the slot fill or
+    // the server-done signal arrives.
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let capture = loop {
+        if let Some(c) = received.lock().expect("mutex").clone() {
+            break c;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("pair: timed out after 5 minutes waiting for browser callback".to_string());
+        }
+        // Cheap polling cadence; the axum task wakes on its own.
+        std::thread::sleep(Duration::from_millis(200));
+        // Drain the server-done channel in case axum exited early.
+        if let Ok(()) = server_done_rx.try_recv() {
+            // Server stopped without filling the slot — re-check once.
+            if let Some(c) = received.lock().expect("mutex").clone() {
+                break c;
+            }
+            return Err("pair: callback server stopped before capturing token".to_string());
+        }
+    };
+    // Best-effort join — we don't fail the operation if the server thread
+    // is still running; it'll time out on its own.
+    drop(server_handle);
+
+    // Exchange (state, token) for the device-token JWT.
+    let url = format!("{}/coord/devices/pair-complete", coord_base);
+    let body = serde_json::json!({
+        "state":  state_nonce,
+        "token":  capture.token,
+        "device_id": capture.token_id,
+        "hostname":  hostname_now,
+        "name":       hostname_now,
+        "os":         detect_os(),
+        "os_version": detect_os_version(),
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {}", e))?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("POST {} failed: {}", url, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp
+            .text()
+            .unwrap_or_else(|_| "<unable to read response body>".to_string());
+        return Err(format!("POST {} -> HTTP {}: {}", url, status, body_text));
+    }
+    resp.json::<PairCompleteResponse>()
+        .map_err(|e| format!("decode pair-complete response failed: {}", e))
+}
+
+/// Derive a `https://` web base from the coord HTTP base, assuming web +
+/// coord live on the same host (the dev-default). Production deployments
+/// override via `QONTINUI_WEB_BASE`.
+fn derive_web_base_from_coord(coord_base: &str) -> String {
+    // Drop the trailing `:9870` (coord port) — leave the rest in place.
+    // Imperfect heuristic; the env override is the escape hatch.
+    let trimmed = coord_base.trim_end_matches('/');
+    if let Some((host, _)) = trimmed.rsplit_once(':') {
+        host.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CallbackQuery {
+    state: String,
+    token: String,
+    #[serde(default)]
+    token_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CallbackCapture {
+    token: String,
+    #[allow(dead_code)]
+    token_id: Option<String>,
+}
+
+/// Persist the device-token JWT (via `qontinui_runner_lib::auth::AuthManager`)
+/// and write the paired user_id to `paired_user.json` so the next
+/// `device init` attaches it to the register payload.
+///
+/// Storing the JWT in the `access_token` slot is intentional: the existing
+/// `AuthManager` already calls that slot the "primary credential," and the
+/// runner's outer code reads `get_access_token()` when authenticating to the
+/// web backend. The refresh-token slot is unused for the device-token flow
+/// (the device JWT has its own lifecycle managed by coord); we pass an empty
+/// string. See the format-change comment in `secure_storage.rs`.
+fn persist_pairing(resp: &PairCompleteResponse) -> Result<(), String> {
+    use qontinui_runner_lib::auth::AuthManager;
+    let mgr = AuthManager::new();
+    mgr.store_tokens(&resp.device_token, "")
+        .map_err(|e| format!("AuthManager::store_tokens failed: {e}"))?;
+    let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let pf = PairedUserFile {
+        user_id: resp.user_id.clone(),
+    };
+    let pretty =
+        serde_json::to_vec_pretty(&pf).map_err(|e| format!("serialize paired_user.json: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &pretty).map_err(|e| format!("write tmp: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+    if let Some(did) = &resp.device_id {
+        // Best-effort: record device_id alongside the auth tokens so the
+        // runner GUI can identify itself without reading machine.json.
+        if let Ok(storage) = qontinui_runner_lib::secure_storage::SecureStorage::new() {
+            if let Err(e) = storage.store_device_id(did) {
+                tracing::debug!("store_device_id non-fatal: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Register this device with coord via `POST /coord/devices/register`.
+/// The endpoint UPSERTs `coord.devices` and returns the resulting row.
+/// Replaces the prior direct-PG INSERT path so the runner no longer needs
+/// PG credentials to coord's database.
 ///
 /// The CLI bootstrap doesn't know its health URL — that's the supervisor's
 /// job (Phase 3 of the fleet-health-url advertisement plan). We pass
 /// `health_url: null`; coord's endpoint treats missing/null as "leave the
 /// stored health_url as-is" (UPSERT semantics).
-fn register_with_coord(machine_id: &str, hostname: &str) -> Result<(), String> {
+///
+/// Phase 3 (Unified Devices Registry) body additions:
+/// - `os`: from `std::env::consts::OS` (always available, no dep).
+/// - `os_version`: from `sysinfo::System::long_os_version()` (best effort).
+/// - `capabilities`: feature-flag enumeration; starts with `["runner"]` as
+///   a sentinel for the canonical runner role. Future capabilities (e.g.
+///   `vision`, `accessibility-bridge`) get pushed by Phase 6 work.
+/// - `name`: user-supplied display name; defaults to hostname.
+/// - `user_id`: optional UUID, present only if the device has been paired
+///   (the file `{data_local_dir}/com.qontinui.runner/paired_user.json`
+///   exists from a prior `device pair` run). When absent, coord treats this
+///   as a "system device" register.
+fn register_with_coord(
+    device_id: &str,
+    hostname: &str,
+    name: &str,
+    user_id: Option<&str>,
+) -> Result<(), String> {
     // Validate UUID shape up front so a malformed machine.json fails fast
     // with a clear error instead of bouncing off a 400 from coord.
-    let _ = uuid::Uuid::parse_str(machine_id)
-        .map_err(|e| format!("machine_id is not a valid UUID: {}", e))?;
+    let _ = uuid::Uuid::parse_str(device_id)
+        .map_err(|e| format!("device_id is not a valid UUID: {}", e))?;
+    if let Some(uid) = user_id {
+        uuid::Uuid::parse_str(uid)
+            .map_err(|e| format!("paired user_id is not a valid UUID: {}", e))?;
+    }
     let base = coord_http_base()?;
-    let url = format!("{}/coord/machine/register", base);
+    let url = format!("{}/coord/devices/register", base);
+    // `device_id` is the canonical name in coord.devices. We also emit
+    // `machine_id` as a duplicate alias key for back-compat with a Phase-2
+    // coord that still reads the old name — the field is removed once
+    // Phase 2 is merged everywhere.
     let body = serde_json::json!({
-        "machine_id": machine_id,
-        "hostname": hostname,
-        "health_url": serde_json::Value::Null,
+        "device_id":    device_id,
+        "machine_id":   device_id,
+        "hostname":     hostname,
+        "name":         name,
+        "os":           detect_os(),
+        "os_version":   detect_os_version(),
+        "capabilities": vec!["runner".to_string()],
+        "user_id":      user_id,
+        "health_url":   serde_json::Value::Null,
     });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -593,7 +1101,7 @@ fn register_with_coord(machine_id: &str, hostname: &str) -> Result<(), String> {
 /// Resolve the coord HTTP base from the active profile's `coord_url`.
 /// Profiles store `ws://host:9870/ws` (the WebSocket upgrade URL); we
 /// convert that to `http://host:9870` so reqwest can POST to
-/// `/coord/machine/register`. Mirrors `qontinui-supervisor/src/fleet.rs`
+/// `/coord/devices/register`. Mirrors `qontinui-supervisor/src/fleet.rs`
 /// `coord_http_base` so both registration paths follow the same recipe.
 fn coord_http_base() -> Result<String, String> {
     let coord_url = load_strict()
@@ -613,9 +1121,9 @@ fn coord_http_base() -> Result<String, String> {
     Ok(with_http)
 }
 
-fn query_coord_registration(machine_id: &str) -> Result<Option<(String, String)>, String> {
-    let id = uuid::Uuid::parse_str(machine_id)
-        .map_err(|e| format!("machine_id is not a valid UUID: {}", e))?;
+fn query_coord_registration(device_id: &str) -> Result<Option<(String, String)>, String> {
+    let id = uuid::Uuid::parse_str(device_id)
+        .map_err(|e| format!("device_id is not a valid UUID: {}", e))?;
     let dsn = active_profile_dsn()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -630,14 +1138,27 @@ fn query_coord_registration(machine_id: &str) -> Result<Option<(String, String)>
                 tracing::debug!("pg connection ended: {}", e);
             }
         });
-        let row = client
+        // Try coord.devices first (Phase 3 target). If the table doesn't
+        // exist yet (Phase 2 not landed), fall back to coord.machines so the
+        // CLI remains usable during the migration window.
+        let row = match client
             .query_opt(
                 "SELECT created_at::text, last_seen_at::text \
-                 FROM coord.machines WHERE machine_id = $1",
+                 FROM coord.devices WHERE device_id = $1",
                 &[&id],
             )
             .await
-            .map_err(|e| format!("SELECT coord.machines failed: {}", e))?;
+        {
+            Ok(r) => r,
+            Err(_) => client
+                .query_opt(
+                    "SELECT created_at::text, last_seen_at::text \
+                     FROM coord.machines WHERE machine_id = $1",
+                    &[&id],
+                )
+                .await
+                .map_err(|e| format!("SELECT coord.devices/.machines failed: {}", e))?,
+        };
         drop(client);
         let _ = join.await;
         Ok(row.map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))))
@@ -657,26 +1178,53 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn atomic_write_machine_via_tmp_then_rename() {
+    fn atomic_write_device_via_tmp_then_rename() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("machine.json");
-        let file = MachineFile {
-            machine_id: "00000000-0000-4000-8000-000000000000".to_string(),
+        let file = DeviceFile {
+            device_id: "00000000-0000-4000-8000-000000000000".to_string(),
             hostname: "test-host".to_string(),
+            name: Some("test-display-name".to_string()),
         };
-        atomic_write_machine(&path, &file).expect("write");
-        let loaded = read_machine_file(&path).expect("read");
-        assert_eq!(loaded.machine_id, file.machine_id);
+        atomic_write_device(&path, &file).expect("write");
+        let loaded = read_device_file(&path).expect("read");
+        assert_eq!(loaded.device_id, file.device_id);
         assert_eq!(loaded.hostname, file.hostname);
+        assert_eq!(loaded.name, file.name);
         // The .tmp sibling must not linger after a successful rename.
         let tmp = path.with_extension("json.tmp");
         assert!(!tmp.exists(), "tmp file should be renamed away");
+    }
+
+    /// Back-compat: a pre-Phase-3 machine.json (using the old `machine_id`
+    /// field name) deserializes via serde alias.
+    #[test]
+    fn read_device_file_accepts_legacy_machine_id_alias() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("machine.json");
+        let legacy = serde_json::json!({
+            "machine_id": "00000000-0000-4000-8000-000000000000",
+            "hostname": "legacy-host",
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).expect("write");
+        let loaded = read_device_file(&path).expect("read legacy");
+        assert_eq!(loaded.device_id, "00000000-0000-4000-8000-000000000000");
+        assert_eq!(loaded.hostname, "legacy-host");
+        assert!(loaded.name.is_none());
     }
 
     #[test]
     fn detect_hostname_returns_non_empty() {
         let h = detect_hostname();
         assert!(!h.is_empty(), "hostname should be detectable on this host");
+    }
+
+    #[test]
+    fn detect_os_returns_known_value() {
+        let os = detect_os();
+        // std::env::consts::OS is one of a fixed set; we don't pin which,
+        // but it should be non-empty.
+        assert!(!os.is_empty(), "detect_os should return a non-empty string");
     }
 
     /// Clap's CLI surface should compile-time validate: this catches a
@@ -744,6 +1292,39 @@ mod tests {
         assert_help(&["qontinui_profile", "machine", "path", "--help"]);
     }
 
+    // ------------------------------------------------------------------
+    // Phase 3 `device` subcommand mirror of the `--help` short-circuit tests.
+    // The `device` name is the canonical Phase 3 alias; `machine` is the
+    // legacy. Both must short-circuit on --help.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn device_help_short_circuits() {
+        assert_help(&["qontinui_profile", "device", "--help"]);
+        assert_help(&["qontinui_profile", "device", "-h"]);
+    }
+
+    #[test]
+    fn device_init_help_short_circuits() {
+        assert_help(&["qontinui_profile", "device", "init", "--help"]);
+        assert_help(&["qontinui_profile", "device", "init", "-h"]);
+    }
+
+    #[test]
+    fn device_show_help_short_circuits() {
+        assert_help(&["qontinui_profile", "device", "show", "--help"]);
+    }
+
+    #[test]
+    fn device_path_help_short_circuits() {
+        assert_help(&["qontinui_profile", "device", "path", "--help"]);
+    }
+
+    #[test]
+    fn device_pair_help_short_circuits() {
+        assert_help(&["qontinui_profile", "device", "pair", "--help"]);
+    }
+
     #[test]
     fn init_help_short_circuits() {
         // `init` is destructive at the top level too (writes profiles.json).
@@ -793,9 +1374,77 @@ mod tests {
         let cli = Cli::try_parse_from(["qontinui_profile", "machine", "init"]).expect("parses");
         match cli.cmd {
             Some(Cmd::Machine {
-                sub: MachineCmd::Init,
-            }) => {}
+                sub: DeviceCmd::Init { name },
+            }) => assert!(name.is_none()),
             other => panic!("expected Machine::Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn device_init_parses_as_device_init() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "device", "init"]).expect("parses");
+        match cli.cmd {
+            Some(Cmd::Device {
+                sub: DeviceCmd::Init { name },
+            }) => assert!(name.is_none()),
+            other => panic!("expected Device::Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn device_init_accepts_name_flag() {
+        let cli =
+            Cli::try_parse_from(["qontinui_profile", "device", "init", "--name", "my-laptop"])
+                .expect("parses");
+        match cli.cmd {
+            Some(Cmd::Device {
+                sub: DeviceCmd::Init { name },
+            }) => assert_eq!(name.as_deref(), Some("my-laptop")),
+            other => panic!("expected Device::Init {{name}}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn device_pair_parses_with_auth_token() {
+        let cli = Cli::try_parse_from([
+            "qontinui_profile",
+            "device",
+            "pair",
+            "--auth-token",
+            "oauth",
+        ])
+        .expect("parses");
+        match cli.cmd {
+            Some(Cmd::Device {
+                sub:
+                    DeviceCmd::Pair {
+                        auth_token,
+                        browser,
+                    },
+            }) => {
+                assert_eq!(auth_token.as_deref(), Some("oauth"));
+                assert!(!browser);
+            }
+            other => panic!("expected Device::Pair, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn device_pair_parses_with_browser_flag() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "device", "pair", "--browser"])
+            .expect("parses");
+        match cli.cmd {
+            Some(Cmd::Device {
+                sub:
+                    DeviceCmd::Pair {
+                        auth_token,
+                        browser,
+                    },
+            }) => {
+                assert!(auth_token.is_none());
+                assert!(browser);
+            }
+            other => panic!("expected Device::Pair {{browser}}, got {:?}", other),
         }
     }
 
