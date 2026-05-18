@@ -380,9 +380,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
     } else {
         let body = resp.text().await.unwrap_or_default();
         let excerpt: String = body.chars().take(200).collect();
-        Err(format!(
-            "coord returned {status} for POST {url}: {excerpt}"
-        ))
+        Err(format!("coord returned {status} for POST {url}: {excerpt}"))
     }
 }
 
