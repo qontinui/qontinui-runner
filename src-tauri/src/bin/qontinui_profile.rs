@@ -29,7 +29,20 @@
 //!
 //! Exit codes follow the convention used by `runner_coordination/runner_lock.py`:
 //! `0` success, `1` recoverable failure (e.g. profile not found), `2` error.
+//!
+//! ## Argv parsing
+//!
+//! The CLI uses `clap` derive macros, not hand-rolled argv inspection.
+//! This matters for `--help`: an earlier hand-rolled dispatcher checked
+//! `args.get(2)` for the subcommand and executed it before inspecting
+//! later tokens, so `qontinui_profile machine init --help` *executed*
+//! `init` (minting a machine_id, writing `machine.json`, UPSERTing
+//! `coord.machines`) instead of printing help. An MSI fleet-join agent
+//! hit this on 2026-05-18 and left a stranded row in canonical PG.
+//! Clap's derive macros short-circuit `--help` at every level for free,
+//! so the destructive paths are unreachable when help is requested.
 
+use clap::{Parser, Subcommand};
 use qontinui_runner_lib::profiles::{
     load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile,
 };
@@ -39,82 +52,85 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+// ============================================================================
+// CLI surface
+// ============================================================================
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "qontinui_profile",
+    about = "Manage ~/.qontinui/profiles.json and ~/.qontinui/machine.json",
+    long_about = "Manage ~/.qontinui/profiles.json (DB/Redis/blob/coord connection \
+                  config) and ~/.qontinui/machine.json (per-machine UUID used as a \
+                  foreign key in coord.machines / coord.claims_audit).\n\n\
+                  When invoked with no subcommand, prints the resolved active profile \
+                  (equivalent to `qontinui_profile show`)."
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Print the resolved active profile (default when no subcommand is given).
+    Show,
+    /// List profile names; the active one is marked with `*`.
+    List,
+    /// Set the file's `active` field to the named profile.
+    Use {
+        /// Profile name (must exist in profiles.json).
+        name: String,
+    },
+    /// Write a starter profiles.json. Default host is localhost (PC-local dev).
+    /// Pass `--host <PC-LAN-IP>` from a laptop / third machine to point at the PC.
+    Init {
+        /// Host / IP for DB, Redis, blob, and coord URLs. Defaults to localhost.
+        #[arg(long, default_value = "localhost")]
+        host: String,
+    },
+    /// Print the absolute profiles.json path.
+    Path,
+    /// Manage ~/.qontinui/machine.json (per-machine identity for coord.machines
+    /// registration; required for /coord/status POSTs and non-NULL claims_audit
+    /// rows).
+    Machine {
+        #[command(subcommand)]
+        sub: MachineCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MachineCmd {
+    /// Mint UUID v4 + hostname to machine.json (atomic), then UPSERT into the
+    /// active profile's coord.machines via POST /coord/machine/register.
+    /// Idempotent: re-runs re-use the existing UUID and refresh hostname.
+    Init,
+    /// Print machine_id + coord.machines registration timestamps as JSON.
+    Show,
+    /// Print the absolute machine.json path.
+    Path,
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("show");
+    let cli = Cli::parse();
 
-    match cmd {
-        "show" => cmd_show(),
-        "list" => cmd_list(),
-        "use" => match args.get(2) {
-            Some(name) => cmd_use(name),
-            None => {
-                eprintln!("usage: qontinui_profile use <name>");
-                ExitCode::from(2)
-            }
+    match cli.cmd.unwrap_or(Cmd::Show) {
+        Cmd::Show => cmd_show(),
+        Cmd::List => cmd_list(),
+        Cmd::Use { name } => cmd_use(&name),
+        Cmd::Init { host } => cmd_init(&host),
+        Cmd::Path => cmd_path(),
+        Cmd::Machine { sub } => match sub {
+            MachineCmd::Init => cmd_machine_init(),
+            MachineCmd::Show => cmd_machine_show(),
+            MachineCmd::Path => cmd_machine_path(),
         },
-        "init" => {
-            // Parse `--host <ip>` if present; otherwise default to localhost.
-            // Position-independent so `init --host 1.2.3.4` and the
-            // accidentally-permuted `init` (no flag) both work.
-            let host = parse_host_arg(&args).unwrap_or_else(|| "localhost".to_string());
-            cmd_init(&host)
-        }
-        "path" => cmd_path(),
-        "machine" => cmd_machine(&args),
-        "help" | "-h" | "--help" => {
-            print_help();
-            ExitCode::SUCCESS
-        }
-        other => {
-            eprintln!("unknown command: {}", other);
-            print_help();
-            ExitCode::from(2)
-        }
     }
-}
-
-fn print_help() {
-    println!(
-        "qontinui_profile — manage ~/.qontinui/profiles.json\n\n\
-         Commands:\n\
-         \x20 show                       Print the resolved active profile\n\
-         \x20 list                       List profile names\n\
-         \x20 use <name>                 Set the file's 'active' field\n\
-         \x20 init [--host <ip>]         Write a starter profiles.json. Default host is\n\
-         \x20                            localhost (PC-local dev). Pass --host <PC-LAN-IP>\n\
-         \x20                            from a laptop / third machine to point at the PC.\n\
-         \x20 path                       Print the profiles.json path\n\
-         \x20 machine <init|show|path>   Manage ~/.qontinui/machine.json (machine identity\n\
-         \x20                            for coord.machines registration; required for\n\
-         \x20                            /coord/status POSTs and non-NULL claims_audit rows)\n\
-         \x20 help                       Show this message\n"
-    );
-}
-
-fn print_machine_help() {
-    println!(
-        "qontinui_profile machine — manage ~/.qontinui/machine.json\n\n\
-         Commands:\n\
-         \x20 init    Mint UUID v4 + hostname to machine.json (atomic), then UPSERT\n\
-         \x20         into the active profile's coord.machines. Idempotent: re-runs\n\
-         \x20         re-use the existing UUID and bump last_seen_at.\n\
-         \x20 show    Print machine_id + coord.machines registration timestamps.\n\
-         \x20 path    Print the absolute machine.json path.\n"
-    );
-}
-
-/// Parse `--host <value>` out of an arg list. Position-independent.
-/// Returns None if the flag is absent; returns Some("") if `--host` is the
-/// last token (caller should treat that the same as default).
-fn parse_host_arg(args: &[String]) -> Option<String> {
-    let mut iter = args.iter();
-    while let Some(a) = iter.next() {
-        if a == "--host" {
-            return iter.next().cloned();
-        }
-    }
-    None
 }
 
 fn cmd_path() -> ExitCode {
@@ -394,24 +410,6 @@ fn detect_hostname() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn cmd_machine(args: &[String]) -> ExitCode {
-    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("show");
-    match sub {
-        "init" => cmd_machine_init(),
-        "show" => cmd_machine_show(),
-        "path" => cmd_machine_path(),
-        "help" | "-h" | "--help" => {
-            print_machine_help();
-            ExitCode::SUCCESS
-        }
-        other => {
-            eprintln!("unknown machine subcommand: {}", other);
-            print_machine_help();
-            ExitCode::from(2)
-        }
-    }
-}
-
 fn cmd_machine_path() -> ExitCode {
     match machine_path() {
         Some(p) => {
@@ -655,6 +653,8 @@ fn active_profile_dsn() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
+    use clap::CommandFactory;
 
     #[test]
     fn atomic_write_machine_via_tmp_then_rename() {
@@ -677,5 +677,131 @@ mod tests {
     fn detect_hostname_returns_non_empty() {
         let h = detect_hostname();
         assert!(!h.is_empty(), "hostname should be detectable on this host");
+    }
+
+    /// Clap's CLI surface should compile-time validate: this catches a
+    /// missing required arg / typoed subcommand at `cargo test` time
+    /// rather than at runtime.
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    // ------------------------------------------------------------------
+    // --help / -h short-circuit regression tests.
+    //
+    // The original hand-rolled argv parser executed subcommands before
+    // inspecting later tokens, so `qontinui_profile machine init --help`
+    // ran `init` (minting a fresh machine.json + UPSERTing coord.machines)
+    // instead of printing help. An MSI fleet-join agent hit this 2026-05-18
+    // and stranded a row in canonical PG.
+    //
+    // Clap's derive macros return `Err(ErrorKind::DisplayHelp)` from
+    // `try_parse_from` when ANY level of the command tree sees `--help` or
+    // `-h`. We assert that here for every destructive path so a future
+    // refactor that drops back to hand-rolled parsing can't silently
+    // regress the bug.
+    // ------------------------------------------------------------------
+
+    fn assert_help(argv: &[&str]) {
+        let err = Cli::try_parse_from(argv).expect_err("clap should short-circuit on --help");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DisplayHelp,
+            "argv {:?} should print help, not execute. got {:?}",
+            argv,
+            err.kind()
+        );
+    }
+
+    #[test]
+    fn top_level_help_short_circuits() {
+        assert_help(&["qontinui_profile", "--help"]);
+        assert_help(&["qontinui_profile", "-h"]);
+    }
+
+    #[test]
+    fn machine_help_short_circuits() {
+        assert_help(&["qontinui_profile", "machine", "--help"]);
+        assert_help(&["qontinui_profile", "machine", "-h"]);
+    }
+
+    /// The original incident: `machine init --help` executed `init`.
+    /// Clap MUST treat this as a help request, not a command execution.
+    #[test]
+    fn machine_init_help_short_circuits() {
+        assert_help(&["qontinui_profile", "machine", "init", "--help"]);
+        assert_help(&["qontinui_profile", "machine", "init", "-h"]);
+    }
+
+    #[test]
+    fn machine_show_help_short_circuits() {
+        assert_help(&["qontinui_profile", "machine", "show", "--help"]);
+    }
+
+    #[test]
+    fn machine_path_help_short_circuits() {
+        assert_help(&["qontinui_profile", "machine", "path", "--help"]);
+    }
+
+    #[test]
+    fn init_help_short_circuits() {
+        // `init` is destructive at the top level too (writes profiles.json).
+        assert_help(&["qontinui_profile", "init", "--help"]);
+    }
+
+    #[test]
+    fn use_help_short_circuits() {
+        // `use` has a required positional; `--help` must short-circuit
+        // before the missing-arg error fires.
+        assert_help(&["qontinui_profile", "use", "--help"]);
+    }
+
+    // ------------------------------------------------------------------
+    // Argv parsing happy-path: assert subcommands route to the expected
+    // variants. These don't execute any handler — they just exercise the
+    // clap parser.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn no_subcommand_means_show() {
+        let cli = Cli::try_parse_from(["qontinui_profile"]).expect("parses");
+        assert!(cli.cmd.is_none());
+    }
+
+    #[test]
+    fn init_defaults_to_localhost() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "init"]).expect("parses");
+        match cli.cmd {
+            Some(Cmd::Init { host }) => assert_eq!(host, "localhost"),
+            other => panic!("expected Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn init_accepts_host_flag() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "init", "--host", "192.168.1.42"])
+            .expect("parses");
+        match cli.cmd {
+            Some(Cmd::Init { host }) => assert_eq!(host, "192.168.1.42"),
+            other => panic!("expected Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn machine_init_parses_as_machine_init() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "machine", "init"]).expect("parses");
+        match cli.cmd {
+            Some(Cmd::Machine {
+                sub: MachineCmd::Init,
+            }) => {}
+            other => panic!("expected Machine::Init, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn use_requires_name() {
+        let err = Cli::try_parse_from(["qontinui_profile", "use"]).expect_err("requires name");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 }
