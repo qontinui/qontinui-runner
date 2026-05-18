@@ -18,26 +18,16 @@ name: Reproducibility Gate
 # and fail if the hashes differ.
 
 on:
-  pull_request:
-    branches: [main, develop]
-    paths:
-      # Repro-sensitive files only — kept narrow so the per-PR cost
-      # (~15-30 min Cold + ~5 min relink per platform) only kicks in
-      # when the inputs that govern reproducibility actually change.
-      # The workflow file itself is intentionally NOT in this list so
-      # gate edits land cheaply; the nightly cron + workflow_dispatch
-      # cover post-edit validation.
-      - 'src-tauri/.cargo/config.toml'
-      - 'src-tauri/build.rs'
-      - 'src-tauri/Cargo.toml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.cargo/**'
+  # PR trigger removed 2026-05-18 — even with the narrow path filter, the
+  # ~15-30 min cold rebuild per platform was a real per-PR drag. The
+  # nightly cron catches regressions on main with one day of lag, which
+  # is acceptable for the build-cache content-addressing use case (a
+  # broken repro on main shows up as cache misses the next day, not as
+  # a wedged build). Reinstate the PR trigger if you ever ship a feature
+  # where same-day repro-regression detection matters.
   schedule:
-    # 03:17 UTC nightly — catches regressions on main that slip through
-    # the PR path-filter (e.g., a new dep that bakes a timestamp without
-    # touching any of the gated files). Off-hour minute reduces collision
-    # with the dozens of other repos cron-firing at :00.
+    # 03:17 UTC nightly — catches regressions on main. Off-hour minute
+    # reduces collision with the dozens of other repos cron-firing at :00.
     - cron: '17 3 * * *'
   workflow_dispatch:
 
