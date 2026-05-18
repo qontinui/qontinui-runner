@@ -20,9 +20,10 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::database::pg::PgDb;
 
@@ -238,6 +239,183 @@ pub async fn publish_on_startup(pg: &Arc<PgDb>, role: MachineRole) {
     if let Err(e) = publish_budget(pg, role, resources, 0).await {
         warn!("fleet::publish_on_startup failed (non-fatal — runner still boots): {e}");
     }
+}
+
+// =============================================================================
+// HTTP heartbeat to coord (plan 2026-05-18-push-aware-fleet-liveness.md §5).
+//
+// The direct-PG `publish_budget` path above is a one-shot at boot. To keep
+// `coord.machines.last_seen_at` fresh under coord's new push-aware liveness
+// model, the runner periodically POSTs `{machine_id, hostname}` to coord's
+// `/coord/machine/register` endpoint. The handler's UPSERT refreshes
+// `last_seen_at` and `COALESCE`s a previously-advertised `health_url`, so
+// heartbeating from the runner side is a clean, side-effect-free refresh.
+//
+// The HTTP heartbeat path is intentionally additive: it never touches the
+// direct-PG publisher and tolerates missing identity, missing profile, or
+// network failure with `info!`/`warn!` and a retry on the next tick.
+// =============================================================================
+
+/// `~/.qontinui/profiles.json` — minimum subset we need (the active
+/// profile's `coord_url`). Mirrors the supervisor's shape at
+/// `qontinui-supervisor/src/fleet.rs:96-107` verbatim so the same
+/// active-profile + trim-`/ws` logic applies on both sides.
+#[derive(Debug, Clone, Deserialize)]
+struct Profiles {
+    #[serde(default)]
+    active: Option<String>,
+    #[serde(default)]
+    profiles: std::collections::HashMap<String, Profile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Profile {
+    #[serde(default)]
+    coord_url: Option<String>,
+}
+
+fn profiles_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
+}
+
+/// Resolve the coord HTTP base from the active profile's `coord_url`.
+/// Profile stores `ws://host:9870/ws` or `wss://host:9870/ws` (the
+/// WebSocket upgrade URL); convert that to `http://host:9870` /
+/// `https://host:9870` so reqwest can POST to `/coord/machine/register`.
+/// Returns `None` if profiles.json is missing or the active profile has
+/// no coord_url. Mirrors `qontinui-supervisor/src/fleet.rs:122-138`.
+///
+/// Re-read each tick — `profiles.json` is tiny and the active profile
+/// may change between ticks; caching would defeat that.
+fn coord_http_base() -> Option<String> {
+    let bytes = std::fs::read(profiles_path()?).ok()?;
+    let pf: Profiles = serde_json::from_slice(&bytes).ok()?;
+    let active = pf.active.as_deref().unwrap_or("dev");
+    let coord_url = pf.profiles.get(active)?.coord_url.as_deref()?;
+
+    let trimmed = coord_url.trim_end_matches("/ws");
+    let with_http = trimmed
+        .strip_prefix("wss://")
+        .map(|rest| format!("https://{rest}"))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("ws://")
+                .map(|rest| format!("http://{rest}"))
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    Some(with_http)
+}
+
+#[derive(Debug, serde::Serialize)]
+struct HeartbeatPayload {
+    machine_id: uuid::Uuid,
+    hostname: String,
+}
+
+/// POST `{machine_id, hostname}` to `<base>/coord/machine/register`.
+///
+/// `health_url` is deliberately omitted — coord's `register_machine`
+/// handler `COALESCE`s `EXCLUDED.health_url` with the existing value,
+/// so omitting from the heartbeat preserves any URL the machine
+/// previously advertised. Failures are reported as `Err(String)` so
+/// the caller can log them; the loop never panics.
+pub async fn heartbeat_to_coord() -> Result<(), String> {
+    let machine = match load_machine_file() {
+        Some(m) => m,
+        None => {
+            info!(
+                "fleet::heartbeat: ~/.qontinui/machine.json missing — \
+                 run `qontinui_profile machine init` to enable fleet visibility. Skipping."
+            );
+            return Ok(());
+        }
+    };
+
+    let machine_id = match uuid::Uuid::parse_str(&machine.machine_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("fleet::heartbeat: machine.json machine_id is not a valid UUID ({e}). Skipping.");
+            return Ok(());
+        }
+    };
+
+    let base = match coord_http_base() {
+        Some(b) => b,
+        None => {
+            info!(
+                "fleet::heartbeat: ~/.qontinui/profiles.json missing or active profile \
+                 has no coord_url — no coord to heartbeat to. Skipping."
+            );
+            return Ok(());
+        }
+    };
+
+    let payload = HeartbeatPayload {
+        machine_id,
+        hostname: machine.hostname.clone(),
+    };
+    let url = format!("{base}/coord/machine/register");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("reqwest builder: {e}"))?;
+
+    let resp = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        // 30s cadence — `info!` would be noisy, debug! keeps the
+        // happy path quiet while still discoverable.
+        debug!(
+            "fleet::heartbeat: ok machine_id={machine_id} hostname={} status={}",
+            machine.hostname, status
+        );
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        let excerpt: String = body.chars().take(200).collect();
+        Err(format!(
+            "coord returned {status} for POST {url}: {excerpt}"
+        ))
+    }
+}
+
+/// Spawn the periodic heartbeat task on the ambient tokio runtime.
+///
+/// Interval is read from `COORD_HEARTBEAT_INTERVAL_SECS` (default 30s,
+/// floored at 1s). `MissedTickBehavior::Skip` mirrors the watcher in
+/// `qontinui-coord/src/health_watcher.rs:99-100` — if a tick is missed
+/// (e.g. system suspend), skip catch-up and resume on the next aligned
+/// tick. Heartbeat failures `warn!` and retry on the next interval;
+/// the loop never panics.
+pub fn spawn_heartbeat() {
+    let secs: u64 = std::env::var("COORD_HEARTBEAT_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30)
+        .max(1);
+
+    info!(
+        "fleet::heartbeat: starting periodic heartbeat task, interval={}s",
+        secs
+    );
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if let Err(e) = heartbeat_to_coord().await {
+                warn!("fleet::heartbeat: {e}");
+            }
+        }
+    });
 }
 
 #[cfg(test)]
