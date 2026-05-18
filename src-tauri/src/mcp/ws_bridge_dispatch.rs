@@ -21,8 +21,9 @@
 //! Phase 2 of plan
 //! `plans/2026-05-17-web-runner-ws-bridge-plan-b.md` introduces this
 //! module + the single `state_machine.discover_ui_bridge` command.
-//! Phases 3-7 extend it by adding entries to
-//! [`COMMAND_DISPATCH_TIMEOUT_S`] / `handlers/dispatch.py`.
+//! Phase 3 adds `state_machine.ui_bridge.discover` and
+//! `state_machine.ui_bridge.pathfind`. Phases 4-7 extend it further by
+//! adding entries to [`is_supported_command`] / `handlers/dispatch.py`.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -44,7 +45,12 @@ const COMMAND_DISPATCH_TIMEOUT_S: u64 = 35;
 /// corresponding handler in
 /// `qontinui-runner/python-bridge/handlers/dispatch.py`.
 pub fn is_supported_command(command_name: &str) -> bool {
-    matches!(command_name, "state_machine.discover_ui_bridge")
+    matches!(
+        command_name,
+        "state_machine.discover_ui_bridge"
+            | "state_machine.ui_bridge.discover"
+            | "state_machine.ui_bridge.pathfind"
+    )
 }
 
 /// Dispatch a WS bridge command to its Python handler.
