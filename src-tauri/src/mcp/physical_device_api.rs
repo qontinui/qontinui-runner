@@ -31,6 +31,12 @@ use crate::mcp::types::{ApiResponse, ApiState};
 struct DeviceListResponse {
     devices: Vec<PhysicalDevice>,
     count: usize,
+    /// Operator remediation hint, present only when no devices are paired.
+    /// A release AAB is not auto-reachable until a transport is set up, so
+    /// `count: 0` is the common "nothing to test" state — surface the fix
+    /// inline instead of leaving callers to guess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,9 +127,24 @@ async fn list_devices(
 ) -> Result<Json<ApiResponse<DeviceListResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let devices = state.physical_device_registry.list_all().await;
     let count = devices.len();
+    let hint = if count == 0 {
+        Some(
+            "No devices paired. Set up a transport, then re-query: \
+             (USB) `adb forward tcp:8087 tcp:8087` and hit \
+             http://localhost:8087/ui-bridge/health; or \
+             (LAN/cloud) in qontinui-mobile enable Settings -> Developer -> \
+             \"Local UI Bridge server\" and pair via the Connection Wizard \
+             (deep link: qontinui:///connect). Release AABs are not \
+             auto-reachable until paired."
+                .to_string(),
+        )
+    } else {
+        None
+    };
     Ok(Json(ApiResponse::success(DeviceListResponse {
         devices,
         count,
+        hint,
     })))
 }
 
