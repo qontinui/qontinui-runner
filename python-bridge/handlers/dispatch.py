@@ -79,6 +79,11 @@ def _load_handler(command: str) -> HandlerFn:
 
         return compare_screenshots
 
+    if command == "discovery.background_removal":
+        from handlers.discovery import background_removal
+
+        return background_removal
+
     raise ValueError(f"unknown command: {command!r}")
 
 
