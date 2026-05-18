@@ -189,6 +189,22 @@ pub fn start_coordinator_scheduler(
             );
         }
 
+        // Plan `coord-agent-session-id-tracking.md` Phase 2 (Side B):
+        // self-heal coord.agent_sessions (the Claude Code session
+        // lookup table). Idempotent. Logs but doesn't fail — coord's
+        // upsert_agent_session helper degrades gracefully when the
+        // table is missing, so a self-heal failure is non-blocking.
+        // Same posture as the merge-proposals helper above: runner
+        // doesn't write this table directly today; the self-heal
+        // exists so local-coord harnesses + fresh dev DBs have a
+        // path to bootstrap without waiting for alembic.
+        if let Err(e) = state.app_state.pg_db.ensure_agent_sessions_table().await {
+            warn!(
+                "Coordinator scheduler: ensure_agent_sessions_table failed: {} — agent-session lineage may be sparse until alembic upgrade",
+                e
+            );
+        }
+
         info!(
             "Coordinator (Rust) scheduler started: instance_id={} interval={}s rule_version={} max_llm_calls_per_hour={} auto_review_enabled={} shadow_mode_enabled={} initial_enabled={}",
             instance_id,

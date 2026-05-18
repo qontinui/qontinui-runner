@@ -149,6 +149,17 @@ impl PgDb {
 
             CREATE INDEX IF NOT EXISTS idx_agent_worktrees_overlap_paths_gin
                 ON coord.agent_worktrees USING gin (declared_overlap_paths);
+
+            -- Plan `coord-agent-session-id-tracking.md` Phase 2 (Side B):
+            -- agent_session_id lineage column. Mirrors the alembic
+            -- migration shape. NULL until Phase 6 tightens to required
+            -- after Side C2 (Claude Code env-var surface) lands.
+            ALTER TABLE coord.agent_worktrees
+                ADD COLUMN IF NOT EXISTS agent_session_id UUID;
+
+            CREATE INDEX IF NOT EXISTS idx_agent_worktrees_agent_session
+                ON coord.agent_worktrees (agent_session_id)
+                WHERE agent_session_id IS NOT NULL;
             "#,
         )
         .await
