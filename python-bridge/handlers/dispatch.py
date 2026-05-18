@@ -44,6 +44,16 @@ def _load_handler(command: str) -> HandlerFn:
 
         return discover_ui_bridge
 
+    if command == "state_machine.ui_bridge.discover":
+        from handlers.state_machine import ui_bridge_discover
+
+        return ui_bridge_discover
+
+    if command == "state_machine.ui_bridge.pathfind":
+        from handlers.state_machine import ui_bridge_pathfind
+
+        return ui_bridge_pathfind
+
     raise ValueError(f"unknown command: {command!r}")
 
 
