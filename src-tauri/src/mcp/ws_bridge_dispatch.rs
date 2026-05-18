@@ -74,6 +74,8 @@ pub fn is_supported_command(command_name: &str) -> bool {
             | "recording_pipeline.process"
             | "recording_pipeline.process_with_playbook"
             | "recording_pipeline.merge"
+            | "vision.compute_perceptual_hash"
+            | "vision.compare_screenshots"
     )
 }
 
