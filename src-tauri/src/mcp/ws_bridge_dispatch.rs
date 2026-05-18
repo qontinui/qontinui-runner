@@ -77,6 +77,7 @@ pub fn is_supported_command(command_name: &str) -> bool {
             | "vision.compute_perceptual_hash"
             | "vision.compare_screenshots"
             | "discovery.background_removal"
+            | "click_analysis.tune_profile"
     )
 }
 
@@ -340,6 +341,11 @@ mod tests {
             "recording_pipeline.process_with_playbook"
         ));
         assert!(is_supported_command("recording_pipeline.merge"));
+    }
+
+    #[test]
+    fn is_supported_command_recognises_phase_5_click_analysis() {
+        assert!(is_supported_command("click_analysis.tune_profile"));
     }
 
     #[test]

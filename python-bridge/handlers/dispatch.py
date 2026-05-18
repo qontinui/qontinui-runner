@@ -84,6 +84,11 @@ def _load_handler(command: str) -> HandlerFn:
 
         return background_removal
 
+    if command == "click_analysis.tune_profile":
+        from handlers.click_analysis import tune_profile
+
+        return tune_profile
+
     raise ValueError(f"unknown command: {command!r}")
 
 
