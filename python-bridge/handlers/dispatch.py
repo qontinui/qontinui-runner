@@ -69,6 +69,16 @@ def _load_handler(command: str) -> HandlerFn:
 
         return merge_recording
 
+    if command == "vision.compute_perceptual_hash":
+        from handlers.vision import compute_perceptual_hash
+
+        return compute_perceptual_hash
+
+    if command == "vision.compare_screenshots":
+        from handlers.vision import compare_screenshots
+
+        return compare_screenshots
+
     raise ValueError(f"unknown command: {command!r}")
 
 
