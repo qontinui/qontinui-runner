@@ -54,6 +54,21 @@ def _load_handler(command: str) -> HandlerFn:
 
         return ui_bridge_pathfind
 
+    if command == "recording_pipeline.process":
+        from handlers.recording_pipeline import process_recording
+
+        return process_recording
+
+    if command == "recording_pipeline.process_with_playbook":
+        from handlers.recording_pipeline import process_with_playbook
+
+        return process_with_playbook
+
+    if command == "recording_pipeline.merge":
+        from handlers.recording_pipeline import merge_recording
+
+        return merge_recording
+
     raise ValueError(f"unknown command: {command!r}")
 
 

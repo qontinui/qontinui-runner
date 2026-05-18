@@ -34,12 +34,33 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
-/// Per-command synchronous timeout (seconds). The web-side
+/// Default per-command synchronous timeout (seconds). The web-side
 /// `dispatch_and_wait` default is 30s; we cap subprocess wall-clock at
 /// the next-higher value so the runner side returns an error
 /// envelope rather than letting the subprocess linger past the web's
 /// timeout window.
 const COMMAND_DISPATCH_TIMEOUT_S: u64 = 35;
+
+/// Long-running command timeout (seconds). Phase 4's
+/// `recording_pipeline.*` commands run the state-discovery +
+/// transition-detection pipeline over thousands of UI events; non-trivial
+/// recordings take minutes. The web-side handler dispatches these on a
+/// background task with a matching long `timeout_s` and persists the
+/// result asynchronously, so the longer subprocess wall-clock here is
+/// intentional. Half-hour ceiling matches the web-side boot-time TTL on
+/// `recording_pipeline_runs` rows; pipelines hitting this limit should
+/// be investigated as legitimate runaway, not a config tweak.
+const LONG_COMMAND_DISPATCH_TIMEOUT_S: u64 = 1800;
+
+/// Resolve the per-command subprocess wall-clock timeout (seconds).
+fn dispatch_timeout_for(command_name: &str) -> u64 {
+    match command_name {
+        "recording_pipeline.process"
+        | "recording_pipeline.process_with_playbook"
+        | "recording_pipeline.merge" => LONG_COMMAND_DISPATCH_TIMEOUT_S,
+        _ => COMMAND_DISPATCH_TIMEOUT_S,
+    }
+}
 
 /// Commands recognised by this dispatcher. Each entry MUST have a
 /// corresponding handler in
@@ -50,6 +71,9 @@ pub fn is_supported_command(command_name: &str) -> bool {
         "state_machine.discover_ui_bridge"
             | "state_machine.ui_bridge.discover"
             | "state_machine.ui_bridge.pathfind"
+            | "recording_pipeline.process"
+            | "recording_pipeline.process_with_playbook"
+            | "recording_pipeline.merge"
     )
 }
 
@@ -151,34 +175,32 @@ pub async fn dispatch_command(command_name: &str, payload: &Value) -> Value {
         let _ = stdin.shutdown().await;
     }
 
+    let timeout_s = dispatch_timeout_for(command_name);
     let output_fut = child.wait_with_output();
-    let output =
-        match tokio::time::timeout(Duration::from_secs(COMMAND_DISPATCH_TIMEOUT_S), output_fut)
-            .await
-        {
-            Ok(Ok(out)) => out,
-            Ok(Err(e)) => {
-                error!("ws_bridge_dispatch: wait_with_output failed: {}", e);
-                return error_envelope(
-                    command_name,
-                    payload,
-                    "internal_error",
-                    &format!("python process wait failed: {e}"),
-                );
-            }
-            Err(_) => {
-                error!(
-                    "ws_bridge_dispatch: timed out after {}s — command={}",
-                    COMMAND_DISPATCH_TIMEOUT_S, command_name
-                );
-                return error_envelope(
-                    command_name,
-                    payload,
-                    "internal_error",
-                    &format!("python dispatcher exceeded {COMMAND_DISPATCH_TIMEOUT_S}s wall-clock"),
-                );
-            }
-        };
+    let output = match tokio::time::timeout(Duration::from_secs(timeout_s), output_fut).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            error!("ws_bridge_dispatch: wait_with_output failed: {}", e);
+            return error_envelope(
+                command_name,
+                payload,
+                "internal_error",
+                &format!("python process wait failed: {e}"),
+            );
+        }
+        Err(_) => {
+            error!(
+                "ws_bridge_dispatch: timed out after {}s — command={}",
+                timeout_s, command_name
+            );
+            return error_envelope(
+                command_name,
+                payload,
+                "internal_error",
+                &format!("python dispatcher exceeded {timeout_s}s wall-clock"),
+            );
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -295,4 +317,82 @@ fn find_python_bridge_dir() -> Option<PathBuf> {
         .into_iter()
         .flatten()
         .find(|p| p.join("handlers").join("dispatch.py").exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_supported_command_recognises_phase_2_and_3() {
+        assert!(is_supported_command("state_machine.discover_ui_bridge"));
+        assert!(is_supported_command("state_machine.ui_bridge.discover"));
+        assert!(is_supported_command("state_machine.ui_bridge.pathfind"));
+    }
+
+    #[test]
+    fn is_supported_command_recognises_phase_4_recording_pipeline() {
+        assert!(is_supported_command("recording_pipeline.process"));
+        assert!(is_supported_command(
+            "recording_pipeline.process_with_playbook"
+        ));
+        assert!(is_supported_command("recording_pipeline.merge"));
+    }
+
+    #[test]
+    fn is_supported_command_rejects_unknown() {
+        assert!(!is_supported_command("state_machine.unknown"));
+        assert!(!is_supported_command("recording_pipeline.unknown"));
+        assert!(!is_supported_command(""));
+    }
+
+    #[test]
+    fn dispatch_timeout_recording_pipeline_is_long() {
+        // Phase 4 recording_pipeline.* commands run minute-scale; the
+        // default 35s timeout would short-circuit them. Verify the
+        // long-timeout branch fires for each Phase 4 command name.
+        assert_eq!(
+            dispatch_timeout_for("recording_pipeline.process"),
+            LONG_COMMAND_DISPATCH_TIMEOUT_S
+        );
+        assert_eq!(
+            dispatch_timeout_for("recording_pipeline.process_with_playbook"),
+            LONG_COMMAND_DISPATCH_TIMEOUT_S
+        );
+        assert_eq!(
+            dispatch_timeout_for("recording_pipeline.merge"),
+            LONG_COMMAND_DISPATCH_TIMEOUT_S
+        );
+        // Sanity: the long timeout must exceed the default; otherwise
+        // dispatch_timeout_for is a no-op for the Phase 4 commands.
+        // `const_assert` would be preferable but is not in the std lib;
+        // a runtime check at the bottom of an existing test is the next
+        // simplest expression of the invariant.
+        const _: () = assert!(LONG_COMMAND_DISPATCH_TIMEOUT_S > COMMAND_DISPATCH_TIMEOUT_S);
+    }
+
+    #[test]
+    fn dispatch_timeout_phase_2_3_keeps_default() {
+        // Phase 2/3 commands are sub-second to sub-30s; keep the default
+        // dispatcher timeout so a hung subprocess surfaces quickly.
+        assert_eq!(
+            dispatch_timeout_for("state_machine.discover_ui_bridge"),
+            COMMAND_DISPATCH_TIMEOUT_S
+        );
+        assert_eq!(
+            dispatch_timeout_for("state_machine.ui_bridge.discover"),
+            COMMAND_DISPATCH_TIMEOUT_S
+        );
+        assert_eq!(
+            dispatch_timeout_for("state_machine.ui_bridge.pathfind"),
+            COMMAND_DISPATCH_TIMEOUT_S
+        );
+        // Unknown commands also fall through to the default; the
+        // is_supported_command guard rejects them before the dispatch
+        // path is reached.
+        assert_eq!(
+            dispatch_timeout_for("unknown_command"),
+            COMMAND_DISPATCH_TIMEOUT_S
+        );
+    }
 }
