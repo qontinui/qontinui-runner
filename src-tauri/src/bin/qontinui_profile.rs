@@ -766,7 +766,7 @@ mod tests {
     #[test]
     fn no_subcommand_means_show() {
         let cli = Cli::try_parse_from(["qontinui_profile"]).expect("parses");
-        assert!(matches!(cli.cmd, None));
+        assert!(cli.cmd.is_none());
     }
 
     #[test]
