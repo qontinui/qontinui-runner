@@ -88,6 +88,17 @@ impl PgDb {
 
             CREATE INDEX IF NOT EXISTS idx_merge_proposal_repos_head_sha
                 ON coord.merge_proposal_repos (repo, head_sha);
+
+            -- Plan `coord-agent-session-id-tracking.md` Phase 2 (Side B):
+            -- agent_session_id lineage column on the parent proposal row.
+            -- Mirrors the alembic migration shape. NULL until Phase 6
+            -- tightens to required after Side C2 lands.
+            ALTER TABLE coord.merge_proposals
+                ADD COLUMN IF NOT EXISTS agent_session_id UUID;
+
+            CREATE INDEX IF NOT EXISTS idx_merge_proposals_agent_session
+                ON coord.merge_proposals (agent_session_id)
+                WHERE agent_session_id IS NOT NULL;
             "#,
         )
         .await
