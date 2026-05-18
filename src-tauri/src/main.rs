@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod action_service;
+mod agent_claims;
 mod agent_daemons;
 mod agent_pusher;
 mod agent_token;
@@ -158,6 +159,7 @@ mod steps;
 mod storage;
 pub(crate) mod str_utils;
 mod summary_generator;
+mod tauri_app_handle;
 mod terminal;
 mod test_executor;
 mod test_orchestrator;
@@ -834,6 +836,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::chunk_labels::delete_chunk_label,
             commands::chunk_labels::list_chunk_labels,
             commands::chunk_labels::upsert_chunk_label,
+            commands::claims::claims_acquire,
+            commands::claims::claims_release,
+            commands::claims::claims_steal,
             commands::clipboard::share_file_to_mobile,
             commands::clipboard::share_to_mobile,
             commands::comparison::get_comparison_status,
@@ -1549,6 +1554,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // for any future migration that updates the frontend invoke sites.
         .setup(|app| {
             info!("Tauri application setup starting");
+
+            // Plan 2026-05-18-agent-spawn-coordination Phase 3 — stash a
+            // global AppHandle so background tokio tasks (e.g. claim
+            // heartbeats from `agent_claims`) can emit Tauri events
+            // to the webview without taking an AppHandle parameter.
+            tauri_app_handle::set(app.handle().clone());
 
             // Phase F.1 — register the deep-link `on_open_url` callback so
             // `qontinui://wake?intent=...` URLs delivered by the OS (cold
