@@ -377,3 +377,84 @@ export async function listOverlappingIntents(
 ): Promise<OverlappingIntentPair[]> {
   return invoke<OverlappingIntentPair[]>("list_overlapping_intents", { limit });
 }
+
+// ---------------------------------------------------------------------------
+// Wave 4 (Phase 4) — Spawn-from-Plan
+//
+// `spawnFromPlan` is the runner-side mirror of the qontinui-web
+// SpawnModal. Coord owns the spawn endpoint (`POST /agents/spawn`);
+// the dashboard's "Spawn from Plan" button gives Joshua + small-fleet
+// operators an in-runner affordance so they don't have to flip to the
+// browser console to spawn agents during readiness rollouts.
+//
+// The runner reaches coord directly at `coordHttpBase()` (same fallback
+// pattern as ConflictModal.tsx); coord is LAN-trusted in the runner's
+// dev posture. A future deployment-config milestone will harden this
+// path (mTLS / signed JWT) before the runner ships to non-trusted
+// networks — at which point this helper becomes a Tauri-command proxy
+// like `getFleetHealth`. For now it's a plain `fetch` to keep the
+// surface small and reviewable.
+// ---------------------------------------------------------------------------
+
+/** Wire shape returned by coord's POST /agents/spawn. Extra fields are
+ *  passed through; only `agentId` is load-bearing on the dashboard
+ *  toast (so the operator sees "agent-deadbeef spawned"). */
+export interface SpawnAgentResult {
+  agentId?: string;
+  agentSessionId?: string;
+  deviceId?: string;
+  status?: string;
+  [k: string]: unknown;
+}
+
+/** Default coord HTTP base — same fallback as ConflictModal.tsx; a
+ *  future Tauri command (`get_coord_http_base`) will replace this
+ *  when production deployments need a non-default base. */
+function defaultCoordHttpBase(): string {
+  return "http://localhost:9870";
+}
+
+/** Spawn an agent from a plan/phase tuple via coord.
+ *
+ *  Mirrors the web SpawnModal contract verbatim:
+ *    - `planSlug` + `phase` identify the plan + phase the agent is
+ *      working under;
+ *    - `repos` is the list of repo slugs the agent declares;
+ *    - `intent` is a one-liner describing the work;
+ *    - `initialPrompt` is the first-tick message coord delivers.
+ *
+ *  `declaredOverlapPaths` is optional — when the operator declares
+ *  overlap up-front, coord can pre-detect conflicts in the L2
+ *  overlap-detection layer. When omitted, coord computes the overlap
+ *  lazily as the agent starts editing.
+ */
+export async function spawnFromPlan(
+  planSlug: string,
+  phase: string,
+  repos: string[],
+  intent: string,
+  initialPrompt: string,
+  declaredOverlapPaths?: string[],
+  coordBase?: string,
+): Promise<SpawnAgentResult> {
+  const base = coordBase ?? defaultCoordHttpBase();
+  const url = new URL("/agents/spawn", base);
+  const body = {
+    plan_slug: planSlug,
+    plan_phase: phase,
+    repos,
+    intent,
+    initial_prompt: initialPrompt,
+    declared_overlap_paths: declaredOverlapPaths ?? [],
+  };
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+  }
+  return (await res.json()) as SpawnAgentResult;
+}
