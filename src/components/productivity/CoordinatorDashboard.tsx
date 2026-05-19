@@ -30,6 +30,7 @@ import {
   CheckCircle2,
   XCircle,
   ExternalLink,
+  Rocket,
 } from "lucide-react";
 import {
   dispatchCoordinatorAction,
@@ -62,6 +63,7 @@ import { BlindSpotsPanel } from "./BlindSpotsPanel";
 import { WorkersPanel } from "./WorkersPanel";
 import { FileActivityPanel } from "./FileActivityPanel";
 import { FleetHealthPanel } from "./FleetHealthPanel";
+import { SpawnFromPlanModal } from "./SpawnFromPlanModal";
 
 const DECISION_LOG_LIMIT = 200;
 
@@ -1125,6 +1127,9 @@ export function CoordinatorDashboard() {
   const [highlightedReviewId, setHighlightedReviewId] = useState<string | null>(null);
   const [leaderResponse, setLeaderResponse] = useState<LeaderResponse | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  // Wave 4 — spawn-from-plan modal state. Mirrors the qontinui-web
+  // SpawnModal UX so operators have the same affordance in-runner.
+  const [spawnFromPlanOpen, setSpawnFromPlanOpen] = useState(false);
 
   const loadDecisions = useCallback(async () => {
     setDecisionsLoading(true);
@@ -1596,6 +1601,19 @@ export function CoordinatorDashboard() {
             >
               Spawn worker tab
             </button>
+            {/* Wave 4 — spawn-from-plan affordance. Mirrors the
+                qontinui-web SpawnModal so operators can mint a coord
+                agent from the runner dashboard without flipping to
+                the browser. */}
+            <button
+              type="button"
+              className={outlineBtnClass}
+              onClick={() => setSpawnFromPlanOpen(true)}
+              data-ui-bridge-id="productivity.spawn-from-plan"
+            >
+              <Rocket className="w-3 h-3" />
+              Spawn from Plan
+            </button>
           </div>
         </div>
         {launchError ? (
@@ -1734,6 +1752,12 @@ export function CoordinatorDashboard() {
           onRefresh={loadOverlap}
         />
       </div>
+      {/* Wave 4 — Spawn from Plan modal. Mounted at the dashboard root
+          so the overlay covers the whole pane. */}
+      <SpawnFromPlanModal
+        open={spawnFromPlanOpen}
+        onClose={() => setSpawnFromPlanOpen(false)}
+      />
     </div>
   );
 }
