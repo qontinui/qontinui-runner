@@ -579,6 +579,13 @@ export interface UIBridgeResponsePayload {
   data?: unknown;
   error?: string;
   /**
+   * Canonical Wave-1 UI Bridge diagnostic code (`UB-...`). Sibling of the
+   * prose `error` field — the runner's Rust consumer discriminates on this
+   * enum mirror instead of string-matching `error` (plan Phase 5). Prose
+   * `error` is retained as a dual-audience feature (plan goal #3), not BC.
+   */
+  code?: string;
+  /**
    * Optional closest-match / recovery hint payload. Sibling field to
    * `error` (does NOT replace the success/error envelope shape). The
    * Rust side forwards this through `wrap_ipc_result` so the HTTP

@@ -250,7 +250,12 @@ export function useControlEvents(
               requestId,
               type,
               success: false,
+              // Phase 5: emit the canonical Wave-1 diagnostic code so the
+              // Rust consumer discriminates on the enum mirror instead of
+              // string-matching this prose. Prose `error` is retained as a
+              // dual-audience feature (plan goal #3), not for BC.
               error: `Component not found: ${componentId}`,
+              code: "UB-ELEM-NOT-FOUND",
               timestamp: Date.now(),
             });
             return true;
@@ -348,6 +353,9 @@ export function useControlEvents(
                 passedCount: 0,
                 failures: [],
                 error: "ELEMENT_NOT_FOUND",
+                // Phase 5: canonical Wave-1 diagnostic code for enum-based
+                // discrimination Rust-side. Prose retained (dual-audience).
+                errorCode: "UB-ELEM-NOT-FOUND",
                 errorMessage: "elementId is required",
               },
               timestamp: Date.now(),
@@ -367,6 +375,9 @@ export function useControlEvents(
                 passedCount: 0,
                 failures: [],
                 error: "ELEMENT_NOT_FOUND",
+                // Phase 5: canonical Wave-1 diagnostic code for enum-based
+                // discrimination Rust-side. Prose retained (dual-audience).
+                errorCode: "UB-ELEM-NOT-FOUND",
                 errorMessage: `Element '${assertElementId}' not found`,
               },
               timestamp: Date.now(),
