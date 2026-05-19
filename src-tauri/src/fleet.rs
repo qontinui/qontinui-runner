@@ -514,13 +514,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
 
     // Current branch (best-effort — detached HEAD returns empty)
     let branch = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_str()?,
-            "symbolic-ref",
-            "--short",
-            "HEAD",
-        ])
+        .args(["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"])
         .output()
         .ok()
         .and_then(|o| {
@@ -578,13 +572,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     } else {
         // git -C <path> log -1 --format=%cI  — committer-date ISO-8601.
         Command::new("git")
-            .args([
-                "-C",
-                repo_path.to_str()?,
-                "log",
-                "-1",
-                "--format=%cI",
-            ])
+            .args(["-C", repo_path.to_str()?, "log", "-1", "--format=%cI"])
             .output()
             .ok()
             .and_then(|o| {
@@ -674,12 +662,7 @@ pub async fn publish_tree_state() -> Result<(), String> {
     // agent worktrees, not the primary tree we're publishing.
     let entries = match std::fs::read_dir(&root) {
         Ok(e) => e,
-        Err(e) => {
-            return Err(format!(
-                "read_dir {root}: {e}",
-                root = root.display()
-            ))
-        }
+        Err(e) => return Err(format!("read_dir {root}: {e}", root = root.display())),
     };
 
     let client = reqwest::Client::builder()
@@ -739,9 +722,7 @@ pub async fn publish_tree_state() -> Result<(), String> {
     }
 
     if total > 0 {
-        debug!(
-            "fleet::tree_publisher: published {posted}/{total} repos device_id={device_id}"
-        );
+        debug!("fleet::tree_publisher: published {posted}/{total} repos device_id={device_id}");
     }
     Ok(())
 }
