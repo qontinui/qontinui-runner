@@ -34,11 +34,13 @@ use crate::mcp::app_dispatch::AppDispatcher;
 use crate::mcp::app_registry::{AppRegistry, AppTransport};
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
+use super::diagnostics::{extract_error_code, CanonicalCode};
 use super::helpers::{
     count_elements_in_discover_payload, direct_webview_evaluate_with_result,
     evaluate_js_expression, extract_ai_find_match, extract_get_element_match,
     filter_element_fields, snapshot_signature,
 };
+use super::recovery_executor::attempt_recovery;
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 use super::screenshots::capture_runner_window_base64;
 use super::types::{
@@ -349,19 +351,19 @@ pub async fn ui_bridge_get_element_tree_subtree_handler(
 
     match result {
         Ok(data) => {
-            // Frontend signals "not found" by returning success=false with
-            // error="element_not_found". Map that to HTTP 404 with a structured
-            // error_detail (matches the existing element-not-found shape used
-            // elsewhere) and forward the frontend's `hint.closestMatches`
-            // payload (added by the closest-match-hint feature) onto the
-            // outer ApiResponse so a typoed id gets the same typo suggestions
-            // it would on `GET /control/element/<id>`.
+            // Frontend signals "not found" via the canonical Wave-1
+            // diagnostic code. Phase 5: discriminate on the enum mirror
+            // instead of string-matching `error == "element_not_found"`.
+            // Map UB-ELEM-NOT-FOUND → HTTP 404 with a structured
+            // error_detail and forward the frontend's `hint.closestMatches`
+            // payload so a typoed id gets the same typo suggestions it
+            // would on `GET /control/element/<id>`.
             if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
                 let err_str = data
                     .get("error")
                     .and_then(|v| v.as_str())
                     .unwrap_or("UI bridge call failed");
-                if err_str == "element_not_found" {
+                if extract_error_code(&data) == Some(CanonicalCode::UbElemNotFound) {
                     let mut body = api_error_detailed(
                         format!("Element '{}' not found", id),
                         UiBridgeError::element_not_found(&id),
@@ -409,22 +411,28 @@ pub async fn ui_bridge_assert_element_handler(
 
     match ui_bridge_request_sync(&state, "assert_element", payload).await {
         Ok(data) => {
-            // Check for ELEMENT_NOT_FOUND from the frontend
-            if data.get("error").and_then(|v| v.as_str()) == Some("ELEMENT_NOT_FOUND") {
-                let msg = data
-                    .get("errorMessage")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Element not found")
-                    .to_string();
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(api_error_detailed(
-                        msg,
-                        UiBridgeError::element_not_found(&id),
-                    )),
-                ));
+            // Phase 5: discriminate on the canonical Wave-1 diagnostic-code
+            // mirror (`failureDetails.errorCode` / `code` / `errorCode`,
+            // canonical `UB-` first; runner-frontend legacy bare strings
+            // bridged) instead of string-matching the prose `error` field.
+            match extract_error_code(&data) {
+                Some(CanonicalCode::UbElemNotFound) => {
+                    let msg = data
+                        .get("errorMessage")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| data.get("error").and_then(|v| v.as_str()))
+                        .unwrap_or("Element not found")
+                        .to_string();
+                    Err((
+                        StatusCode::NOT_FOUND,
+                        Json(api_error_detailed(
+                            msg,
+                            UiBridgeError::element_not_found(&id),
+                        )),
+                    ))
+                }
+                _ => Ok(Json(ApiResponse::success(data))),
             }
-            Ok(Json(ApiResponse::success(data)))
         }
         Err(e) => {
             error!("UI Bridge API: Assert element failed: {}", e);
@@ -824,9 +832,11 @@ pub async fn ui_bridge_execute_action_handler(
             )
             .await;
 
-            // Retry the original action once
-            let retry_result =
-                wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload).await);
+            // Retry the original action once. Clone so `payload` stays
+            // available for the Phase 5 RecoveryExecutor downstream.
+            let retry_result = wrap_ipc_result(
+                ui_bridge_request_sync(&state, "execute_action", payload.clone()).await,
+            );
 
             match &retry_result {
                 Ok(ref resp) if resp.success => {
@@ -939,6 +949,72 @@ pub async fn ui_bridge_execute_action_handler(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // ── Phase 5 pilot path: automatic structured recovery ───────────────
+    //
+    // This is the chosen runner pilot path (element-action / NL-click). If
+    // the action still failed after the existing stale-retry + stable-ref
+    // scaffolding, hand the failure body to the RecoveryExecutor. It:
+    //   1. discriminates the canonical Wave-1 error code,
+    //   2. parses `failureDetails.suggestedActions` (Wave-1 Phase 3),
+    //   3. picks the best retryable command deterministically, executes it
+    //      via the existing IPC action path, retries this action once,
+    //   4. falls back to the runner's existing LLM-driven recovery IPC,
+    //   5. emits `(errorCode, command, succeeded)` telemetry.
+    // It never panics on missing/empty suggestedActions (degrades to LLM).
+    {
+        let failure_body: Option<serde_json::Value> = match &result {
+            Ok(resp) if !resp.success => Some(serde_json::json!({
+                "success": false,
+                "error": resp.error,
+                "failureDetails": resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("failureDetails"))
+                    .cloned(),
+                "code": resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("code"))
+                    .cloned(),
+            })),
+            Err((_, body)) => Some(serde_json::json!({
+                "success": false,
+                "error": body.error,
+                "failureDetails": serde_json::Value::Null,
+            })),
+            _ => None,
+        };
+
+        if let Some(failure) = failure_body {
+            let recovery = attempt_recovery(&state, &failure, &id, &payload, task_run_id).await;
+            if recovery.recovered {
+                info!(
+                    "execute_action: RecoveryExecutor recovered element {} via {:?} (command={:?})",
+                    id, recovery.via, recovery.command_chosen
+                );
+                let body = recovery
+                    .result
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({ "recovered": true }));
+                let mut ok = ApiResponse::success(body);
+                // Attach the recovery audit trail so callers can see which
+                // path/command made the action succeed.
+                if let Some(serde_json::Value::Object(ref mut m)) = ok.data {
+                    m.insert(
+                        "recovery".to_string(),
+                        serde_json::to_value(&recovery).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                result = Ok(Json(ok));
+            } else {
+                warn!(
+                    "execute_action: RecoveryExecutor could not recover element {} ({:?})",
+                    id, recovery.error_code
+                );
             }
         }
     }
@@ -1325,17 +1401,19 @@ pub async fn ui_bridge_get_component_handler(
     )
     .await;
 
-    // Detect the runner's bare "Component not found: <id>" inner-failure
-    // envelope BEFORE wrap_ipc_result flattens it, so we can rewrite the
-    // error message with the enriched SDK shape. Anything else falls
-    // through to wrap_ipc_result unchanged.
+    // Detect the component-not-found inner-failure envelope BEFORE
+    // wrap_ipc_result flattens it, so we can rewrite the error message
+    // with the enriched SDK shape. Phase 5: discriminate on the canonical
+    // Wave-1 code (the frontend `get_component` handler now emits
+    // `code: "UB-ELEM-NOT-FOUND"`); the `"Component not found:"` prose
+    // prefix is kept ONLY as a runner-internal bridge for an in-flight
+    // frontend bundle (the `dist/` build can lag the Rust binary by one
+    // rebuild). Anything else falls through to wrap_ipc_result unchanged.
     if let Ok(ref data) = ipc_result {
         if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
             let bare_error = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
-            // Match by prefix — the runner's serializer emits exactly this
-            // bare text when `currentBridge.getComponent(id)` returns
-            // undefined (see useControlEvents.ts `case "get_component"`).
-            let is_not_found = bare_error.starts_with("Component not found:");
+            let is_not_found = extract_error_code(data) == Some(CanonicalCode::UbElemNotFound)
+                || bare_error.starts_with("Component not found:");
             if is_not_found {
                 // Best-effort snapshot fetch — if it fails, surface the
                 // bare error rather than 5xx-ing the request.
