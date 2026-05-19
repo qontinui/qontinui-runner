@@ -166,7 +166,7 @@ jobs:
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
         #
-        # Step has a hard 90-minute timeout. Empirical durations from
+        # Step has a hard 120-minute timeout. Empirical durations from
         # main-branch runs on 2026-05-11/12 (10-run sample): Ubuntu p50
         # ~43 min, Windows p50 ~70 min, macOS p50 ~58 min / p90 ~70 min /
         # max(success) ~72 min. The earlier 75-min cap sat at p90+5 min;
@@ -175,12 +175,26 @@ jobs:
         # with `Run Rust tests` landing at 75.2 / 75.4 / 75.5 min.
         # Variance is dominated by GitHub-hosted macOS runner load +
         # cache state (cold-cache runs land at 65-72 min, warm-cache at
-        # 30-40 min). 90 min = p90 + 20 min headroom covers the slow
-        # tail without hiding genuine regressions. The original cap
-        # rationale ("fail fast on swap-thrash hangs") is preserved —
-        # JOBS=1 below prevents the 80+ min swap-thrash scenario from
-        # PR #84, so the cap is just bounding normal variance now.
-        timeout-minutes: 90
+        # 30-40 min).
+        #
+        # 2026-05-19 bump 90 -> 120: macOS p95 has crept up since the
+        # 05-11/12 sample. Recent macOS runs are landing at ~97 min
+        # total job time (just-barely-fitting the 90-min step cap):
+        # PR #171 (--help fix) cycled multiple macOS reruns at ~4h
+        # wall-clock before completing; PR #184 (unified-devices
+        # Phase 3) hit the timeout cold and was admin-merged per
+        # `feedback_macos_ci_env_hang_admin_merge`. 120 min buys
+        # ~30% headroom over the p90+20 of the original calibration
+        # without masking genuine regressions (warm-cache runs still
+        # land at 30-40 min — a real regression would show up as
+        # mass overrun, not just slow-tail creep). Near-term
+        # workaround; fundamental fix (self-hosted macOS runners /
+        # Linux-gate slow tests / test-sharding) is a separate plan.
+        # The original cap rationale ("fail fast on swap-thrash
+        # hangs") is preserved — JOBS=1 below prevents the 80+ min
+        # swap-thrash scenario from PR #84, so the cap is just
+        # bounding normal variance now.
+        timeout-minutes: 120
         env:
           # `CARGO_BUILD_JOBS` reduces the parallel-rustc memory peak.
           # Empirically:
