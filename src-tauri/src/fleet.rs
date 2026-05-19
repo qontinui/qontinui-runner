@@ -514,6 +514,347 @@ pub fn spawn_heartbeat() {
     });
 }
 
+// =============================================================================
+// Primary-tree state publisher
+// (plan 2026-05-19-coordinator-production-readiness.md Phase 1)
+//
+// Periodically walks each qontinui-* repo under `D:/qontinui-root/` (resolved
+// from `QONTINUI_ROOT` else the platform default), runs `git status --porcelain`
+// + `git rev-parse HEAD` + `git symbolic-ref --short HEAD` + mtime-scans the
+// working tree, then POSTs one row per repo to `<base>/coord/trees/upsert`.
+//
+// Mirrors the `heartbeat_to_coord` + `spawn_heartbeat` pair above:
+// - Reuses `load_machine_file` for identity.
+// - Reuses `coord_http_base` for the coord HTTP endpoint resolver.
+// - Best-effort: errors `warn!` and the next tick retries; the loop never
+//   panics.
+// - Same `MissedTickBehavior::Skip` posture so a system suspend doesn't
+//   blast catch-up ticks.
+//
+// NOT supervisor-side: the supervisor is dev-only and doesn't run on
+// production fleet machines (see PR #179's commit message). The runner
+// is the universal vantage point — every fleet host has one.
+// =============================================================================
+
+/// `POST /coord/trees/upsert` body (mirror of
+/// `qontinui-coord/src/primary_trees.rs::UpsertRequest`).
+#[derive(Debug, serde::Serialize)]
+struct TreeStatePayload {
+    device_id: uuid::Uuid,
+    repo: String,
+    branch: String,
+    head_sha: String,
+    dirty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dirty_files: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_edit_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Maximum number of dirty paths included per row (the column is unbounded
+/// but operator triage doesn't benefit from a 10k-row dump). Anything past
+/// this is silently truncated; `dirty=true` still flags the tree.
+const MAX_DIRTY_FILES_REPORTED: usize = 50;
+
+/// Resolve the root directory the publisher walks for qontinui-* repos.
+/// `QONTINUI_ROOT` env override → `D:/qontinui-root` on Windows →
+/// `$HOME/qontinui-root` on unix. Returns `None` if neither resolves to
+/// a real directory.
+fn qontinui_root() -> Option<PathBuf> {
+    if let Ok(s) = std::env::var("QONTINUI_ROOT") {
+        let p = PathBuf::from(s);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let p = PathBuf::from("D:/qontinui-root");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join("qontinui-root");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Capture the state of a single primary git tree at `repo_path`. Returns
+/// `None` when the directory isn't a git repo (no `.git/` dir). All
+/// `git` calls use `Command::new("git")` so they go through the operator's
+/// PATH-resolved git — same as the rest of the runner.
+fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
+    use std::process::Command;
+
+    let dot_git = repo_path.join(".git");
+    if !dot_git.exists() {
+        return None;
+    }
+
+    let repo_name = repo_path.file_name()?.to_string_lossy().to_string();
+
+    // HEAD SHA
+    let head_sha = Command::new("git")
+        .args(["-C", repo_path.to_str()?, "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })?;
+
+    // Current branch (best-effort — detached HEAD returns empty)
+    let branch = Command::new("git")
+        .args(["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "(detached)".to_string());
+
+    // Dirty status — `git status --porcelain=v1` is one line per change.
+    let status_out = Command::new("git")
+        .args(["-C", repo_path.to_str()?, "status", "--porcelain=v1"])
+        .output()
+        .ok()?;
+    if !status_out.status.success() {
+        return None;
+    }
+    let status_str = String::from_utf8_lossy(&status_out.stdout);
+    let dirty_files: Vec<String> = status_str
+        .lines()
+        .filter_map(|line| {
+            // porcelain v1: XY<space>path  (XY can have spaces in
+            // rename forms; we just trim and take whatever comes after
+            // the first 3 chars).
+            if line.len() < 4 {
+                return None;
+            }
+            Some(line[3..].to_string())
+        })
+        .take(MAX_DIRTY_FILES_REPORTED)
+        .collect();
+    let dirty = !dirty_files.is_empty() || !status_str.lines().next().unwrap_or("").is_empty();
+
+    // last_edit_at — newest mtime among the dirty files OR (when clean)
+    // the HEAD commit time. The watcher's "stale-WIP" rule is about
+    // *uncommitted* idleness, so the dirty-files mtime is the more
+    // meaningful signal; a clean tree's commit-time is informational
+    // only.
+    let last_edit_at: Option<chrono::DateTime<chrono::Utc>> = if dirty {
+        dirty_files
+            .iter()
+            .filter_map(|p| {
+                let full = repo_path.join(p);
+                let meta = std::fs::metadata(&full).ok()?;
+                let modified = meta.modified().ok()?;
+                let secs = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_secs() as i64;
+                chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+            })
+            .max()
+    } else {
+        // git -C <path> log -1 --format=%cI  — committer-date ISO-8601.
+        Command::new("git")
+            .args(["-C", repo_path.to_str()?, "log", "-1", "--format=%cI"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&chrono::Utc))
+                } else {
+                    None
+                }
+            })
+    };
+
+    // device_id is filled in by the caller (it's identity-side, not
+    // per-repo). Punch in a placeholder; the publisher overwrites it.
+    Some(TreeStatePayload {
+        device_id: uuid::Uuid::nil(),
+        repo: repo_name,
+        branch,
+        head_sha,
+        dirty,
+        dirty_files: if dirty_files.is_empty() {
+            None
+        } else {
+            Some(dirty_files)
+        },
+        last_edit_at,
+    })
+}
+
+/// One publish pass: discover qontinui-* dirs under `QONTINUI_ROOT`,
+/// capture each one's tree state, POST one row per repo to
+/// `<base>/coord/trees/upsert`.
+///
+/// Best-effort: per-repo errors `warn!` and continue; the function only
+/// returns `Err` for terminal conditions (no machine identity, no coord
+/// URL, no root dir). Caller (`spawn_tree_publisher`) treats `Err` the
+/// same as it treats heartbeat errors — log + retry next tick.
+pub async fn publish_tree_state() -> Result<(), String> {
+    let machine = match load_machine_file() {
+        Some(m) => m,
+        None => {
+            info!(
+                "fleet::tree_publisher: ~/.qontinui/machine.json missing — \
+                 run `qontinui_profile machine init` to enable tree-state \
+                 publishing. Skipping."
+            );
+            return Ok(());
+        }
+    };
+
+    let device_id = match uuid::Uuid::parse_str(&machine.machine_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                "fleet::tree_publisher: machine.json machine_id is not a valid UUID ({e}). Skipping."
+            );
+            return Ok(());
+        }
+    };
+
+    let base = match coord_http_base() {
+        Some(b) => b,
+        None => {
+            info!(
+                "fleet::tree_publisher: ~/.qontinui/profiles.json missing or active \
+                 profile has no coord_url — no coord to publish to. Skipping."
+            );
+            return Ok(());
+        }
+    };
+
+    let root = match qontinui_root() {
+        Some(p) => p,
+        None => {
+            info!(
+                "fleet::tree_publisher: no qontinui-root directory found (set \
+                 QONTINUI_ROOT to override). Skipping."
+            );
+            return Ok(());
+        }
+    };
+
+    // Walk top-level entries; only `qontinui-*` dirs with a `.git/`
+    // count. Skip `.wt/` sibling worktree dirs explicitly — those are
+    // agent worktrees, not the primary tree we're publishing.
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(e) => return Err(format!("read_dir {root}: {e}", root = root.display())),
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("reqwest builder: {e}"))?;
+    let url = format!("{base}/coord/trees/upsert");
+
+    let mut total = 0usize;
+    let mut posted = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if !name.starts_with("qontinui-") {
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+
+        let mut payload = match capture_tree(&path) {
+            Some(p) => p,
+            None => {
+                debug!(
+                    "fleet::tree_publisher: {} skipped (not a git repo or capture failed)",
+                    name
+                );
+                continue;
+            }
+        };
+        total += 1;
+        payload.device_id = device_id;
+
+        match client.post(&url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                posted += 1;
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let excerpt: String = body.chars().take(200).collect();
+                warn!(
+                    "fleet::tree_publisher: coord returned {status} for {repo}: {excerpt}",
+                    repo = payload.repo
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "fleet::tree_publisher: POST {url} for {repo} failed: {e}",
+                    repo = payload.repo
+                );
+            }
+        }
+    }
+
+    if total > 0 {
+        debug!("fleet::tree_publisher: published {posted}/{total} repos device_id={device_id}");
+    }
+    Ok(())
+}
+
+/// Spawn the periodic tree-state publisher on the ambient tokio runtime.
+///
+/// Interval read from `COORD_TREE_PUBLISH_INTERVAL_SECS` (default 60s,
+/// floored at 5s). `MissedTickBehavior::Skip` mirrors `spawn_heartbeat`
+/// above. Failures `warn!` and retry on the next tick; the loop never
+/// panics.
+pub fn spawn_tree_publisher() {
+    let secs: u64 = std::env::var("COORD_TREE_PUBLISH_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60)
+        .max(5);
+
+    info!(
+        "fleet::tree_publisher: starting periodic tree-state publisher, interval={}s",
+        secs
+    );
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if let Err(e) = publish_tree_state().await {
+                warn!("fleet::tree_publisher: {e}");
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
