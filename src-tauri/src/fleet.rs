@@ -245,9 +245,9 @@ pub async fn publish_on_startup(pg: &Arc<PgDb>, role: MachineRole) {
 // HTTP heartbeat to coord (plan 2026-05-18-push-aware-fleet-liveness.md §5).
 //
 // The direct-PG `publish_budget` path above is a one-shot at boot. To keep
-// `coord.machines.last_seen_at` fresh under coord's new push-aware liveness
-// model, the runner periodically POSTs `{machine_id, hostname}` to coord's
-// `/coord/machine/register` endpoint. The handler's UPSERT refreshes
+// `coord.devices.last_seen_at` fresh under coord's new push-aware liveness
+// model, the runner periodically POSTs `{device_id, hostname}` to coord's
+// `/coord/devices/register` endpoint. The handler's UPSERT refreshes
 // `last_seen_at` and `COALESCE`s a previously-advertised `health_url`, so
 // heartbeating from the runner side is a clean, side-effect-free refresh.
 //
@@ -281,7 +281,7 @@ fn profiles_path() -> Option<PathBuf> {
 /// Resolve the coord HTTP base from the active profile's `coord_url`.
 /// Profile stores `ws://host:9870/ws` or `wss://host:9870/ws` (the
 /// WebSocket upgrade URL); convert that to `http://host:9870` /
-/// `https://host:9870` so reqwest can POST to `/coord/machine/register`.
+/// `https://host:9870` so reqwest can POST to `/coord/devices/register`.
 /// Returns `None` if profiles.json is missing or the active profile has
 /// no coord_url. Mirrors `qontinui-supervisor/src/fleet.rs:122-138`.
 ///
@@ -308,15 +308,15 @@ fn coord_http_base() -> Option<String> {
 
 #[derive(Debug, serde::Serialize)]
 struct HeartbeatPayload {
-    machine_id: uuid::Uuid,
+    device_id: uuid::Uuid,
     hostname: String,
 }
 
-/// POST `{machine_id, hostname}` to `<base>/coord/machine/register`.
+/// POST `{device_id, hostname}` to `<base>/coord/devices/register`.
 ///
-/// `health_url` is deliberately omitted — coord's `register_machine`
+/// `health_url` is deliberately omitted — coord's `register_device`
 /// handler `COALESCE`s `EXCLUDED.health_url` with the existing value,
-/// so omitting from the heartbeat preserves any URL the machine
+/// so omitting from the heartbeat preserves any URL the device
 /// previously advertised. Failures are reported as `Err(String)` so
 /// the caller can log them; the loop never panics.
 pub async fn heartbeat_to_coord() -> Result<(), String> {
@@ -351,10 +351,10 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
     };
 
     let payload = HeartbeatPayload {
-        machine_id,
+        device_id: machine_id,
         hostname: machine.hostname.clone(),
     };
-    let url = format!("{base}/coord/machine/register");
+    let url = format!("{base}/coord/devices/register");
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

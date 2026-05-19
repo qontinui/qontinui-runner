@@ -103,7 +103,7 @@ enum Cmd {
 #[derive(Subcommand, Debug)]
 enum MachineCmd {
     /// Mint UUID v4 + hostname to machine.json (atomic), then UPSERT into the
-    /// active profile's coord.machines via POST /coord/machine/register.
+    /// active profile's coord.devices via POST /coord/devices/register.
     /// Idempotent: re-runs re-use the existing UUID and refresh hostname.
     Init,
     /// Print machine_id + coord.machines registration timestamps as JSON.
@@ -485,13 +485,13 @@ fn cmd_machine_init() -> ExitCode {
         );
     }
 
-    // Register with coord via HTTP `POST /coord/machine/register`. File
+    // Register with coord via HTTP `POST /coord/devices/register`. File
     // creation succeeds even if coord registration fails — the local
-    // machine.json is the canonical record; coord.machines is a derived view
+    // machine.json is the canonical record; coord.devices is a derived view
     // (qontinui-coord re-syncs from machine.json on next /coord/status POST).
     match register_with_coord(&file.machine_id, &file.hostname) {
         Ok(()) => {
-            println!("registered with coord via HTTP (POST /coord/machine/register)");
+            println!("registered with coord via HTTP (POST /coord/devices/register)");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -547,10 +547,11 @@ fn cmd_machine_show() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Register this machine with coord via `POST /coord/machine/register`.
-/// The endpoint (added in qontinui-coord PR #37) UPSERTs `coord.machines`
-/// and returns the resulting row. Replaces the prior direct-PG INSERT path
-/// so the runner no longer needs PG credentials to coord's database.
+/// Register this machine with coord via `POST /coord/devices/register`.
+/// The endpoint (renamed from `/coord/machine/register` by qontinui-coord
+/// PR #49 Phase 2 — unified-devices) UPSERTs `coord.devices` and returns
+/// the resulting row. Replaces the prior direct-PG INSERT path so the
+/// runner no longer needs PG credentials to coord's database.
 ///
 /// The CLI bootstrap doesn't know its health URL — that's the supervisor's
 /// job (Phase 3 of the fleet-health-url advertisement plan). We pass
@@ -562,9 +563,9 @@ fn register_with_coord(machine_id: &str, hostname: &str) -> Result<(), String> {
     let _ = uuid::Uuid::parse_str(machine_id)
         .map_err(|e| format!("machine_id is not a valid UUID: {}", e))?;
     let base = coord_http_base()?;
-    let url = format!("{}/coord/machine/register", base);
+    let url = format!("{}/coord/devices/register", base);
     let body = serde_json::json!({
-        "machine_id": machine_id,
+        "device_id": machine_id,
         "hostname": hostname,
         "health_url": serde_json::Value::Null,
     });
@@ -593,7 +594,7 @@ fn register_with_coord(machine_id: &str, hostname: &str) -> Result<(), String> {
 /// Resolve the coord HTTP base from the active profile's `coord_url`.
 /// Profiles store `ws://host:9870/ws` (the WebSocket upgrade URL); we
 /// convert that to `http://host:9870` so reqwest can POST to
-/// `/coord/machine/register`. Mirrors `qontinui-supervisor/src/fleet.rs`
+/// `/coord/devices/register`. Mirrors `qontinui-supervisor/src/fleet.rs`
 /// `coord_http_base` so both registration paths follow the same recipe.
 fn coord_http_base() -> Result<String, String> {
     let coord_url = load_strict()

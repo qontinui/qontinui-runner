@@ -419,8 +419,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
     //
-    // Periodic HTTP POST `{machine_id, hostname}` to coord's
-    // `/coord/machine/register`, refreshing `coord.machines.last_seen_at`
+    // Periodic HTTP POST `{device_id, hostname}` to coord's
+    // `/coord/devices/register`, refreshing `coord.devices.last_seen_at`
     // so coord's push-aware liveness ladder (plan 2026-05-18-push-aware-
     // fleet-liveness §4) recognizes this runner as alive even when the
     // inbound probe can't reach us (NAT/firewall asymmetry).
