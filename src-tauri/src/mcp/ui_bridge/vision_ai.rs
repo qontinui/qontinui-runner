@@ -462,8 +462,8 @@ struct VlmDualEnvelope {
 /// function never panics and never returns a partially-validated twin.
 fn parse_vlm_structured(content: &str) -> Result<(String, VlmStructuredSummary), String> {
     let stripped = strip_fence(content);
-    let envelope: VlmDualEnvelope = serde_json::from_str(stripped)
-        .map_err(|e| format!("{e}: {}", trunc(stripped, 200)))?;
+    let envelope: VlmDualEnvelope =
+        serde_json::from_str(stripped).map_err(|e| format!("{e}: {}", trunc(stripped, 200)))?;
     Ok((envelope.description, envelope.structured))
 }
 
@@ -797,7 +797,10 @@ mod tests {
         assert_eq!(s.layout, VlmLayout::Centered);
         assert_eq!(s.confidence, 0.91);
         assert_eq!(s.elements.len(), 2);
-        assert_eq!(s.elements[0].state.as_deref(), Some(&[ElementState::Disabled][..]));
+        assert_eq!(
+            s.elements[0].state.as_deref(),
+            Some(&[ElementState::Disabled][..])
+        );
         assert_eq!(s.elements[0].bbox.unwrap().w, 80);
         assert_eq!(s.elements[1].text.as_deref(), Some("Cancel"));
         // Plan §8 Phase 4 assertion target: modals[0].ctas carries both labels.
@@ -890,7 +893,12 @@ mod tests {
                 text: None,
                 state: Some(vec![ElementState::Focused]),
                 color: None,
-                bbox: Some(OcrBbox { x: 1, y: 2, w: 3, h: 4 }),
+                bbox: Some(OcrBbox {
+                    x: 1,
+                    y: 2,
+                    w: 3,
+                    h: 4,
+                }),
             }],
             modals: vec![],
             overlays: vec![],
