@@ -953,6 +953,60 @@ pub async fn ui_bridge_execute_action_handler(
         }
     }
 
+    // ── Distinct ELEMENT_NOT_FOUND for a true registry miss ─────────────
+    //
+    // If the action still failed *after* the discover-refresh retry and the
+    // stable-ref fallback above, and the failure is a genuine registry miss
+    // (the SDK reports the element was "never registered or discovered" /
+    // "not found"), surface it as a distinct HTTP 404 with a structured
+    // `error_detail.code == ElementNotFound` — the same envelope the
+    // `get_element` DOM-tree / `assert` handlers already return for a typoed
+    // id. Without this, `wrap_ipc_result` routes the prose through
+    // `classify_transport_error`, which only maps the literal "No element
+    // found" string and otherwise falls through to a generic
+    // `INTERNAL_SERVER_ERROR` — making a missing-id miss indistinguishable
+    // from a real action-execution failure.
+    //
+    // This fires ONLY on a true, unrecoverable registry miss: an element
+    // that exists but whose action fails carries a different error and
+    // keeps its existing `wrap_ipc_result` envelope untouched. We reuse the
+    // file's own canonical miss predicate (the exact substrings the
+    // stale-registry retry above keys on) so behavior stays consistent.
+    {
+        let is_registry_miss = |err: Option<&str>| -> bool {
+            err.map(|e| {
+                let lower = e.to_lowercase();
+                lower.contains("never registered or discovered") || lower.contains("not found")
+            })
+            .unwrap_or(false)
+        };
+        let (miss, hint) = match &result {
+            Ok(resp) if !resp.success => {
+                (is_registry_miss(resp.error.as_deref()), resp.hint.clone())
+            }
+            Err((_, body)) => (is_registry_miss(body.error.as_deref()), body.hint.clone()),
+            _ => (false, None),
+        };
+        if miss {
+            warn!(
+                "execute_action: element {} not found in registry after retry + \
+                 stable-ref fallback; returning ELEMENT_NOT_FOUND",
+                id
+            );
+            let mut body = api_error_detailed(
+                format!("Element '{}' not found", id),
+                UiBridgeError::element_not_found(&id),
+            );
+            // Forward the frontend's closest-match / typo-suggestion payload
+            // (when present) so a mistyped id gets the same suggestions it
+            // would on `GET /control/element/<id>`.
+            if hint.is_some() {
+                body.hint = hint;
+            }
+            return Err((StatusCode::NOT_FOUND, Json(body)));
+        }
+    }
+
     // ── Phase 5 pilot path: automatic structured recovery ───────────────
     //
     // This is the chosen runner pilot path (element-action / NL-click). If
