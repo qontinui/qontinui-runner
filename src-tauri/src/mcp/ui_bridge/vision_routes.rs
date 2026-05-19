@@ -344,7 +344,15 @@ pub struct DescribeRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DescribeResponse {
+    /// Human-readable caption. Retained as a deliberate dual-audience
+    /// feature (plan goal #3) — byte-unchanged contract vs. pre-Phase-4.
     pub description: String,
+    /// Closed-schema machine twin of `description` (plan §8 Phase 4).
+    /// `None` when the VLM reply was prose-only or failed strict
+    /// validation; `description` is still populated in that case
+    /// (graceful fallback, `UB-VLM-STRUCTURED-PARSE-FAIL` logged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<vision_ai::VlmStructuredSummary>,
     pub tokens: Option<vision_ai::VlmTokens>,
     pub model: String,
     pub cached: bool,
@@ -1581,6 +1589,7 @@ async fn vision_describe_handler(
         })?;
     let resp = DescribeResponse {
         description: vlm.description,
+        structured: vlm.structured,
         tokens: vlm.tokens,
         model: model_name.clone(),
         cached: false,
