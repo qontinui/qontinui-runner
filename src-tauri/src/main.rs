@@ -452,6 +452,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             };
             rt.block_on(async {
                 fleet::spawn_heartbeat();
+                // Plan 2026-05-19-coordinator-production-readiness.md
+                // Phase 1 — periodic primary-tree state publisher. Same
+                // runtime / OS-thread as the heartbeat task so we don't
+                // pay for a second long-lived thread; the publisher's
+                // 60s cadence is way below the heartbeat's 30s scale.
+                fleet::spawn_tree_publisher();
                 // Park this thread's runtime forever so the spawned
                 // interval task keeps ticking for the runner's lifetime.
                 std::future::pending::<()>().await;
