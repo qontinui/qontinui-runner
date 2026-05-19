@@ -73,10 +73,8 @@ pub enum RunnerRelayMessage {
 
     /// UI error reported by the runner. Emitted from the `ui-error` broadcast
     /// channel; `data` carries the original `AppEvent` payload (matches
-    /// `qontinui_types::device::DeviceUiError`'s wire shape — renamed from
-    /// `RunnerUiError` in the Unified Devices Registry Phase 7 schemas bump).
-    /// Always present (serializes as `null` when absent) to match the legacy
-    /// `json!` literal.
+    /// `qontinui_types::runner::RunnerUiError`'s wire shape). Always present
+    /// (serializes as `null` when absent) to match the legacy `json!` literal.
     UiError {
         #[serde(default)]
         data: Value,
@@ -84,9 +82,7 @@ pub enum RunnerRelayMessage {
 
     /// Most-recent crash dump metadata. Emitted from the `recent-crash`
     /// broadcast channel; `data` carries the original `AppEvent` payload
-    /// (matches `qontinui_types::device::DeviceCrash`'s wire shape — renamed
-    /// from `RunnerCrash` in the Unified Devices Registry Phase 7 schemas
-    /// bump).
+    /// (matches `qontinui_types::runner::RunnerCrash`'s wire shape).
     RecentCrash {
         #[serde(default)]
         data: Value,
@@ -147,15 +143,13 @@ pub enum RunnerRelayMessage {
 
 /// Wire-format runner shape carried inside `runner_connected.connection`.
 ///
-/// This is intentionally a partial Device payload (snake_case, only the
+/// This is intentionally a partial Runner payload (snake_case, only the
 /// fields the Python emitter actually populates in
 /// `RunnerEventPublisher.publish_runner_connected`). It is NOT
-/// `qontinui_types::device::Device` — that shape requires `derived_status`,
+/// `qontinui_types::runner::Runner` — that shape requires `derived_status`,
 /// `capabilities`, `created_at` etc., which the connection payload doesn't
-/// include. Consumers reading this should refetch the canonical Device row
-/// via REST after seeing `runner_connected` (the legacy `runner_*` event
-/// names are preserved on the wire; the Phase 7 schemas rename renamed the
-/// DTO type but not the event identifiers).
+/// include. Consumers reading this should refetch the canonical Runner row
+/// via REST after seeing `runner_connected`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(title = "RunnerConnectedConnection")]
 pub struct RunnerConnectedConnection {
@@ -193,13 +187,11 @@ pub struct RunnerConnectedConnection {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum RunnerStatusEvent {
-    /// Snapshot pushed on WS connect. Each entry is a full canonical Device
-    /// (as serialized by `qontinui_schemas.device.Device` Pydantic — renamed
-    /// from `Runner` in the Unified Devices Registry Phase 7 schemas bump).
-    /// Carried here as `Value` because the canonical `Device` lives in
-    /// `qontinui_types::device::Device`; the TS binding consumer should
-    /// narrow `runners[i] as Device` after import. The wire field name
-    /// `runners` is preserved for back-compat with the Python emitter.
+    /// Snapshot pushed on WS connect. Each entry is a full canonical Runner
+    /// (as serialized by `qontinui_schemas.runner.Runner` Pydantic). Carried
+    /// here as `Value` because the canonical `Runner` lives in
+    /// `qontinui_types::runner::Runner`; the TS binding consumer should
+    /// narrow `runners[i] as Runner` after import.
     #[serde(rename = "initial_state")]
     InitialState { runners: Vec<Value> },
 
