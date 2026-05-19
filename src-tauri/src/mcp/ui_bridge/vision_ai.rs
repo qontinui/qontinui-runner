@@ -58,10 +58,26 @@ respond with `[]`.";
 /// structured-text request that surfaces the elements/regions an agent
 /// would care about (text content + layout cues + interactable signals).
 pub const VLM_SYSTEM_PROMPT: &str =
-    "You are describing a UI screenshot for an automation agent. Focus on what the agent \
-would need to act: visible text, interactive elements (buttons, links, inputs), and \
-their approximate layout. Be concise — one paragraph. Do not invent text or elements \
-that aren't visible. If a region is blank or all-whitespace, say so.";
+    "You are describing a UI screenshot for an automation agent. Respond with a SINGLE \
+JSON object, no markdown fence, no prose outside it, with EXACTLY these two keys:\n\
+\n\
+1. \"description\": a concise one-paragraph human-readable caption — visible text, \
+interactive elements (buttons, links, inputs), and their approximate layout. Do not \
+invent text or elements that aren't visible. If a region is blank or all-whitespace, \
+say so here.\n\
+\n\
+2. \"structured\": a machine-readable object with EXACTLY these keys:\n\
+   - \"elements\": array of {\"role\": string (e.g. button|link|input|heading), \
+\"text\"?: string, \"state\"?: array of (\"disabled\"|\"loading\"|\"selected\"|\"focused\"), \
+\"color\"?: string, \"bbox\"?: {\"x\":int,\"y\":int,\"w\":int,\"h\":int}}\n\
+   - \"modals\": array of {\"kind\": \"confirm\"|\"alert\"|\"form\", \"title\"?: string, \
+\"ctas\"?: array of string (button labels)}\n\
+   - \"overlays\": array of {\"kind\": \"tooltip\"|\"dropdown\"|\"menu\", \"text\"?: string}\n\
+   - \"layout\": one of \"centered\"|\"split\"|\"list\"|\"grid\"|\"custom\"\n\
+   - \"confidence\": float in [0,1]\n\
+\n\
+Use ONLY the enumerated values for state/kind/layout. Omit optional keys rather than \
+emitting null. Empty arrays are fine. Do not add keys not listed above.";
 
 #[derive(Debug, Error)]
 pub enum AiError {
@@ -87,7 +103,7 @@ pub struct OcrBlock {
     pub confidence: f64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OcrBbox {
     pub x: u32,
@@ -301,6 +317,154 @@ fn aggregate_text(blocks: &[OcrBlock]) -> String {
 pub struct VlmDescription {
     pub description: String,
     pub tokens: Option<VlmTokens>,
+    /// Closed-schema machine twin of `description` (plan §8 Phase 4 /
+    /// goal #3 — prose-paired-with-structured). `None` when the model's
+    /// reply was prose-only or failed strict validation; the endpoint
+    /// still returns `description` in that case (graceful fallback) and a
+    /// `UB-VLM-STRUCTURED-PARSE-FAIL` diagnostic is logged.
+    pub structured: Option<VlmStructuredSummary>,
+}
+
+// ===========================================================================
+// VLM structured-twin schema (plan §8 Phase 4)
+//
+// Closed schema. Every string set that the plan enumerates is a Rust enum so
+// serde rejects out-of-vocabulary values at parse time (strict validation —
+// an unknown `layout` / `state` / modal `kind` fails the whole parse and
+// triggers the prose-only fallback rather than silently widening the type).
+// `Bbox` is the existing vision-module bbox type (`OcrBbox`); reused so the
+// describe twin and the extract blocks share one bbox shape.
+// ===========================================================================
+
+/// The vision module's canonical bounding-box type. Re-exported under the
+/// plan's `Bbox` name for the structured-twin schema; identical wire shape
+/// (`{x,y,w,h}` camelCase) as `vision/extract` `OcrBlock.bbox`.
+pub type Bbox = OcrBbox;
+
+/// Interactable / lifecycle states a VLM may report for an element. Closed
+/// set — serde rejects anything else (strict validation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ElementState {
+    Disabled,
+    Loading,
+    Selected,
+    Focused,
+}
+
+/// One element the VLM identified in the screenshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VlmElement {
+    /// Free-text role (`button`, `link`, `input`, `heading`, …). Not
+    /// closed — UI role vocabulary is open-ended; the agent reads it as a
+    /// hint, not a discriminator.
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Vec<ElementState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<Bbox>,
+}
+
+/// Modal-dialog kind. Closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModalKind {
+    Confirm,
+    Alert,
+    Form,
+}
+
+/// A modal/dialog the VLM identified.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VlmModal {
+    pub kind: ModalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Call-to-action button labels in reading order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctas: Option<Vec<String>>,
+}
+
+/// Transient-overlay kind. Closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OverlayKind {
+    Tooltip,
+    Dropdown,
+    Menu,
+}
+
+/// A transient overlay (tooltip / dropdown / menu) the VLM identified.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VlmOverlay {
+    pub kind: OverlayKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// High-level page-layout classification. Closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VlmLayout {
+    Centered,
+    Split,
+    List,
+    Grid,
+    Custom,
+}
+
+/// Closed-schema machine twin of the VLM caption. Mirrors the TS shape in
+/// plan §4 Phase 4. `deny_unknown_fields` + the closed enums above make
+/// `serde_json::from_str::<VlmStructuredSummary>` the strict validator: any
+/// extra key or out-of-vocabulary enum value fails the parse, which the
+/// describe handler treats as "prose-only fallback".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VlmStructuredSummary {
+    #[serde(default)]
+    pub elements: Vec<VlmElement>,
+    #[serde(default)]
+    pub modals: Vec<VlmModal>,
+    #[serde(default)]
+    pub overlays: Vec<VlmOverlay>,
+    pub layout: VlmLayout,
+    pub confidence: f64,
+}
+
+/// The dual-audience envelope the VLM is prompted to emit in JSON mode:
+/// `{ "description": "...", "structured": { ... } }`. Internal — we split
+/// it into [`VlmDescription`]'s prose + structured fields, never surface
+/// the envelope itself. `deny_unknown_fields` keeps the contract tight.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VlmDualEnvelope {
+    description: String,
+    structured: VlmStructuredSummary,
+}
+
+/// Strictly parse the VLM reply as the dual-audience envelope.
+///
+/// Returns `Ok((description, Some(structured)))` only when the reply is the
+/// well-formed `{description, structured}` JSON envelope AND `structured`
+/// passes strict serde validation (closed enums + `deny_unknown_fields`).
+///
+/// On ANY failure — not JSON, missing keys, prose-only, out-of-vocabulary
+/// enum, extra fields — returns `Err(reason)`. The caller (the describe
+/// handler / [`VlmClient::describe`]) then falls back to prose-only with
+/// `structured: None` and logs `UB-VLM-STRUCTURED-PARSE-FAIL`. This
+/// function never panics and never returns a partially-validated twin.
+fn parse_vlm_structured(content: &str) -> Result<(String, VlmStructuredSummary), String> {
+    let stripped = strip_fence(content);
+    let envelope: VlmDualEnvelope =
+        serde_json::from_str(stripped).map_err(|e| format!("{e}: {}", trunc(stripped, 200)))?;
+    Ok((envelope.description, envelope.structured))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -354,10 +518,11 @@ impl VlmClient {
             self.endpoint.trim_end_matches('/')
         );
         let user_text = match extra_prompt {
-            Some(p) if !p.trim().is_empty() => {
-                format!("Describe this UI screenshot. Caller's focus: {}", p.trim())
-            }
-            _ => "Describe this UI screenshot.".to_string(),
+            Some(p) if !p.trim().is_empty() => format!(
+                "Describe this UI screenshot as the specified JSON object. Caller's focus: {}",
+                p.trim()
+            ),
+            _ => "Describe this UI screenshot as the specified JSON object.".to_string(),
         };
         let payload = json!({
             "model": self.model,
@@ -373,6 +538,11 @@ impl VlmClient {
             ],
             "temperature": 0.0,
             "max_tokens": max_tokens.max(64),
+            // JSON mode — ask the endpoint to constrain output to a JSON
+            // object. llama-swap / OpenAI-compatible servers honour this;
+            // servers that ignore it just return text, which the
+            // strict-parse + prose fallback below handles gracefully.
+            "response_format": { "type": "json_object" },
         });
 
         debug!("VLM: POST {} (model={})", url, self.model);
@@ -382,19 +552,39 @@ impl VlmClient {
             return Err(AiError::Status(status.as_u16()));
         }
         let body: serde_json::Value = resp.json().await?;
-        let description = extract_chat_content(&body)
-            .ok_or_else(|| AiError::Parse("no choices[0].message.content".into()))?
-            .trim()
-            .to_string();
-        if description.is_empty() {
-            warn!("VLM: empty description returned");
-        }
+        let raw_content = extract_chat_content(&body)
+            .ok_or_else(|| AiError::Parse("no choices[0].message.content".into()))?;
         let tokens = body
             .get("usage")
             .and_then(|u| serde_json::from_value::<VlmTokens>(u.clone()).ok());
+
+        // Strict-parse the dual-audience envelope. On success the prose
+        // comes from `description` inside the JSON; on ANY failure we fall
+        // back to prose-only with the raw content as the caption and a
+        // logged `UB-VLM-STRUCTURED-PARSE-FAIL` diagnostic. The endpoint
+        // never errors on a structured-parse failure (plan §8 Phase 4 —
+        // "Never 500 on structured-parse failure").
+        let (description, structured) = match parse_vlm_structured(&raw_content) {
+            Ok((desc, summary)) => (desc.trim().to_string(), Some(summary)),
+            Err(reason) => {
+                // Canonical diagnostic code emitted as a literal string.
+                // The typed `qontinui_schemas::ui_bridge_diagnostics`
+                // enum is wired by Phase 5 — kept decoupled here on
+                // purpose (no schemas-crate dep in P4).
+                warn!(
+                    "UB-VLM-STRUCTURED-PARSE-FAIL: VLM reply not a valid \
+{{description, structured}} envelope, falling back to prose-only: {reason}"
+                );
+                (raw_content.trim().to_string(), None)
+            }
+        };
+        if description.is_empty() {
+            warn!("VLM: empty description returned");
+        }
         Ok(VlmDescription {
             description,
             tokens,
+            structured,
         })
     }
 }
@@ -576,5 +766,150 @@ mod tests {
     #[test]
     fn parse_ocr_json_rejects_garbage() {
         assert!(parse_ocr_json("hello world").is_err());
+    }
+
+    // ===================================================================
+    // VLM structured-twin schema + strict-validation + fallback (Phase 4)
+    // ===================================================================
+
+    /// A well-formed dual envelope (the happy path the prompt asks for)
+    /// parses, and every closed enum / nested shape round-trips.
+    #[test]
+    fn parse_vlm_structured_accepts_well_formed_envelope() {
+        let reply = r#"{
+            "description": "Confirm dialog: Save (disabled), Cancel (blue).",
+            "structured": {
+                "elements": [
+                    {"role":"button","text":"Save","state":["disabled"],"color":"gray",
+                     "bbox":{"x":10,"y":20,"w":80,"h":30}},
+                    {"role":"button","text":"Cancel","color":"blue"}
+                ],
+                "modals": [
+                    {"kind":"confirm","title":"Unsaved changes","ctas":["Save","Cancel"]}
+                ],
+                "overlays": [{"kind":"tooltip","text":"Click to save"}],
+                "layout": "centered",
+                "confidence": 0.91
+            }
+        }"#;
+        let (desc, s) = parse_vlm_structured(reply).expect("well-formed envelope must parse");
+        assert_eq!(desc, "Confirm dialog: Save (disabled), Cancel (blue).");
+        assert_eq!(s.layout, VlmLayout::Centered);
+        assert_eq!(s.confidence, 0.91);
+        assert_eq!(s.elements.len(), 2);
+        assert_eq!(
+            s.elements[0].state.as_deref(),
+            Some(&[ElementState::Disabled][..])
+        );
+        assert_eq!(s.elements[0].bbox.unwrap().w, 80);
+        assert_eq!(s.elements[1].text.as_deref(), Some("Cancel"));
+        // Plan §8 Phase 4 assertion target: modals[0].ctas carries both labels.
+        assert_eq!(s.modals.len(), 1);
+        assert_eq!(s.modals[0].kind, ModalKind::Confirm);
+        assert_eq!(
+            s.modals[0].ctas.as_deref(),
+            Some(&["Save".to_string(), "Cancel".to_string()][..])
+        );
+        assert_eq!(s.overlays[0].kind, OverlayKind::Tooltip);
+    }
+
+    /// A fenced envelope (model wrapped it in ```json despite the prompt)
+    /// still parses — `strip_fence` is shared with the OCR path.
+    #[test]
+    fn parse_vlm_structured_handles_fence() {
+        let reply = "```json\n{\"description\":\"empty\",\"structured\":\
+{\"elements\":[],\"modals\":[],\"overlays\":[],\"layout\":\"custom\",\
+\"confidence\":0.5}}\n```";
+        let (desc, s) = parse_vlm_structured(reply).expect("fenced envelope must parse");
+        assert_eq!(desc, "empty");
+        assert_eq!(s.layout, VlmLayout::Custom);
+        assert!(s.elements.is_empty());
+    }
+
+    /// Optional arrays default to empty when omitted (prompt says "omit
+    /// rather than null"); required `layout`/`confidence` still enforced.
+    #[test]
+    fn parse_vlm_structured_defaults_optional_arrays() {
+        let reply = r#"{"description":"d","structured":{"layout":"list","confidence":0.7}}"#;
+        let (_d, s) = parse_vlm_structured(reply).expect("minimal structured must parse");
+        assert!(s.elements.is_empty() && s.modals.is_empty() && s.overlays.is_empty());
+        assert_eq!(s.layout, VlmLayout::List);
+    }
+
+    /// Strict validation: an out-of-vocabulary enum value (here a bogus
+    /// `layout`) fails the parse — it is NOT silently coerced or widened.
+    #[test]
+    fn parse_vlm_structured_rejects_unknown_enum_value() {
+        let reply = r#"{"description":"d","structured":{"elements":[],"modals":[],
+            "overlays":[],"layout":"sidebar","confidence":0.8}}"#;
+        assert!(
+            parse_vlm_structured(reply).is_err(),
+            "unknown layout 'sidebar' must fail strict validation"
+        );
+    }
+
+    /// Strict validation: an unknown extra key inside `structured` fails
+    /// the parse (`deny_unknown_fields`) — the schema is closed.
+    #[test]
+    fn parse_vlm_structured_rejects_extra_fields() {
+        let reply = r#"{"description":"d","structured":{"elements":[],"modals":[],
+            "overlays":[],"layout":"grid","confidence":0.8,"extra":"nope"}}"#;
+        assert!(
+            parse_vlm_structured(reply).is_err(),
+            "extra key in structured must fail strict validation"
+        );
+    }
+
+    /// Fallback trigger: a prose-only reply (the model ignored JSON mode)
+    /// is NOT a valid envelope → Err, so the handler keeps the prose and
+    /// emits `UB-VLM-STRUCTURED-PARSE-FAIL`.
+    #[test]
+    fn parse_vlm_structured_rejects_prose_only_reply() {
+        let prose = "Modal: Save (disabled), Cancel (enabled, blue). Centered layout.";
+        assert!(
+            parse_vlm_structured(prose).is_err(),
+            "prose-only reply must fail so the handler falls back"
+        );
+    }
+
+    /// Fallback trigger: the envelope is present but `structured` is
+    /// missing required keys → Err (no partially-validated twin).
+    #[test]
+    fn parse_vlm_structured_rejects_missing_required_keys() {
+        let reply = r#"{"description":"d","structured":{"elements":[]}}"#;
+        assert!(
+            parse_vlm_structured(reply).is_err(),
+            "missing layout/confidence must fail"
+        );
+    }
+
+    /// The schema serializes back to the documented camelCase wire shape
+    /// (what `DescribeResponse.structured` emits to the agent / skill).
+    #[test]
+    fn vlm_structured_summary_serializes_camel_case() {
+        let s = VlmStructuredSummary {
+            elements: vec![VlmElement {
+                role: "input".into(),
+                text: None,
+                state: Some(vec![ElementState::Focused]),
+                color: None,
+                bbox: Some(OcrBbox {
+                    x: 1,
+                    y: 2,
+                    w: 3,
+                    h: 4,
+                }),
+            }],
+            modals: vec![],
+            overlays: vec![],
+            layout: VlmLayout::Split,
+            confidence: 0.42,
+        };
+        let json = serde_json::to_value(&s).expect("serialize");
+        assert_eq!(json["layout"], "split");
+        assert_eq!(json["elements"][0]["state"][0], "focused");
+        assert_eq!(json["elements"][0]["bbox"]["w"], 3);
+        // Omitted optionals are not serialized (skip_serializing_if).
+        assert!(json["elements"][0].get("text").is_none());
     }
 }
