@@ -417,6 +417,54 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
+    //
+    // Periodic HTTP POST `{machine_id, hostname}` to coord's
+    // `/coord/machine/register`, refreshing `coord.machines.last_seen_at`
+    // so coord's push-aware liveness ladder (plan 2026-05-18-push-aware-
+    // fleet-liveness §4) recognizes this runner as alive even when the
+    // inbound probe can't reach us (NAT/firewall asymmetry).
+    //
+    // We need a long-lived runtime here, but there is no ambient tokio
+    // runtime at this point in `run_app` (Tauri's runtime is constructed
+    // later in `tauri::Builder::run`). So park a dedicated OS thread
+    // hosting a multi-thread runtime, kept alive forever via a `pending`
+    // future. Same posture as the supervisor's interval-style background
+    // tasks — a one-shot `block_on` is the wrong shape because the
+    // heartbeat task lives for the runner's entire lifetime.
+    std::thread::Builder::new()
+        .name("fleet-heartbeat".to_string())
+        .spawn(|| {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("fleet-hb-rt")
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    warn!(
+                        "fleet::heartbeat: failed to build dedicated tokio runtime ({e}). \
+                         Skipping periodic heartbeat — runner still boots."
+                    );
+                    return;
+                }
+            };
+            rt.block_on(async {
+                fleet::spawn_heartbeat();
+                // Park this thread's runtime forever so the spawned
+                // interval task keeps ticking for the runner's lifetime.
+                std::future::pending::<()>().await;
+            });
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| {
+            warn!(
+                "fleet::heartbeat: failed to spawn dedicated OS thread ({e}). \
+                 Skipping periodic heartbeat — runner still boots."
+            );
+        });
+
     // Migrate plaintext API keys to secure keychain storage
     if let Err(e) = config_facade::migrate_api_keys_to_keychain() {
         warn!("API key migration to keychain failed (non-fatal): {}", e);
