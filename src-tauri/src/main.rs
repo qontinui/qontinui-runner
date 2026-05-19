@@ -60,9 +60,10 @@ mod executor;
 mod exploration;
 mod findings;
 mod fixer;
-// Row 2 Phase 1 (fleet topology + per-machine budget). Detects local
-// resources on startup and UPSERTs role + budget onto `coord.machines`
-// so `GET /coord/fleet` can answer "where do I have agent capacity?".
+// Row 2 Phase 1 (fleet topology + per-device budget). Detects local
+// resources on startup and POSTs role + budget to `coord.devices`
+// (was `coord.machines` pre-Phase-3-Unified-Devices-Registry) so
+// `GET /coord/fleet` can answer "where do I have agent capacity?".
 mod fleet;
 mod flow_control;
 mod follow_up;
@@ -400,10 +401,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         rt.block_on(online_learning::initialize(&ol_pg));
     }
 
-    // Row 2 Phase 1: publish this runner's MachineBudget to coord.machines
+    // Row 2 Phase 1: publish this runner's DeviceBudget to coord.devices
     // (role = agent, max_concurrent_agents derived from RAM via §3.2 policy).
     // Best-effort — failures log a warning and the runner still boots.
-    // See `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2
+    // Phase 3 (Unified Devices Registry): now POSTs to coord HTTP rather
+    // than direct-PG UPSERT, with exponential-backoff retry preserving the
+    // runner-bootable-when-coord-down property. See
+    // `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2
     // and `fleet.rs::publish_on_startup`.
     {
         let fleet_pg = pg_db.clone();
@@ -419,8 +423,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
     //
-    // Periodic HTTP POST `{machine_id, hostname}` to coord's
-    // `/coord/machine/register`, refreshing `coord.machines.last_seen_at`
+    // Periodic HTTP POST `{device_id, hostname}` to coord's
+    // `/coord/devices/register` (Phase 3 Unified Devices Registry; was
+    // `/coord/machine/register`), refreshing `coord.devices.last_seen_at`
     // so coord's push-aware liveness ladder (plan 2026-05-18-push-aware-
     // fleet-liveness §4) recognizes this runner as alive even when the
     // inbound probe can't reach us (NAT/firewall asymmetry).

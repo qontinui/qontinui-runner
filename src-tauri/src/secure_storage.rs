@@ -7,6 +7,17 @@
 //! - Tokens are encrypted using AES-256-GCM
 //! - Encryption key is derived from machine-specific identifiers
 //! - Storage file is placed in the app's data directory
+//!
+//! ## Stored value format (Phase 3 Unified Devices Registry)
+//!
+//! Prior to Phase 3, the `access_token` slot held a `qontinui_runner_<random>`
+//! opaque bearer string minted by the web backend's
+//! `POST /api/v1/runners/tokens`. Phase 3 retires that endpoint in favour of
+//! `qontinui_profile device pair`, which mints a coord-issued device-token
+//! JWT and OVERWRITES the same `access_token` slot. The slot name is
+//! preserved so existing readers (`AuthManager::get_access_token`) need no
+//! changes. The `refresh_token` slot is unused under the new flow (the
+//! device JWT lifecycle is coord-managed); pair writes an empty string.
 
 use aes_gcm::{
     aead::{Aead, KeyInit},

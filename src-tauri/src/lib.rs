@@ -9,6 +9,12 @@ pub mod relay_envelopes;
 pub mod schema_export;
 pub mod tauri_event_payloads;
 
+// Exposed for the `qontinui_profile device pair` CLI (and any other binary
+// that needs the encrypted token store outside the Tauri runtime). Both
+// modules are Tauri-free.
+pub mod auth;
+pub mod secure_storage;
+
 // ============================================================================
 // Main window label abstraction
 // ============================================================================
