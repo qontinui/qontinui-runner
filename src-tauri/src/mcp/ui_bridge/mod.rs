@@ -803,7 +803,11 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/navigate-tab"),
             ("POST", "/ui-bridge/control/network/stubs"),
             ("POST", "/ui-bridge/control/network/verify-stub"),
-            ("POST", "/ui-bridge/control/page-health"),
+            // NOTE: `/control/page-health` was previously runner-only; SDK
+            // iter-1 (ui-bridge PR #30) ported `page-health.ts` and added the
+            // route to `UI_BRIDGE_ROUTES`. Runner side still exposes it at
+            // `screenshots.rs::routes` — the entry is now part of the
+            // contract and intentionally omitted here.
             ("POST", "/ui-bridge/control/page/close-request"),
             ("POST", "/ui-bridge/control/page/evaluate-batch"),
             ("POST", "/ui-bridge/control/page/evaluate-raw"),
