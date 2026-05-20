@@ -727,7 +727,13 @@ mod manifest_drift_tests {
             ("GET", "/ui-bridge/ai/element-screenshot"),
             ("GET", "/ui-bridge/ai/elements/last-discovered"),
             ("GET", "/ui-bridge/ai/forms"),
-            ("GET", "/ui-bridge/ai/idle-status"),
+            // NOTE: `/ai/idle-status` was previously in this allow-list
+            // because the SDK only declared `/control/idle-status`. The web
+            // SDK now declares the `/ai/` alias too (alongside `/control/`),
+            // so the route is part of the contract and intentionally omitted
+            // here. Both paths point at the same handler via `add_dual!` at
+            // `errors.rs::routes` — bodies are byte-identical modulo
+            // per-request timestamp/ms-precision drift.
             ("POST", "/ui-bridge/ai/analyze/data"),
             ("POST", "/ui-bridge/ai/analyze/regions"),
             ("POST", "/ui-bridge/ai/analyze/structured-data"),
@@ -797,7 +803,11 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/navigate-tab"),
             ("POST", "/ui-bridge/control/network/stubs"),
             ("POST", "/ui-bridge/control/network/verify-stub"),
-            ("POST", "/ui-bridge/control/page-health"),
+            // NOTE: `/control/page-health` was previously runner-only; SDK
+            // iter-1 (ui-bridge PR #30) ported `page-health.ts` and added the
+            // route to `UI_BRIDGE_ROUTES`. Runner side still exposes it at
+            // `screenshots.rs::routes` — the entry is now part of the
+            // contract and intentionally omitted here.
             ("POST", "/ui-bridge/control/page/close-request"),
             ("POST", "/ui-bridge/control/page/evaluate-batch"),
             ("POST", "/ui-bridge/control/page/evaluate-raw"),
