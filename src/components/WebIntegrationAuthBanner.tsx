@@ -30,6 +30,8 @@ import { listen } from "@tauri-apps/api/event";
 import { useUIElement } from "@qontinui/ui-bridge";
 import { AlertCircle, X } from "lucide-react";
 
+import { useRunnerTier } from "@/hooks/useRunnerTier";
+
 import {
   shouldShowAuthBanner,
   statusSignature,
@@ -62,6 +64,13 @@ function writeDismissedSignature(signature: string): void {
 }
 
 export function WebIntegrationAuthBanner() {
+  // Runner-tier-decoupling Phase 1 — the qontinui-web banner is only
+  // relevant when this runner is configured for the qontinui-account tier.
+  // Tier 0 ("local") and Tier 1 ("local_provider") never integrate with
+  // qontinui-web, so we never surface the "Connect this runner to your
+  // account" prompt for them.
+  const { tier } = useRunnerTier();
+
   const [status, setStatus] = useState<AuthBannerStatus | null>(null);
   const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
     readDismissedSignature(),
@@ -136,6 +145,8 @@ export function WebIntegrationAuthBanner() {
     writeDismissedSignature(sig);
     setDismissedSignature(sig);
   }, [status]);
+
+  if (tier !== "qontinui_account") return null;
 
   const visible = shouldShowAuthBanner(status, dismissedSignature);
   if (!visible) return null;

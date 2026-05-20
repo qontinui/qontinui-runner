@@ -109,6 +109,8 @@ fn ai_provider_str(provider: &crate::settings::AiProvider) -> &'static str {
         AiProvider::ClaudeApi => "claude_api",
         AiProvider::GeminiCli => "gemini_cli",
         AiProvider::GeminiApi => "gemini_api",
+        AiProvider::Ollama => "ollama",
+        AiProvider::OpenAiCompatible => "openai_compatible",
     }
 }
 

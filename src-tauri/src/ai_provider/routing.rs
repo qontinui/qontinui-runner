@@ -60,6 +60,13 @@ pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> Ai
             AiProvider::GeminiApi => {
                 run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
             }
+            // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
+            AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
+                "Local provider (Ollama / OpenAI-compatible) dispatch is not yet \
+                 wired into the agentic loop. The provider is configured but full \
+                 integration is deferred — use Claude or Gemini for now."
+                    .to_string(),
+            ),
         }
     })
 }
@@ -174,6 +181,13 @@ pub fn run_prompt_with_routing(
                     run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
                 }
             }
+            // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
+            AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
+                "Local provider (Ollama / OpenAI-compatible) routed dispatch is not \
+                 yet wired into the agentic loop. The provider is configured but \
+                 full integration is deferred — use Claude or Gemini for now."
+                    .to_string(),
+            ),
         }
     })
 }
@@ -378,6 +392,13 @@ fn run_prompt_with_overrides_inner(
                 doctor_handle,
                 temperature_override,
                 max_tokens_override,
+            ),
+            // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
+            AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
+                "Local provider (Ollama / OpenAI-compatible) overridden dispatch is \
+                 not yet wired into the agentic loop. The provider is configured \
+                 but full integration is deferred — use Claude or Gemini for now."
+                    .to_string(),
             ),
         };
     }
@@ -607,6 +628,13 @@ pub fn run_prompt_multimodal(
             None,
             None,
         ),
+        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
+        AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
+            "Local provider (Ollama / OpenAI-compatible) multimodal dispatch is \
+             not yet wired into the agentic loop. The provider is configured but \
+             full integration is deferred — use Claude or Gemini for now."
+                .to_string(),
+        ),
     }
 }
 
@@ -704,6 +732,14 @@ pub fn run_prompt_with_routing_multimodal(
                 None,
             )
         }
+        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
+        AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
+            "Local provider (Ollama / OpenAI-compatible) multimodal-routed \
+             dispatch is not yet wired into the agentic loop. The provider is \
+             configured but full integration is deferred — use Claude or Gemini \
+             for now."
+                .to_string(),
+        ),
     }
 }
 
@@ -796,6 +832,14 @@ pub fn run_prompt_with_model_override_multimodal(
             doctor_handle,
             temperature_override,
             max_tokens_override,
+        ),
+        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
+        AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
+            "Local provider (Ollama / OpenAI-compatible) multimodal-overridden \
+             dispatch is not yet wired into the agentic loop. The provider is \
+             configured but full integration is deferred — use Claude or Gemini \
+             for now."
+                .to_string(),
         ),
     }
 }
@@ -925,5 +969,13 @@ pub fn run_prompt_with_structured_output(
                 doctor_handle,
             )
         }
+        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
+        AiProvider::Ollama | AiProvider::OpenAiCompatible => AiResponse::error(
+            "Local provider (Ollama / OpenAI-compatible) structured-output \
+             dispatch is not yet wired into the agentic loop. The provider is \
+             configured but full integration is deferred — use Claude or Gemini \
+             for now."
+                .to_string(),
+        ),
     }
 }

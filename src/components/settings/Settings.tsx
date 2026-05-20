@@ -30,6 +30,7 @@ import { OtelSettings } from "./OtelSettings";
 import { ContainerSettings } from "./ContainerSettings";
 import { LockYieldPolicySettings } from "./LockYieldPolicySettings";
 import { SecuritySettings } from "./SecuritySettings";
+import { AccountSettings } from "./AccountSettings";
 
 interface SettingsProps {
   /** Default tab to open. If provided, overrides instanceStorage persistence. */
@@ -39,6 +40,7 @@ interface SettingsProps {
 }
 
 type SettingsTab =
+  | "account"
   | "ai"
   | "agentic"
   | "self-healing"
@@ -73,6 +75,7 @@ const STORAGE_KEY = "qontinui-settings-active-tab";
  * underneath until the next UX pass.
  */
 const SETTINGS_TABS = [
+  { id: "account", label: "Account" },
   { id: "backend-connection", label: "Backend Connection" },
   { id: "ai", label: "AI Providers" },
   { id: "agentic", label: "Advanced AI" },
@@ -186,6 +189,8 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
 
   const settingsContent = (() => {
     switch (activeTab) {
+      case "account":
+        return <AccountSettings onLog={onLog} />;
       case "backend-connection":
         return <WebIntegrationSettings onLog={onLog} />;
       case "ai":

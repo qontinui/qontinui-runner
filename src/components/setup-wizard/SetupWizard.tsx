@@ -1,6 +1,7 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { StepIndicator } from "./StepIndicator";
+import { TierStep } from "./TierStep";
 import { WelcomeStep } from "./WelcomeStep";
 import { ProjectStep } from "./ProjectStep";
 import { ProcessStep } from "./ProcessStep";
@@ -9,6 +10,7 @@ import { AiProviderStep } from "./AiProviderStep";
 import { ClaudeConfigStep } from "./ClaudeConfigStep";
 
 const STEPS = [
+  "Tier",
   "Welcome",
   "Projects",
   "Processes",
@@ -94,9 +96,11 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
       <div className="card w-full max-w-2xl p-8">
         <StepIndicator steps={STEPS} currentStep={currentStep} />
 
-        {currentStep === 0 && <WelcomeStep onNext={goNext} />}
+        {currentStep === 0 && <TierStep onNext={goNext} />}
 
-        {currentStep === 1 && (
+        {currentStep === 1 && <WelcomeStep onNext={goNext} />}
+
+        {currentStep === 2 && (
           <ProjectStep
             selectedProjects={selectedProjects}
             onProjectsChange={setSelectedProjects}
@@ -106,7 +110,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
           />
         )}
 
-        {currentStep === 2 && (
+        {currentStep === 3 && (
           <ProcessStep
             selectedProjects={selectedProjects}
             selectedConfigs={selectedProcessConfigs}
@@ -116,7 +120,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
           />
         )}
 
-        {currentStep === 3 && (
+        {currentStep === 4 && (
           <DevServicesStep
             alreadySelectedConfigs={selectedProcessConfigs}
             onNext={goNext}
@@ -124,11 +128,11 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
           />
         )}
 
-        {currentStep === 4 && (
+        {currentStep === 5 && (
           <AiProviderStep onComplete={handleAiProviderComplete} onBack={goBack} />
         )}
 
-        {currentStep === 5 && <ClaudeConfigStep onComplete={finishSetup} onBack={goBack} />}
+        {currentStep === 6 && <ClaudeConfigStep onComplete={finishSetup} onBack={goBack} />}
       </div>
     </div>
   );

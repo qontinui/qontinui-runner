@@ -206,6 +206,12 @@ mod workflow_state;
 // only compiles when running tests with the feature enabled.
 #[cfg(test)]
 mod flywheel_e2e_tests;
+
+// Phase 9 of the runner tier-decoupling rollout — calibration matrix
+// covering Tier 0 / 1 / 2 boundary invariants.
+// See plans/2026-05-20-runner-tier-decoupling.md.
+#[cfg(test)]
+mod tier_matrix_tests;
 mod worktree;
 mod wrappers;
 mod zombie_sweep;

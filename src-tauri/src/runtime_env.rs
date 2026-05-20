@@ -252,6 +252,10 @@ impl AiSessionContextExt for crate::execution_context::AiSessionContext {
             crate::settings::AiProvider::ClaudeApi => Some(settings.claude_api.model.clone()),
             crate::settings::AiProvider::GeminiCli => Some(settings.gemini_cli.model.clone()),
             crate::settings::AiProvider::GeminiApi => Some(settings.gemini_api.model.clone()),
+            crate::settings::AiProvider::Ollama => Some(settings.ollama.model.clone()),
+            crate::settings::AiProvider::OpenAiCompatible => {
+                Some(settings.openai_compatible.model.clone())
+            }
         };
 
         if let Some(model) = model_id {

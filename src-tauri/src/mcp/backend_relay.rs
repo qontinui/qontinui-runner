@@ -59,6 +59,25 @@ use uuid::Uuid;
 
 use crate::mcp::types::ApiState;
 
+/// Should the relay loop idle (await a settings-change kick) instead of
+/// attempting to connect? True iff *any* of the three gates is unmet:
+///
+/// 1. Runner tier is anything other than `QontinuiAccount` (Tier 0/1 has
+///    no business reaching qontinui-web — Phase 4 of the tier-decoupling
+///    plan).
+/// 2. `web_integration.enabled` is false (user-facing master switch).
+/// 3. `web_integration.runner_token` is empty (no credential to present —
+///    the relay would 403-spam without this guard).
+///
+/// Extracted from the relay loop body so the Phase 9 calibration suite can
+/// exercise it as a pure function. Keep it in lockstep with the call site
+/// at `start_relay_loop` (single conditional, no other consumers).
+pub(crate) fn should_relay_idle(settings: &crate::settings::Settings) -> bool {
+    settings.tier != crate::settings::RunnerTier::QontinuiAccount
+        || !settings.web_integration.enabled
+        || settings.web_integration.runner_token.trim().is_empty()
+}
+
 /// Periodicity of WS heartbeat sends. The backend's `last_heartbeat`
 /// timestamp updates from these.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -155,10 +174,14 @@ async fn relay_loop(
         let settings = crate::settings::load_settings();
         let web_integration = &settings.web_integration;
 
-        // Phase 3 trigger: web integration enabled and a token is set.
-        // No `cloud_relay.enabled` gating, no localhost auto-detect — the
-        // user's `WebIntegrationSettings` is the sole source of truth.
-        if !web_integration.enabled || web_integration.runner_token.trim().is_empty() {
+        // Phase 3 + tier-decoupling: relay idles unless the user is in Tier 2
+        // (signed into Qontinui) AND web integration is enabled AND a token is
+        // present. The tier gate stops the 403-spam loop for Tier 0/1 installs
+        // that have no business reaching qontinui-web. See plans/2026-05-20-
+        // runner-tier-decoupling.md Phase 4. The predicate is extracted to
+        // `should_relay_idle` so the Phase 9 calibration suite can exercise
+        // it without spinning the loop.
+        if should_relay_idle(&settings) {
             // Wait for a kick or shutdown before re-checking — there's
             // nothing to do until settings change.
             tokio::select! {

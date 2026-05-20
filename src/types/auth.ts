@@ -29,12 +29,27 @@ export interface AuthStatus {
   device_info: DeviceInfo | null;
 }
 
+/**
+ * Runner tier — duplicated locally rather than imported from the hook to
+ * avoid a circular-ish dependency (this module is referenced by everything
+ * that uses auth; the hook depends on Tauri APIs). Must match the union in
+ * `hooks/useRunnerTier.ts`.
+ */
+export type RunnerTier = "local" | "local_provider" | "qontinui_account";
+
 export interface AuthContextValue {
   authStatus: AuthStatus | null;
   loading: boolean;
   error: string | null;
   /** True in dev mode until auto-login completes or is skipped */
   devAutoLoginPending: boolean;
+  /**
+   * Current runner tier. Surfaced so consumers can gate UI without calling
+   * `useRunnerTier()` redundantly. Only "qontinui_account" requires a
+   * qontinui-account JWT; "local" and "local_provider" run with a
+   * synthesized local-guest auth.
+   */
+  tier: RunnerTier;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshAuth: () => Promise<void>;

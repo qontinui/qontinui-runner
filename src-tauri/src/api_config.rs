@@ -27,19 +27,23 @@ pub const DEFAULT_TAURI_DEV_PORT: u16 = 1420;
 /// Default qontinui-web FastAPI backend port.
 pub const DEFAULT_BACKEND_PORT: u16 = 8000;
 
+/// Canonical Qontinui production backend FQDN. Single source of truth for
+/// `get_api_base_url` and `settings::default_web_integration_backend_url`.
+pub const PROD_API_BASE_URL: &str = "https://api.qontinui.io";
+
 /// Get API base URL for qontinui-web backend.
 ///
 /// Resolution order:
 /// 1. `QONTINUI_API_URL` environment variable (if set)
 /// 2. Debug builds: `http://127.0.0.1:8000` (IPv4 — backend only binds IPv4,
 ///    localhost may resolve to IPv6 `::1` first)
-/// 3. Release builds: production backend URL
+/// 3. Release builds: `PROD_API_BASE_URL`
 pub fn get_api_base_url() -> String {
     std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
         if cfg!(debug_assertions) {
             format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
         } else {
-            "https://qontinui-prod-py.eba-km2u4s23.eu-central-1.elasticbeanstalk.com".to_string()
+            PROD_API_BASE_URL.to_string()
         }
     })
 }
@@ -146,5 +150,17 @@ mod tests {
         } else {
             assert!(url.is_none());
         }
+    }
+
+    /// Phase 9 calibration: lock in the canonical production backend URL.
+    /// `PROD_API_BASE_URL` is the single source of truth used by both
+    /// `get_api_base_url` (auth endpoints) and
+    /// `settings::default_web_integration_backend_url` (WS relay default).
+    /// A drift between the two surfaces is exactly the Phase 6 defect this
+    /// constant was introduced to prevent — see plans/2026-05-20-runner-
+    /// tier-decoupling.md.
+    #[test]
+    fn prod_api_base_url_is_canonical() {
+        assert_eq!(PROD_API_BASE_URL, "https://api.qontinui.io");
     }
 }

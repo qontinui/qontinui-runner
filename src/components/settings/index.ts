@@ -12,4 +12,5 @@ export { SecuritySettings } from "./SecuritySettings";
 export { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
 export { SectionHeader } from "./SectionHeader";
 export { WebIntegrationSettings } from "./WebIntegrationSettings";
+export { AccountSettings } from "./AccountSettings";
 export * from "./types";

@@ -247,12 +247,18 @@ async fn health(
         crate::settings::AiProvider::ClaudeApi => "claude_api",
         crate::settings::AiProvider::GeminiCli => "gemini_cli",
         crate::settings::AiProvider::GeminiApi => "gemini_api",
+        crate::settings::AiProvider::Ollama => "ollama",
+        crate::settings::AiProvider::OpenAiCompatible => "openai_compatible",
     };
     let ai_model: Option<String> = match &ai_settings.provider {
         crate::settings::AiProvider::ClaudeCli => None, // CLI manages its own model selection
         crate::settings::AiProvider::ClaudeApi => Some(ai_settings.claude_api.model.clone()),
         crate::settings::AiProvider::GeminiCli => Some(ai_settings.gemini_cli.model.clone()),
         crate::settings::AiProvider::GeminiApi => Some(ai_settings.gemini_api.model.clone()),
+        crate::settings::AiProvider::Ollama => Some(ai_settings.ollama.model.clone()),
+        crate::settings::AiProvider::OpenAiCompatible => {
+            Some(ai_settings.openai_compatible.model.clone())
+        }
     };
 
     // Phase 3J.2 — surface the in-memory UI error state captured by the React

@@ -962,6 +962,21 @@ pub fn oneshot_for_settings() -> Box<dyn OneshotLlm> {
                 Box::new(OneshotDisabled::new())
             }
         },
+        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop.
+        // Substrate exists (settings + connection-test functions); oneshot adapter
+        // is deferred until full agentic-loop integration ships.
+        AiProvider::Ollama => {
+            warn!(
+                "oneshot_for_settings: Ollama oneshot adapter not yet wired → OneshotDisabled (deferred Phase 3.5)"
+            );
+            Box::new(OneshotDisabled::new())
+        }
+        AiProvider::OpenAiCompatible => {
+            warn!(
+                "oneshot_for_settings: OpenAiCompatible oneshot adapter not yet wired → OneshotDisabled (deferred Phase 3.5)"
+            );
+            Box::new(OneshotDisabled::new())
+        }
     }
 }
 
@@ -1229,6 +1244,10 @@ mod tests {
                     "disabled"
                 }
             }
+            // Phase 3.5 (tier-decoupling) — oneshot adapters not yet wired.
+            // Mirrors the real `oneshot_for_settings` body which routes
+            // both variants to `OneshotDisabled` until the adapters land.
+            AiProvider::Ollama | AiProvider::OpenAiCompatible => "disabled",
         }
     }
 

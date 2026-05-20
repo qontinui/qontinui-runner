@@ -388,6 +388,8 @@ pub fn provider_key(provider: &crate::settings::AiProvider) -> String {
         crate::settings::AiProvider::ClaudeApi => "claude_api".to_string(),
         crate::settings::AiProvider::GeminiCli => "gemini_cli".to_string(),
         crate::settings::AiProvider::GeminiApi => "gemini_api".to_string(),
+        crate::settings::AiProvider::Ollama => "ollama".to_string(),
+        crate::settings::AiProvider::OpenAiCompatible => "openai_compatible".to_string(),
     }
 }
 

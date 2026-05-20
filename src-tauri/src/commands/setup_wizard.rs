@@ -352,6 +352,16 @@ pub fn save_ai_provider_from_setup(
                 ai_settings.gemini_api.model = m;
             }
         }
+        AiProvider::Ollama => {
+            if let Some(m) = model {
+                ai_settings.ollama.model = m;
+            }
+        }
+        AiProvider::OpenAiCompatible => {
+            if let Some(m) = model {
+                ai_settings.openai_compatible.model = m;
+            }
+        }
     }
 
     settings::save_ai_settings(ai_settings)
