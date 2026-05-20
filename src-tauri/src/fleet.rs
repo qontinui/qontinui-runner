@@ -524,7 +524,7 @@ pub fn spawn_heartbeat() {
 // working tree, then POSTs one row per repo to `<base>/coord/trees/upsert`.
 //
 // Mirrors the `heartbeat_to_coord` + `spawn_heartbeat` pair above:
-// - Reuses `load_machine_file` for identity.
+// - Reuses `load_device_file` for identity.
 // - Reuses `coord_http_base` for the coord HTTP endpoint resolver.
 // - Best-effort: errors `warn!` and the next tick retries; the loop never
 //   panics.
@@ -711,23 +711,31 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
 /// URL, no root dir). Caller (`spawn_tree_publisher`) treats `Err` the
 /// same as it treats heartbeat errors — log + retry next tick.
 pub async fn publish_tree_state() -> Result<(), String> {
-    let machine = match load_machine_file() {
-        Some(m) => m,
+    // Phase 3 unified-devices rename: the on-disk file is still
+    // `~/.qontinui/machine.json` (legacy filename, kept for tooling
+    // back-compat) but the in-memory `DeviceFile` struct now exposes
+    // `device_id` (serde-aliased from `machine_id` per :131-133). Fix-
+    // forwards a Phase 1 fix-forward needed on origin/main per the
+    // `feedback_check_main_red_before_blaming_pr` discovery (PR #188 +
+    // PR #49 landed slightly out of phase; this 1-line rename unblocks
+    // runner CI).
+    let device = match load_device_file() {
+        Some(d) => d,
         None => {
             info!(
                 "fleet::tree_publisher: ~/.qontinui/machine.json missing — \
-                 run `qontinui_profile machine init` to enable tree-state \
+                 run `qontinui_profile device init` to enable tree-state \
                  publishing. Skipping."
             );
             return Ok(());
         }
     };
 
-    let device_id = match uuid::Uuid::parse_str(&machine.machine_id) {
+    let device_id = match uuid::Uuid::parse_str(&device.device_id) {
         Ok(id) => id,
         Err(e) => {
             warn!(
-                "fleet::tree_publisher: machine.json machine_id is not a valid UUID ({e}). Skipping."
+                "fleet::tree_publisher: machine.json device_id is not a valid UUID ({e}). Skipping."
             );
             return Ok(());
         }

@@ -39,6 +39,7 @@ mod config_storage;
 mod constraint_engine;
 mod container;
 mod context;
+mod coord_questions;
 mod coordinator;
 mod cost_management;
 mod crash_dumps;
