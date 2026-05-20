@@ -158,11 +158,18 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
         env.insert("TEMP".to_string(), temp_dir.to_string_lossy().to_string());
         env.insert("TMP".to_string(), temp_dir.to_string_lossy().to_string());
 
+        // Use `npx next dev` rather than `npm run dev`: npx resolves the
+        // project-local Next.js binary from `node_modules/.bin` directly,
+        // independent of whether the spawning shell has populated PATH with
+        // the project's `node_modules/.bin`. Tauri's process_capture spawn
+        // path doesn't run the `npm run` PATH-injection lifecycle reliably
+        // on all hosts, so `npm run dev` was failing with `next: ENOENT`
+        // when the user POST'd `/processes/frontend/restart`.
         services.push(ProcessConfig {
             id: dev_service_id(workspace, FRONTEND_SERVICE_ID_SUFFIX),
             name: "Frontend (Next.js)".to_string(),
-            command: "npm".to_string(),
-            args: vec!["run".to_string(), "dev".to_string()],
+            command: "npx".to_string(),
+            args: vec!["next".to_string(), "dev".to_string()],
             cwd: frontend_dir.to_string_lossy().to_string(),
             env,
             health_port: Some(3001),
@@ -175,8 +182,8 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             start_group: 1,
             dev_only: true,
             rebuild_enabled: true,
-            build_command: Some("npm".to_string()),
-            build_args: vec!["run".to_string(), "build".to_string()],
+            build_command: Some("npx".to_string()),
+            build_args: vec!["next".to_string(), "build".to_string()],
         });
     }
 
