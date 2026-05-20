@@ -18,7 +18,11 @@ jobs:
       # genuine per-platform failures.
       fail-fast: false
       matrix:
-        platform: [ubuntu-22.04, macos-latest, windows-latest]
+        # macOS temporarily disabled — PR cycle time was bottlenecked at
+        # ~90 min p90 by the mac leg (see step-level timeout discussion
+        # below). Joshua does not develop on macOS; re-add `macos-latest`
+        # when cross-platform demos / mac users matter.
+        platform: [ubuntu-22.04, windows-latest]
 
     runs-on: ${{ matrix.platform }}
 
