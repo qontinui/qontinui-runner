@@ -99,7 +99,7 @@ pub async fn start_process(
         .unwrap_or_else(|| id.clone());
     manager.start_process(&resolved).await.map_err(|e| {
         (
-            StatusCode::BAD_REQUEST,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to start process: {}", e))),
         )
     })?;
@@ -173,7 +173,7 @@ pub async fn restart_process(
         .unwrap_or_else(|| id.clone());
     manager.restart_process(&resolved).await.map_err(|e| {
         (
-            StatusCode::BAD_REQUEST,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to restart process: {}", e))),
         )
     })?;
@@ -273,6 +273,64 @@ pub async fn get_output(
     Ok(Json(ApiResponse::success(output)))
 }
 
+/// Get recent log lines for a process, split into stdout / stderr ring-buffer
+/// tails. Default `lines=200`, clamped to `[1, 5000]`.
+///
+/// Response shape: `{ stdout: [..], stderr: [..], truncated: bool }`.
+/// `truncated` is `true` when either side's live ring buffer held more
+/// entries than the per-stream cap (i.e. older entries were dropped from the
+/// returned slice).
+pub async fn get_logs(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let lines_raw = query
+        .get("lines")
+        .and_then(|t| t.parse::<usize>().ok())
+        .unwrap_or(200);
+    let lines = lines_raw.clamp(1, 5000);
+
+    if primary_proxy::is_secondary() {
+        let logs = primary_proxy::get_logs(&id, lines).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(api_error(format!("Primary runner proxy error: {}", e))),
+            )
+        })?;
+        return Ok(Json(ApiResponse::success(serde_json::json!({
+            "stdout": logs.stdout,
+            "stderr": logs.stderr,
+            "truncated": logs.truncated,
+        }))));
+    }
+
+    let manager = state.app_state.process_capture_manager.lock().await;
+    let manager = manager.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error("Process capture manager not initialized")),
+        )
+    })?;
+
+    let resolved = manager
+        .resolve_process_id(&id)
+        .await
+        .unwrap_or_else(|| id.clone());
+    let (stdout, stderr, truncated) = manager.get_logs(&resolved, lines).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Failed to get logs: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": truncated,
+    }))))
+}
+
 /// Build the axum routes for process management.
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::{get, post};
@@ -287,4 +345,5 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(rebuild_and_restart_process),
         )
         .route("/processes/{id}/output", get(get_output))
+        .route("/processes/{id}/logs", get(get_logs))
 }
