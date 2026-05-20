@@ -13,6 +13,11 @@ mod action_service;
 mod agent_claims;
 mod agent_daemons;
 mod agent_pusher;
+// Plan `2026-05-19-coordinator-production-readiness.md` Phase 4 —
+// coord-driven Claude Code subprocess runtime. Subscribes to spawn-
+// requests on coord WS, materializes worktrees, spawns the `claude`
+// CLI, heartbeats the claim, forwards stdout/stderr to coord logs.
+mod agent_runtime;
 mod agent_token;
 mod agent_worktree;
 mod agentic_verification;
@@ -464,6 +469,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // pay for a second long-lived thread; the publisher's
                 // 60s cadence is way below the heartbeat's 30s scale.
                 fleet::spawn_tree_publisher();
+                // Phase 4 — coord-driven Claude Code subprocess runtime.
+                // Subscribes to `events.agent.spawn_requested.<device_id>`
+                // on coord WS and supervises the resulting `claude` CLI
+                // child processes. No-op when no profile is configured.
+                agent_runtime::spawn_runtime();
                 // Park this thread's runtime forever so the spawned
                 // interval task keeps ticking for the runner's lifetime.
                 std::future::pending::<()>().await;
