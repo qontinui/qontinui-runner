@@ -1049,10 +1049,15 @@ mod tier_tests {
     /// first load, and the sentinel must flip true.
     #[test]
     fn migrate_tier_from_runner_token_infers_qontinui_account() {
-        let mut s = Settings::default();
-        s.tier_initialized = false;
-        s.tier = RunnerTier::Local; // pre-migration in-memory state
-        s.web_integration.runner_token = "qontinui_runner_abc".to_string();
+        let mut s = Settings {
+            tier_initialized: false,
+            tier: RunnerTier::Local, // pre-migration in-memory state
+            web_integration: WebIntegrationSettings {
+                runner_token: "qontinui_runner_abc".to_string(),
+                ..WebIntegrationSettings::default()
+            },
+            ..Settings::default()
+        };
 
         let migrated = migrate_tier_in_place(&mut s);
         assert!(migrated, "must report migration performed");
@@ -1064,8 +1069,10 @@ mod tier_tests {
     /// (genuinely fresh install) must land in Local with the sentinel set.
     #[test]
     fn migrate_tier_without_runner_token_stays_local() {
-        let mut s = Settings::default();
-        s.tier_initialized = false;
+        let mut s = Settings {
+            tier_initialized: false,
+            ..Settings::default()
+        };
         s.web_integration.runner_token.clear();
 
         let migrated = migrate_tier_in_place(&mut s);
@@ -1078,10 +1085,15 @@ mod tier_tests {
     /// subsequent loads must not overwrite a deliberate user tier choice.
     #[test]
     fn migrate_tier_is_no_op_once_initialized() {
-        let mut s = Settings::default();
-        s.tier_initialized = true;
-        s.tier = RunnerTier::LocalProvider; // user explicitly chose Tier 1
-        s.web_integration.runner_token = "qontinui_runner_xyz".to_string();
+        let mut s = Settings {
+            tier_initialized: true,
+            tier: RunnerTier::LocalProvider, // user explicitly chose Tier 1
+            web_integration: WebIntegrationSettings {
+                runner_token: "qontinui_runner_xyz".to_string(),
+                ..WebIntegrationSettings::default()
+            },
+            ..Settings::default()
+        };
 
         let migrated = migrate_tier_in_place(&mut s);
         assert!(!migrated, "must not re-migrate when initialized");

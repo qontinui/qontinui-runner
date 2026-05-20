@@ -61,13 +61,14 @@ use crate::settings::{RunnerTier, Settings, WebIntegrationSettings};
 /// stay at `Default::default()` (i.e. `web_integration.enabled = true`,
 /// `runner_token = ""`).
 fn settings_with(tier: RunnerTier, runner_token: &str) -> Settings {
-    let mut s = Settings::default();
-    s.tier = tier;
-    s.web_integration = WebIntegrationSettings {
-        runner_token: runner_token.to_string(),
-        ..WebIntegrationSettings::default()
-    };
-    s
+    Settings {
+        tier,
+        web_integration: WebIntegrationSettings {
+            runner_token: runner_token.to_string(),
+            ..WebIntegrationSettings::default()
+        },
+        ..Settings::default()
+    }
 }
 
 // ----------------------------------------------------------------------------
