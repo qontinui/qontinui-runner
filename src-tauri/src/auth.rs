@@ -16,6 +16,17 @@ use uuid::Uuid;
 /// Service name used for keychain entries (legacy)
 const SERVICE_NAME: &str = "com.qontinui.runner";
 
+/// When `QONTINUI_DISABLE_KEYCHAIN` is set, keychain reads return an error
+/// (callers fall back to file storage) and keychain writes are no-ops. The
+/// keychain path is best-effort migration backup; file storage is the source
+/// of truth. On macOS CI, `keyring::Entry::get_password()` blocks indefinitely
+/// waiting for a Keychain user-permission dialog that never resolves — three
+/// auth tests would hang past the 90-min step timeout. Setting this env var
+/// in CI bypasses the dialog cleanly.
+fn keychain_enabled() -> bool {
+    std::env::var_os("QONTINUI_DISABLE_KEYCHAIN").is_none()
+}
+
 /// Manages authentication tokens and device ID storage.
 ///
 /// The AuthManager provides secure storage for:
@@ -83,6 +94,10 @@ impl AuthManager {
 
     /// Stores tokens in the OS keychain (legacy/backup).
     fn store_tokens_in_keychain(&self, access_token: &str, refresh_token: &str) -> Result<()> {
+        if !keychain_enabled() {
+            debug!("keychain disabled via QONTINUI_DISABLE_KEYCHAIN, skipping store");
+            return Ok(());
+        }
         let entry_access = Entry::new(&self.service_name, "access_token")
             .context("Failed to create keychain entry for access token")?;
         let entry_refresh = Entry::new(&self.service_name, "refresh_token")
@@ -141,6 +156,11 @@ impl AuthManager {
 
     /// Retrieves access token from keychain (legacy).
     fn get_access_token_from_keychain(&self) -> Result<String> {
+        if !keychain_enabled() {
+            return Err(anyhow::anyhow!(
+                "keychain disabled via QONTINUI_DISABLE_KEYCHAIN"
+            ));
+        }
         let entry = Entry::new(&self.service_name, "access_token")
             .context("Failed to create keychain entry for access token")?;
         entry
@@ -182,6 +202,11 @@ impl AuthManager {
 
     /// Retrieves refresh token from keychain (legacy).
     fn get_refresh_token_from_keychain(&self) -> Result<String> {
+        if !keychain_enabled() {
+            return Err(anyhow::anyhow!(
+                "keychain disabled via QONTINUI_DISABLE_KEYCHAIN"
+            ));
+        }
         let entry = Entry::new(&self.service_name, "refresh_token")
             .context("Failed to create keychain entry for refresh token")?;
         entry
@@ -213,6 +238,9 @@ impl AuthManager {
 
     /// Clears tokens from keychain (legacy).
     fn clear_tokens_from_keychain(&self) -> Result<()> {
+        if !keychain_enabled() {
+            return Ok(());
+        }
         let entry_access = Entry::new(&self.service_name, "access_token")
             .context("Failed to create keychain entry for access token")?;
         let entry_refresh = Entry::new(&self.service_name, "refresh_token")
@@ -241,8 +269,10 @@ impl AuthManager {
             .context("Failed to store device_id in secure storage")?;
 
         // Also store in keychain (backup, best effort)
-        if let Ok(entry) = Entry::new(&self.service_name, "device_id") {
-            let _ = entry.set_password(device_id);
+        if keychain_enabled() {
+            if let Ok(entry) = Entry::new(&self.service_name, "device_id") {
+                let _ = entry.set_password(device_id);
+            }
         }
 
         info!("Device ID stored: {}", device_id);
@@ -265,17 +295,19 @@ impl AuthManager {
         }
 
         // Try keychain (for migration)
-        if let Ok(entry) = Entry::new(&self.service_name, "device_id") {
-            if let Ok(id) = entry.get_password() {
-                info!(
-                    "Retrieved existing device ID from keychain (migrating): {}",
-                    id
-                );
-                // Migrate to file storage
-                if let Err(e) = self.secure_storage.store_device_id(&id) {
-                    warn!("Failed to migrate device ID to secure storage: {}", e);
+        if keychain_enabled() {
+            if let Ok(entry) = Entry::new(&self.service_name, "device_id") {
+                if let Ok(id) = entry.get_password() {
+                    info!(
+                        "Retrieved existing device ID from keychain (migrating): {}",
+                        id
+                    );
+                    // Migrate to file storage
+                    if let Err(e) = self.secure_storage.store_device_id(&id) {
+                        warn!("Failed to migrate device ID to secure storage: {}", e);
+                    }
+                    return Ok(id);
                 }
-                return Ok(id);
             }
         }
 

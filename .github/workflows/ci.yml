@@ -182,6 +182,20 @@ jobs:
         # PR #84, so the cap is just bounding normal variance now.
         timeout-minutes: 90
         env:
+          # `auth::tests::test_device_id_*` and `test_token_storage` exercise
+          # `AuthManager::get_device_id` / `store_tokens`, which fall through
+          # to `keyring::Entry::{get,set}_password()` when file storage is
+          # empty (the test helper wipes the storage file). On macOS GitHub
+          # runners the Keychain blocks indefinitely waiting for a permission
+          # dialog (no TTY/desktop session), hanging the three tests past
+          # cargo's per-test heartbeat — the entire test step then eats the
+          # 90-min budget. Bumping the step timeout only delays the hang.
+          # The fix is to skip the keychain-backup path in CI entirely: see
+          # `keychain_enabled()` in `src-tauri/src/auth.rs`, which
+          # short-circuits all keychain ops when this var is set. File
+          # storage remains the source of truth, so auth tests stay real
+          # integration tests against the encrypted file backend.
+          QONTINUI_DISABLE_KEYCHAIN: "1"
           # `CARGO_BUILD_JOBS` reduces the parallel-rustc memory peak.
           # Empirically:
           #   - Windows: was passing at JOBS=2 with a 16 GB pagefile (run
