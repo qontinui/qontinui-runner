@@ -118,6 +118,7 @@ mod tests {
         let mut a = empty_spec();
         a.provenance = Some(IrProvenance {
             source: "hand-authored".to_string(),
+            app_id: "qontinui-runner".to_string(),
             file: Some("a.json".to_string()),
             line: Some(10),
             column: Some(5),
@@ -127,6 +128,7 @@ mod tests {
         let mut b = empty_spec();
         b.provenance = Some(IrProvenance {
             source: "hand-authored".to_string(),
+            app_id: "qontinui-runner".to_string(),
             file: Some("b.json".to_string()),
             line: Some(99),
             column: Some(1),
@@ -144,6 +146,7 @@ mod tests {
         let mut a = empty_spec();
         a.provenance = Some(IrProvenance {
             source: "hand-authored".to_string(),
+            app_id: "qontinui-runner".to_string(),
             file: None,
             line: None,
             column: None,
@@ -153,6 +156,7 @@ mod tests {
         let mut b = empty_spec();
         b.provenance = Some(IrProvenance {
             source: "ai-generated".to_string(),
+            app_id: "qontinui-runner".to_string(),
             file: None,
             line: None,
             column: None,
@@ -186,6 +190,7 @@ mod tests {
             metadata: None,
             provenance: Some(IrProvenance {
                 source: "hand-authored".to_string(),
+                app_id: "qontinui-runner".to_string(),
                 file: Some("a.json".to_string()),
                 line: Some(10),
                 column: None,
@@ -213,6 +218,7 @@ mod tests {
             metadata: None,
             provenance: Some(IrProvenance {
                 source: "hand-authored".to_string(),
+                app_id: "qontinui-runner".to_string(),
                 file: Some("b.json".to_string()),
                 line: Some(99),
                 column: Some(7),

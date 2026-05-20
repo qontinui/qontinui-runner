@@ -658,6 +658,7 @@ pub(crate) fn build_author_response(root: &std::path::Path, doc: IrPageSpec) -> 
         }
     };
     events::emit(events::SpecApiEvent::SpecChanged(SpecChanged {
+        app_id: String::new(),
         page_id: doc.id.clone(),
         kind: "ir-and-projection".to_string(),
         at_ms: events::now_ms(),

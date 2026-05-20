@@ -357,6 +357,7 @@ pub fn write_pending_ir(root: &Path, ir: &IrPageSpec) -> Result<PathBuf, String>
     let mut doc = ir.clone();
     let mut prov = doc.provenance.unwrap_or(super::types::IrProvenance {
         source: "ai-generated".to_string(),
+        app_id: "qontinui-runner".to_string(),
         file: None,
         line: None,
         column: None,
@@ -431,6 +432,7 @@ pub fn promote_pending(root: &Path, page_id: &str) -> Result<(), String> {
 
     let mut prov = doc.provenance.unwrap_or(super::types::IrProvenance {
         source: "ai-generated".to_string(),
+        app_id: "qontinui-runner".to_string(),
         file: None,
         line: None,
         column: None,
@@ -576,6 +578,7 @@ mod pending_tests {
         // without mutating the caller's IR.
         let input_prov = IrProvenance {
             source: "ai-generated".into(),
+            app_id: "qontinui-runner".to_string(),
             file: None,
             line: None,
             column: None,
@@ -640,6 +643,7 @@ mod pending_tests {
             "page-c",
             Some(IrProvenance {
                 source: "ai-generated".into(),
+                app_id: "qontinui-runner".to_string(),
                 file: None,
                 line: None,
                 column: None,

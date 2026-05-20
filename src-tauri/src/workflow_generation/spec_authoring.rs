@@ -234,6 +234,7 @@ async fn load_and_project_skeleton(
         metadata: None,
         provenance: Some(IrProvenance {
             source: "build-plugin".into(),
+            app_id: "qontinui-runner".to_string(),
             status: Some(ProposalStatus::Proposed),
             ..Default::default()
         }),
@@ -367,6 +368,7 @@ fn project_cluster_to_state(cluster: &Cluster) -> IrState {
         metadata: None,
         provenance: Some(IrProvenance {
             source: "build-plugin".into(),
+            app_id: "qontinui-runner".to_string(),
             status: Some(ProposalStatus::Proposed),
             ..Default::default()
         }),
@@ -495,6 +497,7 @@ fn stamp_provenance_ai_generated_proposed(ir: &mut IrPageSpec) {
             None => {
                 state.provenance = Some(IrProvenance {
                     source: "ai-generated".into(),
+                    app_id: "qontinui-runner".to_string(),
                     status: Some(ProposalStatus::Proposed),
                     ..Default::default()
                 });
@@ -744,6 +747,7 @@ pub(crate) fn merge_patch_into_ir(
     for mut tx in patch.add_transitions {
         tx.provenance = Some(IrProvenance {
             source: "ai-generated".into(),
+            app_id: "qontinui-runner".to_string(),
             status: Some(ProposalStatus::Proposed),
             ..Default::default()
         });
@@ -927,6 +931,7 @@ mod tests {
             metadata: None,
             provenance: Some(IrProvenance {
                 source: "build-plugin".into(),
+                app_id: "qontinui-runner".to_string(),
                 status: Some(ProposalStatus::Proposed),
                 ..Default::default()
             }),
@@ -1039,6 +1044,7 @@ mod tests {
             metadata: None,
             provenance: Some(IrProvenance {
                 source: "build-plugin".into(),
+                app_id: "qontinui-runner".to_string(),
                 status: Some(ProposalStatus::Proposed),
                 ..Default::default()
             }),
@@ -1069,6 +1075,7 @@ mod tests {
         let mut ir = make_skeleton(&["keep", "stamp"]);
         ir.states[0].provenance = Some(IrProvenance {
             source: "hand-authored".into(),
+            app_id: "qontinui-runner".to_string(),
             ..Default::default()
         });
         // ir.states[1].provenance is None initially.
@@ -1142,6 +1149,7 @@ mod tests {
         let mut ir = make_skeleton(&[state_id]);
         ir.states[0].provenance = Some(IrProvenance {
             source: source.into(),
+            app_id: "qontinui-runner".to_string(),
             ..Default::default()
         });
         ir

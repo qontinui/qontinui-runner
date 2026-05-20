@@ -34,6 +34,7 @@ use qontinui_types::ui_bridge::UIBridgeSnapshot; // capital UI; lives in ui_brid
 /// `total_duration_ms` field. Sync-only — the evaluator itself is sync.
 fn invoke_emit(snapshot_id: &str, page_ids: Vec<String>, invoked_via: &str) {
     events::emit(SpecApiEvent::SpecCheckInvoked {
+        app_id: String::new(),
         snapshot_id: snapshot_id.to_string(),
         page_ids,
         invoked_via: invoked_via.to_string(),
@@ -585,6 +586,7 @@ pub async fn post_spec_check(
     let (perfect, partial, no_match, eval_error, overall_rate) = completion_counts(&[&result], 1);
     let completed_ms = events::now_ms();
     events::emit(SpecApiEvent::SpecCheckCompleted {
+        app_id: String::new(),
         snapshot_id: snapshot_id.clone(),
         page_count: 1,
         overall_match_rate: overall_rate,
@@ -766,6 +768,7 @@ pub async fn post_spec_check_batch(
         completion_counts(&ok_results, input_page_count);
     let completed_ms = events::now_ms();
     events::emit(SpecApiEvent::SpecCheckCompleted {
+        app_id: String::new(),
         snapshot_id: snapshot_id.clone(),
         page_count: input_page_count,
         overall_match_rate: overall_rate,
@@ -948,6 +951,7 @@ async fn stream_batch_results(
                         };
                         let completed_ms = events::now_ms();
                         events::emit(SpecApiEvent::SpecCheckCompleted {
+                            app_id: String::new(),
                             snapshot_id: snap_id,
                             page_count: input_page_count,
                             overall_match_rate: overall,

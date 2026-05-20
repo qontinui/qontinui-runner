@@ -33,7 +33,7 @@ use serde_json::{Map, Value};
 /// canonical types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        accessibility as qa, ai_workflows as qaw, app_events as qae, config as qcfg,
+        accessibility as qa, ai_workflows as qaw, app_events as qae, apps as qap, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn, geometry as qg,
         ir as qir, mcp_config as qmc, orchestration_config as qoc, process_management as qpm,
         rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
@@ -675,6 +675,13 @@ pub fn export_all_schemas() -> Value {
 
     // ── qontinui-types: spec_api_events (Plan 06 broadcast taxonomy) ──
     add!("SpecApiEvent", qsae::SpecApiEvent);
+
+    // ── qontinui-types: apps (multi-tenant Spec API registry — Stream A) ──
+    add!("App", qap::App);
+    add!("RegisterAppRequest", qap::RegisterAppRequest);
+    add!("UpdateAppRequest", qap::UpdateAppRequest);
+    add!("AppListResponse", qap::AppListResponse);
+    add!("AppError", qap::AppError);
 
     // ── qontinui-types: ui_bridge ──
     add!("ElementBbox", qub::ElementBbox);

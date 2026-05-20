@@ -292,6 +292,7 @@ mod handler_tests {
         // Exercise the broadcaster directly: subscribe, emit, await event.
         let mut rx = events::subscribe();
         events::emit(events::SpecApiEvent::SpecChanged(events::SpecChanged {
+            app_id: String::new(),
             page_id: "active".to_string(),
             kind: "ir-and-projection".to_string(),
             at_ms: events::now_ms(),

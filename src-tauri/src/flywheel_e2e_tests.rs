@@ -178,6 +178,7 @@ fn proposed_ir(id: &str) -> IrPageSpec {
         metadata: None,
         provenance: Some(IrProvenance {
             source: "ai-generated".into(),
+            app_id: "qontinui-runner".to_string(),
             file: None,
             line: None,
             column: None,
@@ -268,6 +269,7 @@ fn hand_authored_ir(id: &str, state_id: &str) -> IrPageSpec {
     ir.states[0].name = state_id.into();
     ir.states[0].provenance = Some(IrProvenance {
         source: "hand-authored".into(),
+        app_id: "qontinui-runner".to_string(),
         file: None,
         line: None,
         column: None,

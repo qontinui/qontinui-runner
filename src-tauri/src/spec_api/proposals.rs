@@ -734,6 +734,7 @@ pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response 
                             // Plan 06: Promoted emit — joins via snapshot_id
                             // against the green run that triggered it.
                             events::emit(SpecApiEvent::FlywheelProposalPromoted {
+                                app_id: String::new(),
                                 proposal_id: prop.id.clone(),
                                 page_id: spec_id.clone(),
                                 consecutive_greens: new_greens.max(0) as u32,
@@ -801,6 +802,7 @@ pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response 
                 let (failing_state_id, failing_assertion_id) =
                     failing_assertion.unwrap_or_default();
                 events::emit(SpecApiEvent::FlywheelProposalDemoted {
+                    app_id: String::new(),
                     proposal_id: prop.id.clone(),
                     page_id: spec_id.clone(),
                     failing_assertion_id,

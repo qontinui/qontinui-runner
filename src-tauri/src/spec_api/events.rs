@@ -113,6 +113,7 @@ pub fn emit_policy_violations(
             .map(|c| rule_kind_str(&c.rule))
             .unwrap_or("unknown");
         emit(SpecApiEvent::SpecCheckPolicyViolation {
+            app_id: String::new(),
             snapshot_id: snapshot_id.to_string(),
             page_id: page_id.to_string(),
             conjunct_name: conjunct_eval.name.clone(),
