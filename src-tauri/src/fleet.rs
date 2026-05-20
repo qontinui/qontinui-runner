@@ -549,6 +549,20 @@ struct TreeStatePayload {
     dirty_files: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_edit_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Commits HEAD is behind `origin/<branch>` (or `origin/main` if
+    /// HEAD is detached). Reflects last-fetched remote state — no
+    /// network fetch is performed. `None` if neither remote ref
+    /// resolves locally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behind_count: Option<i32>,
+    /// True when HEAD is detached (not pointing at a named branch).
+    /// `None` if status couldn't be determined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_detached: Option<bool>,
+    /// `git ls-files --others --exclude-standard` count — files not
+    /// tracked and not gitignored. The orphan-untracked-file signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    untracked_count: Option<i32>,
 }
 
 /// Maximum number of dirty paths included per row (the column is unbounded
@@ -611,10 +625,15 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         })?;
 
     // Current branch (best-effort — detached HEAD returns empty)
-    let branch = Command::new("git")
+    let symbolic_ref = Command::new("git")
         .args(["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"])
         .output()
-        .ok()
+        .ok();
+    let head_detached = symbolic_ref
+        .as_ref()
+        .map(|o| !o.status.success())
+        .or(Some(false));
+    let branch = symbolic_ref
         .and_then(|o| {
             if o.status.success() {
                 Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -685,6 +704,62 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             })
     };
 
+    // behind_count: commits HEAD is behind `origin/<branch>` (or
+    // `origin/main` when detached/no branch). Uses last-fetched remote
+    // state — no `git fetch` is performed here (publisher runs every
+    // 60s; an implicit fetch every cycle would be too aggressive).
+    // The operator's normal `git fetch` / `pull-all` cadence keeps the
+    // remote refs current.
+    let remote_ref = if head_detached.unwrap_or(false) || branch == "(detached)" {
+        "origin/main".to_string()
+    } else {
+        format!("origin/{branch}")
+    };
+    let behind_count: Option<i32> = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str()?,
+            "rev-list",
+            "--count",
+            &format!("HEAD..{remote_ref}"),
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+            } else {
+                None
+            }
+        });
+
+    // untracked_count: `git ls-files --others --exclude-standard` — one
+    // line per untracked file. The orphan-untracked-file signal that
+    // catches sub-agent worktree builds spilling scratch into the
+    // primary tree.
+    let untracked_count: Option<i32> = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str()?,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout);
+                let n: i32 = s.lines().filter(|l| !l.is_empty()).count() as i32;
+                Some(n)
+            } else {
+                None
+            }
+        });
+
     // device_id is filled in by the caller (it's identity-side, not
     // per-repo). Punch in a placeholder; the publisher overwrites it.
     Some(TreeStatePayload {
@@ -699,6 +774,9 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             Some(dirty_files)
         },
         last_edit_at,
+        behind_count,
+        head_detached,
+        untracked_count,
     })
 }
 
