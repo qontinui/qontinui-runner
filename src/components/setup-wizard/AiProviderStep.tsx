@@ -1,3 +1,7 @@
+// TODO(tier-decoupling Phase 3.5): expose Ollama + OpenAiCompatible provider
+// cards here. Rust substrate is shipped (settings::AiProvider variants +
+// test_ollama_connection + test_openai_compatible_connection); only the UI
+// surface needs to be added. Tracking in the runner-tier-decoupling plan.
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Terminal, Cloud, Loader2, Check } from "lucide-react";

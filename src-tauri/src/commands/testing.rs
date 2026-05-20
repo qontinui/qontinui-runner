@@ -1254,6 +1254,8 @@ pub async fn generate_test_with_ai(
         settings::AiProvider::ClaudeApi => "claude_api",
         settings::AiProvider::GeminiCli => "gemini_cli",
         settings::AiProvider::GeminiApi => "gemini_api",
+        settings::AiProvider::Ollama => "ollama",
+        settings::AiProvider::OpenAiCompatible => "openai_compatible",
     };
 
     // Build provider-specific settings
@@ -1283,6 +1285,21 @@ pub async fn generate_test_with_ai(
         }
         settings::AiProvider::GeminiCli | settings::AiProvider::GeminiApi => {
             serde_json::json!({})
+        }
+        // TODO(tier-decoupling): wire Ollama/OpenAiCompatible into the agentic loop
+        settings::AiProvider::Ollama => {
+            serde_json::json!({
+                "base_url": ai_settings.ollama.base_url,
+                "model": ai_settings.ollama.model,
+                "timeout_seconds": ai_settings.ollama.timeout_seconds,
+            })
+        }
+        settings::AiProvider::OpenAiCompatible => {
+            serde_json::json!({
+                "base_url": ai_settings.openai_compatible.base_url,
+                "model": ai_settings.openai_compatible.model,
+                "timeout_seconds": ai_settings.openai_compatible.timeout_seconds,
+            })
         }
     };
 

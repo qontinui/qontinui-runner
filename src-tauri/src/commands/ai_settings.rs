@@ -11,7 +11,8 @@ use crate::error::AppError;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
 use crate::settings::{
     self, AccountSelectionMode, AiProvider, AiSettings, ClaudeApiSettings, ClaudeCliSettings,
-    CliExecutionMode, GeminiApiSettings, GeminiAuthMethod, GeminiCliSettings,
+    CliExecutionMode, GeminiApiSettings, GeminiAuthMethod, GeminiCliSettings, OllamaSettings,
+    OpenAiCompatibleSettings,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,8 @@ pub fn save_ai_settings(
         "claude_api" => AiProvider::ClaudeApi,
         "gemini_cli" => AiProvider::GeminiCli,
         "gemini_api" => AiProvider::GeminiApi,
+        "ollama" => AiProvider::Ollama,
+        "openai_compatible" => AiProvider::OpenAiCompatible,
         _ => return Err(format!("Invalid provider: {}", provider)),
     };
 
@@ -153,6 +156,9 @@ pub fn save_ai_settings(
         // Preserve existing Gemini settings
         gemini_cli: existing_settings.gemini_cli,
         gemini_api: existing_settings.gemini_api,
+        // Preserve existing Ollama / OpenAI-compatible settings (Tier 0 substrate)
+        ollama: existing_settings.ollama,
+        openai_compatible: existing_settings.openai_compatible,
         auto_refine_video_after_iterations: auto_refine_video_after_iterations.unwrap_or(3),
         // Preserve compression, retry, and routing settings
         compression: existing_settings.compression,
@@ -244,6 +250,9 @@ pub fn save_gemini_settings(
             max_output_tokens,
             temperature,
         },
+        // Preserve existing Ollama / OpenAI-compatible settings
+        ollama: existing_settings.ollama,
+        openai_compatible: existing_settings.openai_compatible,
         auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
         // Preserve compression, retry, routing, and interactive settings
         compression: existing_settings.compression,
@@ -263,6 +272,119 @@ pub fn save_gemini_settings(
     Ok(CommandResponse {
         success: true,
         message: Some("Gemini settings saved".to_string()),
+        data: None,
+    })
+}
+
+/// Save Ollama-specific AI settings (Tier 0).
+///
+/// Updates the Ollama settings in the persistent settings file while preserving
+/// every other provider's configuration AND the current `provider` selection.
+/// Symmetric to `save_gemini_settings` so the React-side wiring is uniform.
+///
+/// # Arguments
+/// * `base_url` - Ollama HTTP API base URL (e.g. "http://127.0.0.1:11434")
+/// * `model` - Model identifier (e.g. "llama3.1:8b")
+/// * `timeout_seconds` - Per-request timeout
+#[tauri::command]
+pub fn save_ollama_settings(
+    base_url: String,
+    model: String,
+    timeout_seconds: u64,
+) -> Result<CommandResponse, String> {
+    info!(
+        "Saving Ollama settings: base_url={}, model={}, timeout={}s",
+        base_url, model, timeout_seconds
+    );
+
+    let existing_settings = settings::get_ai_settings();
+    let ai_settings = AiSettings {
+        // IMPORTANT: preserve the existing provider — don't auto-switch to Ollama.
+        provider: existing_settings.provider,
+        claude_cli: existing_settings.claude_cli,
+        claude_api: existing_settings.claude_api,
+        gemini_cli: existing_settings.gemini_cli,
+        gemini_api: existing_settings.gemini_api,
+        ollama: OllamaSettings {
+            base_url,
+            model,
+            timeout_seconds,
+        },
+        openai_compatible: existing_settings.openai_compatible,
+        auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
+        compression: existing_settings.compression,
+        retry: existing_settings.retry,
+        routing: existing_settings.routing,
+        interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
+        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+    };
+
+    settings::save_ai_settings(ai_settings).map_err(|e| {
+        String::from(AppError::ConfigError(format!(
+            "Failed to save Ollama settings: {}",
+            e
+        )))
+    })?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Ollama settings saved".to_string()),
+        data: None,
+    })
+}
+
+/// Save OpenAI-compatible endpoint settings (Tier 0/1).
+///
+/// Updates the OpenAI-compatible settings in the persistent settings file
+/// while preserving every other provider's configuration AND the current
+/// `provider` selection.
+///
+/// # Arguments
+/// * `base_url` - Full base URL (e.g. "http://localhost:8080/v1")
+/// * `model` - Model identifier the server expects
+/// * `timeout_seconds` - Per-request timeout
+#[tauri::command]
+pub fn save_openai_compatible_settings(
+    base_url: String,
+    model: String,
+    timeout_seconds: u64,
+) -> Result<CommandResponse, String> {
+    info!(
+        "Saving OpenAI-compatible settings: base_url={}, model={}, timeout={}s",
+        base_url, model, timeout_seconds
+    );
+
+    let existing_settings = settings::get_ai_settings();
+    let ai_settings = AiSettings {
+        provider: existing_settings.provider,
+        claude_cli: existing_settings.claude_cli,
+        claude_api: existing_settings.claude_api,
+        gemini_cli: existing_settings.gemini_cli,
+        gemini_api: existing_settings.gemini_api,
+        ollama: existing_settings.ollama,
+        openai_compatible: OpenAiCompatibleSettings {
+            base_url,
+            model,
+            timeout_seconds,
+        },
+        auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
+        compression: existing_settings.compression,
+        retry: existing_settings.retry,
+        routing: existing_settings.routing,
+        interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
+        ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+    };
+
+    settings::save_ai_settings(ai_settings).map_err(|e| {
+        String::from(AppError::ConfigError(format!(
+            "Failed to save OpenAI-compatible settings: {}",
+            e
+        )))
+    })?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("OpenAI-compatible settings saved".to_string()),
         data: None,
     })
 }
@@ -372,6 +494,10 @@ async fn test_ai_connection_impl() -> Result<CommandResponse, AppError> {
         AiProvider::ClaudeApi => test_claude_api_connection(&ai_settings.claude_api).await,
         AiProvider::GeminiCli => test_gemini_cli_connection(&ai_settings.gemini_cli).await,
         AiProvider::GeminiApi => test_gemini_api_connection(&ai_settings.gemini_api).await,
+        AiProvider::Ollama => test_ollama_connection(&ai_settings.ollama).await,
+        AiProvider::OpenAiCompatible => {
+            test_openai_compatible_connection(&ai_settings.openai_compatible).await
+        }
     };
 
     let test_result = match result {
@@ -670,6 +796,60 @@ async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<Stri
     }
 }
 
+/// Test Ollama connection by hitting GET <base_url>/api/tags.
+async fn test_ollama_connection(settings: &OllamaSettings) -> Result<String, String> {
+    let url = format!("{}/api/tags", settings.base_url.trim_end_matches('/'));
+    info!("Testing Ollama connection: GET {}", url);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            // Optionally extract the model list and confirm `settings.model` is present.
+            let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+            let model_count = body
+                .get("models")
+                .and_then(|m| m.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Ok(format!(
+                "Ollama connected ({} models available, configured: {})",
+                model_count, settings.model
+            ))
+        }
+        Ok(resp) => Err(format!("Ollama returned {}", resp.status())),
+        Err(e) => Err(format!("Ollama network error: {}", e)),
+    }
+}
+
+/// Test an OpenAI-compatible endpoint by hitting <base_url>/models.
+async fn test_openai_compatible_connection(
+    settings: &OpenAiCompatibleSettings,
+) -> Result<String, String> {
+    if settings.base_url.trim().is_empty() {
+        return Err("OpenAI-compatible base_url is empty — configure it first.".to_string());
+    }
+    let url = format!("{}/models", settings.base_url.trim_end_matches('/'));
+    info!("Testing OpenAI-compatible: GET {}", url);
+    let api_key = get_ai_api_key("openai_compatible").ok().flatten();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;
+    let mut req = client.get(&url);
+    if let Some(k) = api_key {
+        req = req.bearer_auth(k);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            Ok(format!("OpenAI-compatible endpoint reachable at {}", url))
+        }
+        Ok(resp) => Err(format!("Endpoint returned {}", resp.status())),
+        Err(e) => Err(format!("Network error: {}", e)),
+    }
+}
+
 /// Get the agentic settings (compression, retry, routing).
 ///
 /// Returns the agentic features settings from the persistent settings file.
@@ -792,6 +972,8 @@ pub fn save_agentic_settings(
         claude_api: existing_settings.claude_api,
         gemini_cli: existing_settings.gemini_cli,
         gemini_api: existing_settings.gemini_api,
+        ollama: existing_settings.ollama,
+        openai_compatible: existing_settings.openai_compatible,
         auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
         compression: compression_config,
         retry: retry_config,

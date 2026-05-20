@@ -16,6 +16,31 @@ use tauri::Runtime;
 use tracing::{error, info, warn};
 
 use crate::api_config::get_api_base_url;
+use crate::settings;
+
+/// Pure-input variant of [`require_tier_2`] used by tests. Reject any tier
+/// other than `QontinuiAccount` with the canonical error message.
+///
+/// Extracted so the tier-matrix calibration suite (Phase 9 of the runner
+/// tier-decoupling plan) can exercise the gate without going through disk
+/// I/O or `load_settings`.
+pub(crate) fn require_tier_2_for(tier: settings::RunnerTier) -> Result<(), AppError> {
+    if tier != settings::RunnerTier::QontinuiAccount {
+        return Err(AppError::AuthError(
+            "Tier 0/1 (Local / LocalProvider) — Qontinui account commands are unavailable. \
+             Sign in via Settings → Account to enable."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Returns Err with a structured "Tier 0/1 — no auth" message when the
+/// runner is not in Tier 2. All cloud-reaching auth commands gate on this.
+fn require_tier_2() -> Result<(), AppError> {
+    let s = settings::load_settings();
+    require_tier_2_for(s.tier)
+}
 
 /// Response from the login endpoint
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,6 +147,7 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
 }
 
 async fn login_impl(email: String, password: String) -> Result<LoginResponse, AppError> {
+    require_tier_2()?;
     info!("Login attempt for email: {}", email);
 
     let auth_manager = AuthManager::new();
@@ -250,6 +276,7 @@ pub async fn logout() -> Result<(), String> {
 }
 
 async fn logout_impl() -> Result<(), AppError> {
+    require_tier_2()?;
     info!("Logout requested");
 
     let auth_manager = AuthManager::new();
@@ -283,6 +310,17 @@ pub async fn check_auth_status() -> Result<AuthStatus, String> {
 
 async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     info!("Checking authentication status");
+
+    // Tier 0/1 — never reach the backend, never touch the keychain.
+    // Defense in depth: Phase 1 frontend doesn't call this in Tier 0/1, but
+    // any caller that does must get an unambiguous "not authenticated".
+    if settings::load_settings().tier != settings::RunnerTier::QontinuiAccount {
+        return Ok(AuthStatus {
+            authenticated: false,
+            user: None,
+            device_id: None,
+        });
+    }
 
     let auth_manager = AuthManager::new();
 
@@ -425,6 +463,7 @@ pub async fn get_user_projects() -> Result<Vec<Project>, String> {
 }
 
 async fn get_user_projects_impl() -> Result<Vec<Project>, AppError> {
+    require_tier_2()?;
     info!("Getting user projects");
 
     let auth_manager = AuthManager::new();
@@ -476,6 +515,7 @@ pub async fn refresh_token() -> Result<(), String> {
 }
 
 async fn refresh_token_impl() -> Result<(), AppError> {
+    require_tier_2()?;
     info!("Refreshing access token");
 
     let auth_manager = AuthManager::new();
@@ -559,6 +599,7 @@ pub async fn get_access_token_for_websocket() -> Result<String, String> {
 }
 
 async fn get_access_token_for_websocket_impl() -> Result<String, AppError> {
+    require_tier_2()?;
     info!("Getting access token for WebSocket");
 
     let auth_manager = AuthManager::new();
@@ -624,6 +665,116 @@ pub fn get_test_auto_login(
     })
 }
 
+/// Returns the current runner tier. Frontend gates its auth-touching effects
+/// on this — see `AuthProvider.tsx`.
+#[tauri::command]
+pub fn get_runner_tier() -> Result<String, String> {
+    let s = settings::load_settings();
+    // String form so the React side doesn't need a TS enum mirror.
+    Ok(match s.tier {
+        settings::RunnerTier::Local => "local",
+        settings::RunnerTier::LocalProvider => "local_provider",
+        settings::RunnerTier::QontinuiAccount => "qontinui_account",
+    }
+    .to_string())
+}
+
+/// Sets the current runner tier and persists. Used by the SetupWizard's
+/// TierStep and the AccountSettings sign-in completion handler.
+#[tauri::command]
+pub fn set_runner_tier(tier: String) -> Result<(), String> {
+    let parsed = match tier.as_str() {
+        "local" => settings::RunnerTier::Local,
+        "local_provider" => settings::RunnerTier::LocalProvider,
+        "qontinui_account" => settings::RunnerTier::QontinuiAccount,
+        other => return Err(format!("invalid tier: {}", other)),
+    };
+    let mut s = settings::load_settings();
+    s.tier = parsed;
+    s.tier_initialized = true;
+    settings::save_settings(&s).map_err(|e| e.to_string())?;
+    // Kick the relay so it picks up the new tier without a runner restart.
+    tokio::spawn(async {
+        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+    });
+    Ok(())
+}
+
+/// Opens the system browser to `/connect-runner` with the runner's loopback
+/// callback URL.
+///
+/// This is the Settings → Account "Sign in to Qontinui" entry point used by
+/// `AccountSettings.tsx`. It is a thin wrapper over the existing
+/// `start_web_token_flow` machinery (same `TokenFlowStore` + same
+/// `/auth/runner-token-callback` handler) — kept as a separate command so
+/// the FE call site reads as a tier-promotion intent rather than a
+/// generic "open token flow" action.
+///
+/// The actual tier promotion happens in `mcp::auth_callback` when the
+/// user clicks Confirm in the browser; this command returns as soon as
+/// the browser has been launched.
+///
+/// # Errors
+///
+/// Returns `Err` if no `backend_url` is configured in settings or if
+/// `open::that` fails to launch a browser.
+#[tauri::command]
+pub async fn start_qontinui_sign_in<R: Runtime>(
+    integration: tauri::State<'_, crate::commands::compartments::IntegrationCompartment>,
+    health: tauri::State<'_, HealthCompartment>,
+    app_handle: tauri::AppHandle<R>,
+) -> Result<(), String> {
+    // Delegate to the existing token-flow command — same pending-flow store,
+    // same callback handler, same browser-launch logic. `backend_url = None`
+    // re-uses whatever is already persisted (or errors if nothing is).
+    crate::commands::web_integration::start_web_token_flow(integration, health, app_handle, None)
+        .await
+}
+
+/// Clears the runner token, drops the runner back to Tier 0/1, and kicks
+/// the relay so the WS connection closes cleanly.
+///
+/// Used by `AccountSettings.tsx`'s "Sign out" button. The FE is expected
+/// to dispatch a `runner-tier-changed` window event after this call
+/// returns Ok so `useRunnerTier` consumers (notably `AuthProvider`)
+/// re-read and switch back to the synthesized local-guest auth.
+///
+/// # Errors
+///
+/// Returns `Err` only if persisting the cleared settings fails. Keychain
+/// clear failures and the relay-kick are best-effort and logged but not
+/// surfaced to the caller.
+#[tauri::command]
+pub async fn qontinui_sign_out() -> Result<(), String> {
+    info!("qontinui_sign_out: clearing token + dropping to Tier Local");
+
+    // Best-effort: a stale keychain entry is annoying but not fatal —
+    // the gating checks all run off the `tier` field below.
+    let auth_manager = AuthManager::new();
+    if let Err(e) = auth_manager.clear_tokens() {
+        warn!("qontinui_sign_out: clear_tokens failed (continuing): {}", e);
+    }
+
+    let mut s = settings::load_settings();
+    s.web_integration.runner_token = String::new();
+    s.qontinui_user_id = None;
+    s.tier = settings::RunnerTier::Local;
+    s.tier_initialized = true;
+    settings::save_settings(&s).map_err(|e| {
+        let msg = format!("failed to persist sign-out: {}", e);
+        error!("qontinui_sign_out: {}", msg);
+        msg
+    })?;
+
+    // Kick the relay — now that tier != QontinuiAccount, the cloud relay
+    // task enters its idle-await-kick state and drops the WS.
+    tokio::spawn(async {
+        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+    });
+
+    Ok(())
+}
+
 /// Build the Tauri plugin that registers this module's command handlers.
 ///
 /// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
@@ -640,6 +791,10 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             is_api_ready,
             get_api_port,
             get_test_auto_login,
+            get_runner_tier,
+            set_runner_tier,
+            start_qontinui_sign_in,
+            qontinui_sign_out,
         ])
         .build()
 }

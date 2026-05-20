@@ -16,6 +16,7 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AuthStatus, AuthContextValue, LoginResponse } from "../types";
+import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { createLogger } from "@/lib/logger";
 import { withTimeout } from "@/lib/withTimeout";
 
@@ -26,6 +27,14 @@ import { withTimeout } from "@/lib/withTimeout";
 // run their normal cleanup. See
 // qontinui-dev-notes/plans/2026-05-17-runner-auto-login-initial-mount.md.
 const AUTH_PROBE_TIMEOUT_MS = 5000;
+
+// TODO(tier-gating): calibration tests for tier-gating are pending — once a
+// Vitest harness for AuthProvider exists, cover:
+//   1. Tier "local"/"local_provider" synthesizes local-guest auth and never
+//      invokes `check_auth_status` / `refresh_token`.
+//   2. Tier "qontinui_account" boots the existing JWT flow unchanged.
+//   3. A `runner-tier-changed` event switching local→qontinui_account
+//      drops the synthesized auth and triggers `check_auth_status`.
 
 const log = createLogger("Auth");
 
@@ -66,6 +75,13 @@ const DEV_AUTO_LOGIN = {
 };
 
 export function AuthProvider({ children }: AuthProviderProps) {
+  // Tier gating — runner-tier-decoupling Phase 1. Tier 0 ("local") and
+  // Tier 1 ("local_provider") DO NOT require a qontinui-account JWT; they
+  // boot with a synthesized local-guest auth and never hit the auth
+  // backend. Only Tier 2 ("qontinui_account") runs the JWT flow.
+  const { tier, loading: tierLoading } = useRunnerTier();
+  const isTier2 = tier === "qontinui_account";
+
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -228,9 +244,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, []);
 
   /**
-   * Check auth status on mount
+   * Check auth status on mount — Tier 2 only.
+   *
+   * Tier 0/1 never call `check_auth_status` (the backend short-circuits
+   * with `authenticated: false` anyway when tier != QontinuiAccount, but
+   * we avoid the round-trip entirely and synthesize a local-guest auth
+   * state in the effect below).
    */
   useEffect(() => {
+    if (tierLoading) return;
+    if (!isTier2) return;
     log.debug("useEffect[checkAuthStatus] - checking auth status on mount");
     // Async IIFE so we don't invoke a setState-bearing callback synchronously
     // in the effect body (set-state-in-effect).
@@ -242,7 +265,33 @@ export function AuthProvider({ children }: AuthProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, [checkAuthStatus]);
+  }, [checkAuthStatus, isTier2, tierLoading]);
+
+  /**
+   * Synthesize a local-guest authStatus for Tier 0/1.
+   *
+   * Runs once the tier has been read. Sets `authenticated: true` with a
+   * sentinel `local-guest` user so downstream consumers that gate on
+   * `authStatus?.authenticated` keep working without ever reaching the
+   * backend. Also clears the initial `loading` so the App loading screen
+   * doesn't linger on Tier 0/1.
+   */
+  useEffect(() => {
+    if (tierLoading) return;
+    if (!isTier2 && authStatus === null) {
+      // Defer setState off the effect body to avoid cascading renders
+      // during the same commit (react-hooks/set-state-in-effect). Same
+      // idiom as the auto-login effect below.
+      queueMicrotask(() => {
+        setAuthStatus({
+          authenticated: true,
+          user: { id: "local-guest", email: "", name: null },
+          device_info: null,
+        });
+        setLoading(false);
+      });
+    }
+  }, [tierLoading, isTier2, authStatus]);
 
   /**
    * Probe for runtime test-auto-login credentials (temp test runners spawned
@@ -353,6 +402,15 @@ export function AuthProvider({ children }: AuthProviderProps) {
    * Works in both dev mode (Vite) and exe mode (embedded build)
    */
   useEffect(() => {
+    // Tier 0/1 don't authenticate against the qontinui-account backend —
+    // there's no credential to auto-login with. The test-auto-login probe
+    // itself remains unconditional because the test harness flips tier to
+    // "qontinui_account" via the QONTINUI_TEST_AUTO_LOGIN_* path before
+    // expecting the auto-login effect to fire.
+    if (!isTier2) {
+      return;
+    }
+
     // Wait for the runtime test-auto-login probe to complete so a temp runner
     // with runtime-only creds doesn't miss its window.
     if (!testAutoLoginProbed) {
@@ -413,6 +471,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     testAutoLoginProbed,
     autoLoginCreds,
     attemptDevAutoLogin,
+    isTier2,
   ]);
 
   /**
@@ -463,6 +522,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
    * Set up auto-refresh timer when authenticated
    */
   useEffect(() => {
+    // Tier 0/1 have no JWT to refresh — `refresh_token` would fail anyway.
+    if (!isTier2) return;
     log.debug("useEffect[auto-refresh] triggered", { authenticated: authStatus?.authenticated });
 
     if (!authStatus?.authenticated) {
@@ -480,13 +541,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
       log.debug("useEffect[auto-refresh] cleanup - clearing token refresh timer");
       clearInterval(intervalId);
     };
-  }, [authStatus, refreshAuth]);
+  }, [authStatus, refreshAuth, isTier2]);
 
   const contextValue: AuthContextValue = {
     authStatus,
     loading,
     error,
     devAutoLoginPending,
+    tier,
     login,
     logout,
     refreshAuth,

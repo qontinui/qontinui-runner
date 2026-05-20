@@ -275,6 +275,20 @@ async fn runner_token_callback_handler(
                 "runner_token_callback: applied new runner token (token_id={:?}, backend={})",
                 params.token_id, pending.backend_url
             );
+
+            // Runner-tier-decoupling Phase 5: promote runner to Tier 2 on
+            // successful token receipt. The token-storage step above is
+            // the must-succeed part; the steps below are nice-to-have —
+            // log and continue on individual failures so a stuck side-
+            // effect can't leave the user without a working integration.
+            promote_to_tier_2(&params.token);
+
+            // Kick the unified relay so it picks up the new tier + token
+            // without waiting for the next reconnect cycle.
+            tokio::spawn(async {
+                crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+            });
+
             let body =
                 SUCCESS_HTML.replace("__RUNNER_NAME__", &html_escape(&runner_name_for_display));
             html_response(StatusCode::OK, body).into_response()
@@ -287,6 +301,80 @@ async fn runner_token_callback_handler(
             html_response(StatusCode::INTERNAL_SERVER_ERROR, error_html(&e)).into_response()
         }
     }
+}
+
+/// Promote the runner to Tier 2 (`QontinuiAccount`) and mark setup as
+/// complete. Best-effort: any individual write that fails is logged and
+/// skipped so a single side-effect failure can't poison the sign-in flow.
+///
+/// `token` is the qontinui-web-issued runner token. The current token
+/// format is opaque (`qontinui_runner_<random>` per
+/// `qontinui-web/backend/app/models/runner_token.py`), so the `sub`-claim
+/// extraction is a no-op — kept as a forward-compatible path for when/if
+/// the web side issues JWT-shaped tokens that carry the user id directly.
+fn promote_to_tier_2(token: &str) {
+    let mut s = crate::settings::load_settings();
+    let mut mutated = false;
+
+    if s.tier != crate::settings::RunnerTier::QontinuiAccount {
+        s.tier = crate::settings::RunnerTier::QontinuiAccount;
+        s.tier_initialized = true;
+        mutated = true;
+    }
+
+    if !s.setup_completed {
+        // The user reached this code path by completing the browser-side
+        // pairing flow — that's a strictly stronger signal than the
+        // wizard's "Finish" button, so call setup done if it isn't yet.
+        s.setup_completed = true;
+        mutated = true;
+    }
+
+    if s.qontinui_user_id.is_none() {
+        if let Some(sub) = decode_jwt_sub(token) {
+            s.qontinui_user_id = Some(sub);
+            mutated = true;
+        } else {
+            info!(
+                "runner_token_callback: token is opaque (not a JWT) — \
+                 leaving qontinui_user_id unset; web-side relay handshake \
+                 will populate user identity"
+            );
+        }
+    }
+
+    if mutated {
+        if let Err(e) = crate::settings::save_settings(&s) {
+            warn!(
+                "runner_token_callback: failed to persist tier/setup_completed: {}",
+                e
+            );
+        }
+    }
+}
+
+/// Decode a JWT's `sub` claim without verifying signatures.
+///
+/// Returns `None` for non-JWTs (including the opaque
+/// `qontinui_runner_<random>` runner-token format), malformed payloads, or
+/// missing `sub` fields. Signature verification is intentionally skipped —
+/// we just stored this token after a successful loopback handshake; the
+/// only consumer of the extracted `sub` here is a display/log field on
+/// the runner side.
+fn decode_jwt_sub(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    use base64::Engine;
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    payload
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 async fn apply_integration(

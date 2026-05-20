@@ -418,12 +418,21 @@ function AppContent() {
     );
   }
 
-  if (!auth.authStatus?.authenticated) {
-    return <LoginScreen onLogin={auth.login} />;
-  }
-
+  // Runner-tier-decoupling Phase 1 — wizard runs FIRST so Tier 0/1 setup
+  // can happen without ever hitting the login screen. The SetupWizard
+  // dispatches `runner-tier-changed` after writing the tier; the
+  // useRunnerTier hook in AuthProvider re-reads, and the appropriate
+  // gate fires below.
   if (setupCompleted === false) {
     return <SetupWizard onComplete={() => setSetupCompleted(true)} />;
+  }
+
+  // LoginScreen is Tier 2 only. Tier 0/1 get a synthesized local-guest
+  // auth from AuthProvider, so `auth.authStatus?.authenticated` is true
+  // and we fall through to the main app.
+  const isTier2 = auth.tier === "qontinui_account";
+  if (isTier2 && !auth.authStatus?.authenticated) {
+    return <LoginScreen onLogin={auth.login} />;
   }
 
   const lastRunId = lastRun?.id;

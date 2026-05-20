@@ -2,12 +2,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::ai_router::RoutingConfig;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
 
 const SETTINGS_FILE: &str = "settings.json";
+
+// ============================================================================
+// Runner Tier
+// ============================================================================
+
+/// User tier selection — see plans/2026-05-20-runner-tier-decoupling.md.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerTier {
+    /// Tier 0 — local AI, no Qontinui account, no cloud round-trips.
+    #[default]
+    Local,
+    /// Tier 1 — BYO API keys, no Qontinui account.
+    LocalProvider,
+    /// Tier 2 — signed into Qontinui; multi-machine coordination via the
+    /// existing runner ↔ web WS bridge.
+    QontinuiAccount,
+}
 
 // ============================================================================
 // AI Settings
@@ -22,6 +40,11 @@ pub enum AiProvider {
     ClaudeApi, // Claude API (per-token billing)
     GeminiCli, // Gemini CLI (OAuth or API key auth)
     GeminiApi, // Gemini API (direct HTTP calls)
+    /// Local Ollama instance (Tier 0). Default endpoint: http://127.0.0.1:11434
+    Ollama,
+    /// Generic OpenAI-compatible HTTP endpoint (vLLM, Gemma, LM Studio, etc.).
+    /// User supplies the base URL via `OpenAiCompatibleSettings.base_url`.
+    OpenAiCompatible,
 }
 
 /// CLI execution mode for Claude Code
@@ -88,6 +111,68 @@ impl Default for ClaudeApiSettings {
     }
 }
 
+/// Settings for a local Ollama instance (Tier 0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaSettings {
+    /// Base URL of the Ollama HTTP API. Default: http://127.0.0.1:11434
+    #[serde(default = "default_ollama_base_url")]
+    pub base_url: String,
+    /// Model name (e.g. "llama3.1:8b").
+    #[serde(default = "default_ollama_provider_model")]
+    pub model: String,
+    #[serde(default = "default_ollama_timeout_secs")]
+    pub timeout_seconds: u64,
+}
+
+fn default_ollama_base_url() -> String {
+    "http://127.0.0.1:11434".to_string()
+}
+fn default_ollama_provider_model() -> String {
+    "llama3.1:8b".to_string()
+}
+fn default_ollama_timeout_secs() -> u64 {
+    600
+}
+
+impl Default for OllamaSettings {
+    fn default() -> Self {
+        Self {
+            base_url: default_ollama_base_url(),
+            model: default_ollama_provider_model(),
+            timeout_seconds: default_ollama_timeout_secs(),
+        }
+    }
+}
+
+/// Settings for any OpenAI-compatible HTTP endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiCompatibleSettings {
+    /// Full base URL — e.g. "http://localhost:8080/v1" for a vLLM server.
+    #[serde(default)]
+    pub base_url: String,
+    /// Model identifier the server expects.
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "default_openai_compatible_timeout")]
+    pub timeout_seconds: u64,
+    // Note: API key (if any) stored separately in OS keychain via
+    // `ai_keychain().store("openai_compatible", ...)`.
+}
+
+fn default_openai_compatible_timeout() -> u64 {
+    600
+}
+
+impl Default for OpenAiCompatibleSettings {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            model: String::new(),
+            timeout_seconds: default_openai_compatible_timeout(),
+        }
+    }
+}
+
 /// Authentication method for Gemini CLI
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +233,12 @@ pub struct AiSettings {
     pub gemini_cli: GeminiCliSettings,
     #[serde(default)]
     pub gemini_api: GeminiApiSettings,
+    /// Local Ollama instance settings (Tier 0).
+    #[serde(default)]
+    pub ollama: OllamaSettings,
+    /// Generic OpenAI-compatible endpoint settings (vLLM, LM Studio, etc.).
+    #[serde(default)]
+    pub openai_compatible: OpenAiCompatibleSettings,
     /// Default iteration threshold for including video in auto-refine (0 = never)
     #[serde(default = "default_auto_refine_video_after_iterations")]
     pub auto_refine_video_after_iterations: u32,
@@ -193,6 +284,8 @@ impl Default for AiSettings {
             claude_api: ClaudeApiSettings::default(),
             gemini_cli: GeminiCliSettings::default(),
             gemini_api: GeminiApiSettings::default(),
+            ollama: OllamaSettings::default(),
+            openai_compatible: OpenAiCompatibleSettings::default(),
             auto_refine_video_after_iterations: default_auto_refine_video_after_iterations(),
             compression: CompressionConfig::default(),
             retry: RetryConfig::default(),
@@ -858,7 +951,7 @@ pub(crate) fn default_web_integration_backend_url() -> String {
     if cfg!(debug_assertions) {
         "http://localhost:8000".to_string()
     } else {
-        "https://api.qontinui.io".to_string()
+        crate::api_config::PROD_API_BASE_URL.to_string()
     }
 }
 
@@ -928,6 +1021,93 @@ mod web_integration_default_tests {
                 .expect("must deserialize");
         assert!(!parsed.enabled);
         assert_eq!(parsed.backend_url, "http://my-backend:9999");
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_settings_default_to_tier_local() {
+        let s = Settings::default();
+        assert_eq!(s.tier, RunnerTier::Local);
+        assert!(s.qontinui_user_id.is_none());
+    }
+
+    #[test]
+    fn deserializes_missing_tier_field_to_local_default() {
+        let parsed: Settings = serde_json::from_str("{}").expect("empty object must deserialize");
+        assert_eq!(parsed.tier, RunnerTier::Local);
+        assert!(!parsed.tier_initialized);
+        assert!(parsed.local_user_id.is_empty());
+        assert!(parsed.qontinui_user_id.is_none());
+    }
+
+    /// Tier-inference: a settings.json with a runner_token but no tier
+    /// (the upgrade-from-pre-tier shape) must land in QontinuiAccount on
+    /// first load, and the sentinel must flip true.
+    #[test]
+    fn migrate_tier_from_runner_token_infers_qontinui_account() {
+        let mut s = Settings {
+            tier_initialized: false,
+            tier: RunnerTier::Local, // pre-migration in-memory state
+            web_integration: WebIntegrationSettings {
+                runner_token: "qontinui_runner_abc".to_string(),
+                ..WebIntegrationSettings::default()
+            },
+            ..Settings::default()
+        };
+
+        let migrated = migrate_tier_in_place(&mut s);
+        assert!(migrated, "must report migration performed");
+        assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+        assert!(s.tier_initialized);
+    }
+
+    /// Tier-inference: a settings.json with no runner_token and no tier
+    /// (genuinely fresh install) must land in Local with the sentinel set.
+    #[test]
+    fn migrate_tier_without_runner_token_stays_local() {
+        let mut s = Settings {
+            tier_initialized: false,
+            ..Settings::default()
+        };
+        s.web_integration.runner_token.clear();
+
+        let migrated = migrate_tier_in_place(&mut s);
+        assert!(migrated);
+        assert_eq!(s.tier, RunnerTier::Local);
+        assert!(s.tier_initialized);
+    }
+
+    /// Tier-inference must be a one-shot: once `tier_initialized` is true,
+    /// subsequent loads must not overwrite a deliberate user tier choice.
+    #[test]
+    fn migrate_tier_is_no_op_once_initialized() {
+        let mut s = Settings {
+            tier_initialized: true,
+            tier: RunnerTier::LocalProvider, // user explicitly chose Tier 1
+            web_integration: WebIntegrationSettings {
+                runner_token: "qontinui_runner_xyz".to_string(),
+                ..WebIntegrationSettings::default()
+            },
+            ..Settings::default()
+        };
+
+        let migrated = migrate_tier_in_place(&mut s);
+        assert!(!migrated, "must not re-migrate when initialized");
+        assert_eq!(s.tier, RunnerTier::LocalProvider);
+    }
+
+    #[test]
+    fn tier_serializes_snake_case() {
+        let json = serde_json::to_string(&RunnerTier::QontinuiAccount).unwrap();
+        assert_eq!(json, "\"qontinui_account\"");
+        let json = serde_json::to_string(&RunnerTier::LocalProvider).unwrap();
+        assert_eq!(json, "\"local_provider\"");
+        let json = serde_json::to_string(&RunnerTier::Local).unwrap();
+        assert_eq!(json, "\"local\"");
     }
 }
 
@@ -1182,6 +1362,27 @@ pub struct Settings {
     /// until a user opts in.
     #[serde(default)]
     pub lock_yield_policy: LockYieldPolicySettings,
+    /// User tier — controls whether the runner reaches qontinui-web for auth.
+    /// Inferred from `web_integration.runner_token` on first load if missing
+    /// (see `load_settings` post-processing). Default for genuinely fresh
+    /// installs: Local.
+    #[serde(default)]
+    pub tier: RunnerTier,
+    /// Set true once `load_settings` has inferred a tier value from prior
+    /// settings (or confirmed there was nothing to infer). Used as a
+    /// one-shot migration sentinel so upgraders with a `runner_token`
+    /// already populated land in `QontinuiAccount` exactly once.
+    #[serde(default)]
+    pub tier_initialized: bool,
+    /// Per-`~/.qontinui/`-dir UUID identifying this install for local-DB rows.
+    /// Populated lazily by `load_settings` when empty. Persists across Tier
+    /// upgrades and Tier-2 sign-outs — never replaced by the Qontinui user id.
+    #[serde(default)]
+    pub local_user_id: String,
+    /// Qontinui user id (from the access token's `sub` claim). Filled on
+    /// Tier-2 sign-in, cleared on sign-out. `local_user_id` stays alongside.
+    #[serde(default)]
+    pub qontinui_user_id: Option<String>,
 }
 
 // ============================================================================
@@ -1519,7 +1720,53 @@ pub fn load_settings() -> Settings {
         settings.web_integration.enabled = true;
     }
 
+    // Tier + local_user_id migration / lazy init.
+    //
+    // Both branches may mutate the in-memory `settings` and request a
+    // persist. The persist is best-effort (logged on failure) — an in-memory
+    // value is still correct for the rest of this process's lifetime.
+    let mut needs_persist = false;
+    if migrate_tier_in_place(&mut settings) {
+        needs_persist = true;
+    }
+    if settings.local_user_id.trim().is_empty() {
+        settings.local_user_id = uuid::Uuid::new_v4().to_string();
+        needs_persist = true;
+    }
+    if needs_persist {
+        if let Err(e) = save_settings(&settings) {
+            error!("Failed to persist tier/local_user_id migration: {}", e);
+        } else {
+            info!(
+                "Persisted tier/local_user_id migration (tier={:?}, local_user_id set)",
+                settings.tier
+            );
+        }
+    }
+
     settings
+}
+
+/// One-shot tier inference. When `tier_initialized` is false (i.e. the
+/// loaded settings.json was written before tier existed, or the field was
+/// stripped), infer the tier from `web_integration.runner_token` — a
+/// non-empty token implies the user previously signed into Qontinui and
+/// should land in Tier 2. Returns `true` if a migration was performed
+/// (caller should persist).
+///
+/// Factored out so unit tests can drive it against an in-memory `Settings`
+/// without touching the real settings file.
+pub(crate) fn migrate_tier_in_place(settings: &mut Settings) -> bool {
+    if settings.tier_initialized {
+        return false;
+    }
+    if !settings.web_integration.runner_token.trim().is_empty() {
+        settings.tier = RunnerTier::QontinuiAccount;
+    } else {
+        settings.tier = RunnerTier::Local;
+    }
+    settings.tier_initialized = true;
+    true
 }
 
 /// Save settings to file (atomic write to prevent corruption on crash)
