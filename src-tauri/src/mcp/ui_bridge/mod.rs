@@ -723,11 +723,16 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/ai/structured-changes"),
             ("POST", "/ui-bridge/control/ai/summarize-diff"),
             ("POST", "/ui-bridge/control/ai/wait-for-change"),
-            // /ai/* runner extensions not in SDK contract
+            // /ai/* runner extensions not in SDK contract.
+            // Note: /ai/idle-status graduated to the SDK contract in
+            // ui-bridge#30 (6f427bc, "alias /ai/idle-status to
+            // /control/idle-status"). Removed from this allow-list so the
+            // drift test asserts end-to-end wiring. Handler is registered
+            // via add_dual! in errors.rs:453-458; route_entries() includes
+            // it at errors.rs:476.
             ("GET", "/ui-bridge/ai/element-screenshot"),
             ("GET", "/ui-bridge/ai/elements/last-discovered"),
             ("GET", "/ui-bridge/ai/forms"),
-            ("GET", "/ui-bridge/ai/idle-status"),
             ("POST", "/ui-bridge/ai/analyze/data"),
             ("POST", "/ui-bridge/ai/analyze/regions"),
             ("POST", "/ui-bridge/ai/analyze/structured-data"),
@@ -797,7 +802,11 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/navigate-tab"),
             ("POST", "/ui-bridge/control/network/stubs"),
             ("POST", "/ui-bridge/control/network/verify-stub"),
-            ("POST", "/ui-bridge/control/page-health"),
+            // /control/page-health graduated to the SDK contract in
+            // ui-bridge#30 (6f427bc, "port page-health to web SDK").
+            // Removed from this allow-list so the drift test asserts
+            // end-to-end wiring. Handler is in screenshots.rs:798;
+            // route_entries() includes it at screenshots.rs:849.
             ("POST", "/ui-bridge/control/page/close-request"),
             ("POST", "/ui-bridge/control/page/evaluate-batch"),
             ("POST", "/ui-bridge/control/page/evaluate-raw"),
