@@ -1037,8 +1037,7 @@ mod tier_tests {
 
     #[test]
     fn deserializes_missing_tier_field_to_local_default() {
-        let parsed: Settings =
-            serde_json::from_str("{}").expect("empty object must deserialize");
+        let parsed: Settings = serde_json::from_str("{}").expect("empty object must deserialize");
         assert_eq!(parsed.tier, RunnerTier::Local);
         assert!(!parsed.tier_initialized);
         assert!(parsed.local_user_id.is_empty());
