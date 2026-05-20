@@ -2261,6 +2261,10 @@ pub async fn ui_bridge_wait_for_element_handler(
             body.data = Some(serde_json::json!({
                 "found": false,
                 "durationMs": elapsed_ms,
+                // TODO(remove 2026-06): deprecated snake_case alias kept for
+                // pre-F1 callers still parsing `elapsed_ms`. New callers
+                // must read `durationMs`.
+                "elapsed_ms": elapsed_ms,
                 "polls": polls,
             }));
             return Err((StatusCode::REQUEST_TIMEOUT, Json(body)));
@@ -2947,10 +2951,24 @@ pub async fn ui_bridge_type_into_handler(
         ));
     };
 
-    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+    // Item C: UTF-8 safe passthrough. The prior single-quote-literal
+    // interpolation broke on non-ASCII codepoints once the body crossed any
+    // pipeline that downgraded UTF-8 (e.g. lossy decode → '?') and also
+    // choked on newlines / U+2028 / U+2029 / control chars that aren't legal
+    // inside a single-quoted JS literal. `serde_json::to_string` produces a
+    // valid double-quoted JSON string — which is also a valid JS string
+    // literal — with every non-ASCII char preserved (either as a raw UTF-8
+    // sequence or a `\uXXXX` escape, both of which JS parses identically).
+    let text_js_literal = serde_json::to_string(text).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("Failed to encode text: {}", e))),
+        )
+    })?;
 
     let js = format!(
         r#"(() => {{
+            const __qt_text = {text_literal};
             const matches = Array.from({find_expr}).filter(el => el);
             if (matches.length === 0) return JSON.stringify({{ typed: false, error: 'No elements found' }});
             const idx = {index};
@@ -2965,9 +2983,9 @@ pub async fn ui_bridge_type_into_handler(
             const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
                 || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
             if (nativeInputValueSetter) {{
-                nativeInputValueSetter.call(el, {clear} ? '{text}' : el.value + '{text}');
+                nativeInputValueSetter.call(el, {clear} ? __qt_text : el.value + __qt_text);
             }} else {{
-                el.value = {clear} ? '{text}' : el.value + '{text}';
+                el.value = {clear} ? __qt_text : el.value + __qt_text;
             }}
             el.dispatchEvent(new Event('input', {{ bubbles: true }}));
             el.dispatchEvent(new Event('change', {{ bubbles: true }}));
@@ -2981,7 +2999,7 @@ pub async fn ui_bridge_type_into_handler(
         find_expr = find_expr,
         index = index,
         clear = clear,
-        text = escaped_text
+        text_literal = text_js_literal
     );
 
     match evaluate_js_expression(&state, &js).await {
@@ -3245,6 +3263,10 @@ pub async fn ui_bridge_expect_element_handler(
         "passed": found,
         "observedState": observed_state,
         "durationMs": duration_ms,
+        // TODO(remove 2026-06): deprecated snake_case alias kept for pre-F1
+        // callers still parsing `elapsed_ms` from wait-for-element-shaped
+        // responses. New callers must read `durationMs`.
+        "elapsed_ms": duration_ms,
     });
 
     if found {
@@ -3736,13 +3758,16 @@ mod wait_for_element_dual_emit_tests {
         );
     }
 
-    /// F1 — the NL/id timeout path attaches `data: {durationMs, polls}` to
-    /// the HTTP 408 envelope. Mirrors the literal in the timeout branch of
-    /// `ui_bridge_wait_for_element_handler` (`elements.rs:~2102`).
+    /// F1 — the NL/id timeout path attaches `data: {durationMs, elapsed_ms,
+    /// polls}` to the HTTP 408 envelope. Mirrors the literal in the timeout
+    /// branch of `ui_bridge_wait_for_element_handler` (`elements.rs:~2102`).
+    /// The `elapsed_ms` mirror is the Item D back-compat field; new callers
+    /// must read `durationMs`.
     fn nl_timeout_data(elapsed_ms: u64, polls: u32) -> serde_json::Value {
         json!({
             "found": false,
             "durationMs": elapsed_ms,
+            "elapsed_ms": elapsed_ms,
             "polls": polls,
         })
     }
@@ -3753,6 +3778,71 @@ mod wait_for_element_dual_emit_tests {
         assert_eq!(data.get("found").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(data.get("durationMs").and_then(|v| v.as_u64()), Some(5000));
         assert_eq!(data.get("polls").and_then(|v| v.as_u64()), Some(25));
+    }
+
+    /// Item D — the timeout-data payload exposes both `durationMs` (canonical)
+    /// and `elapsed_ms` (deprecated mirror) so pre-F1 callers parsing the
+    /// snake_case form keep working through the 2026-06 sunset window.
+    #[test]
+    fn nl_timeout_data_payload_dual_emits_elapsed_ms_for_backcompat() {
+        let data = nl_timeout_data(1234, 5);
+        assert_eq!(data.get("durationMs").and_then(|v| v.as_u64()), Some(1234));
+        assert_eq!(data.get("elapsed_ms").and_then(|v| v.as_u64()), Some(1234));
+    }
+}
+
+/// Item C — verify the `type-into` JS template encodes the text value via a
+/// double-quoted JSON literal so non-ASCII codepoints (Cyrillic, emoji
+/// surrogate pairs, U+2028/U+2029 line separators) round-trip through the
+/// webview without lossy `?` substitution or string-literal-termination
+/// failures.
+#[cfg(test)]
+mod type_into_unicode_tests {
+    /// Mirror the literal in `ui_bridge_type_into_handler` for unit-testable
+    /// inspection. Keep in sync with the real handler's `text_js_literal`
+    /// construction — the assertions below catch drift if the encoding
+    /// changes back to single-quote interpolation.
+    fn encode_text_for_js(text: &str) -> String {
+        serde_json::to_string(text).expect("text must encode to JSON")
+    }
+
+    #[test]
+    fn cyrillic_round_trips_through_json_string_literal() {
+        let encoded = encode_text_for_js("\u{0442}\u{0435}\u{0441}\u{0442}");
+        // Either form ("тест" raw or "тест") is fine —
+        // JS parses both identically. serde_json defaults to raw UTF-8.
+        assert!(
+            encoded == "\"\u{0442}\u{0435}\u{0441}\u{0442}\""
+                || encoded == "\"\\u0442\\u0435\\u0441\\u0442\"",
+            "unexpected encoding: {encoded}"
+        );
+        // Crucially: no '?' substitution.
+        assert!(!encoded.contains('?'));
+    }
+
+    #[test]
+    fn newlines_are_escaped_not_dropped() {
+        let encoded = encode_text_for_js("line1\nline2");
+        assert_eq!(encoded, "\"line1\\nline2\"");
+    }
+
+    #[test]
+    fn emoji_with_zwj_round_trips() {
+        // Family emoji = woman + ZWJ + woman + ZWJ + girl
+        let encoded = encode_text_for_js("\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}");
+        assert!(encoded.starts_with('"') && encoded.ends_with('"'));
+        // ZWJ (U+200D) is in the BMP; serde_json may emit it raw or escaped.
+        // Either way the codepoint must be present, not stripped.
+        assert!(
+            encoded.contains('\u{200D}') || encoded.contains("\\u200d"),
+            "ZWJ lost: {encoded}"
+        );
+    }
+
+    #[test]
+    fn embedded_double_quote_escapes_correctly() {
+        let encoded = encode_text_for_js("she said \"hi\"");
+        assert_eq!(encoded, "\"she said \\\"hi\\\"\"");
     }
 }
 

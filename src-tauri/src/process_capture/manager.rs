@@ -227,7 +227,130 @@ impl ProcessCaptureManager {
         drop(processes);
         self.emit_state_change(&status);
 
-        Ok(())
+        // Poll for readiness: the child must stay alive and either reach
+        // Running/Healthy (when no health port is configured the event-loop
+        // sets Running immediately; with a port, port_health_loop flips to
+        // Healthy on first successful probe). If the child exits before
+        // readiness, surface the captured stderr so the operator gets a real
+        // diagnostic instead of a silently-stopped tile.
+        self.await_ready(id, Duration::from_secs(30)).await
+    }
+
+    /// Wait up to `timeout` for a process to reach a stable ready state.
+    ///
+    /// Readiness rules:
+    /// - If the process configures a `health_port`, ready = state `Healthy`
+    ///   (port_health_loop has flipped it). Polling `Running` alone is
+    ///   insufficient because the shell wrapper / pre-fork child can be
+    ///   "running" while the inner service is still importing or crashing.
+    /// - If no health_port is configured, ready = state `Running` that
+    ///   persists past a 1-second post-spawn settle window. A child that
+    ///   crashes during import (e.g. `'next' is not recognized`) flips
+    ///   through Running → Stopped within a few hundred ms; the settle
+    ///   guards against returning Ok before the Exited event lands.
+    ///
+    /// Returns `Err` with the captured stderr tail if the child exits before
+    /// readiness, or a "did not reach ready state in {timeout}s" message if
+    /// the timeout fires.
+    ///
+    /// Polls every 200ms — long enough to amortise lock acquisition, short
+    /// enough that a sub-second post-spawn crash is observed within a few
+    /// ticks.
+    async fn await_ready(&self, id: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let poll = Duration::from_millis(200);
+        let settle_window = Duration::from_secs(1);
+
+        // Snapshot the health_port + spawn baseline up front so we know which
+        // ready predicate to use for this iteration.
+        let (has_health_port, spawn_started_at) = {
+            let processes = self.processes.read().await;
+            match processes.get(id) {
+                Some(p) => (
+                    p.config.health_port.is_some(),
+                    p.runtime.started_at.unwrap_or_else(std::time::Instant::now),
+                ),
+                None => return Err(format!("Process '{}' not found", id)),
+            }
+        };
+
+        loop {
+            let (state, name) = {
+                let processes = self.processes.read().await;
+                match processes.get(id) {
+                    Some(p) => (p.runtime.state, p.config.name.clone()),
+                    None => return Err(format!("Process '{}' not found", id)),
+                }
+            };
+
+            match state {
+                ProcessState::Healthy => return Ok(()),
+                ProcessState::Running => {
+                    // No health_port → Running past the settle window is ready.
+                    // With a health_port → keep polling until Healthy flips on.
+                    if !has_health_port && spawn_started_at.elapsed() >= settle_window {
+                        return Ok(());
+                    }
+                }
+                ProcessState::Stopped | ProcessState::Failed => {
+                    // Child died before readiness. Capture the stderr tail
+                    // (last 50 lines) so the caller's HTTP error carries the
+                    // actual crash reason instead of a generic "Stopped".
+                    let stderr_tail = self.collect_stderr_tail(id, 50).await;
+                    let snippet = if stderr_tail.is_empty() {
+                        String::from("(no stderr captured)")
+                    } else {
+                        stderr_tail.join("\n")
+                    };
+                    return Err(format!(
+                        "Process '{}' exited before reaching ready state: {}",
+                        name, snippet
+                    ));
+                }
+                _ => {}
+            }
+
+            if std::time::Instant::now() >= deadline {
+                let stderr_tail = self.collect_stderr_tail(id, 50).await;
+                let snippet = if stderr_tail.is_empty() {
+                    format!(
+                        "did not reach ready state in {}s (last state: {})",
+                        timeout.as_secs(),
+                        state.as_str()
+                    )
+                } else {
+                    format!(
+                        "did not reach ready state in {}s (last state: {}); stderr tail:\n{}",
+                        timeout.as_secs(),
+                        state.as_str(),
+                        stderr_tail.join("\n")
+                    )
+                };
+                return Err(snippet);
+            }
+
+            tokio::time::sleep(poll).await;
+        }
+    }
+
+    /// Walk the process's output ring buffer and pull the last `n` stderr
+    /// entries. Returns an empty vec if the process is gone.
+    async fn collect_stderr_tail(&self, id: &str, n: usize) -> Vec<String> {
+        let processes = self.processes.read().await;
+        let Some(process) = processes.get(id) else {
+            return Vec::new();
+        };
+        let buf = process.output_buffer.read().await;
+        let mut stderr_lines: Vec<String> = buf
+            .iter()
+            .filter(|entry| matches!(entry.stream, OutputStream::Stderr))
+            .map(|entry| entry.line.clone())
+            .collect();
+        if stderr_lines.len() > n {
+            let drop = stderr_lines.len() - n;
+            stderr_lines.drain(..drop);
+        }
+        stderr_lines
     }
 
     /// Stop a managed process by ID.
@@ -325,6 +448,47 @@ impl ProcessCaptureManager {
             .get(id)
             .ok_or_else(|| format!("Process '{}' not found", id))?;
         Ok(process.get_output(tail).await)
+    }
+
+    /// Get the last `lines` log lines for a process, split into stdout/stderr
+    /// arrays. Returns `(stdout, stderr, truncated)` where `truncated` is true
+    /// if the live ring buffer holds more lines than fit in `lines` for either
+    /// stream (i.e. the caller may have missed older entries).
+    ///
+    /// Implementation note: the underlying `output_buffer` is a single
+    /// chronological ring buffer mixing both streams (each entry tags itself
+    /// via `OutputStream`). We walk the buffer in order, partition by stream,
+    /// then per-stream tail to `lines` so the caller gets the *most recent*
+    /// `lines` entries from each side rather than the most recent `lines`
+    /// total entries projected onto each stream.
+    pub async fn get_logs(
+        &self,
+        id: &str,
+        lines: usize,
+    ) -> Result<(Vec<String>, Vec<String>, bool), String> {
+        let processes = self.processes.read().await;
+        let process = processes
+            .get(id)
+            .ok_or_else(|| format!("Process '{}' not found", id))?;
+        let buf = process.output_buffer.read().await;
+        let mut stdout: Vec<String> = Vec::new();
+        let mut stderr: Vec<String> = Vec::new();
+        for entry in buf.iter() {
+            match entry.stream {
+                OutputStream::Stdout => stdout.push(entry.line.clone()),
+                OutputStream::Stderr => stderr.push(entry.line.clone()),
+            }
+        }
+        let truncated = stdout.len() > lines || stderr.len() > lines;
+        if stdout.len() > lines {
+            let drop = stdout.len() - lines;
+            stdout.drain(..drop);
+        }
+        if stderr.len() > lines {
+            let drop = stderr.len() - lines;
+            stderr.drain(..drop);
+        }
+        Ok((stdout, stderr, truncated))
     }
 
     /// Start all processes marked as auto_start, respecting start_group ordering.

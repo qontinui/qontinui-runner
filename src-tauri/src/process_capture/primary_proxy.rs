@@ -95,6 +95,35 @@ pub async fn get_output(id: &str, tail: usize) -> Result<Vec<OutputLine>, String
     }
 }
 
+/// Proxy: GET /processes/{id}/logs?lines=N
+pub async fn get_logs(id: &str, lines: usize) -> Result<LogsResponse, String> {
+    let url = format!("{}/processes/{}/logs?lines={}", base_url(), id, lines);
+    let resp = client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach primary runner: {}", e))?;
+
+    let api: ApiResponse<LogsResponse> = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse primary response: {}", e))?;
+
+    if api.success {
+        Ok(api.data.unwrap_or_default())
+    } else {
+        Err(api.error.unwrap_or_else(|| "Unknown error".to_string()))
+    }
+}
+
+/// Body returned by GET /processes/{id}/logs.
+#[derive(Debug, Default, Deserialize, serde::Serialize, Clone)]
+pub struct LogsResponse {
+    pub stdout: Vec<String>,
+    pub stderr: Vec<String>,
+    pub truncated: bool,
+}
+
 /// Proxy: GET /processes (list with configs)
 pub async fn get_configs() -> Result<Vec<ProcessConfig>, String> {
     // The primary doesn't have a separate /processes/configs endpoint,
