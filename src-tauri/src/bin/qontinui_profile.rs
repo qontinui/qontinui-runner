@@ -148,6 +148,14 @@ enum DeviceCmd {
         /// Browser mode (default). Mutually exclusive with `--auth-token`.
         #[arg(long)]
         browser: bool,
+        /// Explicit tenant_id to bind this device to. When omitted, the
+        /// CLI auto-resolves from the OAuth token's `tenant_id` claim
+        /// (headless mode only). Phase 2 of the
+        /// default-tenant-propagation plan
+        /// (`D:/qontinui-root/plans/2026-05-20-default-tenant-propagation.md`);
+        /// Q3: OAuth claim with `--tenant-id` override for CLI.
+        #[arg(long, value_name = "UUID")]
+        tenant_id: Option<String>,
     },
 }
 
@@ -173,7 +181,8 @@ fn main() -> ExitCode {
             DeviceCmd::Pair {
                 auth_token,
                 browser,
-            } => cmd_device_pair(auth_token.as_deref(), browser),
+                tenant_id,
+            } => cmd_device_pair(auth_token.as_deref(), browser, tenant_id.as_deref()),
         },
     }
 }
@@ -695,9 +704,44 @@ struct PairCompleteResponse {
     user_id: String,
     #[serde(default)]
     device_id: Option<String>,
+    /// Phase 3 of the default-tenant-propagation plan may add this on
+    /// the wire. Tolerate absence with `#[serde(default)]` so today's
+    /// coord (which doesn't include it) deserializes cleanly.
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
-fn cmd_device_pair(auth_token: Option<&str>, browser: bool) -> ExitCode {
+/// Decode the unverified payload of a JWT and pull the `tenant_id`
+/// claim, if any. Returns `None` if the token isn't a JWT, the payload
+/// isn't valid base64-decoded JSON, or no `tenant_id` claim is present.
+///
+/// We deliberately do NOT verify the JWT signature — coord is the
+/// authority on tenant_id (it's enforced in Phase 6's NOT NULL +
+/// resolved by Phase 4's per-write lookup). The CLI is only forwarding
+/// the runner's best guess; coord re-validates on receipt.
+///
+/// Per Phase 2 of the default-tenant-propagation plan, Q3 resolution:
+/// "OAuth claim with `--tenant-id` override for CLI."
+fn tenant_id_from_oauth_claim(token: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    // JWT shape: header.payload.signature (three '.'-separated parts).
+    let mut parts = token.splitn(3, '.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let _signature = parts.next()?;
+    let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    payload_json
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn cmd_device_pair(
+    auth_token: Option<&str>,
+    browser: bool,
+    tenant_id_flag: Option<&str>,
+) -> ExitCode {
     // clap can't express "exactly one of browser/auth_token"; reject the
     // combination by hand.
     if auth_token.is_some() && browser {
@@ -718,9 +762,44 @@ fn cmd_device_pair(auth_token: Option<&str>, browser: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Resolve tenant_id: explicit `--tenant-id` flag wins; otherwise
+    // pull from the OAuth token's `tenant_id` claim (headless mode).
+    // The browser flow has no OAuth token yet at pair-start time, so
+    // it relies entirely on the explicit flag. Phase 2 of the
+    // default-tenant-propagation plan (Q3 resolution).
+    let resolved_tenant_id: Result<uuid::Uuid, String> = match tenant_id_flag {
+        Some(s) => uuid::Uuid::parse_str(s.trim())
+            .map_err(|e| format!("--tenant-id is not a valid UUID: {e}")),
+        None => match &mode {
+            PairMode::AuthToken(token) => match tenant_id_from_oauth_claim(token) {
+                Some(s) => uuid::Uuid::parse_str(s.trim()).map_err(|e| {
+                    format!(
+                        "OAuth token's tenant_id claim is not a valid UUID ({e}); pass --tenant-id <uuid> to override"
+                    )
+                }),
+                None => Err(
+                    "no `tenant_id` claim found in OAuth token; pass --tenant-id <uuid> explicitly"
+                        .to_string(),
+                ),
+            },
+            PairMode::Browser => Err(
+                "--tenant-id <uuid> is required for the browser pair flow (no OAuth token to read a claim from)"
+                    .to_string(),
+            ),
+        },
+    };
+    let tenant_id = match resolved_tenant_id {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+
     let result: Result<PairCompleteResponse, String> = match mode {
-        PairMode::AuthToken(token) => pair_with_auth_token(&base, &token),
-        PairMode::Browser => pair_via_browser(&base),
+        PairMode::AuthToken(token) => pair_with_auth_token(&base, &token, tenant_id),
+        PairMode::Browser => pair_via_browser(&base, tenant_id),
     };
     match result {
         Ok(resp) => {
@@ -747,13 +826,23 @@ fn cmd_device_pair(auth_token: Option<&str>, browser: bool) -> ExitCode {
 /// POST `Authorization: Bearer <oauth-token>` to `POST /coord/devices/pair-cli`
 /// (headless mode). Coord verifies the OAuth token and returns the
 /// device-token JWT + paired user_id.
-fn pair_with_auth_token(base: &str, oauth_token: &str) -> Result<PairCompleteResponse, String> {
+///
+/// `tenant_id` is resolved in `cmd_device_pair` (either explicit
+/// `--tenant-id` flag or auto-extracted from the OAuth token's claim)
+/// and forwarded into the request body. Phase 2 of the
+/// default-tenant-propagation plan.
+fn pair_with_auth_token(
+    base: &str,
+    oauth_token: &str,
+    tenant_id: uuid::Uuid,
+) -> Result<PairCompleteResponse, String> {
     let url = format!("{}/coord/devices/pair-cli", base);
     let body = serde_json::json!({
         "hostname": detect_hostname(),
         "name":     detect_hostname(),
         "os":       detect_os(),
         "os_version": detect_os_version(),
+        "tenant_id": tenant_id.to_string(),
     });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -780,7 +869,17 @@ fn pair_with_auth_token(base: &str, oauth_token: &str) -> Result<PairCompleteRes
 /// browser to `/connect-runner?state=…&callback=…`, waits for the user's
 /// click + redirect, then exchanges the captured `(state, token)` with
 /// coord's `POST /coord/devices/pair-complete` for the device-token JWT.
-fn pair_via_browser(coord_base: &str) -> Result<PairCompleteResponse, String> {
+///
+/// `tenant_id` is forwarded into the pair-complete body as a defensive
+/// hint. Coord's authoritative source for tenant_id on this flow is the
+/// `PairingFlow.tenant_id` value carried over from `pair-start` (which
+/// the web-backend's `pair-confirm` proxy populates from the
+/// authenticated user → operators chain). Phase 2 of the
+/// default-tenant-propagation plan.
+fn pair_via_browser(
+    coord_base: &str,
+    tenant_id: uuid::Uuid,
+) -> Result<PairCompleteResponse, String> {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -935,6 +1034,7 @@ fn pair_via_browser(coord_base: &str) -> Result<PairCompleteResponse, String> {
         "name":       hostname_now,
         "os":         detect_os(),
         "os_version": detect_os_version(),
+        "tenant_id":  tenant_id.to_string(),
     });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -1420,10 +1520,12 @@ mod tests {
                     DeviceCmd::Pair {
                         auth_token,
                         browser,
+                        tenant_id,
                     },
             }) => {
                 assert_eq!(auth_token.as_deref(), Some("oauth"));
                 assert!(!browser);
+                assert!(tenant_id.is_none(), "no --tenant-id flag → None");
             }
             other => panic!("expected Device::Pair, got {:?}", other),
         }
@@ -1439,13 +1541,82 @@ mod tests {
                     DeviceCmd::Pair {
                         auth_token,
                         browser,
+                        tenant_id,
                     },
             }) => {
                 assert!(auth_token.is_none());
                 assert!(browser);
+                assert!(tenant_id.is_none());
             }
             other => panic!("expected Device::Pair {{browser}}, got {:?}", other),
         }
+    }
+
+    /// Phase 2 of the default-tenant-propagation plan: `--tenant-id`
+    /// flag is parsed alongside the existing pair flags.
+    #[test]
+    fn device_pair_parses_with_tenant_id_flag() {
+        let cli = Cli::try_parse_from([
+            "qontinui_profile",
+            "device",
+            "pair",
+            "--browser",
+            "--tenant-id",
+            "11111111-1111-1111-1111-111111111111",
+        ])
+        .expect("parses");
+        match cli.cmd {
+            Some(Cmd::Device {
+                sub:
+                    DeviceCmd::Pair {
+                        auth_token,
+                        browser,
+                        tenant_id,
+                    },
+            }) => {
+                assert!(auth_token.is_none());
+                assert!(browser);
+                assert_eq!(
+                    tenant_id.as_deref(),
+                    Some("11111111-1111-1111-1111-111111111111")
+                );
+            }
+            other => panic!("expected Device::Pair with --tenant-id, got {:?}", other),
+        }
+    }
+
+    /// Phase 2 of the default-tenant-propagation plan: a JWT shaped
+    /// payload with a `tenant_id` claim is decoded without verifying the
+    /// signature.
+    #[test]
+    fn tenant_id_from_oauth_claim_extracts_uuid() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        // Construct a fake JWT-shaped string: header.payload.signature
+        // (we don't sign; only the payload's base64-URL-safe JSON
+        // matters for the decode-and-extract path).
+        let payload = serde_json::json!({
+            "sub": "user@example.test",
+            "tenant_id": "22222222-2222-2222-2222-222222222222",
+        });
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let token = format!("aGVhZGVy.{}.c2lnbmF0dXJl", payload_b64);
+        let got = tenant_id_from_oauth_claim(&token);
+        assert_eq!(got.as_deref(), Some("22222222-2222-2222-2222-222222222222"));
+    }
+
+    #[test]
+    fn tenant_id_from_oauth_claim_returns_none_on_missing_claim() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let payload = serde_json::json!({"sub": "user@example.test"});
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let token = format!("aGVhZGVy.{}.c2lnbmF0dXJl", payload_b64);
+        assert!(tenant_id_from_oauth_claim(&token).is_none());
+    }
+
+    #[test]
+    fn tenant_id_from_oauth_claim_returns_none_on_non_jwt() {
+        assert!(tenant_id_from_oauth_claim("not-a-jwt").is_none());
+        assert!(tenant_id_from_oauth_claim("only-two.parts").is_none());
     }
 
     #[test]
