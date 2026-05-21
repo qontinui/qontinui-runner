@@ -70,6 +70,11 @@ pub struct PairCompleteResponse {
     /// ignored by the CLI today, surfaced for Phase 2 refresh logic.
     #[serde(default)]
     pub exp: Option<i64>,
+    /// Tenant scope coord stamped on this device. Phase 3 of the
+    /// default-tenant-propagation plan may echo this back on the
+    /// wire. `#[serde(default)]` tolerates pre-tenant coord builds.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 // ============================================================================
@@ -243,14 +248,46 @@ pub fn derive_web_base_from_coord(coord_base: &str) -> String {
 /// parameterized form directly so they can run hermetically against an
 /// in-process mock coord without touching `~/.qontinui` or the
 /// `data_local_dir`.
-pub fn pair_with_auth_token(base: &str, oauth_token: &str) -> Result<PairCompleteResponse, String> {
+/// Decode the unverified payload of a JWT and pull the `tenant_id`
+/// claim, if any. Returns `None` if the token isn't a JWT, the payload
+/// isn't valid base64-decoded JSON, or no `tenant_id` claim is present.
+///
+/// We deliberately do NOT verify the JWT signature — coord is the
+/// authority on tenant_id (Phase 4 of the default-tenant-propagation
+/// plan re-validates on receipt via the per-write resolver). This is
+/// just the runner's best-effort auto-resolve to spare the operator
+/// from re-typing a UUID they already authenticated against.
+///
+/// Phase 2 of the default-tenant-propagation plan (Q3 resolution:
+/// "OAuth claim with `--tenant-id` override for CLI"). Also used by
+/// `mcp::device_jwt_refresher` to resolve tenant_id at refresh time
+/// from the stored OAuth/runner token.
+pub fn tenant_id_from_oauth_claim(token: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let mut parts = token.splitn(3, '.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let _signature = parts.next()?;
+    let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    payload_json
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+pub fn pair_with_auth_token(
+    base: &str,
+    oauth_token: &str,
+    tenant_id: uuid::Uuid,
+) -> Result<PairCompleteResponse, String> {
     let device_id = read_device_id()?;
     let user_id = read_paired_user_id().ok_or_else(|| {
         "not yet browser-paired — first pair must use --browser mode \
          (no paired_user.json on disk)"
             .to_string()
     })?;
-    pair_with_auth_token_with_ids(base, oauth_token, &device_id, &user_id)
+    pair_with_auth_token_with_ids(base, oauth_token, &device_id, &user_id, tenant_id)
 }
 
 /// Parameterized variant of [`pair_with_auth_token`] — accepts `device_id`
@@ -264,12 +301,14 @@ pub fn pair_with_auth_token_with_ids(
     oauth_token: &str,
     device_id: &str,
     user_id: &str,
+    tenant_id: uuid::Uuid,
 ) -> Result<PairCompleteResponse, String> {
     let url = format!("{}/coord/devices/pair-cli", base);
     let body = serde_json::json!({
         "device_id": device_id,
         "hostname":  detect_hostname(),
         "name":      detect_hostname(),
+        "tenant_id": tenant_id.to_string(),
     });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -316,7 +355,10 @@ pub(crate) struct CallbackCapture {
 /// browser to `/connect-runner?state=…&callback=…`, waits for the user's
 /// click + redirect, then exchanges the captured `(state, token)` with
 /// coord's `POST /coord/devices/pair-complete` for the device-token JWT.
-pub fn pair_via_browser(coord_base: &str) -> Result<PairCompleteResponse, String> {
+pub fn pair_via_browser(
+    coord_base: &str,
+    tenant_id: uuid::Uuid,
+) -> Result<PairCompleteResponse, String> {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -461,7 +503,12 @@ pub fn pair_via_browser(coord_base: &str) -> Result<PairCompleteResponse, String
     // is still running; it'll time out on its own.
     drop(server_handle);
 
-    // Exchange (state, token) for the device-token JWT.
+    // Exchange (state, token) for the device-token JWT. `tenant_id` is a
+    // defensive forward — coord's authoritative source is `flow.tenant_id`
+    // carried from `pair-start`, but the browser pair flow currently mints
+    // its state nonce locally instead of going through coord's pair-start,
+    // so we forward the runner's best-known value here as a hint. Coord
+    // re-validates per Phase 4 of the default-tenant-propagation plan.
     let url = format!("{}/coord/devices/pair-complete", coord_base);
     let body = serde_json::json!({
         "state":      state_nonce,
@@ -471,6 +518,7 @@ pub fn pair_via_browser(coord_base: &str) -> Result<PairCompleteResponse, String
         "name":       hostname_now,
         "os":         detect_os(),
         "os_version": detect_os_version(),
+        "tenant_id":  tenant_id.to_string(),
     });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -636,16 +684,19 @@ mod tests {
         // Re-construct the body the same way `pair_with_auth_token`
         // does. If a future refactor diverges, this test fails loudly.
         let device_id = "00000000-0000-4000-8000-000000000000";
+        let tenant_id = "11111111-1111-4111-8111-111111111111";
         let body = serde_json::json!({
             "device_id": device_id,
             "hostname":  detect_hostname(),
             "name":      detect_hostname(),
+            "tenant_id": tenant_id,
         });
         let obj = body.as_object().expect("object");
         // Required keys (per PairCliRequest):
         assert!(obj.contains_key("device_id"), "device_id missing");
         assert!(obj.contains_key("hostname"), "hostname missing");
         assert!(obj.contains_key("name"), "name missing");
+        assert!(obj.contains_key("tenant_id"), "tenant_id missing");
         // Rejected legacy keys (would 422 on coord's PairCliRequest):
         assert!(
             !obj.contains_key("os"),
@@ -661,6 +712,34 @@ mod tests {
             Some(device_id)
         );
         assert!(obj.get("hostname").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[test]
+    fn tenant_id_from_oauth_claim_extracts_uuid() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"x","tenant_id":"11111111-2222-3333-4444-555555555555"}"#);
+        let token = format!("{}.{}.signature", header, payload);
+        assert_eq!(
+            tenant_id_from_oauth_claim(&token).as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    #[test]
+    fn tenant_id_from_oauth_claim_returns_none_when_missing() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
+        let token = format!("{}.{}.signature", header, payload);
+        assert_eq!(tenant_id_from_oauth_claim(&token), None);
+    }
+
+    #[test]
+    fn tenant_id_from_oauth_claim_returns_none_for_non_jwt() {
+        assert_eq!(tenant_id_from_oauth_claim("not-a-jwt"), None);
+        assert_eq!(tenant_id_from_oauth_claim("a.b"), None);
     }
 
     /// The legacy `device_token` field name MUST NOT decode — coord
@@ -825,6 +904,11 @@ mod pair_e2e_tests {
     const TEST_DEVICE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const TEST_USER_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     const TEST_BEARER: &str = "bearer-token";
+    const TEST_TENANT_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+    fn test_tenant_uuid() -> uuid::Uuid {
+        uuid::Uuid::parse_str(TEST_TENANT_ID).unwrap()
+    }
 
     #[test]
     fn pair_with_auth_token_e2e_200_persists_jwt() {
@@ -834,8 +918,13 @@ mod pair_e2e_tests {
         let expected_jwt = "header-segment.payload-segment.signature-segment";
         let (base, _capture, _shutdown) =
             spawn_mock_coord(StatusCode::OK, canonical_200_body(expected_jwt));
-        let result =
-            pair_with_auth_token_with_ids(&base, TEST_BEARER, TEST_DEVICE_ID, TEST_USER_ID);
+        let result = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+        );
         let resp = result.expect("pair_with_auth_token_with_ids should succeed on 200");
         assert_eq!(resp.token, expected_jwt);
         assert_eq!(resp.user_id, "22222222-2222-4222-8222-222222222222");
@@ -854,8 +943,13 @@ mod pair_e2e_tests {
             StatusCode::UNAUTHORIZED,
             r#"{"error":"invalid bearer token"}"#.to_string(),
         );
-        let result =
-            pair_with_auth_token_with_ids(&base, TEST_BEARER, TEST_DEVICE_ID, TEST_USER_ID);
+        let result = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+        );
         let err = result.expect_err("401 must return Err");
         assert!(
             err.contains("401"),
@@ -871,8 +965,13 @@ mod pair_e2e_tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             r#"{"error":"coord-side panic"}"#.to_string(),
         );
-        let result =
-            pair_with_auth_token_with_ids(&base, TEST_BEARER, TEST_DEVICE_ID, TEST_USER_ID);
+        let result = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+        );
         let err = result.expect_err("500 must return Err");
         assert!(
             err.contains("500"),
@@ -888,8 +987,14 @@ mod pair_e2e_tests {
         // `device_id` + `hostname`.
         let (base, capture, _shutdown) =
             spawn_mock_coord(StatusCode::OK, canonical_200_body("ignored-jwt"));
-        let _ = pair_with_auth_token_with_ids(&base, TEST_BEARER, TEST_DEVICE_ID, TEST_USER_ID)
-            .expect("200 path");
+        let _ = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+        )
+        .expect("200 path");
 
         let captured = capture.lock().expect("capture mutex").clone();
         assert!(captured.called, "mock coord must have been hit");
@@ -915,6 +1020,11 @@ mod pair_e2e_tests {
         assert!(
             obj.get("hostname").and_then(|v| v.as_str()).is_some(),
             "body.hostname must be present"
+        );
+        assert_eq!(
+            obj.get("tenant_id").and_then(|v| v.as_str()),
+            Some(TEST_TENANT_ID),
+            "body.tenant_id must carry the resolved tenant (Phase 2 of default-tenant-propagation)"
         );
         // Reject legacy keys (would 422 against the canonical coord
         // PairCliRequest schema):

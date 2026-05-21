@@ -176,10 +176,30 @@ pub(crate) async fn try_refresh_once(
     let did = device_id.to_string();
     let uid = user_id.to_string();
 
+    // Resolve tenant_id from the OAuth/runner token's `tenant_id` claim.
+    // Phase 2 of the default-tenant-propagation plan makes tenant_id a
+    // required field on `POST /coord/devices/pair-cli`; the refresher
+    // reuses the same endpoint to re-mint the device JWT, so it must
+    // forward a tenant_id. Absent/malformed → keep the existing JWT.
+    let tenant_id = match qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+    {
+        Some(t) => t,
+        None => {
+            warn!(
+                "device_jwt_refresher: OAuth token has no usable tenant_id claim; \
+                 keeping existing JWT"
+            );
+            return RefreshOutcome::KeptExisting;
+        }
+    };
+
     // pair_with_auth_token_with_ids is reqwest::blocking — must run via
     // spawn_blocking or it stalls the tokio runtime.
     let pair_join = tokio::task::spawn_blocking(move || {
-        qontinui_runner_lib::pair::pair_with_auth_token_with_ids(&base, &token, &did, &uid)
+        qontinui_runner_lib::pair::pair_with_auth_token_with_ids(
+            &base, &token, &did, &uid, tenant_id,
+        )
     })
     .await;
 
@@ -643,7 +663,20 @@ mod try_refresh_once_tests {
 
     const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    const TOK: &str = "test-runner-token";
+
+    /// JWT-shaped runner token whose payload carries a `tenant_id` claim.
+    /// `try_refresh_once` extracts the tenant_id from the OAuth/runner
+    /// token's payload (Phase 2 of the default-tenant-propagation plan),
+    /// so the test fixture must look like a real JWT — not the prior
+    /// opaque string. We use a fixed base64-encoded payload so each test
+    /// gets the same tenant_id resolution path.
+    fn tok() -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"runner","tenant_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc"}"#);
+        format!("{}.{}.test-signature", header, payload)
+    }
 
     #[tokio::test]
     async fn refresher_handles_coord_401_without_clearing_jwt() {
@@ -660,7 +693,7 @@ mod try_refresh_once_tests {
             r#"{"error":"token expired"}"#.to_string(),
         );
 
-        let outcome = try_refresh_once(&mgr, &base, TOK, DID, UID).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID).await;
         assert_eq!(
             outcome,
             RefreshOutcome::KeptExisting,
@@ -689,7 +722,7 @@ mod try_refresh_once_tests {
             r#"{"error":"coord overloaded"}"#.to_string(),
         );
 
-        let outcome = try_refresh_once(&mgr, &base, TOK, DID, UID).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID).await;
         assert_eq!(outcome, RefreshOutcome::KeptExisting);
 
         let still = mgr.get_access_token().expect("token still present");
@@ -721,7 +754,7 @@ mod try_refresh_once_tests {
 
         let (base, _hits, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, TOK, DID, UID).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID).await;
         match outcome {
             RefreshOutcome::Replaced { new_jwt: got } => {
                 assert_eq!(got, new_jwt, "Replaced must carry the new JWT");
