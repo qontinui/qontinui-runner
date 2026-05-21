@@ -1,4 +1,4 @@
-﻿{
+{
     "version":  "1.0",
     "id":  "cross-run-analytics",
     "name":  "CrossRunPatternsPanel, StepProvenanceTimeline, SelectorDecayChart, FailureChainViewer",

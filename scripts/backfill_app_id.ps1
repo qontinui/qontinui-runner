@@ -81,7 +81,16 @@ foreach ($app in $apps) {
             }
 
             if ($needWrite) {
-                $json | ConvertTo-Json -Depth 100 | Set-Content $irPath -Encoding UTF8
+                # Use UTF-8 WITHOUT BOM. PowerShell's `Set-Content -Encoding UTF8`
+                # prepends a BOM on Windows PowerShell, which serde_json refuses
+                # to parse (fails with "expected value at line 1 column 1" on
+                # the BOM byte). The runner reads these files via
+                # spec_api/storage.rs::read_ir + serde_json::from_str, so any
+                # BOM here cascades into HTTP 500 on /spec-check and into a
+                # missing entry on /apps/<id>/spec/list. .NET's UTF8Encoding
+                # constructor with byte-order-mark=false suppresses the BOM.
+                $jsonText = $json | ConvertTo-Json -Depth 100
+                [System.IO.File]::WriteAllText($irPath, $jsonText, [System.Text.UTF8Encoding]::new($false))
                 $updated++
             } else {
                 $skipped++
