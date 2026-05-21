@@ -29,6 +29,8 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
 
+use qontinui_types::apps::AppError;
+
 use crate::mcp::types::ApiState;
 
 use super::apps::AppErrorExt;
@@ -254,17 +256,37 @@ pub async fn get_list(
     AxPath(app_id): AxPath<String>,
     State(state): State<Arc<ApiState>>,
 ) -> Response {
-    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+    let pg = &state.app_state.pg_db;
+    let root = match storage::resolve_specs_root(pg, &app_id).await {
         Ok(p) => p,
         Err(e) => return e.into_app_response(),
     };
-    build_list_response(&root, &app_id)
+    let display_name = match pg.get_app(&app_id).await {
+        Ok(Some(app)) => app.display_name,
+        Ok(None) => return AppError::NotRegistered { app_id }.into_app_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "get-app-failed",
+                    json!({ "error": e }),
+                )),
+            )
+                .into_response();
+        }
+    };
+    build_list_response(&root, &app_id, &display_name)
 }
 
-/// Inner implementation of `get_list` parameterized by the storage root and
-/// `app_id` so tests can exercise the response-building logic without
-/// constructing an `ApiState`.
-pub(crate) fn build_list_response(root: &std::path::Path, app_id: &str) -> Response {
+/// Inner implementation of `get_list` parameterized by the storage root,
+/// `app_id`, and `display_name` so tests can exercise the response-building
+/// logic without constructing an `ApiState`. The `display_name` is sourced
+/// from the `project.apps` registry (it is NOT derivable from `app_id`).
+pub(crate) fn build_list_response(
+    root: &std::path::Path,
+    app_id: &str,
+    display_name: &str,
+) -> Response {
     let ids = match storage::list_pages(root, app_id) {
         Ok(ids) => ids,
         Err(e) => {
@@ -324,7 +346,7 @@ pub(crate) fn build_list_response(root: &std::path::Path, app_id: &str) -> Respo
         };
         let mut entry = json!({
             "specId": id,
-            "appName": app_id,
+            "appName": display_name,
             "config": {
                 "version": projection.get("version").cloned().unwrap_or(Value::Null),
                 "description": projection.get("description").cloned().unwrap_or(Value::Null),
