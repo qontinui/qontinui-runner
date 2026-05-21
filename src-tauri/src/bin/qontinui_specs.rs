@@ -497,8 +497,7 @@ async fn run_match_rate(client: &Client, args: &MatchRateArgs) -> Result<(), Str
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&Value::Object(grouped))
-                    .map_err(|e| e.to_string())?
+                serde_json::to_string_pretty(&Value::Object(grouped)).map_err(|e| e.to_string())?
             );
             return Ok(());
         }
@@ -579,8 +578,7 @@ async fn run_match_rate(client: &Client, args: &MatchRateArgs) -> Result<(), Str
         }
         println!(
             "{}",
-            serde_json::to_string_pretty(&Value::Object(grouped))
-                .map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&Value::Object(grouped)).map_err(|e| e.to_string())?
         );
         return Ok(());
     }

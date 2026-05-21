@@ -304,8 +304,8 @@ async fn flywheel_full_walk_synthetic_page_through_promotion() {
 
     // Stage the candidate into _pending/. This stamps status = Pending on
     // the on-disk doc (caller's IR is untouched).
-    let staged_path = storage::write_pending_ir(root, storage::RUNNER_APP_ID, &ir)
-        .expect("write_pending_ir");
+    let staged_path =
+        storage::write_pending_ir(root, storage::RUNNER_APP_ID, &ir).expect("write_pending_ir");
     assert!(
         staged_path.to_string_lossy().contains("_pending"),
         "staged path should land under _pending/: {}",

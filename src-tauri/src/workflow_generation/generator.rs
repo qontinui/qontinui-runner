@@ -1092,17 +1092,15 @@ pub fn generate_workflow(
                 // is `Ok` when we're on a worker thread of the multi-threaded
                 // runtime — the common path. `block_in_place` keeps the
                 // worker thread happy.
-                let maybe_specs_root = tokio::runtime::Handle::try_current().ok().and_then(
-                    |rt| {
-                        tokio::task::block_in_place(|| {
-                            rt.block_on(crate::spec_api::storage::resolve_specs_root(
-                                &pg_for_resolve,
-                                &app_id,
-                            ))
-                        })
-                        .ok()
-                    },
-                );
+                let maybe_specs_root = tokio::runtime::Handle::try_current().ok().and_then(|rt| {
+                    tokio::task::block_in_place(|| {
+                        rt.block_on(crate::spec_api::storage::resolve_specs_root(
+                            &pg_for_resolve,
+                            &app_id,
+                        ))
+                    })
+                    .ok()
+                });
                 match maybe_specs_root {
                     Some(specs_root) => {
                         let spec_update = super::spec_synthesis::update_page_specs_from_criteria(

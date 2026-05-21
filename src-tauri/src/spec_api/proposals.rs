@@ -380,30 +380,28 @@ pub async fn post_execute(
             // ids in `metadata`, not the full report shape).
             let project_root =
                 std::env::var("QONTINUI_PROJECT_ROOT").unwrap_or_else(|_| ".".into());
-            let drift = match crate::commands::spec_drift::scan_spec_drift(
-                app_id.clone(),
-                project_root,
-            )
-            .await
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = pg_db
-                        .update_proposal_status_with_error(&row.id, "failed", &e)
-                        .await;
-                    return (
-                        StatusCode::OK,
-                        Json(json!({
-                            "ok": false,
-                            "proposalId": row.id,
-                            "outcome": "authoring-failed",
-                            "reason": "drift-scan-failed",
-                            "detail": e,
-                        })),
-                    )
-                        .into_response();
-                }
-            };
+            let drift =
+                match crate::commands::spec_drift::scan_spec_drift(app_id.clone(), project_root)
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = pg_db
+                            .update_proposal_status_with_error(&row.id, "failed", &e)
+                            .await;
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "ok": false,
+                                "proposalId": row.id,
+                                "outcome": "authoring-failed",
+                                "reason": "drift-scan-failed",
+                                "detail": e,
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
             crate::workflow_generation::spec_authoring::AuthoringMode::Patch {
                 existing_spec_id,
                 drift,
@@ -1156,7 +1154,10 @@ mod tests {
             line: 12,
             suggested_assertion: String::new(),
         };
-        assert_eq!(infer_target_spec_id("qontinui-runner", &elem).as_deref(), Some("index"));
+        assert_eq!(
+            infer_target_spec_id("qontinui-runner", &elem).as_deref(),
+            Some("index")
+        );
     }
 
     #[test]
@@ -1478,8 +1479,8 @@ mod tests {
                 synthesized_groups: None,
                 initial_state: None,
             };
-            let staged = storage::write_pending_ir(&root, &app_id, &candidate)
-                .expect("write_pending_ir");
+            let staged =
+                storage::write_pending_ir(&root, &app_id, &candidate).expect("write_pending_ir");
             assert!(
                 staged.to_string_lossy().contains("_pending"),
                 "staged path should land under _pending/: {}",
@@ -1492,7 +1493,11 @@ mod tests {
                 .join("pages")
                 .join(&candidate.id)
                 .join("state-machine.derived.json");
-            assert!(canon_ir.exists(), "canonical IR missing: {}", canon_ir.display());
+            assert!(
+                canon_ir.exists(),
+                "canonical IR missing: {}",
+                canon_ir.display()
+            );
             let pending_dir = root.join("pages").join(&candidate.id).join("_pending");
             assert!(
                 !pending_dir.exists(),

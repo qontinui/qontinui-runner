@@ -608,12 +608,7 @@ pub async fn post_spec_check(
     // subscribers can correlate `snapshot_id` against tracing spans.
     // Stream D: emit on the request's `app_id` channel so per-app subscribers
     // see only events for the app they registered for.
-    invoke_emit(
-        &req.app_id,
-        &snapshot_id,
-        vec![req.page_id.clone()],
-        "http",
-    );
+    invoke_emit(&req.app_id, &snapshot_id, vec![req.page_id.clone()], "http");
     let started_ms = events::now_ms();
 
     // Evaluate — pure crate call, no logic here.
@@ -1357,7 +1352,15 @@ mod tests {
 
         let mut rx = events::subscribe(RUNNER_APP_ID);
         let marker = "scs_batch_emit_test_marker_xyz";
-        let r = evaluate_one(RUNNER_APP_ID, root, &entry, &snapshot, marker, Some(&policy)).await;
+        let r = evaluate_one(
+            RUNNER_APP_ID,
+            root,
+            &entry,
+            &snapshot,
+            marker,
+            Some(&policy),
+        )
+        .await;
         assert_eq!(r.status, "ok");
         let pe = r.policy_evaluation.as_ref().expect("policy_evaluation set");
         assert_eq!(
@@ -1697,7 +1700,12 @@ mod tests {
     fn invoke_emit_publishes_spec_check_invoked() {
         let mut rx = events::subscribe(RUNNER_APP_ID);
         let marker = "scs_test_invoke_emit_1";
-        invoke_emit(RUNNER_APP_ID, marker, vec!["settings-general".into()], "http");
+        invoke_emit(
+            RUNNER_APP_ID,
+            marker,
+            vec!["settings-general".into()],
+            "http",
+        );
         let event = recv_matching_invoked(&mut rx, marker, 32)
             .expect("SpecCheckInvoked with marker must arrive");
         match event {

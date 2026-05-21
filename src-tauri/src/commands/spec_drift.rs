@@ -277,10 +277,7 @@ async fn scan_specs(pg: &PgDb, app_id: &str) -> (SpecAssertedIndex, usize) {
 /// - `project_root`: absolute path to the project root (the directory
 ///   containing `src/` and `src-tauri/`).
 #[tauri::command]
-pub async fn scan_spec_drift(
-    app_id: String,
-    project_root: String,
-) -> Result<DriftReport, String> {
+pub async fn scan_spec_drift(app_id: String, project_root: String) -> Result<DriftReport, String> {
     let root = PathBuf::from(&project_root);
     if !root.is_dir() {
         return Err(format!("project_root does not exist: {}", project_root));
