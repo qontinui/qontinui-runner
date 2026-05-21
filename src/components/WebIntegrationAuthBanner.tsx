@@ -33,7 +33,10 @@ import { AlertCircle, X } from "lucide-react";
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 
 import {
+  makeRePairClickHandler,
+  RE_PAIR_CTA_GRACE_MS,
   shouldShowAuthBanner,
+  shouldShowRePairCta,
   statusSignature,
   type AuthBannerStatus,
 } from "./web-integration-banner-logic";
@@ -78,6 +81,23 @@ export function WebIntegrationAuthBanner() {
   const [authorizing, setAuthorizing] = useState(false);
   const [authorizeError, setAuthorizeError] = useState<string | null>(null);
 
+  // Phase 4 (unified-devices migration): post-upgrade re-pair CTA state.
+  //
+  // `deviceJwtPresent` mirrors the `device_jwt_present` Tauri command
+  // result. `firstDetectedAt` is the wall-clock ms at which we first
+  // observed the migration state (Tier 2 + runner_token + !deviceJwt).
+  // Both are *component* state, not setting state — this is a transient
+  // UI signal that resets on every mount.
+  //
+  // `nowTick` is the ms timestamp the visibility predicate compares
+  // `firstDetectedAt` against. We bump it once via setTimeout after the
+  // grace period so React re-renders and reveals the CTA without polling.
+  const [deviceJwtPresent, setDeviceJwtPresent] = useState<boolean | null>(null);
+  const [firstDetectedAt, setFirstDetectedAt] = useState<number | null>(null);
+  const [nowTick, setNowTick] = useState<number>(() => Date.now());
+  const [reKicking, setReKicking] = useState(false);
+  const [reKickError, setReKickError] = useState<string | null>(null);
+
   const { ref: rootRef } = useUIElement({
     id: "web-integration-banner",
     label: "Web integration authorization banner",
@@ -91,6 +111,11 @@ export function WebIntegrationAuthBanner() {
   const { ref: dismissButtonRef } = useUIElement({
     id: "web-integration-banner-dismiss",
     label: "Dismiss web integration authorization banner",
+    type: "button",
+  });
+  const { ref: rePairButtonRef } = useUIElement({
+    id: "web-integration-banner-re-pair",
+    label: "Retry device re-pair manually",
     type: "button",
   });
 
@@ -126,6 +151,86 @@ export function WebIntegrationAuthBanner() {
     };
   }, []);
 
+  // Phase 4 (unified-devices migration): fetch `device_jwt_present` on
+  // mount. The refresher may flip this from false → true under us; the
+  // simplest signal we own is a re-fetch on `web-integration-changed`
+  // (emitted by the pair-cli wrapper) so we piggyback the same listener
+  // shape used above. setState is only called inside the async resolution.
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchJwt = () => {
+      invoke<boolean>("device_jwt_present")
+        .then((present) => {
+          if (!cancelled) setDeviceJwtPresent(present);
+        })
+        .catch(() => {
+          // Older runner build (pre-Phase 4) won't have this command.
+          // Treat the absence as "we can't tell" — never surface the CTA.
+          if (!cancelled) setDeviceJwtPresent(true);
+        });
+    };
+
+    fetchJwt();
+    const unlisten = listen("web-integration-changed", fetchJwt);
+
+    return () => {
+      cancelled = true;
+      unlisten
+        .then((fn) => fn())
+        .catch(() => {
+          /* listener cleanup is best-effort */
+        });
+    };
+  }, []);
+
+  // Phase 4 — record the first-detected-at timestamp when the migration
+  // state first qualifies, and schedule a one-shot re-render at
+  // detectedAt + RE_PAIR_CTA_GRACE_MS so the CTA reveal isn't gated on
+  // unrelated re-renders. We don't *poll* — we just nudge `nowTick`
+  // once the grace deadline arrives.
+  const migrationStateQualifies =
+    tier === "qontinui_account" &&
+    status !== null &&
+    status.runnerTokenMasked.length > 0 &&
+    deviceJwtPresent === false;
+
+  useEffect(() => {
+    if (!migrationStateQualifies) {
+      // State no longer qualifies (e.g. JWT arrived) — drop the timer.
+      setFirstDetectedAt(null);
+      return;
+    }
+    if (firstDetectedAt !== null) return;
+
+    const detectedAt = Date.now();
+    setFirstDetectedAt(detectedAt);
+    const handle = setTimeout(() => {
+      setNowTick(Date.now());
+    }, RE_PAIR_CTA_GRACE_MS);
+
+    return () => {
+      clearTimeout(handle);
+    };
+  }, [migrationStateQualifies, firstDetectedAt]);
+
+  const handleRePair = useCallback(async () => {
+    setReKicking(true);
+    setReKickError(null);
+    try {
+      // Delegated to a pure factory so the click → invoke contract can be
+      // unit-tested in node (no jsdom). Refresher will fire its `Pair`
+      // path on next tick; the resulting `web-integration-changed` event
+      // refreshes `deviceJwtPresent` above.
+      const click = makeRePairClickHandler((cmd, args) => invoke<void>(cmd, args));
+      await click();
+    } catch (err) {
+      setReKickError(String(err));
+    } finally {
+      setReKicking(false);
+    }
+  }, []);
+
   const handleAuthorize = useCallback(async () => {
     setAuthorizing(true);
     setAuthorizeError(null);
@@ -147,6 +252,86 @@ export function WebIntegrationAuthBanner() {
   }, [status]);
 
   if (tier !== "qontinui_account") return null;
+
+  // Phase 4 (unified-devices migration): re-pair CTA takes precedence over
+  // the "needs first pair" banner. When this runner WAS paired pre-upgrade
+  // but is missing a device-JWT, surface a distinct CTA that kicks the
+  // refresher rather than re-opening the OAuth flow. The 5-min grace
+  // covers the refresher's normal tick — only surface if it hasn't healed.
+  const showRePair = shouldShowRePairCta({
+    tier,
+    runnerTokenPresent: (status?.runnerTokenMasked.length ?? 0) > 0,
+    deviceJwtPresent: deviceJwtPresent ?? true,
+    firstDetectedAt,
+    now: nowTick,
+  });
+
+  if (showRePair) {
+    return (
+      <div
+        ref={rootRef}
+        role="status"
+        aria-live="polite"
+        style={{
+          position: "fixed",
+          top: 16,
+          left: "50%",
+          transform: "translateX(-50%)",
+          zIndex: 9999,
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          padding: "10px 14px",
+          background: "var(--bg-tertiary, #242837)",
+          color: "var(--text-primary, #e4e4e7)",
+          border: "1px solid var(--accent, #6366f1)",
+          borderRadius: 8,
+          boxShadow: "0 4px 16px rgba(0, 0, 0, 0.35)",
+          fontSize: "0.875rem",
+          maxWidth: "min(640px, calc(100vw - 32px))",
+        }}
+      >
+        <AlertCircle
+          className="w-4 h-4 shrink-0"
+          style={{ color: "var(--accent, #6366f1)" }}
+          aria-hidden="true"
+        />
+        <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+          <div style={{ fontWeight: 600 }}>Re-pair this runner with Qontinui.</div>
+          <div style={{ fontSize: "0.8125rem", opacity: 0.85 }}>
+            Your runner needs a fresh device credential after the upgrade. The runner will pair
+            automatically — if this banner stays visible, click here to retry manually.
+            {reKickError ? (
+              <>
+                <br />
+                <span style={{ color: "var(--destructive, #ef4444)" }}>{reKickError}</span>
+              </>
+            ) : null}
+          </div>
+        </div>
+        <button
+          ref={rePairButtonRef}
+          type="button"
+          onClick={handleRePair}
+          disabled={reKicking}
+          style={{
+            background: "var(--accent, #6366f1)",
+            color: "#fff",
+            border: "none",
+            borderRadius: 4,
+            padding: "4px 10px",
+            fontSize: "0.8125rem",
+            fontWeight: 600,
+            cursor: reKicking ? "wait" : "pointer",
+            opacity: reKicking ? 0.7 : 1,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {reKicking ? "Retrying…" : "Retry"}
+        </button>
+      </div>
+    );
+  }
 
   const visible = shouldShowAuthBanner(status, dismissedSignature);
   if (!visible) return null;

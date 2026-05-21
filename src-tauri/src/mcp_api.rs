@@ -1015,6 +1015,21 @@ pub fn create_router(
         });
     }
 
+    // Auto-start device-JWT refresher (Phase 2 of unified-devices migration).
+    // The refresher is tier-aware: it idles unless RunnerTier::QontinuiAccount,
+    // so spawning unconditionally on Tier 0/1 just wastes a watch channel — no
+    // network calls happen until the user signs into Qontinui.
+    {
+        let refresher_api_state = api_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            crate::mcp::device_jwt_refresher::commands::auto_start_device_jwt_refresher(
+                refresher_api_state,
+            )
+            .await;
+        });
+    }
+
     // Sync workflows from web backend on startup (background task)
     {
         let sync_pg_db = api_state.app_state.pg_db.clone();

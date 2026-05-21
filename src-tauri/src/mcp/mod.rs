@@ -51,6 +51,7 @@ pub mod coordinator;
 pub mod debug_builder_prompt;
 pub mod decision_trail_api;
 pub mod development_intelligence;
+pub mod device_jwt_refresher;
 pub mod discovery;
 pub mod dom_capture;
 pub mod entity_profiles_api;

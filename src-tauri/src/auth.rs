@@ -9,12 +9,29 @@
 
 use crate::secure_storage::SecureStorage;
 use anyhow::{Context, Result};
+use base64::Engine;
 use keyring::Entry;
+use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Service name used for keychain entries (legacy)
 const SERVICE_NAME: &str = "com.qontinui.runner";
+
+/// Refresh the device-JWT once we're within TTL/3 of expiry.
+///
+/// Coord mints 4-hour device-JWTs (14_400s). TTL/3 = 4_800s = 80 min.
+/// The refresher loop calls `device_jwt_needs_refresh` to decide whether
+/// to call `pair_with_auth_token` and replace the stored JWT.
+pub const REFRESH_BEFORE_EXPIRY_SECS: i64 = 4 * 60 * 60 / 3;
+
+/// Minimal projection of a device-JWT payload — only the `exp` claim is
+/// consulted by the refresher. Signature is NOT verified here; the
+/// AuthManager just stored this token after a successful pair handshake.
+#[derive(Debug, Deserialize)]
+struct JwtExpClaim {
+    exp: i64,
+}
 
 /// When `QONTINUI_DISABLE_KEYCHAIN` is set, keychain reads return an error
 /// (callers fall back to file storage) and keychain writes are no-ops. The
@@ -331,11 +348,141 @@ impl AuthManager {
         self.get_access_token_from_keychain().is_ok()
             && self.get_refresh_token_from_keychain().is_ok()
     }
+
+    /// Returns `Ok(true)` iff the device-JWT (stored in the access_token
+    /// slot by `pair::persist_pairing`) is missing OR will expire within
+    /// [`REFRESH_BEFORE_EXPIRY_SECS`]. Returns `Ok(false)` iff the JWT is
+    /// fresh enough.
+    ///
+    /// Treatment of unparseable tokens: if the slot is non-empty but the
+    /// middle segment fails to base64-decode or JSON-decode (likely a
+    /// legacy opaque `qontinui_runner_<random>` bearer from before the
+    /// device-JWT migration), this returns `Ok(true)` so the refresher
+    /// replaces it with a real JWT. Returning Err here would prevent the
+    /// refresher from healing legacy installs.
+    ///
+    /// Signature is intentionally NOT verified — the only consumer is the
+    /// refresher loop deciding "should I pair again?". Coord re-verifies
+    /// the JWT on every WS handshake; a forged exp at most causes one
+    /// extra pair call.
+    pub fn device_jwt_needs_refresh(&self) -> Result<bool> {
+        let token = match self.get_access_token() {
+            Ok(t) => t,
+            Err(_) => return Ok(true), // No stored token = needs first pair.
+        };
+        if token.is_empty() {
+            return Ok(true);
+        }
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            debug!("device_jwt_needs_refresh: token is not a 3-segment JWT (likely legacy opaque) — treating as needs-refresh");
+            return Ok(true);
+        }
+        // Try URL_SAFE_NO_PAD first (the JWT spec mandates no-padding), but
+        // accept URL_SAFE defensively too.
+        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[1]));
+        let payload_bytes = match payload_bytes {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(
+                    "device_jwt_needs_refresh: middle segment base64-decode failed ({e}) \
+                     — treating as needs-refresh"
+                );
+                return Ok(true);
+            }
+        };
+        let claim: JwtExpClaim = match serde_json::from_slice(&payload_bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(
+                    "device_jwt_needs_refresh: payload JSON-decode failed ({e}) \
+                     — treating as needs-refresh"
+                );
+                return Ok(true);
+            }
+        };
+        let now = chrono::Utc::now().timestamp();
+        Ok(now + REFRESH_BEFORE_EXPIRY_SECS >= claim.exp)
+    }
 }
 
 impl Default for AuthManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Returns true if `s` looks like a JWS Compact Serialization
+/// (three base64url segments separated by `.`). Used by Phase 4 of the
+/// unified-devices migration to distinguish a real device-JWT from the
+/// legacy opaque `qontinui_runner_<random>` bearer that older paired
+/// installs have in the access_token slot.
+///
+/// Does NOT verify the signature or parse claims — that's
+/// `device_jwt_needs_refresh`'s job. This is the shallow shape check
+/// used at boot to decide whether a refresher kick is warranted.
+pub(crate) fn looks_like_jwt(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    parts.iter().all(|p| {
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+#[cfg(test)]
+mod looks_like_jwt_tests {
+    use super::looks_like_jwt;
+
+    #[test]
+    fn legacy_opaque_runner_token_is_not_jwt() {
+        assert!(!looks_like_jwt("qontinui_runner_abc123"));
+    }
+
+    #[test]
+    fn empty_string_is_not_jwt() {
+        assert!(!looks_like_jwt(""));
+    }
+
+    #[test]
+    fn whitespace_is_not_jwt() {
+        assert!(!looks_like_jwt("   "));
+    }
+
+    #[test]
+    fn single_dot_is_not_jwt() {
+        assert!(!looks_like_jwt("a.b"));
+    }
+
+    #[test]
+    fn four_segments_is_not_jwt() {
+        assert!(!looks_like_jwt("a.b.c.d"));
+    }
+
+    #[test]
+    fn jwt_shape_three_segments_passes() {
+        assert!(looks_like_jwt("abc.def.ghi"));
+    }
+
+    #[test]
+    fn jwt_shape_with_url_safe_chars_passes() {
+        assert!(looks_like_jwt("eyJ_h-1.eyJa-bc.xy_z"));
+    }
+
+    #[test]
+    fn jwt_shape_with_invalid_chars_fails() {
+        // `+` and `/` are standard base64, NOT URL-safe — a real JWT uses
+        // base64url, so a token with these is malformed.
+        assert!(!looks_like_jwt("eyJh.eyJh+/.xyz"));
     }
 }
 
@@ -397,5 +544,103 @@ mod tests {
         // Clear and verify
         auth_manager.clear_tokens().unwrap();
         assert!(!auth_manager.has_tokens());
+    }
+}
+
+/// Tests for `AuthManager::device_jwt_needs_refresh` — Phase 2.1 of the
+/// runner unified-devices migration.
+#[cfg(test)]
+mod device_jwt_tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+
+    /// Each test gets its own isolated storage file so they don't poison
+    /// each other.
+    fn create_test_auth_manager(test_name: &str) -> AuthManager {
+        let temp_dir = env::temp_dir().join("qontinui_test_auth_device_jwt");
+        let storage_path = temp_dir.join(format!("{}.enc", test_name));
+        let _ = fs::remove_file(&storage_path);
+        let storage = SecureStorage::with_path(storage_path).unwrap();
+        AuthManager::with_storage(storage)
+    }
+
+    /// URL-safe base64 without padding — the JWT spec encoding.
+    fn b64url_no_pad(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Mint a synthetic JWT with the given `exp` claim. Signature is not
+    /// verified by `device_jwt_needs_refresh`, so a placeholder is fine.
+    fn synth_jwt(exp: i64) -> String {
+        let header = b64url_no_pad(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url_no_pad(format!("{{\"exp\":{}}}", exp).as_bytes());
+        let sig = b64url_no_pad(b"fake-signature-bytes");
+        format!("{header}.{payload}.{sig}")
+    }
+
+    #[test]
+    fn needs_refresh_when_no_token() {
+        let mgr = create_test_auth_manager("needs_refresh_when_no_token");
+        // Empty slot — never stored anything.
+        assert!(
+            mgr.device_jwt_needs_refresh().unwrap(),
+            "missing token must report needs-refresh"
+        );
+    }
+
+    #[test]
+    fn needs_refresh_when_legacy_opaque_token() {
+        let mgr = create_test_auth_manager("needs_refresh_when_legacy_opaque_token");
+        mgr.store_tokens("qontinui_runner_abc123", "").unwrap();
+        assert!(
+            mgr.device_jwt_needs_refresh().unwrap(),
+            "legacy opaque token must report needs-refresh so the refresher heals it"
+        );
+    }
+
+    #[test]
+    fn needs_refresh_when_jwt_within_threshold() {
+        let mgr = create_test_auth_manager("needs_refresh_when_jwt_within_threshold");
+        let now = chrono::Utc::now().timestamp();
+        // exp 30 minutes from now — well inside the 80-minute refresh threshold.
+        let jwt = synth_jwt(now + 30 * 60);
+        mgr.store_tokens(&jwt, "").unwrap();
+        assert!(
+            mgr.device_jwt_needs_refresh().unwrap(),
+            "JWT within REFRESH_BEFORE_EXPIRY_SECS must report needs-refresh"
+        );
+    }
+
+    #[test]
+    fn does_not_need_refresh_when_jwt_fresh() {
+        let mgr = create_test_auth_manager("does_not_need_refresh_when_jwt_fresh");
+        let now = chrono::Utc::now().timestamp();
+        // exp 3 hours from now — comfortably outside the 80-minute threshold.
+        let jwt = synth_jwt(now + 3 * 60 * 60);
+        mgr.store_tokens(&jwt, "").unwrap();
+        assert!(
+            !mgr.device_jwt_needs_refresh().unwrap(),
+            "JWT with >80min until expiry must NOT report needs-refresh"
+        );
+    }
+
+    #[test]
+    fn needs_refresh_when_jwt_expired() {
+        let mgr = create_test_auth_manager("needs_refresh_when_jwt_expired");
+        let now = chrono::Utc::now().timestamp();
+        // exp 1 hour ago — already expired.
+        let jwt = synth_jwt(now - 60 * 60);
+        mgr.store_tokens(&jwt, "").unwrap();
+        assert!(
+            mgr.device_jwt_needs_refresh().unwrap(),
+            "expired JWT must report needs-refresh"
+        );
+    }
+
+    #[test]
+    fn refresh_threshold_is_ttl_over_three() {
+        // Pin the constant — coord mints 4h JWTs, refresh threshold = TTL/3.
+        assert_eq!(REFRESH_BEFORE_EXPIRY_SECS, 4_800);
     }
 }

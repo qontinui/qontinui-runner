@@ -1,9 +1,12 @@
 //! Unified runner ↔ qontinui-web WebSocket relay (Phase 3).
 //!
-//! Opens a single outbound WebSocket to `WS /api/v1/runners/ws` on the
+//! Opens a single outbound WebSocket to `WS /api/v1/devices/ws` on the
 //! configured `WebIntegrationSettings.backend_url`, authenticated with a
-//! `Authorization: Bearer <runner_token>` header. This connection replaces
-//! the legacy split-brain architecture in which:
+//! `Authorization: Bearer <device_jwt>` header. The device-JWT is minted
+//! by coord (`/pair/cli/complete` → 4h TTL) and stored in `AuthManager`'s
+//! `access_token` slot by `pair::persist_pairing`; the background
+//! `mcp::device_jwt_refresher` task keeps it fresh. This connection
+//! replaces the legacy split-brain architecture in which:
 //!
 //! - `server_mode/mod.rs` HTTP-registered the runner and heartbeated every
 //!   30s via `POST /runners/{id}/heartbeat`.
@@ -32,9 +35,12 @@
 //!   `command_response`, `chat_response`, `terminal_response`.
 //!
 //! Reconnect uses exponential backoff (2s → 60s) with kick-to-retry-now.
-//! Trigger condition is purely `WebIntegrationSettings.enabled &&
-//! !runner_token.is_empty()` — there is no longer a `cloud_relay` toggle
-//! or a localhost auto-detect probe.
+//! Trigger condition is `tier == QontinuiAccount && WebIntegrationSettings.
+//! enabled && AuthManager has a non-empty device-JWT` — there is no longer
+//! a `cloud_relay` toggle or a localhost auto-detect probe. The runner_token
+//! field is no longer consulted by the relay (Phase 3 of the unified-devices
+//! migration); it is owned by the refresher's outbound HTTP to coord's
+//! pair-cli endpoint.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -59,23 +65,74 @@ use uuid::Uuid;
 
 use crate::mcp::types::ApiState;
 
-/// Should the relay loop idle (await a settings-change kick) instead of
-/// attempting to connect? True iff *any* of the three gates is unmet:
+/// Pure idle predicate: given the three relay gates, should the loop
+/// idle (await a kick) instead of connecting? True iff *any* gate is unmet:
 ///
 /// 1. Runner tier is anything other than `QontinuiAccount` (Tier 0/1 has
 ///    no business reaching qontinui-web — Phase 4 of the tier-decoupling
 ///    plan).
 /// 2. `web_integration.enabled` is false (user-facing master switch).
-/// 3. `web_integration.runner_token` is empty (no credential to present —
-///    the relay would 403-spam without this guard).
+/// 3. AuthManager's `access_token` slot is empty — no device-JWT to
+///    present, which would 401-spam the WS without this guard. Phase 3 of
+///    the unified-devices migration replaced the old `runner_token` gate;
+///    the runner_token is now only consumed by `device_jwt_refresher` for
+///    outbound HTTP to coord's pair-cli endpoint.
 ///
-/// Extracted from the relay loop body so the Phase 9 calibration suite can
-/// exercise it as a pure function. Keep it in lockstep with the call site
-/// at `start_relay_loop` (single conditional, no other consumers).
+/// Kept as a pure function (no I/O, no global state) so the Phase 9
+/// tier-matrix calibration suite can exercise it deterministically. The
+/// I/O-bound wrapper `should_relay_idle` reads from `AuthManager` and
+/// calls into this inner predicate.
+pub(crate) fn should_relay_idle_with(
+    tier: crate::settings::RunnerTier,
+    enabled: bool,
+    has_device_jwt: bool,
+) -> bool {
+    if tier != crate::settings::RunnerTier::QontinuiAccount {
+        return true;
+    }
+    if !enabled {
+        return true;
+    }
+    !has_device_jwt
+}
+
+/// Live idle predicate consumed by `relay_loop`. Reads the device-JWT
+/// slot from `AuthManager` (filesystem I/O on `~/.qontinui`) and delegates
+/// to the pure inner [`should_relay_idle_with`]. Tests must use the inner
+/// directly to avoid touching user data_local_dir.
 pub(crate) fn should_relay_idle(settings: &crate::settings::Settings) -> bool {
-    settings.tier != crate::settings::RunnerTier::QontinuiAccount
-        || !settings.web_integration.enabled
-        || settings.web_integration.runner_token.trim().is_empty()
+    let has_device_jwt = match crate::auth::AuthManager::new().get_access_token() {
+        Ok(t) => !t.trim().is_empty(),
+        Err(_) => false,
+    };
+    should_relay_idle_with(
+        settings.tier,
+        settings.web_integration.enabled,
+        has_device_jwt,
+    )
+}
+
+/// Return true iff `e` is a tungstenite handshake error with HTTP 401
+/// (Unauthorized). Used by [`relay_loop`] to detect a stale device-JWT
+/// and kick the refresher BEFORE serving out the backoff sleep.
+///
+/// Factored out of the inline `Err(e)` arm so the Phase 5.3 unit tests
+/// can construct synthetic errors and pin the discrimination:
+/// - `Error::Http(401)` → true (the only "yes")
+/// - `Error::Http(<anything else>)` → false (500 / 403 / 404 are NOT
+///   triggers to kick the refresher — they signal coord-side bugs or
+///   policy denials that a fresh JWT won't fix)
+/// - `Error::Io(...)`, `Error::ConnectionClosed`, transport errors → false
+///
+/// Keeping this isolated from the I/O path means a refactor that moves
+/// to a different WS client (or augments the detection with WWW-
+/// Authenticate parsing) has a regression net here without needing a
+/// live coord.
+pub(crate) fn is_unauthorized(e: &tokio_tungstenite::tungstenite::Error) -> bool {
+    if let tokio_tungstenite::tungstenite::Error::Http(ref resp) = e {
+        return resp.status() == tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+    }
+    false
 }
 
 /// Periodicity of WS heartbeat sends. The backend's `last_heartbeat`
@@ -174,13 +231,17 @@ async fn relay_loop(
         let settings = crate::settings::load_settings();
         let web_integration = &settings.web_integration;
 
-        // Phase 3 + tier-decoupling: relay idles unless the user is in Tier 2
-        // (signed into Qontinui) AND web integration is enabled AND a token is
-        // present. The tier gate stops the 403-spam loop for Tier 0/1 installs
-        // that have no business reaching qontinui-web. See plans/2026-05-20-
-        // runner-tier-decoupling.md Phase 4. The predicate is extracted to
-        // `should_relay_idle` so the Phase 9 calibration suite can exercise
-        // it without spinning the loop.
+        // Phase 3 unified-devices + tier-decoupling: relay idles unless the
+        // user is in Tier 2 (signed into Qontinui) AND web integration is
+        // enabled AND a device-JWT is present in AuthManager's access_token
+        // slot. The tier gate stops the 403-spam loop for Tier 0/1 installs
+        // that have no business reaching qontinui-web. The JWT gate replaces
+        // the legacy runner_token gate — coord now mints a short-lived JWT
+        // that's the canonical WS bearer. See
+        // `plans/2026-05-21-runner-unified-devices-migration.md` Phase 3.
+        // The predicate is split into a pure inner (`should_relay_idle_with`)
+        // and the I/O-bound wrapper (`should_relay_idle`) so the Phase 9
+        // calibration suite can exercise the gate without touching disk.
         if should_relay_idle(&settings) {
             // Wait for a kick or shutdown before re-checking — there's
             // nothing to do until settings change.
@@ -201,24 +262,51 @@ async fn relay_loop(
             .trim()
             .trim_end_matches('/')
             .to_string();
-        let runner_token = web_integration.runner_token.trim().to_string();
 
         let ws_url = format!(
-            "{}/api/v1/runners/ws",
+            "{}/api/v1/devices/ws",
             backend_url
                 .replace("https://", "wss://")
                 .replace("http://", "ws://"),
         );
 
+        // Pull the device-JWT from AuthManager's access_token slot —
+        // populated by `pair::persist_pairing` and kept fresh by
+        // `mcp::device_jwt_refresher`. The upstream `should_relay_idle`
+        // gate already verified the slot is non-empty, but a TOCTOU race
+        // with `clear_tokens` (sign-out) or an in-flight rotation could
+        // leave us empty here; in that case, kick the refresher and
+        // sleep until the next iteration. (Phase 3 of the unified-devices
+        // migration plan.)
+        let device_jwt = match crate::auth::AuthManager::new().get_access_token() {
+            Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => {
+                info!(
+                    "Backend relay: device-JWT slot empty at connect time — \
+                     kicking refresher and backing off"
+                );
+                crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+                sleep_with_kick(
+                    Duration::from_millis(backoff_ms),
+                    &mut shutdown_rx,
+                    &mut kick_rx,
+                )
+                .await;
+                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+                continue;
+            }
+        };
+
         // After many consecutive quick disconnects, the backend is
-        // persistently rejecting us (e.g. revoked token, runner-token
-        // expired). Back off aggressively to avoid hammering the server.
+        // persistently rejecting us (e.g. revoked device-JWT, coord
+        // un-paired this device). Back off aggressively to avoid
+        // hammering the server.
         if consecutive_quick_disconnects >= 5 {
             let extended_backoff = max_backoff_ms.max(120_000);
             warn!(
                 "Backend relay: {} consecutive quick disconnects. \
-                 Check runner token validity and backend connectivity. \
-                 Backing off for {}s (send kick to retry sooner).",
+                 Check device-JWT validity (sign-in state) and backend \
+                 connectivity. Backing off for {}s (send kick to retry sooner).",
                 consecutive_quick_disconnects,
                 extended_backoff / 1000
             );
@@ -243,7 +331,7 @@ async fn relay_loop(
         // `IntoClientRequest`, which lets us set custom headers (the WS
         // spec doesn't define a header-auth scheme, but Anthropic-style
         // backends accept Authorization: Bearer here).
-        let request_result: Result<HttpRequest, String> = build_ws_request(&ws_url, &runner_token);
+        let request_result: Result<HttpRequest, String> = build_ws_request(&ws_url, &device_jwt);
         let request = match request_result {
             Ok(r) => r,
             Err(e) => {
@@ -335,6 +423,22 @@ async fn relay_loop(
                 }
             }
             Err(e) => {
+                // Detect HTTP 401 on the upgrade handshake — coord rejects
+                // the device-JWT (expired or revoked). Kick the refresher
+                // so it re-exchanges the runner_token for a fresh JWT
+                // before the next reconnect attempt; otherwise the relay
+                // would sleep through the entire backoff before the
+                // refresher's 5-min interval fires. (Phase 3 of the
+                // unified-devices migration plan.) Detection factored
+                // into [`is_unauthorized`] so the Phase 5.3 tests can
+                // exercise the branching without spinning up a WS server.
+                if is_unauthorized(&e) {
+                    info!(
+                        "Backend relay got 401 on WS upgrade — kicking \
+                         device-JWT refresher to re-exchange"
+                    );
+                    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+                }
                 let msg = format!("Failed to connect to runner WS: {}", e);
                 warn!("{}", msg);
                 record_connection_error(&api_state, msg).await;
@@ -359,12 +463,13 @@ async fn relay_loop(
 /// Build a tungstenite client `Request` with an `Authorization: Bearer`
 /// header. We start from the URL's parsed `IntoClientRequest` form (which
 /// fills in `Host`, `Upgrade`, `Connection`, `Sec-WebSocket-*` headers)
-/// and then set our auth header on top.
-fn build_ws_request(ws_url: &str, runner_token: &str) -> Result<HttpRequest, String> {
+/// and then set our auth header on top. The bearer is the device-JWT
+/// minted by coord; see Phase 3 of the unified-devices migration plan.
+fn build_ws_request(ws_url: &str, device_jwt: &str) -> Result<HttpRequest, String> {
     let mut req = ws_url
         .into_client_request()
         .map_err(|e| format!("invalid ws URL: {}", e))?;
-    let auth_value = format!("Bearer {}", runner_token);
+    let auth_value = format!("Bearer {}", device_jwt);
     let header_value = HeaderValue::from_str(&auth_value)
         .map_err(|e| format!("invalid auth header value: {}", e))?;
     req.headers_mut()
@@ -1725,9 +1830,10 @@ pub mod commands {
 
     /// Auto-start the WS relay if `WebIntegrationSettings` are configured.
     ///
-    /// Trigger condition is `enabled && !runner_token.is_empty()`. When the
-    /// condition is unmet the relay still starts — its main loop sleeps
-    /// awaiting a kick — so a subsequent settings save can wake it up
+    /// Trigger condition is `tier == QontinuiAccount && enabled && a
+    /// device-JWT is present in AuthManager`. When the condition is unmet
+    /// the relay still starts — its main loop sleeps awaiting a kick — so
+    /// a subsequent settings save or refresher-completion can wake it up
     /// without restarting the runner.
     ///
     /// Called from `mcp_api::start_server` once `Arc<ApiState>` is available.
@@ -1762,5 +1868,88 @@ pub mod commands {
         if let Some(ref relay) = *guard {
             relay.kick();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Phase 5.3 unit tests — `is_unauthorized` discrimination.
+    //!
+    //! The relay's 401 → kick-refresher path is the hot-loop guard
+    //! against a stale device-JWT: if the discriminator stops firing on
+    //! a real 401 (e.g. tungstenite refactors how it represents HTTP
+    //! errors in a future minor bump), the relay quietly sleeps through
+    //! its full exponential backoff before the refresher's 5-minute
+    //! interval fires. That manifests as "ran the runner, took 10
+    //! minutes to come online after a JWT expiry." These tests pin the
+    //! shape so a tungstenite bump can't silently break it.
+
+    use super::*;
+    use tokio_tungstenite::tungstenite::{
+        http::{self, Response, StatusCode},
+        Error,
+    };
+
+    fn http_err_with_status(status: StatusCode) -> Error {
+        // Build a minimal http::Response<Option<Vec<u8>>> — that's the
+        // shape tokio-tungstenite 0.29 wraps in Error::Http (boxed).
+        let resp: Response<Option<Vec<u8>>> = http::Response::builder()
+            .status(status)
+            .body(None)
+            .expect("build response");
+        Error::Http(Box::new(resp))
+    }
+
+    #[test]
+    fn detects_401_in_tungstenite_error() {
+        let err = http_err_with_status(StatusCode::UNAUTHORIZED);
+        assert!(
+            is_unauthorized(&err),
+            "tungstenite::Error::Http with status 401 MUST be recognized"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_401_on_io_error() {
+        // Synthesize an I/O error — std::io::Error wraps cleanly.
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "no listener");
+        let err = Error::Io(io_err);
+        assert!(
+            !is_unauthorized(&err),
+            "I/O errors are NOT 401 — kicking the refresher on every \
+             ECONNREFUSED would mask deeper transport problems"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_401_on_http_500() {
+        let err = http_err_with_status(StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !is_unauthorized(&err),
+            "HTTP 500 is a coord-side bug — a fresh JWT will not fix it. \
+             The refresher MUST NOT be kicked."
+        );
+    }
+
+    #[test]
+    fn does_not_detect_401_on_http_403() {
+        // 403 = "your token is valid but you don't have permission" —
+        // re-pairing produces the SAME runner_token and would still get
+        // 403. Refresher must NOT fire.
+        let err = http_err_with_status(StatusCode::FORBIDDEN);
+        assert!(
+            !is_unauthorized(&err),
+            "HTTP 403 (policy denial) MUST NOT trigger a refresher kick"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_401_on_connection_closed() {
+        // ConnectionClosed = clean WS close — not an auth signal.
+        let err = Error::ConnectionClosed;
+        assert!(
+            !is_unauthorized(&err),
+            "ConnectionClosed MUST NOT trigger a refresher kick"
+        );
     }
 }

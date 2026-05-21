@@ -17,7 +17,10 @@
 //!
 //! - `settings::migrate_tier_in_place` (Phase 2 — settings migration)
 //! - `commands::auth::require_tier_2_for` (Phase 2 — auth-command gate)
-//! - `mcp::backend_relay::should_relay_idle` (Phase 4 — relay gate)
+//! - `mcp::backend_relay::should_relay_idle_with` (Phase 4 — relay gate;
+//!   note: the live `should_relay_idle` wrapper reads `AuthManager` from
+//!   disk, so calibration uses the pure inner instead — Phase 3 of the
+//!   unified-devices migration plan)
 //! - `api_config::PROD_API_BASE_URL` (Phase 6 — canonical prod URL)
 //!
 //! The relay loop and the live `load_settings` path are not invoked from
@@ -36,9 +39,12 @@
 //! | 3 | `require_tier_2_blocks_local_and_local_provider` | Tier 0/1 → `AuthError` |
 //! | 3b| `require_tier_2_permits_qontinui_account`        | Tier 2 → `Ok` |
 //! | 4 | `relay_idles_when_tier_local`                    | gate predicate idles in Tier 0/1 |
-//! | 4b| `relay_idles_when_token_missing`                 | gate predicate idles in Tier 2 w/o token |
+//! | 4b| `relay_idles_when_device_jwt_missing`            | gate predicate idles in Tier 2 w/o JWT |
 //! | 4c| `relay_idles_when_disabled`                      | gate predicate idles when `enabled=false` |
-//! | 4d| `relay_runs_when_tier_qontinui_and_token_set`    | gate predicate runs in Tier 2 + token |
+//! | 4d| `relay_runs_when_tier_qontinui_and_jwt_present`  | gate predicate runs in Tier 2 + JWT |
+//! | 4e| `relay_idles_when_device_jwt_empty`              | Phase 3: idle when JWT absent |
+//! | 4f| `relay_idles_when_device_jwt_expired_or_absent`  | Phase 3: idle when slot empty |
+//! | 4g| `relay_runs_when_device_jwt_present`             | Phase 3: run when JWT present |
 //! | 5 | `tier_promotion_local_to_qontinui_sets_user_id`  | Local → Tier 2 transition shape |
 //! | 5b| `tier_downgrade_qontinui_to_local_clears_state`  | Tier 2 → Local transition shape |
 //! | 6 | `prod_api_base_url_is_canonical`                 | constant is `https://api.qontinui.io` |
@@ -50,7 +56,7 @@
 //! tier-decoupling invariant rather than a scattered set of asserts.)
 
 use crate::commands::auth::require_tier_2_for;
-use crate::mcp::backend_relay::should_relay_idle;
+use crate::mcp::backend_relay::should_relay_idle_with;
 use crate::settings::{RunnerTier, Settings, WebIntegrationSettings};
 
 // ----------------------------------------------------------------------------
@@ -157,58 +163,88 @@ fn require_tier_2_permits_qontinui_account() {
 }
 
 // ----------------------------------------------------------------------------
-// #4 — backend_relay::should_relay_idle (Phase 4 gate)
+// #4 — backend_relay::should_relay_idle_with (Phase 4 gate, Phase 3
+//      unified-devices update)
+//
+// The pure inner predicate consults `(tier, enabled, has_device_jwt)`. The
+// live wrapper reads the JWT slot from `AuthManager` on disk — these tests
+// drive the inner directly to stay deterministic and free of disk I/O.
 // ----------------------------------------------------------------------------
 
 #[test]
 fn relay_idles_when_tier_local() {
-    // Tier 0 with a (hypothetical) token still idles — tier wins over token.
-    let s = settings_with(RunnerTier::Local, "qontinui_runner_stale_token");
+    // Tier 0 with a (hypothetical) JWT still idles — tier wins over JWT.
     assert!(
-        should_relay_idle(&s),
-        "Tier 0 must idle the relay regardless of leftover runner_token"
+        should_relay_idle_with(RunnerTier::Local, true, true),
+        "Tier 0 must idle the relay regardless of leftover device-JWT"
     );
 
-    let s = settings_with(RunnerTier::LocalProvider, "qontinui_runner_stale_token");
     assert!(
-        should_relay_idle(&s),
-        "Tier 1 must idle the relay regardless of leftover runner_token"
+        should_relay_idle_with(RunnerTier::LocalProvider, true, true),
+        "Tier 1 must idle the relay regardless of leftover device-JWT"
     );
 }
 
 #[test]
-fn relay_idles_when_token_missing() {
-    // Tier 2 but no token — must idle (otherwise we 403-spam).
-    let s = settings_with(RunnerTier::QontinuiAccount, "");
+fn relay_idles_when_device_jwt_missing() {
+    // Tier 2 + enabled but no JWT — must idle (otherwise we 401-spam).
     assert!(
-        should_relay_idle(&s),
-        "Tier 2 with empty runner_token must idle the relay"
-    );
-
-    // Whitespace-only token counts as empty.
-    let s = settings_with(RunnerTier::QontinuiAccount, "   ");
-    assert!(
-        should_relay_idle(&s),
-        "Tier 2 with whitespace runner_token must idle the relay"
+        should_relay_idle_with(RunnerTier::QontinuiAccount, true, false),
+        "Tier 2 with no device-JWT must idle the relay"
     );
 }
 
 #[test]
 fn relay_idles_when_disabled() {
-    let mut s = settings_with(RunnerTier::QontinuiAccount, "qontinui_runner_valid_token");
-    s.web_integration.enabled = false;
     assert!(
-        should_relay_idle(&s),
-        "web_integration.enabled=false must idle the relay even in Tier 2"
+        should_relay_idle_with(RunnerTier::QontinuiAccount, false, true),
+        "web_integration.enabled=false must idle the relay even in Tier 2 \
+         with a fresh device-JWT"
     );
 }
 
 #[test]
-fn relay_runs_when_tier_qontinui_and_token_set() {
-    let s = settings_with(RunnerTier::QontinuiAccount, "qontinui_runner_valid_token");
+fn relay_runs_when_tier_qontinui_and_jwt_present() {
     assert!(
-        !should_relay_idle(&s),
-        "Tier 2 + enabled + non-empty runner_token must let the relay run"
+        !should_relay_idle_with(RunnerTier::QontinuiAccount, true, true),
+        "Tier 2 + enabled + device-JWT present must let the relay run"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// #4e/f/g — Phase 3 unified-devices: device-JWT slot replaces runner_token
+//           as the relay-side credential gate.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn relay_idles_when_device_jwt_empty() {
+    // Tier 2 + enabled=true + has_jwt=false → idle. Direct exercise of the
+    // new Phase 3 conjunct (formerly: runner_token.is_empty()).
+    assert!(
+        should_relay_idle_with(RunnerTier::QontinuiAccount, true, false),
+        "Tier 2 + enabled + has_device_jwt=false must idle the relay"
+    );
+}
+
+#[test]
+fn relay_idles_when_device_jwt_expired_or_absent() {
+    // The relay's gate only cares whether the access_token slot is populated;
+    // expiry logic lives in `AuthManager::device_jwt_needs_refresh`, which is
+    // the refresher's concern. So "expired" + "absent" both surface here as
+    // has_jwt=false → idle.
+    assert!(
+        should_relay_idle_with(RunnerTier::QontinuiAccount, true, false),
+        "Tier 2 + enabled + (expired or absent JWT, i.e. has_jwt=false) \
+         must idle the relay"
+    );
+}
+
+#[test]
+fn relay_runs_when_device_jwt_present() {
+    // Tier 2 + enabled=true + has_jwt=true → not idle.
+    assert!(
+        !should_relay_idle_with(RunnerTier::QontinuiAccount, true, true),
+        "Tier 2 + enabled + has_device_jwt=true must let the relay run"
     );
 }
 
@@ -239,9 +275,12 @@ fn tier_promotion_local_to_qontinui_sets_user_id() {
         s.tier_initialized,
         "tier_initialized must stay sticky across a deliberate tier change"
     );
+    // Post-promotion: refresher has populated the device-JWT slot, so the
+    // pure inner sees has_jwt=true and runs.
     assert!(
-        !should_relay_idle(&s),
-        "post-promotion settings must be relay-eligible"
+        !should_relay_idle_with(s.tier, s.web_integration.enabled, true),
+        "post-promotion settings (tier=Tier2 + enabled + JWT present) \
+         must be relay-eligible"
     );
 }
 
@@ -266,9 +305,16 @@ fn tier_downgrade_qontinui_to_local_clears_state() {
         "local_user_id must survive downgrade — local DB rows are keyed on it \
          per Phase 1 of the tier-decoupling plan"
     );
+    // Post-downgrade: tier wins, regardless of whether the JWT slot was
+    // cleared. Exercise both has_jwt arms to nail down the tier-precedence.
     assert!(
-        should_relay_idle(&s),
-        "post-downgrade settings must idle the relay"
+        should_relay_idle_with(s.tier, s.web_integration.enabled, false),
+        "post-downgrade (tier=Local) with cleared JWT must idle the relay"
+    );
+    assert!(
+        should_relay_idle_with(s.tier, s.web_integration.enabled, true),
+        "post-downgrade (tier=Local) must idle even if a JWT lingers — \
+         tier gate is strict"
     );
     assert!(
         require_tier_2_for(s.tier).is_err(),

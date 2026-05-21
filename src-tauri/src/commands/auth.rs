@@ -716,9 +716,15 @@ pub fn set_runner_tier(tier: String) -> Result<(), String> {
     s.tier = parsed;
     s.tier_initialized = true;
     settings::save_settings(&s).map_err(|e| e.to_string())?;
-    // Kick the relay so it picks up the new tier without a runner restart.
+    // Kick both the relay (so it picks up the new tier without a runner
+    // restart) and the device-JWT refresher (Phase 2 of unified-devices
+    // — promotion into Tier 2 should trigger a JWT refresh check, and
+    // demotion out of it should let the refresher idle). The refresher's
+    // `next_action` predicate already handles the tier branching; we
+    // just need to wake it.
     tokio::spawn(async {
         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+        crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
     });
     Ok(())
 }
@@ -798,6 +804,28 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
     Ok(())
 }
 
+/// Returns true iff `AuthManager`'s access_token slot looks like a JWT.
+/// The frontend uses this from `WebIntegrationAuthBanner` to decide
+/// whether to surface a "re-pair this runner" CTA after upgrade
+/// (Phase 4 of the unified-devices migration).
+#[tauri::command]
+pub fn device_jwt_present() -> Result<bool, String> {
+    let token = AuthManager::new().get_access_token().unwrap_or_default();
+    Ok(crate::auth::looks_like_jwt(&token))
+}
+
+/// Tauri-command wrapper around the device-JWT refresher's `kick` API.
+///
+/// Used by `WebIntegrationAuthBanner`'s "retry manually" CTA when the
+/// post-upgrade migration banner has been visible >5min and the operator
+/// asks the refresher to try again immediately. Idempotent — if no
+/// refresher is registered yet, this is a no-op.
+#[tauri::command]
+pub async fn kick_device_jwt_refresher_cmd() -> Result<(), String> {
+    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+    Ok(())
+}
+
 /// Build the Tauri plugin that registers this module's command handlers.
 ///
 /// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
@@ -818,6 +846,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             set_runner_tier,
             start_qontinui_sign_in,
             qontinui_sign_out,
+            device_jwt_present,
+            kick_device_jwt_refresher_cmd,
         ])
         .build()
 }

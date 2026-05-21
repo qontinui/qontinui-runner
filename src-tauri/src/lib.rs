@@ -15,6 +15,11 @@ pub mod tauri_event_payloads;
 pub mod auth;
 pub mod secure_storage;
 
+// Device-pairing flow (headless + browser-mediated). Lifted out of
+// `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI
+// share one code path. See `pair.rs` for the canonical wire shapes.
+pub mod pair;
+
 // ============================================================================
 // Main window label abstraction
 // ============================================================================
