@@ -327,7 +327,9 @@ mod handler_tests {
         super::super::storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc_a).unwrap();
         super::super::storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc_b).unwrap();
 
-        let resp = super::super::handlers::build_list_response(root, RUNNER_APP_ID).into_response();
+        let resp =
+            super::super::handlers::build_list_response(root, RUNNER_APP_ID, "Qontinui Runner")
+                .into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
@@ -643,7 +645,11 @@ mod handler_tests {
         )
         .unwrap();
 
-        let resp = super::super::handlers::build_list_response(tmp.path(), RUNNER_APP_ID);
+        let resp = super::super::handlers::build_list_response(
+            tmp.path(),
+            RUNNER_APP_ID,
+            "Qontinui Runner",
+        );
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         let specs = v["specs"].as_array().expect("specs must be an array");
@@ -908,7 +914,8 @@ mod handler_tests {
         super::super::storage::write_ir_and_regenerate(&specs_root, &app_id, &doc_a).unwrap();
         super::super::storage::write_ir_and_regenerate(&specs_root, &app_id, &doc_b).unwrap();
 
-        let resp = super::super::handlers::build_list_response(&specs_root, &app_id);
+        let resp =
+            super::super::handlers::build_list_response(&specs_root, &app_id, &req.display_name);
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         let specs = v["specs"].as_array().expect("specs must be array");
@@ -918,11 +925,12 @@ mod handler_tests {
             .collect();
         assert!(ids.contains(&"c8-page-alpha"), "alpha missing: {:?}", ids);
         assert!(ids.contains(&"c8-page-beta"), "beta missing: {:?}", ids);
-        // appName should now be the registered app_id (Stream C — no more
-        // hard-coded "Qontinui Runner" literal).
+        // appName surfaces the registered `display_name`, not the slug
+        // `app_id` (the prior behavior dropped the registry's display_name
+        // on the floor — see `build_list_response` doc comment).
         for entry in specs {
             if entry["specId"] == "c8-page-alpha" || entry["specId"] == "c8-page-beta" {
-                assert_eq!(entry["appName"], app_id);
+                assert_eq!(entry["appName"], req.display_name);
             }
         }
 
