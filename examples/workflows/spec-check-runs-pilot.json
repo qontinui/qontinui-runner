@@ -20,7 +20,7 @@
       "name": "Verify runner /spec-check endpoint is up",
       "phase": "setup",
       "check_type": "custom_command",
-      "check_command": "curl -sf -o NUL http://localhost:9876/spec/health",
+      "check_command": "curl -sf -o NUL http://localhost:9876/apps/qontinui-web/spec/health",
       "check_working_directory": "D:/qontinui-root"
     },
     {
@@ -51,10 +51,10 @@
     },
     {
       "type": "spec_check",
-      "name": "spec_check: runs-runs",
+      "name": "spec_check: runs",
       "phase": "verification",
       "spec_check_app_id": "qontinui-web",
-      "spec_check_page_id": "runs-runs",
+      "spec_check_page_id": "runs",
       "spec_check_fail_when_no_app": true,
       "spec_check_fail_when_no_spec": true
     },
@@ -76,10 +76,10 @@
     },
     {
       "type": "spec_check",
-      "name": "spec_check: runs-active-active-runs",
+      "name": "spec_check: active-runs",
       "phase": "verification",
       "spec_check_app_id": "qontinui-web",
-      "spec_check_page_id": "runs-active-active-runs",
+      "spec_check_page_id": "active-runs",
       "spec_check_fail_when_no_app": true,
       "spec_check_fail_when_no_spec": true
     },
@@ -101,10 +101,10 @@
     },
     {
       "type": "spec_check",
-      "name": "spec_check: runs-findings-findings",
+      "name": "spec_check: findings",
       "phase": "verification",
       "spec_check_app_id": "qontinui-web",
-      "spec_check_page_id": "runs-findings-findings",
+      "spec_check_page_id": "findings",
       "spec_check_fail_when_no_app": true,
       "spec_check_fail_when_no_spec": true
     },
@@ -126,10 +126,10 @@
     },
     {
       "type": "spec_check",
-      "name": "spec_check: runs-statistics-statistics",
+      "name": "spec_check: statistics",
       "phase": "verification",
       "spec_check_app_id": "qontinui-web",
-      "spec_check_page_id": "runs-statistics-statistics",
+      "spec_check_page_id": "statistics",
       "spec_check_fail_when_no_app": true,
       "spec_check_fail_when_no_spec": true
     }

@@ -354,25 +354,36 @@ impl PgDb {
         // so existing rows are migrated under the bootstrap app_id
         // `qontinui-runner` (matching Stream F's bootstrap registration).
         //
-        // Wrapped in a transaction so the ADD COLUMN, backfill, and SET NOT
-        // NULL form a single atomic step. ACCESS EXCLUSIVE prevents any
-        // concurrent writer from inserting a NULL row between the backfill and
-        // the NOT NULL constraint flip. Idempotent: `ADD COLUMN IF NOT EXISTS`
-        // + the `SET NOT NULL` becomes a no-op on a subsequent boot because the
+        // Gated on table existence — on a fresh canonical PG where Atlas
+        // hasn't created project.proposal_events yet, this whole block is a
+        // no-op. Atlas owns the CREATE TABLE; the self-heal owns the
+        // app_id column migration once the table exists. Wrapped in a
+        // PL/pgSQL DO block so the table-existence check + locking + ALTER
+        // run in one round-trip and skip cleanly when the table isn't
+        // present. ACCESS EXCLUSIVE prevents any concurrent writer from
+        // inserting a NULL row between the backfill and the NOT NULL
+        // constraint flip. Idempotent: `ADD COLUMN IF NOT EXISTS` + the
+        // `SET NOT NULL` becomes a no-op on a subsequent boot because the
         // backfill keeps the column dense.
         conn.batch_execute(
-            "BEGIN; \
-             LOCK TABLE project.proposal_events IN ACCESS EXCLUSIVE MODE; \
-             ALTER TABLE project.proposal_events \
-                 ADD COLUMN IF NOT EXISTS app_id TEXT; \
-             UPDATE project.proposal_events SET app_id = 'qontinui-runner' \
-                 WHERE app_id IS NULL; \
-             ALTER TABLE project.proposal_events ALTER COLUMN app_id SET NOT NULL; \
-             CREATE INDEX IF NOT EXISTS idx_proposal_events_app_id \
-                 ON project.proposal_events(app_id); \
-             CREATE INDEX IF NOT EXISTS idx_proposal_events_app_id_at_ms \
-                 ON project.proposal_events(app_id, at DESC); \
-             COMMIT;",
+            "DO $$
+             BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'project' AND table_name = 'proposal_events'
+               ) THEN
+                 LOCK TABLE project.proposal_events IN ACCESS EXCLUSIVE MODE;
+                 ALTER TABLE project.proposal_events
+                     ADD COLUMN IF NOT EXISTS app_id TEXT;
+                 UPDATE project.proposal_events SET app_id = 'qontinui-runner'
+                     WHERE app_id IS NULL;
+                 ALTER TABLE project.proposal_events ALTER COLUMN app_id SET NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_proposal_events_app_id
+                     ON project.proposal_events(app_id);
+                 CREATE INDEX IF NOT EXISTS idx_proposal_events_app_id_at_ms
+                     ON project.proposal_events(app_id, at DESC);
+               END IF;
+             END $$;",
         )
         .await
         .map_err(|e| format!("Stream E.1 proposal_events.app_id self-heal failed: {}", e))?;
