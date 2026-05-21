@@ -20,6 +20,7 @@ use qontinui_types::ir::IrElementCriteria;
 use qontinui_types::text_norm::normalize_text;
 use qontinui_types::ui_bridge::UIBridgeElement;
 
+use crate::derive;
 use crate::role_categories::same_category;
 use crate::snapshot::{ElementIdx, IndexedSnapshot};
 
@@ -39,7 +40,7 @@ pub fn matches_all(
     let el = snapshot.element(idx);
 
     if let Some(role) = crit.role.as_deref() {
-        if score_role(role, &el.role) < 1.0 {
+        if score_role(role, &derive::role(el)) < 1.0 {
             return false;
         }
     }
@@ -49,22 +50,22 @@ pub fn matches_all(
         }
     }
     if let Some(text) = crit.text.as_deref() {
-        if score_text(text, &el.text) < 1.0 {
+        if score_text(text, &derive::text(el)) < 1.0 {
             return false;
         }
     }
     if let Some(needle) = crit.text_contains.as_deref() {
-        if !text_contains(needle, &el.text) {
+        if !text_contains(needle, &derive::text(el)) {
             return false;
         }
     }
     if let Some(label) = crit.aria_label.as_deref() {
-        if score_aria_label(label, &el.aria_label) < 1.0 {
+        if score_aria_label(label, &derive::aria_label(el)) < 1.0 {
             return false;
         }
     }
     if let Some(name) = crit.accessible_name.as_deref() {
-        if score_text(name, &el.accessible_name) < 1.0 {
+        if score_text(name, &derive::accessible_name(el)) < 1.0 {
             return false;
         }
     }
@@ -768,6 +769,171 @@ mod tests {
         }
     }
 
+    // -- live-snapshot derivation regression -----------------------------
+    //
+    // These tests exercise the matcher against snapshots shaped the way the
+    // real UI Bridge SDK actually emits them: top-level `role`/`text`/
+    // `accessibleName`/`ariaLabel` are all `None`; the SDK puts visible
+    // text in `state.text_content` and the human-readable name in `label`,
+    // and conveys the ARIA role only through `tag_name` (and the SDK-
+    // semantic `element_type`). Before the `derive` module was wired in,
+    // every `{role: "heading"}` criterion narrowed to zero candidates;
+    // these tests pin that fix.
+
+    /// Build an element whose shape mirrors the live snapshot — top-level
+    /// `role`/`text`/`accessibleName`/`ariaLabel` are `None`, with the
+    /// observed values living in `tag_name` / `state.text_content` /
+    /// `label` instead. Mirrors what `GET /ui-bridge/control/snapshot`
+    /// actually returns on a real runner.
+    fn live_elem(
+        id: &str,
+        tag_name: &str,
+        element_type: &str,
+        label: Option<&str>,
+        text_content: Option<&str>,
+    ) -> UIBridgeElement {
+        let mut state = empty_state();
+        state.text_content = text_content.map(String::from);
+        UIBridgeElement {
+            id: id.to_string(),
+            element_type: element_type.to_string(),
+            label: label.map(String::from),
+            actions: Vec::new(),
+            custom_actions: None,
+            identifier: empty_identifier(),
+            state,
+            registered_at: 0,
+            mounted: true,
+            bbox: None,
+            visible: Some(true),
+            role: None,
+            tag_name: Some(tag_name.to_string()),
+            aria_label: None,
+            accessible_name: None,
+            text: None,
+        }
+    }
+
+    #[test]
+    fn live_h1_matches_role_heading_and_text_via_derivation() {
+        // The acceptance bullet from the task: synthetic snapshot with
+        // role=null, tagName="h1", state.textContent="Hello" + criteria
+        // {role: "heading", text: "Hello"} must produce exactly one
+        // candidate.
+        let s = snap(vec![live_elem("h", "h1", "heading", None, Some("Hello"))]);
+        let idx = IndexedSnapshot::new(&s);
+
+        let crit = IrElementCriteria {
+            role: Some("heading".to_string()),
+            text: Some("Hello".to_string()),
+            ..Default::default()
+        };
+
+        let cands = narrow_candidates(&idx, &crit);
+        assert_eq!(cands.len(), 1, "expected exactly one h1 candidate");
+        assert!(matches_all(&idx, &crit, cands[0]));
+    }
+
+    #[test]
+    fn live_button_matches_via_label_fallback_for_accessible_name() {
+        // accessibleName fallback chain: el.accessible_name → el.label →
+        // state.text_content. Here label is populated (the SDK's typical
+        // emit for buttons) but accessible_name is None.
+        let s = snap(vec![live_elem(
+            "btn",
+            "button",
+            "button",
+            Some("Sign In"),
+            Some("Sign In"),
+        )]);
+        let idx = IndexedSnapshot::new(&s);
+
+        let crit = IrElementCriteria {
+            role: Some("button".to_string()),
+            accessible_name: Some("Sign In".to_string()),
+            ..Default::default()
+        };
+
+        let cands = narrow_candidates(&idx, &crit);
+        assert!(cands.iter().any(|i| matches_all(&idx, &crit, *i)));
+    }
+
+    #[test]
+    fn live_paragraph_matches_text_via_state_text_content() {
+        // text fallback: el.text is None, state.text_content carries the
+        // visible text. A `{text: "..."}` criterion must still narrow
+        // and pass matches_all.
+        let s = snap(vec![
+            live_elem(
+                "p0",
+                "p",
+                "paragraph",
+                Some("App preferences"),
+                Some("Application-level preferences"),
+            ),
+            live_elem(
+                "p1",
+                "p",
+                "paragraph",
+                Some("Other prose"),
+                Some("Something else"),
+            ),
+        ]);
+        let idx = IndexedSnapshot::new(&s);
+
+        let crit = IrElementCriteria {
+            text: Some("Application-level preferences".to_string()),
+            ..Default::default()
+        };
+
+        let cands = narrow_candidates(&idx, &crit);
+        assert!(
+            cands.iter().any(|i| matches_all(&idx, &crit, *i)),
+            "expected the paragraph with the matching text_content to match"
+        );
+    }
+
+    #[test]
+    fn live_input_role_textbox_derived_from_element_type() {
+        // ARIA role for <input type=email> is "textbox". The snapshot
+        // doesn't carry the `type=` attribute but the SDK has already
+        // resolved it into `element_type: "email"` — derivation routes
+        // that to ARIA "textbox".
+        let mut email = live_elem("email", "input", "email", Some("Email"), None);
+        email.state.value = Some(String::new());
+        let s = snap(vec![email]);
+        let idx = IndexedSnapshot::new(&s);
+
+        let crit = IrElementCriteria {
+            role: Some("textbox".to_string()),
+            ..Default::default()
+        };
+
+        let cands = narrow_candidates(&idx, &crit);
+        assert_eq!(cands.len(), 1, "expected the email input to derive role=textbox");
+        assert!(matches_all(&idx, &crit, cands[0]));
+    }
+
+    #[test]
+    fn live_snapshot_role_index_is_populated_via_derivation() {
+        // IndexedSnapshot::lookup_by_role must find candidates even when
+        // every element on the wire has `role: null` — derivation must
+        // run inside the indexer too, otherwise narrow_candidates can
+        // never reach matches_all.
+        let s = snap(vec![
+            live_elem("h", "h1", "heading", None, Some("Title")),
+            live_elem("b", "button", "button", Some("Go"), Some("Go")),
+            live_elem("a", "a", "link", Some("More"), Some("More")),
+        ]);
+        let idx = IndexedSnapshot::new(&s);
+
+        assert_eq!(idx.lookup_by_role("heading").len(), 1);
+        assert_eq!(idx.lookup_by_role("button").len(), 1);
+        assert_eq!(idx.lookup_by_role("link").len(), 1);
+        // Sanity: tag_name still indexes raw.
+        assert_eq!(idx.lookup_by_tag("h1").len(), 1);
+    }
+
     // -- property test (proptest) — randomized variant of the above -----
 
     use proptest::prelude::*;
@@ -777,8 +943,13 @@ mod tests {
         fn proptest_matches_all_implies_score_one(
             role in "[a-z]{3,10}",
             tag in "[a-z]{2,8}",
-            aria in "[A-Za-z ]{2,15}",
-            text in "[A-Za-z ]{3,30}",
+            // Anchor with a non-space character so the strategy never
+            // produces whitespace-only inputs. The derive layer treats
+            // whitespace-only values as "absent" (so the matcher can fall
+            // through to the next source); a real SDK never emits them
+            // deliberately, so excluding them is fine.
+            aria in "[A-Za-z][A-Za-z ]{1,14}",
+            text in "[A-Za-z][A-Za-z ]{2,29}",
         ) {
             // Build a snapshot containing exactly the element we'll point at.
             let s = snap(vec![elem(

@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use qontinui_types::text_norm::normalize_text;
 use qontinui_types::ui_bridge::{UIBridgeElement, UIBridgeSnapshot};
 
+use crate::derive;
+
 /// Stable index into [`UIBridgeSnapshot::elements`]. Minted by
 /// [`IndexedSnapshot::new`] — never construct manually unless you know what
 /// you are doing.
@@ -72,15 +74,18 @@ impl<'a> IndexedSnapshot<'a> {
         for (i, el) in raw.elements.iter().enumerate() {
             let idx = ElementIdx(i as u32);
 
-            // -- role (Addendum A.5)
-            if let Some(role) = el.role.as_deref() {
-                let key = normalize_text(role);
+            // -- role: derived (top-level `el.role` → tag-implicit role →
+            //    `element_type` keyword) so a `{role: "heading"}` criterion
+            //    finds `<h1>` even when the SDK didn't populate top-level
+            //    role. See `crate::derive::role`.
+            if let Some(role) = derive::role(el) {
+                let key = normalize_text(&role);
                 if !key.is_empty() {
                     by_role.entry(key).or_default().push(idx);
                 }
             }
 
-            // -- tag_name (Addendum A.5)
+            // -- tag_name (Addendum A.5) — no derivation, raw field.
             if let Some(tag) = el.tag_name.as_deref() {
                 let key = normalize_text(tag);
                 if !key.is_empty() {
@@ -88,17 +93,18 @@ impl<'a> IndexedSnapshot<'a> {
                 }
             }
 
-            // -- aria_label (Addendum A.5)
-            if let Some(label) = el.aria_label.as_deref() {
-                let key = normalize_text(label);
+            // -- aria_label: derived (top-level `el.aria_label` → `el.label`).
+            if let Some(label) = derive::aria_label(el) {
+                let key = normalize_text(&label);
                 if !key.is_empty() {
                     by_aria_label.entry(key).or_default().push(idx);
                 }
             }
 
-            // -- accessible_name (Addendum A.5)
-            if let Some(name) = el.accessible_name.as_deref() {
-                let key = normalize_text(name);
+            // -- accessible_name: derived (top-level → `el.label` →
+            //    `state.text_content`).
+            if let Some(name) = derive::accessible_name(el) {
+                let key = normalize_text(&name);
                 if !key.is_empty() {
                     by_accessible_name.entry(key).or_default().push(idx);
                 }
@@ -119,9 +125,11 @@ impl<'a> IndexedSnapshot<'a> {
                 insert_id_key(&mut by_id, v, idx);
             }
 
-            // -- text inverted index (tokenize on ASCII whitespace post-normalization)
-            if let Some(text) = el.text.as_deref() {
-                let normalized = normalize_text(text);
+            // -- text inverted index: derived (top-level `el.text` →
+            //    `state.text_content` → `el.label`). Tokenize on ASCII
+            //    whitespace post-normalization.
+            if let Some(text) = derive::text(el) {
+                let normalized = normalize_text(&text);
                 for word in normalized.split_ascii_whitespace() {
                     if word.is_empty() {
                         continue;

@@ -22,6 +22,7 @@ use qontinui_types::ir::{IrAssertion, IrElementCriteria, IrPageSpec, IrState};
 
 use crate::confidence::recommend_state;
 use crate::criteria::{matches_all, narrow_candidates};
+use crate::derive;
 use crate::diff::compute_miss;
 use crate::fetch::{compute_content_sha256, millis_to_iso8601};
 use crate::snapshot::{ElementIdx, IndexedSnapshot};
@@ -261,8 +262,12 @@ fn matched_from(indexed: &IndexedSnapshot, idx: ElementIdx) -> MatchedElement {
     let el = indexed.element(idx);
     MatchedElement {
         element_id: Some(el.id.clone()).filter(|s| !s.is_empty()),
-        role: el.role.clone().filter(|s| !s.is_empty()),
-        text: el.text.clone().filter(|s| !s.is_empty()),
+        // Report the *derived* role/text — top-level `el.role` / `el.text`
+        // are almost always None on the live wire, so callers that surface
+        // these to AI/users need the resolved values to make sense of
+        // matches that came through the tagName / textContent fallbacks.
+        role: derive::role(el).filter(|s| !s.is_empty()),
+        text: derive::text(el).filter(|s| !s.is_empty()),
         path: el.identifier.selector.clone(),
     }
 }

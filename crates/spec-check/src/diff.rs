@@ -33,6 +33,7 @@ use qontinui_types::ui_bridge::UIBridgeElement;
 use crate::criteria::{
     score_aria_label, score_attributes, score_role, score_tag, score_text, score_visibility,
 };
+use crate::derive;
 use crate::snapshot::{ElementIdx, IndexedSnapshot};
 use crate::{AssertionMiss, CandidateMiss, FieldDiff, MissReason};
 
@@ -107,9 +108,13 @@ impl SelectivityIndex {
         let mut aria_label_counts: HashMap<String, u32> = HashMap::new();
         let mut text_word_counts: HashMap<String, u32> = HashMap::new();
 
+        // Selectivity weights must reflect the same value-space the matcher
+        // operates on — use the derive layer so a `{role: heading}` criterion
+        // sees the IDF weight of the *derived* role population, not the
+        // top-level (almost-always-None) `el.role` distribution.
         for (_idx, el) in indexed.iter_elements() {
-            if let Some(role) = el.role.as_deref() {
-                let key = normalize_text(role);
+            if let Some(role) = derive::role(el) {
+                let key = normalize_text(&role);
                 if !key.is_empty() {
                     *role_counts.entry(key).or_insert(0) += 1;
                 }
@@ -120,14 +125,14 @@ impl SelectivityIndex {
                     *tag_counts.entry(key).or_insert(0) += 1;
                 }
             }
-            if let Some(label) = el.aria_label.as_deref() {
-                let key = normalize_text(label);
+            if let Some(label) = derive::aria_label(el) {
+                let key = normalize_text(&label);
                 if !key.is_empty() {
                     *aria_label_counts.entry(key).or_insert(0) += 1;
                 }
             }
-            if let Some(text) = el.text.as_deref() {
-                let normalized = normalize_text(text);
+            if let Some(text) = derive::text(el) {
+                let normalized = normalize_text(&text);
                 // Per-element dedup so an element with repeated tokens
                 // doesn't inflate the count for its own posting.
                 let mut seen_in_el: std::collections::HashSet<&str> =
@@ -318,17 +323,16 @@ pub(crate) fn score_element_against(
     let mut diffs: Vec<FieldDiff> = Vec::new();
 
     if let Some(role) = crit.role.as_deref() {
-        let sim = score_role(role, &el.role);
+        let observed = derive::role(el);
+        let sim = score_role(role, &observed);
         let w = sel.weight_for_role(role);
         score += sim * w;
         if sim < 1.0 {
             diffs.push(FieldDiff {
                 field: "role".to_string(),
                 expected: serde_json::Value::String(role.to_string()),
-                actual: el
-                    .role
-                    .as_ref()
-                    .map(|s| serde_json::Value::String(s.clone()))
+                actual: observed
+                    .map(serde_json::Value::String)
                     .unwrap_or(serde_json::Value::Null),
                 similarity: sim,
             });
@@ -354,17 +358,16 @@ pub(crate) fn score_element_against(
     }
 
     if let Some(text) = crit.text.as_deref() {
-        let sim = score_text(text, &el.text);
+        let observed = derive::text(el);
+        let sim = score_text(text, &observed);
         let w = sel.weight_for_text_phrase(text);
         score += sim * w;
         if sim < 1.0 {
             diffs.push(FieldDiff {
                 field: "text".to_string(),
                 expected: serde_json::Value::String(text.to_string()),
-                actual: el
-                    .text
-                    .as_ref()
-                    .map(|s| serde_json::Value::String(s.clone()))
+                actual: observed
+                    .map(serde_json::Value::String)
                     .unwrap_or(serde_json::Value::Null),
                 similarity: sim,
             });
@@ -374,24 +377,22 @@ pub(crate) fn score_element_against(
     if let Some(needle) = crit.text_contains.as_deref() {
         // text_contains is asymmetric — emit 1.0 if the observed text
         // contains the needle, else use score_text similarity for the diff.
-        let observed_lower = el
-            .text
-            .as_ref()
-            .map(|s| normalize_text(s))
+        let observed = derive::text(el);
+        let observed_lower = observed
+            .as_deref()
+            .map(normalize_text)
             .unwrap_or_default();
         let needle_lower = normalize_text(needle);
         let contains = !needle_lower.is_empty() && observed_lower.contains(&needle_lower);
-        let sim = if contains { 1.0 } else { score_text(needle, &el.text) };
+        let sim = if contains { 1.0 } else { score_text(needle, &observed) };
         let w = sel.weight_for_text_phrase(needle);
         score += sim * w;
         if sim < 1.0 {
             diffs.push(FieldDiff {
                 field: "textContains".to_string(),
                 expected: serde_json::Value::String(needle.to_string()),
-                actual: el
-                    .text
-                    .as_ref()
-                    .map(|s| serde_json::Value::String(s.clone()))
+                actual: observed
+                    .map(serde_json::Value::String)
                     .unwrap_or(serde_json::Value::Null),
                 similarity: sim,
             });
@@ -399,17 +400,16 @@ pub(crate) fn score_element_against(
     }
 
     if let Some(label) = crit.aria_label.as_deref() {
-        let sim = score_aria_label(label, &el.aria_label);
+        let observed = derive::aria_label(el);
+        let sim = score_aria_label(label, &observed);
         let w = sel.weight_for_aria_label(label);
         score += sim * w;
         if sim < 1.0 {
             diffs.push(FieldDiff {
                 field: "ariaLabel".to_string(),
                 expected: serde_json::Value::String(label.to_string()),
-                actual: el
-                    .aria_label
-                    .as_ref()
-                    .map(|s| serde_json::Value::String(s.clone()))
+                actual: observed
+                    .map(serde_json::Value::String)
                     .unwrap_or(serde_json::Value::Null),
                 similarity: sim,
             });
@@ -417,17 +417,16 @@ pub(crate) fn score_element_against(
     }
 
     if let Some(name) = crit.accessible_name.as_deref() {
-        let sim = score_text(name, &el.accessible_name);
+        let observed = derive::accessible_name(el);
+        let sim = score_text(name, &observed);
         let w = sel.weight_for_text_phrase(name);
         score += sim * w;
         if sim < 1.0 {
             diffs.push(FieldDiff {
                 field: "accessibleName".to_string(),
                 expected: serde_json::Value::String(name.to_string()),
-                actual: el
-                    .accessible_name
-                    .as_ref()
-                    .map(|s| serde_json::Value::String(s.clone()))
+                actual: observed
+                    .map(serde_json::Value::String)
                     .unwrap_or(serde_json::Value::Null),
                 similarity: sim,
             });
@@ -603,8 +602,12 @@ fn into_candidate_miss(
     let el = indexed.element(idx);
     CandidateMiss {
         element_id: Some(el.id.clone()).filter(|s| !s.is_empty()),
-        role: el.role.clone().filter(|s| !s.is_empty()),
-        text: el.text.clone().filter(|s| !s.is_empty()),
+        // Surface derived values for parity with the matcher's effective view
+        // — top-level `el.role` / `el.text` are almost always None on the
+        // live wire (the SDK populates `tag_name` / `state.text_content`
+        // instead). See `evaluator::matched_from` for the same reasoning.
+        role: derive::role(el).filter(|s| !s.is_empty()),
+        text: derive::text(el).filter(|s| !s.is_empty()),
         path: el.identifier.selector.clone(),
         field_diffs,
         score,
