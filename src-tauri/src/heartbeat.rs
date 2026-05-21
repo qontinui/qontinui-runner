@@ -77,7 +77,13 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
     let backend_url = std::env::var("QONTINUI_WEB_BACKEND_URL")
         .unwrap_or_else(|_| crate::api_config::get_api_base_url());
 
-    let heartbeat_url = format!("{}/api/v1/dev-dashboard/heartbeat", backend_url);
+    // Backend renamed the route from `/api/v1/dev-dashboard/heartbeat` to
+    // `/api/v1/operations/heartbeat` as part of the operations-rename refactor
+    // (see `qontinui-web/backend/app/api/v1/endpoints/operations.py` — the
+    // file was renamed from `dev_dashboard.py` and re-mounted at the new
+    // prefix in `api.py`). The `/heartbeat` endpoint itself stays unauth +
+    // LAN-only as the cross-machine beacon path.
+    let heartbeat_url = format!("{}/api/v1/operations/heartbeat", backend_url);
 
     // If this is a secondary, also heartbeat to the primary runner
     let primary_port = crate::instance::primary_port();
