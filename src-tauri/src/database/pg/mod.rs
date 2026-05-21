@@ -9,6 +9,7 @@ pub mod agent_sessions;
 pub mod agent_worktrees;
 pub mod agentic_metrics;
 pub mod ai_sessions;
+pub mod apps;
 pub mod approval_gates;
 pub mod breakpoints;
 pub mod cached_specs;
@@ -326,6 +327,27 @@ impl PgDb {
                 e
             )
         })?;
+
+        // spec-multi-app Stream B: project.apps — multi-tenant app registry.
+        //
+        // Authored declaratively in `atlas/schema.hcl`; mirrored here as a
+        // CREATE TABLE IF NOT EXISTS self-heal so a fresh PG without Atlas
+        // applied still boots cleanly. The runner's spec API depends on this
+        // table being present from the first /apps/* request.
+        conn.batch_execute(
+            "CREATE TABLE IF NOT EXISTS project.apps ( \
+                 app_id          TEXT PRIMARY KEY, \
+                 repo_root       TEXT NOT NULL, \
+                 ui_bridge_url   TEXT NOT NULL, \
+                 display_name    TEXT NOT NULL, \
+                 created_at_ms   BIGINT NOT NULL, \
+                 last_seen_at_ms BIGINT NOT NULL \
+             ); \
+             CREATE INDEX IF NOT EXISTS idx_apps_last_seen \
+                 ON project.apps (last_seen_at_ms DESC);",
+        )
+        .await
+        .map_err(|e| format!("Stream B project.apps self-heal failed: {}", e))?;
 
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 

@@ -446,6 +446,7 @@ function FreshnessView() {
       setLoading(true);
       setError(null);
       const result = await invoke<FreshnessEntry[]>("analyze_spec_freshness", {
+        appId: "qontinui-runner",
         specsDir: "src/specs",
         componentsDir: "src/components",
       });

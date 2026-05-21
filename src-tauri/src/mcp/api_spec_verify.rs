@@ -22,6 +22,9 @@ use super::types::{ApiResponse, ApiState};
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyApiSpecRequest {
+    /// Registered app id whose specs/ root holds this spec
+    /// (spec-multi-app Stream C). Required.
+    pub app_id: String,
     /// Spec ID (filename without extension, e.g., "event-history")
     pub spec_id: String,
     /// Override base URL (default: http://localhost:{self_port})
@@ -266,9 +269,12 @@ fn evaluate_field_assertion(body: &serde_json::Value, field: &FieldAssertion) ->
 // =============================================================================
 
 /// Load a spec's apiAssertions from the Spec API's projection storage.
-fn load_api_assertions(spec_id: &str) -> Result<Vec<ApiAssertion>, String> {
-    let specs_root = crate::spec_api::storage::resolve_specs_root();
-    let spec = match crate::spec_api::storage::read_projection(&specs_root, spec_id)? {
+async fn load_api_assertions(app_id: &str, spec_id: &str) -> Result<Vec<ApiAssertion>, String> {
+    let pg = crate::database::pg::PgDb::global();
+    let specs_root = crate::spec_api::storage::resolve_specs_root(&pg, app_id)
+        .await
+        .map_err(|e| format!("resolve_specs_root({}) failed: {:?}", app_id, e))?;
+    let spec = match crate::spec_api::storage::read_projection(&specs_root, app_id, spec_id)? {
         Some(v) => v,
         None => {
             return Err(format!(
@@ -308,7 +314,7 @@ pub async fn verify_api_spec(
     info!("API spec verification: spec_id={}", request.spec_id);
 
     // Load assertions
-    let assertions = match load_api_assertions(&request.spec_id) {
+    let assertions = match load_api_assertions(&request.app_id, &request.spec_id).await {
         Ok(a) => a,
         Err(e) => {
             return Err((StatusCode::NOT_FOUND, Json(ApiResponse::error(e))));

@@ -1337,6 +1337,8 @@ async fn handle_chat_generate_workflow(api_state: &Arc<ApiState>, data: &Value) 
     }
 
     let request = crate::workflow_generation::GenerateWorkflowRequest {
+        // Stream C: backend-relay-launched workflows default to the runner app.
+        app_id: crate::spec_api::storage::RUNNER_APP_ID.to_string(),
         description,
         inline_context: Some(format!(
             "The following is a conversation between a user and an AI assistant. \

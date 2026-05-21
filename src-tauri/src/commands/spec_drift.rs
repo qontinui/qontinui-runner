@@ -24,6 +24,7 @@ use tauri::Runtime;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
+use crate::database::pg::PgDb;
 use crate::spec_api::storage;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,6 +47,10 @@ pub struct SpecOrphan {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DriftReport {
+    /// spec-multi-app Stream E.7 — the registered app this report describes.
+    /// Threaded from the `scan_spec_drift` argument so downstream consumers
+    /// (proposals.rs patch routing, CLI surfaces) can group/filter by app.
+    pub app_id: String,
     pub scanned_at: String,
     pub source_files_scanned: usize,
     pub spec_files_scanned: usize,
@@ -194,11 +199,17 @@ fn collect_assertion_text(target: &serde_json::Value) -> Vec<String> {
     out
 }
 
-fn scan_specs() -> (SpecAssertedIndex, usize) {
+async fn scan_specs(pg: &PgDb, app_id: &str) -> (SpecAssertedIndex, usize) {
     let mut idx = SpecAssertedIndex::default();
     let mut files = 0;
-    let specs_root = storage::resolve_specs_root();
-    let page_ids = match storage::list_pages(&specs_root) {
+    let specs_root = match storage::resolve_specs_root(pg, app_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("spec_drift: resolve_specs_root({}) failed: {:?}", app_id, e);
+            return (idx, 0);
+        }
+    };
+    let page_ids = match storage::list_pages(&specs_root, app_id) {
         Ok(ids) => ids,
         Err(e) => {
             warn!("spec_drift: list_pages failed: {}", e);
@@ -206,7 +217,7 @@ fn scan_specs() -> (SpecAssertedIndex, usize) {
         }
     };
     for page_id in page_ids {
-        let root_v = match storage::read_projection(&specs_root, &page_id) {
+        let root_v = match storage::read_projection(&specs_root, app_id, &page_id) {
             Ok(Some(v)) => v,
             Ok(None) => continue,
             Err(e) => {
@@ -261,17 +272,26 @@ fn scan_specs() -> (SpecAssertedIndex, usize) {
 /// Scan the project and produce a drift report.
 ///
 /// Arguments:
-/// - `project_root`: absolute path to the runner project root (the directory
+/// - `app_id`: registered app whose specs to compare against the source tree.
+///   Spec-multi-app Stream C: every spec read is scoped to a registered app.
+/// - `project_root`: absolute path to the project root (the directory
 ///   containing `src/` and `src-tauri/`).
 #[tauri::command]
-pub async fn scan_spec_drift(project_root: String) -> Result<DriftReport, String> {
+pub async fn scan_spec_drift(
+    app_id: String,
+    project_root: String,
+) -> Result<DriftReport, String> {
     let root = PathBuf::from(&project_root);
     if !root.is_dir() {
         return Err(format!("project_root does not exist: {}", project_root));
     }
-    info!("scan_spec_drift: scanning {}", project_root);
+    info!(
+        "scan_spec_drift: app_id={} scanning {}",
+        app_id, project_root
+    );
     let (elements, source_files) = scan_source_tree(&root);
-    let (asserted, spec_files) = scan_specs();
+    let pg = crate::database::pg::PgDb::global();
+    let (asserted, spec_files) = scan_specs(&pg, &app_id).await;
     debug!(
         "scan_spec_drift: {} elements, {} asserted ids, {} source files, {} spec files",
         elements.len(),
@@ -327,6 +347,7 @@ pub async fn scan_spec_drift(project_root: String) -> Result<DriftReport, String
     });
 
     let report = DriftReport {
+        app_id: app_id.clone(),
         scanned_at: chrono::Utc::now().to_rfc3339(),
         source_files_scanned: source_files,
         spec_files_scanned: spec_files,

@@ -606,6 +606,12 @@ pub struct ExecutionStepConfig {
     // ========================================================================
     // Spec-Check Step Fields (Plan 03 Step 8)
     // ========================================================================
+    /// Spec-Check: The app id whose specs root should resolve `spec_check_page_id`.
+    /// Required at runtime; deserialization keeps it optional so legacy step JSON
+    /// parses, but the handler rejects missing values with a clear error.
+    #[serde(alias = "specCheckAppId", alias = "spec_check_app_id", default)]
+    pub spec_check_app_id: Option<String>,
+
     /// Spec-Check: The page id whose spec should be evaluated.
     #[serde(alias = "specCheckPageId", alias = "spec_check_page_id", default)]
     pub spec_check_page_id: Option<String>,

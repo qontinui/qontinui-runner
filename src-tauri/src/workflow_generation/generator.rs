@@ -76,6 +76,12 @@ pub struct ExplorationSettings {
 /// Request to generate a workflow from natural language
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateWorkflowRequest {
+    /// Owning app id for any spec writes the generator performs
+    /// (spec-multi-app Stream C). Defaults to empty for back-compat with
+    /// in-flight callers; the spec-update step warns + falls back to the
+    /// runner app when this is empty.
+    #[serde(default)]
+    pub app_id: String,
     /// Natural language description of what the workflow should do
     pub description: String,
     /// Optional category for the generated workflow
@@ -196,6 +202,7 @@ fn default_true() -> Option<bool> {
 impl Default for GenerateWorkflowRequest {
     fn default() -> Self {
         Self {
+            app_id: String::new(),
             description: String::new(),
             category: None,
             tags: None,
@@ -1066,21 +1073,61 @@ pub fn generate_workflow(
             // root (`<runner>/specs/pages/<id>/spec.uibridge.json`); writes
             // reach every runner instance because they share the same root.
             {
-                let specs_root = crate::spec_api::storage::resolve_specs_root();
-                let spec_update = super::spec_synthesis::update_page_specs_from_criteria(
-                    &spec_result.criteria,
-                    &effective_request.description,
-                    &specs_root,
-                    0.3,
-                );
-                if spec_update.specs_updated > 0 {
-                    info!(
-                        "Appended acceptance criteria to {} page spec(s): {:?}",
-                        spec_update.specs_updated, spec_update.updated_paths
+                // The request carries the owning app id (spec-multi-app
+                // Stream C). Empty/missing falls back to the runner app for
+                // back-compat with in-flight generation requests crafted
+                // before the field landed; warn so cutover is visible.
+                let app_id = if effective_request.app_id.is_empty() {
+                    warn!(
+                        "generator: GenerateWorkflowRequest.app_id is empty; \
+                         defaulting to runner app for spec-update step"
                     );
-                }
-                if !spec_update.errors.is_empty() {
-                    warn!("Page spec update errors: {:?}", spec_update.errors);
+                    crate::spec_api::storage::RUNNER_APP_ID.to_string()
+                } else {
+                    effective_request.app_id.clone()
+                };
+                let pg_for_resolve = crate::database::pg::PgDb::global();
+                // `generate_workflow` runs inside `spawn_blocking`; we need a
+                // Tokio runtime to drive the async resolver. `Handle::try_current()`
+                // is `Ok` when we're on a worker thread of the multi-threaded
+                // runtime — the common path. `block_in_place` keeps the
+                // worker thread happy.
+                let maybe_specs_root = tokio::runtime::Handle::try_current().ok().and_then(
+                    |rt| {
+                        tokio::task::block_in_place(|| {
+                            rt.block_on(crate::spec_api::storage::resolve_specs_root(
+                                &pg_for_resolve,
+                                &app_id,
+                            ))
+                        })
+                        .ok()
+                    },
+                );
+                match maybe_specs_root {
+                    Some(specs_root) => {
+                        let spec_update = super::spec_synthesis::update_page_specs_from_criteria(
+                            &spec_result.criteria,
+                            &effective_request.description,
+                            &app_id,
+                            &specs_root,
+                            0.3,
+                        );
+                        if spec_update.specs_updated > 0 {
+                            info!(
+                                "Appended acceptance criteria to {} page spec(s): {:?}",
+                                spec_update.specs_updated, spec_update.updated_paths
+                            );
+                        }
+                        if !spec_update.errors.is_empty() {
+                            warn!("Page spec update errors: {:?}", spec_update.errors);
+                        }
+                    }
+                    None => {
+                        warn!(
+                            "generator: resolve_specs_root({}) failed (no runtime or registry miss); skipping spec update",
+                            app_id
+                        );
+                    }
                 }
             }
 

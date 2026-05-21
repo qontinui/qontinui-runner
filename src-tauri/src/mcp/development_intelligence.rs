@@ -18,7 +18,11 @@ use crate::mcp::types::ApiState;
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectRequest {
+    /// Registered app id whose specs/ root to scan
+    /// (spec-multi-app Stream C). Required.
+    pub app_id: String,
     pub project_path: String,
 }
 
@@ -191,9 +195,16 @@ struct SpecAssertion {
     enabled: Option<bool>,
 }
 
-fn load_specs(_project_path: &Path) -> Vec<SpecFile> {
-    let specs_root = crate::spec_api::storage::resolve_specs_root();
-    let page_ids = match crate::spec_api::storage::list_pages(&specs_root) {
+async fn load_specs(app_id: &str, _project_path: &Path) -> Vec<SpecFile> {
+    let pg = crate::database::pg::PgDb::global();
+    let specs_root = match crate::spec_api::storage::resolve_specs_root(&pg, app_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Failed to resolve specs_root for app {}: {:?}", app_id, e);
+            return vec![];
+        }
+    };
+    let page_ids = match crate::spec_api::storage::list_pages(&specs_root, app_id) {
         Ok(ids) => ids,
         Err(e) => {
             warn!("Failed to list pages under {:?}: {}", specs_root, e);
@@ -203,7 +214,7 @@ fn load_specs(_project_path: &Path) -> Vec<SpecFile> {
 
     let mut specs = vec![];
     for page_id in &page_ids {
-        match crate::spec_api::storage::read_projection(&specs_root, page_id) {
+        match crate::spec_api::storage::read_projection(&specs_root, app_id, page_id) {
             Ok(Some(value)) => match serde_json::from_value::<SpecFile>(value) {
                 Ok(spec) => specs.push(spec),
                 Err(e) => warn!("Failed to parse spec for page {}: {}", page_id, e),
@@ -370,8 +381,10 @@ pub async fn coverage_analysis(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let project_path = PathBuf::from(&request.project_path);
 
+    // Load specs on the async side (registry lookup is async); the
+    // CPU-bound test-file scan still goes to spawn_blocking.
+    let specs = load_specs(&request.app_id, &project_path).await;
     let result = tokio::task::spawn_blocking(move || {
-        let specs = load_specs(&project_path);
         let test_files = scan_test_files(&project_path);
 
         let mut gaps: Vec<CoverageGap> = vec![];
@@ -560,8 +573,8 @@ pub async fn complexity_scores(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let project_path = PathBuf::from(&request.project_path);
 
+    let specs = load_specs(&request.app_id, &project_path).await;
     let result = tokio::task::spawn_blocking(move || {
-        let specs = load_specs(&project_path);
 
         let scores: Vec<ComplexityScore> = specs
             .iter()
@@ -714,8 +727,8 @@ pub async fn feature_health(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let project_path = PathBuf::from(&request.project_path);
 
+    let specs = load_specs(&request.app_id, &project_path).await;
     let result = tokio::task::spawn_blocking(move || {
-        let specs = load_specs(&project_path);
         let test_files = scan_test_files(&project_path);
 
         let features: Vec<FeatureHealth> = specs

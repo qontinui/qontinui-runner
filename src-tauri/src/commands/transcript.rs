@@ -366,6 +366,8 @@ pub async fn generate_workflow_standalone(
     };
 
     let request = crate::workflow_generation::GenerateWorkflowRequest {
+        // Stream C: transcript-replay workflows target the runner app by default.
+        app_id: crate::spec_api::storage::RUNNER_APP_ID.to_string(),
         description,
         inline_context: Some(enriched_context),
         category: request_category,

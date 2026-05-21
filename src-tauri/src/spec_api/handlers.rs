@@ -1,14 +1,15 @@
-//! Axum handlers for the Spec API. Endpoints under `/spec/...`.
+//! Axum handlers for the Spec API. Endpoints under `/apps/:app_id/spec/...`.
 //!
-//! Surface (verified against the Section 2 prompt):
-//! - `GET  /spec/get?path=<rel>`       — raw file contents (path-traversal protected)
-//! - `GET  /spec/page/:id`             — bundled-page projection
-//! - `GET  /spec/graph`                — cross-page graph (IDs only)
-//! - `POST /spec/query`                — find* queries against IR
-//! - `POST /spec/derive`               — derived data without persistence
-//! - `GET  /spec/diff?since=<epoch>`   — pages whose IR/projection mtime is newer
-//! - `POST /spec/author`               — write IR + regenerate projection + emit event
-//! - `GET  /spec/subscribe`            — SSE stream of `spec.changed` events
+//! Surface (verified against the Section 2 prompt; per spec-multi-app
+//! Stream C every route is nested under `/apps/:app_id`):
+//! - `GET  /apps/:app_id/spec/get?path=<rel>`       — raw file contents (path-traversal protected)
+//! - `GET  /apps/:app_id/spec/page/:id`             — bundled-page projection
+//! - `GET  /apps/:app_id/spec/graph`                — cross-page graph (IDs only)
+//! - `POST /apps/:app_id/spec/query`                — find* queries against IR
+//! - `POST /apps/:app_id/spec/derive`               — derived data without persistence
+//! - `GET  /apps/:app_id/spec/diff?since=<epoch>`   — pages whose IR/projection mtime is newer
+//! - `POST /apps/:app_id/spec/author`               — write IR + regenerate projection + emit event
+//! - `GET  /apps/:app_id/spec/subscribe`            — SSE stream of per-app `spec.changed` events
 //!
 //! Every empty/error response carries a `reason` field per Section 2's
 //! "no silent empty responses" constraint.
@@ -26,9 +27,11 @@ use futures_util::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::BroadcastStream;
+use tracing::warn;
 
 use crate::mcp::types::ApiState;
 
+use super::apps::AppErrorExt;
 use super::distinctness;
 use super::events::{self, SpecChanged};
 use super::projection::project_ir_to_bundled_page;
@@ -46,7 +49,11 @@ pub struct GetQuery {
     pub path: Option<String>,
 }
 
-pub async fn get_file(State(_state): State<Arc<ApiState>>, Query(q): Query<GetQuery>) -> Response {
+pub async fn get_file(
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<GetQuery>,
+) -> Response {
     let rel = match q.path.as_deref() {
         Some(p) if !p.is_empty() => p,
         _ => {
@@ -58,7 +65,10 @@ pub async fn get_file(State(_state): State<Arc<ApiState>>, Query(q): Query<GetQu
         }
     };
 
-    let root = storage::resolve_specs_root();
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
     match storage::read_within_root(&root, rel) {
         Ok(bytes) => {
             // Always respond as application/octet-stream — caller can
@@ -98,20 +108,26 @@ pub async fn get_file(State(_state): State<Arc<ApiState>>, Query(q): Query<GetQu
 }
 
 // ---------------------------------------------------------------------------
-// GET /spec/page/:id
+// GET /apps/:app_id/spec/page/:id
 // ---------------------------------------------------------------------------
 
-pub async fn get_page(State(_state): State<Arc<ApiState>>, AxPath(id): AxPath<String>) -> Response {
-    let root = storage::resolve_specs_root();
-    match storage::read_projection(&root, &id) {
+pub async fn get_page(
+    AxPath((app_id, id)): AxPath<(String, String)>,
+    State(state): State<Arc<ApiState>>,
+) -> Response {
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
+    match storage::read_projection(&root, &app_id, &id) {
         Ok(Some(value)) => (StatusCode::OK, Json(value)).into_response(),
         Ok(None) => {
             // Fall back to projecting on-the-fly if the IR exists but
             // projection doesn't. Keeps the API useful when an IR file is
             // hand-edited without re-running the generator script.
-            match storage::read_ir(&root, &id) {
+            match storage::read_ir(&root, &app_id, &id) {
                 Ok(Some(doc)) => {
-                    let notes = storage::read_notes(&root, &id).unwrap_or(None);
+                    let notes = storage::read_notes(&root, &app_id, &id).unwrap_or(None);
                     let value = project_ir_to_bundled_page(&doc, notes.as_deref());
                     (StatusCode::OK, Json(value)).into_response()
                 }
@@ -148,9 +164,15 @@ pub async fn get_page(State(_state): State<Arc<ApiState>>, AxPath(id): AxPath<St
 // GET /spec/graph
 // ---------------------------------------------------------------------------
 
-pub async fn get_graph(State(_state): State<Arc<ApiState>>) -> Response {
-    let root = storage::resolve_specs_root();
-    let ids = match storage::list_pages(&root) {
+pub async fn get_graph(
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
+) -> Response {
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
+    let ids = match storage::list_pages(&root, &app_id) {
         Ok(ids) => ids,
         Err(e) => {
             return (
@@ -176,7 +198,7 @@ pub async fn get_graph(State(_state): State<Arc<ApiState>>) -> Response {
     }
     let mut pages: Vec<Value> = Vec::with_capacity(ids.len());
     for id in &ids {
-        let entry = match storage::read_ir(&root, id) {
+        let entry = match storage::read_ir(&root, &app_id, id) {
             Ok(Some(doc)) => json!({
                 "id": doc.id,
                 "stateIds": doc.states.iter().map(|s| &s.id).collect::<Vec<_>>(),
@@ -228,15 +250,22 @@ pub async fn get_graph(State(_state): State<Arc<ApiState>>) -> Response {
 /// for discovery-time enumeration and downstream consumers can call
 /// `/spec/page/:id` to get a per-page error envelope. Mixing well-formed
 /// entries with error entries here would force every consumer to filter.
-pub async fn get_list(State(_state): State<Arc<ApiState>>) -> Response {
-    build_list_response(&storage::resolve_specs_root())
+pub async fn get_list(
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
+) -> Response {
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
+    build_list_response(&root, &app_id)
 }
 
-/// Inner implementation of `get_list` parameterized by the storage root so
-/// tests can exercise the response-building logic without constructing an
-/// `ApiState`.
-pub(crate) fn build_list_response(root: &std::path::Path) -> Response {
-    let ids = match storage::list_pages(root) {
+/// Inner implementation of `get_list` parameterized by the storage root and
+/// `app_id` so tests can exercise the response-building logic without
+/// constructing an `ApiState`.
+pub(crate) fn build_list_response(root: &std::path::Path, app_id: &str) -> Response {
+    let ids = match storage::list_pages(root, app_id) {
         Ok(ids) => ids,
         Err(e) => {
             return (
@@ -266,11 +295,11 @@ pub(crate) fn build_list_response(root: &std::path::Path) -> Response {
         // Mirror get_page's resolution: prefer the on-disk projection;
         // fall back to projecting the IR document on-the-fly when the
         // projection file is absent (or fails to parse).
-        let projection: Option<Value> = match storage::read_projection(root, id) {
+        let projection: Option<Value> = match storage::read_projection(root, app_id, id) {
             Ok(Some(v)) => Some(v),
-            _ => match storage::read_ir(root, id) {
+            _ => match storage::read_ir(root, app_id, id) {
                 Ok(Some(doc)) => {
-                    let notes = storage::read_notes(root, id).unwrap_or(None);
+                    let notes = storage::read_notes(root, app_id, id).unwrap_or(None);
                     Some(project_ir_to_bundled_page(&doc, notes.as_deref()))
                 }
                 _ => None,
@@ -282,7 +311,7 @@ pub(crate) fn build_list_response(root: &std::path::Path) -> Response {
         // Plan 04 Step 7 — surface the landed `SpecValidation` rollup on each
         // entry when the IR fails distinctness. Clean specs omit the field
         // entirely so consumers don't pay a deserialization cost.
-        let validation: Option<SpecValidation> = match storage::read_ir(root, id) {
+        let validation: Option<SpecValidation> = match storage::read_ir(root, app_id, id) {
             Ok(Some(doc)) => {
                 let r = distinctness::report(&doc);
                 if r.ok {
@@ -295,7 +324,7 @@ pub(crate) fn build_list_response(root: &std::path::Path) -> Response {
         };
         let mut entry = json!({
             "specId": id,
-            "appName": "Qontinui Runner",
+            "appName": app_id,
             "config": {
                 "version": projection.get("version").cloned().unwrap_or(Value::Null),
                 "description": projection.get("description").cloned().unwrap_or(Value::Null),
@@ -324,11 +353,15 @@ pub struct QueryBody {
 }
 
 pub async fn post_query(
-    State(_state): State<Arc<ApiState>>,
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
     Json(body): Json<QueryBody>,
 ) -> Response {
-    let root = storage::resolve_specs_root();
-    let ids = match storage::list_pages(&root) {
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
+    let ids = match storage::list_pages(&root, &app_id) {
         Ok(ids) => ids,
         Err(e) => {
             return (
@@ -344,7 +377,7 @@ pub async fn post_query(
 
     let mut docs: Vec<IrPageSpec> = Vec::new();
     for id in &ids {
-        if let Ok(Some(doc)) = storage::read_ir(&root, id) {
+        if let Ok(Some(doc)) = storage::read_ir(&root, &app_id, id) {
             docs.push(doc);
         }
     }
@@ -442,16 +475,25 @@ pub struct DeriveBody {
 }
 
 pub async fn post_derive(
-    State(_state): State<Arc<ApiState>>,
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
     Json(body): Json<DeriveBody>,
 ) -> Response {
-    build_derive_response(&storage::resolve_specs_root(), body)
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
+    build_derive_response(&root, &app_id, body)
 }
 
 /// Inner implementation of `post_derive` parameterized by the storage root
-/// so tests can inject a temp directory.
-pub(crate) fn build_derive_response(root: &std::path::Path, body: DeriveBody) -> Response {
-    let doc = match storage::read_ir(root, &body.page_id) {
+/// and `app_id` so tests can inject a temp directory.
+pub(crate) fn build_derive_response(
+    root: &std::path::Path,
+    app_id: &str,
+    body: DeriveBody,
+) -> Response {
+    let doc = match storage::read_ir(root, app_id, &body.page_id) {
         Ok(Some(d)) => d,
         Ok(None) => {
             return (
@@ -546,10 +588,17 @@ pub struct DiffQuery {
     pub since: Option<u64>,
 }
 
-pub async fn get_diff(State(_state): State<Arc<ApiState>>, Query(q): Query<DiffQuery>) -> Response {
+pub async fn get_diff(
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<DiffQuery>,
+) -> Response {
     let since = q.since.unwrap_or(0);
-    let root = storage::resolve_specs_root();
-    let ids = match storage::list_pages(&root) {
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
+    let ids = match storage::list_pages(&root, &app_id) {
         Ok(ids) => ids,
         Err(e) => {
             return (
@@ -564,7 +613,7 @@ pub async fn get_diff(State(_state): State<Arc<ApiState>>, Query(q): Query<DiffQ
     };
     let mut changed: Vec<Value> = Vec::new();
     for id in &ids {
-        if let Some(mtime) = storage::newest_mtime_for_page(&root, id) {
+        if let Some(mtime) = storage::newest_mtime_for_page(&root, &app_id, id) {
             if mtime > since {
                 changed.push(json!({ "pageId": id, "mtime": mtime }));
             }
@@ -592,16 +641,31 @@ pub async fn get_diff(State(_state): State<Arc<ApiState>>, Query(q): Query<DiffQ
 // ---------------------------------------------------------------------------
 
 pub async fn post_author(
-    State(_state): State<Arc<ApiState>>,
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
     Json(doc): Json<IrPageSpec>,
 ) -> Response {
-    build_author_response(&storage::resolve_specs_root(), doc)
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
+    build_author_response(&root, &app_id, doc)
 }
 
 /// Inner implementation of `post_author` parameterized by the storage root
-/// so tests can exercise the validation + write path without constructing
-/// an `ApiState`.
-pub(crate) fn build_author_response(root: &std::path::Path, doc: IrPageSpec) -> Response {
+/// and `app_id` so tests can exercise the validation + write path without
+/// constructing an `ApiState`.
+///
+/// Per spec-multi-app Stream C (PLAN.md §C.6) the handler reconciles
+/// `doc.provenance.app_id` against the URL path's `app_id`:
+/// 1. Match → proceed.
+/// 2. Empty / missing provenance.app_id → fill from URL path, warn.
+/// 3. Mismatch → 400 `app-id-mismatch`.
+pub(crate) fn build_author_response(
+    root: &std::path::Path,
+    app_id: &str,
+    mut doc: IrPageSpec,
+) -> Response {
     if doc.id.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -618,6 +682,50 @@ pub(crate) fn build_author_response(root: &std::path::Path, doc: IrPageSpec) -> 
             )),
         )
             .into_response();
+    }
+    // Stream C §C.6 — provenance.app_id reconciliation.
+    match doc.provenance.as_mut() {
+        Some(prov) if !prov.app_id.is_empty() && prov.app_id != app_id => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SpecError::with_detail(
+                    "app-id-mismatch",
+                    json!({
+                        "urlAppId": app_id,
+                        "provenanceAppId": prov.app_id,
+                        "pageId": doc.id,
+                    }),
+                )),
+            )
+                .into_response();
+        }
+        Some(prov) if prov.app_id.is_empty() => {
+            warn!(
+                "post_author: filling empty provenance.app_id from URL path \
+                 ({}) for pageId={}",
+                app_id, doc.id
+            );
+            prov.app_id = app_id.to_string();
+        }
+        Some(_) => {
+            // Match — proceed.
+        }
+        None => {
+            warn!(
+                "post_author: synthesizing minimal provenance (app_id from URL \
+                 path={}) for pageId={} (IR omits the provenance block)",
+                app_id, doc.id
+            );
+            doc.provenance = Some(super::types::IrProvenance {
+                source: "hand-authored".to_string(),
+                app_id: app_id.to_string(),
+                file: None,
+                line: None,
+                column: None,
+                plugin_version: None,
+                status: None,
+            });
+        }
     }
     // Plan 04 Step 5 — hard-stop on distinctness violations. 422 per RFC 4918
     // §11.2 (semantic rejection, not a parse failure).
@@ -644,7 +752,7 @@ pub(crate) fn build_author_response(root: &std::path::Path, doc: IrPageSpec) -> 
         )
             .into_response();
     }
-    let projection_path = match storage::write_ir_and_regenerate(root, &doc) {
+    let projection_path = match storage::write_ir_and_regenerate(root, app_id, &doc) {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -658,7 +766,7 @@ pub(crate) fn build_author_response(root: &std::path::Path, doc: IrPageSpec) -> 
         }
     };
     events::emit(events::SpecApiEvent::SpecChanged(SpecChanged {
-        app_id: String::new(),
+        app_id: app_id.to_string(),
         page_id: doc.id.clone(),
         kind: "ir-and-projection".to_string(),
         at_ms: events::now_ms(),
@@ -679,9 +787,10 @@ pub(crate) fn build_author_response(root: &std::path::Path, doc: IrPageSpec) -> 
 // ---------------------------------------------------------------------------
 
 pub async fn get_subscribe(
+    AxPath(app_id): AxPath<String>,
     State(_state): State<Arc<ApiState>>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let rx = events::subscribe();
+    let rx = events::subscribe(&app_id);
     let stream = BroadcastStream::new(rx).filter_map(|res| async move {
         match res {
             Ok(ev) => {
@@ -714,7 +823,12 @@ pub async fn get_subscribe(
 }
 
 /// Smoke endpoint — used to confirm the spec_api router is mounted.
-pub async fn get_health() -> Response {
+///
+/// Accepts (and ignores) the `app_id` path segment — the health check is
+/// trivially independent of the registry. Keeping the path-extractor in
+/// place keeps the route signature uniform with the other handlers and
+/// preserves the `/apps/:app_id/spec/health` URL shape that callers expect.
+pub async fn get_health(AxPath(_app_id): AxPath<String>) -> Response {
     (StatusCode::OK, Json(EmptyOk::new("spec-api-mounted"))).into_response()
 }
 
@@ -736,17 +850,27 @@ pub struct ValidateBody {
 }
 
 pub async fn post_validate(
-    State(_state): State<Arc<ApiState>>,
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
     Json(body): Json<ValidateBody>,
 ) -> Response {
-    build_validate_response(&storage::resolve_specs_root(), body)
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
+    build_validate_response(&root, &app_id, body)
 }
 
-/// Inner implementation of `post_validate` parameterized by the storage root.
-pub(crate) fn build_validate_response(root: &std::path::Path, body: ValidateBody) -> Response {
+/// Inner implementation of `post_validate` parameterized by the storage root
+/// and `app_id`.
+pub(crate) fn build_validate_response(
+    root: &std::path::Path,
+    app_id: &str,
+    body: ValidateBody,
+) -> Response {
     let doc: IrPageSpec = match (body.document, body.page_id.as_deref()) {
         (Some(d), _) => d,
-        (None, Some(id)) => match storage::read_ir(root, id) {
+        (None, Some(id)) => match storage::read_ir(root, app_id, id) {
             Ok(Some(d)) => d,
             Ok(None) => {
                 return (

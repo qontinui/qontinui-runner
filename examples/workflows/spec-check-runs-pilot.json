@@ -1,0 +1,158 @@
+{
+  "name": "Spec-Check Pilot: /runs/* (replaces runs.spec.ts)",
+  "description": "Structural conformance check for the four /runs/* routes covered by qontinui-web/frontend/tests/e2e/pages/runs.spec.ts. Connects the SDK to localhost:3001, navigates to each route, and runs `spec_check` against the matching IR page spec. Single-pass; no AI loop. Replaces the four Playwright route-suites with a single workflow that runs in well under a minute against a warm web app.\n\nPrerequisite: the qontinui-web app must be registered in the runner's app registry (`POST /apps/register {\"appId\": \"qontinui-web\", \"repoRoot\": \"D:/qontinui-root/qontinui-web/frontend\"}`). The four runs-* specs live at qontinui-web/frontend/specs/pages/ per spec-multi-app PLAN.md Stream F bootstrap — no staging step needed.\n\nNot covered (no spec exists yet): /runs/checkpoints, /runs/learning. The original Playwright file tests those too; flywheel growth targets.",
+  "category": "spec-check",
+  "tags": ["spec-check", "pilot", "qontinui-web", "runs", "replaces-playwright"],
+
+  "setup_steps": [
+    {
+      "type": "command",
+      "mode": "check",
+      "name": "Verify qontinui-web frontend is up",
+      "phase": "setup",
+      "check_type": "custom_command",
+      "check_command": "curl -sf -o NUL http://localhost:3001/api/ui-bridge/health",
+      "check_working_directory": "D:/qontinui-root"
+    },
+    {
+      "type": "command",
+      "mode": "check",
+      "name": "Verify runner /spec-check endpoint is up",
+      "phase": "setup",
+      "check_type": "custom_command",
+      "check_command": "curl -sf -o NUL http://localhost:9876/spec/health",
+      "check_working_directory": "D:/qontinui-root"
+    },
+    {
+      "type": "command",
+      "mode": "shell",
+      "name": "Connect SDK to qontinui-web",
+      "phase": "setup",
+      "shell_command": "curl -s -X POST http://localhost:9876/ui-bridge/sdk/connect -H \"Content-Type: application/json\" -d \"{\\\"url\\\":\\\"http://localhost:3001\\\"}\"",
+      "shell_command_working_directory": "D:/qontinui-root"
+    }
+  ],
+
+  "verification_steps": [
+    {
+      "type": "ui_bridge",
+      "name": "Navigate to /runs",
+      "phase": "verification",
+      "ui_bridge_action": "navigate",
+      "ui_bridge_url": "http://localhost:3001/runs"
+    },
+    {
+      "type": "ui_bridge",
+      "name": "Wait for /runs heading",
+      "phase": "verification",
+      "ui_bridge_action": "wait_for_element",
+      "ui_bridge_target": "{\"criteria\":{\"role\":\"main\"},\"timeout\":10000}",
+      "ui_bridge_snapshot_target": "sdk"
+    },
+    {
+      "type": "spec_check",
+      "name": "spec_check: runs-runs",
+      "phase": "verification",
+      "spec_check_app_id": "qontinui-web",
+      "spec_check_page_id": "runs-runs",
+      "spec_check_fail_when_no_app": true,
+      "spec_check_fail_when_no_spec": true
+    },
+
+    {
+      "type": "ui_bridge",
+      "name": "Navigate to /runs/active",
+      "phase": "verification",
+      "ui_bridge_action": "navigate",
+      "ui_bridge_url": "http://localhost:3001/runs/active"
+    },
+    {
+      "type": "ui_bridge",
+      "name": "Wait for /runs/active heading",
+      "phase": "verification",
+      "ui_bridge_action": "wait_for_element",
+      "ui_bridge_target": "{\"criteria\":{\"role\":\"main\"},\"timeout\":10000}",
+      "ui_bridge_snapshot_target": "sdk"
+    },
+    {
+      "type": "spec_check",
+      "name": "spec_check: runs-active-active-runs",
+      "phase": "verification",
+      "spec_check_app_id": "qontinui-web",
+      "spec_check_page_id": "runs-active-active-runs",
+      "spec_check_fail_when_no_app": true,
+      "spec_check_fail_when_no_spec": true
+    },
+
+    {
+      "type": "ui_bridge",
+      "name": "Navigate to /runs/findings",
+      "phase": "verification",
+      "ui_bridge_action": "navigate",
+      "ui_bridge_url": "http://localhost:3001/runs/findings"
+    },
+    {
+      "type": "ui_bridge",
+      "name": "Wait for /runs/findings heading",
+      "phase": "verification",
+      "ui_bridge_action": "wait_for_element",
+      "ui_bridge_target": "{\"criteria\":{\"role\":\"main\"},\"timeout\":10000}",
+      "ui_bridge_snapshot_target": "sdk"
+    },
+    {
+      "type": "spec_check",
+      "name": "spec_check: runs-findings-findings",
+      "phase": "verification",
+      "spec_check_app_id": "qontinui-web",
+      "spec_check_page_id": "runs-findings-findings",
+      "spec_check_fail_when_no_app": true,
+      "spec_check_fail_when_no_spec": true
+    },
+
+    {
+      "type": "ui_bridge",
+      "name": "Navigate to /runs/statistics",
+      "phase": "verification",
+      "ui_bridge_action": "navigate",
+      "ui_bridge_url": "http://localhost:3001/runs/statistics"
+    },
+    {
+      "type": "ui_bridge",
+      "name": "Wait for /runs/statistics heading",
+      "phase": "verification",
+      "ui_bridge_action": "wait_for_element",
+      "ui_bridge_target": "{\"criteria\":{\"role\":\"main\"},\"timeout\":10000}",
+      "ui_bridge_snapshot_target": "sdk"
+    },
+    {
+      "type": "spec_check",
+      "name": "spec_check: runs-statistics-statistics",
+      "phase": "verification",
+      "spec_check_app_id": "qontinui-web",
+      "spec_check_page_id": "runs-statistics-statistics",
+      "spec_check_fail_when_no_app": true,
+      "spec_check_fail_when_no_spec": true
+    }
+  ],
+
+  "agentic_steps": [],
+
+  "completion_steps": [
+    {
+      "type": "command",
+      "mode": "shell",
+      "name": "Print summary from /spec-check observability CLI",
+      "phase": "completion",
+      "shell_command": "qontinui-specs match-rate --days 1 --format text",
+      "shell_command_working_directory": "D:/qontinui-root"
+    }
+  ],
+
+  "max_iterations": 1,
+  "timeout_seconds": null,
+  "reflection_mode": false,
+  "skip_ai_summary": true,
+  "log_watch_enabled": false,
+  "preflight_check_enabled": false,
+  "health_check_enabled": false
+}

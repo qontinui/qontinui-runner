@@ -304,7 +304,8 @@ async fn flywheel_full_walk_synthetic_page_through_promotion() {
 
     // Stage the candidate into _pending/. This stamps status = Pending on
     // the on-disk doc (caller's IR is untouched).
-    let staged_path = storage::write_pending_ir(root, &ir).expect("write_pending_ir");
+    let staged_path = storage::write_pending_ir(root, storage::RUNNER_APP_ID, &ir)
+        .expect("write_pending_ir");
     assert!(
         staged_path.to_string_lossy().contains("_pending"),
         "staged path should land under _pending/: {}",
@@ -337,7 +338,7 @@ async fn flywheel_full_walk_synthetic_page_through_promotion() {
 
     // Two greens → promote. promote_pending stamps status = Promoted and
     // moves the file out of _pending/.
-    storage::promote_pending(root, page_id).expect("promote_pending");
+    storage::promote_pending(root, storage::RUNNER_APP_ID, page_id).expect("promote_pending");
 
     // Canonical IR + projection exist.
     let canonical_ir = root
@@ -364,7 +365,7 @@ async fn flywheel_full_walk_synthetic_page_through_promotion() {
     );
 
     // Promoted IR carries provenance.status = Promoted.
-    let read = storage::read_ir(root, page_id)
+    let read = storage::read_ir(root, storage::RUNNER_APP_ID, page_id)
         .expect("read canonical")
         .expect("present");
     let prov = read.provenance.as_ref().expect("provenance");
@@ -389,7 +390,7 @@ async fn flywheel_demotes_on_single_red() {
     let page_id = "test-page-b";
     let ir = proposed_ir(page_id);
 
-    storage::write_pending_ir(root, &ir).expect("write_pending_ir");
+    storage::write_pending_ir(root, storage::RUNNER_APP_ID, &ir).expect("write_pending_ir");
     let pending_dir = root.join("pages").join(page_id).join("_pending");
     assert!(pending_dir.exists(), "_pending/ should exist after stage");
 
@@ -428,7 +429,7 @@ async fn flywheel_demotes_on_single_red() {
     );
 
     // Re-reading after demote returns None (no on-disk file).
-    let read = storage::read_ir(root, page_id).expect("read ok");
+    let read = storage::read_ir(root, storage::RUNNER_APP_ID, page_id).expect("read ok");
     assert!(
         read.is_none(),
         "no canonical IR should be readable after demote"
@@ -458,13 +459,13 @@ async fn flywheel_skips_existing_specs_in_scan() {
     if let Some(prov) = ir.provenance.as_mut() {
         prov.status = Some(ProposalStatus::Promoted);
     }
-    storage::write_ir_and_regenerate(root, &ir).expect("write canonical");
+    storage::write_ir_and_regenerate(root, storage::RUNNER_APP_ID, &ir).expect("write canonical");
 
     // The on-disk filter the scan uses lives in `storage::list_pages`. After
     // pre-creating the canonical spec, the page id must show up — this is
     // exactly what `proposals.rs::post_scan` consults to skip pre-spec'd
     // pathnames (`on_disk_pathnames.contains(&pathname)`).
-    let pages = storage::list_pages(root).expect("list_pages");
+    let pages = storage::list_pages(root, storage::RUNNER_APP_ID).expect("list_pages");
     assert!(
         pages.iter().any(|p| p == page_id),
         "list_pages should report {} after canonical write; got {:?}",
@@ -601,7 +602,7 @@ async fn flywheel_patch_preserves_hand_authored() {
         .add_required_elements
         .insert("s-hand".into(), vec![crit]);
 
-    let err = merge_patch_into_ir(existing, patch)
+    let err = merge_patch_into_ir(existing, patch, "qontinui-runner")
         .expect_err("merge must refuse pinned hand-authored state");
     assert!(
         err.contains("pinned state 's-hand'") || err.contains("hand-authored"),
@@ -661,4 +662,81 @@ async fn flywheel_validator_rejects_low_coverage() {
         }
         other => panic!("expected CoverageBelowFloor, got {:?}", other),
     }
+}
+
+// =============================================================================
+// spec-multi-app Stream E.9 test #4 — two apps run independent cycles
+// =============================================================================
+//
+// Plan invariant (§E.9):
+//   Two distinct apps each register a separate repo_root, each stage a
+//   `_pending/` candidate, and each promotion lands under the owning app's
+//   spec corpus without bleeding into the sibling.
+//
+// We exercise the storage primitives directly (no HTTP) to keep the test
+// hermetic; the route layer is a thin `Path((app_id,))` wrapper around
+// these calls.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_two_apps_independent_proposal_cycles() {
+    // Two apps, two tempdirs, two pages — same page id slug to prove
+    // the per-app root partitions the corpus.
+    let app_a = "qontinui-runner";
+    let app_b = "qontinui-web";
+    let env_a = TestEnv::new();
+    let env_b = TestEnv::new();
+    let page_id = "shared-slug";
+
+    let ir_a = proposed_ir(page_id);
+    let ir_b = proposed_ir(page_id);
+
+    // Stage under each app's root.
+    storage::write_pending_ir(env_a.root(), app_a, &ir_a).expect("stage A");
+    storage::write_pending_ir(env_b.root(), app_b, &ir_b).expect("stage B");
+
+    let pending_a = env_a.root().join("pages").join(page_id).join("_pending");
+    let pending_b = env_b.root().join("pages").join(page_id).join("_pending");
+    assert!(pending_a.exists(), "A _pending/ missing");
+    assert!(pending_b.exists(), "B _pending/ missing");
+
+    // Promote A. B must be untouched.
+    storage::promote_pending(env_a.root(), app_a, page_id).expect("promote A");
+    let canon_a = env_a
+        .root()
+        .join("pages")
+        .join(page_id)
+        .join("state-machine.derived.json");
+    assert!(canon_a.exists(), "A canonical missing after promote");
+    assert!(!pending_a.exists(), "A _pending/ should be gone");
+    // Sibling app B is untouched.
+    assert!(
+        pending_b.exists(),
+        "B _pending/ must not be affected by A's promotion"
+    );
+    let canon_b = env_b
+        .root()
+        .join("pages")
+        .join(page_id)
+        .join("state-machine.derived.json");
+    assert!(
+        !canon_b.exists(),
+        "B must not have a canonical IR yet — only A was promoted"
+    );
+
+    // Now promote B independently.
+    storage::promote_pending(env_b.root(), app_b, page_id).expect("promote B");
+    assert!(canon_b.exists(), "B canonical missing after promote");
+    assert!(!pending_b.exists(), "B _pending/ should be gone");
+
+    // Promoted IR carries the right provenance.app_id on each side.
+    let read_a = storage::read_ir(env_a.root(), app_a, page_id)
+        .expect("read A")
+        .expect("A present");
+    let read_b = storage::read_ir(env_b.root(), app_b, page_id)
+        .expect("read B")
+        .expect("B present");
+    let prov_a = read_a.provenance.as_ref().expect("A provenance");
+    let prov_b = read_b.provenance.as_ref().expect("B provenance");
+    assert_eq!(prov_a.app_id, app_a, "A provenance.app_id");
+    assert_eq!(prov_b.app_id, app_b, "B provenance.app_id");
 }

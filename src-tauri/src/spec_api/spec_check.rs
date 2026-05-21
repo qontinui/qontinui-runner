@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::mcp::types::ApiState;
 use crate::spec_api::events;
 use crate::spec_api::responses::SpecError;
-use crate::spec_api::storage;
+use crate::spec_api::storage::{self, RUNNER_APP_ID};
 use qontinui_spec_check as spec_check; // crate name = "qontinui-spec-check"
 use qontinui_types::spec_api_events::SpecApiEvent;
 use qontinui_types::spec_check::{
@@ -32,9 +32,13 @@ use qontinui_types::ui_bridge::UIBridgeSnapshot; // capital UI; lives in ui_brid
 
 /// Wall-clock at evaluator entry → end. Carried into `SpecCheckCompleted`'s
 /// `total_duration_ms` field. Sync-only — the evaluator itself is sync.
-fn invoke_emit(snapshot_id: &str, page_ids: Vec<String>, invoked_via: &str) {
+///
+/// Stream D threads the request-body `app_id` here, replacing the earlier
+/// hardcoded `RUNNER_APP_ID` placeholder. Per-app channel routing inside
+/// `events::emit` derives from the variant's `app_id` field.
+fn invoke_emit(app_id: &str, snapshot_id: &str, page_ids: Vec<String>, invoked_via: &str) {
     events::emit(SpecApiEvent::SpecCheckInvoked {
-        app_id: String::new(),
+        app_id: app_id.to_string(),
         snapshot_id: snapshot_id.to_string(),
         page_ids,
         invoked_via: invoked_via.to_string(),
@@ -471,6 +475,10 @@ fn invalid_page_id(page_id: &str) -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpecCheckRequest {
+    /// Stream D: the app id whose specs root should resolve `page_id`.
+    /// Required. `serde` keeps it `String` (not `Option`) so a missing field
+    /// yields a 400 deserialize error rather than a silent default.
+    pub app_id: String,
     pub page_id: String,
     /// Optional caller-supplied snapshot. Accepted in either the canonical
     /// [`UIBridgeSnapshot`] shape OR the SDK control-mode shape (the output
@@ -501,8 +509,33 @@ pub async fn post_spec_check(
     // Load IR via the existing helper — adapters do not re-implement
     // spec-loading. The IR doc is directly consumable by `evaluate`
     // (Plan 01 unified the top-level on `IrPageSpec`; no projection).
-    let root = storage::resolve_specs_root();
-    let ir = match storage::read_ir(&root, &req.page_id) {
+    // Stream D: `app_id` is threaded from the request body. `NotRegistered`
+    // maps to 404 with cause `app-not-found` so the workflow handler can
+    // distinguish a registry miss from a page miss.
+    let root = match storage::resolve_specs_root(&state.app_state.pg_db, &req.app_id).await {
+        Ok(p) => p,
+        Err(qontinui_types::apps::AppError::NotRegistered { app_id }) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(SpecError::with_detail(
+                    "app-not-found",
+                    json!({ "cause": "app-not-found", "appId": app_id }),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SpecError::with_detail(
+                    "specs-root-unresolved",
+                    json!({ "appId": req.app_id, "error": e.to_string() }),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let ir = match storage::read_ir(&root, &req.app_id, &req.page_id) {
         Ok(Some(doc)) => doc,
         Ok(None) => {
             return (
@@ -548,7 +581,10 @@ pub async fn post_spec_check(
                 }
             };
             let fp = qontinui_types::spec_check::BridgeFingerprint {
-                app_id: "supplied".to_string(),
+                // Stream D: bind the fingerprint to the requested app so
+                // downstream observability can group supplied-snapshot
+                // results per app (was hardcoded "supplied" in v1).
+                app_id: req.app_id.clone(),
                 app_version: None,
                 route: None,
                 bridge_version: None,
@@ -570,7 +606,14 @@ pub async fn post_spec_check(
 
     // Plan 06: emit Invoked before the (potentially slow) evaluator runs so
     // subscribers can correlate `snapshot_id` against tracing spans.
-    invoke_emit(&snapshot_id, vec![req.page_id.clone()], "http");
+    // Stream D: emit on the request's `app_id` channel so per-app subscribers
+    // see only events for the app they registered for.
+    invoke_emit(
+        &req.app_id,
+        &snapshot_id,
+        vec![req.page_id.clone()],
+        "http",
+    );
     let started_ms = events::now_ms();
 
     // Evaluate — pure crate call, no logic here.
@@ -583,10 +626,11 @@ pub async fn post_spec_check(
 
     // Plan 06: emit Completed after the evaluator returns. The full result
     // body stays out of the broadcast (subscribers join by snapshot_id).
+    // Stream D: emit on the request's `app_id` channel.
     let (perfect, partial, no_match, eval_error, overall_rate) = completion_counts(&[&result], 1);
     let completed_ms = events::now_ms();
     events::emit(SpecApiEvent::SpecCheckCompleted {
-        app_id: String::new(),
+        app_id: req.app_id.clone(),
         snapshot_id: snapshot_id.clone(),
         page_count: 1,
         overall_match_rate: overall_rate,
@@ -608,6 +652,9 @@ pub async fn post_spec_check(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchRequest {
+    /// Stream D: single-app per batch. Cross-app batching is rejected —
+    /// callers must split into N requests, one per `app_id`. Required.
+    pub app_id: String,
     pub snapshot: BatchSnapshot,
     pub pages: Vec<BatchPageEntry>,
     #[serde(default)]
@@ -705,7 +752,34 @@ pub async fn post_spec_check_batch(
         }
     };
 
-    let root = Arc::new(storage::resolve_specs_root());
+    // Stream D: resolve the specs root against the request's `app_id`.
+    // Registry miss is a hard 404 with `app-not-found` so the batch
+    // doesn't silently turn every per-page lookup into spec-not-found.
+    let root = Arc::new(
+        match storage::resolve_specs_root(&state.app_state.pg_db, &req.app_id).await {
+            Ok(p) => p,
+            Err(qontinui_types::apps::AppError::NotRegistered { app_id }) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(SpecError::with_detail(
+                        "app-not-found",
+                        json!({ "cause": "app-not-found", "appId": app_id }),
+                    )),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SpecError::with_detail(
+                        "specs-root-unresolved",
+                        json!({ "appId": req.app_id, "error": e.to_string() }),
+                    )),
+                )
+                    .into_response();
+            }
+        },
+    );
 
     info!(
         "spec_check batch pages={} stream={} snapshot_id={}",
@@ -716,14 +790,22 @@ pub async fn post_spec_check_batch(
 
     // Plan 06: emit Invoked once for the batch. Both the streaming and
     // collected paths reach the evaluator below.
+    // Stream D: emit on the request's `app_id` channel.
     let input_page_count = req.pages.len();
     let page_ids: Vec<String> = req.pages.iter().map(|p| p.page_id.clone()).collect();
-    invoke_emit(&snapshot_id, page_ids, "http");
+    invoke_emit(&req.app_id, &snapshot_id, page_ids, "http");
     let batch_started_ms = events::now_ms();
 
     if req.stream {
-        return stream_batch_results(snapshot, snapshot_id, root, req.pages, req.shared_policy)
-            .await;
+        return stream_batch_results(
+            req.app_id.clone(),
+            snapshot,
+            snapshot_id,
+            root,
+            req.pages,
+            req.shared_policy,
+        )
+        .await;
     }
 
     // Concurrent eval — spawn all N (N ≤ 256), snapshot is Arc-shared.
@@ -733,8 +815,10 @@ pub async fn post_spec_check_batch(
         let root = root.clone();
         let shared_policy = req.shared_policy.clone();
         let snapshot_id_owned = snapshot_id.clone();
+        let app_id_owned = req.app_id.clone();
         set.spawn(async move {
             evaluate_one(
+                &app_id_owned,
                 &root,
                 &entry,
                 &snapshot,
@@ -768,7 +852,7 @@ pub async fn post_spec_check_batch(
         completion_counts(&ok_results, input_page_count);
     let completed_ms = events::now_ms();
     events::emit(SpecApiEvent::SpecCheckCompleted {
-        app_id: String::new(),
+        app_id: req.app_id.clone(),
         snapshot_id: snapshot_id.clone(),
         page_count: input_page_count,
         overall_match_rate: overall_rate,
@@ -860,6 +944,7 @@ impl BatchElementResult {
 /// Evaluate one batch entry. Identical to the single-shot handler except
 /// errors become per-element statuses, not HTTP responses (§5.14).
 async fn evaluate_one(
+    app_id: &str,
     root: &std::path::Path,
     entry: &BatchPageEntry,
     snapshot: &Arc<UIBridgeSnapshot>,
@@ -870,7 +955,7 @@ async fn evaluate_one(
         return BatchElementResult::invalid_page_id(entry.page_id.clone());
     }
 
-    let ir = match storage::read_ir(root, &entry.page_id) {
+    let ir = match storage::read_ir(root, app_id, &entry.page_id) {
         Ok(Some(doc)) => doc,
         Ok(None) => return BatchElementResult::spec_not_found(entry.page_id.clone()),
         Err(e) => return BatchElementResult::spec_malformed(entry.page_id.clone(), e),
@@ -890,8 +975,9 @@ async fn evaluate_one(
     // can join all per-element violations under one batch run. The
     // workflow-step handler does the same emit, but it self-calls
     // /spec-check (single), not /spec-check/batch, so no double-counting.
+    // Stream D: emit on the batch request's `app_id` channel.
     if let (Some(pol), Some(eval)) = (policy, policy_eval.as_ref()) {
-        events::emit_policy_violations(snapshot_id, &entry.page_id, pol, eval);
+        events::emit_policy_violations(app_id, snapshot_id, &entry.page_id, pol, eval);
     }
 
     BatchElementResult::ok(entry.page_id.clone(), result, policy_eval)
@@ -900,7 +986,11 @@ async fn evaluate_one(
 /// NDJSON streaming variant: one `BatchElementResult` JSON object per line,
 /// `application/x-ndjson`. SSE (`text/event-stream`) is wrong here — this is
 /// raw NDJSON via a streamed body.
+///
+/// Stream D: `app_id` is threaded through so per-page evaluation routes to
+/// the right specs root and `SpecCheckCompleted` emits on the right channel.
 async fn stream_batch_results(
+    app_id: String,
     snapshot: Arc<UIBridgeSnapshot>,
     snapshot_id: String,
     root: Arc<std::path::PathBuf>,
@@ -939,6 +1029,7 @@ async fn stream_batch_results(
         let root = root.clone();
         let shared_policy = shared_policy.clone();
         let snap_id = snapshot_id_for_completion.clone();
+        let app_id = app_id.clone();
         async move {
             let entry = match st.iter.next() {
                 Some(e) => e,
@@ -951,7 +1042,8 @@ async fn stream_batch_results(
                         };
                         let completed_ms = events::now_ms();
                         events::emit(SpecApiEvent::SpecCheckCompleted {
-                            app_id: String::new(),
+                            // Stream D: emit on the batch request's `app_id`.
+                            app_id: app_id.clone(),
                             snapshot_id: snap_id,
                             page_count: input_page_count,
                             overall_match_rate: overall,
@@ -967,7 +1059,15 @@ async fn stream_batch_results(
                     return None;
                 }
             };
-            let r = evaluate_one(&root, &entry, &snapshot, &snap_id, shared_policy.as_ref()).await;
+            let r = evaluate_one(
+                &app_id,
+                &root,
+                &entry,
+                &snapshot,
+                &snap_id,
+                shared_policy.as_ref(),
+            )
+            .await;
             match (r.status, r.result.as_ref()) {
                 ("ok", Some(res)) => {
                     st.ok_count += 1;
@@ -1117,7 +1217,7 @@ mod tests {
             page_id: "no-such-page".to_string(),
             policy_override: None,
         };
-        let r = evaluate_one(&root, &entry, &snapshot, "scs_test", None).await;
+        let r = evaluate_one(RUNNER_APP_ID, &root, &entry, &snapshot, "scs_test", None).await;
         assert_eq!(r.status, "spec-not-found");
         assert!(r.result.is_none());
         assert_eq!(r.page_id, "no-such-page");
@@ -1133,7 +1233,7 @@ mod tests {
             page_id: "../escape".to_string(),
             policy_override: None,
         };
-        let r = evaluate_one(&root, &entry, &snapshot, "scs_test", None).await;
+        let r = evaluate_one(RUNNER_APP_ID, &root, &entry, &snapshot, "scs_test", None).await;
         assert_eq!(r.status, "eval-error");
         assert_eq!(r.error.as_deref(), Some("invalid-page-id"));
     }
@@ -1182,7 +1282,7 @@ mod tests {
 
         // Seed a minimal IR page on disk so read_ir finds it.
         let doc = minimal_ir_doc("batch-page");
-        storage::write_ir_and_regenerate(root, &doc).unwrap();
+        storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc).unwrap();
 
         let snapshot: UIBridgeSnapshot = serde_json::from_value(minimal_snapshot_json()).unwrap();
         let snapshot = Arc::new(snapshot);
@@ -1190,7 +1290,7 @@ mod tests {
             page_id: "batch-page".to_string(),
             policy_override: None,
         };
-        let r = evaluate_one(root, &entry, &snapshot, "scs_test", None).await;
+        let r = evaluate_one(RUNNER_APP_ID, root, &entry, &snapshot, "scs_test", None).await;
         assert_eq!(r.status, "ok");
         let result = r.result.expect("ok status carries a result");
         assert_eq!(result.page_id, "batch-page");
@@ -1255,9 +1355,9 @@ mod tests {
             }],
         };
 
-        let mut rx = events::subscribe();
+        let mut rx = events::subscribe(RUNNER_APP_ID);
         let marker = "scs_batch_emit_test_marker_xyz";
-        let r = evaluate_one(root, &entry, &snapshot, marker, Some(&policy)).await;
+        let r = evaluate_one(RUNNER_APP_ID, root, &entry, &snapshot, marker, Some(&policy)).await;
         assert_eq!(r.status, "ok");
         let pe = r.policy_evaluation.as_ref().expect("policy_evaluation set");
         assert_eq!(
@@ -1293,6 +1393,7 @@ mod tests {
     #[test]
     fn batch_request_deserializes_camel_case_fields() {
         let body = json!({
+            "appId": "qontinui-runner",
             "snapshot": { "source": "supplied", "blob": minimal_snapshot_json() },
             "pages": [
                 { "pageId": "p1" },
@@ -1301,6 +1402,7 @@ mod tests {
             "stream": false
         });
         let req: BatchRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.app_id, "qontinui-runner");
         assert_eq!(req.snapshot.source, "supplied");
         assert!(req.snapshot.blob.is_some());
         assert_eq!(req.pages.len(), 2);
@@ -1311,8 +1413,12 @@ mod tests {
 
     #[test]
     fn spec_check_request_snapshot_is_optional() {
-        let req: SpecCheckRequest =
-            serde_json::from_value(json!({ "pageId": "settings-general" })).unwrap();
+        let req: SpecCheckRequest = serde_json::from_value(json!({
+            "appId": "qontinui-runner",
+            "pageId": "settings-general"
+        }))
+        .unwrap();
+        assert_eq!(req.app_id, "qontinui-runner");
         assert_eq!(req.page_id, "settings-general");
         assert!(req.snapshot.is_none());
     }
@@ -1322,8 +1428,9 @@ mod tests {
         // Post-remediation: wire is camelCase. snake_case must NOT silently
         // succeed — would mask caller mistakes (the very class of bug this
         // PR fixes).
-        let result: Result<SpecCheckRequest, _> =
-            serde_json::from_value(json!({ "page_id": "settings-general" }));
+        let result: Result<SpecCheckRequest, _> = serde_json::from_value(
+            json!({ "appId": "qontinui-runner", "page_id": "settings-general" }),
+        );
         assert!(
             result.is_err(),
             "snake_case page_id must be rejected; got {:?}",
@@ -1588,9 +1695,9 @@ mod tests {
 
     #[test]
     fn invoke_emit_publishes_spec_check_invoked() {
-        let mut rx = events::subscribe();
+        let mut rx = events::subscribe(RUNNER_APP_ID);
         let marker = "scs_test_invoke_emit_1";
-        invoke_emit(marker, vec!["settings-general".into()], "http");
+        invoke_emit(RUNNER_APP_ID, marker, vec!["settings-general".into()], "http");
         let event = recv_matching_invoked(&mut rx, marker, 32)
             .expect("SpecCheckInvoked with marker must arrive");
         match event {
@@ -1650,5 +1757,159 @@ mod tests {
         let (p, q, n, e, o) = completion_counts(&[], 0);
         assert_eq!((p, q, n, e), (0, 0, 0, 0));
         assert_eq!(o, 0.0);
+    }
+
+    // ========================================================================
+    // Stream D — POST /spec-check + /spec-check/batch body extensions
+    // ========================================================================
+
+    /// D.8 #7: `POST /spec-check` deserialization must reject a body that
+    /// omits `app_id`. axum's `Json` extractor maps a Deserialize error to
+    /// HTTP 400 — we verify the contract at the struct level (same effect,
+    /// independent of the full ApiState test harness).
+    #[test]
+    fn post_spec_check_missing_app_id_returns_400() {
+        // Missing the required `appId` field → deserialize must fail.
+        let result: Result<SpecCheckRequest, _> = serde_json::from_value(json!({
+            "pageId": "active-runs"
+        }));
+        assert!(
+            result.is_err(),
+            "SpecCheckRequest with no appId must fail to deserialize (which axum maps to 400); got {:?}",
+            result
+        );
+
+        // Both fields present → deserialize succeeds.
+        let result_ok: SpecCheckRequest = serde_json::from_value(json!({
+            "appId": "qontinui-web",
+            "pageId": "active-runs"
+        }))
+        .expect("body with both fields must deserialize");
+        assert_eq!(result_ok.app_id, "qontinui-web");
+        assert_eq!(result_ok.page_id, "active-runs");
+
+        // Empty-string app_id deserializes successfully at the wire level —
+        // the storage::resolve_specs_root layer rejects it via the registry
+        // lookup (no row with empty app_id). The wire contract is "present
+        // and a String"; emptiness is a runtime / lookup concern.
+        let result_empty: SpecCheckRequest = serde_json::from_value(json!({
+            "appId": "",
+            "pageId": "active-runs"
+        }))
+        .expect("empty appId is accepted at the wire level");
+        assert_eq!(result_empty.app_id, "");
+    }
+
+    /// D.8 #8 (PG-gated): unknown app_id → 404 + cause `app-not-found`.
+    /// Verified at the resolver level — the same code path the handler uses.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn post_spec_check_unknown_app_id_returns_404_app_not_found() {
+        use crate::database::pg::PgDb;
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
+        });
+        let pg = PgDb::new(&url)
+            .await
+            .expect("PgDb::new for Stream D spec_check tests");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let unknown_id = format!("d8-unknown-{}", nanos);
+        let err = storage::resolve_specs_root(&pg, &unknown_id)
+            .await
+            .expect_err("unregistered app must error");
+        match err {
+            qontinui_types::apps::AppError::NotRegistered { app_id } => {
+                // The handler maps this to HTTP 404 with cause `app-not-found`.
+                assert_eq!(app_id, unknown_id);
+            }
+            other => panic!("expected NotRegistered, got {:?}", other),
+        }
+    }
+
+    /// D.8 #9 (PG-gated): known app, unknown page → handler returns 404 +
+    /// cause `spec-not-found`. Verified at the storage layer (the handler
+    /// short-circuits on `read_ir` returning `Ok(None)`).
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn post_spec_check_known_app_unknown_page_returns_404_spec_not_found() {
+        use crate::database::pg::PgDb;
+        use qontinui_types::apps::RegisterAppRequest;
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
+        });
+        let pg = PgDb::new(&url)
+            .await
+            .expect("PgDb::new for Stream D spec_check tests");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let specs_root = tmp.path().join("specs");
+        std::fs::create_dir_all(&specs_root).unwrap();
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let app_id = format!("d9-known-{}", nanos);
+        let req = RegisterAppRequest {
+            app_id: app_id.clone(),
+            repo_root: tmp.path().to_string_lossy().to_string(),
+            ui_bridge_url: format!("http://localhost:3001/{}", app_id),
+            display_name: format!("Test App {}", app_id),
+        };
+        pg.insert_app(&req).await.expect("insert app");
+
+        // Resolve succeeds (app is registered).
+        let root = storage::resolve_specs_root(&pg, &app_id)
+            .await
+            .expect("registered app resolves");
+        // But read_ir for a non-existent page returns Ok(None) — the handler
+        // maps this to HTTP 404 with cause `spec-not-found`.
+        let result = storage::read_ir(&root, &app_id, "no-such-page-d9").expect("read_ir ok");
+        assert!(result.is_none(), "unknown page must return None");
+
+        // Cleanup.
+        let _ = pg.delete_app(&app_id).await;
+    }
+
+    /// D.8 #10: `POST /spec-check/batch` accepts a single `app_id` field —
+    /// cross-app batching is rejected by the struct shape (one `app_id` per
+    /// request). Clients with multi-app workloads must split into N batches.
+    #[test]
+    fn post_spec_check_batch_resolves_against_one_app_root() {
+        // Single app per batch is the canonical shape.
+        let single: BatchRequest = serde_json::from_value(json!({
+            "appId": "qontinui-web",
+            "snapshot": { "source": "supplied", "blob": minimal_snapshot_json() },
+            "pages": [
+                { "pageId": "active-runs" },
+                { "pageId": "completed-runs" }
+            ],
+            "stream": false
+        }))
+        .expect("single-app batch must deserialize");
+        assert_eq!(single.app_id, "qontinui-web");
+        assert_eq!(single.pages.len(), 2);
+
+        // Omitting appId rejects.
+        let no_app: Result<BatchRequest, _> = serde_json::from_value(json!({
+            "snapshot": { "source": "supplied", "blob": minimal_snapshot_json() },
+            "pages": [{ "pageId": "active-runs" }],
+            "stream": false
+        }));
+        assert!(
+            no_app.is_err(),
+            "BatchRequest with no appId must fail to deserialize; got {:?}",
+            no_app
+        );
+
+        // Even if a caller tries to put `appId` on a per-page entry, the
+        // BatchPageEntry struct ignores unknown fields (only pageId +
+        // policyOverride) — there's no per-page app routing.
+        // (Verified indirectly: the BatchPageEntry deserializer rejects no
+        // unknown fields explicitly but the batch handler only ever passes
+        // `req.app_id` to `evaluate_one` — see the spawn loop above.)
     }
 }

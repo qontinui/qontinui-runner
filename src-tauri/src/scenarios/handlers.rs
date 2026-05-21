@@ -45,8 +45,12 @@ use super::projection::project_scenarios;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IrDocIdQuery {
     pub ir_doc_id: Option<String>,
+    /// Registered app id that owns the IR document
+    /// (spec-multi-app Stream C). Required.
+    pub app_id: Option<String>,
 }
 
 /// Wire envelope shared by both endpoints. Uses the `success: bool` shape
@@ -92,24 +96,41 @@ enum LoadIr {
     Error(String),
 }
 
-fn load_ir(ir_doc_id: &str) -> LoadIr {
-    let root = storage::resolve_specs_root();
-    match storage::read_ir(&root, ir_doc_id) {
+async fn load_ir(app_id: &str, ir_doc_id: &str) -> LoadIr {
+    let pg = crate::database::pg::PgDb::global();
+    let root = match storage::resolve_specs_root(&pg, app_id).await {
+        Ok(p) => p,
+        Err(e) => return LoadIr::Error(format!("resolve_specs_root({}) failed: {:?}", app_id, e)),
+    };
+    match storage::read_ir(&root, app_id, ir_doc_id) {
         Ok(Some(doc)) => LoadIr::Found(doc),
         Ok(None) => LoadIr::NotFound,
         Err(e) => LoadIr::Error(e),
     }
 }
 
-fn validate_id(q: &IrDocIdQuery) -> Result<&str, Response> {
-    match q.ir_doc_id.as_deref() {
-        Some(s) if !s.is_empty() => Ok(s),
-        _ => Err((
-            StatusCode::BAD_REQUEST,
-            Json(err_envelope("missing-ir-doc-id-query-param")),
-        )
-            .into_response()),
-    }
+fn validate_request<'a>(q: &'a IrDocIdQuery) -> Result<(&'a str, &'a str), Response> {
+    let ir_doc_id = match q.ir_doc_id.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(err_envelope("missing-ir-doc-id-query-param")),
+            )
+                .into_response());
+        }
+    };
+    let app_id = match q.app_id.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(err_envelope("missing-app-id-query-param")),
+            )
+                .into_response());
+        }
+    };
+    Ok((app_id, ir_doc_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -120,12 +141,12 @@ pub async fn get_scenarios_projection(
     State(_state): State<Arc<ApiState>>,
     Query(q): Query<IrDocIdQuery>,
 ) -> Response {
-    let ir_doc_id = match validate_id(&q) {
-        Ok(s) => s,
+    let (app_id, ir_doc_id) = match validate_request(&q) {
+        Ok(p) => p,
         Err(resp) => return resp,
     };
 
-    match load_ir(ir_doc_id) {
+    match load_ir(app_id, ir_doc_id).await {
         LoadIr::Found(ir) => {
             let projection = project_scenarios(&ir);
             (StatusCode::OK, Json(ScenarioEnvelope::ok(projection))).into_response()
@@ -166,12 +187,12 @@ pub async fn get_scenarios_current(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<IrDocIdQuery>,
 ) -> Response {
-    let ir_doc_id = match validate_id(&q) {
-        Ok(s) => s,
+    let (app_id, ir_doc_id) = match validate_request(&q) {
+        Ok(p) => p,
         Err(resp) => return resp,
     };
 
-    let ir = match load_ir(ir_doc_id) {
+    let ir = match load_ir(app_id, ir_doc_id).await {
         LoadIr::Found(ir) => ir,
         LoadIr::NotFound => {
             return (

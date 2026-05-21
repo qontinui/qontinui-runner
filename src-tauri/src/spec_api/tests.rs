@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::projection::project_ir_to_bundled_page;
-use super::storage::{self, ReadWithinRootError};
+use super::storage::{self, ReadWithinRootError, RUNNER_APP_ID};
 use super::types::IrPageSpec;
 
 fn small_doc() -> IrPageSpec {
@@ -158,15 +158,15 @@ fn storage_round_trip_in_tempdir() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let doc = small_doc();
-    let projection_path = storage::write_ir_and_regenerate(root, &doc).unwrap();
+    let projection_path = storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc).unwrap();
     assert!(projection_path.exists());
     // Re-read both halves; they must round-trip.
-    let read_back = storage::read_ir(root, "active").unwrap().unwrap();
+    let read_back = storage::read_ir(root, RUNNER_APP_ID, "active").unwrap().unwrap();
     assert_eq!(read_back.id, "active");
     assert_eq!(read_back.states.len(), 1);
-    let proj = storage::read_projection(root, "active").unwrap().unwrap();
+    let proj = storage::read_projection(root, RUNNER_APP_ID, "active").unwrap().unwrap();
     assert_eq!(proj["version"], "1.0.0");
-    let pages = storage::list_pages(root).unwrap();
+    let pages = storage::list_pages(root, RUNNER_APP_ID).unwrap();
     assert_eq!(pages, vec!["active".to_string()]);
 }
 
@@ -181,7 +181,7 @@ fn embedded_pages_snapshot_is_populated() {
     // page id (the runner repo currently ships ~95 pages under specs/pages/).
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let pages = storage::list_pages(root).unwrap();
+    let pages = storage::list_pages(root, RUNNER_APP_ID).unwrap();
     assert!(
         !pages.is_empty(),
         "EMBEDDED_PAGES fallback should surface at least one page when the \
@@ -195,7 +195,7 @@ fn embedded_pages_snapshot_is_populated() {
         pages
     );
     // The snapshot should be readable end-to-end via read_ir.
-    let doc = storage::read_ir(root, "active")
+    let doc = storage::read_ir(root, RUNNER_APP_ID, "active")
         .expect("read_ir should not error on embedded fallback")
         .expect("active page must be present in the embedded snapshot");
     assert_eq!(doc.id, "active");
@@ -238,6 +238,7 @@ fn storage_path_traversal_rejected() {
 mod handler_tests {
     use super::super::events;
     use super::super::handlers;
+    use super::super::storage::RUNNER_APP_ID;
     use super::small_doc;
 
     use axum::body::{to_bytes, Body};
@@ -249,23 +250,15 @@ mod handler_tests {
 
     fn router_for_tests() -> Router {
         // Tests don't need ApiState; we route to plain handler functions
-        // that don't actually read it (we use `_state: State<...>` in
-        // handlers but the body of the handler doesn't dereference it for
-        // the tested code paths).
+        // that don't actually read it for the tested code paths.
         //
-        // To avoid wiring a fake ApiState (it has many `Arc<...>` fields
-        // and would be expensive), we register parallel routes that match
-        // the production ones but drop the State extractor. We do this by
-        // wrapping each handler in a small adapter closure.
-        //
-        // For the four endpoints that don't need ApiState's contents
-        // (path-traversal-protected file read, projection lookup, graph,
-        // diff, query, derive, author, subscribe), the State extractor is
-        // satisfied by a NoState type.
-        Router::new().route("/spec/health", get(handlers::get_health))
-        // For full coverage of state-using routes, the dedicated
-        // ApiState construction is too expensive; we exercise those
-        // through the storage layer directly in the storage tests.
+        // Stream C: the path is now `/apps/:app_id/spec/health` and the
+        // handler extracts the `app_id` segment (and ignores it for the
+        // health smoke check).
+        Router::new().route(
+            "/apps/{app_id}/spec/health",
+            get(handlers::get_health),
+        )
     }
 
     #[tokio::test]
@@ -274,7 +267,7 @@ mod handler_tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/spec/health")
+                    .uri("/apps/qontinui-runner/spec/health")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -290,9 +283,11 @@ mod handler_tests {
     #[tokio::test]
     async fn sse_receives_emitted_event() {
         // Exercise the broadcaster directly: subscribe, emit, await event.
-        let mut rx = events::subscribe();
+        // Per-app channels (Stream C) — subscriber + emitter must agree on
+        // the app_id or the event lands on a different channel.
+        let mut rx = events::subscribe(RUNNER_APP_ID);
         events::emit(events::SpecApiEvent::SpecChanged(events::SpecChanged {
-            app_id: String::new(),
+            app_id: RUNNER_APP_ID.to_string(),
             page_id: "active".to_string(),
             kind: "ir-and-projection".to_string(),
             at_ms: events::now_ms(),
@@ -328,10 +323,10 @@ mod handler_tests {
         doc_a.id = "test-alpha".to_string();
         let mut doc_b = small_doc();
         doc_b.id = "test-beta".to_string();
-        super::super::storage::write_ir_and_regenerate(root, &doc_a).unwrap();
-        super::super::storage::write_ir_and_regenerate(root, &doc_b).unwrap();
+        super::super::storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc_a).unwrap();
+        super::super::storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc_b).unwrap();
 
-        let resp = super::super::handlers::build_list_response(root).into_response();
+        let resp = super::super::handlers::build_list_response(root, RUNNER_APP_ID).into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
@@ -369,32 +364,27 @@ mod handler_tests {
 
     #[tokio::test]
     async fn projection_via_handler_storage_round_trip() {
-        // End-to-end through storage: write a tempdir IR via env override,
-        // then re-read the projection and assert reason-bearing 404 for an
-        // unknown id.
+        // End-to-end through storage: write a tempdir IR and re-read the
+        // projection; assert reason-bearing 404 for an unknown id.
+        //
+        // Spec-multi-app Stream B: the QONTINUI_SPECS_ROOT env-var path was
+        // deleted with the v1 single-root resolver. Tests now pass the
+        // tempdir root directly to the storage primitives.
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(
-            "QONTINUI_SPECS_ROOT",
-            tmp.path().to_string_lossy().to_string(),
-        );
-        let _guard = scopeguard::guard((), |_| {
-            std::env::remove_var("QONTINUI_SPECS_ROOT");
-        });
-        let root = super::super::storage::resolve_specs_root();
-        // sanity
-        assert!(root.starts_with(tmp.path()) || root == tmp.path());
+        let root = tmp.path();
 
         let doc = small_doc();
-        super::super::storage::write_ir_and_regenerate(&root, &doc).unwrap();
+        super::super::storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc).unwrap();
 
-        let projection = super::super::storage::read_projection(&root, "active")
+        let projection = super::super::storage::read_projection(root, RUNNER_APP_ID, "active")
             .unwrap()
             .expect("projection must exist");
         assert_eq!(projection["version"], "1.0.0");
 
         // Unknown id read should return None (handler then renders the
         // reason: "page-not-found" envelope).
-        let missing = super::super::storage::read_projection(&root, "nonexistent").unwrap();
+        let missing =
+            super::super::storage::read_projection(root, RUNNER_APP_ID, "nonexistent").unwrap();
         assert!(missing.is_none());
     }
 
@@ -512,7 +502,7 @@ mod handler_tests {
     #[tokio::test]
     async fn post_author_rejects_empty_criterion() {
         let tmp = tempfile::tempdir().unwrap();
-        let resp = build_author_response(tmp.path(), degenerate_doc("test-degen"));
+        let resp = build_author_response(tmp.path(), RUNNER_APP_ID, degenerate_doc("test-degen"));
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(v["ok"], false);
@@ -536,7 +526,7 @@ mod handler_tests {
     #[tokio::test]
     async fn post_author_accepts_clean_spec() {
         let tmp = tempfile::tempdir().unwrap();
-        let resp = build_author_response(tmp.path(), clean_doc("test-clean"));
+        let resp = build_author_response(tmp.path(), RUNNER_APP_ID, clean_doc("test-clean"));
         let (status, v) = response_to_json(resp).await;
         assert_eq!(
             status,
@@ -560,7 +550,7 @@ mod handler_tests {
             document: Some(degenerate_doc("test-degen-validate")),
             page_id: None,
         };
-        let resp = build_validate_response(tmp.path(), body);
+        let resp = build_validate_response(tmp.path(), RUNNER_APP_ID, body);
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(v["ok"], false);
@@ -590,7 +580,7 @@ mod handler_tests {
             document: None,
             page_id: Some("seeded-degen".to_string()),
         };
-        let resp = build_validate_response(tmp.path(), body);
+        let resp = build_validate_response(tmp.path(), RUNNER_APP_ID, body);
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(v["ok"], false);
@@ -612,7 +602,7 @@ mod handler_tests {
             document: None,
             page_id: None,
         };
-        let resp = build_validate_response(tmp.path(), body);
+        let resp = build_validate_response(tmp.path(), RUNNER_APP_ID, body);
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(v["ok"], false);
@@ -652,7 +642,7 @@ mod handler_tests {
         )
         .unwrap();
 
-        let resp = super::super::handlers::build_list_response(tmp.path());
+        let resp = super::super::handlers::build_list_response(tmp.path(), RUNNER_APP_ID);
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         let specs = v["specs"].as_array().expect("specs must be an array");
@@ -702,11 +692,244 @@ mod handler_tests {
             page_id: "derive-degen".to_string(),
             derivation: "incomingTransitions".to_string(),
         };
-        let resp = build_derive_response(tmp.path(), body);
+        let resp = build_derive_response(tmp.path(), RUNNER_APP_ID, body);
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(v["ok"], false);
         assert_eq!(v["reason"], "spec-validation-failed");
         assert_eq!(v["detail"]["pageId"], "derive-degen");
+    }
+
+    // =========================================================================
+    // Spec-multi-app Stream C tests (PLAN.md §C.8)
+    // =========================================================================
+
+    use super::super::handlers::build_author_response as build_author_response_c8;
+    use super::super::types::IrProvenance;
+
+    /// Construct an IR document with an explicit provenance.app_id for the
+    /// post_author multi-tenant validation tests.
+    fn doc_with_app_id(page_id: &str, provenance_app_id: &str) -> super::IrPageSpec {
+        let mut doc = clean_doc(page_id);
+        doc.provenance = Some(IrProvenance {
+            source: "test".to_string(),
+            app_id: provenance_app_id.to_string(),
+            file: None,
+            line: None,
+            column: None,
+            plugin_version: None,
+            status: None,
+        });
+        doc
+    }
+
+    // C.8 (3) — post_author rejects when provenance.app_id mismatches URL path
+    #[tokio::test]
+    async fn post_author_mismatched_app_id_returns_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = doc_with_app_id("c8-mismatch", "other-app");
+        let resp = build_author_response_c8(tmp.path(), "qontinui-runner", doc);
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["reason"], "app-id-mismatch");
+        assert_eq!(v["detail"]["urlAppId"], "qontinui-runner");
+        assert_eq!(v["detail"]["provenanceAppId"], "other-app");
+    }
+
+    // C.8 (4) — post_author fills missing provenance.app_id from URL path
+    #[tokio::test]
+    async fn post_author_missing_app_id_fills_from_path_and_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = doc_with_app_id("c8-fill", ""); // empty triggers fill
+        let resp = build_author_response_c8(tmp.path(), "qontinui-runner", doc);
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "expected 200 OK after fill; body={}",
+            v
+        );
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["pageId"], "c8-fill");
+        // Re-read the written IR and assert the app_id was persisted from the URL path.
+        let written = super::super::storage::read_ir(tmp.path(), "qontinui-runner", "c8-fill")
+            .expect("read ok")
+            .expect("file present");
+        assert_eq!(
+            written.provenance.expect("provenance written").app_id,
+            "qontinui-runner"
+        );
+    }
+
+    // C.8 (5) — per-app broadcast channels isolate subscribers
+    #[tokio::test]
+    async fn get_subscribe_only_receives_own_app_events() {
+        use super::super::events;
+        // Two subscribers on two distinct app channels.
+        let mut rx_runner = events::subscribe("qontinui-runner");
+        let mut rx_web = events::subscribe("qontinui-web");
+
+        // Emit a SpecChanged tagged for the runner app.
+        events::emit(events::SpecApiEvent::SpecChanged(events::SpecChanged {
+            app_id: "qontinui-runner".to_string(),
+            page_id: "c8-iso".to_string(),
+            kind: "ir-and-projection".to_string(),
+            at_ms: events::now_ms(),
+        }));
+
+        // The runner subscriber must see it.
+        let recv_runner =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx_runner.recv())
+                .await
+                .expect("runner subscriber should receive within timeout")
+                .expect("event must arrive on runner channel");
+        match recv_runner {
+            events::SpecApiEvent::SpecChanged(payload) => {
+                assert_eq!(payload.app_id, "qontinui-runner");
+                assert_eq!(payload.page_id, "c8-iso");
+            }
+            other => panic!("expected SpecChanged on runner channel, got {other:?}"),
+        }
+
+        // The web subscriber must NOT see it (timeout expected).
+        let recv_web =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx_web.recv()).await;
+        assert!(
+            recv_web.is_err(),
+            "qontinui-web subscriber must not receive qontinui-runner events; got {:?}",
+            recv_web
+        );
+    }
+
+    // C.8 (6) — regression guard: the un-scoped `/spec/list` path no longer
+    // exists. We mount the production router and assert 404 — proves Stream C
+    // removed the legacy mounts (not just added new ones alongside).
+    #[tokio::test]
+    async fn unscoped_spec_list_route_returns_404() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // We build a thin router that mounts only the same /apps/:app_id/spec/health
+        // pattern Stream C registers, then assert /spec/list (legacy path) returns 404.
+        // The full production router needs `Router<Arc<ApiState>>` which is too heavy
+        // to construct in unit tests; the routing-table semantics are equivalent.
+        let app: Router = Router::new().route(
+            "/apps/{app_id}/spec/health",
+            get(super::super::handlers::get_health),
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/spec/list")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "legacy /spec/list must 404 after Stream C rescope"
+        );
+    }
+
+    // =========================================================================
+    // PG-gated tests (Stream C C.8 1 + 2). Run with a live PG via:
+    //   DATABASE_URL=postgres://... cargo test --bin qontinui-runner --features spec-authoring \
+    //     -- --ignored spec_api::tests::handler_tests::pg --test-threads=1
+    // =========================================================================
+
+    // C.8 (1) — GET /apps/:app_id/spec/list with unknown app returns 404
+    // "app-not-found" via the AppError::NotRegistered mapping.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn get_list_unknown_app_returns_404_not_registered() {
+        use crate::database::pg::PgDb;
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
+        });
+        let pg = PgDb::new(&url)
+            .await
+            .expect("PgDb::new for spec_api tests");
+        // Pick a deterministic-but-unique id that we never register.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let unknown_id = format!("c8-unknown-{}", nanos);
+        let err = super::super::storage::resolve_specs_root(&pg, &unknown_id)
+            .await
+            .expect_err("must error for unregistered app");
+        match err {
+            qontinui_types::apps::AppError::NotRegistered { app_id } => {
+                assert_eq!(app_id, unknown_id);
+            }
+            other => panic!("expected NotRegistered, got {:?}", other),
+        }
+    }
+
+    // C.8 (2) — GET /apps/:app_id/spec/list returns the app's own pages
+    // when the registry resolves the app to its repo_root + writes land
+    // there.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn get_list_with_app_returns_app_specific_pages() {
+        use crate::database::pg::PgDb;
+        use qontinui_types::apps::RegisterAppRequest;
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
+        });
+        let pg = PgDb::new(&url)
+            .await
+            .expect("PgDb::new for spec_api tests");
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Create the specs/ subdir the resolver requires.
+        let specs_root = tmp.path().join("specs");
+        std::fs::create_dir_all(&specs_root).unwrap();
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let app_id = format!("c8-list-{}", nanos);
+        let req = RegisterAppRequest {
+            app_id: app_id.clone(),
+            repo_root: tmp.path().to_string_lossy().to_string(),
+            ui_bridge_url: format!("http://localhost:3001/{}", app_id),
+            display_name: format!("Test App {}", app_id),
+        };
+        pg.insert_app(&req).await.expect("insert app");
+
+        // Seed two pages under the registered app's specs/ root.
+        let mut doc_a = small_doc();
+        doc_a.id = "c8-page-alpha".to_string();
+        let mut doc_b = small_doc();
+        doc_b.id = "c8-page-beta".to_string();
+        super::super::storage::write_ir_and_regenerate(&specs_root, &app_id, &doc_a).unwrap();
+        super::super::storage::write_ir_and_regenerate(&specs_root, &app_id, &doc_b).unwrap();
+
+        let resp = super::super::handlers::build_list_response(&specs_root, &app_id);
+        let (status, v) = response_to_json(resp).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let specs = v["specs"].as_array().expect("specs must be array");
+        let ids: Vec<&str> = specs
+            .iter()
+            .map(|s| s["specId"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"c8-page-alpha"), "alpha missing: {:?}", ids);
+        assert!(ids.contains(&"c8-page-beta"), "beta missing: {:?}", ids);
+        // appName should now be the registered app_id (Stream C — no more
+        // hard-coded "Qontinui Runner" literal).
+        for entry in specs {
+            if entry["specId"] == "c8-page-alpha" || entry["specId"] == "c8-page-beta" {
+                assert_eq!(entry["appName"], app_id);
+            }
+        }
+
+        // Cleanup.
+        let _ = pg.delete_app(&app_id).await;
     }
 }

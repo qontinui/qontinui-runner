@@ -433,3 +433,57 @@ table "coordinator_shadow_decisions" {
     }
   }
 }
+
+// ---------------------------------------------------------------
+// project.apps — multi-tenant app registry (spec-multi-app Stream B).
+//
+// One row per registered Qontinui application. The runner serves each app's
+// specs out of `<repo_root>/specs/pages/`. `app_id` is a slug (lowercase
+// ASCII letters, digits, hyphens; 1–64 chars; validated by
+// `qontinui_types::apps::validate_app_id` before insert).
+//
+// `repo_root` is an absolute path on disk owned by the runner; this is a
+// runner-local registry and is NOT synced via coord in v1.
+//
+// `last_seen_at_ms` is bumped on every `/apps/<app_id>/spec/*` hit so the
+// CLI / dashboard can show recently-touched apps. Updates are best-effort —
+// `touch_app` failures are logged at `warn!` but never fail the calling
+// storage operation.
+// ---------------------------------------------------------------
+
+table "apps" {
+  schema = schema.project
+  column "app_id" {
+    null = false
+    type = text
+  }
+  column "repo_root" {
+    null = false
+    type = text
+  }
+  column "ui_bridge_url" {
+    null = false
+    type = text
+  }
+  column "display_name" {
+    null = false
+    type = text
+  }
+  column "created_at_ms" {
+    null = false
+    type = bigint
+  }
+  column "last_seen_at_ms" {
+    null = false
+    type = bigint
+  }
+  primary_key {
+    columns = [column.app_id]
+  }
+  index "idx_apps_last_seen" {
+    on {
+      column = column.last_seen_at_ms
+      desc   = true
+    }
+  }
+}

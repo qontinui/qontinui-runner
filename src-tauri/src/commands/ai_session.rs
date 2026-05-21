@@ -644,6 +644,9 @@ pub async fn generate_workflow_from_session(
 
     // Build generation request with conversation as inline context
     let request = crate::workflow_generation::GenerateWorkflowRequest {
+        // Stream C: AI-session-launched workflows default to the runner app.
+        // A future iteration may let the user pick an app at session start.
+        app_id: crate::spec_api::storage::RUNNER_APP_ID.to_string(),
         description: description
             .unwrap_or_else(|| "Generate workflow from chat conversation".to_string()),
         inline_context: Some(inline_context),

@@ -3,8 +3,13 @@
  *
  * Runtime spec loader (Section 13). Replaces the build-time
  * `getAllSpecs()` registry with a fetch from the runner's Spec API
- * (`GET http://localhost:9876/spec/list`), with module-singleton
- * caching and automatic SSE-driven invalidation on `spec.changed`.
+ * (`GET http://localhost:9876/apps/qontinui-runner/spec/list`), with
+ * module-singleton caching and automatic SSE-driven invalidation on
+ * `spec.changed`.
+ *
+ * Spec-multi-app Stream C: the runner-frontend always reads its OWN
+ * specs (`app_id: "qontinui-runner"`). Other apps' specs are surfaced
+ * through different views (the `/apps` registry + per-app browser).
  *
  * Two entry points:
  *   - `loadDiscoveredSpecs()` — async loader for non-React contexts
@@ -18,8 +23,9 @@
 import { useEffect, useState } from "react";
 import type { DiscoveredSpec } from "../spec-prompt-builder";
 
-const SPEC_LIST_URL = "http://localhost:9876/spec/list";
-const SPEC_SUBSCRIBE_URL = "http://localhost:9876/spec/subscribe";
+const RUNNER_APP_ID = "qontinui-runner";
+const SPEC_LIST_URL = `http://localhost:9876/apps/${RUNNER_APP_ID}/spec/list`;
+const SPEC_SUBSCRIBE_URL = `http://localhost:9876/apps/${RUNNER_APP_ID}/spec/subscribe`;
 
 // =============================================================================
 // Module-scoped state
@@ -99,14 +105,14 @@ async function fetchSpecs(): Promise<DiscoveredSpec[]> {
 
   if (!response.ok) {
     throw new Error(
-      `GET /spec/list failed: HTTP ${response.status} ${response.statusText}`
+      `GET ${SPEC_LIST_URL} failed: HTTP ${response.status} ${response.statusText}`
     );
   }
 
   const body = (await response.json()) as SpecListResponse;
   if (!body.ok) {
     throw new Error(
-      `GET /spec/list returned ok=false${body.reason ? `: ${body.reason}` : ""}`
+      `GET ${SPEC_LIST_URL} returned ok=false${body.reason ? `: ${body.reason}` : ""}`
     );
   }
 

@@ -86,15 +86,18 @@ pub enum AuthoringError {
 
 /// Top-level entrypoint. `proposals.rs` calls this from the execute handler.
 ///
-/// Runs the appropriate authoring flavor and returns either a candidate
-/// `IrPageSpec` (still un-validated — the validator gates are layered on top
-/// by the proposals handler) or a structured error.
+/// `app_id` scopes every spec read/write to the owning app (spec-multi-app
+/// Stream C). Runs the appropriate authoring flavor and returns either a
+/// candidate `IrPageSpec` (still un-validated — the validator gates are
+/// layered on top by the proposals handler) or a structured error.
 pub async fn author_candidate(
     pg_db: Arc<PgDb>,
     app_state: Arc<crate::commands::AppState>,
+    app_id: &str,
     mode: AuthoringMode,
 ) -> Result<AuthoringOutcome, AuthoringError> {
-    author_candidate_with_executor(pg_db, app_state, mode, &DefaultMetaWorkflowExecutor).await
+    author_candidate_with_executor(pg_db, app_state, app_id, mode, &DefaultMetaWorkflowExecutor)
+        .await
 }
 
 /// Test seam: same as [`author_candidate`] but takes an explicit
@@ -103,18 +106,20 @@ pub async fn author_candidate(
 pub async fn author_candidate_with_executor(
     pg_db: Arc<PgDb>,
     app_state: Arc<crate::commands::AppState>,
+    app_id: &str,
     mode: AuthoringMode,
     executor: &dyn MetaWorkflowExecutor,
 ) -> Result<AuthoringOutcome, AuthoringError> {
     match mode {
         AuthoringMode::FullPage { pathname } => {
             // 1. Project the artifact into a deterministic skeleton.
-            let skeleton = load_and_project_skeleton(&pg_db, &pathname).await?;
+            let skeleton = load_and_project_skeleton(&pg_db, app_id, &pathname).await?;
             let skeleton_id = skeleton.id.clone();
 
             // 2. AI fill-in via the meta-workflow.
             let filled =
-                ai_fill_skeleton(pg_db.clone(), app_state.clone(), skeleton, executor).await?;
+                ai_fill_skeleton(pg_db.clone(), app_state.clone(), app_id, skeleton, executor)
+                    .await?;
 
             Ok(AuthoringOutcome {
                 candidate: filled,
@@ -129,8 +134,15 @@ pub async fn author_candidate_with_executor(
             existing_spec_id,
             drift,
         } => {
-            let mutated =
-                author_patch(pg_db, app_state, &existing_spec_id, &drift, executor).await?;
+            let mutated = author_patch(
+                pg_db,
+                app_state,
+                app_id,
+                &existing_spec_id,
+                &drift,
+                executor,
+            )
+            .await?;
             Ok(AuthoringOutcome {
                 candidate: mutated,
                 diagnostics: serde_json::json!({
@@ -206,6 +218,7 @@ pub(crate) fn pathname_to_spec_id(pathname: &str) -> String {
 /// - `IrElementCriteria.attributes` is a `BTreeMap` (already deterministic)
 async fn load_and_project_skeleton(
     pg_db: &PgDb,
+    app_id: &str,
     pathname: &str,
 ) -> Result<IrPageSpec, AuthoringError> {
     let candidate_id = pathname_to_spec_id(pathname);
@@ -219,7 +232,7 @@ async fn load_and_project_skeleton(
     // Project each cluster, then sort states by id for determinism.
     let mut states: Vec<IrState> = clusters
         .iter()
-        .map(project_cluster_to_state)
+        .map(|c| project_cluster_to_state(app_id, c))
         .collect::<Vec<_>>();
     states.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -234,7 +247,7 @@ async fn load_and_project_skeleton(
         metadata: None,
         provenance: Some(IrProvenance {
             source: "build-plugin".into(),
-            app_id: "qontinui-runner".to_string(),
+            app_id: app_id.to_string(),
             status: Some(ProposalStatus::Proposed),
             ..Default::default()
         }),
@@ -339,7 +352,7 @@ fn extract_clusters(body: &serde_json::Value) -> Result<Vec<Cluster>, AuthoringE
 /// the final assertions. The slot name is a historical artifact — Stream E
 /// treats it as the "candidate criteria" channel for the skeleton, and the
 /// AI verification step relocates them onto `assertions` as appropriate.
-fn project_cluster_to_state(cluster: &Cluster) -> IrState {
+fn project_cluster_to_state(app_id: &str, cluster: &Cluster) -> IrState {
     let mut sorted = cluster.fingerprints.clone();
     sorted.sort();
     sorted.dedup();
@@ -368,7 +381,7 @@ fn project_cluster_to_state(cluster: &Cluster) -> IrState {
         metadata: None,
         provenance: Some(IrProvenance {
             source: "build-plugin".into(),
-            app_id: "qontinui-runner".to_string(),
+            app_id: app_id.to_string(),
             status: Some(ProposalStatus::Proposed),
             ..Default::default()
         }),
@@ -409,6 +422,7 @@ fn fingerprint_to_criteria(fingerprint: &String) -> IrElementCriteria {
 async fn ai_fill_skeleton(
     pg_db: Arc<PgDb>,
     app_state: Arc<crate::commands::AppState>,
+    app_id: &str,
     skeleton: IrPageSpec,
     executor: &dyn MetaWorkflowExecutor,
 ) -> Result<IrPageSpec, AuthoringError> {
@@ -418,7 +432,7 @@ async fn ai_fill_skeleton(
     };
 
     let description = build_priming_description(&skeleton);
-    let historical = build_spec_priming_context(&pg_db, &skeleton, 5).await;
+    let historical = build_spec_priming_context(&pg_db, app_id, &skeleton, 5).await;
 
     let request = GenerateWorkflowRequest {
         description: description.clone(),
@@ -444,7 +458,7 @@ async fn ai_fill_skeleton(
 
     let mut filled: IrPageSpec =
         parse_meta_workflow_output(&run_result).map_err(AuthoringError::MalformedAiOutput)?;
-    stamp_provenance_ai_generated_proposed(&mut filled);
+    stamp_provenance_ai_generated_proposed(&mut filled, app_id);
 
     enforce_skeleton_invariants(&skeleton, &filled).map_err(AuthoringError::MalformedAiOutput)?;
 
@@ -487,17 +501,20 @@ fn build_priming_description(skeleton: &IrPageSpec) -> String {
 /// document level + on every state whose existing provenance is missing or
 /// `ai-generated`. States with `hand-authored` / `migrated` / `build-plugin`
 /// provenance are left untouched.
-fn stamp_provenance_ai_generated_proposed(ir: &mut IrPageSpec) {
+fn stamp_provenance_ai_generated_proposed(ir: &mut IrPageSpec, app_id: &str) {
     let doc_prov = ir.provenance.get_or_insert_with(IrProvenance::default);
     doc_prov.source = "ai-generated".to_string();
     doc_prov.status = Some(ProposalStatus::Proposed);
+    if doc_prov.app_id.is_empty() {
+        doc_prov.app_id = app_id.to_string();
+    }
 
     for state in &mut ir.states {
         match &state.provenance {
             None => {
                 state.provenance = Some(IrProvenance {
                     source: "ai-generated".into(),
-                    app_id: "qontinui-runner".to_string(),
+                    app_id: app_id.to_string(),
                     status: Some(ProposalStatus::Proposed),
                     ..Default::default()
                 });
@@ -506,6 +523,9 @@ fn stamp_provenance_ai_generated_proposed(ir: &mut IrPageSpec) {
                 let mut clone = p.clone();
                 clone.source = "ai-generated".to_string();
                 clone.status = Some(ProposalStatus::Proposed);
+                if clone.app_id.is_empty() {
+                    clone.app_id = app_id.to_string();
+                }
                 state.provenance = Some(clone);
             }
             Some(_) => {
@@ -575,6 +595,7 @@ pub(crate) struct IrPatch {
 async fn author_patch(
     pg_db: Arc<PgDb>,
     app_state: Arc<crate::commands::AppState>,
+    app_id: &str,
     existing_spec_id: &str,
     drift: &crate::commands::spec_drift::DriftReport,
     executor: &dyn MetaWorkflowExecutor,
@@ -584,8 +605,15 @@ async fn author_patch(
         build_historical_context_pg, build_meta_workflow_template,
     };
 
-    let root = crate::spec_api::storage::resolve_specs_root();
-    let existing: IrPageSpec = crate::spec_api::storage::read_ir(&root, existing_spec_id)
+    let root = crate::spec_api::storage::resolve_specs_root(&pg_db, app_id)
+        .await
+        .map_err(|e| {
+            AuthoringError::ExistingSpecMissing(format!(
+                "resolve_specs_root({}) failed: {:?}",
+                app_id, e
+            ))
+        })?;
+    let existing: IrPageSpec = crate::spec_api::storage::read_ir(&root, app_id, existing_spec_id)
         .map_err(AuthoringError::ExistingSpecMissing)?
         .ok_or_else(|| {
             AuthoringError::ExistingSpecMissing(format!(
@@ -621,7 +649,7 @@ async fn author_patch(
 
     let patch: IrPatch =
         parse_patch_output(&run_result).map_err(AuthoringError::MalformedAiOutput)?;
-    merge_patch_into_ir(existing, patch).map_err(AuthoringError::MalformedAiOutput)
+    merge_patch_into_ir(existing, patch, app_id).map_err(AuthoringError::MalformedAiOutput)
 }
 
 fn build_patch_resolved_contexts(
@@ -673,6 +701,7 @@ fn parse_patch_output(value: &serde_json::Value) -> Result<IrPatch, String> {
 pub(crate) fn merge_patch_into_ir(
     mut existing: IrPageSpec,
     patch: IrPatch,
+    app_id: &str,
 ) -> Result<IrPageSpec, String> {
     // Validate transition ids first so we don't half-apply.
     let mut existing_tx_ids: BTreeSet<String> =
@@ -747,7 +776,7 @@ pub(crate) fn merge_patch_into_ir(
     for mut tx in patch.add_transitions {
         tx.provenance = Some(IrProvenance {
             source: "ai-generated".into(),
-            app_id: "qontinui-runner".to_string(),
+            app_id: app_id.to_string(),
             status: Some(ProposalStatus::Proposed),
             ..Default::default()
         });
@@ -918,7 +947,10 @@ mod tests {
     fn skeleton_from_artifact(body: &serde_json::Value, observation_count: i32) -> IrPageSpec {
         // Helper that mirrors the projection path without touching PG.
         let clusters = extract_clusters(body).expect("clusters parse");
-        let mut states: Vec<IrState> = clusters.iter().map(project_cluster_to_state).collect();
+        let mut states: Vec<IrState> = clusters
+            .iter()
+            .map(|c| project_cluster_to_state("qontinui-runner", c))
+            .collect();
         states.sort_by(|a, b| a.id.cmp(&b.id));
         IrPageSpec {
             version: "1.0".into(),
@@ -1079,7 +1111,7 @@ mod tests {
             ..Default::default()
         });
         // ir.states[1].provenance is None initially.
-        stamp_provenance_ai_generated_proposed(&mut ir);
+        stamp_provenance_ai_generated_proposed(&mut ir, "qontinui-runner");
         assert_eq!(
             ir.states[0].provenance.as_ref().unwrap().source,
             "hand-authored"
@@ -1186,7 +1218,7 @@ mod tests {
         patch
             .add_required_elements
             .insert("s1".into(), vec![make_criteria("new-elem")]);
-        let result = merge_patch_into_ir(existing, patch).expect("merge ok");
+        let result = merge_patch_into_ir(existing, patch, "qontinui-runner").expect("merge ok");
         let crit = result.states[0]
             .excluded_elements
             .as_ref()
@@ -1204,7 +1236,7 @@ mod tests {
         patch
             .add_required_elements
             .insert("s1".into(), vec![make_criteria("new-elem")]);
-        let err = merge_patch_into_ir(existing_before, patch).unwrap_err();
+        let err = merge_patch_into_ir(existing_before, patch, "qontinui-runner").unwrap_err();
         assert!(err.contains("pinned state 's1'"), "got: {}", err);
         // The original snapshot should still match what we built — proves
         // the function did not return a half-mutated IR.
@@ -1223,7 +1255,7 @@ mod tests {
         patch
             .add_transitions
             .push(make_transition("tx-1", "s1", "s2"));
-        let err = merge_patch_into_ir(existing, patch).unwrap_err();
+        let err = merge_patch_into_ir(existing, patch, "qontinui-runner").unwrap_err();
         assert!(err.contains("collides with an existing transition"));
     }
 
@@ -1234,7 +1266,7 @@ mod tests {
         patch
             .add_transitions
             .push(make_transition("tx-new", "s1", "s2"));
-        let result = merge_patch_into_ir(existing, patch).expect("merge ok");
+        let result = merge_patch_into_ir(existing, patch, "qontinui-runner").expect("merge ok");
         assert_eq!(result.transitions.len(), 1);
         let prov = result.transitions[0]
             .provenance
@@ -1254,7 +1286,7 @@ mod tests {
         patch
             .add_transitions
             .push(make_transition("tx-dup", "s1", "s2"));
-        let err = merge_patch_into_ir(existing, patch).unwrap_err();
+        let err = merge_patch_into_ir(existing, patch, "qontinui-runner").unwrap_err();
         assert!(err.contains("duplicate transition id"));
     }
 
@@ -1265,7 +1297,7 @@ mod tests {
         patch
             .add_required_elements
             .insert("ghost".into(), vec![make_criteria("x")]);
-        let err = merge_patch_into_ir(existing, patch).unwrap_err();
+        let err = merge_patch_into_ir(existing, patch, "qontinui-runner").unwrap_err();
         assert!(err.contains("unknown state 'ghost'"));
     }
 

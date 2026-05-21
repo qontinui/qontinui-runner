@@ -507,14 +507,17 @@ pub fn analyze_freshness(spec_file_path: &Path, component_paths: &[PathBuf]) -> 
 /// Analyze freshness for all spec files.
 ///
 /// `specs_root` is the Spec API storage root (e.g. `<runner>/specs/`); page
-/// projections live at `<specs_root>/pages/<id>/spec.uibridge.json`.
+/// projections live at `<specs_root>/pages/<id>/spec.uibridge.json`. `app_id`
+/// scopes the embedded-snapshot fallback (PLAN.md §B.6 — only the
+/// `qontinui-runner` app has embedded pages).
 pub fn analyze_all_freshness(
+    app_id: &str,
     specs_root: &Path,
     components_dir: &Path,
 ) -> Vec<(String, FreshnessResult)> {
     let mut results = Vec::new();
 
-    let page_ids = match crate::spec_api::storage::list_pages(specs_root) {
+    let page_ids = match crate::spec_api::storage::list_pages(specs_root, app_id) {
         Ok(ids) => ids,
         Err(_) => return results,
     };

@@ -2715,7 +2715,11 @@ struct PageComponent {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DiscoverPagesRequest {
+    /// Registered app id whose spec storage to consult when checking
+    /// `page.has_spec` (spec-multi-app Stream C). Required.
+    app_id: String,
     project_path: String,
 }
 
@@ -2726,7 +2730,7 @@ struct DiscoverPagesResult {
 }
 
 /// Walk a project and find all page/route components.
-async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, String> {
+async fn discover_pages(app_id: &str, project_path: &str) -> Result<DiscoverPagesResult, String> {
     let project = PathBuf::from(project_path);
     if !project.exists() {
         return Err(format!("Project path does not exist: {}", project_path));
@@ -2778,11 +2782,14 @@ async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, Strin
         // Check for a page projection in the Spec API storage. The spec id
         // is derived from the route (matching the legacy filename convention).
         let spec_id = page.route.trim_start_matches('/').replace('/', "-");
-        let specs_root = crate::spec_api::storage::resolve_specs_root();
-        page.has_spec = matches!(
-            crate::spec_api::storage::read_projection(&specs_root, &spec_id),
-            Ok(Some(_))
-        );
+        let pg = crate::database::pg::PgDb::global();
+        page.has_spec = match crate::spec_api::storage::resolve_specs_root(&pg, app_id).await {
+            Ok(specs_root) => matches!(
+                crate::spec_api::storage::read_projection(&specs_root, app_id, &spec_id),
+                Ok(Some(_))
+            ),
+            Err(_) => false,
+        };
 
         // Check for tutorial data file
         let tutorial_name = format!(
@@ -3527,7 +3534,7 @@ async fn handle_discover_pages(
     State(_state): State<Arc<ApiState>>,
     Json(req): Json<DiscoverPagesRequest>,
 ) -> Json<ApiResponse<DiscoverPagesResult>> {
-    match discover_pages(&req.project_path).await {
+    match discover_pages(&req.app_id, &req.project_path).await {
         Ok(result) => Json(ApiResponse::success(result)),
         Err(e) => Json(ApiResponse::error(e)),
     }

@@ -2403,6 +2403,8 @@ pub async fn generate_workflow_from_session(
         .and_then(|v| v.as_bool());
 
     let request = crate::workflow_generation::GenerateWorkflowRequest {
+        // Stream C: task-run-launched workflows default to the runner app.
+        app_id: crate::spec_api::storage::RUNNER_APP_ID.to_string(),
         description,
         inline_context: Some(format!(
             "The following is a conversation between a user and an AI assistant. \

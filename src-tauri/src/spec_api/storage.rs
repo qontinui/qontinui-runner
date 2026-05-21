@@ -19,8 +19,19 @@ use std::path::{Path, PathBuf};
 
 use include_dir::{include_dir, Dir};
 
+use qontinui_types::apps::AppError;
+
+use crate::database::pg::PgDb;
+
 use super::projection::project_to_pretty_json;
 use super::types::IrPageSpec;
+
+/// App id used by the embedded `qontinui-runner` spec corpus. The
+/// `EMBEDDED_PAGES` fallback only fires when the caller asks for this app
+/// (per PLAN.md §B.6). Centralized here so Stream C / E / F have one
+/// constant to grep instead of a literal "qontinui-runner" string sprinkled
+/// across read paths.
+pub const RUNNER_APP_ID: &str = "qontinui-runner";
 
 #[cfg(feature = "spec-authoring")]
 use super::types::ProposalStatus;
@@ -36,31 +47,47 @@ use super::types::ProposalStatus;
 ///   tree (e.g. a standalone build).
 static EMBEDDED_PAGES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../specs/pages");
 
-/// Resolve the storage root for the Spec API.
+/// Resolve the storage root for an app's specs by looking up the registry
+/// entry, joining `<repo_root>/specs`, and verifying the path is a
+/// directory.
 ///
-/// Resolution order:
-///   1. `QONTINUI_SPECS_ROOT` env var (absolute path).
-///   2. `<runner-repo>/specs/` resolved relative to the current working dir.
+/// Per spec-multi-app PLAN.md §B.5 this REPLACES the spec-check-v1 single-
+/// root resolver: there is no `QONTINUI_SPECS_ROOT` env-var fallback and no
+/// implicit "runner repo" default. Every caller that needs a spec root MUST
+/// know which app it's resolving for; unregistered apps deliberately error
+/// rather than silently fall back to a runner-local root.
 ///
-/// We do NOT auto-create the root — if it's missing, calls return errors so
-/// the caller knows storage is unwired (avoids the "silent empty stub"
-/// failure mode the Section 2 plan calls out).
-pub fn resolve_specs_root() -> PathBuf {
-    if let Ok(override_path) = std::env::var("QONTINUI_SPECS_ROOT") {
-        return PathBuf::from(override_path);
+/// Side effect: on a successful resolve, `PgDb::touch_app` is fired so the
+/// app's `last_seen_at_ms` reflects the most recent hit. The touch is
+/// best-effort (failures swallowed at `warn!` level inside `touch_app`) so
+/// transient PG hiccups don't poison the storage read.
+///
+/// Errors:
+/// - `AppError::NotRegistered` if no `apps` row matches `app_id`.
+/// - `AppError::InvalidRepoRoot` if the registered path no longer exists or
+///   is not a directory (e.g. user moved their repo on disk).
+///
+/// Returns the canonical `<repo_root>/specs` PathBuf on success.
+pub async fn resolve_specs_root(pg: &PgDb, app_id: &str) -> Result<PathBuf, AppError> {
+    let app = pg
+        .get_app(app_id)
+        .await
+        .map_err(|e| AppError::InvalidRepoRoot {
+            repo_root: format!("(pg lookup error) {}", e),
+        })?
+        .ok_or_else(|| AppError::NotRegistered {
+            app_id: app_id.into(),
+        })?;
+
+    let root = PathBuf::from(&app.repo_root).join("specs");
+    if !root.is_dir() {
+        return Err(AppError::InvalidRepoRoot {
+            repo_root: root.display().to_string(),
+        });
     }
-    // Default to <CARGO_MANIFEST_DIR>/../specs (i.e. <runner>/specs) when
-    // running tests; else current dir + ../specs which matches the runner
-    // layout when launched from src-tauri/.
-    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-        let p = PathBuf::from(manifest_dir).join("..").join("specs");
-        if let Ok(canon) = p.canonicalize() {
-            return canon;
-        }
-        return p;
-    }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    cwd.join("specs")
+
+    pg.touch_app(app_id).await;
+    Ok(root)
 }
 
 /// Page-level paths. Cheap to construct from a page id.
@@ -90,10 +117,13 @@ impl PagePaths {
 /// before returning to the user).
 ///
 /// Falls back to enumerating the compile-time `EMBEDDED_PAGES` snapshot when
-/// the on-disk pages directory is missing or empty. Filesystem entries take
-/// precedence on collisions; the embedded set is merged in only as a fallback
-/// to cover production binaries shipped without a sibling specs/ tree.
-pub fn list_pages(root: &Path) -> std::io::Result<Vec<String>> {
+/// the on-disk pages directory is missing or empty AND the caller asked for
+/// the `qontinui-runner` app (`app_id == RUNNER_APP_ID`). `EMBEDDED_PAGES`
+/// is the compile-time snapshot of `<runner>/specs/pages/` only — for any
+/// other app the on-disk path is authoritative and a missing tree yields an
+/// empty list (Stream C handlers translate that to a `reason`-bearing
+/// envelope).
+pub fn list_pages(root: &Path, app_id: &str) -> std::io::Result<Vec<String>> {
     let pages_dir = root.join("pages");
     let mut ids: Vec<String> = Vec::new();
     if pages_dir.exists() {
@@ -107,7 +137,7 @@ pub fn list_pages(root: &Path) -> std::io::Result<Vec<String>> {
             }
         }
     }
-    if ids.is_empty() {
+    if ids.is_empty() && app_id == RUNNER_APP_ID {
         for embedded_dir in EMBEDDED_PAGES.dirs() {
             if let Some(name) = embedded_dir.path().file_name().and_then(|n| n.to_str()) {
                 ids.push(name.to_string());
@@ -124,9 +154,14 @@ pub fn list_pages(root: &Path) -> std::io::Result<Vec<String>> {
 /// internal error).
 ///
 /// Filesystem-first, embedded-second. The embedded snapshot
-/// (`EMBEDDED_PAGES`) only kicks in when the on-disk file is absent — dev
-/// hot-reload and `/update-spec` writes always win.
-pub fn read_ir(root: &Path, page_id: &str) -> Result<Option<IrPageSpec>, String> {
+/// (`EMBEDDED_PAGES`) only kicks in when the on-disk file is absent AND the
+/// caller is reading the `qontinui-runner` app — per PLAN.md §B.6 the
+/// compile-time snapshot embeds only the runner's spec corpus.
+pub fn read_ir(
+    root: &Path,
+    app_id: &str,
+    page_id: &str,
+) -> Result<Option<IrPageSpec>, String> {
     let paths = PagePaths::for_page(root, page_id);
     if paths.ir_path.exists() {
         let data = fs::read_to_string(&paths.ir_path)
@@ -135,20 +170,26 @@ pub fn read_ir(root: &Path, page_id: &str) -> Result<Option<IrPageSpec>, String>
             .map_err(|e| format!("parse {} failed: {}", paths.ir_path.display(), e))?;
         return Ok(Some(doc));
     }
-    // Embedded fallback.
-    let embedded_rel = format!("{}/state-machine.derived.json", page_id);
-    if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-        let doc: IrPageSpec = serde_json::from_slice(file.contents())
-            .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
-        return Ok(Some(doc));
+    if app_id == RUNNER_APP_ID {
+        let embedded_rel = format!("{}/state-machine.derived.json", page_id);
+        if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
+            let doc: IrPageSpec = serde_json::from_slice(file.contents())
+                .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
+            return Ok(Some(doc));
+        }
     }
     Ok(None)
 }
 
 /// Read the bundled projection (pretty JSON) as a `serde_json::Value`.
 ///
-/// Filesystem-first, embedded-second (see [`read_ir`] for the rationale).
-pub fn read_projection(root: &Path, page_id: &str) -> Result<Option<serde_json::Value>, String> {
+/// Filesystem-first, embedded-second gated on `app_id == RUNNER_APP_ID`
+/// (see [`read_ir`]).
+pub fn read_projection(
+    root: &Path,
+    app_id: &str,
+    page_id: &str,
+) -> Result<Option<serde_json::Value>, String> {
     let paths = PagePaths::for_page(root, page_id);
     if paths.projection_path.exists() {
         let data = fs::read_to_string(&paths.projection_path)
@@ -157,11 +198,13 @@ pub fn read_projection(root: &Path, page_id: &str) -> Result<Option<serde_json::
             .map_err(|e| format!("parse {} failed: {}", paths.projection_path.display(), e))?;
         return Ok(Some(v));
     }
-    let embedded_rel = format!("{}/spec.uibridge.json", page_id);
-    if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-        let v: serde_json::Value = serde_json::from_slice(file.contents())
-            .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
-        return Ok(Some(v));
+    if app_id == RUNNER_APP_ID {
+        let embedded_rel = format!("{}/spec.uibridge.json", page_id);
+        if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
+            let v: serde_json::Value = serde_json::from_slice(file.contents())
+                .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
+            return Ok(Some(v));
+        }
     }
     Ok(None)
 }
@@ -169,8 +212,13 @@ pub fn read_projection(root: &Path, page_id: &str) -> Result<Option<serde_json::
 /// Read the notes companion file. Returns `None` if absent. Empty/whitespace
 /// content normalizes to `None`.
 ///
-/// Filesystem-first, embedded-second (see [`read_ir`] for the rationale).
-pub fn read_notes(root: &Path, page_id: &str) -> Result<Option<String>, String> {
+/// Filesystem-first, embedded-second gated on `app_id == RUNNER_APP_ID`
+/// (see [`read_ir`]).
+pub fn read_notes(
+    root: &Path,
+    app_id: &str,
+    page_id: &str,
+) -> Result<Option<String>, String> {
     let paths = PagePaths::for_page(root, page_id);
     if paths.notes_path.exists() {
         let s = fs::read_to_string(&paths.notes_path)
@@ -182,16 +230,18 @@ pub fn read_notes(root: &Path, page_id: &str) -> Result<Option<String>, String> 
             Ok(Some(trimmed))
         };
     }
-    let embedded_rel = format!("{}/notes.md", page_id);
-    if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-        let s = std::str::from_utf8(file.contents())
-            .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
-        let trimmed = s.trim().to_string();
-        return if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(trimmed))
-        };
+    if app_id == RUNNER_APP_ID {
+        let embedded_rel = format!("{}/notes.md", page_id);
+        if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
+            let s = std::str::from_utf8(file.contents())
+                .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
+            let trimmed = s.trim().to_string();
+            return if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            };
+        }
     }
     Ok(None)
 }
@@ -226,7 +276,15 @@ fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// snapshot and cannot be mutated at runtime. After this call, subsequent
 /// `read_ir` / `read_projection` calls will resolve to the freshly-written
 /// file (filesystem wins over embedded).
-pub fn write_ir_and_regenerate(root: &Path, doc: &IrPageSpec) -> Result<PathBuf, String> {
+///
+/// `app_id` is the registered app this IR belongs to; used only by the
+/// `read_notes` lookup to decide whether the embedded-snapshot fallback is
+/// eligible (per PLAN.md §B.6).
+pub fn write_ir_and_regenerate(
+    root: &Path,
+    app_id: &str,
+    doc: &IrPageSpec,
+) -> Result<PathBuf, String> {
     let paths = PagePaths::for_page(root, &doc.id);
     let ir_json =
         serde_json::to_string_pretty(doc).map_err(|e| format!("serialize IR failed: {}", e))?;
@@ -235,7 +293,7 @@ pub fn write_ir_and_regenerate(root: &Path, doc: &IrPageSpec) -> Result<PathBuf,
     atomic_write(&paths.ir_path, &ir_buf)
         .map_err(|e| format!("write {} failed: {}", paths.ir_path.display(), e))?;
 
-    let notes = read_notes(root, &doc.id).unwrap_or(None);
+    let notes = read_notes(root, app_id, &doc.id).unwrap_or(None);
     let projection = project_to_pretty_json(doc, notes.as_deref());
     atomic_write(&paths.projection_path, projection.as_bytes())
         .map_err(|e| format!("write {} failed: {}", paths.projection_path.display(), e))?;
@@ -272,11 +330,14 @@ pub enum ReadWithinRootError {
 /// Stat-based mtime check; returns the modified time as seconds since epoch
 /// for IR + projection files. Used by `/spec/diff?since=`.
 ///
-/// Embedded-only pages (no on-disk files) return `Some(0)` so callers' `since=`
-/// cursor behaves predictably — `0` is older than any real epoch timestamp,
-/// so a client polling with a non-zero cursor won't see spurious "modified"
+/// Embedded-only pages (no on-disk files) return `Some(0)` ONLY when the
+/// caller is reading the runner app (`app_id == RUNNER_APP_ID`) — per
+/// PLAN.md §B.6 the embedded snapshot is the runner's spec corpus only.
+/// The `Some(0)` sentinel signals "page exists" so callers' `since=` cursor
+/// behaves predictably: `0` is older than any real epoch timestamp, so a
+/// client polling with a non-zero cursor won't see spurious "modified"
 /// signals for content that hasn't actually changed.
-pub fn newest_mtime_for_page(root: &Path, page_id: &str) -> Option<u64> {
+pub fn newest_mtime_for_page(root: &Path, app_id: &str, page_id: &str) -> Option<u64> {
     let paths = PagePaths::for_page(root, page_id);
     let mut newest: Option<u64> = None;
     let mut any_on_disk = false;
@@ -296,8 +357,8 @@ pub fn newest_mtime_for_page(root: &Path, page_id: &str) -> Option<u64> {
     }
     // If nothing was on disk but the page exists in the embedded snapshot,
     // return 0 so the caller still sees "the page exists" (vs `None`, which
-    // means "no such page").
-    if !any_on_disk {
+    // means "no such page"). Embedded snapshot is runner-only.
+    if !any_on_disk && app_id == RUNNER_APP_ID {
         let ir_rel = format!("{}/state-machine.derived.json", page_id);
         let proj_rel = format!("{}/spec.uibridge.json", page_id);
         let notes_rel = format!("{}/notes.md", page_id);
@@ -352,18 +413,29 @@ fn pending_projection_path(root: &Path, page_id: &str) -> PathBuf {
 /// Auto-creates the `_pending/` subdirectory. If a `provenance` block is
 /// absent on the input, one is synthesized with `source: "ai-generated"`
 /// (the only `_pending/` producer in v1.0) and `status: Some(Pending)`.
+///
+/// `app_id` is stamped onto `provenance.app_id` if the block was missing or
+/// carried an empty / placeholder value — every `_pending/` artefact must
+/// declare its owning app (spec-multi-app Stream E.2). `root` is already
+/// app-scoped via `resolve_specs_root(&db, &app_id)`, so each app gets its
+/// own `<repo_root>/specs/pages/<id>/_pending/` automatically.
 #[cfg(feature = "spec-authoring")]
-pub fn write_pending_ir(root: &Path, ir: &IrPageSpec) -> Result<PathBuf, String> {
+pub fn write_pending_ir(root: &Path, app_id: &str, ir: &IrPageSpec) -> Result<PathBuf, String> {
     let mut doc = ir.clone();
     let mut prov = doc.provenance.unwrap_or(super::types::IrProvenance {
         source: "ai-generated".to_string(),
-        app_id: "qontinui-runner".to_string(),
+        app_id: app_id.to_string(),
         file: None,
         line: None,
         column: None,
         plugin_version: None,
         status: None,
     });
+    // Backfill `app_id` if the caller supplied a provenance block that left
+    // it blank or hardcoded the legacy `qontinui-runner` placeholder.
+    if prov.app_id.is_empty() {
+        prov.app_id = app_id.to_string();
+    }
     prov.status = Some(ProposalStatus::Pending);
     doc.provenance = Some(prov);
 
@@ -423,8 +495,11 @@ pub fn read_pending_ir(root: &Path, page_id: &str) -> Result<Option<IrPageSpec>,
 ///
 /// Returns `Err` if the pending IR is missing or any step fails. The lock is
 /// released on Drop regardless of success/failure.
+///
+/// `app_id` is passed through to `write_ir_and_regenerate` so the embedded
+/// notes-snapshot fallback is gated correctly (PLAN.md §B.6).
 #[cfg(feature = "spec-authoring")]
-pub fn promote_pending(root: &Path, page_id: &str) -> Result<(), String> {
+pub fn promote_pending(root: &Path, app_id: &str, page_id: &str) -> Result<(), String> {
     let _guard = page_lock(root, page_id)?;
 
     let mut doc = read_pending_ir(root, page_id)?
@@ -432,7 +507,7 @@ pub fn promote_pending(root: &Path, page_id: &str) -> Result<(), String> {
 
     let mut prov = doc.provenance.unwrap_or(super::types::IrProvenance {
         source: "ai-generated".to_string(),
-        app_id: "qontinui-runner".to_string(),
+        app_id: app_id.to_string(),
         file: None,
         line: None,
         column: None,
@@ -443,7 +518,7 @@ pub fn promote_pending(root: &Path, page_id: &str) -> Result<(), String> {
     doc.provenance = Some(prov);
 
     // Canonical write + projection regen.
-    write_ir_and_regenerate(root, &doc)?;
+    write_ir_and_regenerate(root, app_id, &doc)?;
 
     // rm -rf _pending/
     let dir = pending_dir(root, page_id);
@@ -586,7 +661,8 @@ mod pending_tests {
             status: Some(ProposalStatus::Proposed),
         };
         let ir = empty_ir("page-a", Some(input_prov.clone()));
-        let path = write_pending_ir(tmp.path(), &ir).expect("write_pending_ir");
+        let path =
+            write_pending_ir(tmp.path(), RUNNER_APP_ID, &ir).expect("write_pending_ir");
         // Caller's IR is unchanged.
         assert_eq!(
             ir.provenance.as_ref().unwrap().status,
@@ -620,7 +696,7 @@ mod pending_tests {
     fn write_pending_ir_synthesizes_provenance_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let ir = empty_ir("page-b", None);
-        write_pending_ir(tmp.path(), &ir).expect("write_pending_ir");
+        write_pending_ir(tmp.path(), RUNNER_APP_ID, &ir).expect("write_pending_ir");
         let read = read_pending_ir(tmp.path(), "page-b")
             .expect("read")
             .expect("file present");
@@ -651,9 +727,9 @@ mod pending_tests {
                 status: Some(ProposalStatus::Proposed),
             }),
         );
-        write_pending_ir(tmp.path(), &ir).expect("stage");
+        write_pending_ir(tmp.path(), RUNNER_APP_ID, &ir).expect("stage");
 
-        promote_pending(tmp.path(), "page-c").expect("promote");
+        promote_pending(tmp.path(), RUNNER_APP_ID, "page-c").expect("promote");
 
         // Canonical files exist.
         let canon_ir = tmp
@@ -678,7 +754,7 @@ mod pending_tests {
         );
 
         // Canonical IR has status = Promoted.
-        let canon = read_ir(tmp.path(), "page-c")
+        let canon = read_ir(tmp.path(), RUNNER_APP_ID, "page-c")
             .expect("read canonical")
             .expect("present");
         assert_eq!(
@@ -690,7 +766,7 @@ mod pending_tests {
     #[test]
     fn promote_pending_errors_when_no_pending_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let res = promote_pending(tmp.path(), "absent-page");
+        let res = promote_pending(tmp.path(), RUNNER_APP_ID, "absent-page");
         assert!(
             res.is_err(),
             "promote should fail when nothing is staged: {:?}",
@@ -702,7 +778,7 @@ mod pending_tests {
     fn demote_pending_removes_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let ir = empty_ir("page-d", None);
-        write_pending_ir(tmp.path(), &ir).expect("stage");
+        write_pending_ir(tmp.path(), RUNNER_APP_ID, &ir).expect("stage");
         let pending_dir = tmp.path().join("pages").join("page-d").join("_pending");
         assert!(pending_dir.exists(), "pending dir must exist after stage");
 

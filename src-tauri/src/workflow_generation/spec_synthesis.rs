@@ -853,6 +853,7 @@ pub fn classify_spec_target(criteria: &AcceptanceCriteria, description: &str) ->
 /// `result.updated_paths` keeps the same external behavior).
 fn write_group_to_page_projection(
     specs_root: &std::path::Path,
+    app_id: &str,
     page_id: &str,
     group: &Value,
     group_id: &str,
@@ -860,7 +861,7 @@ fn write_group_to_page_projection(
 ) -> Result<std::path::PathBuf, String> {
     use crate::spec_api::types::IrGroup;
 
-    let mut ir = match crate::spec_api::storage::read_ir(specs_root, page_id)? {
+    let mut ir = match crate::spec_api::storage::read_ir(specs_root, app_id, page_id)? {
         Some(doc) => doc,
         None => {
             return Err(format!(
@@ -889,7 +890,7 @@ fn write_group_to_page_projection(
     groups.push(new_group);
     ir.synthesized_groups = Some(groups);
 
-    let written = crate::spec_api::storage::write_ir_and_regenerate(specs_root, &ir)?;
+    let written = crate::spec_api::storage::write_ir_and_regenerate(specs_root, app_id, &ir)?;
 
     info!(
         "Updated IR for page '{}' with {} acceptance criteria (projection regenerated)",
@@ -917,6 +918,7 @@ fn write_group_to_page_projection(
 pub fn update_page_specs_from_criteria(
     criteria: &AcceptanceCriteria,
     description: &str,
+    app_id: &str,
     specs_root: &std::path::Path,
     match_threshold: f32,
 ) -> PageSpecUpdateResult {
@@ -943,7 +945,7 @@ pub fn update_page_specs_from_criteria(
     let group_id = "wf-acceptance-criteria";
     const CATCHALL_PAGE_ID: &str = "workflow-criteria";
 
-    let page_ids = match crate::spec_api::storage::list_pages(specs_root) {
+    let page_ids = match crate::spec_api::storage::list_pages(specs_root, app_id) {
         Ok(ids) => ids,
         Err(e) => {
             debug!(
@@ -961,7 +963,7 @@ pub fn update_page_specs_from_criteria(
             continue;
         }
 
-        let spec_json = match crate::spec_api::storage::read_projection(specs_root, page_id) {
+        let spec_json = match crate::spec_api::storage::read_projection(specs_root, app_id, page_id) {
             Ok(Some(v)) => v,
             Ok(None) => continue,
             Err(e) => {
@@ -979,6 +981,7 @@ pub fn update_page_specs_from_criteria(
 
         match write_group_to_page_projection(
             specs_root,
+            app_id,
             page_id,
             &new_group,
             group_id,
@@ -1002,6 +1005,7 @@ pub fn update_page_specs_from_criteria(
         if page_ids.iter().any(|id| id == CATCHALL_PAGE_ID) {
             match write_group_to_page_projection(
                 specs_root,
+                app_id,
                 CATCHALL_PAGE_ID,
                 &new_group,
                 group_id,
@@ -1519,8 +1523,12 @@ mod tests {
             initial_state: None,
         };
 
-        crate::spec_api::storage::write_ir_and_regenerate(root, &doc)
-            .expect("write_ir_and_regenerate must succeed for fixture");
+        crate::spec_api::storage::write_ir_and_regenerate(
+            root,
+            crate::spec_api::storage::RUNNER_APP_ID,
+            &doc,
+        )
+        .expect("write_ir_and_regenerate must succeed for fixture");
     }
 
     fn projection_path(root: &std::path::Path, page_id: &str) -> std::path::PathBuf {
@@ -1568,6 +1576,7 @@ mod tests {
         let result = update_page_specs_from_criteria(
             &criteria,
             "Fix the dark-mode toggle on settings page",
+            crate::spec_api::storage::RUNNER_APP_ID,
             dir.path(),
             0.2,
         );
@@ -1636,7 +1645,13 @@ mod tests {
         };
 
         let result =
-            update_page_specs_from_criteria(&criteria, "Update the settings page", dir.path(), 0.2);
+            update_page_specs_from_criteria(
+                &criteria,
+                "Update the settings page",
+                crate::spec_api::storage::RUNNER_APP_ID,
+                dir.path(),
+                0.2,
+            );
 
         // Should replace the old group, not skip
         assert_eq!(result.specs_updated, 1);
@@ -1687,6 +1702,7 @@ mod tests {
         let result = update_page_specs_from_criteria(
             &criteria,
             "Fix authentication backend service",
+            crate::spec_api::storage::RUNNER_APP_ID,
             dir.path(),
             0.3,
         );
@@ -1711,7 +1727,13 @@ mod tests {
         };
 
         let result =
-            update_page_specs_from_criteria(&criteria, "some description", dir.path(), 0.3);
+            update_page_specs_from_criteria(
+                &criteria,
+                "some description",
+                crate::spec_api::storage::RUNNER_APP_ID,
+                dir.path(),
+                0.3,
+            );
 
         assert_eq!(result.specs_updated, 0);
     }
@@ -1817,6 +1839,7 @@ mod tests {
         let result = update_page_specs_from_criteria(
             &criteria,
             "git push the branch to remote",
+            crate::spec_api::storage::RUNNER_APP_ID,
             dir.path(),
             0.2,
         );
@@ -1857,6 +1880,7 @@ mod tests {
         let result = update_page_specs_from_criteria(
             &criteria,
             "Fix SQLite WAL checkpoint timeout",
+            crate::spec_api::storage::RUNNER_APP_ID,
             dir.path(),
             0.3,
         );

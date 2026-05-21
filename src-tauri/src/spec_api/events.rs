@@ -1,8 +1,14 @@
-//! Spec API broadcast channel.
+//! Spec API broadcast channels — per-app fan-out.
 //!
-//! A single `tokio::sync::broadcast` channel per process — each
-//! `/spec/subscribe` SSE handler subscribes and forwards the events. Every
-//! write path on the Spec API emits a [`SpecApiEvent`] here on success.
+//! One `tokio::sync::broadcast` channel per registered `app_id`, lazily
+//! created on first emit / first subscribe. The `/apps/:app_id/spec/subscribe`
+//! SSE handler subscribes via [`subscribe`] and forwards the events; every
+//! write path on the Spec API emits a [`SpecApiEvent`] via [`emit`], which
+//! dispatches by `event.app_id()` (see `qontinui_types::spec_api_events`).
+//!
+//! Subscribers receive ONLY their own app's events — there is no cross-app
+//! leakage. Per spec-multi-app Stream C (PLAN.md §C.4) this replaces the
+//! single global `OnceLock<broadcast::Sender>`.
 //!
 //! The event taxonomy itself lives in [`qontinui_types::spec_api_events`]
 //! so the Rust enum, the generated TS bindings, and the generated Python
@@ -12,41 +18,57 @@
 //!
 //! - `SpecChanged` — [`handlers.rs` post_author](super::handlers) emits after
 //!   a successful IR + projection write.
-//! - `SpecCheckInvoked` / `SpecCheckCompleted` — emitted by the
-//!   `spec_api/spec_check.rs` HTTP handlers when Plan 06 Step 1's adapter
-//!   layer lands (Stream C dependency).
+//! - `SpecCheckInvoked` / `SpecCheckCompleted` — emitted by
+//!   `spec_api/spec_check.rs` HTTP handlers.
 //! - `SpecCheckPolicyViolation` — emitted by Plan 03's
 //!   `step_executor/spec_check.rs` workflow-step handler when the conjunct
 //!   evaluator returns a Fail.
 //! - `FlywheelProposalPromoted` / `FlywheelProposalDemoted` — emitted by the
 //!   Plan 05 Step 9 sweep handler (`POST /spec/proposals/sweep-pending` +
-//!   `storage::promote_pending` / `storage::demote_pending`). The variants
-//!   are reserved here so the wire is ready; the emit sites land when the
-//!   sweep handler ships.
+//!   `storage::promote_pending` / `storage::demote_pending`).
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use once_cell::sync::Lazy;
 use tokio::sync::broadcast;
 
 pub use qontinui_types::spec_api_events::{SpecApiEvent, SpecChanged};
 
-/// Broadcast capacity. Slow subscribers will Lag if they fall this far
-/// behind; the SSE handler logs and continues.
+/// Broadcast capacity per app. Slow subscribers will Lag if they fall this
+/// far behind; the SSE handler logs and continues.
 const CAPACITY: usize = 256;
 
-static SENDER: OnceLock<broadcast::Sender<SpecApiEvent>> = OnceLock::new();
+/// Per-app channel map. Lazily populated on first `channel_for` call (from
+/// either `emit` or `subscribe`). The Mutex is held only for the
+/// HashMap insert / lookup — broadcast sends happen outside the lock on
+/// the cloned `Sender`.
+static CHANNELS: Lazy<Mutex<HashMap<String, broadcast::Sender<SpecApiEvent>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
-fn sender() -> &'static broadcast::Sender<SpecApiEvent> {
-    SENDER.get_or_init(|| broadcast::channel::<SpecApiEvent>(CAPACITY).0)
+/// Get or create the per-app broadcast Sender. Cloning a Sender is cheap
+/// (Arc bump) and the resulting send happens lock-free.
+fn channel_for(app_id: &str) -> broadcast::Sender<SpecApiEvent> {
+    let mut guard = CHANNELS.lock().expect("CHANNELS mutex poisoned");
+    guard
+        .entry(app_id.to_string())
+        .or_insert_with(|| broadcast::channel::<SpecApiEvent>(CAPACITY).0)
+        .clone()
 }
 
-pub fn subscribe() -> broadcast::Receiver<SpecApiEvent> {
-    sender().subscribe()
+/// Subscribe to the per-app channel for `app_id`. Subscribers see only
+/// this app's events; cross-app leakage is impossible by construction.
+pub fn subscribe(app_id: &str) -> broadcast::Receiver<SpecApiEvent> {
+    channel_for(app_id).subscribe()
 }
 
+/// Emit an event onto the channel for its owning app. Routing is driven by
+/// `event.app_id()` (see the `qontinui_types::spec_api_events::SpecApiEvent`
+/// helper). Ignore SendError: it just means there are no subscribers — drop
+/// the event silently in that case.
 pub fn emit(event: SpecApiEvent) {
-    // Ignore SendError: it just means there are no subscribers — drop the
-    // event silently in that case.
-    let _ = sender().send(event);
+    let tx = channel_for(event.app_id());
+    let _ = tx.send(event);
 }
 
 pub fn now_ms() -> u64 {
@@ -97,6 +119,7 @@ pub fn rule_kind_str(rule: &ConjunctRule) -> &'static str {
 /// since the workflow handler self-calls the **single** endpoint, which
 /// doesn't run policy.
 pub fn emit_policy_violations(
+    app_id: &str,
     snapshot_id: &str,
     page_id: &str,
     policy: &SpecCheckPolicy,
@@ -113,7 +136,7 @@ pub fn emit_policy_violations(
             .map(|c| rule_kind_str(&c.rule))
             .unwrap_or("unknown");
         emit(SpecApiEvent::SpecCheckPolicyViolation {
-            app_id: String::new(),
+            app_id: app_id.to_string(),
             snapshot_id: snapshot_id.to_string(),
             page_id: page_id.to_string(),
             conjunct_name: conjunct_eval.name.clone(),
@@ -162,7 +185,8 @@ mod tests {
 
     #[test]
     fn emit_policy_violations_publishes_one_per_failing_conjunct() {
-        let mut rx = subscribe();
+        let app_id = "qontinui-runner";
+        let mut rx = subscribe(app_id);
         let marker = "scs_test_policy_violation_emit_shared_1";
         let page_id = "settings-test-violation-shared";
         let policy = SpecCheckPolicy {
@@ -204,7 +228,7 @@ mod tests {
                 },
             ],
         };
-        emit_policy_violations(marker, page_id, &policy, &eval);
+        emit_policy_violations(app_id, marker, page_id, &policy, &eval);
         let mut violations = Vec::new();
         for _ in 0..128 {
             match rx.try_recv() {
@@ -232,7 +256,8 @@ mod tests {
 
     #[test]
     fn emit_policy_violations_skips_pass_and_indeterminate_conjuncts() {
-        let mut rx = subscribe();
+        let app_id = "qontinui-runner";
+        let mut rx = subscribe(app_id);
         let marker = "scs_test_policy_violation_emit_skip_1";
         let policy = SpecCheckPolicy {
             conjuncts: vec![PolicyConjunct {
@@ -251,7 +276,7 @@ mod tests {
                 evidence: "no in-scope assertions".into(),
             }],
         };
-        emit_policy_violations(marker, "page-x", &policy, &eval);
+        emit_policy_violations(app_id, marker, "page-x", &policy, &eval);
         // Drain; expect zero matching events.
         let mut hits = 0;
         for _ in 0..32 {

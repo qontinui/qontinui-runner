@@ -124,20 +124,26 @@ pub async fn run_spec_mutation_test(
 }
 
 #[tauri::command]
-pub fn analyze_spec_freshness(
+pub async fn analyze_spec_freshness(
     _app_state: State<'_, Arc<AppState>>,
+    app_id: String,
     specs_dir: String,
     components_dir: String,
 ) -> Result<Vec<(String, accuracy::FreshnessResult)>, String> {
     // `specs_dir` is retained for backwards compatibility with the frontend
     // call site but ignored — page projections now live under the Spec API
-    // storage root (`<runner>/specs/pages/<id>/`), which `analyze_all_freshness`
-    // resolves via `crate::spec_api::storage::resolve_specs_root`.
+    // storage root (`<repo>/specs/pages/<id>/`), which `analyze_all_freshness`
+    // resolves via `crate::spec_api::storage::resolve_specs_root` for the
+    // supplied `app_id`.
     let _ = specs_dir;
     let components_path = std::path::Path::new(&components_dir);
 
-    let specs_root = crate::spec_api::storage::resolve_specs_root();
+    let pg = crate::database::pg::PgDb::global();
+    let specs_root = crate::spec_api::storage::resolve_specs_root(&pg, &app_id)
+        .await
+        .map_err(|e| format!("resolve_specs_root({}) failed: {:?}", app_id, e))?;
     Ok(accuracy::analyze_all_freshness(
+        &app_id,
         &specs_root,
         components_path,
     ))

@@ -555,6 +555,23 @@ If the Additional Context contains a block labeled "Spec Generation Brief (JSON)
 }}
 ```
 
+### Canonical spec_check Step Example
+
+```json
+{{
+  "id": "<uuid>",
+  "type": "spec_check",
+  "phase": "verification",
+  "name": "spec_check <page-id>",
+  "spec_check_app_id": "qontinui-web",
+  "spec_check_page_id": "active-runs",
+  "spec_check_fail_when_no_app": true,
+  "spec_check_fail_when_no_spec": true
+}}
+```
+
+Pair every `spec_check` step with a preceding `ui_bridge` navigate + `wait_for_element` for the page the spec describes. `spec_check_app_id` is REQUIRED — there is no default. It selects which registered app's specs root resolves `spec_check_page_id`. Use the app id the workflow targets (typically `qontinui-web` for web-frontend pages, `qontinui-runner` for the runner's own UI, or the user app's registered id).
+
 ### Canonical click Step Example (for preconditions from spec `setupActions: [{{type: "click"}}]`)
 
 ```json
@@ -1279,6 +1296,7 @@ fn build_past_fixes_section() -> String {
 #[cfg(feature = "spec-authoring")]
 pub async fn build_spec_priming_context(
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    app_id: &str,
     skeleton: &qontinui_types::ir::IrPageSpec,
     top_k: usize,
 ) -> Option<HistoricalContext> {
@@ -1320,15 +1338,25 @@ pub async fn build_spec_priming_context(
     // List existing IR pages and rank by Jaccard similarity. We do a
     // best-effort filesystem scan (cheap; <500 pages today) and skip any
     // page that fails to read.
-    let root = storage::resolve_specs_root();
-    let candidates = storage::list_pages(&root).unwrap_or_default();
+    let root = match storage::resolve_specs_root(pg_db, app_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                "build_spec_priming_context: resolve_specs_root({}) failed ({:?}); skipping priming context",
+                app_id,
+                e
+            );
+            return None;
+        }
+    };
+    let candidates = storage::list_pages(&root, app_id).unwrap_or_default();
 
     let mut scored: Vec<(f32, IrPageSpec)> = Vec::new();
     for page_id in candidates {
         if page_id == skeleton.id {
             continue;
         }
-        let Ok(Some(other)) = storage::read_ir(&root, &page_id) else {
+        let Ok(Some(other)) = storage::read_ir(&root, app_id, &page_id) else {
             continue;
         };
         let other_tokens = fingerprint_tokens(&other);

@@ -54,8 +54,11 @@ export function SpecDriftButton() {
     setScanning(true);
     setError(null);
     try {
-      // projectRoot must be the runner's source root; we use the well-known path.
+      // projectRoot must be the runner's source root; we use the well-known
+      // path. The runner-frontend always scans the `qontinui-runner` app
+      // (spec-multi-app Stream C — app_id is required by scan_spec_drift).
       const result = await invoke<DriftReport>("scan_spec_drift", {
+        appId: "qontinui-runner",
         projectRoot: "D:/qontinui-root/qontinui-runner",
       });
       setReport(result);

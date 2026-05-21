@@ -40,6 +40,7 @@ use tracing::{debug, info, warn};
 use crate::commands::spec_drift::RegisteredElement;
 use crate::database::pg::spec_proposals::SpecProposalRow;
 use crate::mcp::types::ApiState;
+use crate::spec_api::apps::AppErrorExt;
 use crate::spec_api::events;
 use crate::spec_api::responses::SpecError;
 use crate::spec_api::storage;
@@ -78,6 +79,7 @@ struct QueuedProposalSummary {
 }
 
 pub async fn post_scan(
+    AxPath(app_id): AxPath<String>,
     State(state): State<Arc<ApiState>>,
     body: Option<Json<ScanRequest>>,
 ) -> Response {
@@ -87,7 +89,10 @@ pub async fn post_scan(
     let limit = req.limit.unwrap_or(DEFAULT_SCAN_LIMIT);
 
     let pg_db = state.app_state.pg_db.clone();
-    let root = storage::resolve_specs_root();
+    let root = match storage::resolve_specs_root(&pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
 
     // ---- Full-page branch -------------------------------------------------
     let full_page_rows = match query_eligible_pathnames(&pg_db, lookback, min_obs, limit).await {
@@ -105,7 +110,7 @@ pub async fn post_scan(
         }
     };
 
-    let on_disk = storage::list_pages(&root).unwrap_or_default();
+    let on_disk = storage::list_pages(&root, &app_id).unwrap_or_default();
     let on_disk_pathnames: HashSet<String> = on_disk
         .iter()
         .filter_map(|id| spec_id_to_pathname(id))
@@ -161,13 +166,13 @@ pub async fn post_scan(
     // ---- Patch branch -----------------------------------------------------
     let project_root = std::env::var("QONTINUI_PROJECT_ROOT").unwrap_or_else(|_| ".".into());
     let mut scanned_drift_reports = 0usize;
-    match crate::commands::spec_drift::scan_spec_drift(project_root.clone()).await {
+    match crate::commands::spec_drift::scan_spec_drift(app_id.clone(), project_root.clone()).await {
         Ok(drift) => {
             scanned_drift_reports = 1;
             let mut per_spec: std::collections::BTreeMap<String, Vec<&RegisteredElement>> =
                 Default::default();
             for elem in &drift.missing_from_spec {
-                if let Some(target_id) = infer_target_spec_id(elem) {
+                if let Some(target_id) = infer_target_spec_id(&app_id, elem) {
                     per_spec.entry(target_id).or_default().push(elem);
                 }
             }
@@ -284,11 +289,15 @@ async fn query_eligible_pathnames(
 // =============================================================================
 
 pub async fn post_execute(
+    AxPath((app_id, id)): AxPath<(String, String)>,
     State(state): State<Arc<ApiState>>,
-    AxPath(id): AxPath<String>,
 ) -> Response {
     let pg_db = state.app_state.pg_db.clone();
     let app_state = state.app_state.clone();
+    let root = match storage::resolve_specs_root(&pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
 
     // Look up the proposal.
     let row = match pg_db.find_proposal_by_id(&id).await {
@@ -371,7 +380,12 @@ pub async fn post_execute(
             // ids in `metadata`, not the full report shape).
             let project_root =
                 std::env::var("QONTINUI_PROJECT_ROOT").unwrap_or_else(|_| ".".into());
-            let drift = match crate::commands::spec_drift::scan_spec_drift(project_root).await {
+            let drift = match crate::commands::spec_drift::scan_spec_drift(
+                app_id.clone(),
+                project_root,
+            )
+            .await
+            {
                 Ok(d) => d,
                 Err(e) => {
                     let _ = pg_db
@@ -418,6 +432,7 @@ pub async fn post_execute(
     let outcome = match crate::workflow_generation::spec_authoring::author_candidate(
         pg_db.clone(),
         app_state,
+        &app_id,
         mode,
     )
     .await
@@ -446,8 +461,7 @@ pub async fn post_execute(
     // Step 8 — three-gate validator (distinctness → round-trip → coverage →
     // b-green). On Err, surface as `validator-rejected` + persist the
     // reason in `spec_proposals.last_error`. Authoring failures stay
-    // distinct (`authoring-failed` codepath above).
-    let root = storage::resolve_specs_root();
+    // distinct (`authoring-failed` codepath above). `root` resolved above.
     let pathname_for_gate = match row.kind.as_str() {
         "fullPage" => row.pathname.clone().unwrap_or_default(),
         "patch" => row.spec_id.clone().unwrap_or_default(),
@@ -505,7 +519,7 @@ pub async fn post_execute(
                     .into_response();
             }
         };
-        match storage::write_pending_ir(&root, &outcome.candidate) {
+        match storage::write_pending_ir(&root, &app_id, &outcome.candidate) {
             Ok(p) => p.display().to_string(),
             Err(e) => {
                 let _ = pg_db
@@ -615,10 +629,16 @@ fn authoring_error_detail(
 
 const SWEEP_BATCH_LIMIT: i64 = 100;
 
-pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response {
+pub async fn post_sweep_pending(
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
+) -> Response {
     let pg_db = state.app_state.pg_db.clone();
     let app_state = state.app_state.clone();
-    let root = storage::resolve_specs_root();
+    let root = match storage::resolve_specs_root(&pg_db, &app_id).await {
+        Ok(p) => p,
+        Err(e) => return e.into_app_response(),
+    };
 
     let rows = match pg_db
         .list_proposals_by_status("pendingPromotion", SWEEP_BATCH_LIMIT)
@@ -726,7 +746,7 @@ pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response 
                 let new_greens = prop.consecutive_greens.saturating_add(1);
                 if new_greens >= 2 {
                     // Promote.
-                    match storage::promote_pending(&root, &spec_id) {
+                    match storage::promote_pending(&root, &app_id, &spec_id) {
                         Ok(()) => {
                             let _ = pg_db.update_proposal_status(&prop.id, "promoted").await;
                             let _ = pg_db.update_proposal_attempt_only(&prop.id).await;
@@ -734,7 +754,7 @@ pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response 
                             // Plan 06: Promoted emit — joins via snapshot_id
                             // against the green run that triggered it.
                             events::emit(SpecApiEvent::FlywheelProposalPromoted {
-                                app_id: String::new(),
+                                app_id: app_id.clone(),
                                 proposal_id: prop.id.clone(),
                                 page_id: spec_id.clone(),
                                 consecutive_greens: new_greens.max(0) as u32,
@@ -802,7 +822,7 @@ pub async fn post_sweep_pending(State(state): State<Arc<ApiState>>) -> Response 
                 let (failing_state_id, failing_assertion_id) =
                     failing_assertion.unwrap_or_default();
                 events::emit(SpecApiEvent::FlywheelProposalDemoted {
-                    app_id: String::new(),
+                    app_id: app_id.clone(),
                     proposal_id: prop.id.clone(),
                     page_id: spec_id.clone(),
                     failing_assertion_id,
@@ -891,10 +911,18 @@ impl From<SpecProposalRow> for ProposalListItem {
     }
 }
 
-pub async fn get_list(State(state): State<Arc<ApiState>>, Query(q): Query<ListQuery>) -> Response {
+pub async fn get_list(
+    AxPath(app_id): AxPath<String>,
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<ListQuery>,
+) -> Response {
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
     let pg_db = state.app_state.pg_db.clone();
+    // Resolve so unregistered apps return 404 before we query proposals.
+    if let Err(e) = storage::resolve_specs_root(&pg_db, &app_id).await {
+        return e.into_app_response();
+    }
 
     match pg_db.list_proposals(limit, offset).await {
         Ok(rows) => {
@@ -964,10 +992,17 @@ fn spec_id_to_pathname(spec_id: &str) -> Option<String> {
 }
 
 /// Map a `RegisteredElement` (from `commands::spec_drift::DriftReport
-/// .missing_from_spec`) to a target `spec_id`, using `elem.file` as the
-/// pathname-routing input.
+/// .missing_from_spec`) to a target `spec_id` within `app_id`'s spec
+/// corpus, using `elem.file` as the pathname-routing input.
 ///
-/// Heuristic v1.0: strip the conventional Next.js / Vite source-tree prefix
+/// spec-multi-app Stream E.5: the result is scoped to a single app — the
+/// returned slug is interpreted by callers as a page id within
+/// `<app.repo_root>/specs/pages/`, never as a cross-app global id. The
+/// `app_id` parameter is reserved for future routing rules (e.g. app-specific
+/// source-tree layout overrides); v1.0 still uses the universal Next.js /
+/// Vite prefixes regardless of which app we're scanning.
+///
+/// Heuristic v1.0: strip the conventional source-tree prefix
 /// (`src/pages/...`, `src/app/...`, `app/...`), drop the file extension and
 /// the `index` leaf, lowercase, and slugify by joining the remaining
 /// segments with `-`. Files outside these prefixes return `None` (the
@@ -977,7 +1012,7 @@ fn spec_id_to_pathname(spec_id: &str) -> Option<String> {
 /// `pathname_to_spec_id` helper owned by `workflow_generation::spec_authoring`.
 /// If the sibling makes that helper `pub(crate)`, this should be deleted in
 /// favor of calling it directly.
-fn infer_target_spec_id(elem: &RegisteredElement) -> Option<String> {
+fn infer_target_spec_id(_app_id: &str, elem: &RegisteredElement) -> Option<String> {
     let file = elem.file.replace('\\', "/");
 
     // Strip the leading source-tree prefix; preserve order, longest first.
@@ -1076,7 +1111,7 @@ mod tests {
             suggested_assertion: String::new(),
         };
         assert_eq!(
-            infer_target_spec_id(&elem).as_deref(),
+            infer_target_spec_id("qontinui-runner", &elem).as_deref(),
             Some("account-billing")
         );
     }
@@ -1092,7 +1127,7 @@ mod tests {
         };
         // `page.tsx` is not the literal `index`, so it stays as a segment.
         assert_eq!(
-            infer_target_spec_id(&elem).as_deref(),
+            infer_target_spec_id("qontinui-runner", &elem).as_deref(),
             Some("settings-general-page")
         );
     }
@@ -1107,7 +1142,7 @@ mod tests {
             suggested_assertion: String::new(),
         };
         assert_eq!(
-            infer_target_spec_id(&elem).as_deref(),
+            infer_target_spec_id("qontinui-runner", &elem).as_deref(),
             Some("account-billing")
         );
     }
@@ -1121,7 +1156,7 @@ mod tests {
             line: 12,
             suggested_assertion: String::new(),
         };
-        assert_eq!(infer_target_spec_id(&elem).as_deref(), Some("index"));
+        assert_eq!(infer_target_spec_id("qontinui-runner", &elem).as_deref(), Some("index"));
     }
 
     #[test]
@@ -1133,7 +1168,7 @@ mod tests {
             line: 12,
             suggested_assertion: String::new(),
         };
-        assert_eq!(infer_target_spec_id(&elem), None);
+        assert_eq!(infer_target_spec_id("qontinui-runner", &elem), None);
     }
 
     #[test]
@@ -1146,7 +1181,7 @@ mod tests {
             suggested_assertion: String::new(),
         };
         assert_eq!(
-            infer_target_spec_id(&elem).as_deref(),
+            infer_target_spec_id("qontinui-runner", &elem).as_deref(),
             Some("account-billing")
         );
     }
@@ -1171,7 +1206,7 @@ mod tests {
             synthesized_groups: None,
             initial_state: None,
         };
-        let path = storage::write_pending_ir(tmp.path(), &candidate).unwrap();
+        let path = storage::write_pending_ir(tmp.path(), "qontinui-runner", &candidate).unwrap();
         let path_str = path.display().to_string();
         assert!(path_str.contains("_pending"));
         let target = tmp
@@ -1294,6 +1329,178 @@ mod tests {
             assert!(rows
                 .iter()
                 .any(|r| r.id == "prop_test_list" && r.status == "queued"));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // spec-multi-app Stream E.9 — multi-tenant proposal-sweep tests
+    // -----------------------------------------------------------------
+    //
+    // Each test exercises the underlying primitives (`storage::resolve_specs_root`,
+    // `pg_db.insert_proposal_event`, `storage::promote_pending`) directly
+    // rather than the HTTP handler — the handler is a thin
+    // `Path((app_id,)) -> resolve_specs_root -> ...` wrapper, so testing
+    // the primitives transitively covers the route shape. Gated on
+    // DATABASE_URL because they touch live PG.
+
+    #[cfg(feature = "spec-authoring")]
+    mod stream_e {
+        use super::super::storage;
+        use crate::database::pg::PgDb;
+        use qontinui_types::apps::{AppError, RegisterAppRequest};
+
+        async fn pg() -> PgDb {
+            let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
+            });
+            PgDb::new(&url).await.expect("PgDb for Stream E tests")
+        }
+
+        fn unique_id(prefix: &str) -> String {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{}-{}", prefix, nanos)
+        }
+
+        async fn cleanup_app(pg: &PgDb, app_id: &str) {
+            let _ = pg.delete_app(app_id).await;
+        }
+
+        /// Stream E.9 test #1 — `scan_for_unknown_app_returns_404`.
+        /// The handler calls `storage::resolve_specs_root(&pg, &app_id)`
+        /// first; on unknown app it returns `AppError::NotRegistered`,
+        /// which the handler converts to a 404 via `AppErrorExt::into_app_response`.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "requires PG via DATABASE_URL"]
+        async fn scan_for_unknown_app_returns_404() {
+            let pg = pg().await;
+            let ghost = unique_id("e9-ghost");
+            let err = storage::resolve_specs_root(&pg, &ghost)
+                .await
+                .expect_err("unknown app must error");
+            match err {
+                AppError::NotRegistered { app_id } => {
+                    assert_eq!(app_id, ghost, "NotRegistered must echo the requested id");
+                }
+                other => panic!("expected NotRegistered; got {:?}", other),
+            }
+        }
+
+        /// Stream E.9 test #2 — `scan_for_known_app_writes_proposal_events_with_app_id`.
+        /// Insert an event under one app and confirm the round-trip carries
+        /// the `app_id` correctly (via the per-app reader added by E.1).
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "requires PG via DATABASE_URL"]
+        async fn scan_for_known_app_writes_proposal_events_with_app_id() {
+            let pg = pg().await;
+            let app_id = unique_id("e9-app-write");
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("specs")).unwrap();
+            pg.insert_app(&RegisterAppRequest {
+                app_id: app_id.clone(),
+                repo_root: tmp.path().to_string_lossy().to_string(),
+                ui_bridge_url: format!("http://localhost:0/{}", app_id),
+                display_name: format!("Test {}", app_id),
+            })
+            .await
+            .expect("insert_app");
+
+            // Insert a proposal so the event has something to reference.
+            let proposal_id = unique_id("e9-prop");
+            pg.insert_proposal(
+                &proposal_id,
+                "fullPage",
+                Some("/e9-test"),
+                None,
+                "queued",
+                &serde_json::json!({}),
+            )
+            .await
+            .expect("insert_proposal");
+
+            // Write an event under this app's id.
+            let _event_id = pg
+                .insert_proposal_event(&app_id, &proposal_id, "scanned", None, None)
+                .await
+                .expect("insert_proposal_event");
+
+            // Read back — the per-app reader must return at least our row.
+            let rows = pg
+                .list_recent_proposal_events_for_app(&app_id, 50)
+                .await
+                .expect("list_recent_proposal_events_for_app");
+            assert!(
+                rows.iter().any(|r| r.proposal_id == proposal_id
+                    && r.event_type == "scanned"
+                    && r.app_id == app_id),
+                "event must round-trip with the right app_id; rows={:?}",
+                rows
+            );
+
+            cleanup_app(&pg, &app_id).await;
+        }
+
+        /// Stream E.9 test #3 — `promote_pending_under_app_root_succeeds`.
+        /// Stage a candidate via `write_pending_ir` under the app's
+        /// app-scoped specs root, then promote — the canonical IR + projection
+        /// land under `<repo_root>/specs/pages/<id>/` and `_pending/` is gone.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "requires PG via DATABASE_URL"]
+        async fn promote_pending_under_app_root_succeeds() {
+            let pg = pg().await;
+            let app_id = unique_id("e9-app-promote");
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("specs")).unwrap();
+            pg.insert_app(&RegisterAppRequest {
+                app_id: app_id.clone(),
+                repo_root: tmp.path().to_string_lossy().to_string(),
+                ui_bridge_url: format!("http://localhost:0/{}", app_id),
+                display_name: format!("Test {}", app_id),
+            })
+            .await
+            .expect("insert_app");
+
+            let root = storage::resolve_specs_root(&pg, &app_id)
+                .await
+                .expect("resolve_specs_root for registered app");
+
+            let candidate = crate::spec_api::types::IrPageSpec {
+                version: "1.0".into(),
+                id: "e9-promote-page".into(),
+                name: "E9 Promote".into(),
+                description: None,
+                metadata: None,
+                provenance: None,
+                states: Vec::new(),
+                transitions: Vec::new(),
+                synthesized_groups: None,
+                initial_state: None,
+            };
+            let staged = storage::write_pending_ir(&root, &app_id, &candidate)
+                .expect("write_pending_ir");
+            assert!(
+                staged.to_string_lossy().contains("_pending"),
+                "staged path should land under _pending/: {}",
+                staged.display()
+            );
+
+            storage::promote_pending(&root, &app_id, &candidate.id).expect("promote_pending");
+
+            let canon_ir = root
+                .join("pages")
+                .join(&candidate.id)
+                .join("state-machine.derived.json");
+            assert!(canon_ir.exists(), "canonical IR missing: {}", canon_ir.display());
+            let pending_dir = root.join("pages").join(&candidate.id).join("_pending");
+            assert!(
+                !pending_dir.exists(),
+                "_pending/ should be gone after promote: {}",
+                pending_dir.display()
+            );
+
+            cleanup_app(&pg, &app_id).await;
         }
     }
 }
