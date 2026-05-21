@@ -13,7 +13,7 @@ use crate::error_monitor::ErrorMonitorHandle;
 const MAX_SESSION_OUTPUT_LINES: u32 = 50_000;
 
 use super::health;
-use super::process::{ManagedProcess, ProcessMessage};
+use super::process::{EarlyExitInfo, ManagedProcess, ProcessMessage};
 use super::types::*;
 
 /// Manages all spawned child processes.
@@ -261,24 +261,51 @@ impl ProcessCaptureManager {
         let poll = Duration::from_millis(200);
         let settle_window = Duration::from_secs(1);
 
-        // Snapshot the health_port + spawn baseline up front so we know which
-        // ready predicate to use for this iteration.
-        let (has_health_port, spawn_started_at) = {
+        // Snapshot the health_port + spawn baseline + early-exit handle up
+        // front so we know which ready predicate to use for this iteration
+        // and can cheaply check `try_wait()`-equivalent without re-acquiring
+        // the processes read lock just to grab the Arc each tick.
+        let (has_health_port, spawn_started_at, name, early_exit) = {
             let processes = self.processes.read().await;
             match processes.get(id) {
                 Some(p) => (
                     p.config.health_port.is_some(),
                     p.runtime.started_at.unwrap_or_else(std::time::Instant::now),
+                    p.config.name.clone(),
+                    Arc::clone(&p.early_exit),
                 ),
                 None => return Err(format!("Process '{}' not found", id)),
             }
         };
 
         loop {
-            let (state, name) = {
+            // try_wait()-equivalent: the exit-monitor task in `process.rs`
+            // populates this signal as the FIRST action after `child.wait()`
+            // returns, before the `Exited` channel message is even sent.
+            // Catching it here means we surface a crashed-on-spawn child
+            // (e.g. `'next' is not recognized`) within one 200ms tick instead
+            // of waiting 30s for the readiness deadline to expire.
+            let early_exit_snapshot: Option<EarlyExitInfo> = match early_exit.lock() {
+                Ok(g) => *g,
+                Err(_) => None,
+            };
+            if let Some(info) = early_exit_snapshot {
+                let stderr_tail = self.collect_stderr_tail(id, 50).await;
+                let snippet = if stderr_tail.is_empty() {
+                    String::from("(no stderr captured)")
+                } else {
+                    stderr_tail.join("\n")
+                };
+                return Err(format!(
+                    "Process '{}' exited before reaching ready state (exit code: {:?}); stderr: {}",
+                    name, info.code, snippet
+                ));
+            }
+
+            let state = {
                 let processes = self.processes.read().await;
                 match processes.get(id) {
-                    Some(p) => (p.runtime.state, p.config.name.clone()),
+                    Some(p) => p.runtime.state,
                     None => return Err(format!("Process '{}' not found", id)),
                 }
             };
