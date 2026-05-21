@@ -559,6 +559,72 @@ pub async fn ui_bridge_batch_actions_handler(
     }))))
 }
 
+/// Closed set of action names accepted by `POST /control/element/{id}/action`.
+///
+/// Mirrors the dispatcher vocabulary owned by the wrapper SDK
+/// (`ui-bridge/packages/ui-bridge/src/server/relay-handlers.ts`) — the runner
+/// only forwards the action name to the frontend, so an unknown name *must*
+/// be rejected here. Without this gate the request reached
+/// `execute_action` → IPC failure → the Phase 5 `RecoveryExecutor`, whose LLM
+/// fallback then synthesized a click on an unrelated "Active" element and
+/// surfaced HTTP 200 `success:true` `via:"llm_fallback"` — a false-success
+/// for autonomous loops (verified empirically 2026-05-21 with
+/// `action:"press"`).
+///
+/// Includes both `camelCase` and `snake_case` aliases for the multi-token
+/// names because the SDK accepts either (e.g. `scrollIntoView` vs
+/// `scroll_into_view`, see `recovery_executor::execute_recovery_command`).
+const SUPPORTED_ACTION_NAMES: &[&str] = &[
+    "click",
+    "doubleClick",
+    "double_click",
+    "double",
+    "right",
+    "middle",
+    "type",
+    "sendKeys",
+    "clear",
+    "select",
+    "focus",
+    "blur",
+    "hover",
+    "scroll",
+    "scrollIntoView",
+    "scroll_into_view",
+    "check",
+    "uncheck",
+    "toggle",
+    "drag",
+    "setValue",
+    "submit",
+    "reset",
+    "autocomplete",
+];
+
+/// Validate a user-supplied action name against [`SUPPORTED_ACTION_NAMES`].
+///
+/// Returns the canonical action name on success (currently the input
+/// unchanged — case-sensitive match — but the indirection keeps the
+/// future option of accepting a kebab-case alias open without churning
+/// every caller).
+///
+/// On failure returns a structured [`UiBridgeError`] with
+/// `code = INVALID_REQUEST` and the full supported list in
+/// `context.supportedActions`, so the handler can build a 400 envelope
+/// that mirrors the `tab/activate` -> `knownTabs` prior art.
+///
+/// Split out from the handler as a pure helper so it's unit-testable
+/// without spinning up an `axum::Router` — see `validate_action_name_tests`
+/// below. This matches the seam established for
+/// `validate_wait_for_element_state_request` / `validate_tab_id`.
+pub(crate) fn validate_action_name(raw: &str) -> Result<&str, UiBridgeError> {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && SUPPORTED_ACTION_NAMES.contains(&trimmed) {
+        return Ok(trimmed);
+    }
+    Err(UiBridgeError::invalid_action(raw, SUPPORTED_ACTION_NAMES))
+}
+
 pub async fn ui_bridge_execute_action_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -629,6 +695,28 @@ pub async fn ui_bridge_execute_action_handler(
             }
         }
     };
+
+    // ── Invalid-action gate ─────────────────────────────────────────────
+    // Reject unknown action names BEFORE the registry lookup, the
+    // stale-registry retry, and the Phase 5 RecoveryExecutor. Without this
+    // gate a typo (e.g. `"press"`) reached `execute_action` -> IPC failure
+    // -> RecoveryExecutor::llm_fallback, which synthesized a click on a
+    // random "Active" button and returned HTTP 200 `success:true`
+    // (verified empirically 2026-05-21). Mirrors the `tab/activate`
+    // -> `knownTabs` 400 envelope shape; see `validate_action_name`.
+    if let Err(detail) = validate_action_name(&request.action) {
+        warn!(
+            "execute_action: rejecting unknown action '{}' on element {} (supported: {})",
+            request.action,
+            id,
+            SUPPORTED_ACTION_NAMES.join(", ")
+        );
+        let msg = detail.message.clone();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error_detailed(msg, detail)),
+        ));
+    }
 
     info!(
         "UI Bridge API: Executing action {} on element {}",
@@ -4253,5 +4341,96 @@ mod ws_dispatch_selection_tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(ids, expected, "merged ids must contain every WS component");
+    }
+}
+
+#[cfg(test)]
+mod validate_action_name_tests {
+    //! Validation seam for the invalid-action gate that lives at the top of
+    //! `ui_bridge_execute_action_handler`. Exercises the pure helper so we
+    //! don't need an axum router / live IPC harness — matches the precedent
+    //! set by `validate_wait_for_element_state_request` /
+    //! `validate_tab_id`. Locks down both the accept-list (every known
+    //! action round-trips) and the reject-shape (`INVALID_REQUEST` code +
+    //! `supportedActions` context payload) so a future rename can't
+    //! silently let `press` through to the RecoveryExecutor again.
+    use super::{validate_action_name, SUPPORTED_ACTION_NAMES};
+    use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
+
+    #[test]
+    fn every_supported_action_is_accepted() {
+        for name in SUPPORTED_ACTION_NAMES {
+            let got = validate_action_name(name)
+                .unwrap_or_else(|_| panic!("expected {name} to validate"));
+            assert_eq!(got, *name, "validator must return the canonical name");
+        }
+    }
+
+    #[test]
+    fn canonical_click_round_trips() {
+        // Sanity check the click path explicitly — it's the dominant call
+        // site and the one most likely to regress under refactor.
+        assert_eq!(validate_action_name("click").unwrap(), "click");
+    }
+
+    #[test]
+    fn unknown_action_is_rejected_with_invalid_request_code() {
+        let err = validate_action_name("press").expect_err("press must not be accepted");
+        assert!(
+            matches!(err.code, UiBridgeErrorCode::InvalidRequest),
+            "expected INVALID_REQUEST code, got {:?}",
+            err.code
+        );
+        assert!(
+            err.message.contains("press"),
+            "message must surface the rejected name, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn unknown_action_carries_supported_list_in_context() {
+        let err = validate_action_name("slap").expect_err("slap must not be accepted");
+        let ctx = err.context.as_ref().expect("context must be present");
+        let supported = ctx
+            .get("supportedActions")
+            .and_then(|v| v.as_array())
+            .expect("supportedActions must be an array");
+        let names: Vec<&str> = supported.iter().filter_map(|v| v.as_str()).collect();
+        // Spot-check a couple of canonical names — full equality with
+        // SUPPORTED_ACTION_NAMES is locked down by
+        // `every_supported_action_is_accepted` above.
+        assert!(names.contains(&"click"), "supportedActions must list click");
+        assert!(names.contains(&"type"), "supportedActions must list type");
+        assert!(
+            names.contains(&"scrollIntoView"),
+            "supportedActions must list scrollIntoView"
+        );
+        // And the offending name is echoed back so callers don't have to
+        // remember what they sent.
+        assert_eq!(ctx.get("action").and_then(|v| v.as_str()), Some("slap"));
+    }
+
+    #[test]
+    fn empty_action_is_rejected() {
+        let err = validate_action_name("").expect_err("empty action must be rejected");
+        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+    }
+
+    #[test]
+    fn whitespace_only_action_is_rejected() {
+        // Trim-then-check semantics: a body whose `action` field is `"   "`
+        // is the same misuse as an empty string.
+        let err = validate_action_name("   ").expect_err("whitespace-only action must be rejected");
+        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+    }
+
+    #[test]
+    fn case_sensitive_match_is_enforced() {
+        // `Click` (capital C) is NOT in the SDK vocabulary; rejecting it
+        // here matches what the wrapper SDK's relay-handlers.ts would do
+        // and prevents downstream "no handler" silent failures.
+        let err = validate_action_name("Click").expect_err("Click must not be accepted");
+        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
     }
 }
