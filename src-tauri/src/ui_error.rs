@@ -10,7 +10,7 @@
 //!    view poll this to flag runners whose Rust backend is up but whose UI
 //!    is broken (errored) or whose embedding subsystem is unreachable
 //!    (degraded).
-//! 2. The runner's heartbeats (both the dev-dashboard heartbeat in
+//! 2. The runner's heartbeats (both the operations heartbeat in
 //!    [`crate::heartbeat`] and the runner-fleet heartbeat in
 //!    [`crate::server_mode`]). Each heartbeat payload includes the
 //!    `derived_status` and `ui_error` fields so receivers can react
@@ -170,7 +170,7 @@ fn matches_existing(existing: &UiError, message: &str, digest: Option<&str>) -> 
 ///   unknown, not degraded — avoids false positives during boot). `Some(true)`
 ///   = healthy. `Some(false)` = degraded.
 ///
-/// All three heartbeat sinks (`/health`, dev-dashboard heartbeat, web-backend
+/// All three heartbeat sinks (`/health`, operations heartbeat, web-backend
 /// heartbeat) call this so their `derived_status` stays in lockstep.
 pub fn compute_derived_status(
     has_ui_error: bool,
