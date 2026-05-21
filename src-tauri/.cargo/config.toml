@@ -1,6 +1,16 @@
-# Row 2 Phase 2 — sccache defaults for the LAN-shared compile-unit
-# cache backed by canonical MinIO. See
-# plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.3.
+# sccache defaults for the shared compile-unit cache (Phase 2.2 cutover
+# from in-stack MinIO to real AWS S3). See
+# plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.3 and
+# plans/2026-05-21-coordination-improvements.md Phase 2.
+#
+# sccache wired to shared AWS S3 (qontinui-sccache-shared, us-east-1).
+# Developer setup (env exports + daemon restart): see
+# qontinui-stack/docs/sccache-cross-machine.md.
+#
+# The in-stack docker-compose MinIO lane (`qontinui-sccache` bucket via
+# `minio:9000`) is unchanged — it serves the compose-internal CI path,
+# while this file points developer machines at real AWS S3 so spaceship
+# and MSI share artifacts directly without going through canonical.
 #
 # RUSTC_WRAPPER is intentionally NOT pinned here. Opt in by exporting
 # `RUSTC_WRAPPER=sccache` in the invoking shell — dev-start.ps1,
@@ -10,14 +20,16 @@
 # RUSTC_WRAPPER is set, sccache picks up the SCCACHE_* defaults below
 # — same bucket, same region, same prefix, fleet-wide.
 #
-# SCCACHE_ENDPOINT + AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY are
-# also per-machine env (LAN IP varies, creds sensitive). dev-start.ps1
-# and cargo-guard.sh export them from ~/.qontinui/profile.
+# AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY are per-machine env (creds
+# sensitive). dev-start.ps1 and cargo-guard.sh export them from
+# ~/.qontinui/profile.
 [env]
-SCCACHE_BUCKET = { value = "qontinui-sccache", force = false }
+SCCACHE_BUCKET = { value = "qontinui-sccache-shared", force = false }
 SCCACHE_REGION = { value = "us-east-1", force = false }
-SCCACHE_S3_USE_SSL = { value = "off", force = false }
 SCCACHE_S3_KEY_PREFIX = { value = "sccache", force = false }
+# SCCACHE_S3_USE_SSL omitted — defaults on for real AWS S3.
+# SCCACHE_ENDPOINT / SCCACHE_MINIO_HOST omitted — real S3 uses the
+# default regional endpoint; in-stack MinIO env stays in docker-compose.
 
 # Increase linker stack size to prevent STATUS_STACK_BUFFER_OVERRUN
 # when linking the large test binary on Windows. Default MSVC stack is
