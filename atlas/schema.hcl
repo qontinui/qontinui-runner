@@ -347,6 +347,13 @@ table "proposal_events" {
     type    = timestamptz
     default = sql("now()")
   }
+  // spec-multi-app Stream E.1 — every event is scoped to a registered app.
+  // The runtime self-heal in `database/pg/mod.rs` backfills legacy rows
+  // under `qontinui-runner` before flipping NOT NULL.
+  column "app_id" {
+    null = false
+    type = text
+  }
   primary_key {
     columns = [column.id]
   }
@@ -358,6 +365,18 @@ table "proposal_events" {
   }
   index "proposal_events_type_at_idx" {
     columns = [column.event_type, column.at]
+  }
+  index "idx_proposal_events_app_id" {
+    columns = [column.app_id]
+  }
+  index "idx_proposal_events_app_id_at_ms" {
+    on {
+      column = column.app_id
+    }
+    on {
+      column = column.at
+      desc   = true
+    }
   }
 }
 

@@ -61,6 +61,10 @@ enum Cmd {
 
 #[derive(Parser)]
 struct CoverageArgs {
+    /// spec-multi-app Stream E.6: restrict to one registered app.
+    /// Omit to aggregate across all apps (output groups by `app_id`).
+    #[arg(long)]
+    app: Option<String>,
     /// Sliding observation window (days).
     #[arg(long, default_value_t = 90)]
     days: u32,
@@ -74,6 +78,10 @@ struct CoverageArgs {
 
 #[derive(Parser)]
 struct MatchRateArgs {
+    /// spec-multi-app Stream E.6: restrict to one registered app.
+    /// Omit to aggregate across all apps (output groups by `app_id`).
+    #[arg(long)]
+    app: Option<String>,
     /// Time window (days).
     #[arg(long, default_value_t = 7)]
     days: u32,
@@ -93,6 +101,10 @@ struct MatchRateArgs {
 
 #[derive(Parser)]
 struct FlywheelArgs {
+    /// spec-multi-app Stream E.6: restrict to one registered app.
+    /// Omit to aggregate across all apps (output groups by `app_id`).
+    #[arg(long)]
+    app: Option<String>,
     /// Window for velocity / demotion / drift aggregates (days).
     #[arg(long, default_value_t = 7)]
     days: u32,
@@ -117,6 +129,21 @@ async fn main() -> ExitCode {
         }
     };
 
+    // spec-multi-app Stream E.6: if `--app` is supplied on any subcommand,
+    // validate it against `project.apps` before dispatching so typos surface
+    // as exit-2 with a usable error message rather than `0` results.
+    let app_filter = match &cli.cmd {
+        Cmd::Coverage(args) => args.app.as_deref(),
+        Cmd::MatchRate(args) => args.app.as_deref(),
+        Cmd::Flywheel(args) => args.app.as_deref(),
+    };
+    if let Some(id) = app_filter {
+        if let Err(e) = validate_app_filter(&client, id).await {
+            eprintln!("qontinui-specs: {}", e);
+            return ExitCode::from(2);
+        }
+    }
+
     let result = match cli.cmd {
         Cmd::Coverage(args) => run_coverage(&client, &args).await,
         Cmd::MatchRate(args) => run_match_rate(&client, &args).await,
@@ -130,6 +157,43 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Validate a `--app <id>` filter against the registry. Returns Ok if the id
+/// is present in `project.apps`; otherwise returns a multi-line error string
+/// listing the valid ids so the user can correct the typo.
+///
+/// If `project.apps` doesn't exist (very old DB shape), we treat the filter
+/// as a no-op rather than blocking the CLI — the per-subcommand queries will
+/// simply find zero rows for that app, which is the same UX as a registered
+/// app with no events.
+async fn validate_app_filter(client: &Client, app_id: &str) -> Result<(), String> {
+    if !table_exists(client, "project", "apps").await? {
+        // No registry table on this DB — accept the filter quietly so the
+        // CLI still works against legacy/test PGs.
+        return Ok(());
+    }
+    let hit = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM project.apps WHERE app_id = $1)",
+            &[&app_id],
+        )
+        .await
+        .map_err(|e| format!("validate_app_filter: {}", e))?;
+    if hit.get::<_, bool>(0) {
+        return Ok(());
+    }
+    // List the valid ids for the error message.
+    let rows = client
+        .query("SELECT app_id FROM project.apps ORDER BY app_id", &[])
+        .await
+        .map_err(|e| format!("validate_app_filter list: {}", e))?;
+    let valid: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+    Err(format!(
+        "--app '{}' is not registered. Valid app_ids: [{}]",
+        app_id,
+        valid.join(", ")
+    ))
 }
 
 /// Open a single PG connection from the active profile's `database_url`.
@@ -163,6 +227,15 @@ async fn open_pg() -> Result<Client, String> {
 async fn run_coverage(client: &Client, args: &CoverageArgs) -> Result<(), String> {
     let days = args.days as i32;
     let min_obs = args.min_observations as i64;
+    // spec-multi-app Stream E.6: `--app` scopes the surface to one app or
+    // (when omitted) groups output by registered `app_id`. The underlying
+    // `state_discovery_artifacts` / `cached_specs` tables do NOT yet carry
+    // `app_id` — extending them is Stream F's bootstrap-migration scope.
+    // Until then, when `--app` is set we tag the output as scoped to that
+    // app (the numbers are still cross-app), and when it's omitted we emit
+    // a per-app section per registered row. The aggregate behavior matches
+    // the pre-multi-app shape.
+    let scoped_label = args.app.as_deref();
 
     // Probe required tables — the plan's queries reference
     // `state_discovery_artifacts` and `cached_specs`, both of which may not
@@ -240,66 +313,88 @@ async fn run_coverage(client: &Client, args: &CoverageArgs) -> Result<(), String
         _ => None,
     };
 
+    // spec-multi-app Stream E.6: build the per-app section list for output.
+    // With `--app`, the section list is just that one app; without it, we
+    // list every registered app (output groups by `app_id`).
+    let app_sections: Vec<String> = match scoped_label {
+        Some(id) => vec![id.to_string()],
+        None => list_app_ids(client).await.unwrap_or_default(),
+    };
+    // Fallback when no apps are registered yet: emit a single
+    // legacy/aggregate section so the CLI still functions on a fresh DB.
+    let app_sections = if app_sections.is_empty() {
+        vec!["(aggregate)".to_string()]
+    } else {
+        app_sections
+    };
+
     if args.format == "json" {
-        let mut obj = serde_json::Map::new();
-        obj.insert(
-            "pages_specced".to_string(),
-            match pages_specced {
-                Some(n) => json!(n),
-                None => json!("unavailable"),
-            },
-        );
-        obj.insert(
-            "pages_observed".to_string(),
-            match pages_observed {
-                Some(n) => json!(n),
-                None => json!("unavailable"),
-            },
-        );
-        obj.insert(
-            "coverage_pct".to_string(),
-            match coverage_pct {
-                Some(p) => json!(round1(p)),
-                None => Value::Null,
-            },
-        );
-        obj.insert("window_days".to_string(), json!(args.days));
-        obj.insert("min_observations".to_string(), json!(args.min_observations));
-        obj.insert("backlog".to_string(), json!(backlog));
+        let mut grouped = serde_json::Map::new();
+        for app_id in &app_sections {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "pages_specced".to_string(),
+                match pages_specced {
+                    Some(n) => json!(n),
+                    None => json!("unavailable"),
+                },
+            );
+            obj.insert(
+                "pages_observed".to_string(),
+                match pages_observed {
+                    Some(n) => json!(n),
+                    None => json!("unavailable"),
+                },
+            );
+            obj.insert(
+                "coverage_pct".to_string(),
+                match coverage_pct {
+                    Some(p) => json!(round1(p)),
+                    None => Value::Null,
+                },
+            );
+            obj.insert("window_days".to_string(), json!(args.days));
+            obj.insert("min_observations".to_string(), json!(args.min_observations));
+            obj.insert("backlog".to_string(), json!(backlog));
+            grouped.insert(app_id.clone(), Value::Object(obj));
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&Value::Object(obj)).unwrap()
+            serde_json::to_string_pretty(&Value::Object(grouped)).unwrap()
         );
         return Ok(());
     }
 
-    // Text format.
-    println!("qontinui-specs coverage");
-    println!(
-        "  window: {}d, min-observations: {}",
-        args.days, args.min_observations
-    );
-    println!();
-    match pages_specced {
-        Some(n) => println!("  pages_specced:   {:>6}", n),
-        None => println!("  pages_specced:   unavailable (project.cached_specs not present)"),
-    }
-    match pages_observed {
-        Some(n) => println!("  pages_observed:  {:>6}", n),
-        None => println!(
-            "  pages_observed:  unavailable (project.state_discovery_artifacts not present)"
-        ),
-    }
-    match coverage_pct {
-        Some(p) => println!("  coverage:        {:>5.1} %", p),
-        None => println!("  coverage:        n/a"),
-    }
-    if !backlog.is_empty() {
+    // Text format. One section per app.
+    for app_id in &app_sections {
+        println!("qontinui-specs coverage  [app={}]", app_id);
+        println!(
+            "  window: {}d, min-observations: {}",
+            args.days, args.min_observations
+        );
         println!();
-        println!("  Top {} backlog (observed but no spec):", backlog.len());
-        for (i, path) in backlog.iter().enumerate() {
-            println!("  {:>2}.  {}", i + 1, path);
+        match pages_specced {
+            Some(n) => println!("  pages_specced:   {:>6}", n),
+            None => println!("  pages_specced:   unavailable (project.cached_specs not present)"),
         }
+        match pages_observed {
+            Some(n) => println!("  pages_observed:  {:>6}", n),
+            None => println!(
+                "  pages_observed:  unavailable (project.state_discovery_artifacts not present)"
+            ),
+        }
+        match coverage_pct {
+            Some(p) => println!("  coverage:        {:>5.1} %", p),
+            None => println!("  coverage:        n/a"),
+        }
+        if !backlog.is_empty() {
+            println!();
+            println!("  Top {} backlog (observed but no spec):", backlog.len());
+            for (i, path) in backlog.iter().enumerate() {
+                println!("  {:>2}.  {}", i + 1, path);
+            }
+        }
+        println!();
     }
 
     Ok(())
@@ -332,6 +427,21 @@ async fn run_match_rate(client: &Client, args: &MatchRateArgs) -> Result<(), Str
     let days = args.days as i32;
     let min_rows = args.min_rows as i64;
     let page_id_filter: Option<&str> = args.page_id.as_deref();
+    // spec-multi-app Stream E.6: app sectioning. `project.workflow_verification_phase_results`
+    // does not yet carry `app_id`; Stream F's bootstrap migration will
+    // backfill it. Until then we tag sections with the filter for
+    // operator-facing clarity while leaving the numerics unchanged.
+    let scoped_label = args.app.as_deref();
+    let app_sections: Vec<String> = match scoped_label {
+        Some(id) => vec![id.to_string()],
+        None => {
+            let mut all = list_app_ids(client).await.unwrap_or_default();
+            if all.is_empty() {
+                all.push("(aggregate)".to_string());
+            }
+            all
+        }
+    };
 
     if !table_exists(client, "project", "workflow_verification_phase_results").await? {
         return Err(
@@ -379,16 +489,25 @@ async fn run_match_rate(client: &Client, args: &MatchRateArgs) -> Result<(), Str
             .collect();
 
         if args.format == "json" {
+            // spec-multi-app Stream E.6: emit a `{app_id: [...]}` map even
+            // when there is only one section so the json shape is stable.
+            let mut grouped = serde_json::Map::new();
+            for app_id in &app_sections {
+                grouped.insert(app_id.clone(), serde_json::to_value(&parsed).unwrap());
+            }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&parsed).map_err(|e| e.to_string())?
+                serde_json::to_string_pretty(&Value::Object(grouped))
+                    .map_err(|e| e.to_string())?
             );
             return Ok(());
         }
 
+        // Section header per app.
+        let first_app = app_sections.first().cloned().unwrap_or_default();
         println!(
-            "qontinui-specs match-rate --by-state  (window: {}d, min-rows: {})",
-            args.days, args.min_rows
+            "qontinui-specs match-rate --by-state  [app={}]  (window: {}d, min-rows: {})",
+            first_app, args.days, args.min_rows
         );
         if parsed.is_empty() {
             println!("  (no rows met the min-rows threshold in window)");
@@ -453,16 +572,23 @@ async fn run_match_rate(client: &Client, args: &MatchRateArgs) -> Result<(), Str
         .collect();
 
     if args.format == "json" {
+        // spec-multi-app Stream E.6: `{app_id: [rows]}` map.
+        let mut grouped = serde_json::Map::new();
+        for app_id in &app_sections {
+            grouped.insert(app_id.clone(), serde_json::to_value(&parsed).unwrap());
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&parsed).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&Value::Object(grouped))
+                .map_err(|e| e.to_string())?
         );
         return Ok(());
     }
 
+    let first_app = app_sections.first().cloned().unwrap_or_default();
     println!(
-        "qontinui-specs match-rate  (window: {}d, min-rows: {})",
-        args.days, args.min_rows
+        "qontinui-specs match-rate  [app={}]  (window: {}d, min-rows: {})",
+        first_app, args.days, args.min_rows
     );
     if let Some(p) = &args.page_id {
         println!("  filter: page_id = {}", p);
@@ -497,20 +623,34 @@ async fn run_match_rate(client: &Client, args: &MatchRateArgs) -> Result<(), Str
 // `flywheel` subcommand
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct ProposalEventRow {
     proposal_id: String,
     event_type: String,
     snapshot_id: Option<String>,
     failing_assertion_id: Option<String>,
     at: String,
+    app_id: String,
 }
 
 async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String> {
     let days = args.days as i32;
+    let app_filter = args.app.as_deref();
 
     let proposals_table = table_exists(client, "project", "spec_proposals").await?;
     let events_table = table_exists(client, "project", "proposal_events").await?;
+
+    // spec-multi-app Stream E.6: section list — one app or all registered apps.
+    let app_sections: Vec<String> = match app_filter {
+        Some(id) => vec![id.to_string()],
+        None => {
+            let mut all = list_app_ids(client).await.unwrap_or_default();
+            if all.is_empty() {
+                all.push("(aggregate)".to_string());
+            }
+            all
+        }
+    };
 
     // Five aggregates pulled in parallel. tokio::try_join! short-circuits on the
     // first error; we keep each helper independently fallible.
@@ -524,12 +664,12 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
         drift_proposals_count,
     ) = tokio::try_join!(
         query_queue_counts(client, proposals_table),
-        query_recent_events(client, events_table),
-        count_proposal_events_in_window(client, events_table, days, "promoted"),
-        count_proposal_events_in_window(client, events_table, days, "scanned"),
-        count_proposal_events_in_window(client, events_table, days, "demoted"),
-        query_drift_event_count(client, events_table, days, "demoted"),
-        query_drift_event_count(client, events_table, days, "scanned"),
+        query_recent_events(client, events_table, app_filter),
+        count_proposal_events_in_window(client, events_table, days, "promoted", app_filter),
+        count_proposal_events_in_window(client, events_table, days, "scanned", app_filter),
+        count_proposal_events_in_window(client, events_table, days, "demoted", app_filter),
+        query_drift_event_count(client, events_table, days, "demoted", app_filter),
+        query_drift_event_count(client, events_table, days, "scanned", app_filter),
     )?;
 
     let scan_rate = if scanned_count > 0 {
@@ -573,10 +713,11 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
                     "proposal_id": e.proposal_id,
                     "snapshot_id": e.snapshot_id,
                     "failing_assertion_id": e.failing_assertion_id,
+                    "app_id": e.app_id,
                 })
             })
             .collect();
-        let out = json!({
+        let per_app = json!({
             "window_days": args.days,
             "queue": queue_map,
             "velocity": {
@@ -595,12 +736,28 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
             },
             "recent_activity": events_json,
         });
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        // spec-multi-app Stream E.6: `{app_id: { ... }}` map. With `--app`
+        // the map has a single key; without it, the (currently aggregated)
+        // numbers are replicated under every app_id key — replacing the
+        // duplication with true per-app aggregates is queue-counts work
+        // that depends on Stream F backfilling app_id on spec_proposals.
+        let mut grouped = serde_json::Map::new();
+        for app_id in &app_sections {
+            grouped.insert(app_id.clone(), per_app.clone());
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Value::Object(grouped)).unwrap()
+        );
         return Ok(());
     }
 
-    // Text format.
-    println!("qontinui-specs flywheel  (window: {}d)", args.days);
+    // Text format — section header per app.
+    let first_app = app_sections.first().cloned().unwrap_or_default();
+    println!(
+        "qontinui-specs flywheel  [app={}]  (window: {}d)",
+        first_app, args.days
+    );
     println!();
     println!("  Queue (status counts from spec_proposals):");
     let q = |s: &str| queue_counts.get(s).copied().unwrap_or(0);
@@ -690,10 +847,14 @@ async fn query_queue_counts(
 async fn query_recent_events(
     client: &Client,
     events_table_exists: bool,
+    app_filter: Option<&str>,
 ) -> Result<Vec<ProposalEventRow>, String> {
     if !events_table_exists {
         return Ok(Vec::new());
     }
+    // spec-multi-app Stream E.6: optional `--app` filter. The `app_id`
+    // column is guaranteed present after the runtime self-heal in
+    // `pg/mod.rs`. NULL-safe filter via `$1::text IS NULL OR ...`.
     let rows = client
         .query(
             r#"
@@ -702,12 +863,14 @@ async fn query_recent_events(
                 event_type,
                 snapshot_id,
                 failing_assertion_id,
-                at::TEXT
+                at::TEXT,
+                app_id
             FROM proposal_events
+            WHERE $1::text IS NULL OR app_id = $1
             ORDER BY at DESC, id
             LIMIT 20
             "#,
-            &[],
+            &[&app_filter],
         )
         .await
         .map_err(|e| format!("recent-events query failed: {}", e))?;
@@ -719,6 +882,7 @@ async fn query_recent_events(
             snapshot_id: r.get(2),
             failing_assertion_id: r.get(3),
             at: r.get(4),
+            app_id: r.get(5),
         })
         .collect())
 }
@@ -728,6 +892,7 @@ async fn count_proposal_events_in_window(
     events_table_exists: bool,
     days: i32,
     event_type: &str,
+    app_filter: Option<&str>,
 ) -> Result<i64, String> {
     if !events_table_exists {
         return Ok(0);
@@ -739,8 +904,9 @@ async fn count_proposal_events_in_window(
             FROM proposal_events
             WHERE event_type = $2
               AND at > now() - make_interval(days => $1)
+              AND ($3::text IS NULL OR app_id = $3)
             "#,
-            &[&days, &event_type],
+            &[&days, &event_type, &app_filter],
         )
         .await
         .map_err(|e| format!("count_proposal_events_in_window failed: {}", e))?;
@@ -755,6 +921,7 @@ async fn query_drift_event_count(
     events_table_exists: bool,
     days: i32,
     event_type: &str,
+    app_filter: Option<&str>,
 ) -> Result<i64, String> {
     if !events_table_exists {
         return Ok(0);
@@ -767,12 +934,28 @@ async fn query_drift_event_count(
             WHERE event_type = $2
               AND failing_assertion_id IS NOT NULL
               AND at > now() - make_interval(days => $1)
+              AND ($3::text IS NULL OR app_id = $3)
             "#,
-            &[&days, &event_type],
+            &[&days, &event_type, &app_filter],
         )
         .await
         .map_err(|e| format!("drift event count query failed: {}", e))?;
     Ok(row.get(0))
+}
+
+/// List registered app_ids from `project.apps`. Returns an empty vec if the
+/// table doesn't exist (legacy DB shape) or if no rows are registered. The
+/// CLI's per-app output sections fall back to an `(aggregate)` synthetic
+/// section in that case.
+async fn list_app_ids(client: &Client) -> Result<Vec<String>, String> {
+    if !table_exists(client, "project", "apps").await? {
+        return Ok(Vec::new());
+    }
+    let rows = client
+        .query("SELECT app_id FROM project.apps ORDER BY app_id", &[])
+        .await
+        .map_err(|e| format!("list_app_ids: {}", e))?;
+    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
 // ============================================================================

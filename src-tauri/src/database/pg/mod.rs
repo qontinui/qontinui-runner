@@ -349,6 +349,34 @@ impl PgDb {
         .await
         .map_err(|e| format!("Stream B project.apps self-heal failed: {}", e))?;
 
+        // spec-multi-app Stream E.1: backfill `app_id` onto
+        // project.proposal_events. The table predates the multi-tenant model,
+        // so existing rows are migrated under the bootstrap app_id
+        // `qontinui-runner` (matching Stream F's bootstrap registration).
+        //
+        // Wrapped in a transaction so the ADD COLUMN, backfill, and SET NOT
+        // NULL form a single atomic step. ACCESS EXCLUSIVE prevents any
+        // concurrent writer from inserting a NULL row between the backfill and
+        // the NOT NULL constraint flip. Idempotent: `ADD COLUMN IF NOT EXISTS`
+        // + the `SET NOT NULL` becomes a no-op on a subsequent boot because the
+        // backfill keeps the column dense.
+        conn.batch_execute(
+            "BEGIN; \
+             LOCK TABLE project.proposal_events IN ACCESS EXCLUSIVE MODE; \
+             ALTER TABLE project.proposal_events \
+                 ADD COLUMN IF NOT EXISTS app_id TEXT; \
+             UPDATE project.proposal_events SET app_id = 'qontinui-runner' \
+                 WHERE app_id IS NULL; \
+             ALTER TABLE project.proposal_events ALTER COLUMN app_id SET NOT NULL; \
+             CREATE INDEX IF NOT EXISTS idx_proposal_events_app_id \
+                 ON project.proposal_events(app_id); \
+             CREATE INDEX IF NOT EXISTS idx_proposal_events_app_id_at_ms \
+                 ON project.proposal_events(app_id, at DESC); \
+             COMMIT;",
+        )
+        .await
+        .map_err(|e| format!("Stream E.1 proposal_events.app_id self-heal failed: {}", e))?;
+
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 
         let db = Self { pool };
