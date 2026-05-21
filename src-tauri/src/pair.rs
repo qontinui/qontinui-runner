@@ -718,8 +718,8 @@ mod tests {
     fn tenant_id_from_oauth_claim_extracts_uuid() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
-        let payload =
-            URL_SAFE_NO_PAD.encode(br#"{"sub":"x","tenant_id":"11111111-2222-3333-4444-555555555555"}"#);
+        let payload = URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"x","tenant_id":"11111111-2222-3333-4444-555555555555"}"#);
         let token = format!("{}.{}.signature", header, payload);
         assert_eq!(
             tenant_id_from_oauth_claim(&token).as_deref(),
@@ -918,8 +918,13 @@ mod pair_e2e_tests {
         let expected_jwt = "header-segment.payload-segment.signature-segment";
         let (base, _capture, _shutdown) =
             spawn_mock_coord(StatusCode::OK, canonical_200_body(expected_jwt));
-        let result =
-            pair_with_auth_token_with_ids(&base, TEST_BEARER, TEST_DEVICE_ID, TEST_USER_ID, test_tenant_uuid());
+        let result = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+        );
         let resp = result.expect("pair_with_auth_token_with_ids should succeed on 200");
         assert_eq!(resp.token, expected_jwt);
         assert_eq!(resp.user_id, "22222222-2222-4222-8222-222222222222");
@@ -938,8 +943,13 @@ mod pair_e2e_tests {
             StatusCode::UNAUTHORIZED,
             r#"{"error":"invalid bearer token"}"#.to_string(),
         );
-        let result =
-            pair_with_auth_token_with_ids(&base, TEST_BEARER, TEST_DEVICE_ID, TEST_USER_ID, test_tenant_uuid());
+        let result = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+        );
         let err = result.expect_err("401 must return Err");
         assert!(
             err.contains("401"),
@@ -955,8 +965,13 @@ mod pair_e2e_tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             r#"{"error":"coord-side panic"}"#.to_string(),
         );
-        let result =
-            pair_with_auth_token_with_ids(&base, TEST_BEARER, TEST_DEVICE_ID, TEST_USER_ID, test_tenant_uuid());
+        let result = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+        );
         let err = result.expect_err("500 must return Err");
         assert!(
             err.contains("500"),
@@ -972,8 +987,14 @@ mod pair_e2e_tests {
         // `device_id` + `hostname`.
         let (base, capture, _shutdown) =
             spawn_mock_coord(StatusCode::OK, canonical_200_body("ignored-jwt"));
-        let _ = pair_with_auth_token_with_ids(&base, TEST_BEARER, TEST_DEVICE_ID, TEST_USER_ID, test_tenant_uuid())
-            .expect("200 path");
+        let _ = pair_with_auth_token_with_ids(
+            &base,
+            TEST_BEARER,
+            TEST_DEVICE_ID,
+            TEST_USER_ID,
+            test_tenant_uuid(),
+        )
+        .expect("200 path");
 
         let captured = capture.lock().expect("capture mutex").clone();
         assert!(captured.called, "mock coord must have been hit");

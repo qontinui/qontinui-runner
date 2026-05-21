@@ -742,17 +742,13 @@ fn cmd_device_pair(
                          pass --tenant-id <uuid> to override"
                     )
                 }),
-                None => Err(
-                    "no `tenant_id` claim found in OAuth token; \
+                None => Err("no `tenant_id` claim found in OAuth token; \
                      pass --tenant-id <uuid> explicitly"
-                        .to_string(),
-                ),
+                    .to_string()),
             },
-            PairMode::Browser => Err(
-                "--tenant-id <uuid> is required for the browser pair flow \
+            PairMode::Browser => Err("--tenant-id <uuid> is required for the browser pair flow \
                  (no OAuth token to read a claim from)"
-                    .to_string(),
-            ),
+                .to_string()),
         },
     };
     let tenant_id = match resolved_tenant_id {
