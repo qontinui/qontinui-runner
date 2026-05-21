@@ -167,6 +167,7 @@ mod storage;
 pub(crate) mod str_utils;
 mod summary_generator;
 mod tauri_app_handle;
+mod tauri_command_audit;
 mod terminal;
 mod test_executor;
 mod test_orchestrator;
@@ -749,7 +750,32 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         //
         // The per-module `plugin()` fns are left in place for future reuse
         // even though nothing invokes them now.
-        .invoke_handler(tauri::generate_handler![
+        //
+        // 2026-05-21 audit-trail shim — every IPC dispatch is observed once
+        // before being forwarded to the macro-generated handler. We record
+        // *only* the command name and a unix-millis timestamp into the bounded
+        // ring buffer at `crate::tauri_command_audit`. No args, no return
+        // values; the security argument for keeping credential-returning
+        // commands (e.g. `get_test_auto_login`) off the UI Bridge invoke
+        // allowlist is preserved — operators only learn that a command with
+        // that name fired at some moment, surfaced via the runner-only
+        // `GET /ui-bridge/control/tauri-command-history` endpoint
+        // (see `mcp/ui_bridge/tauri_audit.rs`).
+        //
+        // The `generate_handler!` macro expands to `move |invoke| { … }` of
+        // exact type `Fn(tauri::Invoke<tauri::Wry>) -> bool` (see
+        // `tauri-macros-2.6.0/src/command/handler.rs::From<Handler>`), which
+        // matches `Builder::invoke_handler`'s `F: Fn(Invoke<R>) -> bool + Send
+        // + Sync + 'static` bound. Binding it to a local lets us wrap with a
+        // pre-hook without forking the macro or losing per-command ACL
+        // matching.
+        .invoke_handler({
+            // Type-annotate the binding so Rust can resolve the macro's
+            // untyped closure parameter (`move |invoke| { ... }`) — without
+            // the explicit `impl Fn(...) -> bool` ascription the call to
+            // `invoke.message.command()` is ambiguous.
+            let inner: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
+                Box::new(tauri::generate_handler![
             commands::accessibility::a11y_ai_context,
             commands::accessibility::a11y_capture,
             commands::accessibility::a11y_click,
@@ -1618,7 +1644,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::workflow_events::emit_workflow_event,
             commands::worktrees::merge_worktree,
             commands::worktrees::merge_worktree_force
-        ])
+            ]);
+            move |invoke: tauri::ipc::Invoke<tauri::Wry>| -> bool {
+                tauri_command_audit::record(invoke.message.command());
+                inner(invoke)
+            }
+        })
         .manage(shared_app_state)
         .manage(launch_env.clone()) // Item 3: typed startup env snapshot, read once in run_app()
         .manage(bridge_compartment)
