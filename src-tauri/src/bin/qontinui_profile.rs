@@ -1158,10 +1158,12 @@ mod tests {
                     DeviceCmd::Pair {
                         auth_token,
                         browser,
+                        tenant_id,
                     },
             }) => {
                 assert_eq!(auth_token.as_deref(), Some("oauth"));
                 assert!(!browser);
+                assert!(tenant_id.is_none());
             }
             other => panic!("expected Device::Pair, got {:?}", other),
         }
@@ -1177,10 +1179,12 @@ mod tests {
                     DeviceCmd::Pair {
                         auth_token,
                         browser,
+                        tenant_id,
                     },
             }) => {
                 assert!(auth_token.is_none());
                 assert!(browser);
+                assert!(tenant_id.is_none());
             }
             other => panic!("expected Device::Pair {{browser}}, got {:?}", other),
         }
