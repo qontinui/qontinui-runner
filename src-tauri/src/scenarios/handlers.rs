@@ -109,7 +109,7 @@ async fn load_ir(app_id: &str, ir_doc_id: &str) -> LoadIr {
     }
 }
 
-fn validate_request<'a>(q: &'a IrDocIdQuery) -> Result<(&'a str, &'a str), Response> {
+fn validate_request(q: &IrDocIdQuery) -> Result<(&str, &str), Response> {
     let ir_doc_id = match q.ir_doc_id.as_deref() {
         Some(s) if !s.is_empty() => s,
         _ => {
