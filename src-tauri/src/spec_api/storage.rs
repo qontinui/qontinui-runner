@@ -181,11 +181,7 @@ pub fn list_pages(root: &Path, app_id: &str) -> std::io::Result<Vec<String>> {
 /// (`EMBEDDED_PAGES`) only kicks in when the on-disk file is absent AND the
 /// caller is reading the `qontinui-runner` app — per PLAN.md §B.6 the
 /// compile-time snapshot embeds only the runner's spec corpus.
-pub fn read_ir(
-    root: &Path,
-    app_id: &str,
-    page_id: &str,
-) -> Result<Option<IrPageSpec>, String> {
+pub fn read_ir(root: &Path, app_id: &str, page_id: &str) -> Result<Option<IrPageSpec>, String> {
     let paths = PagePaths::for_page(root, page_id);
     if paths.ir_path.exists() {
         let data = fs::read_to_string(&paths.ir_path)
@@ -225,8 +221,10 @@ pub fn read_projection(
     if app_id == RUNNER_APP_ID {
         let embedded_rel = format!("{}/spec.uibridge.json", page_id);
         if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-            let v: serde_json::Value = serde_json::from_slice(strip_utf8_bom_bytes(file.contents()))
-                .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
+            let v: serde_json::Value =
+                serde_json::from_slice(strip_utf8_bom_bytes(file.contents())).map_err(|e| {
+                    format!("parse embedded {} failed: {}", file.path().display(), e)
+                })?;
             return Ok(Some(v));
         }
     }
@@ -238,11 +236,7 @@ pub fn read_projection(
 ///
 /// Filesystem-first, embedded-second gated on `app_id == RUNNER_APP_ID`
 /// (see [`read_ir`]).
-pub fn read_notes(
-    root: &Path,
-    app_id: &str,
-    page_id: &str,
-) -> Result<Option<String>, String> {
+pub fn read_notes(root: &Path, app_id: &str, page_id: &str) -> Result<Option<String>, String> {
     let paths = PagePaths::for_page(root, page_id);
     if paths.notes_path.exists() {
         let s = fs::read_to_string(&paths.notes_path)
@@ -666,7 +660,8 @@ mod bom_tests {
         fs::create_dir_all(&page_dir).unwrap();
         let ir_path = page_dir.join("state-machine.derived.json");
 
-        let body = r#"{"version":"1.0","id":"page-bom","name":"BOM page","states":[],"transitions":[]}"#;
+        let body =
+            r#"{"version":"1.0","id":"page-bom","name":"BOM page","states":[],"transitions":[]}"#;
         let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice(body.as_bytes());
         fs::write(&ir_path, &bytes).unwrap();
@@ -771,8 +766,7 @@ mod pending_tests {
             status: Some(ProposalStatus::Proposed),
         };
         let ir = empty_ir("page-a", Some(input_prov.clone()));
-        let path =
-            write_pending_ir(tmp.path(), RUNNER_APP_ID, &ir).expect("write_pending_ir");
+        let path = write_pending_ir(tmp.path(), RUNNER_APP_ID, &ir).expect("write_pending_ir");
         // Caller's IR is unchanged.
         assert_eq!(
             ir.provenance.as_ref().unwrap().status,

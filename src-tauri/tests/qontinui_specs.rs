@@ -83,19 +83,14 @@ fn coverage_without_app_filter_returns_grouped_output() {
     // `(aggregate)` if the registry is empty). Either way, the top-level
     // shape MUST be an object map — never a bare numeric / array, because
     // the per-app sectioning shape is what downstream dashboards consume.
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("--format json output must parse as JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--format json output must parse as JSON");
     assert!(
         parsed.is_object(),
         "expected top-level object (per-app map), got: {:?}",
         parsed
     );
-    let keys: Vec<String> = parsed
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
+    let keys: Vec<String> = parsed.as_object().unwrap().keys().cloned().collect();
     assert!(
         !keys.is_empty(),
         "per-app map must have at least one section (aggregate fallback if registry is empty)"

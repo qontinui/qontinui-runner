@@ -575,7 +575,6 @@ pub async fn complexity_scores(
 
     let specs = load_specs(&request.app_id, &project_path).await;
     let result = tokio::task::spawn_blocking(move || {
-
         let scores: Vec<ComplexityScore> = specs
             .iter()
             .map(|spec| {

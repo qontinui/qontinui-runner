@@ -603,8 +603,14 @@ mod tests {
     fn handler_passes_app_id_in_self_call_body() {
         let body = build_self_call_body("qontinui-web", "active-runs");
         // Both keys present, both values correct.
-        assert_eq!(body.get("app_id").and_then(|v| v.as_str()), Some("qontinui-web"));
-        assert_eq!(body.get("page_id").and_then(|v| v.as_str()), Some("active-runs"));
+        assert_eq!(
+            body.get("app_id").and_then(|v| v.as_str()),
+            Some("qontinui-web")
+        );
+        assert_eq!(
+            body.get("page_id").and_then(|v| v.as_str()),
+            Some("active-runs")
+        );
         // Body is a 2-key object — nothing else leaks.
         let map = body.as_object().expect("body is object");
         assert_eq!(map.len(), 2);
@@ -636,10 +642,7 @@ mod tests {
             http_status_to_variant(S::NOT_FOUND, "spec-not-found"),
             "spec_not_found"
         );
-        assert_eq!(
-            http_status_to_variant(S::NOT_FOUND, ""),
-            "spec_not_found"
-        );
+        assert_eq!(http_status_to_variant(S::NOT_FOUND, ""), "spec_not_found");
     }
 
     /// D.8 #6: The `ExecutionStepConfig` deserializer accepts both the
@@ -665,7 +668,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(snake.spec_check_app_id.as_deref(), Some("qontinui-runner"));
-        assert_eq!(snake.spec_check_page_id.as_deref(), Some("settings-general"));
+        assert_eq!(
+            snake.spec_check_page_id.as_deref(),
+            Some("settings-general")
+        );
 
         // Absent field deserializes to None (legacy step JSON without the
         // field still parses; the handler is the gatekeeper).

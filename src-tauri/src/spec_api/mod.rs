@@ -103,10 +103,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/apps/{app_id}/spec/proposals/scan",
             post(proposals::post_scan),
         )
-        .route(
-            "/apps/{app_id}/spec/proposals",
-            get(proposals::get_list),
-        )
+        .route("/apps/{app_id}/spec/proposals", get(proposals::get_list))
         .route(
             "/apps/{app_id}/spec/proposals/{id}/execute",
             post(proposals::post_execute),

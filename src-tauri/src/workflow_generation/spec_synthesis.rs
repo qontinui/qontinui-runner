@@ -963,7 +963,8 @@ pub fn update_page_specs_from_criteria(
             continue;
         }
 
-        let spec_json = match crate::spec_api::storage::read_projection(specs_root, app_id, page_id) {
+        let spec_json = match crate::spec_api::storage::read_projection(specs_root, app_id, page_id)
+        {
             Ok(Some(v)) => v,
             Ok(None) => continue,
             Err(e) => {
@@ -1644,14 +1645,13 @@ mod tests {
             bugfix_context: None,
         };
 
-        let result =
-            update_page_specs_from_criteria(
-                &criteria,
-                "Update the settings page",
-                crate::spec_api::storage::RUNNER_APP_ID,
-                dir.path(),
-                0.2,
-            );
+        let result = update_page_specs_from_criteria(
+            &criteria,
+            "Update the settings page",
+            crate::spec_api::storage::RUNNER_APP_ID,
+            dir.path(),
+            0.2,
+        );
 
         // Should replace the old group, not skip
         assert_eq!(result.specs_updated, 1);
@@ -1726,14 +1726,13 @@ mod tests {
             bugfix_context: None,
         };
 
-        let result =
-            update_page_specs_from_criteria(
-                &criteria,
-                "some description",
-                crate::spec_api::storage::RUNNER_APP_ID,
-                dir.path(),
-                0.3,
-            );
+        let result = update_page_specs_from_criteria(
+            &criteria,
+            "some description",
+            crate::spec_api::storage::RUNNER_APP_ID,
+            dir.path(),
+            0.3,
+        );
 
         assert_eq!(result.specs_updated, 0);
     }

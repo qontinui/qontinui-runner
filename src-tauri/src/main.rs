@@ -395,9 +395,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // production runners do not register the developer's
                 // hard-coded sibling-repo layout. Idempotent — failures
                 // (including AlreadyRegistered) are swallowed.
-                if let Err(e) = rt.block_on(
-                    crate::database::pg::apps::bootstrap_dev_apps(&pg),
-                ) {
+                if let Err(e) = rt.block_on(crate::database::pg::apps::bootstrap_dev_apps(&pg)) {
                     warn!(
                         "PG bootstrap: bootstrap_dev_apps failed (non-fatal): {:?}",
                         e

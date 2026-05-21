@@ -161,10 +161,14 @@ fn storage_round_trip_in_tempdir() {
     let projection_path = storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc).unwrap();
     assert!(projection_path.exists());
     // Re-read both halves; they must round-trip.
-    let read_back = storage::read_ir(root, RUNNER_APP_ID, "active").unwrap().unwrap();
+    let read_back = storage::read_ir(root, RUNNER_APP_ID, "active")
+        .unwrap()
+        .unwrap();
     assert_eq!(read_back.id, "active");
     assert_eq!(read_back.states.len(), 1);
-    let proj = storage::read_projection(root, RUNNER_APP_ID, "active").unwrap().unwrap();
+    let proj = storage::read_projection(root, RUNNER_APP_ID, "active")
+        .unwrap()
+        .unwrap();
     assert_eq!(proj["version"], "1.0.0");
     let pages = storage::list_pages(root, RUNNER_APP_ID).unwrap();
     assert_eq!(pages, vec!["active".to_string()]);
@@ -255,10 +259,7 @@ mod handler_tests {
         // Stream C: the path is now `/apps/:app_id/spec/health` and the
         // handler extracts the `app_id` segment (and ignores it for the
         // health smoke check).
-        Router::new().route(
-            "/apps/{app_id}/spec/health",
-            get(handlers::get_health),
-        )
+        Router::new().route("/apps/{app_id}/spec/health", get(handlers::get_health))
     }
 
     #[tokio::test]
@@ -850,9 +851,7 @@ mod handler_tests {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
         });
-        let pg = PgDb::new(&url)
-            .await
-            .expect("PgDb::new for spec_api tests");
+        let pg = PgDb::new(&url).await.expect("PgDb::new for spec_api tests");
         // Pick a deterministic-but-unique id that we never register.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -881,9 +880,7 @@ mod handler_tests {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://qontinui_user:qontinui_password@localhost:5433/qontinui_db".to_string()
         });
-        let pg = PgDb::new(&url)
-            .await
-            .expect("PgDb::new for spec_api tests");
+        let pg = PgDb::new(&url).await.expect("PgDb::new for spec_api tests");
 
         let tmp = tempfile::tempdir().unwrap();
         // Create the specs/ subdir the resolver requires.

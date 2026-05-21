@@ -18,9 +18,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
-use qontinui_types::apps::{
-    validate_app_id, App, AppError, RegisterAppRequest, UpdateAppRequest,
-};
+use qontinui_types::apps::{validate_app_id, App, AppError, RegisterAppRequest, UpdateAppRequest};
 
 use super::PgDb;
 
@@ -111,14 +109,18 @@ impl PgDb {
             });
         }
 
-        let mut conn = self.pool.get().await.map_err(|e| AppError::InvalidRepoRoot {
-            // Surface PG pool failures through InvalidRepoRoot so the HTTP
-            // layer's `IntoResponse` mapping reports a 500. There is no
-            // "internal error" variant in `AppError` (kept narrow on purpose).
-            // The error message is captured in the `repo_root` field so the
-            // detail is visible in logs without expanding the enum surface.
-            repo_root: format!("(pg pool error) {}", e),
-        })?;
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| AppError::InvalidRepoRoot {
+                // Surface PG pool failures through InvalidRepoRoot so the HTTP
+                // layer's `IntoResponse` mapping reports a 500. There is no
+                // "internal error" variant in `AppError` (kept narrow on purpose).
+                // The error message is captured in the `repo_root` field so the
+                // detail is visible in logs without expanding the enum surface.
+                repo_root: format!("(pg pool error) {}", e),
+            })?;
 
         let txn = conn
             .transaction()
@@ -183,11 +185,9 @@ impl PgDb {
             repo_root: format!("(pg commit error) {}", e),
         })?;
 
-        let row = rows
-            .first()
-            .ok_or_else(|| AppError::InvalidRepoRoot {
-                repo_root: "(insert returned no rows)".into(),
-            })?;
+        let row = rows.first().ok_or_else(|| AppError::InvalidRepoRoot {
+            repo_root: "(insert returned no rows)".into(),
+        })?;
         Ok(row_to_app(row))
     }
 
@@ -195,14 +195,14 @@ impl PgDb {
     /// `UpdateAppRequest` are optional — `None` means "leave unchanged".
     /// Returns the updated row. Errors with `AppError::NotRegistered` if no
     /// row exists for `app_id`.
-    pub async fn update_app(
-        &self,
-        app_id: &str,
-        req: &UpdateAppRequest,
-    ) -> Result<App, AppError> {
-        let conn = self.pool.get().await.map_err(|e| AppError::InvalidRepoRoot {
-            repo_root: format!("(pg pool error) {}", e),
-        })?;
+    pub async fn update_app(&self, app_id: &str, req: &UpdateAppRequest) -> Result<App, AppError> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| AppError::InvalidRepoRoot {
+                repo_root: format!("(pg pool error) {}", e),
+            })?;
 
         // COALESCE($n, column) → leave the column untouched when the param is
         // NULL. Single round-trip, no SELECT-then-UPDATE race.
@@ -345,7 +345,9 @@ pub async fn bootstrap_dev_apps(pg: &PgDb) -> Result<(), AppError> {
 
     for req in registrations {
         match pg.insert_app(&req).await {
-            Ok(_) => info!(app_id = %req.app_id, repo_root = %req.repo_root, "bootstrap: registered app"),
+            Ok(_) => {
+                info!(app_id = %req.app_id, repo_root = %req.repo_root, "bootstrap: registered app")
+            }
             Err(AppError::AlreadyRegistered { .. }) => {
                 debug!(app_id = %req.app_id, "bootstrap: app already registered (idempotent)");
             }

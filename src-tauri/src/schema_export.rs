@@ -766,7 +766,7 @@ mod tests {
             obj.contains_key("SpecApiEvent"),
             "Missing SpecApiEvent schema (Plan 06)"
         );
-        assert_eq!(obj.len(), 478, "Expected 478 schema entries");
+        assert_eq!(obj.len(), 483, "Expected 483 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
