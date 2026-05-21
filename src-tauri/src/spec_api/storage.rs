@@ -90,6 +90,30 @@ pub async fn resolve_specs_root(pg: &PgDb, app_id: &str) -> Result<PathBuf, AppE
     Ok(root)
 }
 
+/// Strip a leading UTF-8 BOM (`U+FEFF`, bytes `EF BB BF`) from a string slice.
+///
+/// PowerShell 5.1's `Set-Content -Encoding UTF8` writes UTF-8 with a BOM,
+/// which `serde_json::from_str` rejects with `"expected value at line 1
+/// column 1"`. Stream F's spec backfill scripts wrote 117 IRs with this
+/// encoding, breaking `/spec-check` (HTTP 500 `spec-malformed`) and silently
+/// dropping affected pages from `/apps/<id>/spec/list`. The writer scripts
+/// were fixed in commit f0feea04; this helper is defense in depth so a
+/// future BOM-emitting writer (or a hand-edited file saved with the wrong
+/// encoding) cannot re-break things.
+fn strip_utf8_bom(s: &str) -> &str {
+    s.trim_start_matches('\u{FEFF}')
+}
+
+/// Byte-slice variant of [`strip_utf8_bom`] for `serde_json::from_slice`
+/// callers (embedded snapshot reads land here).
+fn strip_utf8_bom_bytes(b: &[u8]) -> &[u8] {
+    if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &b[3..]
+    } else {
+        b
+    }
+}
+
 /// Page-level paths. Cheap to construct from a page id.
 pub struct PagePaths {
     pub root: PathBuf,
@@ -166,14 +190,14 @@ pub fn read_ir(
     if paths.ir_path.exists() {
         let data = fs::read_to_string(&paths.ir_path)
             .map_err(|e| format!("read {} failed: {}", paths.ir_path.display(), e))?;
-        let doc: IrPageSpec = serde_json::from_str(&data)
+        let doc: IrPageSpec = serde_json::from_str(strip_utf8_bom(&data))
             .map_err(|e| format!("parse {} failed: {}", paths.ir_path.display(), e))?;
         return Ok(Some(doc));
     }
     if app_id == RUNNER_APP_ID {
         let embedded_rel = format!("{}/state-machine.derived.json", page_id);
         if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-            let doc: IrPageSpec = serde_json::from_slice(file.contents())
+            let doc: IrPageSpec = serde_json::from_slice(strip_utf8_bom_bytes(file.contents()))
                 .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
             return Ok(Some(doc));
         }
@@ -194,14 +218,14 @@ pub fn read_projection(
     if paths.projection_path.exists() {
         let data = fs::read_to_string(&paths.projection_path)
             .map_err(|e| format!("read {} failed: {}", paths.projection_path.display(), e))?;
-        let v: serde_json::Value = serde_json::from_str(&data)
+        let v: serde_json::Value = serde_json::from_str(strip_utf8_bom(&data))
             .map_err(|e| format!("parse {} failed: {}", paths.projection_path.display(), e))?;
         return Ok(Some(v));
     }
     if app_id == RUNNER_APP_ID {
         let embedded_rel = format!("{}/spec.uibridge.json", page_id);
         if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-            let v: serde_json::Value = serde_json::from_slice(file.contents())
+            let v: serde_json::Value = serde_json::from_slice(strip_utf8_bom_bytes(file.contents()))
                 .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
             return Ok(Some(v));
         }
@@ -223,7 +247,7 @@ pub fn read_notes(
     if paths.notes_path.exists() {
         let s = fs::read_to_string(&paths.notes_path)
             .map_err(|e| format!("read {} failed: {}", paths.notes_path.display(), e))?;
-        let trimmed = s.trim().to_string();
+        let trimmed = strip_utf8_bom(&s).trim().to_string();
         return if trimmed.is_empty() {
             Ok(None)
         } else {
@@ -233,7 +257,7 @@ pub fn read_notes(
     if app_id == RUNNER_APP_ID {
         let embedded_rel = format!("{}/notes.md", page_id);
         if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
-            let s = std::str::from_utf8(file.contents())
+            let s = std::str::from_utf8(strip_utf8_bom_bytes(file.contents()))
                 .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
             let trimmed = s.trim().to_string();
             return if trimmed.is_empty() {
@@ -477,7 +501,7 @@ pub fn read_pending_ir(root: &Path, page_id: &str) -> Result<Option<IrPageSpec>,
     }
     let data = fs::read_to_string(&ir_path)
         .map_err(|e| format!("read {} failed: {}", ir_path.display(), e))?;
-    let doc: IrPageSpec = serde_json::from_str(&data)
+    let doc: IrPageSpec = serde_json::from_str(strip_utf8_bom(&data))
         .map_err(|e| format!("parse {} failed: {}", ir_path.display(), e))?;
     Ok(Some(doc))
 }
@@ -625,6 +649,92 @@ pub(crate) fn page_lock(root: &Path, page_id: &str) -> Result<PageLockGuard, Str
 // =============================================================================
 // Tests
 // =============================================================================
+
+#[cfg(test)]
+mod bom_tests {
+    use super::*;
+
+    /// Build a minimal valid IR document with a leading UTF-8 BOM, write it
+    /// to `<root>/pages/<id>/state-machine.derived.json`, and assert
+    /// `read_ir` returns `Ok(Some(_))` despite the BOM. Regression guard for
+    /// the post-ship `/manual-test` smoke that found all 117 spec IRs had
+    /// been written with `Set-Content -Encoding UTF8` (BOM-emitting).
+    #[test]
+    fn read_ir_strips_leading_utf8_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_dir = tmp.path().join("pages").join("page-bom");
+        fs::create_dir_all(&page_dir).unwrap();
+        let ir_path = page_dir.join("state-machine.derived.json");
+
+        let body = r#"{"version":"1.0","id":"page-bom","name":"BOM page","states":[],"transitions":[]}"#;
+        let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(body.as_bytes());
+        fs::write(&ir_path, &bytes).unwrap();
+
+        let doc = read_ir(tmp.path(), "any-app", "page-bom")
+            .expect("read_ir must accept BOM-prefixed JSON")
+            .expect("file is present so result must be Some");
+        assert_eq!(doc.id, "page-bom");
+        assert_eq!(doc.name, "BOM page");
+    }
+
+    /// Same scenario for the projection sibling: BOM-prefixed JSON must
+    /// parse as a `serde_json::Value`.
+    #[test]
+    fn read_projection_strips_leading_utf8_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_dir = tmp.path().join("pages").join("page-bom");
+        fs::create_dir_all(&page_dir).unwrap();
+        let proj_path = page_dir.join("spec.uibridge.json");
+
+        let body = r#"{"hello":"world"}"#;
+        let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(body.as_bytes());
+        fs::write(&proj_path, &bytes).unwrap();
+
+        let v = read_projection(tmp.path(), "any-app", "page-bom")
+            .expect("read_projection must accept BOM-prefixed JSON")
+            .expect("file is present so result must be Some");
+        assert_eq!(v["hello"], "world");
+    }
+
+    /// Notes file with a leading BOM should yield clean content (BOM
+    /// stripped, then whitespace-trimmed).
+    #[test]
+    fn read_notes_strips_leading_utf8_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_dir = tmp.path().join("pages").join("page-bom");
+        fs::create_dir_all(&page_dir).unwrap();
+        let notes_path = page_dir.join("notes.md");
+
+        let body = "hello notes";
+        let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(body.as_bytes());
+        fs::write(&notes_path, &bytes).unwrap();
+
+        let s = read_notes(tmp.path(), "any-app", "page-bom")
+            .expect("read_notes must accept BOM-prefixed content")
+            .expect("file is present so result must be Some");
+        assert_eq!(s, "hello notes");
+    }
+
+    /// Non-BOM input must continue to round-trip unchanged — the BOM
+    /// strip helper is a no-op on clean JSON.
+    #[test]
+    fn read_ir_without_bom_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_dir = tmp.path().join("pages").join("page-clean");
+        fs::create_dir_all(&page_dir).unwrap();
+        let ir_path = page_dir.join("state-machine.derived.json");
+        let body = r#"{"version":"1.0","id":"page-clean","name":"Clean page","states":[],"transitions":[]}"#;
+        fs::write(&ir_path, body).unwrap();
+
+        let doc = read_ir(tmp.path(), "any-app", "page-clean")
+            .expect("read_ir on clean JSON")
+            .expect("file present");
+        assert_eq!(doc.id, "page-clean");
+    }
+}
 
 #[cfg(all(test, feature = "spec-authoring"))]
 mod pending_tests {
