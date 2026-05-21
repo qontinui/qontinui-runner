@@ -408,15 +408,37 @@ pub async fn publish_on_startup(pg: &Arc<PgDb>, role: MachineRole) {
 struct HeartbeatPayload {
     device_id: uuid::Uuid,
     hostname: String,
+    /// PR Merge Orchestrator Phase 8 D8.0 — whether `claude --version`
+    /// resolves on this device's PATH. Coord's `tenant_has_audit_capable_device`
+    /// helper joins on `coord.devices.claude_code_available = true` AND
+    /// `last_seen_at > now() - 5m`; the auditor + merge-specialist spawn
+    /// path refuses to route work to a device whose latest heartbeat
+    /// reported `false`. Cached for 60s per `claude_code_probe()` to keep
+    /// the heartbeat's hot path cheap.
+    #[serde(skip_serializing_if = "is_false")]
+    claude_code_available: bool,
 }
 
-/// POST `{device_id, hostname}` to `<base>/coord/devices/register`.
+/// Suppress serializing the field when it's the default. Keeps the
+/// heartbeat wire small for the historical "no claude installed" case
+/// while still flipping `coord.devices.claude_code_available` to `true`
+/// the moment the probe starts passing.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// POST `{device_id, hostname, claude_code_available}` to
+/// `<base>/coord/devices/register`.
 ///
 /// `health_url` is deliberately omitted — coord's `register_device`
 /// handler `COALESCE`s `EXCLUDED.health_url` with the existing value,
 /// so omitting from the heartbeat preserves any URL the device
-/// previously advertised. Failures are reported as `Err(String)` so
-/// the caller can log them; the loop never panics.
+/// previously advertised.
+///
+/// `claude_code_available` (PR Merge Orchestrator Phase 8 D8.0) is the
+/// straight-write field that gates the auditor spawn. Detected via
+/// [`claude_code_probe`] (cached 60s). Failures are reported as
+/// `Err(String)` so the caller can log them; the loop never panics.
 pub async fn heartbeat_to_coord() -> Result<(), String> {
     let device = match load_device_file() {
         Some(d) => d,
@@ -448,9 +470,12 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         }
     };
 
+    let claude_code_available = claude_code_probe();
+
     let payload = HeartbeatPayload {
         device_id,
         hostname: device.hostname.clone(),
+        claude_code_available,
     };
     let url = format!("{base}/coord/devices/register");
 
@@ -479,6 +504,118 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         let body = resp.text().await.unwrap_or_default();
         let excerpt: String = body.chars().take(200).collect();
         Err(format!("coord returned {status} for POST {url}: {excerpt}"))
+    }
+}
+
+// =============================================================================
+// PR Merge Orchestrator Phase 8 D8.0 — Claude Code availability probe.
+//
+// The auditor + merge-specialist spawn paths require an audit-capable device
+// (paired + `claude --version` resolves). The runner self-probes and reports
+// the result on every heartbeat tick (`coord.devices.claude_code_available`).
+//
+// Probe is cached in-process for 60s — `claude --version` is cheap (<100ms
+// typical) but spawning a subprocess every 30s heartbeat is wasteful and
+// adds spurious load on the host. Cache invalidates after 60s, so a fresh
+// install / uninstall / PATH change is reflected within at most 1.5
+// heartbeat intervals.
+// =============================================================================
+
+use std::sync::Mutex;
+
+/// Cached result of the most recent `claude --version` probe + when it
+/// was taken. `Mutex` serializes the (cheap, infrequent) re-probe call.
+static CLAUDE_PROBE_CACHE: Mutex<Option<(bool, std::time::Instant)>> = Mutex::new(None);
+
+/// Cache TTL — 60s. Picked to be slightly larger than the default
+/// heartbeat interval (30s), so two consecutive heartbeats reuse a
+/// single probe result. Override via `COORD_CLAUDE_PROBE_TTL_SECS` for
+/// tests.
+fn claude_probe_ttl() -> Duration {
+    let secs: u64 = std::env::var("COORD_CLAUDE_PROBE_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+/// Detect whether `claude --version` resolves on PATH. Returns `true`
+/// iff `claude` is invokable AND exits 0 within a 3s budget.
+///
+/// Cached per [`CLAUDE_PROBE_CACHE`] for [`claude_probe_ttl`]. The
+/// probe is `Command::new("claude").arg("--version")` with stdout +
+/// stderr captured (so a Claude Code that prints to stderr still counts
+/// as available). A child that times out, panics, or never spawns
+/// counts as unavailable.
+pub fn claude_code_probe() -> bool {
+    {
+        // Fast-path: cache hit.
+        let guard = CLAUDE_PROBE_CACHE.lock();
+        if let Ok(g) = guard {
+            if let Some((cached, taken)) = *g {
+                if taken.elapsed() < claude_probe_ttl() {
+                    return cached;
+                }
+            }
+        }
+    }
+    let detected = detect_claude_code_now();
+    if let Ok(mut g) = CLAUDE_PROBE_CACHE.lock() {
+        *g = Some((detected, std::time::Instant::now()));
+    }
+    detected
+}
+
+/// Uncached one-shot probe. Pure side-effect (spawns + waits on a
+/// subprocess); should never be called from a hot path directly.
+fn detect_claude_code_now() -> bool {
+    use std::process::Command;
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let child = Command::new("claude")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("claude_code_probe: spawn failed ({e}) — treating as unavailable");
+            return false;
+        }
+    };
+    // Bounded wait: poll at 50ms intervals up to 3s. Avoids dragging the
+    // heartbeat tick when a `claude` binary is wedged.
+    let deadline = started + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let ok = status.success();
+                debug!(
+                    "claude_code_probe: claude --version exited status={:?} ok={ok} in {}ms",
+                    status.code(),
+                    started.elapsed().as_millis()
+                );
+                return ok;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    warn!(
+                        "claude_code_probe: claude --version exceeded 3s budget — treating as unavailable"
+                    );
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                warn!("claude_code_probe: try_wait failed ({e}) — treating as unavailable");
+                return false;
+            }
+        }
     }
 }
 
@@ -970,6 +1107,63 @@ mod tests {
             r.disk_total_gb >= 1,
             "expected ≥1 GiB disk, got {}",
             r.disk_total_gb
+        );
+    }
+
+    // ---- PR Merge Orchestrator Phase 8 D8.0 — claude probe -----------
+
+    /// Smoke: the probe never panics; whether `claude` is on PATH varies
+    /// per host so we only assert the function returns a `bool`. This
+    /// also exercises the cache-fill path (first call) + cache-hit path
+    /// (second call) without spawning twice.
+    #[test]
+    fn claude_code_probe_smoke() {
+        // Clear any inherited cache state from earlier tests in the
+        // same process.
+        if let Ok(mut g) = CLAUDE_PROBE_CACHE.lock() {
+            *g = None;
+        }
+        let first = claude_code_probe();
+        let second = claude_code_probe();
+        // Cache invariant — two back-to-back calls must agree.
+        assert_eq!(
+            first, second,
+            "claude_code_probe must be cache-stable across consecutive calls"
+        );
+    }
+
+    /// The heartbeat payload's `claude_code_available` field is
+    /// `#[serde(skip_serializing_if = "is_false")]` so devices without
+    /// claude installed continue to serialize the same wire shape as
+    /// pre-Phase-8 (no regression for the long-tail of fleet hosts).
+    /// Devices WITH claude flip the field to `true` and it appears on
+    /// the wire.
+    #[test]
+    fn heartbeat_payload_omits_false_claude_field() {
+        let p = HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: false,
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert!(
+            body.get("claude_code_available").is_none(),
+            "false value should be omitted from heartbeat wire"
+        );
+    }
+
+    #[test]
+    fn heartbeat_payload_includes_true_claude_field() {
+        let p = HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: true,
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            body.get("claude_code_available").and_then(|v| v.as_bool()),
+            Some(true),
+            "true value must appear on the heartbeat wire"
         );
     }
 }
