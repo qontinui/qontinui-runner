@@ -90,13 +90,24 @@ export default function CostControlPanel() {
             </li>
           ))}
         </ul>
+        <button
+          type="button"
+          onClick={refresh}
+          className="mt-2 inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-md bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors"
+        >
+          <RefreshCw className="w-3 h-3" />
+          Retry
+        </button>
       </div>
     </div>
   ) : null;
 
   // Initial load skeleton: keep heading visible and approximate the eventual
-  // layout so the page doesn't "pop" when data arrives.
-  if (isLoading && !dashboard && !activeBudget) {
+  // layout so the page doesn't "pop" when data arrives. Skip the skeleton
+  // and fall through to the main layout (which already renders the error
+  // banner + retry button) once a fetch error is registered — without this,
+  // a timeout would re-trigger the skeleton on every refetchInterval tick.
+  if (isLoading && !dashboard && !activeBudget && !status.isError) {
     return (
       <div className="h-full overflow-auto p-4 space-y-4">
         {header}

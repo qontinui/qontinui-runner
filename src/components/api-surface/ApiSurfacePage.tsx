@@ -23,6 +23,30 @@ const ALL_LAYERS: NodeCategory[] = [
   "db_table",
 ];
 
+function LayerHint({
+  color,
+  label,
+  description,
+}: {
+  color: string;
+  label: string;
+  description: string;
+}) {
+  return (
+    <div className="flex items-start gap-2">
+      <span
+        aria-hidden
+        className="mt-1 inline-block w-2 h-2 rounded-full shrink-0"
+        style={{ backgroundColor: color }}
+      />
+      <div className="min-w-0">
+        <p className="font-semibold text-zinc-300">{label}</p>
+        <p className="text-zinc-500">{description}</p>
+      </div>
+    </div>
+  );
+}
+
 export function ApiSurfacePage() {
   const [surface, setSurface] = useState<ApiSurface | null>(null);
   const [diff, setDiff] = useState<ApiSurfaceDiff | null>(null);
@@ -207,18 +231,80 @@ export function ApiSurfacePage() {
           )}
         </div>
       ) : (
-        <div className="flex-1 flex items-center justify-center">
-          <div className="text-center">
-            <p className="text-zinc-400 text-sm mb-3">
-              Scan the codebase to map all API endpoints and their connections
-            </p>
-            <button
-              onClick={handleScan}
-              disabled={scanning}
-              className="px-4 py-2 text-sm font-medium rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white"
-            >
-              {scanning ? "Scanning..." : "Start Scan"}
-            </button>
+        <div className="flex-1 overflow-auto p-6">
+          <div className="max-w-3xl mx-auto space-y-6">
+            {/* Hero / CTA */}
+            <div className="text-center space-y-3">
+              <h3 className="text-lg font-semibold text-zinc-200">No API surface data yet</h3>
+              <p className="text-zinc-400 text-sm">
+                Scan the codebase to map all API endpoints and their connections across the
+                runner&rsquo;s layered architecture.
+              </p>
+              <button
+                onClick={handleScan}
+                disabled={scanning}
+                className="px-4 py-2 text-sm font-medium rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white"
+                data-testid="api-surface-start-scan"
+              >
+                {scanning ? "Scanning..." : "Start Scan"}
+              </button>
+            </div>
+
+            {/* What gets scanned — layer explainer */}
+            <div className="rounded-lg border border-zinc-700/50 bg-zinc-800/40 p-4">
+              <h4 className="text-xs font-semibold uppercase tracking-wide text-zinc-400 mb-3">
+                What the scan discovers
+              </h4>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <LayerHint
+                  color="#f97316"
+                  label="Tauri commands"
+                  description="Frontend ↔ Rust IPC handlers registered via generate_handler!"
+                />
+                <LayerHint
+                  color="#22c55e"
+                  label="MCP routes"
+                  description="HTTP endpoints exposed by mcp_api.rs (axum routes)"
+                />
+                <LayerHint
+                  color="#a855f7"
+                  label="PgDb methods"
+                  description="Database access wrappers around Clorinde-generated queries"
+                />
+                <LayerHint
+                  color="#06b6d4"
+                  label="Clorinde queries"
+                  description="SQL templates compiled into typed Rust functions"
+                />
+                <LayerHint
+                  color="#71717a"
+                  label="DB tables"
+                  description="Tables touched by Clorinde queries"
+                />
+                <LayerHint
+                  color="#eab308"
+                  label="Python events"
+                  description="Events emitted from the Python bridge into Rust"
+                />
+              </div>
+            </div>
+
+            {/* Why this matters */}
+            <div className="rounded-lg border border-zinc-700/50 bg-zinc-800/40 p-4 text-xs text-zinc-400 space-y-2">
+              <p>
+                <span className="font-semibold text-zinc-300">Orphans</span> are endpoints that have
+                no caller (Tauri command never invoked from the frontend, MCP route with no client,
+                etc.) — handy for finding dead code.
+              </p>
+              <p>
+                <span className="font-semibold text-zinc-300">Diffs</span> against the saved
+                snapshot highlight surface changes between scans so you can spot accidental
+                breakages early.
+              </p>
+              <p>
+                The scan is read-only; it parses source files and never mutates state.
+              </p>
+            </div>
           </div>
         </div>
       )}

@@ -117,6 +117,32 @@ export default function EvaluationDashboard() {
 
   // Error state
   if (datasetsError) {
+    // The evaluation dataset REST endpoints (`/api/v1/evaluation/datasets`)
+    // are not yet implemented in the runner backend. Distinguish a clean
+    // "not implemented" 404 from a transient failure so the page surfaces
+    // an informative empty-state rather than a generic "Failed to load"
+    // banner that previously cluttered the console with API 404s. When the
+    // backend routes land, the existing TanStack Query branch already
+    // handles success.
+    const isNotImplemented = datasetsError.includes("API 404");
+    if (isNotImplemented) {
+      return (
+        <div className="h-full flex items-center justify-center text-muted-foreground">
+          <div className="text-center max-w-md px-6">
+            <FlaskConical className="w-12 h-12 mx-auto mb-4 opacity-50" />
+            <p className="font-medium">Evaluation Dashboard</p>
+            <p className="text-sm mt-2">
+              The evaluation backend is not yet enabled in this runner build.
+              Datasets and experiments will appear here once the
+              <code className="mx-1 px-1 py-0.5 rounded bg-muted text-xs">
+                /api/v1/evaluation/datasets
+              </code>
+              endpoints are available.
+            </p>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="h-full flex items-center justify-center text-muted-foreground">
         <div className="text-center">

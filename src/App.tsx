@@ -312,11 +312,27 @@ function AppContent() {
   }, []);
 
   useEffect(() => {
-    if (auth.authStatus?.authenticated && !auth.loading) {
+    // Gate the project fetch on the *settled* auth state. Without the
+    // `devAutoLoginPending` check, a temp test runner that boots with
+    // `QONTINUI_TEST_AUTO_LOGIN_*` env vars races: the initial
+    // `check_auth_status` resolves first with `authenticated: false`,
+    // `loading` flips false, and although this effect won't fire its
+    // happy-path branch, a stale-keychain read from a sibling reload
+    // path can still produce a "Not authenticated" surface before the
+    // auto-login flow swaps the token. Waiting for the auto-login retry
+    // chain to settle (devAutoLoginPending → false) ensures the
+    // `get_user_projects` invoke runs only after the access token is in
+    // place. The retry-on-Not-authenticated inside `loadProjects` still
+    // covers the rare keychain-write/read ordering blip.
+    if (
+      auth.authStatus?.authenticated &&
+      !auth.loading &&
+      !auth.devAutoLoginPending
+    ) {
       projectSelection.loadProjects();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- loadProjects changes with selectedProjectId; including it would reload projects on every selection change
-  }, [auth.authStatus?.authenticated, auth.loading]);
+  }, [auth.authStatus?.authenticated, auth.loading, auth.devAutoLoginPending]);
 
   useEffect(() => {
     if (projectSelection.selectedProjectId && projectSelection.selectedProjectName) {
