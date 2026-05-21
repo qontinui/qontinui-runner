@@ -327,12 +327,9 @@ mod handler_tests {
         super::super::storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc_a).unwrap();
         super::super::storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc_b).unwrap();
 
-        let resp = super::super::handlers::build_list_response(
-            root,
-            RUNNER_APP_ID,
-            "Qontinui Runner",
-        )
-        .into_response();
+        let resp =
+            super::super::handlers::build_list_response(root, RUNNER_APP_ID, "Qontinui Runner")
+                .into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
@@ -648,8 +645,11 @@ mod handler_tests {
         )
         .unwrap();
 
-        let resp =
-            super::super::handlers::build_list_response(tmp.path(), RUNNER_APP_ID, "Qontinui Runner");
+        let resp = super::super::handlers::build_list_response(
+            tmp.path(),
+            RUNNER_APP_ID,
+            "Qontinui Runner",
+        );
         let (status, v) = response_to_json(resp).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         let specs = v["specs"].as_array().expect("specs must be an array");
