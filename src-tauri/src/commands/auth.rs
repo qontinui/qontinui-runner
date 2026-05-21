@@ -655,14 +655,37 @@ pub struct TestAutoLoginCreds {
 /// Returns `None` for normal primary runners where the env vars are absent.
 /// This is safe to expose: it only reveals credentials the process already has
 /// in its own environment — no privilege escalation.
+///
+/// # Logging contract (phase-8 manual-test remediation)
+///
+/// When this returns `None`, the call site logs at `INFO` with target
+/// `test_auto_login_skipped` and a `reason=<AUTO_LOGIN_SKIP_*>` field so
+/// an operator staring at a LoginScreen can `grep test_auto_login_skipped`
+/// `runner-tauri.log` to determine why auto-login didn't fire. The log is
+/// emitted on every invocation rather than deduped via a once-flag — the
+/// AuthProvider effect invokes this exactly once per mount, HMR reloads
+/// are dev-only noise, and the cost of an extra info line is negligible
+/// compared to the cost of silent failure.
 #[tauri::command]
 pub fn get_test_auto_login(
     launch_env: tauri::State<'_, crate::launch_env::SharedLaunchEnv>,
 ) -> Option<TestAutoLoginCreds> {
-    launch_env.auto_login.as_ref().map(|c| TestAutoLoginCreds {
-        email: c.email.clone(),
-        password: c.password.clone(),
-    })
+    match launch_env.auto_login.as_ref() {
+        Some(c) => Some(TestAutoLoginCreds {
+            email: c.email.clone(),
+            password: c.password.clone(),
+        }),
+        None => {
+            // `auto_login_skip_reason` is `Some` whenever `auto_login` is
+            // `None` — populated from `classify_test_auto_login` in
+            // `RunnerLaunchEnv::read`. The `unwrap_or` guards against a
+            // future code path that sets `auto_login = None` without
+            // populating the reason; preserves the log contract.
+            let reason = launch_env.auto_login_skip_reason.unwrap_or("unknown");
+            info!(reason = %reason, "test_auto_login_skipped");
+            None
+        }
+    }
 }
 
 /// Returns the current runner tier. Frontend gates its auth-touching effects

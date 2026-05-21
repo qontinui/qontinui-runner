@@ -384,6 +384,26 @@ export function AuthProvider({ children }: AuthProviderProps) {
             // Clear pending flag on non-retryable failure so user can see login screen
             devLoginFailed.current = true;
             setDevAutoLoginPending(false);
+            // Phase 8 (manual-test remediation): surface the failure as a
+            // toast so an operator parked on the LoginScreen knows the
+            // auto-login attempt was made and failed — distinguishing
+            // "credentials configured but rejected / network down" from
+            // "no test credentials configured at all" (the latter returns
+            // None from get_test_auto_login and never reaches this branch).
+            //
+            // Dispatched as a window event because the toast registry
+            // lives at App-level (outside AuthProvider). The companion
+            // listener in App.tsx maps this to showToast(..., "error").
+            // The Rust-side `tracing::info!(reason, "test_auto_login_skipped")`
+            // log (commands/auth.rs::get_test_auto_login) is the primary
+            // diagnostic surface; the toast is a thin UI hint pointing
+            // operators at runner-tauri.log.
+            const cause = isTransientError ? "network" : "credentials";
+            window.dispatchEvent(
+              new CustomEvent("test-auto-login-failed", {
+                detail: { cause, error: errStr },
+              }),
+            );
           }
         });
     },

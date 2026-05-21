@@ -106,6 +106,13 @@ declare global {
     "sm-show-exploration": Event;
     "sm-config-changed": CustomEvent<{ configId: string | null }>;
     "runner-name-changed": CustomEvent<string>;
+    // Phase 8 (manual-test remediation) — AuthProvider dispatches this when
+    // a credential-bearing auto-login attempt fails non-recoverably so an
+    // App-level listener can toast the operator. `cause` is one of
+    // "network" (transient retries exhausted) or "credentials" (auth
+    // error — bad password, account locked, etc.); `error` is the raw
+    // error string for log correlation.
+    "test-auto-login-failed": CustomEvent<{ cause: "network" | "credentials"; error: string }>;
   }
 }
 
@@ -273,6 +280,26 @@ function AppContent() {
   const { alerts: canaryAlerts, dismissAlert: dismissCanaryAlert } = useCanaryAlerts();
   const { toasts, showToast, dismissToast } = useToast();
   useErrorNotifications(showToast);
+
+  // Phase 8 (manual-test remediation) — surface failed auto-login attempts.
+  // AuthProvider dispatches `test-auto-login-failed` only when a credential-
+  // bearing auto-login attempt produced a non-retryable error (or exhausted
+  // retries). The "no credentials configured" case is silent — that's the
+  // standard primary-runner path and would be noisy for normal users. The
+  // toast is intentionally thin; the rich diagnostic ("reason=<...>") is in
+  // runner-tauri.log via `tracing::info!(target: "test_auto_login_skipped")`.
+  useEffect(() => {
+    const onAutoLoginFailed = (e: Event) => {
+      const detail = (e as CustomEvent<{ cause?: string }>).detail;
+      const cause = detail?.cause === "network" ? "network" : "credentials";
+      showToast(
+        `Auto-login failed (${cause}) — see runner-tauri.log`,
+        "error",
+      );
+    };
+    window.addEventListener("test-auto-login-failed", onAutoLoginFailed);
+    return () => window.removeEventListener("test-auto-login-failed", onAutoLoginFailed);
+  }, [showToast]);
 
   const { activities: backgroundActivities } = useBackgroundActivities({
     isExtracting: false,

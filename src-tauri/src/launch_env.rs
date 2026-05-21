@@ -61,6 +61,44 @@ pub struct TestAutoLogin {
     pub password: String,
 }
 
+/// Reasons `auto_login` may be `None`. Surfaced via
+/// `auto_login_skip_reason` so `get_test_auto_login` can log the
+/// specific control-flow branch that caused the skip — the FE-facing
+/// `Option<TestAutoLoginCreds>` return type alone hides this distinction
+/// and leaves operators staring at a LoginScreen with no diagnostic.
+///
+/// `&'static str` so log queries (`grep test_auto_login_skipped runner-tauri.log`)
+/// can match exactly, and so callers don't need to allocate to emit the field.
+pub const AUTO_LOGIN_SKIP_ENV_VARS_MISSING: &str = "env_vars_missing";
+pub const AUTO_LOGIN_SKIP_ENV_EMAIL_MISSING: &str = "env_email_missing";
+pub const AUTO_LOGIN_SKIP_ENV_PASSWORD_MISSING: &str = "env_password_missing";
+pub const AUTO_LOGIN_SKIP_ENV_CREDENTIALS_EMPTY: &str = "env_credentials_empty";
+
+/// Pure helper used by both [`RunnerLaunchEnv::read`] and the unit tests.
+///
+/// Returns `Ok(TestAutoLogin)` when both env vars are present and non-empty,
+/// `Err(&'static str)` with one of the `AUTO_LOGIN_SKIP_*` reasons otherwise.
+///
+/// Extracted so the skip-reason taxonomy can be verified without mutating
+/// process env — every branch is exercised directly via `Option<&str>` inputs.
+pub(crate) fn classify_test_auto_login(
+    email: Option<&str>,
+    password: Option<&str>,
+) -> Result<TestAutoLogin, &'static str> {
+    match (email, password) {
+        (None, None) => Err(AUTO_LOGIN_SKIP_ENV_VARS_MISSING),
+        (None, Some(_)) => Err(AUTO_LOGIN_SKIP_ENV_EMAIL_MISSING),
+        (Some(_), None) => Err(AUTO_LOGIN_SKIP_ENV_PASSWORD_MISSING),
+        (Some(e), Some(p)) if e.is_empty() || p.is_empty() => {
+            Err(AUTO_LOGIN_SKIP_ENV_CREDENTIALS_EMPTY)
+        }
+        (Some(e), Some(p)) => Ok(TestAutoLogin {
+            email: e.to_string(),
+            password: p.to_string(),
+        }),
+    }
+}
+
 /// Restate runtime overrides injected by the supervisor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestateEnvHints {
@@ -111,6 +149,13 @@ pub struct RunnerLaunchEnv {
     /// Both must be set and non-empty for `Some` to be returned.
     pub auto_login: Option<TestAutoLogin>,
 
+    /// Skip-reason tag when `auto_login` is `None`. One of the
+    /// `AUTO_LOGIN_SKIP_*` constants — see [`classify_test_auto_login`].
+    /// `None` when `auto_login` is `Some`. Surfaced by
+    /// `commands::auth::get_test_auto_login` to runner-tauri.log so an
+    /// operator stuck on a LoginScreen can grep for the exact reason.
+    pub auto_login_skip_reason: Option<&'static str>,
+
     /// Override for the panic-log directory (`QONTINUI_PANIC_LOG_DIR`).
     /// Note: `startup_panic.rs` historically reads `QONTINUI_RUNNER_LOG_DIR`
     /// for the same purpose — both are accepted; the runner-log-dir wins.
@@ -138,6 +183,7 @@ impl Default for RunnerLaunchEnv {
             server_mode: false,
             window: WindowEnvHints::default(),
             auto_login: None,
+            auto_login_skip_reason: Some(AUTO_LOGIN_SKIP_ENV_VARS_MISSING),
             panic_log_dir: None,
             runner_log_dir: None,
             webview2_user_data_dir: None,
@@ -177,15 +223,13 @@ impl RunnerLaunchEnv {
                 .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false"))),
         };
 
-        let auto_login = match (
-            std::env::var("QONTINUI_TEST_AUTO_LOGIN_EMAIL").ok(),
-            std::env::var("QONTINUI_TEST_AUTO_LOGIN_PASSWORD").ok(),
-        ) {
-            (Some(email), Some(password)) if !email.is_empty() && !password.is_empty() => {
-                Some(TestAutoLogin { email, password })
-            }
-            _ => None,
-        };
+        let email_raw = std::env::var("QONTINUI_TEST_AUTO_LOGIN_EMAIL").ok();
+        let password_raw = std::env::var("QONTINUI_TEST_AUTO_LOGIN_PASSWORD").ok();
+        let (auto_login, auto_login_skip_reason) =
+            match classify_test_auto_login(email_raw.as_deref(), password_raw.as_deref()) {
+                Ok(creds) => (Some(creds), None),
+                Err(reason) => (None, Some(reason)),
+            };
 
         let panic_log_dir = std::env::var("QONTINUI_PANIC_LOG_DIR")
             .ok()
@@ -220,6 +264,7 @@ impl RunnerLaunchEnv {
             server_mode,
             window,
             auto_login,
+            auto_login_skip_reason,
             panic_log_dir,
             runner_log_dir,
             webview2_user_data_dir,
@@ -256,6 +301,14 @@ mod tests {
         assert!(!env.is_secondary());
         assert_eq!(env.window, WindowEnvHints::default());
         assert!(env.auto_login.is_none());
+        // Default = "no env vars" which is the env-vars-missing case.
+        // Phase 8 (manual-test remediation): default is the canonical
+        // representation of a primary-runner launch, where the absence of
+        // QONTINUI_TEST_AUTO_LOGIN_* must surface as a logged skip reason.
+        assert_eq!(
+            env.auto_login_skip_reason,
+            Some(AUTO_LOGIN_SKIP_ENV_VARS_MISSING)
+        );
     }
 
     #[test]
@@ -319,5 +372,76 @@ mod tests {
         let env = RunnerLaunchEnv::read();
         let _ = env.is_secondary();
         let _ = env.kind;
+    }
+
+    // -- classify_test_auto_login: phase-8 manual-test remediation --
+    //
+    // Pure-helper tests that exercise every skip-reason branch without
+    // mutating process env. The exact reason strings are part of the
+    // operator-grep contract (`grep test_auto_login_skipped runner-tauri.log`),
+    // so the assertions check the constants verbatim.
+
+    #[test]
+    fn classify_both_missing_yields_env_vars_missing() {
+        assert_eq!(
+            classify_test_auto_login(None, None),
+            Err(AUTO_LOGIN_SKIP_ENV_VARS_MISSING)
+        );
+    }
+
+    #[test]
+    fn classify_only_password_yields_email_missing() {
+        assert_eq!(
+            classify_test_auto_login(None, Some("p")),
+            Err(AUTO_LOGIN_SKIP_ENV_EMAIL_MISSING)
+        );
+    }
+
+    #[test]
+    fn classify_only_email_yields_password_missing() {
+        assert_eq!(
+            classify_test_auto_login(Some("e@x"), None),
+            Err(AUTO_LOGIN_SKIP_ENV_PASSWORD_MISSING)
+        );
+    }
+
+    #[test]
+    fn classify_empty_strings_yield_credentials_empty() {
+        assert_eq!(
+            classify_test_auto_login(Some(""), Some("p")),
+            Err(AUTO_LOGIN_SKIP_ENV_CREDENTIALS_EMPTY)
+        );
+        assert_eq!(
+            classify_test_auto_login(Some("e@x"), Some("")),
+            Err(AUTO_LOGIN_SKIP_ENV_CREDENTIALS_EMPTY)
+        );
+        assert_eq!(
+            classify_test_auto_login(Some(""), Some("")),
+            Err(AUTO_LOGIN_SKIP_ENV_CREDENTIALS_EMPTY)
+        );
+    }
+
+    #[test]
+    fn classify_both_set_returns_creds() {
+        assert_eq!(
+            classify_test_auto_login(Some("e@x"), Some("p")),
+            Ok(TestAutoLogin {
+                email: "e@x".to_string(),
+                password: "p".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn auto_login_skip_reason_constants_are_distinct() {
+        // Operator-grep contract: each reason must be a unique &'static str.
+        let reasons = [
+            AUTO_LOGIN_SKIP_ENV_VARS_MISSING,
+            AUTO_LOGIN_SKIP_ENV_EMAIL_MISSING,
+            AUTO_LOGIN_SKIP_ENV_PASSWORD_MISSING,
+            AUTO_LOGIN_SKIP_ENV_CREDENTIALS_EMPTY,
+        ];
+        let unique: std::collections::HashSet<_> = reasons.iter().copied().collect();
+        assert_eq!(unique.len(), reasons.len());
     }
 }
