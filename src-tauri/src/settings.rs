@@ -927,8 +927,18 @@ pub struct WebIntegrationSettings {
     #[serde(default)]
     pub web_base_url: Option<String>,
 
-    /// Plain runner token (qontinui_runner_<64hex>) created via the web UI or API.
+    /// Long-lived runner-side bearer (qontinui_runner_<64hex>) minted by
+    /// web's `/connect-runner` flow and exchanged for a coord-issued
+    /// device-JWT by `mcp::device_jwt_refresher`. Phase 3 of the
+    /// unified-devices migration removed this from the WS handshake; it
+    /// is now presented ONLY on outbound HTTP to `<coord>/coord/devices/
+    /// pair-cli` as the OAuth-style bearer. The relay's `Authorization:
+    /// Bearer` header comes from `AuthManager`'s access_token slot (the
+    /// device-JWT) instead.
+    ///
     /// Stored plaintext — acceptable since the settings file is user-local.
+    /// The device-JWT itself lives in `AuthManager`'s encrypted file
+    /// storage (`auth_tokens.enc`).
     #[serde(default)]
     pub runner_token: String,
 }
@@ -1740,6 +1750,28 @@ pub fn load_settings() -> Settings {
             info!(
                 "Persisted tier/local_user_id migration (tier={:?}, local_user_id set)",
                 settings.tier
+            );
+        }
+    }
+
+    // One-shot post-upgrade detector: if Tier 2 + has a runner_token + the
+    // access_token slot does NOT look like a JWT (likely the legacy opaque
+    // `qontinui_runner_<random>` bearer from pre-unified-devices days), log
+    // so the device_jwt_refresher knows to attempt a pair on its next tick.
+    // The refresher's tick interval is 5min; user-visible recovery is
+    // surfaced via WebIntegrationAuthBanner if the pair-cli call keeps
+    // failing for >5min (Phase 4.3 of the unified-devices migration plan).
+    if settings.tier == RunnerTier::QontinuiAccount
+        && !settings.web_integration.runner_token.trim().is_empty()
+    {
+        let access_token = crate::auth::AuthManager::new()
+            .get_access_token()
+            .unwrap_or_default();
+        if !crate::auth::looks_like_jwt(&access_token) {
+            tracing::info!(
+                "Tier 2 install detected without device-JWT (access_token slot \
+                 is {} bytes, not JWT-shaped) — refresher will pair-cli on next tick",
+                access_token.len()
             );
         }
     }

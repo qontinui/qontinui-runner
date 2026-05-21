@@ -7,11 +7,15 @@
  * doesn't bundle jsdom).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  makeRePairClickHandler,
+  RE_PAIR_CTA_GRACE_MS,
   shouldShowAuthBanner,
+  shouldShowRePairCta,
   statusSignature,
   type AuthBannerStatus,
+  type RePairCtaInputs,
 } from "./web-integration-banner-logic";
 
 const baseFreshInstall: AuthBannerStatus = {
@@ -71,6 +75,94 @@ describe("shouldShowAuthBanner", () => {
     const dismissedWhenTokenSet = statusSignature(withToken);
     // Token is now empty again:
     expect(shouldShowAuthBanner(baseFreshInstall, dismissedWhenTokenSet)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4 (unified-devices migration): re-pair CTA
+// ---------------------------------------------------------------------------
+
+const baseMigrationInputs: RePairCtaInputs = {
+  tier: "qontinui_account",
+  runnerTokenPresent: true,
+  deviceJwtPresent: false,
+  firstDetectedAt: null,
+  now: 1_000_000,
+};
+
+describe("shouldShowRePairCta (post-upgrade migration)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(1_000_000));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does_not_render_re_pair_cta_immediately_after_boot", () => {
+    // Fresh mount: the migration state JUST got detected. The grace
+    // period hasn't elapsed yet, so the CTA stays hidden — we don't
+    // want to flash a "re-pair required" message on every boot while
+    // the refresher is doing its job.
+    const detectedAt = Date.now();
+    expect(
+      shouldShowRePairCta({
+        ...baseMigrationInputs,
+        firstDetectedAt: detectedAt,
+        now: detectedAt,
+      }),
+    ).toBe(false);
+  });
+
+  it("renders_re_pair_cta_after_5min_timeout", () => {
+    // Same migration state, but `RE_PAIR_CTA_GRACE_MS` has elapsed —
+    // the refresher hasn't healed the gap, so surface the manual CTA.
+    const detectedAt = Date.now();
+    vi.advanceTimersByTime(RE_PAIR_CTA_GRACE_MS);
+    expect(
+      shouldShowRePairCta({
+        ...baseMigrationInputs,
+        firstDetectedAt: detectedAt,
+        now: Date.now(),
+      }),
+    ).toBe(true);
+  });
+
+  it("re_pair_cta_calls_kick_refresher_on_click", async () => {
+    // The component delegates the click handler to `makeRePairClickHandler`
+    // so the click → invoke contract can be locked down in node without
+    // a DOM. Wire a spy into the invoker slot, fire the handler, assert.
+    const invokeSpy = vi.fn().mockResolvedValue(undefined);
+    const click = makeRePairClickHandler(invokeSpy);
+    await click();
+    expect(invokeSpy).toHaveBeenCalledTimes(1);
+    expect(invokeSpy).toHaveBeenCalledWith("kick_device_jwt_refresher_cmd", {});
+  });
+
+  it("hides re-pair CTA on Tier 0/1 even when the rest of the state qualifies", () => {
+    const detectedAt = Date.now();
+    vi.advanceTimersByTime(RE_PAIR_CTA_GRACE_MS);
+    expect(
+      shouldShowRePairCta({
+        ...baseMigrationInputs,
+        tier: "local",
+        firstDetectedAt: detectedAt,
+        now: Date.now(),
+      }),
+    ).toBe(false);
+  });
+
+  it("hides re-pair CTA once a device-JWT lands", () => {
+    const detectedAt = Date.now();
+    vi.advanceTimersByTime(RE_PAIR_CTA_GRACE_MS);
+    expect(
+      shouldShowRePairCta({
+        ...baseMigrationInputs,
+        deviceJwtPresent: true,
+        firstDetectedAt: detectedAt,
+        now: Date.now(),
+      }),
+    ).toBe(false);
   });
 });
 

@@ -53,3 +53,78 @@ export function shouldShowAuthBanner(
   }
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 (unified-devices migration): re-pair CTA
+// ---------------------------------------------------------------------------
+
+/**
+ * Inputs for {@link shouldShowRePairCta}. All fields originate from
+ * Tauri-side state at render time:
+ *
+ *   - `tier` — from `get_runner_tier` (via `useRunnerTier`)
+ *   - `runnerTokenPresent` — derived from `runnerTokenMasked.length > 0`
+ *   - `deviceJwtPresent` — from the `device_jwt_present` Tauri command
+ *   - `firstDetectedAt` — ms timestamp of the first render at which the
+ *     above three conditions all aligned this session (component state,
+ *     NOT settings — transient UI signal)
+ *   - `now` — current time in ms (passed in for testability)
+ *
+ * Returns true iff the migration banner should surface RIGHT NOW. The
+ * 5-minute grace period covers the device-JWT refresher's normal tick:
+ * if the refresher is already healing the gap, we don't want to flash a
+ * "re-pair required" message on every boot.
+ */
+export interface RePairCtaInputs {
+  tier: string;
+  runnerTokenPresent: boolean;
+  deviceJwtPresent: boolean;
+  firstDetectedAt: number | null;
+  now: number;
+}
+
+/** 5 minutes in milliseconds — matches the device-JWT refresher's tick. */
+export const RE_PAIR_CTA_GRACE_MS = 5 * 60 * 1000;
+
+/**
+ * Decide whether to surface the post-upgrade re-pair CTA. See
+ * {@link RePairCtaInputs} for input semantics.
+ *
+ * Visibility rule:
+ *   - Hide unless tier === "qontinui_account" (Tier 2 only).
+ *   - Hide unless this runner WAS paired pre-upgrade (runner_token present).
+ *   - Hide if a device-JWT is already present (refresher succeeded).
+ *   - Hide if the migration state has been detected for less than 5min
+ *     (RE_PAIR_CTA_GRACE_MS) — covers transient boot-time staleness.
+ *
+ * Note: `firstDetectedAt === null` means we haven't observed the
+ * migration state yet → hide. The component records the timestamp on
+ * the first render where the underlying state qualifies.
+ */
+export function shouldShowRePairCta(input: RePairCtaInputs): boolean {
+  if (input.tier !== "qontinui_account") return false;
+  if (!input.runnerTokenPresent) return false;
+  if (input.deviceJwtPresent) return false;
+  if (input.firstDetectedAt === null) return false;
+  return input.now - input.firstDetectedAt >= RE_PAIR_CTA_GRACE_MS;
+}
+
+/** Command name the re-pair CTA invokes — extracted so tests can assert
+ * the contract without importing `@tauri-apps/api/core` (which throws at
+ * module load in node).
+ */
+export const KICK_DEVICE_JWT_REFRESHER_CMD = "kick_device_jwt_refresher_cmd";
+
+/**
+ * Build a click handler that invokes the device-JWT refresher kick.
+ * Extracted so the test suite can assert the click → invoke wiring in
+ * `node` without a DOM. Returns a Promise that resolves once the invoke
+ * call settles (success or thrown).
+ */
+export function makeRePairClickHandler(
+  invoker: (cmd: string, args: Record<string, unknown>) => Promise<void>,
+): () => Promise<void> {
+  return async () => {
+    await invoker(KICK_DEVICE_JWT_REFRESHER_CMD, {});
+  };
+}
