@@ -423,7 +423,9 @@ mod tests {
         let frontend = services
             .iter()
             .find(|s| s.health_port == Some(3001))
-            .expect("frontend dev service should be emitted for a workspace with frontend/package.json");
+            .expect(
+                "frontend dev service should be emitted for a workspace with frontend/package.json",
+            );
 
         assert_eq!(frontend.command, "npx");
         assert!(
@@ -445,7 +447,10 @@ mod tests {
             .iter()
             .position(|a| a == "--port")
             .expect("--port present");
-        assert_eq!(frontend.args.get(port_idx + 1).map(String::as_str), Some("3001"));
+        assert_eq!(
+            frontend.args.get(port_idx + 1).map(String::as_str),
+            Some("3001")
+        );
         let host_idx = frontend
             .args
             .iter()
