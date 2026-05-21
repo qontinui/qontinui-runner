@@ -1,188 +1,191 @@
-{
-  "version": "1.0",
-  "id": "run-state-explorer",
-  "name": "StateExplorerTab",
-  "states": [
-    {
-      "id": "state-explorer-history-browsing",
-      "name": "Exploration History Browsing",
-      "assertions": [
-        {
-          "id": "state-explorer-history-browsing-elem-0",
-          "description": "Required element 0 for state Exploration History Browsing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "exploration|history|state"
-            },
-            "label": "Required element for Exploration History Browsing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-explorer-history-browsing-elem-1",
-          "description": "Required element 1 for state Exploration History Browsing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Exploration History Browsing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-explorer-history-browsing-elem-2",
-          "description": "Required element 2 for state Exploration History Browsing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No Run Selected|Select a run"
-            },
-            "label": "Required element for Exploration History Browsing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The State Explorer presents a history of past state exploration runs associated with the selected workflow run. Each exploration represents a point-in-time capture of the target application's UI state. Users browse this history to find specific exploration runs, understand the progression of state changes across the workflow, and select individual explorations for detailed review. The history view is the entry point for all state analysis.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "state-explorer-report-viewing",
-      "name": "Exploration Report Viewing",
-      "assertions": [
-        {
-          "id": "state-explorer-report-viewing-elem-0",
-          "description": "Required element 0 for state Exploration Report Viewing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "report|state|exploration"
-            },
-            "label": "Required element for Exploration Report Viewing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-explorer-report-viewing-elem-1",
-          "description": "Required element 1 for state Exploration Report Viewing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Back|History"
-            },
-            "label": "Required element for Exploration Report Viewing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-explorer-report-viewing-elem-2",
-          "description": "Required element 2 for state Exploration Report Viewing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "AI|prompt|analyze"
-            },
-            "label": "Required element for Exploration Report Viewing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When the user selects a specific exploration from the history, they see a detailed report of the captured state. This report shows the UI elements that were discovered, their properties and values, and the overall structure of the application at that point in time. The report is the core analytical artifact that helps developers verify whether expected state changes occurred during workflow execution.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "state-explorer-verification-support",
-      "name": "Verification and Debugging Support",
-      "assertions": [
-        {
-          "id": "state-explorer-verification-support-elem-0",
-          "description": "Required element 0 for state Verification and Debugging Support",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "state|snapshot|capture"
-            },
-            "label": "Required element for Verification and Debugging Support"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-explorer-verification-support-elem-1",
-          "description": "Required element 1 for state Verification and Debugging Support",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "element|value|property"
-            },
-            "label": "Required element for Verification and Debugging Support"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The State Explorer's primary purpose is to support verification debugging. When a verification phase reports unexpected results, developers use state explorations to understand why the application was in a particular state. By comparing state snapshots taken at different execution points, users can identify what changed (or did not change) and trace the root cause of verification failures back to specific automation actions or AI decisions.",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Run State Explorer page (dev-only) — displays UI state exploration results captured during verification phases. Users can browse exploration history, view detailed reports of state snapshots, and compare application state at different points in execution.",
-  "metadata": {
-    "tags": [
-      "run-state-explorer",
-      "state-exploration",
-      "dev-only",
-      "verification",
-      "observe"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "run-state-explorer",
+    "name":  "StateExplorerTab",
+    "states":  [
+                   {
+                       "id":  "state-explorer-history-browsing",
+                       "name":  "Exploration History Browsing",
+                       "assertions":  [
+                                          {
+                                              "id":  "state-explorer-history-browsing-elem-0",
+                                              "description":  "Required element 0 for state Exploration History Browsing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "exploration|history|state"
+                                                                          },
+                                                             "label":  "Required element for Exploration History Browsing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-explorer-history-browsing-elem-1",
+                                              "description":  "Required element 1 for state Exploration History Browsing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Exploration History Browsing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-explorer-history-browsing-elem-2",
+                                              "description":  "Required element 2 for state Exploration History Browsing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No Run Selected|Select a run"
+                                                                          },
+                                                             "label":  "Required element for Exploration History Browsing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The State Explorer presents a history of past state exploration runs associated with the selected workflow run. Each exploration represents a point-in-time capture of the target application\u0027s UI state. Users browse this history to find specific exploration runs, understand the progression of state changes across the workflow, and select individual explorations for detailed review. The history view is the entry point for all state analysis.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "state-explorer-report-viewing",
+                       "name":  "Exploration Report Viewing",
+                       "assertions":  [
+                                          {
+                                              "id":  "state-explorer-report-viewing-elem-0",
+                                              "description":  "Required element 0 for state Exploration Report Viewing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "report|state|exploration"
+                                                                          },
+                                                             "label":  "Required element for Exploration Report Viewing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-explorer-report-viewing-elem-1",
+                                              "description":  "Required element 1 for state Exploration Report Viewing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Back|History"
+                                                                          },
+                                                             "label":  "Required element for Exploration Report Viewing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-explorer-report-viewing-elem-2",
+                                              "description":  "Required element 2 for state Exploration Report Viewing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "AI|prompt|analyze"
+                                                                          },
+                                                             "label":  "Required element for Exploration Report Viewing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When the user selects a specific exploration from the history, they see a detailed report of the captured state. This report shows the UI elements that were discovered, their properties and values, and the overall structure of the application at that point in time. The report is the core analytical artifact that helps developers verify whether expected state changes occurred during workflow execution.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "state-explorer-verification-support",
+                       "name":  "Verification and Debugging Support",
+                       "assertions":  [
+                                          {
+                                              "id":  "state-explorer-verification-support-elem-0",
+                                              "description":  "Required element 0 for state Verification and Debugging Support",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "state|snapshot|capture"
+                                                                          },
+                                                             "label":  "Required element for Verification and Debugging Support"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-explorer-verification-support-elem-1",
+                                              "description":  "Required element 1 for state Verification and Debugging Support",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "element|value|property"
+                                                                          },
+                                                             "label":  "Required element for Verification and Debugging Support"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The State Explorer\u0027s primary purpose is to support verification debugging. When a verification phase reports unexpected results, developers use state explorations to understand why the application was in a particular state. By comparing state snapshots taken at different execution points, users can identify what changed (or did not change) and trace the root cause of verification failures back to specific automation actions or AI decisions.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Run State Explorer page (dev-only) — displays UI state exploration results captured during verification phases. Users can browse exploration history, view detailed reports of state snapshots, and compare application state at different points in execution.",
+    "metadata":  {
+                     "tags":  [
+                                  "run-state-explorer",
+                                  "state-exploration",
+                                  "dev-only",
+                                  "verification",
+                                  "observe"
+                              ]
+                 }
 }

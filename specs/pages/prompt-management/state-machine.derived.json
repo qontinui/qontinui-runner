@@ -1,1480 +1,1483 @@
-{
-  "version": "1.0",
-  "id": "prompt-management",
-  "name": "PromptRegistryTab",
-  "states": [
-    {
-      "id": "version-history-list",
-      "name": "Version History List",
-      "assertions": [
-        {
-          "id": "version-history-list-elem-0",
-          "description": "Required element 0 for state Version History List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Version History"
-            },
-            "label": "Required element for Version History List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-history-list-elem-1",
-          "description": "Required element 1 for state Version History List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "versions"
-            },
-            "label": "Required element for Version History List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-history-list-elem-2",
-          "description": "Required element 2 for state Version History List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "v\\d+"
-            },
-            "label": "Required element for Version History List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-history-list-elem-4",
-          "description": "Required element 4 for state Version History List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No description"
-            },
-            "label": "Required element for Version History List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-history-list-elem-6",
-          "description": "Required element 6 for state Version History List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Version History List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-history-list-elem-7",
-          "description": "Required element 7 for state Version History List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No versions recorded for this template yet."
-            },
-            "label": "Required element for Version History List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-history-list-elem-9",
-          "description": "Required element 9 for state Version History List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Failed to load version history."
-            },
-            "label": "Required element for Version History List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-history-list-elem-10",
-          "description": "Required element 10 for state Version History List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Refresh"
-            },
-            "label": "Required element for Version History List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The version history list shows all versions for a prompt template sorted by version number descending. Each version row shows the version number badge (v1, v2...), the change description, a truncated SHA256 content hash, and the creation date. The list header displays a count of versions and provides Compare and Refresh controls. In compare mode, two versions can be selected as A and B with highlighted selection indicators.",
-      "precondition": "At least one prompt variant exists with at least 2 versions",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "version-detail-view",
-      "name": "Version Detail View",
-      "assertions": [
-        {
-          "id": "version-detail-view-elem-0",
-          "description": "Required element 0 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Back to history"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-1",
-          "description": "Required element 1 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "v\\d+"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-2",
-          "description": "Required element 2 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "hash:"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-3",
-          "description": "Required element 3 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Prompt Content"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-4",
-          "description": "Required element 4 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Success Rate"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-5",
-          "description": "Required element 5 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Avg Cost"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-6",
-          "description": "Required element 6 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Avg Latency"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-7",
-          "description": "Required element 7 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Performance Metrics"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-8",
-          "description": "Required element 8 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Restore this version"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-9",
-          "description": "Required element 9 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Create new version with this content?"
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-10",
-          "description": "Required element 10 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Restoring..."
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-detail-view-elem-11",
-          "description": "Required element 11 for state Version Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Failed to load version details."
-            },
-            "label": "Required element for Version Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The version detail view shows the full prompt content, metadata, performance metrics, and a 'Restore this version' button. It displays the version number, creation timestamp, truncated content hash, change description, and the full prompt content in a scrollable pre block. Performance metrics show success rate, average cost, and average latency when available.",
-      "precondition": "At least one prompt variant exists with at least 2 versions",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "version-comparison",
-      "name": "Version Comparison",
-      "assertions": [
-        {
-          "id": "version-comparison-elem-0",
-          "description": "Required element 0 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Compare"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-1",
-          "description": "Required element 1 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Select first version"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-2",
-          "description": "Required element 2 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Select second version"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-3",
-          "description": "Required element 3 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Ready to compare"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-4",
-          "description": "Required element 4 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "View Diff"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-5",
-          "description": "Required element 5 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "A|B"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-6",
-          "description": "Required element 6 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Cancel"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-7",
-          "description": "Required element 7 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Comparing"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-10",
-          "description": "Required element 10 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Inline"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-11",
-          "description": "Required element 11 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Side-by-side"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-12",
-          "description": "Required element 12 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No differences found."
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-13",
-          "description": "Required element 13 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Back to history"
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "version-comparison-elem-14",
-          "description": "Required element 14 for state Version Comparison",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Failed to load diff."
-            },
-            "label": "Required element for Version Comparison"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The version comparison feature allows users to view a unified or side-by-side diff between two selected versions. Compare mode allows selecting two versions as A and B. The diff view parses unified diff output into addition (green), deletion (red), context, and header lines. Two view modes are available: 'Inline' and 'Side-by-side'.",
-      "precondition": "At least one prompt variant exists with at least 2 versions",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "canary-ab-testing",
-      "name": "Canary A/B Testing",
-      "assertions": [
-        {
-          "id": "canary-ab-testing-elem-0",
-          "description": "Required element 0 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Prompt Canary A/B Tests"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-1",
-          "description": "Required element 1 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "active|promoted|rolled_back|completed"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-2",
-          "description": "Required element 2 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "vs"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-3",
-          "description": "Required element 3 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "candidate traffic"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-4",
-          "description": "Required element 4 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Metric"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-5",
-          "description": "Required element 5 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Success Rate"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-6",
-          "description": "Required element 6 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Avg Cost"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-7",
-          "description": "Required element 7 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Avg Latency"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-8",
-          "description": "Required element 8 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "pp"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-9",
-          "description": "Required element 9 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "p-value"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-10",
-          "description": "Required element 10 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Verdict"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-11",
-          "description": "Required element 11 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Total Runs"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-12",
-          "description": "Required element 12 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Candidate sample progress"
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-13",
-          "description": "Required element 13 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No prompt canary A/B tests found. Create one to compare prompt versions."
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-ab-testing-elem-14",
-          "description": "Required element 14 for state Canary A/B Testing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Loading canary tests..."
-            },
-            "label": "Required element for Canary A/B Testing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The PromptCanaryPanel displays active and completed prompt canary A/B tests. Each canary card shows the status badge, template ID, version comparison (baseline vs candidate), traffic percentage, and a metrics comparison grid with Success Rate, Avg Cost, Avg Latency, and Delta columns. Statistical evaluation shows the p-value, verdict (promote/rollback/keep/pending), and total runs. Active canaries display a progress bar toward the minimum 20 candidate runs needed for a verdict.",
-      "precondition": "An active prompt canary exists with at least one recorded run",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "canary-creation",
-      "name": "Canary Creation",
-      "assertions": [
-        {
-          "id": "canary-creation-elem-0",
-          "description": "Required element 0 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Create Prompt Canary A/B Test"
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-creation-elem-1",
-          "description": "Required element 1 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Template ID"
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-creation-elem-2",
-          "description": "Required element 2 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Baseline Version"
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-creation-elem-3",
-          "description": "Required element 3 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Candidate Version"
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-creation-elem-4",
-          "description": "Required element 4 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Candidate Traffic:"
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-creation-elem-5",
-          "description": "Required element 5 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Create Canary"
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-creation-elem-6",
-          "description": "Required element 6 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Canary A/B test created successfully."
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-creation-elem-7",
-          "description": "Required element 7 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Create Another"
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-creation-elem-9",
-          "description": "Required element 9 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Close"
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-creation-elem-10",
-          "description": "Required element 10 for state Canary Creation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Create A/B Test"
-            },
-            "label": "Required element for Canary Creation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The CreatePromptCanaryForm allows users to set up a new prompt canary A/B test. The form has fields for Template ID, Baseline Version, Candidate Version, and a Candidate Traffic percentage slider (1-100%). When opened from a prompt variant, the template ID and baseline version are pre-filled.",
-      "precondition": "At least one prompt variant exists in the registry",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "canary-lifecycle",
-      "name": "Canary Lifecycle",
-      "assertions": [
-        {
-          "id": "canary-lifecycle-elem-0",
-          "description": "Required element 0 for state Canary Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Promote"
-            },
-            "label": "Required element for Canary Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-lifecycle-elem-1",
-          "description": "Required element 1 for state Canary Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Rollback"
-            },
-            "label": "Required element for Canary Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-lifecycle-elem-2",
-          "description": "Required element 2 for state Canary Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "active"
-            },
-            "label": "Required element for Canary Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-lifecycle-elem-3",
-          "description": "Required element 3 for state Canary Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Version History"
-            },
-            "label": "Required element for Canary Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-lifecycle-elem-4",
-          "description": "Required element 4 for state Canary Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Create A/B Test"
-            },
-            "label": "Required element for Canary Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-lifecycle-elem-5",
-          "description": "Required element 5 for state Canary Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Activate"
-            },
-            "label": "Required element for Canary Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "canary-lifecycle-elem-7",
-          "description": "Required element 7 for state Canary Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Refresh"
-            },
-            "label": "Required element for Canary Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Active canary tests have Promote and Rollback action buttons that control the canary lifecycle. Promoting a canary makes the candidate version the new active version. Rolling back reverts to the baseline. The PromptRegistryTab integrates both features: each expanded prompt variant has a 'Version History' button and a 'Create A/B Test' button. The canary panel at the top of the registry shows all canaries across templates.",
-      "precondition": "An active canary exists",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "navigation",
-      "name": "Navigation",
-      "assertions": [
-        {
-          "id": "navigation-elem-0",
-          "description": "Required element 0 for state Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Version History"
-            },
-            "label": "Required element for Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "navigation-elem-1",
-          "description": "Required element 1 for state Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Back to history"
-            },
-            "label": "Required element for Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "navigation-elem-2",
-          "description": "Required element 2 for state Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Back to history"
-            },
-            "label": "Required element for Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "navigation-elem-3",
-          "description": "Required element 3 for state Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Create A/B Test"
-            },
-            "label": "Required element for Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "navigation-elem-4",
-          "description": "Required element 4 for state Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Navigation flows between the prompt registry, version history, version detail, diff view, and canary creation form. Users navigate via buttons that toggle inline panels or switch between list/detail/diff sub-views within PromptVersionHistory.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "state-consistency",
-      "name": "State Consistency",
-      "assertions": [
-        {
-          "id": "state-consistency-elem-0",
-          "description": "Required element 0 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "v\\d+"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-consistency-elem-1",
-          "description": "Required element 1 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Active:"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-consistency-elem-3",
-          "description": "Required element 3 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Baseline"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-consistency-elem-4",
-          "description": "Required element 4 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Candidate"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-consistency-elem-5",
-          "description": "Required element 5 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "candidate traffic"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-consistency-elem-6",
-          "description": "Required element 6 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "p-value"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "state-consistency-elem-7",
-          "description": "Required element 7 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Restore this version"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Assertions verifying that displayed state remains internally consistent: version numbering is sequential, current-version indicators match, diff stats are accurate, canary metrics update correctly, and statistical values converge as expected.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "element-presence",
-      "name": "Element Presence",
-      "assertions": [
-        {
-          "id": "element-presence-elem-0",
-          "description": "Required element 0 for state Element Presence",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Element Presence"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "element-presence-elem-2",
-          "description": "Required element 2 for state Element Presence",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Promote|Rollback"
-            },
-            "label": "Required element for Element Presence"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "element-presence-elem-4",
-          "description": "Required element 4 for state Element Presence",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Version History|Create A/B Test"
-            },
-            "label": "Required element for Element Presence"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Assertions verifying that required UI elements are present in each view: version row metadata, diff line numbers, canary action buttons, metrics grid columns, and registry variant action buttons.",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "The Prompt Registry manages prompt template versioning with diff comparison, and canary A/B test deployments that split traffic between baseline and candidate prompt versions to evaluate performance via statistical analysis. Backend: 6 prompt version endpoints, PromptTemplateVersion model with SHA256 content hashing, PromptTemplateCanary in SQLite+PG with proportion_analysis statistics.",
-  "metadata": {
-    "tags": [
-      "prompt-versions",
-      "prompt-canary",
-      "a-b-testing",
-      "opik",
-      "tier-2"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "prompt-management",
+    "name":  "PromptRegistryTab",
+    "states":  [
+                   {
+                       "id":  "version-history-list",
+                       "name":  "Version History List",
+                       "assertions":  [
+                                          {
+                                              "id":  "version-history-list-elem-0",
+                                              "description":  "Required element 0 for state Version History List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Version History"
+                                                                          },
+                                                             "label":  "Required element for Version History List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-history-list-elem-1",
+                                              "description":  "Required element 1 for state Version History List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "versions"
+                                                                          },
+                                                             "label":  "Required element for Version History List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-history-list-elem-2",
+                                              "description":  "Required element 2 for state Version History List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "v\\d+"
+                                                                          },
+                                                             "label":  "Required element for Version History List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-history-list-elem-4",
+                                              "description":  "Required element 4 for state Version History List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No description"
+                                                                          },
+                                                             "label":  "Required element for Version History List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-history-list-elem-6",
+                                              "description":  "Required element 6 for state Version History List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Version History List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-history-list-elem-7",
+                                              "description":  "Required element 7 for state Version History List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No versions recorded for this template yet."
+                                                                          },
+                                                             "label":  "Required element for Version History List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-history-list-elem-9",
+                                              "description":  "Required element 9 for state Version History List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Failed to load version history."
+                                                                          },
+                                                             "label":  "Required element for Version History List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-history-list-elem-10",
+                                              "description":  "Required element 10 for state Version History List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Refresh"
+                                                                          },
+                                                             "label":  "Required element for Version History List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The version history list shows all versions for a prompt template sorted by version number descending. Each version row shows the version number badge (v1, v2...), the change description, a truncated SHA256 content hash, and the creation date. The list header displays a count of versions and provides Compare and Refresh controls. In compare mode, two versions can be selected as A and B with highlighted selection indicators.",
+                       "precondition":  "At least one prompt variant exists with at least 2 versions",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "version-detail-view",
+                       "name":  "Version Detail View",
+                       "assertions":  [
+                                          {
+                                              "id":  "version-detail-view-elem-0",
+                                              "description":  "Required element 0 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Back to history"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-1",
+                                              "description":  "Required element 1 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "v\\d+"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-2",
+                                              "description":  "Required element 2 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "hash:"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-3",
+                                              "description":  "Required element 3 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Prompt Content"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-4",
+                                              "description":  "Required element 4 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Success Rate"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-5",
+                                              "description":  "Required element 5 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Avg Cost"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-6",
+                                              "description":  "Required element 6 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Avg Latency"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-7",
+                                              "description":  "Required element 7 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Performance Metrics"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-8",
+                                              "description":  "Required element 8 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Restore this version"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-9",
+                                              "description":  "Required element 9 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Create new version with this content?"
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-10",
+                                              "description":  "Required element 10 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Restoring..."
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-detail-view-elem-11",
+                                              "description":  "Required element 11 for state Version Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Failed to load version details."
+                                                                          },
+                                                             "label":  "Required element for Version Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The version detail view shows the full prompt content, metadata, performance metrics, and a \u0027Restore this version\u0027 button. It displays the version number, creation timestamp, truncated content hash, change description, and the full prompt content in a scrollable pre block. Performance metrics show success rate, average cost, and average latency when available.",
+                       "precondition":  "At least one prompt variant exists with at least 2 versions",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "version-comparison",
+                       "name":  "Version Comparison",
+                       "assertions":  [
+                                          {
+                                              "id":  "version-comparison-elem-0",
+                                              "description":  "Required element 0 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Compare"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-1",
+                                              "description":  "Required element 1 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Select first version"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-2",
+                                              "description":  "Required element 2 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Select second version"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-3",
+                                              "description":  "Required element 3 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Ready to compare"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-4",
+                                              "description":  "Required element 4 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "View Diff"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-5",
+                                              "description":  "Required element 5 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "A|B"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-6",
+                                              "description":  "Required element 6 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Cancel"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-7",
+                                              "description":  "Required element 7 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Comparing"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-10",
+                                              "description":  "Required element 10 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Inline"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-11",
+                                              "description":  "Required element 11 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Side-by-side"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-12",
+                                              "description":  "Required element 12 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No differences found."
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-13",
+                                              "description":  "Required element 13 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Back to history"
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "version-comparison-elem-14",
+                                              "description":  "Required element 14 for state Version Comparison",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Failed to load diff."
+                                                                          },
+                                                             "label":  "Required element for Version Comparison"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The version comparison feature allows users to view a unified or side-by-side diff between two selected versions. Compare mode allows selecting two versions as A and B. The diff view parses unified diff output into addition (green), deletion (red), context, and header lines. Two view modes are available: \u0027Inline\u0027 and \u0027Side-by-side\u0027.",
+                       "precondition":  "At least one prompt variant exists with at least 2 versions",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "canary-ab-testing",
+                       "name":  "Canary A/B Testing",
+                       "assertions":  [
+                                          {
+                                              "id":  "canary-ab-testing-elem-0",
+                                              "description":  "Required element 0 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Prompt Canary A/B Tests"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-1",
+                                              "description":  "Required element 1 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "active|promoted|rolled_back|completed"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-2",
+                                              "description":  "Required element 2 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "vs"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-3",
+                                              "description":  "Required element 3 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "candidate traffic"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-4",
+                                              "description":  "Required element 4 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Metric"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-5",
+                                              "description":  "Required element 5 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Success Rate"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-6",
+                                              "description":  "Required element 6 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Avg Cost"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-7",
+                                              "description":  "Required element 7 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Avg Latency"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-8",
+                                              "description":  "Required element 8 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "pp"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-9",
+                                              "description":  "Required element 9 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "p-value"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-10",
+                                              "description":  "Required element 10 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Verdict"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-11",
+                                              "description":  "Required element 11 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Total Runs"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-12",
+                                              "description":  "Required element 12 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Candidate sample progress"
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-13",
+                                              "description":  "Required element 13 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No prompt canary A/B tests found. Create one to compare prompt versions."
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-ab-testing-elem-14",
+                                              "description":  "Required element 14 for state Canary A/B Testing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Loading canary tests..."
+                                                                          },
+                                                             "label":  "Required element for Canary A/B Testing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The PromptCanaryPanel displays active and completed prompt canary A/B tests. Each canary card shows the status badge, template ID, version comparison (baseline vs candidate), traffic percentage, and a metrics comparison grid with Success Rate, Avg Cost, Avg Latency, and Delta columns. Statistical evaluation shows the p-value, verdict (promote/rollback/keep/pending), and total runs. Active canaries display a progress bar toward the minimum 20 candidate runs needed for a verdict.",
+                       "precondition":  "An active prompt canary exists with at least one recorded run",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "canary-creation",
+                       "name":  "Canary Creation",
+                       "assertions":  [
+                                          {
+                                              "id":  "canary-creation-elem-0",
+                                              "description":  "Required element 0 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Create Prompt Canary A/B Test"
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-creation-elem-1",
+                                              "description":  "Required element 1 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Template ID"
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-creation-elem-2",
+                                              "description":  "Required element 2 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Baseline Version"
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-creation-elem-3",
+                                              "description":  "Required element 3 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Candidate Version"
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-creation-elem-4",
+                                              "description":  "Required element 4 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Candidate Traffic:"
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-creation-elem-5",
+                                              "description":  "Required element 5 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Create Canary"
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-creation-elem-6",
+                                              "description":  "Required element 6 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Canary A/B test created successfully."
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-creation-elem-7",
+                                              "description":  "Required element 7 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Create Another"
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-creation-elem-9",
+                                              "description":  "Required element 9 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Close"
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-creation-elem-10",
+                                              "description":  "Required element 10 for state Canary Creation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Create A/B Test"
+                                                                          },
+                                                             "label":  "Required element for Canary Creation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The CreatePromptCanaryForm allows users to set up a new prompt canary A/B test. The form has fields for Template ID, Baseline Version, Candidate Version, and a Candidate Traffic percentage slider (1-100%). When opened from a prompt variant, the template ID and baseline version are pre-filled.",
+                       "precondition":  "At least one prompt variant exists in the registry",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "canary-lifecycle",
+                       "name":  "Canary Lifecycle",
+                       "assertions":  [
+                                          {
+                                              "id":  "canary-lifecycle-elem-0",
+                                              "description":  "Required element 0 for state Canary Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Promote"
+                                                                          },
+                                                             "label":  "Required element for Canary Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-lifecycle-elem-1",
+                                              "description":  "Required element 1 for state Canary Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Rollback"
+                                                                          },
+                                                             "label":  "Required element for Canary Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-lifecycle-elem-2",
+                                              "description":  "Required element 2 for state Canary Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "active"
+                                                                          },
+                                                             "label":  "Required element for Canary Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-lifecycle-elem-3",
+                                              "description":  "Required element 3 for state Canary Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Version History"
+                                                                          },
+                                                             "label":  "Required element for Canary Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-lifecycle-elem-4",
+                                              "description":  "Required element 4 for state Canary Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Create A/B Test"
+                                                                          },
+                                                             "label":  "Required element for Canary Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-lifecycle-elem-5",
+                                              "description":  "Required element 5 for state Canary Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Activate"
+                                                                          },
+                                                             "label":  "Required element for Canary Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "canary-lifecycle-elem-7",
+                                              "description":  "Required element 7 for state Canary Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Refresh"
+                                                                          },
+                                                             "label":  "Required element for Canary Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Active canary tests have Promote and Rollback action buttons that control the canary lifecycle. Promoting a canary makes the candidate version the new active version. Rolling back reverts to the baseline. The PromptRegistryTab integrates both features: each expanded prompt variant has a \u0027Version History\u0027 button and a \u0027Create A/B Test\u0027 button. The canary panel at the top of the registry shows all canaries across templates.",
+                       "precondition":  "An active canary exists",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "navigation",
+                       "name":  "Navigation",
+                       "assertions":  [
+                                          {
+                                              "id":  "navigation-elem-0",
+                                              "description":  "Required element 0 for state Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Version History"
+                                                                          },
+                                                             "label":  "Required element for Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "navigation-elem-1",
+                                              "description":  "Required element 1 for state Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Back to history"
+                                                                          },
+                                                             "label":  "Required element for Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "navigation-elem-2",
+                                              "description":  "Required element 2 for state Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Back to history"
+                                                                          },
+                                                             "label":  "Required element for Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "navigation-elem-3",
+                                              "description":  "Required element 3 for state Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Create A/B Test"
+                                                                          },
+                                                             "label":  "Required element for Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "navigation-elem-4",
+                                              "description":  "Required element 4 for state Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Navigation flows between the prompt registry, version history, version detail, diff view, and canary creation form. Users navigate via buttons that toggle inline panels or switch between list/detail/diff sub-views within PromptVersionHistory.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "state-consistency",
+                       "name":  "State Consistency",
+                       "assertions":  [
+                                          {
+                                              "id":  "state-consistency-elem-0",
+                                              "description":  "Required element 0 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "v\\d+"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-consistency-elem-1",
+                                              "description":  "Required element 1 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Active:"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-consistency-elem-3",
+                                              "description":  "Required element 3 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Baseline"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-consistency-elem-4",
+                                              "description":  "Required element 4 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Candidate"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-consistency-elem-5",
+                                              "description":  "Required element 5 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "candidate traffic"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-consistency-elem-6",
+                                              "description":  "Required element 6 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "p-value"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "state-consistency-elem-7",
+                                              "description":  "Required element 7 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Restore this version"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Assertions verifying that displayed state remains internally consistent: version numbering is sequential, current-version indicators match, diff stats are accurate, canary metrics update correctly, and statistical values converge as expected.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "element-presence",
+                       "name":  "Element Presence",
+                       "assertions":  [
+                                          {
+                                              "id":  "element-presence-elem-0",
+                                              "description":  "Required element 0 for state Element Presence",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Element Presence"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "element-presence-elem-2",
+                                              "description":  "Required element 2 for state Element Presence",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Promote|Rollback"
+                                                                          },
+                                                             "label":  "Required element for Element Presence"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "element-presence-elem-4",
+                                              "description":  "Required element 4 for state Element Presence",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Version History|Create A/B Test"
+                                                                          },
+                                                             "label":  "Required element for Element Presence"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Assertions verifying that required UI elements are present in each view: version row metadata, diff line numbers, canary action buttons, metrics grid columns, and registry variant action buttons.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "The Prompt Registry manages prompt template versioning with diff comparison, and canary A/B test deployments that split traffic between baseline and candidate prompt versions to evaluate performance via statistical analysis. Backend: 6 prompt version endpoints, PromptTemplateVersion model with SHA256 content hashing, PromptTemplateCanary in SQLite+PG with proportion_analysis statistics.",
+    "metadata":  {
+                     "tags":  [
+                                  "prompt-versions",
+                                  "prompt-canary",
+                                  "a-b-testing",
+                                  "opik",
+                                  "tier-2"
+                              ]
+                 }
 }

@@ -1,801 +1,804 @@
-{
-  "version": "1.0",
-  "id": "error-monitor",
-  "name": "ErrorMonitorTab",
-  "states": [
-    {
-      "id": "error-monitor-visibility",
-      "name": "Error Visibility and Awareness",
-      "assertions": [
-        {
-          "id": "error-monitor-visibility-elem-0",
-          "description": "Required element 0 for state Error Visibility and Awareness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Error Monitor"
-            },
-            "label": "Required element for Error Visibility and Awareness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-visibility-elem-1",
-          "description": "Required element 1 for state Error Visibility and Awareness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "critical"
-            },
-            "label": "Required element for Error Visibility and Awareness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-visibility-elem-2",
-          "description": "Required element 2 for state Error Visibility and Awareness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "unresolved"
-            },
-            "label": "Required element for Error Visibility and Awareness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-visibility-elem-3",
-          "description": "Required element 3 for state Error Visibility and Awareness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Auto-refresh"
-            },
-            "label": "Required element for Error Visibility and Awareness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Error Monitor page serves as a centralized hub where users gain immediate awareness of all errors detected across automation runs. Upon navigating to this page, users should quickly understand the overall error landscape through summary badges showing counts by severity level (critical, error, warning), an unresolved error count indicator, and an auto-refreshing list of error events. The page must convey the health of the automation system at a glance, so a user who just finished a batch of workflow runs can immediately see whether anything went wrong and how severe the issues are.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "error-monitor-filtering",
-      "name": "Error Filtering and Search",
-      "assertions": [
-        {
-          "id": "error-monitor-filtering-elem-0",
-          "description": "Required element 0 for state Error Filtering and Search",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Search errors"
-            },
-            "label": "Required element for Error Filtering and Search"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-filtering-elem-1",
-          "description": "Required element 1 for state Error Filtering and Search",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Severity"
-            },
-            "label": "Required element for Error Filtering and Search"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-filtering-elem-2",
-          "description": "Required element 2 for state Error Filtering and Search",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Status"
-            },
-            "label": "Required element for Error Filtering and Search"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-filtering-elem-3",
-          "description": "Required element 3 for state Error Filtering and Search",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Filters"
-            },
-            "label": "Required element for Error Filtering and Search"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users need powerful filtering capabilities to narrow down the error list to the specific issues they care about. This includes text-based search across error messages, types, log sources, and workflow names, as well as structured filters for severity levels (critical, error, warning, info, debug) and status categories (new, acknowledged, in_progress, resolved, ignored, recurring). The filter system should support combining multiple criteria and provide clear feedback about how many filters are active, with the ability to clear all filters at once. Users dealing with dozens or hundreds of errors need to quickly isolate the subset relevant to their current investigation.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "error-monitor-triage",
-      "name": "Error Triage and Status Management",
-      "assertions": [
-        {
-          "id": "error-monitor-triage-elem-0",
-          "description": "Required element 0 for state Error Triage and Status Management",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Full Message"
-            },
-            "label": "Required element for Error Triage and Status Management"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-triage-elem-1",
-          "description": "Required element 1 for state Error Triage and Status Management",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Acknowledge"
-            },
-            "label": "Required element for Error Triage and Status Management"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-triage-elem-2",
-          "description": "Required element 2 for state Error Triage and Status Management",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Mark Resolved"
-            },
-            "label": "Required element for Error Triage and Status Management"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-triage-elem-3",
-          "description": "Required element 3 for state Error Triage and Status Management",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Fix"
-            },
-            "label": "Required element for Error Triage and Status Management"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Once users have identified relevant errors, they need to triage them by changing their status. The workflow involves expanding an error to see its full message and stack trace, then marking it as acknowledged (someone is aware), resolved (the issue is fixed), or ignored (not actionable). This triage workflow is essential for teams managing automation reliability, as it prevents the same errors from being re-investigated and provides a clear record of which issues have been addressed. Users should also be able to generate fix workflows from errors to automatically address recurring problems.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "error-monitor-context",
-      "name": "Error Context and Metadata",
-      "assertions": [
-        {
-          "id": "error-monitor-context-elem-0",
-          "description": "Required element 0 for state Error Context and Metadata",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "error"
-            },
-            "label": "Required element for Error Context and Metadata"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-context-elem-1",
-          "description": "Required element 1 for state Error Context and Metadata",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "error"
-            },
-            "label": "Required element for Error Context and Metadata"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-context-elem-2",
-          "description": "Required element 2 for state Error Context and Metadata",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No Errors"
-            },
-            "label": "Required element for Error Context and Metadata"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Each error entry should provide rich contextual information beyond just the error message. Users need to see which log source produced the error, which workflow was running when it occurred, the file path and line number if available, the timestamp, the occurrence count for recurring errors, and the current triage status. This metadata helps users correlate errors with specific automation runs and prioritize based on frequency and recency.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "error-monitor-browser-errors",
-      "name": "Browser Errors Panel",
-      "assertions": [
-        {
-          "id": "error-monitor-browser-errors-elem-0",
-          "description": "Required element 0 for state Browser Errors Panel",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Browser Errors"
-            },
-            "label": "Required element for Browser Errors Panel"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-browser-errors-elem-1",
-          "description": "Required element 1 for state Browser Errors Panel",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "healthy",
-              "attributes": {
-                "content-role": "badge"
-              }
-            },
-            "label": "Required element for Browser Errors Panel"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-browser-errors-elem-2",
-          "description": "Required element 2 for state Browser Errors Panel",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Browser Errors"
-            },
-            "label": "Required element for Browser Errors Panel"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-browser-errors-elem-3",
-          "description": "Required element 3 for state Browser Errors Panel",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "recent"
-            },
-            "label": "Required element for Browser Errors Panel"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Error Monitor page includes a collapsible Browser Errors panel that surfaces UI Bridge SDK browser-level errors. This panel shows a health status badge indicating whether the browser environment is healthy, degraded, or broken, along with a list of recent browser errors. Users can expand or collapse this panel to manage screen real estate while still having quick access to client-side error information that may not appear in server logs.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "error-monitor-patterns",
-      "name": "Detected Patterns Display",
-      "assertions": [
-        {
-          "id": "error-monitor-patterns-elem-0",
-          "description": "Required element 0 for state Detected Patterns Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Detected Patterns"
-            },
-            "label": "Required element for Detected Patterns Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-patterns-elem-1",
-          "description": "Required element 1 for state Detected Patterns Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-role": "badge"
-              }
-            },
-            "label": "Required element for Detected Patterns Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-patterns-elem-2",
-          "description": "Required element 2 for state Detected Patterns Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "occurrences"
-            },
-            "label": "Required element for Detected Patterns Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-patterns-elem-3",
-          "description": "Required element 3 for state Detected Patterns Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "pattern"
-            },
-            "label": "Required element for Detected Patterns Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Error Monitor identifies recurring error patterns and clusters them for display. Users can see detected pattern groups with type badges indicating the kind of pattern, frequency counts showing how often each pattern occurs, and the ability to select a pattern to filter the error list to only matching errors. This helps users prioritize systemic issues over one-off errors.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "error-monitor-error-details",
-      "name": "Error Item Expanded Details",
-      "assertions": [
-        {
-          "id": "error-monitor-error-details-elem-0",
-          "description": "Required element 0 for state Error Item Expanded Details",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Stack Trace"
-            },
-            "label": "Required element for Error Item Expanded Details"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-error-details-elem-1",
-          "description": "Required element 1 for state Error Item Expanded Details",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Context"
-            },
-            "label": "Required element for Error Item Expanded Details"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-error-details-elem-2",
-          "description": "Required element 2 for state Error Item Expanded Details",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Open in Editor"
-            },
-            "label": "Required element for Error Item Expanded Details"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-error-details-elem-3",
-          "description": "Required element 3 for state Error Item Expanded Details",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Show context"
-            },
-            "label": "Required element for Error Item Expanded Details"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-error-details-elem-4",
-          "description": "Required element 4 for state Error Item Expanded Details",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "recurrence"
-            },
-            "label": "Required element for Error Item Expanded Details"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When a user expands an error item, they see a detailed view containing the full error message rendered in a code block for readability, the stack trace if available, context lines surrounding the error, resolution notes from previous triage, recurrence history, and action buttons including 'Open in Editor' to jump to the source file and 'Show context' to view surrounding code. This detailed view provides all information needed to diagnose and act on an error without leaving the Error Monitor page.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "error-monitor-states",
-      "name": "Loading, Empty, and Error States",
-      "assertions": [
-        {
-          "id": "error-monitor-states-elem-0",
-          "description": "Required element 0 for state Loading, Empty, and Error States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "status",
-              "text": "Loading"
-            },
-            "label": "Required element for Loading, Empty, and Error States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-states-elem-1",
-          "description": "Required element 1 for state Loading, Empty, and Error States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No Errors Detected"
-            },
-            "label": "Required element for Loading, Empty, and Error States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-states-elem-2",
-          "description": "Required element 2 for state Loading, Empty, and Error States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Failed to load"
-            },
-            "label": "Required element for Loading, Empty, and Error States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-states-elem-3",
-          "description": "Required element 3 for state Loading, Empty, and Error States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Auto-refresh: 30s"
-            },
-            "label": "Required element for Loading, Empty, and Error States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Error Monitor page handles various data-loading states gracefully. When data is being fetched, a loading spinner is displayed. When no errors exist, an empty state with a success icon communicates that no issues have been detected. When the page itself encounters an error loading data, an error state with an alert icon is shown. An auto-refresh indicator displays the refresh interval (e.g., 'Auto-refresh: 30s') so users know data will update automatically.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "error-monitor-fix-workflow",
-      "name": "Fix Errors Workflow Generation",
-      "assertions": [
-        {
-          "id": "error-monitor-fix-workflow-elem-0",
-          "description": "Required element 0 for state Fix Errors Workflow Generation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Fix Errors"
-            },
-            "label": "Required element for Fix Errors Workflow Generation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-fix-workflow-elem-1",
-          "description": "Required element 1 for state Fix Errors Workflow Generation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Generating"
-            },
-            "label": "Required element for Fix Errors Workflow Generation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-fix-workflow-elem-2",
-          "description": "Required element 2 for state Fix Errors Workflow Generation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "selected"
-            },
-            "label": "Required element for Fix Errors Workflow Generation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Error Monitor includes a dedicated Fix Errors button (FixErrorsButton component) that allows users to generate automated fix workflows for selected or visible errors. When activated, this triggers the AI system to analyze the error patterns and propose remediation steps as a workflow that can be executed. This bridges the gap between error detection and resolution, enabling users to take action directly from the monitoring interface.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "error-monitor-run-scope",
-      "name": "Per-Run Scope Indicator",
-      "assertions": [
-        {
-          "id": "error-monitor-run-scope-elem-0",
-          "description": "Required element 0 for state Per-Run Scope Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Showing errors for"
-            },
-            "label": "Required element for Per-Run Scope Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-run-scope-elem-1",
-          "description": "Required element 1 for state Per-Run Scope Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "run",
-              "attributes": {
-                "content-role": "label"
-              }
-            },
-            "label": "Required element for Per-Run Scope Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-run-scope-elem-2",
-          "description": "Required element 2 for state Per-Run Scope Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Clear"
-            },
-            "label": "Required element for Per-Run Scope Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "error-monitor-run-scope-elem-3",
-          "description": "Required element 3 for state Per-Run Scope Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Showing errors for"
-            },
-            "label": "Required element for Per-Run Scope Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Error Monitor supports scoping the error view to a specific task run. When scoped, a blue banner appears at the top of the error list showing the name of the task run being viewed, along with a clear button to remove the scope and return to the full error view. This allows users who navigated from a specific workflow run to see only the errors relevant to that run, reducing noise from unrelated errors.",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Error Monitor page — centralized error tracking and management across automation runs, providing filtering, status management, and fix workflow generation capabilities.",
-  "metadata": {
-    "tags": [
-      "error-monitor",
-      "error-tracking",
-      "triage",
-      "observability",
-      "browser-errors",
-      "patterns",
-      "fix-workflow",
-      "run-scope"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "error-monitor",
+    "name":  "ErrorMonitorTab",
+    "states":  [
+                   {
+                       "id":  "error-monitor-visibility",
+                       "name":  "Error Visibility and Awareness",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-visibility-elem-0",
+                                              "description":  "Required element 0 for state Error Visibility and Awareness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Error Monitor"
+                                                                          },
+                                                             "label":  "Required element for Error Visibility and Awareness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-visibility-elem-1",
+                                              "description":  "Required element 1 for state Error Visibility and Awareness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "critical"
+                                                                          },
+                                                             "label":  "Required element for Error Visibility and Awareness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-visibility-elem-2",
+                                              "description":  "Required element 2 for state Error Visibility and Awareness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "unresolved"
+                                                                          },
+                                                             "label":  "Required element for Error Visibility and Awareness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-visibility-elem-3",
+                                              "description":  "Required element 3 for state Error Visibility and Awareness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Auto-refresh"
+                                                                          },
+                                                             "label":  "Required element for Error Visibility and Awareness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Error Monitor page serves as a centralized hub where users gain immediate awareness of all errors detected across automation runs. Upon navigating to this page, users should quickly understand the overall error landscape through summary badges showing counts by severity level (critical, error, warning), an unresolved error count indicator, and an auto-refreshing list of error events. The page must convey the health of the automation system at a glance, so a user who just finished a batch of workflow runs can immediately see whether anything went wrong and how severe the issues are.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "error-monitor-filtering",
+                       "name":  "Error Filtering and Search",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-filtering-elem-0",
+                                              "description":  "Required element 0 for state Error Filtering and Search",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Search errors"
+                                                                          },
+                                                             "label":  "Required element for Error Filtering and Search"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-filtering-elem-1",
+                                              "description":  "Required element 1 for state Error Filtering and Search",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Severity"
+                                                                          },
+                                                             "label":  "Required element for Error Filtering and Search"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-filtering-elem-2",
+                                              "description":  "Required element 2 for state Error Filtering and Search",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Status"
+                                                                          },
+                                                             "label":  "Required element for Error Filtering and Search"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-filtering-elem-3",
+                                              "description":  "Required element 3 for state Error Filtering and Search",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Filters"
+                                                                          },
+                                                             "label":  "Required element for Error Filtering and Search"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users need powerful filtering capabilities to narrow down the error list to the specific issues they care about. This includes text-based search across error messages, types, log sources, and workflow names, as well as structured filters for severity levels (critical, error, warning, info, debug) and status categories (new, acknowledged, in_progress, resolved, ignored, recurring). The filter system should support combining multiple criteria and provide clear feedback about how many filters are active, with the ability to clear all filters at once. Users dealing with dozens or hundreds of errors need to quickly isolate the subset relevant to their current investigation.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "error-monitor-triage",
+                       "name":  "Error Triage and Status Management",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-triage-elem-0",
+                                              "description":  "Required element 0 for state Error Triage and Status Management",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Full Message"
+                                                                          },
+                                                             "label":  "Required element for Error Triage and Status Management"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-triage-elem-1",
+                                              "description":  "Required element 1 for state Error Triage and Status Management",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Acknowledge"
+                                                                          },
+                                                             "label":  "Required element for Error Triage and Status Management"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-triage-elem-2",
+                                              "description":  "Required element 2 for state Error Triage and Status Management",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Mark Resolved"
+                                                                          },
+                                                             "label":  "Required element for Error Triage and Status Management"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-triage-elem-3",
+                                              "description":  "Required element 3 for state Error Triage and Status Management",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Fix"
+                                                                          },
+                                                             "label":  "Required element for Error Triage and Status Management"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Once users have identified relevant errors, they need to triage them by changing their status. The workflow involves expanding an error to see its full message and stack trace, then marking it as acknowledged (someone is aware), resolved (the issue is fixed), or ignored (not actionable). This triage workflow is essential for teams managing automation reliability, as it prevents the same errors from being re-investigated and provides a clear record of which issues have been addressed. Users should also be able to generate fix workflows from errors to automatically address recurring problems.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "error-monitor-context",
+                       "name":  "Error Context and Metadata",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-context-elem-0",
+                                              "description":  "Required element 0 for state Error Context and Metadata",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "error"
+                                                                          },
+                                                             "label":  "Required element for Error Context and Metadata"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-context-elem-1",
+                                              "description":  "Required element 1 for state Error Context and Metadata",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "error"
+                                                                          },
+                                                             "label":  "Required element for Error Context and Metadata"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-context-elem-2",
+                                              "description":  "Required element 2 for state Error Context and Metadata",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No Errors"
+                                                                          },
+                                                             "label":  "Required element for Error Context and Metadata"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Each error entry should provide rich contextual information beyond just the error message. Users need to see which log source produced the error, which workflow was running when it occurred, the file path and line number if available, the timestamp, the occurrence count for recurring errors, and the current triage status. This metadata helps users correlate errors with specific automation runs and prioritize based on frequency and recency.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "error-monitor-browser-errors",
+                       "name":  "Browser Errors Panel",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-browser-errors-elem-0",
+                                              "description":  "Required element 0 for state Browser Errors Panel",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Browser Errors"
+                                                                          },
+                                                             "label":  "Required element for Browser Errors Panel"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-browser-errors-elem-1",
+                                              "description":  "Required element 1 for state Browser Errors Panel",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "healthy",
+                                                                              "attributes":  {
+                                                                                                 "content-role":  "badge"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for Browser Errors Panel"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-browser-errors-elem-2",
+                                              "description":  "Required element 2 for state Browser Errors Panel",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Browser Errors"
+                                                                          },
+                                                             "label":  "Required element for Browser Errors Panel"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-browser-errors-elem-3",
+                                              "description":  "Required element 3 for state Browser Errors Panel",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "recent"
+                                                                          },
+                                                             "label":  "Required element for Browser Errors Panel"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Error Monitor page includes a collapsible Browser Errors panel that surfaces UI Bridge SDK browser-level errors. This panel shows a health status badge indicating whether the browser environment is healthy, degraded, or broken, along with a list of recent browser errors. Users can expand or collapse this panel to manage screen real estate while still having quick access to client-side error information that may not appear in server logs.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "error-monitor-patterns",
+                       "name":  "Detected Patterns Display",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-patterns-elem-0",
+                                              "description":  "Required element 0 for state Detected Patterns Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Detected Patterns"
+                                                                          },
+                                                             "label":  "Required element for Detected Patterns Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-patterns-elem-1",
+                                              "description":  "Required element 1 for state Detected Patterns Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-role":  "badge"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for Detected Patterns Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-patterns-elem-2",
+                                              "description":  "Required element 2 for state Detected Patterns Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "occurrences"
+                                                                          },
+                                                             "label":  "Required element for Detected Patterns Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-patterns-elem-3",
+                                              "description":  "Required element 3 for state Detected Patterns Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "pattern"
+                                                                          },
+                                                             "label":  "Required element for Detected Patterns Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Error Monitor identifies recurring error patterns and clusters them for display. Users can see detected pattern groups with type badges indicating the kind of pattern, frequency counts showing how often each pattern occurs, and the ability to select a pattern to filter the error list to only matching errors. This helps users prioritize systemic issues over one-off errors.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "error-monitor-error-details",
+                       "name":  "Error Item Expanded Details",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-error-details-elem-0",
+                                              "description":  "Required element 0 for state Error Item Expanded Details",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Stack Trace"
+                                                                          },
+                                                             "label":  "Required element for Error Item Expanded Details"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-error-details-elem-1",
+                                              "description":  "Required element 1 for state Error Item Expanded Details",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Context"
+                                                                          },
+                                                             "label":  "Required element for Error Item Expanded Details"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-error-details-elem-2",
+                                              "description":  "Required element 2 for state Error Item Expanded Details",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Open in Editor"
+                                                                          },
+                                                             "label":  "Required element for Error Item Expanded Details"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-error-details-elem-3",
+                                              "description":  "Required element 3 for state Error Item Expanded Details",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Show context"
+                                                                          },
+                                                             "label":  "Required element for Error Item Expanded Details"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-error-details-elem-4",
+                                              "description":  "Required element 4 for state Error Item Expanded Details",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "recurrence"
+                                                                          },
+                                                             "label":  "Required element for Error Item Expanded Details"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When a user expands an error item, they see a detailed view containing the full error message rendered in a code block for readability, the stack trace if available, context lines surrounding the error, resolution notes from previous triage, recurrence history, and action buttons including \u0027Open in Editor\u0027 to jump to the source file and \u0027Show context\u0027 to view surrounding code. This detailed view provides all information needed to diagnose and act on an error without leaving the Error Monitor page.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "error-monitor-states",
+                       "name":  "Loading, Empty, and Error States",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-states-elem-0",
+                                              "description":  "Required element 0 for state Loading, Empty, and Error States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "status",
+                                                                              "text":  "Loading"
+                                                                          },
+                                                             "label":  "Required element for Loading, Empty, and Error States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-states-elem-1",
+                                              "description":  "Required element 1 for state Loading, Empty, and Error States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No Errors Detected"
+                                                                          },
+                                                             "label":  "Required element for Loading, Empty, and Error States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-states-elem-2",
+                                              "description":  "Required element 2 for state Loading, Empty, and Error States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Failed to load"
+                                                                          },
+                                                             "label":  "Required element for Loading, Empty, and Error States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-states-elem-3",
+                                              "description":  "Required element 3 for state Loading, Empty, and Error States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Auto-refresh: 30s"
+                                                                          },
+                                                             "label":  "Required element for Loading, Empty, and Error States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Error Monitor page handles various data-loading states gracefully. When data is being fetched, a loading spinner is displayed. When no errors exist, an empty state with a success icon communicates that no issues have been detected. When the page itself encounters an error loading data, an error state with an alert icon is shown. An auto-refresh indicator displays the refresh interval (e.g., \u0027Auto-refresh: 30s\u0027) so users know data will update automatically.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "error-monitor-fix-workflow",
+                       "name":  "Fix Errors Workflow Generation",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-fix-workflow-elem-0",
+                                              "description":  "Required element 0 for state Fix Errors Workflow Generation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Fix Errors"
+                                                                          },
+                                                             "label":  "Required element for Fix Errors Workflow Generation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-fix-workflow-elem-1",
+                                              "description":  "Required element 1 for state Fix Errors Workflow Generation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Generating"
+                                                                          },
+                                                             "label":  "Required element for Fix Errors Workflow Generation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-fix-workflow-elem-2",
+                                              "description":  "Required element 2 for state Fix Errors Workflow Generation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "selected"
+                                                                          },
+                                                             "label":  "Required element for Fix Errors Workflow Generation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Error Monitor includes a dedicated Fix Errors button (FixErrorsButton component) that allows users to generate automated fix workflows for selected or visible errors. When activated, this triggers the AI system to analyze the error patterns and propose remediation steps as a workflow that can be executed. This bridges the gap between error detection and resolution, enabling users to take action directly from the monitoring interface.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "error-monitor-run-scope",
+                       "name":  "Per-Run Scope Indicator",
+                       "assertions":  [
+                                          {
+                                              "id":  "error-monitor-run-scope-elem-0",
+                                              "description":  "Required element 0 for state Per-Run Scope Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Showing errors for"
+                                                                          },
+                                                             "label":  "Required element for Per-Run Scope Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-run-scope-elem-1",
+                                              "description":  "Required element 1 for state Per-Run Scope Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "run",
+                                                                              "attributes":  {
+                                                                                                 "content-role":  "label"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for Per-Run Scope Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-run-scope-elem-2",
+                                              "description":  "Required element 2 for state Per-Run Scope Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Clear"
+                                                                          },
+                                                             "label":  "Required element for Per-Run Scope Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "error-monitor-run-scope-elem-3",
+                                              "description":  "Required element 3 for state Per-Run Scope Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Showing errors for"
+                                                                          },
+                                                             "label":  "Required element for Per-Run Scope Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Error Monitor supports scoping the error view to a specific task run. When scoped, a blue banner appears at the top of the error list showing the name of the task run being viewed, along with a clear button to remove the scope and return to the full error view. This allows users who navigated from a specific workflow run to see only the errors relevant to that run, reducing noise from unrelated errors.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Error Monitor page — centralized error tracking and management across automation runs, providing filtering, status management, and fix workflow generation capabilities.",
+    "metadata":  {
+                     "tags":  [
+                                  "error-monitor",
+                                  "error-tracking",
+                                  "triage",
+                                  "observability",
+                                  "browser-errors",
+                                  "patterns",
+                                  "fix-workflow",
+                                  "run-scope"
+                              ]
+                 }
 }

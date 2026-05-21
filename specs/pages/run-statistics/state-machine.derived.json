@@ -1,267 +1,270 @@
-{
-  "version": "1.0",
-  "id": "run-statistics",
-  "name": "StatisticsTab",
-  "states": [
-    {
-      "id": "statistics-overview-dashboard",
-      "name": "Overview Dashboard",
-      "assertions": [
-        {
-          "id": "statistics-overview-dashboard-elem-0",
-          "description": "Required element 0 for state Overview Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Statistics|Health"
-            },
-            "label": "Required element for Overview Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "statistics-overview-dashboard-elem-1",
-          "description": "Required element 1 for state Overview Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "flaky|Flaky|unreliable"
-            },
-            "label": "Required element for Overview Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "statistics-overview-dashboard-elem-2",
-          "description": "Required element 2 for state Overview Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "history|runs|recent"
-            },
-            "label": "Required element for Overview Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "statistics-overview-dashboard-elem-3",
-          "description": "Required element 3 for state Overview Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "error|pattern"
-            },
-            "label": "Required element for Overview Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Overview view provides a high-level health assessment of the workflow configuration. Users see a grid of panels showing config health metrics, a list of flaky items (elements or actions with inconsistent success rates), recent run history, and recurring error patterns. This view helps users understand whether their workflow configuration is reliable over time, identify items that need attention, and spot trends in execution quality.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "statistics-performance-view",
-      "name": "Performance Dashboard",
-      "assertions": [
-        {
-          "id": "statistics-performance-view-elem-0",
-          "description": "Required element 0 for state Performance Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Overview|Performance"
-            },
-            "label": "Required element for Performance Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "statistics-performance-view-elem-1",
-          "description": "Required element 1 for state Performance Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Performance|timing|duration"
-            },
-            "label": "Required element for Performance Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "statistics-performance-view-elem-2",
-          "description": "Required element 2 for state Performance Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Refresh|refresh"
-            },
-            "label": "Required element for Performance Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Performance view provides deeper metrics on execution timing and success rates. Users can analyze action timing distributions, success trends over time, and transition reliability between states. This view is valuable for optimizing workflow performance — identifying slow actions, understanding where time is spent, and measuring how improvements to the configuration translate into better execution metrics.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "statistics-run-details-drilldown",
-      "name": "Run Details Drill-Down",
-      "assertions": [
-        {
-          "id": "statistics-run-details-drilldown-elem-0",
-          "description": "Required element 0 for state Run Details Drill-Down",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Run Details Drill-Down"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "statistics-run-details-drilldown-elem-1",
-          "description": "Required element 1 for state Run Details Drill-Down",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Close"
-            },
-            "label": "Required element for Run Details Drill-Down"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "From the run history panel, users can click on any individual run to see its details in a slide-out panel. This provides a quick way to inspect specific runs without leaving the statistics context. The drill-down shows run-level metrics and helps correlate specific executions with the aggregate statistics shown in the main panels.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "statistics-empty-and-loading-states",
-      "name": "Empty and Loading States",
-      "assertions": [
-        {
-          "id": "statistics-empty-and-loading-states-elem-0",
-          "description": "Required element 0 for state Empty and Loading States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Load a configuration|No Run Selected"
-            },
-            "label": "Required element for Empty and Loading States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "statistics-empty-and-loading-states-elem-1",
-          "description": "Required element 1 for state Empty and Loading States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No statistics|Run some workflows"
-            },
-            "label": "Required element for Empty and Loading States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "statistics-empty-and-loading-states-elem-2",
-          "description": "Required element 2 for state Empty and Loading States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "status"
-            },
-            "label": "Required element for Empty and Loading States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Statistics page requires a loaded configuration to display data. When no configuration is loaded, no run is selected, or statistics data is still loading, the page must communicate these states clearly. It also handles the case where no statistics have been collected yet, guiding the user to run workflows to generate data.",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Run Statistics page — displays execution performance metrics for a workflow configuration. Provides two views: Overview (config health, flaky items, run history, error patterns) and Performance (action timing, success trends, transition reliability). Shows config-level automation statistics rather than individual task run statistics.",
-  "metadata": {
-    "tags": [
-      "run-statistics",
-      "performance",
-      "config-health",
-      "analytics",
-      "observe"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "run-statistics",
+    "name":  "StatisticsTab",
+    "states":  [
+                   {
+                       "id":  "statistics-overview-dashboard",
+                       "name":  "Overview Dashboard",
+                       "assertions":  [
+                                          {
+                                              "id":  "statistics-overview-dashboard-elem-0",
+                                              "description":  "Required element 0 for state Overview Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Statistics|Health"
+                                                                          },
+                                                             "label":  "Required element for Overview Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "statistics-overview-dashboard-elem-1",
+                                              "description":  "Required element 1 for state Overview Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "flaky|Flaky|unreliable"
+                                                                          },
+                                                             "label":  "Required element for Overview Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "statistics-overview-dashboard-elem-2",
+                                              "description":  "Required element 2 for state Overview Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "history|runs|recent"
+                                                                          },
+                                                             "label":  "Required element for Overview Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "statistics-overview-dashboard-elem-3",
+                                              "description":  "Required element 3 for state Overview Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "error|pattern"
+                                                                          },
+                                                             "label":  "Required element for Overview Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Overview view provides a high-level health assessment of the workflow configuration. Users see a grid of panels showing config health metrics, a list of flaky items (elements or actions with inconsistent success rates), recent run history, and recurring error patterns. This view helps users understand whether their workflow configuration is reliable over time, identify items that need attention, and spot trends in execution quality.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "statistics-performance-view",
+                       "name":  "Performance Dashboard",
+                       "assertions":  [
+                                          {
+                                              "id":  "statistics-performance-view-elem-0",
+                                              "description":  "Required element 0 for state Performance Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Overview|Performance"
+                                                                          },
+                                                             "label":  "Required element for Performance Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "statistics-performance-view-elem-1",
+                                              "description":  "Required element 1 for state Performance Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Performance|timing|duration"
+                                                                          },
+                                                             "label":  "Required element for Performance Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "statistics-performance-view-elem-2",
+                                              "description":  "Required element 2 for state Performance Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Refresh|refresh"
+                                                                          },
+                                                             "label":  "Required element for Performance Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Performance view provides deeper metrics on execution timing and success rates. Users can analyze action timing distributions, success trends over time, and transition reliability between states. This view is valuable for optimizing workflow performance — identifying slow actions, understanding where time is spent, and measuring how improvements to the configuration translate into better execution metrics.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "statistics-run-details-drilldown",
+                       "name":  "Run Details Drill-Down",
+                       "assertions":  [
+                                          {
+                                              "id":  "statistics-run-details-drilldown-elem-0",
+                                              "description":  "Required element 0 for state Run Details Drill-Down",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Run Details Drill-Down"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "statistics-run-details-drilldown-elem-1",
+                                              "description":  "Required element 1 for state Run Details Drill-Down",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Close"
+                                                                          },
+                                                             "label":  "Required element for Run Details Drill-Down"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "From the run history panel, users can click on any individual run to see its details in a slide-out panel. This provides a quick way to inspect specific runs without leaving the statistics context. The drill-down shows run-level metrics and helps correlate specific executions with the aggregate statistics shown in the main panels.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "statistics-empty-and-loading-states",
+                       "name":  "Empty and Loading States",
+                       "assertions":  [
+                                          {
+                                              "id":  "statistics-empty-and-loading-states-elem-0",
+                                              "description":  "Required element 0 for state Empty and Loading States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Load a configuration|No Run Selected"
+                                                                          },
+                                                             "label":  "Required element for Empty and Loading States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "statistics-empty-and-loading-states-elem-1",
+                                              "description":  "Required element 1 for state Empty and Loading States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No statistics|Run some workflows"
+                                                                          },
+                                                             "label":  "Required element for Empty and Loading States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "statistics-empty-and-loading-states-elem-2",
+                                              "description":  "Required element 2 for state Empty and Loading States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "status"
+                                                                          },
+                                                             "label":  "Required element for Empty and Loading States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Statistics page requires a loaded configuration to display data. When no configuration is loaded, no run is selected, or statistics data is still loading, the page must communicate these states clearly. It also handles the case where no statistics have been collected yet, guiding the user to run workflows to generate data.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Run Statistics page — displays execution performance metrics for a workflow configuration. Provides two views: Overview (config health, flaky items, run history, error patterns) and Performance (action timing, success trends, transition reliability). Shows config-level automation statistics rather than individual task run statistics.",
+    "metadata":  {
+                     "tags":  [
+                                  "run-statistics",
+                                  "performance",
+                                  "config-health",
+                                  "analytics",
+                                  "observe"
+                              ]
+                 }
 }

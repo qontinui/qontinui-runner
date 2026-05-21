@@ -1,618 +1,621 @@
-{
-  "version": "1.0",
-  "id": "processes",
-  "name": "ProcessManagerTab",
-  "states": [
-    {
-      "id": "process-manager-overview",
-      "name": "Process Inventory and Status Awareness",
-      "assertions": [
-        {
-          "id": "process-manager-overview-elem-0",
-          "description": "Required element 0 for state Process Inventory and Status Awareness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Process Manager"
-            },
-            "label": "Required element for Process Inventory and Status Awareness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-overview-elem-1",
-          "description": "Required element 1 for state Process Inventory and Status Awareness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "running"
-            },
-            "label": "Required element for Process Inventory and Status Awareness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-overview-elem-2",
-          "description": "Required element 2 for state Process Inventory and Status Awareness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No processes configured"
-            },
-            "label": "Required element for Process Inventory and Status Awareness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-overview-elem-3",
-          "description": "Required element 3 for state Process Inventory and Status Awareness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Proxied"
-            },
-            "label": "Required element for Process Inventory and Status Awareness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Process Manager page provides users with a real-time inventory of all processes managed by the runner. Users need to immediately see how many processes are configured, how many are currently running, and the health status of each. The page displays a process list on the left with status indicators (stopped, starting, running, healthy, stopping, failed), PIDs, uptime counters, error counts, and category labels. This overview lets users quickly assess whether their development environment services are all healthy or if something needs attention. The running/total count in the header provides a quick pulse check without needing to scan every row.",
-      "precondition": "The current runner is a secondary instance (QONTINUI_INSTANCE_NAME is set)",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "process-manager-lifecycle",
-      "name": "Process Lifecycle Controls",
-      "assertions": [
-        {
-          "id": "process-manager-lifecycle-elem-0",
-          "description": "Required element 0 for state Process Lifecycle Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Process Lifecycle Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-lifecycle-elem-1",
-          "description": "Required element 1 for state Process Lifecycle Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Process Lifecycle Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-lifecycle-elem-2",
-          "description": "Required element 2 for state Process Lifecycle Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Process Lifecycle Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-lifecycle-elem-3",
-          "description": "Required element 3 for state Process Lifecycle Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Add Process"
-            },
-            "label": "Required element for Process Lifecycle Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users need granular control over the lifecycle of each managed process. For stopped processes, they should be able to start them with a single click. For running processes, they need stop and restart capabilities. Processes that are stopped should also be deletable from the configuration. These controls must be immediately accessible in the process list row without requiring navigation to a detail view, enabling rapid response when a service crashes or needs cycling. The UI must prevent destructive actions on running processes (no delete while running) and provide confirmation for irreversible operations like deletion.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "process-manager-output",
-      "name": "Process Output and Diagnostics",
-      "assertions": [
-        {
-          "id": "process-manager-output-elem-0",
-          "description": "Required element 0 for state Process Output and Diagnostics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Select a process to view its output"
-            },
-            "label": "Required element for Process Output and Diagnostics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-output-elem-1",
-          "description": "Required element 1 for state Process Output and Diagnostics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Fix"
-            },
-            "label": "Required element for Process Output and Diagnostics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-output-elem-2",
-          "description": "Required element 2 for state Process Output and Diagnostics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Scan for Projects"
-            },
-            "label": "Required element for Process Output and Diagnostics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When a user selects a process from the list, the right panel should display the process output (stdout and stderr) in real-time. This log viewer is the primary diagnostic tool for understanding why a process failed or what it is currently doing. Users need to see timestamped output lines with visual distinction between stdout and stderr streams. For processes that have errors, an AI-powered fix feature should be available that analyzes the error output and provides actionable remediation suggestions, turning the process manager from a passive viewer into an active troubleshooting tool.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "process-output-virtualization",
-      "name": "Process Output Virtualized Rendering",
-      "assertions": [
-        {
-          "id": "process-output-virtualization-elem-0",
-          "description": "Required element 0 for state Process Output Virtualized Rendering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "lines"
-            },
-            "label": "Required element for Process Output Virtualized Rendering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-output-virtualization-elem-1",
-          "description": "Required element 1 for state Process Output Virtualized Rendering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Scroll to bottom"
-            },
-            "label": "Required element for Process Output Virtualized Rendering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-output-virtualization-elem-3",
-          "description": "Required element 3 for state Process Output Virtualized Rendering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Out of Memory"
-            },
-            "label": "Required element for Process Output Virtualized Rendering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The process output viewer uses react-window virtual scrolling to render only visible log lines. This prevents OOM crashes when processes produce extensive output (e.g., 240K+ lines, 48MB). The viewer maintains a 2000-line in-memory buffer, auto-scrolls to follow new output, and supports search filtering.",
-      "precondition": "A process is selected and has produced output",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "process-output-session-picker",
-      "name": "Historical Session Picker",
-      "assertions": [
-        {
-          "id": "process-output-session-picker-elem-0",
-          "description": "Required element 0 for state Historical Session Picker",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "tagName": "select"
-            },
-            "label": "Required element for Historical Session Picker"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-output-session-picker-elem-1",
-          "description": "Required element 1 for state Historical Session Picker",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Live"
-            },
-            "label": "Required element for Historical Session Picker"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-output-session-picker-elem-2",
-          "description": "Required element 2 for state Historical Session Picker",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "tagName": "select"
-            },
-            "label": "Required element for Historical Session Picker"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-output-session-picker-elem-3",
-          "description": "Required element 3 for state Historical Session Picker",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "tagName": "select"
-            },
-            "label": "Required element for Historical Session Picker"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The process output viewer's toolbar includes a session picker dropdown that lets the user switch between the live ring-buffer view and historical sessions persisted in the runner's PostgreSQL database (process_sessions + process_session_output). The runner's event loop writes every output line to PG in batches (50 lines or 500ms), so every process restart creates a new session that can be browsed after the process has stopped. The picker lists 'Live' as the first option followed by up to 20 recent historical sessions (for the currently selected process config), each labeled with a relative time and the session's final exit status. Selecting a historical session swaps the live event stream for a batch fetch of that session's output; selecting 'Live' re-subscribes to the Tauri process-output event. This group specifies that the picker is present and correctly populated for the selected process.",
-      "precondition": "A process is selected from the process list",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "process-output-cross-session-search",
-      "name": "Cross-Session Search",
-      "assertions": [
-        {
-          "id": "process-output-cross-session-search-elem-0",
-          "description": "Required element 0 for state Cross-Session Search",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "All sessions"
-            },
-            "label": "Required element for Cross-Session Search"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-output-cross-session-search-elem-1",
-          "description": "Required element 1 for state Cross-Session Search",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "All sessions"
-            },
-            "label": "Required element for Cross-Session Search"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-output-cross-session-search-elem-2",
-          "description": "Required element 2 for state Cross-Session Search",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No matches across sessions."
-            },
-            "label": "Required element for Cross-Session Search"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-output-cross-session-search-elem-3",
-          "description": "Required element 3 for state Cross-Session Search",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "hits across sessions"
-            },
-            "label": "Required element for Cross-Session Search"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-output-cross-session-search-elem-4",
-          "description": "Required element 4 for state Cross-Session Search",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "hits across sessions"
-            },
-            "label": "Required element for Cross-Session Search"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The output viewer toolbar includes an 'All sessions' toggle button next to the search input. When active (visually highlighted cyan), the search input's placeholder changes from 'Search output...' to 'Search all sessions...' and typing triggers a backend call to search_process_logs, which runs an ILIKE query across every persisted session's output in the runner's PostgreSQL database. Results appear in a hits panel replacing the normal output view, each row showing the session ID prefix, process name, timestamp, and the matching log line. Clicking a hit jumps to that session in the picker and switches the view to that session's full content. This turns the process manager into a full-history log search tool, not just a live viewer. Toggling the button off restores the regular in-buffer filter.",
-      "precondition": "A process is selected from the process list",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "process-log-persistence-correctness",
-      "name": "Process Log Persistence — Algorithm Correctness",
-      "assertions": [
-        {
-          "id": "process-log-persistence-correctness-elem-0",
-          "description": "Required element 0 for state Process Log Persistence — Algorithm Correctness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "tagName": "select"
-            },
-            "label": "Required element for Process Log Persistence — Algorithm Correctness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-log-persistence-correctness-elem-1",
-          "description": "Required element 1 for state Process Log Persistence — Algorithm Correctness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "lines"
-            },
-            "label": "Required element for Process Log Persistence — Algorithm Correctness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-log-persistence-correctness-elem-2",
-          "description": "Required element 2 for state Process Log Persistence — Algorithm Correctness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "tagName": "select"
-            },
-            "label": "Required element for Process Log Persistence — Algorithm Correctness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-log-persistence-correctness-elem-3",
-          "description": "Required element 3 for state Process Log Persistence — Algorithm Correctness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "tagName": "select"
-            },
-            "label": "Required element for Process Log Persistence — Algorithm Correctness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The process log DB persistence feature writes every stdout/stderr line to PostgreSQL tables (process_sessions + process_session_output) via a batched writer task in the ManagedProcess event loop. This group defines what CORRECT output looks like from that persistence algorithm, verifiable from the page: the session picker reflects every process run, the historical session content matches what was previously shown live, the line counts are consistent between live and historical views, and zombie 'running' sessions from previous runner crashes are cleaned up on startup so the picker doesn't show stale entries.",
-      "precondition": "User has run the selected process multiple times",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "process-manager-visual-design",
-      "name": "Visual Design and Text Legibility",
-      "assertions": [
-        {
-          "id": "process-manager-visual-design-elem-0",
-          "description": "Required element 0 for state Visual Design and Text Legibility",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Process Manager"
-            },
-            "label": "Required element for Visual Design and Text Legibility"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-visual-design-elem-1",
-          "description": "Required element 1 for state Visual Design and Text Legibility",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "All sessions"
-            },
-            "label": "Required element for Visual Design and Text Legibility"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "process-manager-visual-design-elem-3",
-          "description": "Required element 3 for state Visual Design and Text Legibility",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "lines"
-            },
-            "label": "Required element for Visual Design and Text Legibility"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Process Manager uses the runner's standard dark theme with zinc grays, cyan accents for primary actions, and red/yellow/green for status indication. Text must be legible against the panel backgrounds — muted text uses zinc-500, primary text uses zinc-200, headings use zinc-200. The toolbar uses zinc-900 backgrounds with white/10 borders. Buttons in the toolbar follow the existing runner style: small xs text, bg-zinc-800 for secondary, bg-cyan-900/40 with border-cyan-700/50 for primary (Add Process), and the 'All sessions' toggle uses bg-cyan-900/30 with text-cyan-300 when active.",
-      "precondition": "A process is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Process Manager page — manages spawned child processes with lifecycle controls, log viewing (live ring buffer + historical PG sessions), cross-session search, project scanning, and AI-assisted error diagnosis. Processes are managed by the primary runner; secondary runners proxy their actions. Live output streams via Tauri events into a 2000-line virtualized ring buffer; historical sessions are persisted to PostgreSQL (process_sessions + process_session_output) and browseable via a dropdown picker.",
-  "metadata": {
-    "tags": [
-      "process-manager",
-      "lifecycle",
-      "diagnostics",
-      "runner-only",
-      "log-persistence",
-      "historical-sessions"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "processes",
+    "name":  "ProcessManagerTab",
+    "states":  [
+                   {
+                       "id":  "process-manager-overview",
+                       "name":  "Process Inventory and Status Awareness",
+                       "assertions":  [
+                                          {
+                                              "id":  "process-manager-overview-elem-0",
+                                              "description":  "Required element 0 for state Process Inventory and Status Awareness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Process Manager"
+                                                                          },
+                                                             "label":  "Required element for Process Inventory and Status Awareness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-overview-elem-1",
+                                              "description":  "Required element 1 for state Process Inventory and Status Awareness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "running"
+                                                                          },
+                                                             "label":  "Required element for Process Inventory and Status Awareness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-overview-elem-2",
+                                              "description":  "Required element 2 for state Process Inventory and Status Awareness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No processes configured"
+                                                                          },
+                                                             "label":  "Required element for Process Inventory and Status Awareness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-overview-elem-3",
+                                              "description":  "Required element 3 for state Process Inventory and Status Awareness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Proxied"
+                                                                          },
+                                                             "label":  "Required element for Process Inventory and Status Awareness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Process Manager page provides users with a real-time inventory of all processes managed by the runner. Users need to immediately see how many processes are configured, how many are currently running, and the health status of each. The page displays a process list on the left with status indicators (stopped, starting, running, healthy, stopping, failed), PIDs, uptime counters, error counts, and category labels. This overview lets users quickly assess whether their development environment services are all healthy or if something needs attention. The running/total count in the header provides a quick pulse check without needing to scan every row.",
+                       "precondition":  "The current runner is a secondary instance (QONTINUI_INSTANCE_NAME is set)",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "process-manager-lifecycle",
+                       "name":  "Process Lifecycle Controls",
+                       "assertions":  [
+                                          {
+                                              "id":  "process-manager-lifecycle-elem-0",
+                                              "description":  "Required element 0 for state Process Lifecycle Controls",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Process Lifecycle Controls"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-lifecycle-elem-1",
+                                              "description":  "Required element 1 for state Process Lifecycle Controls",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Process Lifecycle Controls"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-lifecycle-elem-2",
+                                              "description":  "Required element 2 for state Process Lifecycle Controls",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Process Lifecycle Controls"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-lifecycle-elem-3",
+                                              "description":  "Required element 3 for state Process Lifecycle Controls",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Add Process"
+                                                                          },
+                                                             "label":  "Required element for Process Lifecycle Controls"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users need granular control over the lifecycle of each managed process. For stopped processes, they should be able to start them with a single click. For running processes, they need stop and restart capabilities. Processes that are stopped should also be deletable from the configuration. These controls must be immediately accessible in the process list row without requiring navigation to a detail view, enabling rapid response when a service crashes or needs cycling. The UI must prevent destructive actions on running processes (no delete while running) and provide confirmation for irreversible operations like deletion.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "process-manager-output",
+                       "name":  "Process Output and Diagnostics",
+                       "assertions":  [
+                                          {
+                                              "id":  "process-manager-output-elem-0",
+                                              "description":  "Required element 0 for state Process Output and Diagnostics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Select a process to view its output"
+                                                                          },
+                                                             "label":  "Required element for Process Output and Diagnostics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-output-elem-1",
+                                              "description":  "Required element 1 for state Process Output and Diagnostics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Fix"
+                                                                          },
+                                                             "label":  "Required element for Process Output and Diagnostics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-output-elem-2",
+                                              "description":  "Required element 2 for state Process Output and Diagnostics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Scan for Projects"
+                                                                          },
+                                                             "label":  "Required element for Process Output and Diagnostics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When a user selects a process from the list, the right panel should display the process output (stdout and stderr) in real-time. This log viewer is the primary diagnostic tool for understanding why a process failed or what it is currently doing. Users need to see timestamped output lines with visual distinction between stdout and stderr streams. For processes that have errors, an AI-powered fix feature should be available that analyzes the error output and provides actionable remediation suggestions, turning the process manager from a passive viewer into an active troubleshooting tool.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "process-output-virtualization",
+                       "name":  "Process Output Virtualized Rendering",
+                       "assertions":  [
+                                          {
+                                              "id":  "process-output-virtualization-elem-0",
+                                              "description":  "Required element 0 for state Process Output Virtualized Rendering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "lines"
+                                                                          },
+                                                             "label":  "Required element for Process Output Virtualized Rendering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-output-virtualization-elem-1",
+                                              "description":  "Required element 1 for state Process Output Virtualized Rendering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Scroll to bottom"
+                                                                          },
+                                                             "label":  "Required element for Process Output Virtualized Rendering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-output-virtualization-elem-3",
+                                              "description":  "Required element 3 for state Process Output Virtualized Rendering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Out of Memory"
+                                                                          },
+                                                             "label":  "Required element for Process Output Virtualized Rendering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The process output viewer uses react-window virtual scrolling to render only visible log lines. This prevents OOM crashes when processes produce extensive output (e.g., 240K+ lines, 48MB). The viewer maintains a 2000-line in-memory buffer, auto-scrolls to follow new output, and supports search filtering.",
+                       "precondition":  "A process is selected and has produced output",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "process-output-session-picker",
+                       "name":  "Historical Session Picker",
+                       "assertions":  [
+                                          {
+                                              "id":  "process-output-session-picker-elem-0",
+                                              "description":  "Required element 0 for state Historical Session Picker",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "tagName":  "select"
+                                                                          },
+                                                             "label":  "Required element for Historical Session Picker"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-output-session-picker-elem-1",
+                                              "description":  "Required element 1 for state Historical Session Picker",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Live"
+                                                                          },
+                                                             "label":  "Required element for Historical Session Picker"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-output-session-picker-elem-2",
+                                              "description":  "Required element 2 for state Historical Session Picker",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "tagName":  "select"
+                                                                          },
+                                                             "label":  "Required element for Historical Session Picker"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-output-session-picker-elem-3",
+                                              "description":  "Required element 3 for state Historical Session Picker",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "tagName":  "select"
+                                                                          },
+                                                             "label":  "Required element for Historical Session Picker"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The process output viewer\u0027s toolbar includes a session picker dropdown that lets the user switch between the live ring-buffer view and historical sessions persisted in the runner\u0027s PostgreSQL database (process_sessions + process_session_output). The runner\u0027s event loop writes every output line to PG in batches (50 lines or 500ms), so every process restart creates a new session that can be browsed after the process has stopped. The picker lists \u0027Live\u0027 as the first option followed by up to 20 recent historical sessions (for the currently selected process config), each labeled with a relative time and the session\u0027s final exit status. Selecting a historical session swaps the live event stream for a batch fetch of that session\u0027s output; selecting \u0027Live\u0027 re-subscribes to the Tauri process-output event. This group specifies that the picker is present and correctly populated for the selected process.",
+                       "precondition":  "A process is selected from the process list",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "process-output-cross-session-search",
+                       "name":  "Cross-Session Search",
+                       "assertions":  [
+                                          {
+                                              "id":  "process-output-cross-session-search-elem-0",
+                                              "description":  "Required element 0 for state Cross-Session Search",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "All sessions"
+                                                                          },
+                                                             "label":  "Required element for Cross-Session Search"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-output-cross-session-search-elem-1",
+                                              "description":  "Required element 1 for state Cross-Session Search",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "All sessions"
+                                                                          },
+                                                             "label":  "Required element for Cross-Session Search"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-output-cross-session-search-elem-2",
+                                              "description":  "Required element 2 for state Cross-Session Search",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No matches across sessions."
+                                                                          },
+                                                             "label":  "Required element for Cross-Session Search"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-output-cross-session-search-elem-3",
+                                              "description":  "Required element 3 for state Cross-Session Search",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "hits across sessions"
+                                                                          },
+                                                             "label":  "Required element for Cross-Session Search"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-output-cross-session-search-elem-4",
+                                              "description":  "Required element 4 for state Cross-Session Search",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "hits across sessions"
+                                                                          },
+                                                             "label":  "Required element for Cross-Session Search"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The output viewer toolbar includes an \u0027All sessions\u0027 toggle button next to the search input. When active (visually highlighted cyan), the search input\u0027s placeholder changes from \u0027Search output...\u0027 to \u0027Search all sessions...\u0027 and typing triggers a backend call to search_process_logs, which runs an ILIKE query across every persisted session\u0027s output in the runner\u0027s PostgreSQL database. Results appear in a hits panel replacing the normal output view, each row showing the session ID prefix, process name, timestamp, and the matching log line. Clicking a hit jumps to that session in the picker and switches the view to that session\u0027s full content. This turns the process manager into a full-history log search tool, not just a live viewer. Toggling the button off restores the regular in-buffer filter.",
+                       "precondition":  "A process is selected from the process list",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "process-log-persistence-correctness",
+                       "name":  "Process Log Persistence — Algorithm Correctness",
+                       "assertions":  [
+                                          {
+                                              "id":  "process-log-persistence-correctness-elem-0",
+                                              "description":  "Required element 0 for state Process Log Persistence — Algorithm Correctness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "tagName":  "select"
+                                                                          },
+                                                             "label":  "Required element for Process Log Persistence — Algorithm Correctness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-log-persistence-correctness-elem-1",
+                                              "description":  "Required element 1 for state Process Log Persistence — Algorithm Correctness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "lines"
+                                                                          },
+                                                             "label":  "Required element for Process Log Persistence — Algorithm Correctness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-log-persistence-correctness-elem-2",
+                                              "description":  "Required element 2 for state Process Log Persistence — Algorithm Correctness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "tagName":  "select"
+                                                                          },
+                                                             "label":  "Required element for Process Log Persistence — Algorithm Correctness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-log-persistence-correctness-elem-3",
+                                              "description":  "Required element 3 for state Process Log Persistence — Algorithm Correctness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "tagName":  "select"
+                                                                          },
+                                                             "label":  "Required element for Process Log Persistence — Algorithm Correctness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The process log DB persistence feature writes every stdout/stderr line to PostgreSQL tables (process_sessions + process_session_output) via a batched writer task in the ManagedProcess event loop. This group defines what CORRECT output looks like from that persistence algorithm, verifiable from the page: the session picker reflects every process run, the historical session content matches what was previously shown live, the line counts are consistent between live and historical views, and zombie \u0027running\u0027 sessions from previous runner crashes are cleaned up on startup so the picker doesn\u0027t show stale entries.",
+                       "precondition":  "User has run the selected process multiple times",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "process-manager-visual-design",
+                       "name":  "Visual Design and Text Legibility",
+                       "assertions":  [
+                                          {
+                                              "id":  "process-manager-visual-design-elem-0",
+                                              "description":  "Required element 0 for state Visual Design and Text Legibility",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Process Manager"
+                                                                          },
+                                                             "label":  "Required element for Visual Design and Text Legibility"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-visual-design-elem-1",
+                                              "description":  "Required element 1 for state Visual Design and Text Legibility",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "All sessions"
+                                                                          },
+                                                             "label":  "Required element for Visual Design and Text Legibility"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "process-manager-visual-design-elem-3",
+                                              "description":  "Required element 3 for state Visual Design and Text Legibility",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "lines"
+                                                                          },
+                                                             "label":  "Required element for Visual Design and Text Legibility"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Process Manager uses the runner\u0027s standard dark theme with zinc grays, cyan accents for primary actions, and red/yellow/green for status indication. Text must be legible against the panel backgrounds — muted text uses zinc-500, primary text uses zinc-200, headings use zinc-200. The toolbar uses zinc-900 backgrounds with white/10 borders. Buttons in the toolbar follow the existing runner style: small xs text, bg-zinc-800 for secondary, bg-cyan-900/40 with border-cyan-700/50 for primary (Add Process), and the \u0027All sessions\u0027 toggle uses bg-cyan-900/30 with text-cyan-300 when active.",
+                       "precondition":  "A process is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Process Manager page — manages spawned child processes with lifecycle controls, log viewing (live ring buffer + historical PG sessions), cross-session search, project scanning, and AI-assisted error diagnosis. Processes are managed by the primary runner; secondary runners proxy their actions. Live output streams via Tauri events into a 2000-line virtualized ring buffer; historical sessions are persisted to PostgreSQL (process_sessions + process_session_output) and browseable via a dropdown picker.",
+    "metadata":  {
+                     "tags":  [
+                                  "process-manager",
+                                  "lifecycle",
+                                  "diagnostics",
+                                  "runner-only",
+                                  "log-persistence",
+                                  "historical-sessions"
+                              ]
+                 }
 }

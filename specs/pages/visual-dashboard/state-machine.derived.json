@@ -1,1098 +1,1101 @@
-{
-  "version": "1.0",
-  "id": "visual-dashboard",
-  "name": "ActiveDashboardPage",
-  "states": [
-    {
-      "id": "vd-page-structure",
-      "name": "Page Structure — Fixed Bars and Content Area",
-      "assertions": [
-        {
-          "id": "vd-page-structure-elem-0",
-          "description": "Required element 0 for state Page Structure — Fixed Bars and Content Area",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "banner"
-            },
-            "label": "Required element for Page Structure — Fixed Bars and Content Area"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-page-structure-elem-1",
-          "description": "Required element 1 for state Page Structure — Fixed Bars and Content Area",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "main"
-            },
-            "label": "Required element for Page Structure — Fixed Bars and Content Area"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-page-structure-elem-2",
-          "description": "Required element 2 for state Page Structure — Fixed Bars and Content Area",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "contentinfo"
-            },
-            "label": "Required element for Page Structure — Fixed Bars and Content Area"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-page-structure-elem-3",
-          "description": "Required element 3 for state Page Structure — Fixed Bars and Content Area",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Page Structure — Fixed Bars and Content Area"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-page-structure-discriminator",
-          "description": "Distinctness discriminator for state Page Structure — Fixed Bars and Content Area",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Page Structure — Fixed Bars and Content Area"
-            },
-            "label": "Discriminator for Page Structure — Fixed Bars and Content Area"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The dashboard has a fixed vertical layout: ControlBar at the top (always visible), a flex-1 DashboardLayout content area in the middle, and BottomBar at the bottom (always visible). An optional OrchestrationLoopBanner and TopPatternsWidget may appear between the ControlBar and the content area when orchestration is active.",
-      "precondition": "A workflow is running with at least two detected activity types",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-idle-state",
-      "name": "Idle State — No Active Workflow",
-      "assertions": [
-        {
-          "id": "vd-idle-state-elem-0",
-          "description": "Required element 0 for state Idle State — No Active Workflow",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "heading",
-              "text": "No Active Workflow"
-            },
-            "label": "Required element for Idle State — No Active Workflow"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-idle-state-elem-1",
-          "description": "Required element 1 for state Idle State — No Active Workflow",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Run Last Workflow"
-            },
-            "label": "Required element for Idle State — No Active Workflow"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-idle-state-elem-2",
-          "description": "Required element 2 for state Idle State — No Active Workflow",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "heading",
-              "text": "No Active Workflow"
-            },
-            "label": "Required element for Idle State — No Active Workflow"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-idle-state-elem-3",
-          "description": "Required element 3 for state Idle State — No Active Workflow",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Run Last Workflow"
-            },
-            "label": "Required element for Idle State — No Active Workflow"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When no workflow is running, the content area shows the IdleState component: a workflow icon, 'No Active Workflow' heading, a subtitle, and optional 'Run Last Workflow ({name})' / 'View Last Run ({name})' buttons when a previous run exists.",
-      "precondition": "No workflow is running or queued",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-control-bar-task-phase",
-      "name": "Control Bar — Task Name and Phase",
-      "assertions": [
-        {
-          "id": "vd-control-bar-task-phase-elem-0",
-          "description": "Required element 0 for state Control Bar — Task Name and Phase",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "banner"
-            },
-            "label": "Required element for Control Bar — Task Name and Phase"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-control-bar-task-phase-elem-1",
-          "description": "Required element 1 for state Control Bar — Task Name and Phase",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "data-content-label": "task name"
-              }
-            },
-            "label": "Required element for Control Bar — Task Name and Phase"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-control-bar-task-phase-elem-2",
-          "description": "Required element 2 for state Control Bar — Task Name and Phase",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "RUNNING"
-            },
-            "label": "Required element for Control Bar — Task Name and Phase"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The left section of the ControlBar shows the running workflow's task name (data-content-label='task name', truncated if too long). For simple (non-orchestrated) workflows a phase badge reflects setup/verification/ai_work/idle phases with matching color coding. A 'RUNNING' fallback label appears when the task is executing but no specific phase is detected.",
-      "precondition": "A workflow is currently running",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-orchestrated-stages",
-      "name": "Control Bar — Orchestrated Workflow Stage Pills",
-      "assertions": [
-        {
-          "id": "vd-orchestrated-stages-elem-0",
-          "description": "Required element 0 for state Control Bar — Orchestrated Workflow Stage Pills",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "data-content-label": "setup stage"
-              }
-            },
-            "label": "Required element for Control Bar — Orchestrated Workflow Stage Pills"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-orchestrated-stages-elem-1",
-          "description": "Required element 1 for state Control Bar — Orchestrated Workflow Stage Pills",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "data-content-label": "agentic stage"
-              }
-            },
-            "label": "Required element for Control Bar — Orchestrated Workflow Stage Pills"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-orchestrated-stages-elem-2",
-          "description": "Required element 2 for state Control Bar — Orchestrated Workflow Stage Pills",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "data-content-label": "verification stage"
-              }
-            },
-            "label": "Required element for Control Bar — Orchestrated Workflow Stage Pills"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-orchestrated-stages-elem-3",
-          "description": "Required element 3 for state Control Bar — Orchestrated Workflow Stage Pills",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Iteration"
-            },
-            "label": "Required element for Control Bar — Orchestrated Workflow Stage Pills"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "For multi-stage orchestrated workflows the ControlBar center shows four stage pill badges in order: Setup → Agentic ↔ Verification → Completion. Each badge has data-content-label='{stage} stage'. The currently active stage glows via an animate-phase-glow CSS animation. Optional step-count sub-labels (completed/total) appear inside each pill. An iteration counter badge shows 'Iteration X/Y' or 'Iteration X' when iterating.",
-      "precondition": "An orchestrated (multi-stage) workflow is running",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-playback-controls",
-      "name": "Control Bar — Playback Controls",
-      "assertions": [
-        {
-          "id": "vd-playback-controls-elem-0",
-          "description": "Required element 0 for state Control Bar — Playback Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Stop"
-            },
-            "label": "Required element for Control Bar — Playback Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-playback-controls-elem-1",
-          "description": "Required element 1 for state Control Bar — Playback Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Stop"
-            },
-            "label": "Required element for Control Bar — Playback Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-playback-controls-elem-2",
-          "description": "Required element 2 for state Control Bar — Playback Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Pause"
-            },
-            "label": "Required element for Control Bar — Playback Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-playback-controls-elem-3",
-          "description": "Required element 3 for state Control Bar — Playback Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Stop"
-            },
-            "label": "Required element for Control Bar — Playback Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-playback-controls-elem-4",
-          "description": "Required element 4 for state Control Bar — Playback Controls",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Control Bar — Playback Controls"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The right section of the ControlBar contains three controls: a combined Play/Pause toggle (icon switches based on state), a Stop button, and an Auto-Continue toggle. The Stop button is disabled when status is 'idle'. The Play/Pause button is disabled when status is 'idle'. The Auto-Continue toggle shows an orange icon when enabled and a muted icon when disabled.",
-      "precondition": "Dashboard is idle — no workflow running or queued",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-bottom-bar",
-      "name": "Bottom Bar — Real-Time Status Metrics",
-      "assertions": [
-        {
-          "id": "vd-bottom-bar-elem-0",
-          "description": "Required element 0 for state Bottom Bar — Real-Time Status Metrics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "contentinfo"
-            },
-            "label": "Required element for Bottom Bar — Real-Time Status Metrics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-bottom-bar-elem-1",
-          "description": "Required element 1 for state Bottom Bar — Real-Time Status Metrics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Elapsed"
-            },
-            "label": "Required element for Bottom Bar — Real-Time Status Metrics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-bottom-bar-elem-2",
-          "description": "Required element 2 for state Bottom Bar — Real-Time Status Metrics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Orchestrator"
-            },
-            "label": "Required element for Bottom Bar — Real-Time Status Metrics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-bottom-bar-elem-3",
-          "description": "Required element 3 for state Bottom Bar — Real-Time Status Metrics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Updated"
-            },
-            "label": "Required element for Bottom Bar — Real-Time Status Metrics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-bottom-bar-elem-4",
-          "description": "Required element 4 for state Bottom Bar — Real-Time Status Metrics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "status"
-            },
-            "label": "Required element for Bottom Bar — Real-Time Status Metrics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The BottomBar (h-10, always visible) provides three sections: left = elapsed time metric; center = orchestrator-agent badge (when orchestrated) + current activity-type label (when running); right = data-freshness metric + connection-status badge. All metrics update in real time during execution.",
-      "precondition": "A workflow is running",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-widget-layout",
-      "name": "Dynamic Widget Layout",
-      "assertions": [
-        {
-          "id": "vd-widget-layout-elem-0",
-          "description": "Required element 0 for state Dynamic Widget Layout",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "AI Conversation"
-            },
-            "label": "Required element for Dynamic Widget Layout"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-widget-layout-elem-1",
-          "description": "Required element 1 for state Dynamic Widget Layout",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Dynamic Widget Layout"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-widget-layout-elem-2",
-          "description": "Required element 2 for state Dynamic Widget Layout",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Dynamic Widget Layout"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-widget-layout-elem-3",
-          "description": "Required element 3 for state Dynamic Widget Layout",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Execution Timeline"
-            },
-            "label": "Required element for Dynamic Widget Layout"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The DashboardLayout content area assigns detected activities to widgets. The primary (active) widget occupies ~65% width on the left with a 2px accent border matching the activity type's color; secondary widgets stack compactly in ~35% on the right. Clicking a compact widget promotes it to the primary position. Each activity type has a distinct accent color: gui_automation=blue, ai_conversation=green, verification=teal, findings=amber, shell_command=slate, api_request=orange, script=indigo, workflow_ref=pink, mcp_call=violet, execution_timeline=cyan, flow_execution=emerald, canvas=rose, trace_viewer=sky.",
-      "precondition": "A workflow with AI conversation activity is running",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-completion-summary",
-      "name": "Completion Summary Overlay",
-      "assertions": [
-        {
-          "id": "vd-completion-summary-elem-0",
-          "description": "Required element 0 for state Completion Summary Overlay",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "heading",
-              "text": "Workflow Completed"
-            },
-            "label": "Required element for Completion Summary Overlay"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-completion-summary-elem-1",
-          "description": "Required element 1 for state Completion Summary Overlay",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "heading",
-              "text": "Workflow Failed"
-            },
-            "label": "Required element for Completion Summary Overlay"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-completion-summary-elem-2",
-          "description": "Required element 2 for state Completion Summary Overlay",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Dismiss"
-            },
-            "label": "Required element for Completion Summary Overlay"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-completion-summary-elem-3",
-          "description": "Required element 3 for state Completion Summary Overlay",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Success Rate"
-            },
-            "label": "Required element for Completion Summary Overlay"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-completion-summary-elem-4",
-          "description": "Required element 4 for state Completion Summary Overlay",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Dismiss"
-            },
-            "label": "Required element for Completion Summary Overlay"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When a workflow transitions from running to finished (completed or failed), a CompletionSummary overlay appears over the dashboard. The overlay shows: a header with success (green, checkmark, 'Workflow Completed') or failure (red, X, 'Workflow Failed') theme; a stats grid with duration, step counts (total/passed/failed), and success-rate percentage; a progress bar; and a Dismiss button. Auto-dismisses after 15 s. Escape also dismisses.",
-      "precondition": "A workflow just completed successfully and the overlay is visible",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-breakpoint-indicator",
-      "name": "Control Bar — Breakpoint Pause Indicator",
-      "assertions": [
-        {
-          "id": "vd-breakpoint-indicator-elem-0",
-          "description": "Required element 0 for state Control Bar — Breakpoint Pause Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Breakpoint"
-            },
-            "label": "Required element for Control Bar — Breakpoint Pause Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-breakpoint-indicator-elem-1",
-          "description": "Required element 1 for state Control Bar — Breakpoint Pause Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "data-content-label": "breakpoint step"
-              }
-            },
-            "label": "Required element for Control Bar — Breakpoint Pause Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-breakpoint-indicator-elem-2",
-          "description": "Required element 2 for state Control Bar — Breakpoint Pause Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Inspect"
-            },
-            "label": "Required element for Control Bar — Breakpoint Pause Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-breakpoint-indicator-elem-3",
-          "description": "Required element 3 for state Control Bar — Breakpoint Pause Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Resume"
-            },
-            "label": "Required element for Control Bar — Breakpoint Pause Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-breakpoint-indicator-elem-4",
-          "description": "Required element 4 for state Control Bar — Breakpoint Pause Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Breakpoint"
-            },
-            "label": "Required element for Control Bar — Breakpoint Pause Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When a workflow step with breakpoint:true completes, execution suspends. The ControlBar shows an amber 'Breakpoint' badge with animate-phase-glow animation, the step name (data-content-label='breakpoint step'), an 'Inspect' button (blue, eye icon), and a 'Resume' button (green, play icon). These controls are absent when no breakpoint is active.",
-      "precondition": "A workflow is paused at a breakpoint (snapshot status='waiting')",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-breakpoint-inspector",
-      "name": "Breakpoint Inspector Panel",
-      "assertions": [
-        {
-          "id": "vd-breakpoint-inspector-elem-0",
-          "description": "Required element 0 for state Breakpoint Inspector Panel",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Breakpoint Inspector"
-            },
-            "label": "Required element for Breakpoint Inspector Panel"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-breakpoint-inspector-elem-1",
-          "description": "Required element 1 for state Breakpoint Inspector Panel",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Close inspector"
-            },
-            "label": "Required element for Breakpoint Inspector Panel"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-breakpoint-inspector-elem-2",
-          "description": "Required element 2 for state Breakpoint Inspector Panel",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Variables"
-            },
-            "label": "Required element for Breakpoint Inspector Panel"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-breakpoint-inspector-elem-3",
-          "description": "Required element 3 for state Breakpoint Inspector Panel",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "ago"
-            },
-            "label": "Required element for Breakpoint Inspector Panel"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The BreakpointInspector is a 384px-wide overlay panel anchored to the right side of the screen (full height, z-40). It opens when the user clicks Inspect. Content: 'Breakpoint Inspector' heading + close button (aria-label='Close inspector'); an info bar with step index (amber badge 'Step N'), step name, phase badge, and optional iteration; a freshness indicator ('Ns ago', amber if 10-30 min, red if >30 min); a Variables collapsible tree; a Pending Steps list; and an optional Last Screenshot thumbnail.",
-      "precondition": "Inspector panel is open (user clicked Inspect)",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-approval-dialog",
-      "name": "Human Approval Dialog",
-      "assertions": [
-        {
-          "id": "vd-approval-dialog-elem-0",
-          "description": "Required element 0 for state Human Approval Dialog",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Approval Required"
-            },
-            "label": "Required element for Human Approval Dialog"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-approval-dialog-elem-1",
-          "description": "Required element 1 for state Human Approval Dialog",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Approve"
-            },
-            "label": "Required element for Human Approval Dialog"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-approval-dialog-elem-2",
-          "description": "Required element 2 for state Human Approval Dialog",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Approve"
-            },
-            "label": "Required element for Human Approval Dialog"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When a workflow step requires human approval the ApprovalDialog overlay appears on top of the running dashboard. It shows 'Approval Required' header, context about the pending action (summary, modified files, optional diff), a comment textarea, and three action buttons: Approve (resumes workflow), Reject (continues to next iteration), Abort Workflow (terminates run). The dashboard remains visible behind the semi-transparent backdrop.",
-      "precondition": "A workflow is paused awaiting human approval",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-multi-run-switcher",
-      "name": "Multi-Run Switcher (ActiveRunsBar)",
-      "assertions": [
-        {
-          "id": "vd-multi-run-switcher-elem-0",
-          "description": "Required element 0 for state Multi-Run Switcher (ActiveRunsBar)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Active Runs"
-            },
-            "label": "Required element for Multi-Run Switcher (ActiveRunsBar)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-multi-run-switcher-elem-1",
-          "description": "Required element 1 for state Multi-Run Switcher (ActiveRunsBar)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "New Run"
-            },
-            "label": "Required element for Multi-Run Switcher (ActiveRunsBar)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-multi-run-switcher-elem-2",
-          "description": "Required element 2 for state Multi-Run Switcher (ActiveRunsBar)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Multi-Run Switcher (ActiveRunsBar)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When two or more concurrent workflow runs are active, the ActiveRunsBar appears at the bottom-right of the dashboard (above the BottomBar). Each run has a card showing its name and status. Clicking a card switches the main dashboard to that run's view. A 'New Run' button navigates to the Execute page.",
-      "precondition": "Only one workflow is running",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "vd-keyboard-shortcuts",
-      "name": "Keyboard Shortcuts",
-      "assertions": [
-        {
-          "id": "vd-keyboard-shortcuts-elem-0",
-          "description": "Required element 0 for state Keyboard Shortcuts",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Keyboard Shortcuts"
-            },
-            "label": "Required element for Keyboard Shortcuts"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-keyboard-shortcuts-elem-1",
-          "description": "Required element 1 for state Keyboard Shortcuts",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "tooltip"
-            },
-            "label": "Required element for Keyboard Shortcuts"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "vd-keyboard-shortcuts-elem-2",
-          "description": "Required element 2 for state Keyboard Shortcuts",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Keyboard Shortcuts"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The dashboard supports: '?' opens the ShortcutsModal (lists all bindings); Ctrl+1-8 promotes a summary widget to active by position; Ctrl+R (Cmd+R) triggers a data refresh (GET /status); Escape closes open overlays (completion summary, shortcuts modal).",
-      "precondition": "No modal overlay is currently open",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "The Visual Dashboard (accessible via the 'active' tab in runner navigation) is the real-time monitoring hub for workflow execution in qontinui-runner. It provides: a top ControlBar (h-14) showing the running task name, workflow stage indicator pills, and playback controls (pause/resume/stop/auto-continue); a dynamic widget content area with a 65% active / 35% summary-stack split that supports 14 activity types (gui_automation, ai_conversation, verification, findings, shell_command, api_request, script, workflow_ref, mcp_call, execution_timeline, flow_execution, canvas, trace_viewer, playwright); a bottom status bar (h-10) with elapsed-time metric, current-activity label, orchestrator-agent badge, and connection-health indicator. Overlays include: a completion summary auto-dismissing after 15 s, a breakpoint inspector panel for paused executions, a human approval dialog, and an ActiveRunsBar multi-run switcher that appears when two or more concurrent runs are active. Keyboard shortcuts (?, Ctrl+1-8, Ctrl+R, Escape) are available throughout.",
-  "metadata": {
-    "tags": [
-      "visual-dashboard",
-      "active-dashboard",
-      "monitoring",
-      "real-time",
-      "widgets",
-      "runner",
-      "execution",
-      "multi-run",
-      "breakpoints",
-      "tier-1"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "visual-dashboard",
+    "name":  "ActiveDashboardPage",
+    "states":  [
+                   {
+                       "id":  "vd-page-structure",
+                       "name":  "Page Structure — Fixed Bars and Content Area",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-page-structure-elem-0",
+                                              "description":  "Required element 0 for state Page Structure — Fixed Bars and Content Area",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "banner"
+                                                                          },
+                                                             "label":  "Required element for Page Structure — Fixed Bars and Content Area"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-page-structure-elem-1",
+                                              "description":  "Required element 1 for state Page Structure — Fixed Bars and Content Area",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "main"
+                                                                          },
+                                                             "label":  "Required element for Page Structure — Fixed Bars and Content Area"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-page-structure-elem-2",
+                                              "description":  "Required element 2 for state Page Structure — Fixed Bars and Content Area",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "contentinfo"
+                                                                          },
+                                                             "label":  "Required element for Page Structure — Fixed Bars and Content Area"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-page-structure-elem-3",
+                                              "description":  "Required element 3 for state Page Structure — Fixed Bars and Content Area",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Page Structure — Fixed Bars and Content Area"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-page-structure-discriminator",
+                                              "description":  "Distinctness discriminator for state Page Structure — Fixed Bars and Content Area",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Page Structure — Fixed Bars and Content Area"
+                                                                          },
+                                                             "label":  "Discriminator for Page Structure — Fixed Bars and Content Area"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The dashboard has a fixed vertical layout: ControlBar at the top (always visible), a flex-1 DashboardLayout content area in the middle, and BottomBar at the bottom (always visible). An optional OrchestrationLoopBanner and TopPatternsWidget may appear between the ControlBar and the content area when orchestration is active.",
+                       "precondition":  "A workflow is running with at least two detected activity types",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-idle-state",
+                       "name":  "Idle State — No Active Workflow",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-idle-state-elem-0",
+                                              "description":  "Required element 0 for state Idle State — No Active Workflow",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "heading",
+                                                                              "text":  "No Active Workflow"
+                                                                          },
+                                                             "label":  "Required element for Idle State — No Active Workflow"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-idle-state-elem-1",
+                                              "description":  "Required element 1 for state Idle State — No Active Workflow",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Run Last Workflow"
+                                                                          },
+                                                             "label":  "Required element for Idle State — No Active Workflow"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-idle-state-elem-2",
+                                              "description":  "Required element 2 for state Idle State — No Active Workflow",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "heading",
+                                                                              "text":  "No Active Workflow"
+                                                                          },
+                                                             "label":  "Required element for Idle State — No Active Workflow"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-idle-state-elem-3",
+                                              "description":  "Required element 3 for state Idle State — No Active Workflow",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Run Last Workflow"
+                                                                          },
+                                                             "label":  "Required element for Idle State — No Active Workflow"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When no workflow is running, the content area shows the IdleState component: a workflow icon, \u0027No Active Workflow\u0027 heading, a subtitle, and optional \u0027Run Last Workflow ({name})\u0027 / \u0027View Last Run ({name})\u0027 buttons when a previous run exists.",
+                       "precondition":  "No workflow is running or queued",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-control-bar-task-phase",
+                       "name":  "Control Bar — Task Name and Phase",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-control-bar-task-phase-elem-0",
+                                              "description":  "Required element 0 for state Control Bar — Task Name and Phase",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "banner"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Task Name and Phase"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-control-bar-task-phase-elem-1",
+                                              "description":  "Required element 1 for state Control Bar — Task Name and Phase",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "data-content-label":  "task name"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Task Name and Phase"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-control-bar-task-phase-elem-2",
+                                              "description":  "Required element 2 for state Control Bar — Task Name and Phase",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "RUNNING"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Task Name and Phase"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The left section of the ControlBar shows the running workflow\u0027s task name (data-content-label=\u0027task name\u0027, truncated if too long). For simple (non-orchestrated) workflows a phase badge reflects setup/verification/ai_work/idle phases with matching color coding. A \u0027RUNNING\u0027 fallback label appears when the task is executing but no specific phase is detected.",
+                       "precondition":  "A workflow is currently running",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-orchestrated-stages",
+                       "name":  "Control Bar — Orchestrated Workflow Stage Pills",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-orchestrated-stages-elem-0",
+                                              "description":  "Required element 0 for state Control Bar — Orchestrated Workflow Stage Pills",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "data-content-label":  "setup stage"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Orchestrated Workflow Stage Pills"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-orchestrated-stages-elem-1",
+                                              "description":  "Required element 1 for state Control Bar — Orchestrated Workflow Stage Pills",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "data-content-label":  "agentic stage"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Orchestrated Workflow Stage Pills"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-orchestrated-stages-elem-2",
+                                              "description":  "Required element 2 for state Control Bar — Orchestrated Workflow Stage Pills",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "data-content-label":  "verification stage"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Orchestrated Workflow Stage Pills"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-orchestrated-stages-elem-3",
+                                              "description":  "Required element 3 for state Control Bar — Orchestrated Workflow Stage Pills",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Iteration"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Orchestrated Workflow Stage Pills"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "For multi-stage orchestrated workflows the ControlBar center shows four stage pill badges in order: Setup → Agentic ↔ Verification → Completion. Each badge has data-content-label=\u0027{stage} stage\u0027. The currently active stage glows via an animate-phase-glow CSS animation. Optional step-count sub-labels (completed/total) appear inside each pill. An iteration counter badge shows \u0027Iteration X/Y\u0027 or \u0027Iteration X\u0027 when iterating.",
+                       "precondition":  "An orchestrated (multi-stage) workflow is running",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-playback-controls",
+                       "name":  "Control Bar — Playback Controls",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-playback-controls-elem-0",
+                                              "description":  "Required element 0 for state Control Bar — Playback Controls",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Stop"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Playback Controls"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-playback-controls-elem-1",
+                                              "description":  "Required element 1 for state Control Bar — Playback Controls",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Stop"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Playback Controls"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-playback-controls-elem-2",
+                                              "description":  "Required element 2 for state Control Bar — Playback Controls",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Pause"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Playback Controls"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-playback-controls-elem-3",
+                                              "description":  "Required element 3 for state Control Bar — Playback Controls",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Stop"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Playback Controls"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-playback-controls-elem-4",
+                                              "description":  "Required element 4 for state Control Bar — Playback Controls",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Playback Controls"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The right section of the ControlBar contains three controls: a combined Play/Pause toggle (icon switches based on state), a Stop button, and an Auto-Continue toggle. The Stop button is disabled when status is \u0027idle\u0027. The Play/Pause button is disabled when status is \u0027idle\u0027. The Auto-Continue toggle shows an orange icon when enabled and a muted icon when disabled.",
+                       "precondition":  "Dashboard is idle — no workflow running or queued",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-bottom-bar",
+                       "name":  "Bottom Bar — Real-Time Status Metrics",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-bottom-bar-elem-0",
+                                              "description":  "Required element 0 for state Bottom Bar — Real-Time Status Metrics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "contentinfo"
+                                                                          },
+                                                             "label":  "Required element for Bottom Bar — Real-Time Status Metrics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-bottom-bar-elem-1",
+                                              "description":  "Required element 1 for state Bottom Bar — Real-Time Status Metrics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Elapsed"
+                                                                          },
+                                                             "label":  "Required element for Bottom Bar — Real-Time Status Metrics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-bottom-bar-elem-2",
+                                              "description":  "Required element 2 for state Bottom Bar — Real-Time Status Metrics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Orchestrator"
+                                                                          },
+                                                             "label":  "Required element for Bottom Bar — Real-Time Status Metrics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-bottom-bar-elem-3",
+                                              "description":  "Required element 3 for state Bottom Bar — Real-Time Status Metrics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Updated"
+                                                                          },
+                                                             "label":  "Required element for Bottom Bar — Real-Time Status Metrics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-bottom-bar-elem-4",
+                                              "description":  "Required element 4 for state Bottom Bar — Real-Time Status Metrics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "status"
+                                                                          },
+                                                             "label":  "Required element for Bottom Bar — Real-Time Status Metrics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The BottomBar (h-10, always visible) provides three sections: left = elapsed time metric; center = orchestrator-agent badge (when orchestrated) + current activity-type label (when running); right = data-freshness metric + connection-status badge. All metrics update in real time during execution.",
+                       "precondition":  "A workflow is running",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-widget-layout",
+                       "name":  "Dynamic Widget Layout",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-widget-layout-elem-0",
+                                              "description":  "Required element 0 for state Dynamic Widget Layout",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "AI Conversation"
+                                                                          },
+                                                             "label":  "Required element for Dynamic Widget Layout"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-widget-layout-elem-1",
+                                              "description":  "Required element 1 for state Dynamic Widget Layout",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Dynamic Widget Layout"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-widget-layout-elem-2",
+                                              "description":  "Required element 2 for state Dynamic Widget Layout",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Dynamic Widget Layout"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-widget-layout-elem-3",
+                                              "description":  "Required element 3 for state Dynamic Widget Layout",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Execution Timeline"
+                                                                          },
+                                                             "label":  "Required element for Dynamic Widget Layout"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The DashboardLayout content area assigns detected activities to widgets. The primary (active) widget occupies ~65% width on the left with a 2px accent border matching the activity type\u0027s color; secondary widgets stack compactly in ~35% on the right. Clicking a compact widget promotes it to the primary position. Each activity type has a distinct accent color: gui_automation=blue, ai_conversation=green, verification=teal, findings=amber, shell_command=slate, api_request=orange, script=indigo, workflow_ref=pink, mcp_call=violet, execution_timeline=cyan, flow_execution=emerald, canvas=rose, trace_viewer=sky.",
+                       "precondition":  "A workflow with AI conversation activity is running",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-completion-summary",
+                       "name":  "Completion Summary Overlay",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-completion-summary-elem-0",
+                                              "description":  "Required element 0 for state Completion Summary Overlay",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "heading",
+                                                                              "text":  "Workflow Completed"
+                                                                          },
+                                                             "label":  "Required element for Completion Summary Overlay"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-completion-summary-elem-1",
+                                              "description":  "Required element 1 for state Completion Summary Overlay",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "heading",
+                                                                              "text":  "Workflow Failed"
+                                                                          },
+                                                             "label":  "Required element for Completion Summary Overlay"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-completion-summary-elem-2",
+                                              "description":  "Required element 2 for state Completion Summary Overlay",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Dismiss"
+                                                                          },
+                                                             "label":  "Required element for Completion Summary Overlay"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-completion-summary-elem-3",
+                                              "description":  "Required element 3 for state Completion Summary Overlay",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Success Rate"
+                                                                          },
+                                                             "label":  "Required element for Completion Summary Overlay"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-completion-summary-elem-4",
+                                              "description":  "Required element 4 for state Completion Summary Overlay",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Dismiss"
+                                                                          },
+                                                             "label":  "Required element for Completion Summary Overlay"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When a workflow transitions from running to finished (completed or failed), a CompletionSummary overlay appears over the dashboard. The overlay shows: a header with success (green, checkmark, \u0027Workflow Completed\u0027) or failure (red, X, \u0027Workflow Failed\u0027) theme; a stats grid with duration, step counts (total/passed/failed), and success-rate percentage; a progress bar; and a Dismiss button. Auto-dismisses after 15 s. Escape also dismisses.",
+                       "precondition":  "A workflow just completed successfully and the overlay is visible",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-breakpoint-indicator",
+                       "name":  "Control Bar — Breakpoint Pause Indicator",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-breakpoint-indicator-elem-0",
+                                              "description":  "Required element 0 for state Control Bar — Breakpoint Pause Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Breakpoint"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Breakpoint Pause Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-breakpoint-indicator-elem-1",
+                                              "description":  "Required element 1 for state Control Bar — Breakpoint Pause Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "data-content-label":  "breakpoint step"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Breakpoint Pause Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-breakpoint-indicator-elem-2",
+                                              "description":  "Required element 2 for state Control Bar — Breakpoint Pause Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Inspect"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Breakpoint Pause Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-breakpoint-indicator-elem-3",
+                                              "description":  "Required element 3 for state Control Bar — Breakpoint Pause Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Resume"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Breakpoint Pause Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-breakpoint-indicator-elem-4",
+                                              "description":  "Required element 4 for state Control Bar — Breakpoint Pause Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Breakpoint"
+                                                                          },
+                                                             "label":  "Required element for Control Bar — Breakpoint Pause Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When a workflow step with breakpoint:true completes, execution suspends. The ControlBar shows an amber \u0027Breakpoint\u0027 badge with animate-phase-glow animation, the step name (data-content-label=\u0027breakpoint step\u0027), an \u0027Inspect\u0027 button (blue, eye icon), and a \u0027Resume\u0027 button (green, play icon). These controls are absent when no breakpoint is active.",
+                       "precondition":  "A workflow is paused at a breakpoint (snapshot status=\u0027waiting\u0027)",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-breakpoint-inspector",
+                       "name":  "Breakpoint Inspector Panel",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-breakpoint-inspector-elem-0",
+                                              "description":  "Required element 0 for state Breakpoint Inspector Panel",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Breakpoint Inspector"
+                                                                          },
+                                                             "label":  "Required element for Breakpoint Inspector Panel"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-breakpoint-inspector-elem-1",
+                                              "description":  "Required element 1 for state Breakpoint Inspector Panel",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Close inspector"
+                                                                          },
+                                                             "label":  "Required element for Breakpoint Inspector Panel"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-breakpoint-inspector-elem-2",
+                                              "description":  "Required element 2 for state Breakpoint Inspector Panel",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Variables"
+                                                                          },
+                                                             "label":  "Required element for Breakpoint Inspector Panel"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-breakpoint-inspector-elem-3",
+                                              "description":  "Required element 3 for state Breakpoint Inspector Panel",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "ago"
+                                                                          },
+                                                             "label":  "Required element for Breakpoint Inspector Panel"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The BreakpointInspector is a 384px-wide overlay panel anchored to the right side of the screen (full height, z-40). It opens when the user clicks Inspect. Content: \u0027Breakpoint Inspector\u0027 heading + close button (aria-label=\u0027Close inspector\u0027); an info bar with step index (amber badge \u0027Step N\u0027), step name, phase badge, and optional iteration; a freshness indicator (\u0027Ns ago\u0027, amber if 10-30 min, red if \u003e30 min); a Variables collapsible tree; a Pending Steps list; and an optional Last Screenshot thumbnail.",
+                       "precondition":  "Inspector panel is open (user clicked Inspect)",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-approval-dialog",
+                       "name":  "Human Approval Dialog",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-approval-dialog-elem-0",
+                                              "description":  "Required element 0 for state Human Approval Dialog",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Approval Required"
+                                                                          },
+                                                             "label":  "Required element for Human Approval Dialog"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-approval-dialog-elem-1",
+                                              "description":  "Required element 1 for state Human Approval Dialog",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Approve"
+                                                                          },
+                                                             "label":  "Required element for Human Approval Dialog"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-approval-dialog-elem-2",
+                                              "description":  "Required element 2 for state Human Approval Dialog",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Approve"
+                                                                          },
+                                                             "label":  "Required element for Human Approval Dialog"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When a workflow step requires human approval the ApprovalDialog overlay appears on top of the running dashboard. It shows \u0027Approval Required\u0027 header, context about the pending action (summary, modified files, optional diff), a comment textarea, and three action buttons: Approve (resumes workflow), Reject (continues to next iteration), Abort Workflow (terminates run). The dashboard remains visible behind the semi-transparent backdrop.",
+                       "precondition":  "A workflow is paused awaiting human approval",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-multi-run-switcher",
+                       "name":  "Multi-Run Switcher (ActiveRunsBar)",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-multi-run-switcher-elem-0",
+                                              "description":  "Required element 0 for state Multi-Run Switcher (ActiveRunsBar)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Active Runs"
+                                                                          },
+                                                             "label":  "Required element for Multi-Run Switcher (ActiveRunsBar)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-multi-run-switcher-elem-1",
+                                              "description":  "Required element 1 for state Multi-Run Switcher (ActiveRunsBar)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "New Run"
+                                                                          },
+                                                             "label":  "Required element for Multi-Run Switcher (ActiveRunsBar)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-multi-run-switcher-elem-2",
+                                              "description":  "Required element 2 for state Multi-Run Switcher (ActiveRunsBar)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Multi-Run Switcher (ActiveRunsBar)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When two or more concurrent workflow runs are active, the ActiveRunsBar appears at the bottom-right of the dashboard (above the BottomBar). Each run has a card showing its name and status. Clicking a card switches the main dashboard to that run\u0027s view. A \u0027New Run\u0027 button navigates to the Execute page.",
+                       "precondition":  "Only one workflow is running",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "vd-keyboard-shortcuts",
+                       "name":  "Keyboard Shortcuts",
+                       "assertions":  [
+                                          {
+                                              "id":  "vd-keyboard-shortcuts-elem-0",
+                                              "description":  "Required element 0 for state Keyboard Shortcuts",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Keyboard Shortcuts"
+                                                                          },
+                                                             "label":  "Required element for Keyboard Shortcuts"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-keyboard-shortcuts-elem-1",
+                                              "description":  "Required element 1 for state Keyboard Shortcuts",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "tooltip"
+                                                                          },
+                                                             "label":  "Required element for Keyboard Shortcuts"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "vd-keyboard-shortcuts-elem-2",
+                                              "description":  "Required element 2 for state Keyboard Shortcuts",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Keyboard Shortcuts"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The dashboard supports: \u0027?\u0027 opens the ShortcutsModal (lists all bindings); Ctrl+1-8 promotes a summary widget to active by position; Ctrl+R (Cmd+R) triggers a data refresh (GET /status); Escape closes open overlays (completion summary, shortcuts modal).",
+                       "precondition":  "No modal overlay is currently open",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "The Visual Dashboard (accessible via the \u0027active\u0027 tab in runner navigation) is the real-time monitoring hub for workflow execution in qontinui-runner. It provides: a top ControlBar (h-14) showing the running task name, workflow stage indicator pills, and playback controls (pause/resume/stop/auto-continue); a dynamic widget content area with a 65% active / 35% summary-stack split that supports 14 activity types (gui_automation, ai_conversation, verification, findings, shell_command, api_request, script, workflow_ref, mcp_call, execution_timeline, flow_execution, canvas, trace_viewer, playwright); a bottom status bar (h-10) with elapsed-time metric, current-activity label, orchestrator-agent badge, and connection-health indicator. Overlays include: a completion summary auto-dismissing after 15 s, a breakpoint inspector panel for paused executions, a human approval dialog, and an ActiveRunsBar multi-run switcher that appears when two or more concurrent runs are active. Keyboard shortcuts (?, Ctrl+1-8, Ctrl+R, Escape) are available throughout.",
+    "metadata":  {
+                     "tags":  [
+                                  "visual-dashboard",
+                                  "active-dashboard",
+                                  "monitoring",
+                                  "real-time",
+                                  "widgets",
+                                  "runner",
+                                  "execution",
+                                  "multi-run",
+                                  "breakpoints",
+                                  "tier-1"
+                              ]
+                 }
 }

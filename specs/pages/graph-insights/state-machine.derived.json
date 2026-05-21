@@ -1,331 +1,334 @@
-{
-  "version": "1.0",
-  "id": "graph-insights",
-  "name": "ReflectionDashboard",
-  "states": [
-    {
-      "id": "graph-insights-section",
-      "name": "Graph Insights Section in Reflection Dashboard",
-      "assertions": [
-        {
-          "id": "graph-insights-section-elem-0",
-          "description": "Required element 0 for state Graph Insights Section in Reflection Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Graph Insights"
-            },
-            "label": "Required element for Graph Insights Section in Reflection Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "graph-insights-section-elem-1",
-          "description": "Required element 1 for state Graph Insights Section in Reflection Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Cross-Run Patterns"
-            },
-            "label": "Required element for Graph Insights Section in Reflection Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "graph-insights-section-elem-2",
-          "description": "Required element 2 for state Graph Insights Section in Reflection Dashboard",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Rule Influence"
-            },
-            "label": "Required element for Graph Insights Section in Reflection Dashboard"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Reflection Dashboard includes a 'Graph Insights' section that embeds CrossRunPatternsPanel, RuleInfluencePanel, PipelineEventsTimeline, StepProvenanceTimeline, and WorkflowVersionLineage as sub-panels within the existing reflection view.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "active-dashboard-widget",
-      "name": "Active Dashboard Top Patterns Widget",
-      "assertions": [
-        {
-          "id": "active-dashboard-widget-elem-0",
-          "description": "Required element 0 for state Active Dashboard Top Patterns Widget",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Cross-Run Patterns"
-            },
-            "label": "Required element for Active Dashboard Top Patterns Widget"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "active-dashboard-widget-elem-1",
-          "description": "Required element 1 for state Active Dashboard Top Patterns Widget",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "recurring"
-            },
-            "label": "Required element for Active Dashboard Top Patterns Widget"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "active-dashboard-widget-elem-2",
-          "description": "Required element 2 for state Active Dashboard Top Patterns Widget",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "oscillation"
-            },
-            "label": "Required element for Active Dashboard Top Patterns Widget"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Active Dashboard shows a compact TopPatternsWidget that summarizes active cross-run patterns (recurring findings and fix oscillations), auto-hiding when no patterns exist.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "history-pattern-indicator",
-      "name": "Run History Pattern Indicator",
-      "assertions": [
-        {
-          "id": "history-pattern-indicator-elem-0",
-          "description": "Required element 0 for state Run History Pattern Indicator",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "status"
-            },
-            "label": "Required element for Run History Pattern Indicator"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Run history rows show a small orange badge with the count of active cross-run patterns for each workflow, helping users spot problematic workflows at a glance.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "graph-insights-data-flow",
-      "name": "Graph Data Flow Architecture",
-      "assertions": [
-        {
-          "id": "graph-insights-data-flow-elem-0",
-          "description": "Required element 0 for state Graph Data Flow Architecture",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Graph Data Flow Architecture"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "All graph panels consume data from the /graph/* MCP endpoints via React Query hooks (useGraphAnalytics.ts) with 30-second stale time and 60-second polling interval. Event-driven refresh (useGraphDataRefresh.ts) invalidates queries when tasks or reflections complete.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "graph-insights-navigation",
-      "name": "Graph Insights Navigation",
-      "assertions": [
-        {
-          "id": "graph-insights-navigation-elem-0",
-          "description": "Required element 0 for state Graph Insights Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Graph Insights"
-            },
-            "label": "Required element for Graph Insights Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "graph-insights-navigation-elem-1",
-          "description": "Required element 1 for state Graph Insights Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Element Reliability"
-            },
-            "label": "Required element for Graph Insights Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Graph insight panels are accessible through multiple navigation paths: embedded in the Reflection Dashboard tab, as standalone tabs (element-reliability, pipeline-events, rule-influence, unified-search, workflow-versions), and via the global Cmd+K palette.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "graph-insights-behavior",
-      "name": "Data Refresh Behavior",
-      "assertions": [
-        {
-          "id": "graph-insights-behavior-elem-0",
-          "description": "Required element 0 for state Data Refresh Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Cross-Run Patterns"
-            },
-            "label": "Required element for Data Refresh Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "graph-insights-behavior-elem-1",
-          "description": "Required element 1 for state Data Refresh Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "pattern"
-            },
-            "label": "Required element for Data Refresh Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "graph-insights-behavior-elem-2",
-          "description": "Required element 2 for state Data Refresh Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Cross-Run Patterns"
-            },
-            "label": "Required element for Data Refresh Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Graph data refreshes on two cadences: React Query polling (30s stale, 60s interval) and event-driven invalidation via useGraphDataRefresh when tasks or reflections complete. The TopPatternsWidget auto-hides when no active patterns exist.",
-      "precondition": "No active cross-run patterns exist",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "graph-insights-state-consistency",
-      "name": "Cross-Panel State Consistency",
-      "assertions": [
-        {
-          "id": "graph-insights-state-consistency-elem-0",
-          "description": "Required element 0 for state Cross-Panel State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "recurring finding"
-            },
-            "label": "Required element for Cross-Panel State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The pattern count shown in TopPatternsWidget (Active Dashboard) must match the data shown in CrossRunPatternsPanel (Reflection Dashboard) since both consume the same useCrossRunPatterns hook. Similarly, PatternIndicator badges in run history must reflect the same pattern counts.",
-      "precondition": "Both TopPatternsWidget and CrossRunPatternsPanel are visible (active patterns exist)",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Graph Insights — embedded knowledge graph panels within the Reflection Dashboard showing cross-run patterns, rule influence, pipeline events, step provenance, and workflow version lineage. Also includes a compact patterns widget on the Active Dashboard and pattern indicators in run history.",
-  "metadata": {
-    "tags": [
-      "knowledge-graph",
-      "cross-run-patterns",
-      "dashboard",
-      "integration",
-      "runner-only"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "graph-insights",
+    "name":  "ReflectionDashboard",
+    "states":  [
+                   {
+                       "id":  "graph-insights-section",
+                       "name":  "Graph Insights Section in Reflection Dashboard",
+                       "assertions":  [
+                                          {
+                                              "id":  "graph-insights-section-elem-0",
+                                              "description":  "Required element 0 for state Graph Insights Section in Reflection Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Graph Insights"
+                                                                          },
+                                                             "label":  "Required element for Graph Insights Section in Reflection Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "graph-insights-section-elem-1",
+                                              "description":  "Required element 1 for state Graph Insights Section in Reflection Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Cross-Run Patterns"
+                                                                          },
+                                                             "label":  "Required element for Graph Insights Section in Reflection Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "graph-insights-section-elem-2",
+                                              "description":  "Required element 2 for state Graph Insights Section in Reflection Dashboard",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Rule Influence"
+                                                                          },
+                                                             "label":  "Required element for Graph Insights Section in Reflection Dashboard"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Reflection Dashboard includes a \u0027Graph Insights\u0027 section that embeds CrossRunPatternsPanel, RuleInfluencePanel, PipelineEventsTimeline, StepProvenanceTimeline, and WorkflowVersionLineage as sub-panels within the existing reflection view.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "active-dashboard-widget",
+                       "name":  "Active Dashboard Top Patterns Widget",
+                       "assertions":  [
+                                          {
+                                              "id":  "active-dashboard-widget-elem-0",
+                                              "description":  "Required element 0 for state Active Dashboard Top Patterns Widget",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Cross-Run Patterns"
+                                                                          },
+                                                             "label":  "Required element for Active Dashboard Top Patterns Widget"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "active-dashboard-widget-elem-1",
+                                              "description":  "Required element 1 for state Active Dashboard Top Patterns Widget",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "recurring"
+                                                                          },
+                                                             "label":  "Required element for Active Dashboard Top Patterns Widget"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "active-dashboard-widget-elem-2",
+                                              "description":  "Required element 2 for state Active Dashboard Top Patterns Widget",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "oscillation"
+                                                                          },
+                                                             "label":  "Required element for Active Dashboard Top Patterns Widget"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Active Dashboard shows a compact TopPatternsWidget that summarizes active cross-run patterns (recurring findings and fix oscillations), auto-hiding when no patterns exist.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "history-pattern-indicator",
+                       "name":  "Run History Pattern Indicator",
+                       "assertions":  [
+                                          {
+                                              "id":  "history-pattern-indicator-elem-0",
+                                              "description":  "Required element 0 for state Run History Pattern Indicator",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "status"
+                                                                          },
+                                                             "label":  "Required element for Run History Pattern Indicator"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Run history rows show a small orange badge with the count of active cross-run patterns for each workflow, helping users spot problematic workflows at a glance.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "graph-insights-data-flow",
+                       "name":  "Graph Data Flow Architecture",
+                       "assertions":  [
+                                          {
+                                              "id":  "graph-insights-data-flow-elem-0",
+                                              "description":  "Required element 0 for state Graph Data Flow Architecture",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Graph Data Flow Architecture"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "All graph panels consume data from the /graph/* MCP endpoints via React Query hooks (useGraphAnalytics.ts) with 30-second stale time and 60-second polling interval. Event-driven refresh (useGraphDataRefresh.ts) invalidates queries when tasks or reflections complete.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "graph-insights-navigation",
+                       "name":  "Graph Insights Navigation",
+                       "assertions":  [
+                                          {
+                                              "id":  "graph-insights-navigation-elem-0",
+                                              "description":  "Required element 0 for state Graph Insights Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Graph Insights"
+                                                                          },
+                                                             "label":  "Required element for Graph Insights Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "graph-insights-navigation-elem-1",
+                                              "description":  "Required element 1 for state Graph Insights Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Element Reliability"
+                                                                          },
+                                                             "label":  "Required element for Graph Insights Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Graph insight panels are accessible through multiple navigation paths: embedded in the Reflection Dashboard tab, as standalone tabs (element-reliability, pipeline-events, rule-influence, unified-search, workflow-versions), and via the global Cmd+K palette.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "graph-insights-behavior",
+                       "name":  "Data Refresh Behavior",
+                       "assertions":  [
+                                          {
+                                              "id":  "graph-insights-behavior-elem-0",
+                                              "description":  "Required element 0 for state Data Refresh Behavior",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Cross-Run Patterns"
+                                                                          },
+                                                             "label":  "Required element for Data Refresh Behavior"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "graph-insights-behavior-elem-1",
+                                              "description":  "Required element 1 for state Data Refresh Behavior",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "pattern"
+                                                                          },
+                                                             "label":  "Required element for Data Refresh Behavior"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "graph-insights-behavior-elem-2",
+                                              "description":  "Required element 2 for state Data Refresh Behavior",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Cross-Run Patterns"
+                                                                          },
+                                                             "label":  "Required element for Data Refresh Behavior"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Graph data refreshes on two cadences: React Query polling (30s stale, 60s interval) and event-driven invalidation via useGraphDataRefresh when tasks or reflections complete. The TopPatternsWidget auto-hides when no active patterns exist.",
+                       "precondition":  "No active cross-run patterns exist",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "graph-insights-state-consistency",
+                       "name":  "Cross-Panel State Consistency",
+                       "assertions":  [
+                                          {
+                                              "id":  "graph-insights-state-consistency-elem-0",
+                                              "description":  "Required element 0 for state Cross-Panel State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "recurring finding"
+                                                                          },
+                                                             "label":  "Required element for Cross-Panel State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The pattern count shown in TopPatternsWidget (Active Dashboard) must match the data shown in CrossRunPatternsPanel (Reflection Dashboard) since both consume the same useCrossRunPatterns hook. Similarly, PatternIndicator badges in run history must reflect the same pattern counts.",
+                       "precondition":  "Both TopPatternsWidget and CrossRunPatternsPanel are visible (active patterns exist)",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Graph Insights — embedded knowledge graph panels within the Reflection Dashboard showing cross-run patterns, rule influence, pipeline events, step provenance, and workflow version lineage. Also includes a compact patterns widget on the Active Dashboard and pattern indicators in run history.",
+    "metadata":  {
+                     "tags":  [
+                                  "knowledge-graph",
+                                  "cross-run-patterns",
+                                  "dashboard",
+                                  "integration",
+                                  "runner-only"
+                              ]
+                 }
 }

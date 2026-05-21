@@ -1,170 +1,173 @@
-{
-  "version": "1.0",
-  "id": "run-image-recognition",
-  "name": "RunImageRecognitionTab",
-  "states": [
-    {
-      "id": "image-recognition-results-browsing",
-      "name": "Image Recognition Results Browsing",
-      "assertions": [
-        {
-          "id": "image-recognition-results-browsing-elem-0",
-          "description": "Required element 0 for state Image Recognition Results Browsing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "image|recognition|match"
-            },
-            "label": "Required element for Image Recognition Results Browsing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "image-recognition-results-browsing-elem-1",
-          "description": "Required element 1 for state Image Recognition Results Browsing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "row"
-            },
-            "label": "Required element for Image Recognition Results Browsing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "image-recognition-results-browsing-elem-2",
-          "description": "Required element 2 for state Image Recognition Results Browsing",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "confidence|score|match"
-            },
-            "label": "Required element for Image Recognition Results Browsing"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Developers use this page to review all image template matching attempts that occurred during a workflow run. Each entry represents a moment where the automation engine tried to locate a visual element on screen using image recognition. The user needs to see the full list of attempts, understand which succeeded and which failed, and view the confidence scores to assess matching reliability. This is the primary diagnostic tool for tuning image-based automation.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "image-recognition-visual-debugging",
-      "name": "Visual Debugging with Annotated Screenshots",
-      "assertions": [
-        {
-          "id": "image-recognition-visual-debugging-elem-0",
-          "description": "Required element 0 for state Visual Debugging with Annotated Screenshots",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "img"
-            },
-            "label": "Required element for Visual Debugging with Annotated Screenshots"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "image-recognition-visual-debugging-elem-1",
-          "description": "Required element 1 for state Visual Debugging with Annotated Screenshots",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "not found|failed|no match"
-            },
-            "label": "Required element for Visual Debugging with Annotated Screenshots"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "image-recognition-visual-debugging-elem-2",
-          "description": "Required element 2 for state Visual Debugging with Annotated Screenshots",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "x|y|coordinate|region"
-            },
-            "label": "Required element for Visual Debugging with Annotated Screenshots"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The core value of this page is visual debugging. When image recognition fails or produces unexpected results, the developer needs to see the actual screenshot with annotations showing where the template was matched (or where the system looked). Annotated screenshots with bounding boxes over the detected region are the single most useful debugging artifact for image-based automation.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "image-recognition-empty-state",
-      "name": "Empty State Handling",
-      "assertions": [
-        {
-          "id": "image-recognition-empty-state-elem-0",
-          "description": "Required element 0 for state Empty State Handling",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No image recognition"
-            },
-            "label": "Required element for Empty State Handling"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Many workflow runs do not involve image recognition at all (purely command-driven or AI-only workflows). The page must clearly communicate when no image recognition data exists for the selected run, guiding the developer to understand this is expected rather than an error condition.",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Run Image Recognition page (dev-only) — displays all image template matching attempts during a workflow run, including confidence scores, matched regions, and annotated screenshots showing detection results.",
-  "metadata": {
-    "tags": [
-      "run-image-recognition",
-      "visual-automation",
-      "dev-only",
-      "debugging",
-      "observe"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "run-image-recognition",
+    "name":  "RunImageRecognitionTab",
+    "states":  [
+                   {
+                       "id":  "image-recognition-results-browsing",
+                       "name":  "Image Recognition Results Browsing",
+                       "assertions":  [
+                                          {
+                                              "id":  "image-recognition-results-browsing-elem-0",
+                                              "description":  "Required element 0 for state Image Recognition Results Browsing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "image|recognition|match"
+                                                                          },
+                                                             "label":  "Required element for Image Recognition Results Browsing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "image-recognition-results-browsing-elem-1",
+                                              "description":  "Required element 1 for state Image Recognition Results Browsing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "row"
+                                                                          },
+                                                             "label":  "Required element for Image Recognition Results Browsing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "image-recognition-results-browsing-elem-2",
+                                              "description":  "Required element 2 for state Image Recognition Results Browsing",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "confidence|score|match"
+                                                                          },
+                                                             "label":  "Required element for Image Recognition Results Browsing"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Developers use this page to review all image template matching attempts that occurred during a workflow run. Each entry represents a moment where the automation engine tried to locate a visual element on screen using image recognition. The user needs to see the full list of attempts, understand which succeeded and which failed, and view the confidence scores to assess matching reliability. This is the primary diagnostic tool for tuning image-based automation.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "image-recognition-visual-debugging",
+                       "name":  "Visual Debugging with Annotated Screenshots",
+                       "assertions":  [
+                                          {
+                                              "id":  "image-recognition-visual-debugging-elem-0",
+                                              "description":  "Required element 0 for state Visual Debugging with Annotated Screenshots",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "img"
+                                                                          },
+                                                             "label":  "Required element for Visual Debugging with Annotated Screenshots"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "image-recognition-visual-debugging-elem-1",
+                                              "description":  "Required element 1 for state Visual Debugging with Annotated Screenshots",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "not found|failed|no match"
+                                                                          },
+                                                             "label":  "Required element for Visual Debugging with Annotated Screenshots"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "image-recognition-visual-debugging-elem-2",
+                                              "description":  "Required element 2 for state Visual Debugging with Annotated Screenshots",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "x|y|coordinate|region"
+                                                                          },
+                                                             "label":  "Required element for Visual Debugging with Annotated Screenshots"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The core value of this page is visual debugging. When image recognition fails or produces unexpected results, the developer needs to see the actual screenshot with annotations showing where the template was matched (or where the system looked). Annotated screenshots with bounding boxes over the detected region are the single most useful debugging artifact for image-based automation.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "image-recognition-empty-state",
+                       "name":  "Empty State Handling",
+                       "assertions":  [
+                                          {
+                                              "id":  "image-recognition-empty-state-elem-0",
+                                              "description":  "Required element 0 for state Empty State Handling",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No image recognition"
+                                                                          },
+                                                             "label":  "Required element for Empty State Handling"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Many workflow runs do not involve image recognition at all (purely command-driven or AI-only workflows). The page must clearly communicate when no image recognition data exists for the selected run, guiding the developer to understand this is expected rather than an error condition.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Run Image Recognition page (dev-only) — displays all image template matching attempts during a workflow run, including confidence scores, matched regions, and annotated screenshots showing detection results.",
+    "metadata":  {
+                     "tags":  [
+                                  "run-image-recognition",
+                                  "visual-automation",
+                                  "dev-only",
+                                  "debugging",
+                                  "observe"
+                              ]
+                 }
 }

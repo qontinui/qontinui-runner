@@ -1,397 +1,400 @@
-{
-  "version": "1.0",
-  "id": "run-ai-data",
-  "name": "AiDataViewerTab",
-  "states": [
-    {
-      "id": "ai-data-sidebar-navigation",
-      "name": "Sidebar Navigation and Data Categories",
-      "assertions": [
-        {
-          "id": "ai-data-sidebar-navigation-elem-0",
-          "description": "Required element 0 for state Sidebar Navigation and Data Categories",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "AI Session|Execution Logs|Configuration"
-            },
-            "label": "Required element for Sidebar Navigation and Data Categories"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-sidebar-navigation-elem-1",
-          "description": "Required element 1 for state Sidebar Navigation and Data Categories",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Sidebar Navigation and Data Categories"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-sidebar-navigation-elem-2",
-          "description": "Required element 2 for state Sidebar Navigation and Data Categories",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "AI Session|Execution"
-            },
-            "label": "Required element for Sidebar Navigation and Data Categories"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The AI Data page uses a grouped sidebar navigation to organize the many types of data that AI can access during execution. Categories include AI Session (prompt, output, contexts), Execution Logs (events, API requests, MCP calls, image recognition, Playwright tests, AWAS steps, execution spans), Captures (DOM snapshots), Processes (sessions, output), and Configuration (loaded config, dev logs). Users navigate between these categories to inspect exactly what data the AI received and produced, which is essential for understanding AI decision-making and debugging integration issues.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "ai-data-session-data",
-      "name": "AI Session Data Inspection",
-      "assertions": [
-        {
-          "id": "ai-data-session-data-elem-0",
-          "description": "Required element 0 for state AI Session Data Inspection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Prompt|prompt"
-            },
-            "label": "Required element for AI Session Data Inspection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-session-data-elem-1",
-          "description": "Required element 1 for state AI Session Data Inspection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Output|output"
-            },
-            "label": "Required element for AI Session Data Inspection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-session-data-elem-2",
-          "description": "Required element 2 for state AI Session Data Inspection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Context|context"
-            },
-            "label": "Required element for AI Session Data Inspection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The AI Session group provides access to the prompt that was sent to AI, the consolidated AI output, and the context objects that were available during the session. This is the most commonly inspected data group because it directly shows what the AI was told, what it produced, and what context it had available. Users inspect these to verify prompt quality, understand AI reasoning, and debug cases where AI made unexpected decisions due to missing or incorrect context.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "ai-data-execution-logs",
-      "name": "Execution Logs and Events",
-      "assertions": [
-        {
-          "id": "ai-data-execution-logs-elem-0",
-          "description": "Required element 0 for state Execution Logs and Events",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Events|events"
-            },
-            "label": "Required element for Execution Logs and Events"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-execution-logs-elem-1",
-          "description": "Required element 1 for state Execution Logs and Events",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "API|request"
-            },
-            "label": "Required element for Execution Logs and Events"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-execution-logs-elem-2",
-          "description": "Required element 2 for state Execution Logs and Events",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "MCP|tool"
-            },
-            "label": "Required element for Execution Logs and Events"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Execution Logs group provides access to structured event data from the run: task run events, API request logs, MCP tool calls, image recognition results, Playwright test results, AWAS steps, and execution spans. Each data type is displayed as structured JSON or formatted tables. This group is primarily used for debugging integration issues — understanding what API calls were made, what MCP tools were invoked, and how different system components interacted during execution.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "ai-data-captures-and-config",
-      "name": "Captures and Configuration",
-      "assertions": [
-        {
-          "id": "ai-data-captures-and-config-elem-0",
-          "description": "Required element 0 for state Captures and Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "DOM|Snapshot|snapshot"
-            },
-            "label": "Required element for Captures and Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-captures-and-config-elem-1",
-          "description": "Required element 1 for state Captures and Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Config|Configuration|config"
-            },
-            "label": "Required element for Captures and Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-captures-and-config-elem-2",
-          "description": "Required element 2 for state Captures and Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "JSON|json"
-            },
-            "label": "Required element for Captures and Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The remaining data categories cover DOM snapshots captured during execution (showing the page structure at specific points), process session data, and configuration information. DOM snapshots are particularly valuable for debugging verification failures — they show exactly what the page looked like from a structural perspective at the time a check was run. Configuration data helps verify that the correct config was loaded during execution.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "ai-data-pagination-memory-protection",
-      "name": "Pagination and Memory Protection",
-      "assertions": [
-        {
-          "id": "ai-data-pagination-memory-protection-elem-0",
-          "description": "Required element 0 for state Pagination and Memory Protection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Show more"
-            },
-            "label": "Required element for Pagination and Memory Protection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-pagination-memory-protection-elem-1",
-          "description": "Required element 1 for state Pagination and Memory Protection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Show more"
-            },
-            "label": "Required element for Pagination and Memory Protection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-pagination-memory-protection-elem-2",
-          "description": "Required element 2 for state Pagination and Memory Protection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Show more"
-            },
-            "label": "Required element for Pagination and Memory Protection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-pagination-memory-protection-elem-3",
-          "description": "Required element 3 for state Pagination and Memory Protection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Show more"
-            },
-            "label": "Required element for Pagination and Memory Protection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-pagination-memory-protection-elem-4",
-          "description": "Required element 4 for state Pagination and Memory Protection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Show more"
-            },
-            "label": "Required element for Pagination and Memory Protection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-pagination-memory-protection-elem-5",
-          "description": "Required element 5 for state Pagination and Memory Protection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Session Output"
-            },
-            "label": "Required element for Pagination and Memory Protection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "ai-data-pagination-memory-protection-elem-6",
-          "description": "Required element 6 for state Pagination and Memory Protection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Out of Memory"
-            },
-            "label": "Required element for Pagination and Memory Protection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "All data-heavy panels (Events, API Requests, MCP Calls, Playwright Results, AWAS Steps, Process Session Output) use backend-driven pagination to prevent webview OOM crashes. Large datasets (240K+ rows, 48MB+) must never be loaded in full. Each panel initially loads a limited page of results and provides a 'Show more' mechanism to load additional pages on demand. The backend enforces LIMIT/OFFSET at the SQL level for unfiltered queries, capping IPC payload size at ~200 items by default.",
-      "precondition": "A completed task run with >200 events is selected and Events section is active",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Run AI Data page — a structured viewer for all data accessible to AI via MCP tools during a workflow run. Organized into grouped sidebar navigation (AI Session, Execution Logs, Captures, Processes, Configuration) with panels for prompts, output, contexts, events, API requests, DOM snapshots, and more.",
-  "metadata": {
-    "tags": [
-      "run-ai-data",
-      "data-viewer",
-      "mcp-tools",
-      "debugging",
-      "observe",
-      "pagination",
-      "memory-protection"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "run-ai-data",
+    "name":  "AiDataViewerTab",
+    "states":  [
+                   {
+                       "id":  "ai-data-sidebar-navigation",
+                       "name":  "Sidebar Navigation and Data Categories",
+                       "assertions":  [
+                                          {
+                                              "id":  "ai-data-sidebar-navigation-elem-0",
+                                              "description":  "Required element 0 for state Sidebar Navigation and Data Categories",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "AI Session|Execution Logs|Configuration"
+                                                                          },
+                                                             "label":  "Required element for Sidebar Navigation and Data Categories"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-sidebar-navigation-elem-1",
+                                              "description":  "Required element 1 for state Sidebar Navigation and Data Categories",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Sidebar Navigation and Data Categories"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-sidebar-navigation-elem-2",
+                                              "description":  "Required element 2 for state Sidebar Navigation and Data Categories",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "AI Session|Execution"
+                                                                          },
+                                                             "label":  "Required element for Sidebar Navigation and Data Categories"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The AI Data page uses a grouped sidebar navigation to organize the many types of data that AI can access during execution. Categories include AI Session (prompt, output, contexts), Execution Logs (events, API requests, MCP calls, image recognition, Playwright tests, AWAS steps, execution spans), Captures (DOM snapshots), Processes (sessions, output), and Configuration (loaded config, dev logs). Users navigate between these categories to inspect exactly what data the AI received and produced, which is essential for understanding AI decision-making and debugging integration issues.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "ai-data-session-data",
+                       "name":  "AI Session Data Inspection",
+                       "assertions":  [
+                                          {
+                                              "id":  "ai-data-session-data-elem-0",
+                                              "description":  "Required element 0 for state AI Session Data Inspection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Prompt|prompt"
+                                                                          },
+                                                             "label":  "Required element for AI Session Data Inspection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-session-data-elem-1",
+                                              "description":  "Required element 1 for state AI Session Data Inspection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Output|output"
+                                                                          },
+                                                             "label":  "Required element for AI Session Data Inspection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-session-data-elem-2",
+                                              "description":  "Required element 2 for state AI Session Data Inspection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Context|context"
+                                                                          },
+                                                             "label":  "Required element for AI Session Data Inspection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The AI Session group provides access to the prompt that was sent to AI, the consolidated AI output, and the context objects that were available during the session. This is the most commonly inspected data group because it directly shows what the AI was told, what it produced, and what context it had available. Users inspect these to verify prompt quality, understand AI reasoning, and debug cases where AI made unexpected decisions due to missing or incorrect context.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "ai-data-execution-logs",
+                       "name":  "Execution Logs and Events",
+                       "assertions":  [
+                                          {
+                                              "id":  "ai-data-execution-logs-elem-0",
+                                              "description":  "Required element 0 for state Execution Logs and Events",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Events|events"
+                                                                          },
+                                                             "label":  "Required element for Execution Logs and Events"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-execution-logs-elem-1",
+                                              "description":  "Required element 1 for state Execution Logs and Events",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "API|request"
+                                                                          },
+                                                             "label":  "Required element for Execution Logs and Events"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-execution-logs-elem-2",
+                                              "description":  "Required element 2 for state Execution Logs and Events",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "MCP|tool"
+                                                                          },
+                                                             "label":  "Required element for Execution Logs and Events"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Execution Logs group provides access to structured event data from the run: task run events, API request logs, MCP tool calls, image recognition results, Playwright test results, AWAS steps, and execution spans. Each data type is displayed as structured JSON or formatted tables. This group is primarily used for debugging integration issues — understanding what API calls were made, what MCP tools were invoked, and how different system components interacted during execution.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "ai-data-captures-and-config",
+                       "name":  "Captures and Configuration",
+                       "assertions":  [
+                                          {
+                                              "id":  "ai-data-captures-and-config-elem-0",
+                                              "description":  "Required element 0 for state Captures and Configuration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "DOM|Snapshot|snapshot"
+                                                                          },
+                                                             "label":  "Required element for Captures and Configuration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-captures-and-config-elem-1",
+                                              "description":  "Required element 1 for state Captures and Configuration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Config|Configuration|config"
+                                                                          },
+                                                             "label":  "Required element for Captures and Configuration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-captures-and-config-elem-2",
+                                              "description":  "Required element 2 for state Captures and Configuration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "JSON|json"
+                                                                          },
+                                                             "label":  "Required element for Captures and Configuration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The remaining data categories cover DOM snapshots captured during execution (showing the page structure at specific points), process session data, and configuration information. DOM snapshots are particularly valuable for debugging verification failures — they show exactly what the page looked like from a structural perspective at the time a check was run. Configuration data helps verify that the correct config was loaded during execution.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "ai-data-pagination-memory-protection",
+                       "name":  "Pagination and Memory Protection",
+                       "assertions":  [
+                                          {
+                                              "id":  "ai-data-pagination-memory-protection-elem-0",
+                                              "description":  "Required element 0 for state Pagination and Memory Protection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Show more"
+                                                                          },
+                                                             "label":  "Required element for Pagination and Memory Protection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-pagination-memory-protection-elem-1",
+                                              "description":  "Required element 1 for state Pagination and Memory Protection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Show more"
+                                                                          },
+                                                             "label":  "Required element for Pagination and Memory Protection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-pagination-memory-protection-elem-2",
+                                              "description":  "Required element 2 for state Pagination and Memory Protection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Show more"
+                                                                          },
+                                                             "label":  "Required element for Pagination and Memory Protection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-pagination-memory-protection-elem-3",
+                                              "description":  "Required element 3 for state Pagination and Memory Protection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Show more"
+                                                                          },
+                                                             "label":  "Required element for Pagination and Memory Protection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-pagination-memory-protection-elem-4",
+                                              "description":  "Required element 4 for state Pagination and Memory Protection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Show more"
+                                                                          },
+                                                             "label":  "Required element for Pagination and Memory Protection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-pagination-memory-protection-elem-5",
+                                              "description":  "Required element 5 for state Pagination and Memory Protection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Session Output"
+                                                                          },
+                                                             "label":  "Required element for Pagination and Memory Protection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "ai-data-pagination-memory-protection-elem-6",
+                                              "description":  "Required element 6 for state Pagination and Memory Protection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Out of Memory"
+                                                                          },
+                                                             "label":  "Required element for Pagination and Memory Protection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "All data-heavy panels (Events, API Requests, MCP Calls, Playwright Results, AWAS Steps, Process Session Output) use backend-driven pagination to prevent webview OOM crashes. Large datasets (240K+ rows, 48MB+) must never be loaded in full. Each panel initially loads a limited page of results and provides a \u0027Show more\u0027 mechanism to load additional pages on demand. The backend enforces LIMIT/OFFSET at the SQL level for unfiltered queries, capping IPC payload size at ~200 items by default.",
+                       "precondition":  "A completed task run with \u003e200 events is selected and Events section is active",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Run AI Data page — a structured viewer for all data accessible to AI via MCP tools during a workflow run. Organized into grouped sidebar navigation (AI Session, Execution Logs, Captures, Processes, Configuration) with panels for prompts, output, contexts, events, API requests, DOM snapshots, and more.",
+    "metadata":  {
+                     "tags":  [
+                                  "run-ai-data",
+                                  "data-viewer",
+                                  "mcp-tools",
+                                  "debugging",
+                                  "observe",
+                                  "pagination",
+                                  "memory-protection"
+                              ]
+                 }
 }

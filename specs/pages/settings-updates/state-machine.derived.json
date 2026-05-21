@@ -1,615 +1,618 @@
-{
-  "version": "1.0",
-  "id": "settings-updates",
-  "name": "UpdateSettings",
-  "states": [
-    {
-      "id": "upd-page-structure",
-      "name": "Page Structure",
-      "assertions": [
-        {
-          "id": "upd-page-structure-elem-0",
-          "description": "Required element 0 for state Page Structure",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "heading",
-              "text": "Updates"
-            },
-            "label": "Required element for Page Structure"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-page-structure-elem-1",
-          "description": "Required element 1 for state Page Structure",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Check for and install application updates to get the latest features and bug fixes."
-            },
-            "label": "Required element for Page Structure"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-page-structure-elem-2",
-          "description": "Required element 2 for state Page Structure",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Tip: Updates are checked automatically"
-            },
-            "label": "Required element for Page Structure"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-page-structure-elem-3",
-          "description": "Required element 3 for state Page Structure",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "heading",
-              "text": "Updates"
-            },
-            "label": "Required element for Page Structure"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Updates tab renders a SectionHeader with a Download icon, title 'Updates', and a description line. Below it are two always-visible structural elements: the current version card and the info tip box. A third conditional card appears after a check completes.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-current-version-card",
-      "name": "Current Version Card",
-      "assertions": [
-        {
-          "id": "upd-current-version-card-elem-2",
-          "description": "Required element 2 for state Current Version Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Check for Updates"
-            },
-            "label": "Required element for Current Version Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-current-version-card-discriminator",
-          "description": "Distinctness discriminator for state Current Version Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Current Version Card"
-            },
-            "label": "Discriminator for Current Version Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "A card that is always visible showing the currently installed application version and when updates were last checked. Also contains the 'Check for Updates' button.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-check-button-interaction",
-      "name": "Check for Updates Button Interaction",
-      "assertions": [
-        {
-          "id": "upd-check-button-interaction-elem-0",
-          "description": "Required element 0 for state Check for Updates Button Interaction",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Check for Updates"
-            },
-            "label": "Required element for Check for Updates Button Interaction"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-check-button-interaction-elem-1",
-          "description": "Required element 1 for state Check for Updates Button Interaction",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Checking..."
-            },
-            "label": "Required element for Check for Updates Button Interaction"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-check-button-interaction-elem-2",
-          "description": "Required element 2 for state Check for Updates Button Interaction",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Check for Updates"
-            },
-            "label": "Required element for Check for Updates Button Interaction"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The 'Check for Updates' button triggers an update check via the Tauri `check_for_updates` command. During the check the button is disabled and shows a spinner. After the check completes the status card is updated and the last-checked timestamp is refreshed.",
-      "precondition": "Page is in idle state (no check or install in progress)",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-auto-check-on-load",
-      "name": "Automatic Check on Tab Load",
-      "assertions": [
-        {
-          "id": "upd-auto-check-on-load-elem-0",
-          "description": "Required element 0 for state Automatic Check on Tab Load",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Checking..."
-            },
-            "label": "Required element for Automatic Check on Tab Load"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-auto-check-on-load-discriminator",
-          "description": "Distinctness discriminator for state Automatic Check on Tab Load",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Automatic Check on Tab Load"
-            },
-            "label": "Discriminator for Automatic Check on Tab Load"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The UpdateSettings component automatically triggers a `check_for_updates` call via useEffect when it first mounts. The user does not need to click anything — the check runs immediately and the status card populates once it completes.",
-      "precondition": "The Updates settings tab has just been opened for the first time in this session",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-dev-mode-state",
-      "name": "Development Mode Status Card",
-      "assertions": [
-        {
-          "id": "upd-dev-mode-state-elem-1",
-          "description": "Required element 1 for state Development Mode Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Update checking is disabled in development builds."
-            },
-            "label": "Required element for Development Mode Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-dev-mode-state-elem-2",
-          "description": "Required element 2 for state Development Mode Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Download and Install Update"
-            },
-            "label": "Required element for Development Mode Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "In debug/development builds the `check_for_updates` command returns `{ available: false, development: true }`. The component renders a 'Development Mode' status card with an informational message explaining that update checking is disabled in development builds.",
-      "precondition": "Running a debug/development build and a check has completed",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-update-available-state",
-      "name": "Update Available Status Card",
-      "assertions": [
-        {
-          "id": "upd-update-available-state-elem-2",
-          "description": "Required element 2 for state Update Available Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Release Notes"
-            },
-            "label": "Required element for Update Available Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-update-available-state-elem-3",
-          "description": "Required element 3 for state Update Available Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Download and Install Update"
-            },
-            "label": "Required element for Update Available Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-update-available-state-elem-4",
-          "description": "Required element 4 for state Update Available Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "The application will restart automatically after the update is installed."
-            },
-            "label": "Required element for Update Available Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When `check_for_updates` returns `{ available: true, version, current_version, notes }`, the component renders an 'Update Available' card showing the new version, optional release notes, and a 'Download and Install Update' button.",
-      "precondition": "check_for_updates returned available=true",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-install-flow",
-      "name": "Install Update Flow",
-      "assertions": [
-        {
-          "id": "upd-install-flow-elem-0",
-          "description": "Required element 0 for state Install Update Flow",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Download and Install Update"
-            },
-            "label": "Required element for Install Update Flow"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-install-flow-elem-1",
-          "description": "Required element 1 for state Install Update Flow",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Installing Update..."
-            },
-            "label": "Required element for Install Update Flow"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-install-flow-elem-2",
-          "description": "Required element 2 for state Install Update Flow",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Download and Install Update"
-            },
-            "label": "Required element for Install Update Flow"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Clicking 'Download and Install Update' invokes the Tauri `install_update` command, which downloads the update package and restarts the application. During install, the button is disabled and shows an 'Installing Update...' label with a spinner.",
-      "precondition": "Update available card is shown and status is not 'installing'",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-up-to-date-state",
-      "name": "Up to Date Status Card",
-      "assertions": [
-        {
-          "id": "upd-up-to-date-state-elem-1",
-          "description": "Required element 1 for state Up to Date Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "You're running the latest version of Qontinui Runner."
-            },
-            "label": "Required element for Up to Date Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-up-to-date-state-elem-2",
-          "description": "Required element 2 for state Up to Date Status Card",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Download and Install Update"
-            },
-            "label": "Required element for Up to Date Status Card"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When `check_for_updates` returns `{ available: false }` without the development flag, the component renders an 'Up to Date' card with a green CheckCircle icon confirming the user is on the latest version.",
-      "precondition": "check_for_updates returned available=false without development=true",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-error-state",
-      "name": "Error State",
-      "assertions": [
-        {
-          "id": "upd-error-state-elem-2",
-          "description": "Required element 2 for state Error State",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Check for Updates"
-            },
-            "label": "Required element for Error State"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-error-state-discriminator",
-          "description": "Distinctness discriminator for state Error State",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Error State"
-            },
-            "label": "Discriminator for Error State"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "If `check_for_updates` or `install_update` throws an exception, the component stores the error message in state and renders an error card with an AlertCircle icon and the error text. The status card is not shown when an error card is displayed.",
-      "precondition": "check_for_updates or install_update threw an error",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-state-mutual-exclusion",
-      "name": "Status Card Mutual Exclusion",
-      "assertions": [
-        {
-          "id": "upd-state-mutual-exclusion-elem-1",
-          "description": "Required element 1 for state Status Card Mutual Exclusion",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Checking..."
-            },
-            "label": "Required element for Status Card Mutual Exclusion"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-state-mutual-exclusion-discriminator",
-          "description": "Distinctness discriminator for state Status Card Mutual Exclusion",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Status Card Mutual Exclusion"
-            },
-            "label": "Discriminator for Status Card Mutual Exclusion"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Only one status card variant can be shown at a time. The four possible status card states (development mode, update available, up to date, and nothing) are mutually exclusive — they are driven by a single `updateInfo` nullable value and a single `error` nullable string. The error card and status card are also mutually exclusive.",
-      "precondition": "A check has completed",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "upd-ipc-data-model",
-      "name": "IPC Response Data Model",
-      "assertions": [
-        {
-          "id": "upd-ipc-data-model-elem-1",
-          "description": "Required element 1 for state IPC Response Data Model",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Download and Install Update"
-            },
-            "label": "Required element for IPC Response Data Model"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "upd-ipc-data-model-discriminator",
-          "description": "Distinctness discriminator for state IPC Response Data Model",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "IPC Response Data Model"
-            },
-            "label": "Discriminator for IPC Response Data Model"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The page relies on two Tauri IPC commands. Their response shapes determine which UI state is shown. Both commands behave differently in debug vs release builds, which is critical for verifying behavior in the correct build context.",
-      "precondition": "Update available card is shown",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Updates settings tab within the runner Settings panel. Allows users to check for and install application updates. The page auto-checks for updates on mount via the Tauri `check_for_updates` IPC command. It renders a permanent 'current version' card (showing the installed version and last-checked timestamp) and a conditional status card that shows one of four states: checking/idle (no card), development mode (update checking disabled), update available (with release notes and install button), or up to date. A separate error card appears if a check or install fails. An informational tip box is always visible at the bottom.",
-  "metadata": {
-    "tags": [
-      "settings",
-      "updates",
-      "tauri",
-      "ipc",
-      "auto-update"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "settings-updates",
+    "name":  "UpdateSettings",
+    "states":  [
+                   {
+                       "id":  "upd-page-structure",
+                       "name":  "Page Structure",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-page-structure-elem-0",
+                                              "description":  "Required element 0 for state Page Structure",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "heading",
+                                                                              "text":  "Updates"
+                                                                          },
+                                                             "label":  "Required element for Page Structure"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-page-structure-elem-1",
+                                              "description":  "Required element 1 for state Page Structure",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Check for and install application updates to get the latest features and bug fixes."
+                                                                          },
+                                                             "label":  "Required element for Page Structure"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-page-structure-elem-2",
+                                              "description":  "Required element 2 for state Page Structure",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Tip: Updates are checked automatically"
+                                                                          },
+                                                             "label":  "Required element for Page Structure"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-page-structure-elem-3",
+                                              "description":  "Required element 3 for state Page Structure",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "heading",
+                                                                              "text":  "Updates"
+                                                                          },
+                                                             "label":  "Required element for Page Structure"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Updates tab renders a SectionHeader with a Download icon, title \u0027Updates\u0027, and a description line. Below it are two always-visible structural elements: the current version card and the info tip box. A third conditional card appears after a check completes.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-current-version-card",
+                       "name":  "Current Version Card",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-current-version-card-elem-2",
+                                              "description":  "Required element 2 for state Current Version Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Check for Updates"
+                                                                          },
+                                                             "label":  "Required element for Current Version Card"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-current-version-card-discriminator",
+                                              "description":  "Distinctness discriminator for state Current Version Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Current Version Card"
+                                                                          },
+                                                             "label":  "Discriminator for Current Version Card"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "A card that is always visible showing the currently installed application version and when updates were last checked. Also contains the \u0027Check for Updates\u0027 button.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-check-button-interaction",
+                       "name":  "Check for Updates Button Interaction",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-check-button-interaction-elem-0",
+                                              "description":  "Required element 0 for state Check for Updates Button Interaction",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Check for Updates"
+                                                                          },
+                                                             "label":  "Required element for Check for Updates Button Interaction"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-check-button-interaction-elem-1",
+                                              "description":  "Required element 1 for state Check for Updates Button Interaction",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Checking..."
+                                                                          },
+                                                             "label":  "Required element for Check for Updates Button Interaction"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-check-button-interaction-elem-2",
+                                              "description":  "Required element 2 for state Check for Updates Button Interaction",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Check for Updates"
+                                                                          },
+                                                             "label":  "Required element for Check for Updates Button Interaction"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The \u0027Check for Updates\u0027 button triggers an update check via the Tauri `check_for_updates` command. During the check the button is disabled and shows a spinner. After the check completes the status card is updated and the last-checked timestamp is refreshed.",
+                       "precondition":  "Page is in idle state (no check or install in progress)",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-auto-check-on-load",
+                       "name":  "Automatic Check on Tab Load",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-auto-check-on-load-elem-0",
+                                              "description":  "Required element 0 for state Automatic Check on Tab Load",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Checking..."
+                                                                          },
+                                                             "label":  "Required element for Automatic Check on Tab Load"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-auto-check-on-load-discriminator",
+                                              "description":  "Distinctness discriminator for state Automatic Check on Tab Load",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Automatic Check on Tab Load"
+                                                                          },
+                                                             "label":  "Discriminator for Automatic Check on Tab Load"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The UpdateSettings component automatically triggers a `check_for_updates` call via useEffect when it first mounts. The user does not need to click anything — the check runs immediately and the status card populates once it completes.",
+                       "precondition":  "The Updates settings tab has just been opened for the first time in this session",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-dev-mode-state",
+                       "name":  "Development Mode Status Card",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-dev-mode-state-elem-1",
+                                              "description":  "Required element 1 for state Development Mode Status Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Update checking is disabled in development builds."
+                                                                          },
+                                                             "label":  "Required element for Development Mode Status Card"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-dev-mode-state-elem-2",
+                                              "description":  "Required element 2 for state Development Mode Status Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Download and Install Update"
+                                                                          },
+                                                             "label":  "Required element for Development Mode Status Card"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "In debug/development builds the `check_for_updates` command returns `{ available: false, development: true }`. The component renders a \u0027Development Mode\u0027 status card with an informational message explaining that update checking is disabled in development builds.",
+                       "precondition":  "Running a debug/development build and a check has completed",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-update-available-state",
+                       "name":  "Update Available Status Card",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-update-available-state-elem-2",
+                                              "description":  "Required element 2 for state Update Available Status Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Release Notes"
+                                                                          },
+                                                             "label":  "Required element for Update Available Status Card"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-update-available-state-elem-3",
+                                              "description":  "Required element 3 for state Update Available Status Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Download and Install Update"
+                                                                          },
+                                                             "label":  "Required element for Update Available Status Card"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-update-available-state-elem-4",
+                                              "description":  "Required element 4 for state Update Available Status Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "The application will restart automatically after the update is installed."
+                                                                          },
+                                                             "label":  "Required element for Update Available Status Card"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When `check_for_updates` returns `{ available: true, version, current_version, notes }`, the component renders an \u0027Update Available\u0027 card showing the new version, optional release notes, and a \u0027Download and Install Update\u0027 button.",
+                       "precondition":  "check_for_updates returned available=true",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-install-flow",
+                       "name":  "Install Update Flow",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-install-flow-elem-0",
+                                              "description":  "Required element 0 for state Install Update Flow",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Download and Install Update"
+                                                                          },
+                                                             "label":  "Required element for Install Update Flow"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-install-flow-elem-1",
+                                              "description":  "Required element 1 for state Install Update Flow",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Installing Update..."
+                                                                          },
+                                                             "label":  "Required element for Install Update Flow"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-install-flow-elem-2",
+                                              "description":  "Required element 2 for state Install Update Flow",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Download and Install Update"
+                                                                          },
+                                                             "label":  "Required element for Install Update Flow"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Clicking \u0027Download and Install Update\u0027 invokes the Tauri `install_update` command, which downloads the update package and restarts the application. During install, the button is disabled and shows an \u0027Installing Update...\u0027 label with a spinner.",
+                       "precondition":  "Update available card is shown and status is not \u0027installing\u0027",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-up-to-date-state",
+                       "name":  "Up to Date Status Card",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-up-to-date-state-elem-1",
+                                              "description":  "Required element 1 for state Up to Date Status Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "You\u0027re running the latest version of Qontinui Runner."
+                                                                          },
+                                                             "label":  "Required element for Up to Date Status Card"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-up-to-date-state-elem-2",
+                                              "description":  "Required element 2 for state Up to Date Status Card",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Download and Install Update"
+                                                                          },
+                                                             "label":  "Required element for Up to Date Status Card"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When `check_for_updates` returns `{ available: false }` without the development flag, the component renders an \u0027Up to Date\u0027 card with a green CheckCircle icon confirming the user is on the latest version.",
+                       "precondition":  "check_for_updates returned available=false without development=true",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-error-state",
+                       "name":  "Error State",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-error-state-elem-2",
+                                              "description":  "Required element 2 for state Error State",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Check for Updates"
+                                                                          },
+                                                             "label":  "Required element for Error State"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-error-state-discriminator",
+                                              "description":  "Distinctness discriminator for state Error State",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Error State"
+                                                                          },
+                                                             "label":  "Discriminator for Error State"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "If `check_for_updates` or `install_update` throws an exception, the component stores the error message in state and renders an error card with an AlertCircle icon and the error text. The status card is not shown when an error card is displayed.",
+                       "precondition":  "check_for_updates or install_update threw an error",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-state-mutual-exclusion",
+                       "name":  "Status Card Mutual Exclusion",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-state-mutual-exclusion-elem-1",
+                                              "description":  "Required element 1 for state Status Card Mutual Exclusion",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Checking..."
+                                                                          },
+                                                             "label":  "Required element for Status Card Mutual Exclusion"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-state-mutual-exclusion-discriminator",
+                                              "description":  "Distinctness discriminator for state Status Card Mutual Exclusion",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Status Card Mutual Exclusion"
+                                                                          },
+                                                             "label":  "Discriminator for Status Card Mutual Exclusion"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Only one status card variant can be shown at a time. The four possible status card states (development mode, update available, up to date, and nothing) are mutually exclusive — they are driven by a single `updateInfo` nullable value and a single `error` nullable string. The error card and status card are also mutually exclusive.",
+                       "precondition":  "A check has completed",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "upd-ipc-data-model",
+                       "name":  "IPC Response Data Model",
+                       "assertions":  [
+                                          {
+                                              "id":  "upd-ipc-data-model-elem-1",
+                                              "description":  "Required element 1 for state IPC Response Data Model",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Download and Install Update"
+                                                                          },
+                                                             "label":  "Required element for IPC Response Data Model"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "upd-ipc-data-model-discriminator",
+                                              "description":  "Distinctness discriminator for state IPC Response Data Model",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "IPC Response Data Model"
+                                                                          },
+                                                             "label":  "Discriminator for IPC Response Data Model"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The page relies on two Tauri IPC commands. Their response shapes determine which UI state is shown. Both commands behave differently in debug vs release builds, which is critical for verifying behavior in the correct build context.",
+                       "precondition":  "Update available card is shown",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Updates settings tab within the runner Settings panel. Allows users to check for and install application updates. The page auto-checks for updates on mount via the Tauri `check_for_updates` IPC command. It renders a permanent \u0027current version\u0027 card (showing the installed version and last-checked timestamp) and a conditional status card that shows one of four states: checking/idle (no card), development mode (update checking disabled), update available (with release notes and install button), or up to date. A separate error card appears if a check or install fails. An informational tip box is always visible at the bottom.",
+    "metadata":  {
+                     "tags":  [
+                                  "settings",
+                                  "updates",
+                                  "tauri",
+                                  "ipc",
+                                  "auto-update"
+                              ]
+                 }
 }

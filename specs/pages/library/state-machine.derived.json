@@ -1,255 +1,258 @@
-{
-  "version": "1.0",
-  "id": "library",
-  "name": "LibraryDashboard",
-  "states": [
-    {
-      "id": "lib-dashboard-overview",
-      "name": "Dashboard Overview and Navigation",
-      "assertions": [
-        {
-          "id": "lib-dashboard-overview-elem-0",
-          "description": "Required element 0 for state Dashboard Overview and Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Library Dashboard"
-            },
-            "label": "Required element for Dashboard Overview and Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "lib-dashboard-overview-elem-1",
-          "description": "Required element 1 for state Dashboard Overview and Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "total items"
-            },
-            "label": "Required element for Dashboard Overview and Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "lib-dashboard-overview-elem-2",
-          "description": "Required element 2 for state Dashboard Overview and Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Recently modified items across all categories"
-            },
-            "label": "Required element for Dashboard Overview and Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "lib-dashboard-overview-elem-3",
-          "description": "Required element 3 for state Dashboard Overview and Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Library Dashboard"
-            },
-            "label": "Required element for Dashboard Overview and Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Library Dashboard provides a bird's-eye view of all automation assets across every category. Users land here to quickly find recently modified items, understand what assets exist in their library, and navigate to the appropriate builder for editing. The page heading shows the total item count, and items are sorted by modification time with the most recently changed items appearing first. This makes the dashboard particularly useful for resuming work on recently edited assets.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "lib-search-filter",
-      "name": "Cross-Category Search and Filtering",
-      "assertions": [
-        {
-          "id": "lib-search-filter-elem-0",
-          "description": "Required element 0 for state Cross-Category Search and Filtering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Search across all categories"
-            },
-            "label": "Required element for Cross-Category Search and Filtering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "lib-search-filter-elem-1",
-          "description": "Required element 1 for state Cross-Category Search and Filtering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "All"
-            },
-            "label": "Required element for Cross-Category Search and Filtering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "lib-search-filter-elem-2",
-          "description": "Required element 2 for state Cross-Category Search and Filtering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Library Dashboard"
-            },
-            "label": "Required element for Cross-Category Search and Filtering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "lib-search-filter-elem-3",
-          "description": "Required element 3 for state Cross-Category Search and Filtering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Library Dashboard"
-            },
-            "label": "Required element for Cross-Category Search and Filtering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The dashboard provides powerful search and filtering capabilities that work across all asset categories simultaneously. The search input matches against item names, descriptions, categories, and tags. Type filter pills let users narrow the view to a single asset type while showing per-type counts. The filter pills dynamically show only categories that have items, preventing confusion from empty categories. These tools let users efficiently locate specific assets in large libraries.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "lib-item-presentation",
-      "name": "Item Display and Metadata",
-      "assertions": [
-        {
-          "id": "lib-item-presentation-elem-0",
-          "description": "Required element 0 for state Item Display and Metadata",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Library Dashboard"
-            },
-            "label": "Required element for Item Display and Metadata"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "lib-item-presentation-elem-1",
-          "description": "Required element 1 for state Item Display and Metadata",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Library Dashboard"
-            },
-            "label": "Required element for Item Display and Metadata"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "lib-item-presentation-elem-2",
-          "description": "Required element 2 for state Item Display and Metadata",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Library Dashboard"
-            },
-            "label": "Required element for Item Display and Metadata"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "lib-item-presentation-discriminator",
-          "description": "Distinctness discriminator for state Item Display and Metadata",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Item Display and Metadata"
-            },
-            "label": "Discriminator for Item Display and Metadata"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Each item in the dashboard list shows rich metadata to help users identify and distinguish assets without navigating to the builder. Items display their name, type badge (color-coded to match the builder), description or content preview, category, tags, and relative modification time (e.g., '2h ago', '3d ago'). The type badge uses consistent colors across the application so users develop visual associations with asset types. Items show a navigation arrow on hover indicating clickability.",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Library Dashboard page -- a unified cross-category asset browser that aggregates recently modified items from all automation library categories. Users can browse, search, and filter assets across tasks, prompt snippets, contexts, checks, check groups, shell commands, workflows, playwright tests, and more. Clicking any item navigates to the appropriate builder page for editing. The dashboard serves as the central hub for discovering and managing all reusable automation building blocks.",
-  "metadata": {
-    "tags": [
-      "library",
-      "dashboard",
-      "cross-category",
-      "search",
-      "asset-management"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "library",
+    "name":  "LibraryDashboard",
+    "states":  [
+                   {
+                       "id":  "lib-dashboard-overview",
+                       "name":  "Dashboard Overview and Navigation",
+                       "assertions":  [
+                                          {
+                                              "id":  "lib-dashboard-overview-elem-0",
+                                              "description":  "Required element 0 for state Dashboard Overview and Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Library Dashboard"
+                                                                          },
+                                                             "label":  "Required element for Dashboard Overview and Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "lib-dashboard-overview-elem-1",
+                                              "description":  "Required element 1 for state Dashboard Overview and Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "total items"
+                                                                          },
+                                                             "label":  "Required element for Dashboard Overview and Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "lib-dashboard-overview-elem-2",
+                                              "description":  "Required element 2 for state Dashboard Overview and Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Recently modified items across all categories"
+                                                                          },
+                                                             "label":  "Required element for Dashboard Overview and Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "lib-dashboard-overview-elem-3",
+                                              "description":  "Required element 3 for state Dashboard Overview and Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Library Dashboard"
+                                                                          },
+                                                             "label":  "Required element for Dashboard Overview and Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Library Dashboard provides a bird\u0027s-eye view of all automation assets across every category. Users land here to quickly find recently modified items, understand what assets exist in their library, and navigate to the appropriate builder for editing. The page heading shows the total item count, and items are sorted by modification time with the most recently changed items appearing first. This makes the dashboard particularly useful for resuming work on recently edited assets.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "lib-search-filter",
+                       "name":  "Cross-Category Search and Filtering",
+                       "assertions":  [
+                                          {
+                                              "id":  "lib-search-filter-elem-0",
+                                              "description":  "Required element 0 for state Cross-Category Search and Filtering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Search across all categories"
+                                                                          },
+                                                             "label":  "Required element for Cross-Category Search and Filtering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "lib-search-filter-elem-1",
+                                              "description":  "Required element 1 for state Cross-Category Search and Filtering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "All"
+                                                                          },
+                                                             "label":  "Required element for Cross-Category Search and Filtering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "lib-search-filter-elem-2",
+                                              "description":  "Required element 2 for state Cross-Category Search and Filtering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Library Dashboard"
+                                                                          },
+                                                             "label":  "Required element for Cross-Category Search and Filtering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "lib-search-filter-elem-3",
+                                              "description":  "Required element 3 for state Cross-Category Search and Filtering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Library Dashboard"
+                                                                          },
+                                                             "label":  "Required element for Cross-Category Search and Filtering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The dashboard provides powerful search and filtering capabilities that work across all asset categories simultaneously. The search input matches against item names, descriptions, categories, and tags. Type filter pills let users narrow the view to a single asset type while showing per-type counts. The filter pills dynamically show only categories that have items, preventing confusion from empty categories. These tools let users efficiently locate specific assets in large libraries.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "lib-item-presentation",
+                       "name":  "Item Display and Metadata",
+                       "assertions":  [
+                                          {
+                                              "id":  "lib-item-presentation-elem-0",
+                                              "description":  "Required element 0 for state Item Display and Metadata",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Library Dashboard"
+                                                                          },
+                                                             "label":  "Required element for Item Display and Metadata"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "lib-item-presentation-elem-1",
+                                              "description":  "Required element 1 for state Item Display and Metadata",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Library Dashboard"
+                                                                          },
+                                                             "label":  "Required element for Item Display and Metadata"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "lib-item-presentation-elem-2",
+                                              "description":  "Required element 2 for state Item Display and Metadata",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Library Dashboard"
+                                                                          },
+                                                             "label":  "Required element for Item Display and Metadata"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "lib-item-presentation-discriminator",
+                                              "description":  "Distinctness discriminator for state Item Display and Metadata",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Item Display and Metadata"
+                                                                          },
+                                                             "label":  "Discriminator for Item Display and Metadata"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Each item in the dashboard list shows rich metadata to help users identify and distinguish assets without navigating to the builder. Items display their name, type badge (color-coded to match the builder), description or content preview, category, tags, and relative modification time (e.g., \u00272h ago\u0027, \u00273d ago\u0027). The type badge uses consistent colors across the application so users develop visual associations with asset types. Items show a navigation arrow on hover indicating clickability.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Library Dashboard page -- a unified cross-category asset browser that aggregates recently modified items from all automation library categories. Users can browse, search, and filter assets across tasks, prompt snippets, contexts, checks, check groups, shell commands, workflows, playwright tests, and more. Clicking any item navigates to the appropriate builder page for editing. The dashboard serves as the central hub for discovering and managing all reusable automation building blocks.",
+    "metadata":  {
+                     "tags":  [
+                                  "library",
+                                  "dashboard",
+                                  "cross-category",
+                                  "search",
+                                  "asset-management"
+                              ]
+                 }
 }

@@ -1,514 +1,517 @@
-{
-  "version": "1.0",
-  "id": "cross-run-analytics",
-  "name": "CrossRunPatternsPanel, StepProvenanceTimeline, SelectorDecayChart, FailureChainViewer",
-  "states": [
-    {
-      "id": "crossrun-elements",
-      "name": "Cross-Run Pattern Elements",
-      "assertions": [
-        {
-          "id": "crossrun-elements-elem-0",
-          "description": "Required element 0 for state Cross-Run Pattern Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Cross-Run Patterns"
-            },
-            "label": "Required element for Cross-Run Pattern Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "crossrun-elements-elem-1",
-          "description": "Required element 1 for state Cross-Run Pattern Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "No cross-run patterns detected"
-            },
-            "label": "Required element for Cross-Run Pattern Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The CrossRunPatternsPanel renders a list of detected patterns with type badges, signature hashes, occurrence counts, timestamps, and status indicators. Each pattern row has a type badge (recurring_finding or fix_oscillation), truncated signature hash, occurrence count, last seen date, and status badge.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "crossrun-data-display",
-      "name": "Pattern Data Display",
-      "assertions": [
-        {
-          "id": "crossrun-data-display-elem-0",
-          "description": "Required element 0 for state Pattern Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Recurring Finding|Fix Oscillation"
-            },
-            "label": "Required element for Pattern Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "crossrun-data-display-elem-1",
-          "description": "Required element 1 for state Pattern Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Cross-Run Patterns"
-            },
-            "label": "Required element for Pattern Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Each pattern row shows: type badge (yellow 'Recurring Finding' with TrendingUp icon, or orange 'Fix Oscillation' with RefreshCw icon), signature_hash first 12 chars in monospace, affected_components below in muted text, occurrence count as bold 'Nx', last seen date, and status badge (active=red, resolved=green, suppressed=gray). Data from GET /graph/cross-run-patterns.",
-      "precondition": "At least one cross-run pattern exists in cross_run_patterns table",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "crossrun-status-semantics",
-      "name": "Pattern Status Semantics",
-      "assertions": [
-        {
-          "id": "crossrun-status-semantics-elem-0",
-          "description": "Required element 0 for state Pattern Status Semantics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "active"
-            },
-            "label": "Required element for Pattern Status Semantics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "crossrun-status-semantics-elem-1",
-          "description": "Required element 1 for state Pattern Status Semantics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "resolved"
-            },
-            "label": "Required element for Pattern Status Semantics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Pattern status badges communicate urgency through color: 'active' (red bg-red-500/10) means the pattern is still occurring and needs attention, 'resolved' (green bg-green-500/10) means a fix successfully addressed it, 'suppressed' (gray bg-muted) means it was intentionally ignored. These match the cross_run_patterns.status column values.",
-      "precondition": "At least one active pattern exists",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "provenance-elements",
-      "name": "Step Provenance Timeline Elements",
-      "assertions": [
-        {
-          "id": "provenance-elements-elem-0",
-          "description": "Required element 0 for state Step Provenance Timeline Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Step Provenance Timeline"
-            },
-            "label": "Required element for Step Provenance Timeline Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "provenance-elements-elem-1",
-          "description": "Required element 1 for state Step Provenance Timeline Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "No step provenance data"
-            },
-            "label": "Required element for Step Provenance Timeline Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Vertical timeline with colored dots per agent. Each step shows: agent-colored dot (3x3px rounded), step name, phase badge (setup/verification/agentic/completion in bg-muted), step index (#N), generating agent name in monospace, generation iteration, and UI Bridge interaction count badge. Legend at bottom shows all 5 agent colors. Max height 384px with scroll.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "provenance-data-display",
-      "name": "Provenance Agent Color Coding",
-      "assertions": [
-        {
-          "id": "provenance-data-display-elem-0",
-          "description": "Required element 0 for state Provenance Agent Color Coding",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "discovery"
-            },
-            "label": "Required element for Provenance Agent Color Coding"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "provenance-data-display-elem-1",
-          "description": "Required element 1 for state Provenance Agent Color Coding",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "UI interaction"
-            },
-            "label": "Required element for Provenance Agent Color Coding"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Each step's timeline dot color identifies the generating agent: discovery (blue bg-blue-500), builder (green bg-green-500), fixer (orange bg-orange-500), hardener (purple bg-purple-500), verifier (cyan bg-cyan-500), other (gray bg-muted-foreground). The legend at bottom shows all agent colors. Steps with UI Bridge interactions show a count badge (e.g., '3 UI interactions' in bg-primary/10 text-primary).",
-      "precondition": "A workflow is selected and has step_provenance records",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "provenance-state-consistency",
-      "name": "Provenance Loading and Error States",
-      "assertions": [
-        {
-          "id": "provenance-state-consistency-elem-0",
-          "description": "Required element 0 for state Provenance Loading and Error States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Loading provenance"
-            },
-            "label": "Required element for Provenance Loading and Error States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The timeline shows 'Loading provenance...' during fetch, an error message in text-destructive on failure, and the agent legend only when data is available.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "decay-chart-data-display",
-      "name": "Selector Decay Chart Data Display",
-      "assertions": [
-        {
-          "id": "decay-chart-data-display-elem-0",
-          "description": "Required element 0 for state Selector Decay Chart Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Selector Decay"
-            },
-            "label": "Required element for Selector Decay Chart Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "decay-chart-data-display-discriminator",
-          "description": "Distinctness discriminator for state Selector Decay Chart Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Selector Decay Chart Data Display"
-            },
-            "label": "Discriminator for Selector Decay Chart Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Line chart showing success rate over time windows. X-axis: window labels (W1, W2, ..., newest last). Y-axis: 0-100% with dashed reference line at 95% (reliability threshold). Uses primary color stroke, width 2, dots enabled. A declining curve indicates the element's selector is degrading and needs CTR updates. Used in element detail views, not the main dashboard. Backed by GET /ui-bridge/analytics/decay-curve.",
-      "precondition": "An element ID is provided and has interaction history in ui_bridge_events",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "decay-chart-semantics",
-      "name": "Decay Chart Reference Line Semantics",
-      "assertions": [
-        {
-          "id": "decay-chart-semantics-elem-0",
-          "description": "Required element 0 for state Decay Chart Reference Line Semantics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Selector Decay"
-            },
-            "label": "Required element for Decay Chart Reference Line Semantics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "decay-chart-semantics-discriminator",
-          "description": "Distinctness discriminator for state Decay Chart Reference Line Semantics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Decay Chart Reference Line Semantics"
-            },
-            "label": "Discriminator for Decay Chart Reference Line Semantics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The dashed line at 95% represents the reliability threshold. Elements above this line are considered reliable. Elements below need attention — their selectors may be breaking due to DOM restructuring, CSS changes, or app updates. The trend direction (rising vs falling) is more important than the absolute value.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "failure-chain-elements",
-      "name": "Failure Chain Viewer Elements",
-      "assertions": [
-        {
-          "id": "failure-chain-elements-elem-0",
-          "description": "Required element 0 for state Failure Chain Viewer Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Failure Chain"
-            },
-            "label": "Required element for Failure Chain Viewer Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "failure-chain-elements-elem-1",
-          "description": "Required element 1 for state Failure Chain Viewer Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "No failure chains found"
-            },
-            "label": "Required element for Failure Chain Viewer Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Displays graph traversal paths as horizontal node chains. Each node has a colored dot (7 types: ui_element=blue, task_run=purple, workflow=green, finding=orange, fix=cyan, rule=yellow, error=red), kind label, and entity name (monospace). Nodes connected by ChevronRight arrows with edge kind labels. Multiple paths shown in separate bordered cards. Legend shows all node types. Max height 384px with scroll.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "failure-chain-semantics",
-      "name": "Failure Chain Node Type Semantics",
-      "assertions": [
-        {
-          "id": "failure-chain-semantics-elem-0",
-          "description": "Required element 0 for state Failure Chain Node Type Semantics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "ui_element"
-            },
-            "label": "Required element for Failure Chain Node Type Semantics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "failure-chain-semantics-elem-1",
-          "description": "Required element 1 for state Failure Chain Node Type Semantics",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Failure Chain"
-            },
-            "label": "Required element for Failure Chain Node Type Semantics"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The graph traversal follows the knowledge graph: UIElement ← InteractedWith ← TaskRun → BelongsTo → Workflow, with DetectedDuring edges connecting to findings. Each node type's color communicates its role in the causal chain: blue elements are UI targets, purple runs are execution instances, green workflows are the automation definition, orange findings are discovered issues, cyan fixes are attempted solutions. This lets users trace 'why did this element fail?' back to its root cause.",
-      "precondition": "At least one failure chain path was found for the given element",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "crossrun-behavior",
-      "name": "Cross-Run Data Update Behavior",
-      "assertions": [
-        {
-          "id": "crossrun-behavior-elem-0",
-          "description": "Required element 0 for state Cross-Run Data Update Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Cross-Run Patterns"
-            },
-            "label": "Required element for Cross-Run Data Update Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "crossrun-behavior-elem-1",
-          "description": "Required element 1 for state Cross-Run Data Update Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Cross-Run Patterns"
-            },
-            "label": "Required element for Cross-Run Data Update Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "crossrun-behavior-discriminator",
-          "description": "Distinctness discriminator for state Cross-Run Data Update Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Cross-Run Data Update Behavior"
-            },
-            "label": "Discriminator for Cross-Run Data Update Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "CrossRunPatternsPanel accepts an optional workflowName prop to filter patterns. When no workflow is selected, all patterns are shown. The panel uses useCrossRunPatterns() hook with 30s stale time and 60s refetch interval. StepProvenanceTimeline requires a workflowId prop and is disabled when empty. SelectorDecayChart requires an elementId prop. FailureChainViewer requires an elementId prop.",
-      "precondition": "Multiple patterns exist, some associated with different workflows",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Cross-Run Analytics components — CrossRunPatternsPanel, StepProvenanceTimeline, SelectorDecayChart, and FailureChainViewer. Used within the Reflection Dashboard and element detail views. CrossRunPatternsPanel shows recurring_finding and fix_oscillation patterns from the knowledge graph's cross_run_patterns table. StepProvenanceTimeline shows which pipeline agent generated each step with UI Bridge interaction overlays. SelectorDecayChart tracks element reliability over time. FailureChainViewer traces graph paths from UI elements through task runs to workflows, findings, and fixes.",
-  "metadata": {
-    "tags": [
-      "cross-run-patterns",
-      "step-provenance",
-      "selector-decay",
-      "failure-chain",
-      "knowledge-graph",
-      "pipeline-agents",
-      "ui-bridge",
-      "analytics"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "cross-run-analytics",
+    "name":  "CrossRunPatternsPanel, StepProvenanceTimeline, SelectorDecayChart, FailureChainViewer",
+    "states":  [
+                   {
+                       "id":  "crossrun-elements",
+                       "name":  "Cross-Run Pattern Elements",
+                       "assertions":  [
+                                          {
+                                              "id":  "crossrun-elements-elem-0",
+                                              "description":  "Required element 0 for state Cross-Run Pattern Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Cross-Run Patterns"
+                                                                          },
+                                                             "label":  "Required element for Cross-Run Pattern Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "crossrun-elements-elem-1",
+                                              "description":  "Required element 1 for state Cross-Run Pattern Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "No cross-run patterns detected"
+                                                                          },
+                                                             "label":  "Required element for Cross-Run Pattern Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The CrossRunPatternsPanel renders a list of detected patterns with type badges, signature hashes, occurrence counts, timestamps, and status indicators. Each pattern row has a type badge (recurring_finding or fix_oscillation), truncated signature hash, occurrence count, last seen date, and status badge.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "crossrun-data-display",
+                       "name":  "Pattern Data Display",
+                       "assertions":  [
+                                          {
+                                              "id":  "crossrun-data-display-elem-0",
+                                              "description":  "Required element 0 for state Pattern Data Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Recurring Finding|Fix Oscillation"
+                                                                          },
+                                                             "label":  "Required element for Pattern Data Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "crossrun-data-display-elem-1",
+                                              "description":  "Required element 1 for state Pattern Data Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Cross-Run Patterns"
+                                                                          },
+                                                             "label":  "Required element for Pattern Data Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Each pattern row shows: type badge (yellow \u0027Recurring Finding\u0027 with TrendingUp icon, or orange \u0027Fix Oscillation\u0027 with RefreshCw icon), signature_hash first 12 chars in monospace, affected_components below in muted text, occurrence count as bold \u0027Nx\u0027, last seen date, and status badge (active=red, resolved=green, suppressed=gray). Data from GET /graph/cross-run-patterns.",
+                       "precondition":  "At least one cross-run pattern exists in cross_run_patterns table",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "crossrun-status-semantics",
+                       "name":  "Pattern Status Semantics",
+                       "assertions":  [
+                                          {
+                                              "id":  "crossrun-status-semantics-elem-0",
+                                              "description":  "Required element 0 for state Pattern Status Semantics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "active"
+                                                                          },
+                                                             "label":  "Required element for Pattern Status Semantics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "crossrun-status-semantics-elem-1",
+                                              "description":  "Required element 1 for state Pattern Status Semantics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "resolved"
+                                                                          },
+                                                             "label":  "Required element for Pattern Status Semantics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Pattern status badges communicate urgency through color: \u0027active\u0027 (red bg-red-500/10) means the pattern is still occurring and needs attention, \u0027resolved\u0027 (green bg-green-500/10) means a fix successfully addressed it, \u0027suppressed\u0027 (gray bg-muted) means it was intentionally ignored. These match the cross_run_patterns.status column values.",
+                       "precondition":  "At least one active pattern exists",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "provenance-elements",
+                       "name":  "Step Provenance Timeline Elements",
+                       "assertions":  [
+                                          {
+                                              "id":  "provenance-elements-elem-0",
+                                              "description":  "Required element 0 for state Step Provenance Timeline Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Step Provenance Timeline"
+                                                                          },
+                                                             "label":  "Required element for Step Provenance Timeline Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "provenance-elements-elem-1",
+                                              "description":  "Required element 1 for state Step Provenance Timeline Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "No step provenance data"
+                                                                          },
+                                                             "label":  "Required element for Step Provenance Timeline Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Vertical timeline with colored dots per agent. Each step shows: agent-colored dot (3x3px rounded), step name, phase badge (setup/verification/agentic/completion in bg-muted), step index (#N), generating agent name in monospace, generation iteration, and UI Bridge interaction count badge. Legend at bottom shows all 5 agent colors. Max height 384px with scroll.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "provenance-data-display",
+                       "name":  "Provenance Agent Color Coding",
+                       "assertions":  [
+                                          {
+                                              "id":  "provenance-data-display-elem-0",
+                                              "description":  "Required element 0 for state Provenance Agent Color Coding",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "discovery"
+                                                                          },
+                                                             "label":  "Required element for Provenance Agent Color Coding"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "provenance-data-display-elem-1",
+                                              "description":  "Required element 1 for state Provenance Agent Color Coding",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "UI interaction"
+                                                                          },
+                                                             "label":  "Required element for Provenance Agent Color Coding"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Each step\u0027s timeline dot color identifies the generating agent: discovery (blue bg-blue-500), builder (green bg-green-500), fixer (orange bg-orange-500), hardener (purple bg-purple-500), verifier (cyan bg-cyan-500), other (gray bg-muted-foreground). The legend at bottom shows all agent colors. Steps with UI Bridge interactions show a count badge (e.g., \u00273 UI interactions\u0027 in bg-primary/10 text-primary).",
+                       "precondition":  "A workflow is selected and has step_provenance records",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "provenance-state-consistency",
+                       "name":  "Provenance Loading and Error States",
+                       "assertions":  [
+                                          {
+                                              "id":  "provenance-state-consistency-elem-0",
+                                              "description":  "Required element 0 for state Provenance Loading and Error States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Loading provenance"
+                                                                          },
+                                                             "label":  "Required element for Provenance Loading and Error States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The timeline shows \u0027Loading provenance...\u0027 during fetch, an error message in text-destructive on failure, and the agent legend only when data is available.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "decay-chart-data-display",
+                       "name":  "Selector Decay Chart Data Display",
+                       "assertions":  [
+                                          {
+                                              "id":  "decay-chart-data-display-elem-0",
+                                              "description":  "Required element 0 for state Selector Decay Chart Data Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Selector Decay"
+                                                                          },
+                                                             "label":  "Required element for Selector Decay Chart Data Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "decay-chart-data-display-discriminator",
+                                              "description":  "Distinctness discriminator for state Selector Decay Chart Data Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Selector Decay Chart Data Display"
+                                                                          },
+                                                             "label":  "Discriminator for Selector Decay Chart Data Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Line chart showing success rate over time windows. X-axis: window labels (W1, W2, ..., newest last). Y-axis: 0-100% with dashed reference line at 95% (reliability threshold). Uses primary color stroke, width 2, dots enabled. A declining curve indicates the element\u0027s selector is degrading and needs CTR updates. Used in element detail views, not the main dashboard. Backed by GET /ui-bridge/analytics/decay-curve.",
+                       "precondition":  "An element ID is provided and has interaction history in ui_bridge_events",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "decay-chart-semantics",
+                       "name":  "Decay Chart Reference Line Semantics",
+                       "assertions":  [
+                                          {
+                                              "id":  "decay-chart-semantics-elem-0",
+                                              "description":  "Required element 0 for state Decay Chart Reference Line Semantics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Selector Decay"
+                                                                          },
+                                                             "label":  "Required element for Decay Chart Reference Line Semantics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "decay-chart-semantics-discriminator",
+                                              "description":  "Distinctness discriminator for state Decay Chart Reference Line Semantics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Decay Chart Reference Line Semantics"
+                                                                          },
+                                                             "label":  "Discriminator for Decay Chart Reference Line Semantics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The dashed line at 95% represents the reliability threshold. Elements above this line are considered reliable. Elements below need attention — their selectors may be breaking due to DOM restructuring, CSS changes, or app updates. The trend direction (rising vs falling) is more important than the absolute value.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "failure-chain-elements",
+                       "name":  "Failure Chain Viewer Elements",
+                       "assertions":  [
+                                          {
+                                              "id":  "failure-chain-elements-elem-0",
+                                              "description":  "Required element 0 for state Failure Chain Viewer Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Failure Chain"
+                                                                          },
+                                                             "label":  "Required element for Failure Chain Viewer Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "failure-chain-elements-elem-1",
+                                              "description":  "Required element 1 for state Failure Chain Viewer Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "No failure chains found"
+                                                                          },
+                                                             "label":  "Required element for Failure Chain Viewer Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Displays graph traversal paths as horizontal node chains. Each node has a colored dot (7 types: ui_element=blue, task_run=purple, workflow=green, finding=orange, fix=cyan, rule=yellow, error=red), kind label, and entity name (monospace). Nodes connected by ChevronRight arrows with edge kind labels. Multiple paths shown in separate bordered cards. Legend shows all node types. Max height 384px with scroll.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "failure-chain-semantics",
+                       "name":  "Failure Chain Node Type Semantics",
+                       "assertions":  [
+                                          {
+                                              "id":  "failure-chain-semantics-elem-0",
+                                              "description":  "Required element 0 for state Failure Chain Node Type Semantics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "ui_element"
+                                                                          },
+                                                             "label":  "Required element for Failure Chain Node Type Semantics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "failure-chain-semantics-elem-1",
+                                              "description":  "Required element 1 for state Failure Chain Node Type Semantics",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Failure Chain"
+                                                                          },
+                                                             "label":  "Required element for Failure Chain Node Type Semantics"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The graph traversal follows the knowledge graph: UIElement ← InteractedWith ← TaskRun → BelongsTo → Workflow, with DetectedDuring edges connecting to findings. Each node type\u0027s color communicates its role in the causal chain: blue elements are UI targets, purple runs are execution instances, green workflows are the automation definition, orange findings are discovered issues, cyan fixes are attempted solutions. This lets users trace \u0027why did this element fail?\u0027 back to its root cause.",
+                       "precondition":  "At least one failure chain path was found for the given element",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "crossrun-behavior",
+                       "name":  "Cross-Run Data Update Behavior",
+                       "assertions":  [
+                                          {
+                                              "id":  "crossrun-behavior-elem-0",
+                                              "description":  "Required element 0 for state Cross-Run Data Update Behavior",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Cross-Run Patterns"
+                                                                          },
+                                                             "label":  "Required element for Cross-Run Data Update Behavior"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "crossrun-behavior-elem-1",
+                                              "description":  "Required element 1 for state Cross-Run Data Update Behavior",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Cross-Run Patterns"
+                                                                          },
+                                                             "label":  "Required element for Cross-Run Data Update Behavior"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "crossrun-behavior-discriminator",
+                                              "description":  "Distinctness discriminator for state Cross-Run Data Update Behavior",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Cross-Run Data Update Behavior"
+                                                                          },
+                                                             "label":  "Discriminator for Cross-Run Data Update Behavior"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "CrossRunPatternsPanel accepts an optional workflowName prop to filter patterns. When no workflow is selected, all patterns are shown. The panel uses useCrossRunPatterns() hook with 30s stale time and 60s refetch interval. StepProvenanceTimeline requires a workflowId prop and is disabled when empty. SelectorDecayChart requires an elementId prop. FailureChainViewer requires an elementId prop.",
+                       "precondition":  "Multiple patterns exist, some associated with different workflows",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Cross-Run Analytics components — CrossRunPatternsPanel, StepProvenanceTimeline, SelectorDecayChart, and FailureChainViewer. Used within the Reflection Dashboard and element detail views. CrossRunPatternsPanel shows recurring_finding and fix_oscillation patterns from the knowledge graph\u0027s cross_run_patterns table. StepProvenanceTimeline shows which pipeline agent generated each step with UI Bridge interaction overlays. SelectorDecayChart tracks element reliability over time. FailureChainViewer traces graph paths from UI elements through task runs to workflows, findings, and fixes.",
+    "metadata":  {
+                     "tags":  [
+                                  "cross-run-patterns",
+                                  "step-provenance",
+                                  "selector-decay",
+                                  "failure-chain",
+                                  "knowledge-graph",
+                                  "pipeline-agents",
+                                  "ui-bridge",
+                                  "analytics"
+                              ]
+                 }
 }

@@ -1,1025 +1,1028 @@
-{
-  "version": "1.0",
-  "id": "settings",
-  "name": "Settings",
-  "states": [
-    {
-      "id": "settings-purpose",
-      "name": "Page Purpose",
-      "assertions": [
-        {
-          "id": "settings-purpose-elem-0",
-          "description": "Required element 0 for state Page Purpose",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Settings"
-            },
-            "label": "Required element for Page Purpose"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-purpose-elem-1",
-          "description": "Required element 1 for state Page Purpose",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "navigation"
-            },
-            "label": "Required element for Page Purpose"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Settings page is the central configuration hub for the entire runner application.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-ai-config",
-      "name": "AI Provider Configuration Goals",
-      "assertions": [
-        {
-          "id": "settings-ai-config-elem-0",
-          "description": "Required element 0 for state AI Provider Configuration Goals",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "AI"
-            },
-            "label": "Required element for AI Provider Configuration Goals"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-ai-config-elem-1",
-          "description": "Required element 1 for state AI Provider Configuration Goals",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Model"
-            },
-            "label": "Required element for AI Provider Configuration Goals"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users need to configure which AI providers and models power their automation workflows.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-claude-accounts",
-      "name": "Claude Account Switching",
-      "assertions": [
-        {
-          "id": "settings-claude-accounts-elem-0",
-          "description": "Required element 0 for state Claude Account Switching",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Claude Accounts"
-            },
-            "label": "Required element for Claude Account Switching"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-accounts-elem-1",
-          "description": "Required element 1 for state Claude Account Switching",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Active"
-            },
-            "label": "Required element for Claude Account Switching"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-accounts-elem-2",
-          "description": "Required element 2 for state Claude Account Switching",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Switch"
-            },
-            "label": "Required element for Claude Account Switching"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-accounts-elem-3",
-          "description": "Required element 3 for state Claude Account Switching",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Rate-limited"
-            },
-            "label": "Required element for Claude Account Switching"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-accounts-elem-4",
-          "description": "Required element 4 for state Claude Account Switching",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "failover on rate-limit"
-            },
-            "label": "Required element for Claude Account Switching"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-accounts-elem-5",
-          "description": "Required element 5 for state Claude Account Switching",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Switching..."
-            },
-            "label": "Required element for Claude Account Switching"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The AI tab's Claude Accounts section supports multi-account management with automatic failover on rate-limit. Users can see which account is active, which are rate-limited, and manually switch between accounts. When in Least Usage mode, the runner auto-selects the best account at startup and auto-rotates on rate-limit during workflows.",
-      "precondition": "AI Providers tab is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-agentic",
-      "name": "Agentic Behavior Goals",
-      "assertions": [
-        {
-          "id": "settings-agentic-elem-0",
-          "description": "Required element 0 for state Agentic Behavior Goals",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "iteration"
-            },
-            "label": "Required element for Agentic Behavior Goals"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users fine-tune how the AI behaves during workflow execution.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-integrations",
-      "name": "Integration Configuration Goals",
-      "assertions": [
-        {
-          "id": "settings-integrations-elem-0",
-          "description": "Required element 0 for state Integration Configuration Goals",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "MCP"
-            },
-            "label": "Required element for Integration Configuration Goals"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-integrations-elem-1",
-          "description": "Required element 1 for state Integration Configuration Goals",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Log Sources"
-            },
-            "label": "Required element for Integration Configuration Goals"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-integrations-elem-2",
-          "description": "Required element 2 for state Integration Configuration Goals",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Playwright"
-            },
-            "label": "Required element for Integration Configuration Goals"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users configure external integrations like MCP servers, cloud relay, Playwright, and log sources.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-data-management",
-      "name": "Data Management Goals",
-      "assertions": [
-        {
-          "id": "settings-data-management-elem-0",
-          "description": "Required element 0 for state Data Management Goals",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Backup"
-            },
-            "label": "Required element for Data Management Goals"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-data-management-elem-1",
-          "description": "Required element 1 for state Data Management Goals",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Updates"
-            },
-            "label": "Required element for Data Management Goals"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users manage storage, backups, and updates.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-claude-auth",
-      "name": "Claude CLI Authentication Status",
-      "assertions": [
-        {
-          "id": "settings-claude-auth-elem-0",
-          "description": "Required element 0 for state Claude CLI Authentication Status",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Auth"
-            },
-            "label": "Required element for Claude CLI Authentication Status"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-auth-elem-1",
-          "description": "Required element 1 for state Claude CLI Authentication Status",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "subscription"
-            },
-            "label": "Required element for Claude CLI Authentication Status"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-auth-elem-2",
-          "description": "Required element 2 for state Claude CLI Authentication Status",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "expir"
-            },
-            "label": "Required element for Claude CLI Authentication Status"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-auth-elem-3",
-          "description": "Required element 3 for state Claude CLI Authentication Status",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "uthenticat"
-            },
-            "label": "Required element for Claude CLI Authentication Status"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Claude CLI section displays authentication status including subscription type and expiry countdown, with the ability to re-authenticate when needed.",
-      "precondition": "AI Providers tab is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-claude-execution",
-      "name": "Claude CLI Execution Configuration",
-      "assertions": [
-        {
-          "id": "settings-claude-execution-elem-0",
-          "description": "Required element 0 for state Claude CLI Execution Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Execution Mode"
-            },
-            "label": "Required element for Claude CLI Execution Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-execution-elem-1",
-          "description": "Required element 1 for state Claude CLI Execution Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "executable"
-            },
-            "label": "Required element for Claude CLI Execution Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-execution-elem-2",
-          "description": "Required element 2 for state Claude CLI Execution Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "timeout"
-            },
-            "label": "Required element for Claude CLI Execution Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-execution-elem-3",
-          "description": "Required element 3 for state Claude CLI Execution Configuration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "launch"
-            },
-            "label": "Required element for Claude CLI Execution Configuration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users configure how the Claude CLI is executed: choosing an execution mode (auto, windows_native, wsl, native), optionally setting a custom executable path, and configuring a timeout for CLI operations.",
-      "precondition": "AI Providers tab is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-claude-accounts-mgmt",
-      "name": "Claude CLI Multi-Account Management",
-      "assertions": [
-        {
-          "id": "settings-claude-accounts-mgmt-elem-0",
-          "description": "Required element 0 for state Claude CLI Multi-Account Management",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "usage"
-            },
-            "label": "Required element for Claude CLI Multi-Account Management"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-accounts-mgmt-elem-1",
-          "description": "Required element 1 for state Claude CLI Multi-Account Management",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Active"
-            },
-            "label": "Required element for Claude CLI Multi-Account Management"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-accounts-mgmt-elem-2",
-          "description": "Required element 2 for state Claude CLI Multi-Account Management",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Check Usage"
-            },
-            "label": "Required element for Claude CLI Multi-Account Management"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Claude CLI section provides multi-account management with live state badges (Active, Rate-limited, Auto-selected), color-coded usage bars (green <50%, yellow 50-80%, red >80%), switch buttons per account, and a Check Usage button to refresh usage data.",
-      "precondition": "AI Providers tab is selected and at least one Claude account directory is configured and usage has been checked",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-claude-account-actions",
-      "name": "Claude CLI Account Directory Actions",
-      "assertions": [
-        {
-          "id": "settings-claude-account-actions-elem-0",
-          "description": "Required element 0 for state Claude CLI Account Directory Actions",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Add"
-            },
-            "label": "Required element for Claude CLI Account Directory Actions"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-account-actions-elem-1",
-          "description": "Required element 1 for state Claude CLI Account Directory Actions",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Remove"
-            },
-            "label": "Required element for Claude CLI Account Directory Actions"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-account-actions-elem-2",
-          "description": "Required element 2 for state Claude CLI Account Directory Actions",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Auto"
-            },
-            "label": "Required element for Claude CLI Account Directory Actions"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-claude-account-actions-elem-3",
-          "description": "Required element 3 for state Claude CLI Account Directory Actions",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Selection Mode"
-            },
-            "label": "Required element for Claude CLI Account Directory Actions"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users can manage their Claude account directories: add new directories, remove existing ones, auto-detect available directories, and toggle between Manual and Least Usage account selection modes.",
-      "precondition": "AI Providers tab is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-wsv-mode",
-      "name": "World State Verifier — Mode & Connection",
-      "assertions": [
-        {
-          "id": "settings-wsv-mode-elem-0",
-          "description": "Required element 0 for state World State Verifier — Mode & Connection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "World State Verifier"
-            },
-            "label": "Required element for World State Verifier — Mode & Connection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-mode-elem-1",
-          "description": "Required element 1 for state World State Verifier — Mode & Connection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "wsv mode"
-              }
-            },
-            "label": "Required element for World State Verifier — Mode & Connection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-mode-elem-2",
-          "description": "Required element 2 for state World State Verifier — Mode & Connection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Shadow mode is the recommended"
-            },
-            "label": "Required element for World State Verifier — Mode & Connection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-mode-elem-3",
-          "description": "Required element 3 for state World State Verifier — Mode & Connection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "wsv endpoint"
-              }
-            },
-            "label": "Required element for World State Verifier — Mode & Connection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-mode-elem-4",
-          "description": "Required element 4 for state World State Verifier — Mode & Connection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "wsv model"
-              }
-            },
-            "label": "Required element for World State Verifier — Mode & Connection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-mode-elem-5",
-          "description": "Required element 5 for state World State Verifier — Mode & Connection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "test wsv connection"
-              }
-            },
-            "label": "Required element for World State Verifier — Mode & Connection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-mode-elem-6",
-          "description": "Required element 6 for state World State Verifier — Mode & Connection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "save wsv settings"
-              }
-            },
-            "label": "Required element for World State Verifier — Mode & Connection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The WSV tab allows configuring the VLM-based World State Verifier (CUA-WSM / SEAgent 7B judge). The mode dropdown selects between Disabled (default), Enabled (WSM verdict wins), and Shadow (both run, text verifier decides, disagreements logged). Changes take effect on the next agentic verification iteration without a runner restart.",
-      "precondition": "World State Verifier tab is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-wsv-evidence",
-      "name": "World State Verifier — Screenshot Evidence Toggle",
-      "assertions": [
-        {
-          "id": "settings-wsv-evidence-elem-0",
-          "description": "Required element 0 for state World State Verifier — Screenshot Evidence Toggle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Screenshot Evidence"
-            },
-            "label": "Required element for World State Verifier — Screenshot Evidence Toggle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-evidence-elem-1",
-          "description": "Required element 1 for state World State Verifier — Screenshot Evidence Toggle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "320px wide"
-            },
-            "label": "Required element for World State Verifier — Screenshot Evidence Toggle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "A toggle controls whether downsampled pre/post screenshot thumbnails are embedded in the agentic verification iteration canvas panels when the WSM verdict is used.",
-      "precondition": "World State Verifier tab is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-wsv-calibration",
-      "name": "World State Verifier — Shadow-Mode Calibration View",
-      "assertions": [
-        {
-          "id": "settings-wsv-calibration-elem-0",
-          "description": "Required element 0 for state World State Verifier — Shadow-Mode Calibration View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Shadow-Mode Calibration"
-            },
-            "label": "Required element for World State Verifier — Shadow-Mode Calibration View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-calibration-elem-1",
-          "description": "Required element 1 for state World State Verifier — Shadow-Mode Calibration View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Enable Shadow mode above"
-            },
-            "label": "Required element for World State Verifier — Shadow-Mode Calibration View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-calibration-elem-2",
-          "description": "Required element 2 for state World State Verifier — Shadow-Mode Calibration View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "filter-any"
-              }
-            },
-            "label": "Required element for World State Verifier — Shadow-Mode Calibration View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-calibration-elem-3",
-          "description": "Required element 3 for state World State Verifier — Shadow-Mode Calibration View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "wsv calibration empty"
-              }
-            },
-            "label": "Required element for World State Verifier — Shadow-Mode Calibration View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-calibration-elem-4",
-          "description": "Required element 4 for state World State Verifier — Shadow-Mode Calibration View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "wsv disagreements"
-              }
-            },
-            "label": "Required element for World State Verifier — Shadow-Mode Calibration View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-calibration-elem-5",
-          "description": "Required element 5 for state World State Verifier — Shadow-Mode Calibration View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "auto-refresh every 10s"
-            },
-            "label": "Required element for World State Verifier — Shadow-Mode Calibration View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "A calibration section shows recent disagreements between the WSM (VLM judge) and the text verifier agent from shadow-mode runs. Users review these to decide whether to flip from Shadow to Enabled mode. The section auto-polls every 10 seconds and supports filtering by status-pair pattern.",
-      "precondition": "World State Verifier tab is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "settings-wsv-reset",
-      "name": "World State Verifier — Reset & Validation",
-      "assertions": [
-        {
-          "id": "settings-wsv-reset-elem-0",
-          "description": "Required element 0 for state World State Verifier — Reset & Validation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "reset wsv defaults"
-              }
-            },
-            "label": "Required element for World State Verifier — Reset & Validation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-reset-elem-1",
-          "description": "Required element 1 for state World State Verifier — Reset & Validation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "save wsv settings"
-              }
-            },
-            "label": "Required element for World State Verifier — Reset & Validation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "settings-wsv-reset-elem-2",
-          "description": "Required element 2 for state World State Verifier — Reset & Validation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "attributes": {
-                "content-label": "save wsv settings"
-              }
-            },
-            "label": "Required element for World State Verifier — Reset & Validation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Edge cases and the Reset to Defaults flow.",
-      "precondition": "World State Verifier tab is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Settings page",
-  "metadata": {
-    "tags": [
-      "settings",
-      "configuration",
-      "ai-providers",
-      "integrations",
-      "system"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "settings",
+    "name":  "Settings",
+    "states":  [
+                   {
+                       "id":  "settings-purpose",
+                       "name":  "Page Purpose",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-purpose-elem-0",
+                                              "description":  "Required element 0 for state Page Purpose",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Settings"
+                                                                          },
+                                                             "label":  "Required element for Page Purpose"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-purpose-elem-1",
+                                              "description":  "Required element 1 for state Page Purpose",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "navigation"
+                                                                          },
+                                                             "label":  "Required element for Page Purpose"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Settings page is the central configuration hub for the entire runner application.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-ai-config",
+                       "name":  "AI Provider Configuration Goals",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-ai-config-elem-0",
+                                              "description":  "Required element 0 for state AI Provider Configuration Goals",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "AI"
+                                                                          },
+                                                             "label":  "Required element for AI Provider Configuration Goals"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-ai-config-elem-1",
+                                              "description":  "Required element 1 for state AI Provider Configuration Goals",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Model"
+                                                                          },
+                                                             "label":  "Required element for AI Provider Configuration Goals"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users need to configure which AI providers and models power their automation workflows.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-claude-accounts",
+                       "name":  "Claude Account Switching",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-claude-accounts-elem-0",
+                                              "description":  "Required element 0 for state Claude Account Switching",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Claude Accounts"
+                                                                          },
+                                                             "label":  "Required element for Claude Account Switching"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-accounts-elem-1",
+                                              "description":  "Required element 1 for state Claude Account Switching",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Active"
+                                                                          },
+                                                             "label":  "Required element for Claude Account Switching"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-accounts-elem-2",
+                                              "description":  "Required element 2 for state Claude Account Switching",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Switch"
+                                                                          },
+                                                             "label":  "Required element for Claude Account Switching"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-accounts-elem-3",
+                                              "description":  "Required element 3 for state Claude Account Switching",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Rate-limited"
+                                                                          },
+                                                             "label":  "Required element for Claude Account Switching"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-accounts-elem-4",
+                                              "description":  "Required element 4 for state Claude Account Switching",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "failover on rate-limit"
+                                                                          },
+                                                             "label":  "Required element for Claude Account Switching"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-accounts-elem-5",
+                                              "description":  "Required element 5 for state Claude Account Switching",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Switching..."
+                                                                          },
+                                                             "label":  "Required element for Claude Account Switching"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The AI tab\u0027s Claude Accounts section supports multi-account management with automatic failover on rate-limit. Users can see which account is active, which are rate-limited, and manually switch between accounts. When in Least Usage mode, the runner auto-selects the best account at startup and auto-rotates on rate-limit during workflows.",
+                       "precondition":  "AI Providers tab is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-agentic",
+                       "name":  "Agentic Behavior Goals",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-agentic-elem-0",
+                                              "description":  "Required element 0 for state Agentic Behavior Goals",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "iteration"
+                                                                          },
+                                                             "label":  "Required element for Agentic Behavior Goals"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users fine-tune how the AI behaves during workflow execution.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-integrations",
+                       "name":  "Integration Configuration Goals",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-integrations-elem-0",
+                                              "description":  "Required element 0 for state Integration Configuration Goals",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "MCP"
+                                                                          },
+                                                             "label":  "Required element for Integration Configuration Goals"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-integrations-elem-1",
+                                              "description":  "Required element 1 for state Integration Configuration Goals",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Log Sources"
+                                                                          },
+                                                             "label":  "Required element for Integration Configuration Goals"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-integrations-elem-2",
+                                              "description":  "Required element 2 for state Integration Configuration Goals",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Playwright"
+                                                                          },
+                                                             "label":  "Required element for Integration Configuration Goals"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users configure external integrations like MCP servers, cloud relay, Playwright, and log sources.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-data-management",
+                       "name":  "Data Management Goals",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-data-management-elem-0",
+                                              "description":  "Required element 0 for state Data Management Goals",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Backup"
+                                                                          },
+                                                             "label":  "Required element for Data Management Goals"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-data-management-elem-1",
+                                              "description":  "Required element 1 for state Data Management Goals",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Updates"
+                                                                          },
+                                                             "label":  "Required element for Data Management Goals"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users manage storage, backups, and updates.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-claude-auth",
+                       "name":  "Claude CLI Authentication Status",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-claude-auth-elem-0",
+                                              "description":  "Required element 0 for state Claude CLI Authentication Status",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Auth"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Authentication Status"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-auth-elem-1",
+                                              "description":  "Required element 1 for state Claude CLI Authentication Status",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "subscription"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Authentication Status"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-auth-elem-2",
+                                              "description":  "Required element 2 for state Claude CLI Authentication Status",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "expir"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Authentication Status"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-auth-elem-3",
+                                              "description":  "Required element 3 for state Claude CLI Authentication Status",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "uthenticat"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Authentication Status"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Claude CLI section displays authentication status including subscription type and expiry countdown, with the ability to re-authenticate when needed.",
+                       "precondition":  "AI Providers tab is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-claude-execution",
+                       "name":  "Claude CLI Execution Configuration",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-claude-execution-elem-0",
+                                              "description":  "Required element 0 for state Claude CLI Execution Configuration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Execution Mode"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Execution Configuration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-execution-elem-1",
+                                              "description":  "Required element 1 for state Claude CLI Execution Configuration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "executable"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Execution Configuration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-execution-elem-2",
+                                              "description":  "Required element 2 for state Claude CLI Execution Configuration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "timeout"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Execution Configuration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-execution-elem-3",
+                                              "description":  "Required element 3 for state Claude CLI Execution Configuration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "launch"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Execution Configuration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users configure how the Claude CLI is executed: choosing an execution mode (auto, windows_native, wsl, native), optionally setting a custom executable path, and configuring a timeout for CLI operations.",
+                       "precondition":  "AI Providers tab is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-claude-accounts-mgmt",
+                       "name":  "Claude CLI Multi-Account Management",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-claude-accounts-mgmt-elem-0",
+                                              "description":  "Required element 0 for state Claude CLI Multi-Account Management",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "usage"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Multi-Account Management"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-accounts-mgmt-elem-1",
+                                              "description":  "Required element 1 for state Claude CLI Multi-Account Management",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Active"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Multi-Account Management"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-accounts-mgmt-elem-2",
+                                              "description":  "Required element 2 for state Claude CLI Multi-Account Management",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Check Usage"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Multi-Account Management"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Claude CLI section provides multi-account management with live state badges (Active, Rate-limited, Auto-selected), color-coded usage bars (green \u003c50%, yellow 50-80%, red \u003e80%), switch buttons per account, and a Check Usage button to refresh usage data.",
+                       "precondition":  "AI Providers tab is selected and at least one Claude account directory is configured and usage has been checked",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-claude-account-actions",
+                       "name":  "Claude CLI Account Directory Actions",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-claude-account-actions-elem-0",
+                                              "description":  "Required element 0 for state Claude CLI Account Directory Actions",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Add"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Account Directory Actions"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-account-actions-elem-1",
+                                              "description":  "Required element 1 for state Claude CLI Account Directory Actions",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Remove"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Account Directory Actions"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-account-actions-elem-2",
+                                              "description":  "Required element 2 for state Claude CLI Account Directory Actions",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Auto"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Account Directory Actions"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-claude-account-actions-elem-3",
+                                              "description":  "Required element 3 for state Claude CLI Account Directory Actions",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Selection Mode"
+                                                                          },
+                                                             "label":  "Required element for Claude CLI Account Directory Actions"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users can manage their Claude account directories: add new directories, remove existing ones, auto-detect available directories, and toggle between Manual and Least Usage account selection modes.",
+                       "precondition":  "AI Providers tab is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-wsv-mode",
+                       "name":  "World State Verifier — Mode \u0026 Connection",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-wsv-mode-elem-0",
+                                              "description":  "Required element 0 for state World State Verifier — Mode \u0026 Connection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "World State Verifier"
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Mode \u0026 Connection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-mode-elem-1",
+                                              "description":  "Required element 1 for state World State Verifier — Mode \u0026 Connection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "wsv mode"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Mode \u0026 Connection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-mode-elem-2",
+                                              "description":  "Required element 2 for state World State Verifier — Mode \u0026 Connection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Shadow mode is the recommended"
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Mode \u0026 Connection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-mode-elem-3",
+                                              "description":  "Required element 3 for state World State Verifier — Mode \u0026 Connection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "wsv endpoint"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Mode \u0026 Connection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-mode-elem-4",
+                                              "description":  "Required element 4 for state World State Verifier — Mode \u0026 Connection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "wsv model"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Mode \u0026 Connection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-mode-elem-5",
+                                              "description":  "Required element 5 for state World State Verifier — Mode \u0026 Connection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "test wsv connection"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Mode \u0026 Connection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-mode-elem-6",
+                                              "description":  "Required element 6 for state World State Verifier — Mode \u0026 Connection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "save wsv settings"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Mode \u0026 Connection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The WSV tab allows configuring the VLM-based World State Verifier (CUA-WSM / SEAgent 7B judge). The mode dropdown selects between Disabled (default), Enabled (WSM verdict wins), and Shadow (both run, text verifier decides, disagreements logged). Changes take effect on the next agentic verification iteration without a runner restart.",
+                       "precondition":  "World State Verifier tab is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-wsv-evidence",
+                       "name":  "World State Verifier — Screenshot Evidence Toggle",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-wsv-evidence-elem-0",
+                                              "description":  "Required element 0 for state World State Verifier — Screenshot Evidence Toggle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Screenshot Evidence"
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Screenshot Evidence Toggle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-evidence-elem-1",
+                                              "description":  "Required element 1 for state World State Verifier — Screenshot Evidence Toggle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "320px wide"
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Screenshot Evidence Toggle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "A toggle controls whether downsampled pre/post screenshot thumbnails are embedded in the agentic verification iteration canvas panels when the WSM verdict is used.",
+                       "precondition":  "World State Verifier tab is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-wsv-calibration",
+                       "name":  "World State Verifier — Shadow-Mode Calibration View",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-wsv-calibration-elem-0",
+                                              "description":  "Required element 0 for state World State Verifier — Shadow-Mode Calibration View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Shadow-Mode Calibration"
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Shadow-Mode Calibration View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-calibration-elem-1",
+                                              "description":  "Required element 1 for state World State Verifier — Shadow-Mode Calibration View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Enable Shadow mode above"
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Shadow-Mode Calibration View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-calibration-elem-2",
+                                              "description":  "Required element 2 for state World State Verifier — Shadow-Mode Calibration View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "filter-any"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Shadow-Mode Calibration View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-calibration-elem-3",
+                                              "description":  "Required element 3 for state World State Verifier — Shadow-Mode Calibration View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "wsv calibration empty"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Shadow-Mode Calibration View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-calibration-elem-4",
+                                              "description":  "Required element 4 for state World State Verifier — Shadow-Mode Calibration View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "wsv disagreements"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Shadow-Mode Calibration View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-calibration-elem-5",
+                                              "description":  "Required element 5 for state World State Verifier — Shadow-Mode Calibration View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "auto-refresh every 10s"
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Shadow-Mode Calibration View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "A calibration section shows recent disagreements between the WSM (VLM judge) and the text verifier agent from shadow-mode runs. Users review these to decide whether to flip from Shadow to Enabled mode. The section auto-polls every 10 seconds and supports filtering by status-pair pattern.",
+                       "precondition":  "World State Verifier tab is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "settings-wsv-reset",
+                       "name":  "World State Verifier — Reset \u0026 Validation",
+                       "assertions":  [
+                                          {
+                                              "id":  "settings-wsv-reset-elem-0",
+                                              "description":  "Required element 0 for state World State Verifier — Reset \u0026 Validation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "reset wsv defaults"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Reset \u0026 Validation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-reset-elem-1",
+                                              "description":  "Required element 1 for state World State Verifier — Reset \u0026 Validation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "save wsv settings"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Reset \u0026 Validation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "settings-wsv-reset-elem-2",
+                                              "description":  "Required element 2 for state World State Verifier — Reset \u0026 Validation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "attributes":  {
+                                                                                                 "content-label":  "save wsv settings"
+                                                                                             }
+                                                                          },
+                                                             "label":  "Required element for World State Verifier — Reset \u0026 Validation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Edge cases and the Reset to Defaults flow.",
+                       "precondition":  "World State Verifier tab is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Settings page",
+    "metadata":  {
+                     "tags":  [
+                                  "settings",
+                                  "configuration",
+                                  "ai-providers",
+                                  "integrations",
+                                  "system"
+                              ]
+                 }
 }

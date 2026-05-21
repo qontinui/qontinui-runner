@@ -1,337 +1,340 @@
-{
-  "version": "1.0",
-  "id": "workflow-versions",
-  "name": "WorkflowVersionLineage",
-  "states": [
-    {
-      "id": "workflow-versions-timeline",
-      "name": "Version Timeline",
-      "assertions": [
-        {
-          "id": "workflow-versions-timeline-elem-0",
-          "description": "Required element 0 for state Version Timeline",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Workflow Version Lineage"
-            },
-            "label": "Required element for Version Timeline"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-versions-timeline-elem-1",
-          "description": "Required element 1 for state Version Timeline",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "v"
-            },
-            "label": "Required element for Version Timeline"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-versions-timeline-elem-2",
-          "description": "Required element 2 for state Version Timeline",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "listitem"
-            },
-            "label": "Required element for Version Timeline"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-versions-timeline-elem-3",
-          "description": "Required element 3 for state Version Timeline",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": ":"
-            },
-            "label": "Required element for Version Timeline"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users need a timeline of workflow versions showing version numbers, what triggered each version (generation, reflection, manual edit, fix), and when it was created.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "workflow-versions-diffs",
-      "name": "Version Diff Summaries",
-      "assertions": [
-        {
-          "id": "workflow-versions-diffs-elem-0",
-          "description": "Required element 0 for state Version Diff Summaries",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "article"
-            },
-            "label": "Required element for Version Diff Summaries"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users need diff summaries explaining what changed between versions to understand workflow evolution without reading raw JSON.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "workflow-versions-triggers",
-      "name": "Trigger Type Color Coding",
-      "assertions": [
-        {
-          "id": "workflow-versions-triggers-elem-0",
-          "description": "Required element 0 for state Trigger Type Color Coding",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "listitem"
-            },
-            "label": "Required element for Trigger Type Color Coding"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-versions-triggers-discriminator",
-          "description": "Distinctness discriminator for state Trigger Type Color Coding",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Trigger Type Color Coding"
-            },
-            "label": "Discriminator for Trigger Type Color Coding"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Trigger types are color-coded: green for generation, purple for reflection, blue for manual, orange for fix.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "workflow-versions-states",
-      "name": "Selection, Loading, and Empty States",
-      "assertions": [
-        {
-          "id": "workflow-versions-states-elem-0",
-          "description": "Required element 0 for state Selection, Loading, and Empty States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Select a workflow to view version history"
-            },
-            "label": "Required element for Selection, Loading, and Empty States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-versions-states-elem-1",
-          "description": "Required element 1 for state Selection, Loading, and Empty States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Loading versions..."
-            },
-            "label": "Required element for Selection, Loading, and Empty States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-versions-states-elem-2",
-          "description": "Required element 2 for state Selection, Loading, and Empty States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No version history available"
-            },
-            "label": "Required element for Selection, Loading, and Empty States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When no workflow is selected or no versions exist, clear messages guide the user.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "workflow-versions-data-display",
-      "name": "Version Data Rendering",
-      "assertions": [
-        {
-          "id": "workflow-versions-data-display-elem-0",
-          "description": "Required element 0 for state Version Data Rendering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "v"
-            },
-            "label": "Required element for Version Data Rendering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-versions-data-display-elem-1",
-          "description": "Required element 1 for state Version Data Rendering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "generation|reflection|manual|fix"
-            },
-            "label": "Required element for Version Data Rendering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-versions-data-display-elem-2",
-          "description": "Required element 2 for state Version Data Rendering",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Workflow Version Lineage"
-            },
-            "label": "Required element for Version Data Rendering"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Each version node must accurately render the version number, trigger type badge, formatted timestamp, and diff summary text from the API response.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "workflow-versions-behavior",
-      "name": "Version Timeline Behavior",
-      "assertions": [
-        {
-          "id": "workflow-versions-behavior-elem-0",
-          "description": "Required element 0 for state Version Timeline Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Select a workflow to view version history"
-            },
-            "label": "Required element for Version Timeline Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-versions-behavior-elem-1",
-          "description": "Required element 1 for state Version Timeline Behavior",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Workflow Version Lineage"
-            },
-            "label": "Required element for Version Timeline Behavior"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The version timeline scrolls when versions exceed the visible area, and requires a workflow to be selected via the execution context before displaying data.",
-      "precondition": "No workflow is selected in the execution context",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Workflow Version Lineage — shows how a workflow evolved over time through generations, reflection fixes, and manual edits, with version numbers, trigger types, timestamps, and diff summaries.",
-  "metadata": {
-    "tags": [
-      "knowledge-graph",
-      "workflow",
-      "versioning",
-      "lineage",
-      "runner-only"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "workflow-versions",
+    "name":  "WorkflowVersionLineage",
+    "states":  [
+                   {
+                       "id":  "workflow-versions-timeline",
+                       "name":  "Version Timeline",
+                       "assertions":  [
+                                          {
+                                              "id":  "workflow-versions-timeline-elem-0",
+                                              "description":  "Required element 0 for state Version Timeline",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Workflow Version Lineage"
+                                                                          },
+                                                             "label":  "Required element for Version Timeline"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-versions-timeline-elem-1",
+                                              "description":  "Required element 1 for state Version Timeline",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "v"
+                                                                          },
+                                                             "label":  "Required element for Version Timeline"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-versions-timeline-elem-2",
+                                              "description":  "Required element 2 for state Version Timeline",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "listitem"
+                                                                          },
+                                                             "label":  "Required element for Version Timeline"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-versions-timeline-elem-3",
+                                              "description":  "Required element 3 for state Version Timeline",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  ":"
+                                                                          },
+                                                             "label":  "Required element for Version Timeline"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users need a timeline of workflow versions showing version numbers, what triggered each version (generation, reflection, manual edit, fix), and when it was created.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "workflow-versions-diffs",
+                       "name":  "Version Diff Summaries",
+                       "assertions":  [
+                                          {
+                                              "id":  "workflow-versions-diffs-elem-0",
+                                              "description":  "Required element 0 for state Version Diff Summaries",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "article"
+                                                                          },
+                                                             "label":  "Required element for Version Diff Summaries"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users need diff summaries explaining what changed between versions to understand workflow evolution without reading raw JSON.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "workflow-versions-triggers",
+                       "name":  "Trigger Type Color Coding",
+                       "assertions":  [
+                                          {
+                                              "id":  "workflow-versions-triggers-elem-0",
+                                              "description":  "Required element 0 for state Trigger Type Color Coding",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "listitem"
+                                                                          },
+                                                             "label":  "Required element for Trigger Type Color Coding"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-versions-triggers-discriminator",
+                                              "description":  "Distinctness discriminator for state Trigger Type Color Coding",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Trigger Type Color Coding"
+                                                                          },
+                                                             "label":  "Discriminator for Trigger Type Color Coding"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Trigger types are color-coded: green for generation, purple for reflection, blue for manual, orange for fix.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "workflow-versions-states",
+                       "name":  "Selection, Loading, and Empty States",
+                       "assertions":  [
+                                          {
+                                              "id":  "workflow-versions-states-elem-0",
+                                              "description":  "Required element 0 for state Selection, Loading, and Empty States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Select a workflow to view version history"
+                                                                          },
+                                                             "label":  "Required element for Selection, Loading, and Empty States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-versions-states-elem-1",
+                                              "description":  "Required element 1 for state Selection, Loading, and Empty States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Loading versions..."
+                                                                          },
+                                                             "label":  "Required element for Selection, Loading, and Empty States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-versions-states-elem-2",
+                                              "description":  "Required element 2 for state Selection, Loading, and Empty States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No version history available"
+                                                                          },
+                                                             "label":  "Required element for Selection, Loading, and Empty States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When no workflow is selected or no versions exist, clear messages guide the user.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "workflow-versions-data-display",
+                       "name":  "Version Data Rendering",
+                       "assertions":  [
+                                          {
+                                              "id":  "workflow-versions-data-display-elem-0",
+                                              "description":  "Required element 0 for state Version Data Rendering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "v"
+                                                                          },
+                                                             "label":  "Required element for Version Data Rendering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-versions-data-display-elem-1",
+                                              "description":  "Required element 1 for state Version Data Rendering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "generation|reflection|manual|fix"
+                                                                          },
+                                                             "label":  "Required element for Version Data Rendering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-versions-data-display-elem-2",
+                                              "description":  "Required element 2 for state Version Data Rendering",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Workflow Version Lineage"
+                                                                          },
+                                                             "label":  "Required element for Version Data Rendering"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Each version node must accurately render the version number, trigger type badge, formatted timestamp, and diff summary text from the API response.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "workflow-versions-behavior",
+                       "name":  "Version Timeline Behavior",
+                       "assertions":  [
+                                          {
+                                              "id":  "workflow-versions-behavior-elem-0",
+                                              "description":  "Required element 0 for state Version Timeline Behavior",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Select a workflow to view version history"
+                                                                          },
+                                                             "label":  "Required element for Version Timeline Behavior"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-versions-behavior-elem-1",
+                                              "description":  "Required element 1 for state Version Timeline Behavior",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Workflow Version Lineage"
+                                                                          },
+                                                             "label":  "Required element for Version Timeline Behavior"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The version timeline scrolls when versions exceed the visible area, and requires a workflow to be selected via the execution context before displaying data.",
+                       "precondition":  "No workflow is selected in the execution context",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Workflow Version Lineage — shows how a workflow evolved over time through generations, reflection fixes, and manual edits, with version numbers, trigger types, timestamps, and diff summaries.",
+    "metadata":  {
+                     "tags":  [
+                                  "knowledge-graph",
+                                  "workflow",
+                                  "versioning",
+                                  "lineage",
+                                  "runner-only"
+                              ]
+                 }
 }

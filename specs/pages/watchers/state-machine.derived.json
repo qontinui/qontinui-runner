@@ -1,497 +1,508 @@
-{
-  "version": "1.0",
-  "id": "watchers",
-  "name": "WatcherManagementPanel",
-  "states": [
-    {
-      "id": "watchers-navigation",
-      "name": "Page Navigation",
-      "assertions": [
-        {
-          "id": "watchers-navigation-elem-0",
-          "description": "Required element 0 for state Page Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Watchers"
-            },
-            "label": "Required element for Page Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-navigation-discriminator",
-          "description": "Distinctness discriminator for state Page Navigation",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Page Navigation"
-            },
-            "label": "Discriminator for Page Navigation"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Watchers page is under the Observe sidebar group, adjacent to Activity Timeline. It is a runner-only page.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-semantic",
-      "name": "Page Purpose",
-      "assertions": [
-        {
-          "id": "watchers-semantic-elem-2",
-          "description": "Required element 2 for state Page Purpose",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "("
-            },
-            "label": "Required element for Page Purpose"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-semantic-discriminator",
-          "description": "Distinctness discriminator for state Page Purpose",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Page Purpose"
-            },
-            "label": "Discriminator for Page Purpose"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users come here to set up automated monitoring of their activity timeline. The page should immediately communicate that watchers are scheduled agents, and guide first-time users with a clear empty state.",
-      "precondition": "No watchers exist in the PostgreSQL watchers table and the create form is not open",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-element-presence",
-      "name": "Core UI Elements",
-      "assertions": [
-        {
-          "id": "watchers-element-presence-elem-0",
-          "description": "Required element 0 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "textContains": "New Watcher"
-            },
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-1",
-          "description": "Required element 1 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "textContains": "Cancel"
-            },
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-4",
-          "description": "Required element 4 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Every 5 minutes"
-            },
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-5",
-          "description": "Required element 5 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "15 minutes"
-            },
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-6",
-          "description": "Required element 6 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Log Only"
-            },
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-element-presence-elem-9",
-          "description": "Required element 9 for state Core UI Elements",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "textContains": "Create Watcher"
-            },
-            "label": "Required element for Core UI Elements"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The page always shows a header with the heading, count badge, and 'New Watcher'/'Cancel' button. The watcher list area is always present (may be empty).",
-      "precondition": "The create form is not currently open",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-data-display",
-      "name": "Watcher Card Data Display",
-      "assertions": [
-        {
-          "id": "watchers-data-display-elem-3",
-          "description": "Required element 3 for state Watcher Card Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Last run:"
-            },
-            "label": "Required element for Watcher Card Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-data-display-elem-4",
-          "description": "Required element 4 for state Watcher Card Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "App:"
-            },
-            "label": "Required element for Watcher Card Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-data-display-elem-5",
-          "description": "Required element 5 for state Watcher Card Data Display",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Source:"
-            },
-            "label": "Required element for Watcher Card Data Display"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Each watcher is displayed as a bordered card. The card shows the watcher name (font-medium), FTS query in a code element (bg-muted), lookback window with Clock icon, last run timestamp, and optional filter labels.",
-      "precondition": "At least one watcher exists",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-interaction",
-      "name": "User Interactions",
-      "assertions": [
-        {
-          "id": "watchers-interaction-elem-2",
-          "description": "Required element 2 for state User Interactions",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for User Interactions"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users can create watchers (form submit), toggle enable/disable (toggle button click), and delete watchers (trash button click). Each action calls a Tauri IPC command and then refreshes the list.",
-      "precondition": "A watcher that was enabled has had its toggle button clicked",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-state-consistency",
-      "name": "State Consistency",
-      "assertions": [
-        {
-          "id": "watchers-state-consistency-elem-0",
-          "description": "Required element 0 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "textContains": "Create Watcher"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-state-consistency-elem-1",
-          "description": "Required element 1 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "textContains": "Create Watcher"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-state-consistency-elem-2",
-          "description": "Required element 2 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "textContains": "Create Watcher"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-state-consistency-elem-3",
-          "description": "Required element 3 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Last run: Never"
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-state-consistency-elem-4",
-          "description": "Required element 4 for state State Consistency",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "("
-            },
-            "label": "Required element for State Consistency"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The submit button's disabled state must track form validity. The form toggle (New Watcher / Cancel) must correctly show/hide the form. The list must refresh after every mutation.",
-      "precondition": "The create form is open and the name field is empty",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-behavior",
-      "name": "Automatic Behaviors",
-      "assertions": [
-        {
-          "id": "watchers-behavior-elem-0",
-          "description": "Required element 0 for state Automatic Behaviors",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Watchers"
-            },
-            "label": "Required element for Automatic Behaviors"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "watchers-behavior-elem-1",
-          "description": "Required element 1 for state Automatic Behaviors",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "textContains": "New Watcher"
-            },
-            "label": "Required element for Automatic Behaviors"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The page automatically loads the watcher list on mount via useEffect calling list_watchers. After create/toggle/delete, the list is re-fetched. If PostgreSQL is unavailable, the list silently stays empty.",
-      "precondition": "A watcher has just been successfully created",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-execution-architecture",
-      "name": "Execution Architecture",
-      "assertions": [],
-      "description": "Watcher execution is driven by the SchedulerService (scheduler_service.rs). The service checks for due watcher tasks in its tick() loop, then calls execute_watcher(watcher_id). The execution flow: (1) load watcher definition from PgDb::get_watcher(), (2) check enabled flag (skip if disabled), (3) run PgDb::search_timeline_filtered() with the watcher's timelineQuery and optional app/source filters, fetching up to 200 results, (4) parse the lookbackWindow via parse_lookback_window() which converts strings like '15 minutes' into a chrono::DateTime cutoff and post-filter results by created_at, taking at most 50, (5) format the reasoning_prompt template by replacing {{results}} with a numbered list of timeline entries, {{result_count}} with the count, and {{query}} with the original query, (6) send the formatted prompt to the runner's own /prompts/run HTTP API via reqwest, (7) record the execution result via PgDb::record_watcher_run() which sets last_run_at=NOW() and stores the AI response text in last_result_json. The SchedulerService receives pg_db: Option<Arc<PgDb>> from main.rs via start_scheduler_service(). The Watcher step type in step_types.rs has a 120-second expected duration. The ScheduledTaskType::Watcher variant in scheduler.rs carries the watcher_id.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-data-model",
-      "name": "Data Model and Storage",
-      "assertions": [],
-      "description": "Watchers are stored in the PostgreSQL 'watchers' table with columns: id (TEXT PK, UUID generated on create), name, schedule_json (ScheduleExpression as JSON), timeline_query (FTS query string), app_name_filter (nullable), source_type_filter (nullable), lookback_window (TEXT, default '15 minutes'), reasoning_prompt (TEXT with {{results}}/{{result_count}}/{{query}} placeholders), action_json (WatcherAction as JSON), enabled (BOOLEAN, default true), last_run_at (nullable TIMESTAMPTZ), last_result_json (nullable TEXT), created_at, updated_at. The table is created via ensure_tables() on PgDb startup. Queries are generated by Clorinde from queries/watchers.sql with nullable annotations (last_run_at?, last_result_json?, app_name_filter?, source_type_filter?) ensuring proper Option<T> types in Rust. The PgDb wrapper (database/pg/watchers.rs) uses a map_watcher_row! macro to convert Clorinde row types to the app-level Watcher struct. CRUD operations are exposed as 6 Tauri commands registered in main.rs.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-implementation",
-      "name": "Implementation Details",
-      "assertions": [],
-      "description": "Frontend: WatcherManagementPanel (React, components/activity-timeline/WatcherManagementPanel.tsx) uses useState for watchers list, showForm toggle, form data, editingId, and loading state. useEffect calls loadWatchers() on mount via list_watchers Tauri command. Form defaults: name='', timelineQuery='', scheduleInterval='5 minutes', lookbackWindow='15 minutes', actionType='LogOnly', reasoningPrompt=default template with placeholders. Create calls create_watcher with JSON-serialized schedule ({type:'interval',value:scheduleInterval}) and action ({type:actionType}). Toggle calls set_watcher_enabled with inverted boolean. Delete calls delete_watcher. All mutations call loadWatchers() after completion. The component is lazy-loaded in TabContent.tsx. Tab ID 'watchers' registered in tab-types.ts. Sidebar item in qontinui-navigation/src/groups.ts under OBSERVE_ITEMS with Eye icon and #06B6D4 cyan color, runner-only platform. Watcher cards rendered with border-border, hover:bg-accent/50. Enabled toggle uses ToggleRight (text-green-500), disabled uses ToggleLeft (default muted). Delete button uses hover:text-destructive. Query displayed in code element with bg-muted.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "watchers-relationship-to-timeline",
-      "name": "Relationship to Activity Timeline",
-      "assertions": [],
-      "description": "Watchers depend entirely on the activity timeline for their data source. A watcher's timeline_query is executed against the same activity_timeline PostgreSQL table that the Activity Timeline page searches. The three capture sources that feed the timeline (BackgroundObserver, Python bridge, BackgroundCaptureService) indirectly feed watchers. The lookback_window determines how far back a watcher searches, preventing it from reasoning over stale data. Watchers and the Activity Timeline share the same Observe sidebar group and are positioned adjacent to each other in the navigation.",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "The Watchers page lets users create, manage, and monitor scheduled AI agents that watch the activity timeline for specific patterns. Each watcher runs on a schedule, queries the timeline using full-text search, feeds the results into an AI reasoning prompt, and optionally triggers an action. The page loads the watcher list on mount via the list_watchers Tauri command and provides inline creation, enable/disable toggling, and deletion. Watchers are stored in a PostgreSQL table and executed by the runner's scheduler service.",
-  "metadata": {
-    "tags": [
-      "screenpipe",
-      "watchers",
-      "scheduled-agents",
-      "reactive-automation",
-      "postgresql"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "watchers",
+    "name":  "WatcherManagementPanel",
+    "states":  [
+                   {
+                       "id":  "watchers-navigation",
+                       "name":  "Page Navigation",
+                       "assertions":  [
+                                          {
+                                              "id":  "watchers-navigation-elem-0",
+                                              "description":  "Required element 0 for state Page Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Watchers"
+                                                                          },
+                                                             "label":  "Required element for Page Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-navigation-discriminator",
+                                              "description":  "Distinctness discriminator for state Page Navigation",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Page Navigation"
+                                                                          },
+                                                             "label":  "Discriminator for Page Navigation"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Watchers page is under the Observe sidebar group, adjacent to Activity Timeline. It is a runner-only page.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-semantic",
+                       "name":  "Page Purpose",
+                       "assertions":  [
+                                          {
+                                              "id":  "watchers-semantic-elem-2",
+                                              "description":  "Required element 2 for state Page Purpose",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "("
+                                                                          },
+                                                             "label":  "Required element for Page Purpose"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-semantic-discriminator",
+                                              "description":  "Distinctness discriminator for state Page Purpose",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Page Purpose"
+                                                                          },
+                                                             "label":  "Discriminator for Page Purpose"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users come here to set up automated monitoring of their activity timeline. The page should immediately communicate that watchers are scheduled agents, and guide first-time users with a clear empty state.",
+                       "precondition":  "No watchers exist in the PostgreSQL watchers table and the create form is not open",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-element-presence",
+                       "name":  "Core UI Elements",
+                       "assertions":  [
+                                          {
+                                              "id":  "watchers-element-presence-elem-0",
+                                              "description":  "Required element 0 for state Core UI Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "textContains":  "New Watcher"
+                                                                          },
+                                                             "label":  "Required element for Core UI Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-element-presence-elem-1",
+                                              "description":  "Required element 1 for state Core UI Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "textContains":  "Cancel"
+                                                                          },
+                                                             "label":  "Required element for Core UI Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-element-presence-elem-4",
+                                              "description":  "Required element 4 for state Core UI Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Every 5 minutes"
+                                                                          },
+                                                             "label":  "Required element for Core UI Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-element-presence-elem-5",
+                                              "description":  "Required element 5 for state Core UI Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "15 minutes"
+                                                                          },
+                                                             "label":  "Required element for Core UI Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-element-presence-elem-6",
+                                              "description":  "Required element 6 for state Core UI Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Log Only"
+                                                                          },
+                                                             "label":  "Required element for Core UI Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-element-presence-elem-9",
+                                              "description":  "Required element 9 for state Core UI Elements",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "textContains":  "Create Watcher"
+                                                                          },
+                                                             "label":  "Required element for Core UI Elements"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The page always shows a header with the heading, count badge, and \u0027New Watcher\u0027/\u0027Cancel\u0027 button. The watcher list area is always present (may be empty).",
+                       "precondition":  "The create form is not currently open",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-data-display",
+                       "name":  "Watcher Card Data Display",
+                       "assertions":  [
+                                          {
+                                              "id":  "watchers-data-display-elem-3",
+                                              "description":  "Required element 3 for state Watcher Card Data Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Last run:"
+                                                                          },
+                                                             "label":  "Required element for Watcher Card Data Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-data-display-elem-4",
+                                              "description":  "Required element 4 for state Watcher Card Data Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "App:"
+                                                                          },
+                                                             "label":  "Required element for Watcher Card Data Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-data-display-elem-5",
+                                              "description":  "Required element 5 for state Watcher Card Data Display",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Source:"
+                                                                          },
+                                                             "label":  "Required element for Watcher Card Data Display"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Each watcher is displayed as a bordered card. The card shows the watcher name (font-medium), FTS query in a code element (bg-muted), lookback window with Clock icon, last run timestamp, and optional filter labels.",
+                       "precondition":  "At least one watcher exists",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-interaction",
+                       "name":  "User Interactions",
+                       "assertions":  [
+                                          {
+                                              "id":  "watchers-interaction-elem-2",
+                                              "description":  "Required element 2 for state User Interactions",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for User Interactions"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users can create watchers (form submit), toggle enable/disable (toggle button click), and delete watchers (trash button click). Each action calls a Tauri IPC command and then refreshes the list.",
+                       "precondition":  "A watcher that was enabled has had its toggle button clicked",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-state-consistency",
+                       "name":  "State Consistency",
+                       "assertions":  [
+                                          {
+                                              "id":  "watchers-state-consistency-elem-0",
+                                              "description":  "Required element 0 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "textContains":  "Create Watcher"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-state-consistency-elem-1",
+                                              "description":  "Required element 1 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "textContains":  "Create Watcher"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-state-consistency-elem-2",
+                                              "description":  "Required element 2 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "textContains":  "Create Watcher"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-state-consistency-elem-3",
+                                              "description":  "Required element 3 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Last run: Never"
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-state-consistency-elem-4",
+                                              "description":  "Required element 4 for state State Consistency",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "("
+                                                                          },
+                                                             "label":  "Required element for State Consistency"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The submit button\u0027s disabled state must track form validity. The form toggle (New Watcher / Cancel) must correctly show/hide the form. The list must refresh after every mutation.",
+                       "precondition":  "The create form is open and the name field is empty",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-behavior",
+                       "name":  "Automatic Behaviors",
+                       "assertions":  [
+                                          {
+                                              "id":  "watchers-behavior-elem-0",
+                                              "description":  "Required element 0 for state Automatic Behaviors",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Watchers"
+                                                                          },
+                                                             "label":  "Required element for Automatic Behaviors"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "watchers-behavior-elem-1",
+                                              "description":  "Required element 1 for state Automatic Behaviors",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "textContains":  "New Watcher"
+                                                                          },
+                                                             "label":  "Required element for Automatic Behaviors"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The page automatically loads the watcher list on mount via useEffect calling list_watchers. After create/toggle/delete, the list is re-fetched. If PostgreSQL is unavailable, the list silently stays empty.",
+                       "precondition":  "A watcher has just been successfully created",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-execution-architecture",
+                       "name":  "Execution Architecture",
+                       "assertions":  [
+
+                                      ],
+                       "description":  "Watcher execution is driven by the SchedulerService (scheduler_service.rs). The service checks for due watcher tasks in its tick() loop, then calls execute_watcher(watcher_id). The execution flow: (1) load watcher definition from PgDb::get_watcher(), (2) check enabled flag (skip if disabled), (3) run PgDb::search_timeline_filtered() with the watcher\u0027s timelineQuery and optional app/source filters, fetching up to 200 results, (4) parse the lookbackWindow via parse_lookback_window() which converts strings like \u002715 minutes\u0027 into a chrono::DateTime cutoff and post-filter results by created_at, taking at most 50, (5) format the reasoning_prompt template by replacing {{results}} with a numbered list of timeline entries, {{result_count}} with the count, and {{query}} with the original query, (6) send the formatted prompt to the runner\u0027s own /prompts/run HTTP API via reqwest, (7) record the execution result via PgDb::record_watcher_run() which sets last_run_at=NOW() and stores the AI response text in last_result_json. The SchedulerService receives pg_db: Option\u003cArc\u003cPgDb\u003e\u003e from main.rs via start_scheduler_service(). The Watcher step type in step_types.rs has a 120-second expected duration. The ScheduledTaskType::Watcher variant in scheduler.rs carries the watcher_id.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-data-model",
+                       "name":  "Data Model and Storage",
+                       "assertions":  [
+
+                                      ],
+                       "description":  "Watchers are stored in the PostgreSQL \u0027watchers\u0027 table with columns: id (TEXT PK, UUID generated on create), name, schedule_json (ScheduleExpression as JSON), timeline_query (FTS query string), app_name_filter (nullable), source_type_filter (nullable), lookback_window (TEXT, default \u002715 minutes\u0027), reasoning_prompt (TEXT with {{results}}/{{result_count}}/{{query}} placeholders), action_json (WatcherAction as JSON), enabled (BOOLEAN, default true), last_run_at (nullable TIMESTAMPTZ), last_result_json (nullable TEXT), created_at, updated_at. The table is created via ensure_tables() on PgDb startup. Queries are generated by Clorinde from queries/watchers.sql with nullable annotations (last_run_at?, last_result_json?, app_name_filter?, source_type_filter?) ensuring proper Option\u003cT\u003e types in Rust. The PgDb wrapper (database/pg/watchers.rs) uses a map_watcher_row! macro to convert Clorinde row types to the app-level Watcher struct. CRUD operations are exposed as 6 Tauri commands registered in main.rs.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-implementation",
+                       "name":  "Implementation Details",
+                       "assertions":  [
+
+                                      ],
+                       "description":  "Frontend: WatcherManagementPanel (React, components/activity-timeline/WatcherManagementPanel.tsx) uses useState for watchers list, showForm toggle, form data, editingId, and loading state. useEffect calls loadWatchers() on mount via list_watchers Tauri command. Form defaults: name=\u0027\u0027, timelineQuery=\u0027\u0027, scheduleInterval=\u00275 minutes\u0027, lookbackWindow=\u002715 minutes\u0027, actionType=\u0027LogOnly\u0027, reasoningPrompt=default template with placeholders. Create calls create_watcher with JSON-serialized schedule ({type:\u0027interval\u0027,value:scheduleInterval}) and action ({type:actionType}). Toggle calls set_watcher_enabled with inverted boolean. Delete calls delete_watcher. All mutations call loadWatchers() after completion. The component is lazy-loaded in TabContent.tsx. Tab ID \u0027watchers\u0027 registered in tab-types.ts. Sidebar item in qontinui-navigation/src/groups.ts under OBSERVE_ITEMS with Eye icon and #06B6D4 cyan color, runner-only platform. Watcher cards rendered with border-border, hover:bg-accent/50. Enabled toggle uses ToggleRight (text-green-500), disabled uses ToggleLeft (default muted). Delete button uses hover:text-destructive. Query displayed in code element with bg-muted.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "watchers-relationship-to-timeline",
+                       "name":  "Relationship to Activity Timeline",
+                       "assertions":  [
+
+                                      ],
+                       "description":  "Watchers depend entirely on the activity timeline for their data source. A watcher\u0027s timeline_query is executed against the same activity_timeline PostgreSQL table that the Activity Timeline page searches. The three capture sources that feed the timeline (BackgroundObserver, Python bridge, BackgroundCaptureService) indirectly feed watchers. The lookback_window determines how far back a watcher searches, preventing it from reasoning over stale data. Watchers and the Activity Timeline share the same Observe sidebar group and are positioned adjacent to each other in the navigation.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "The Watchers page lets users create, manage, and monitor scheduled AI agents that watch the activity timeline for specific patterns. Each watcher runs on a schedule, queries the timeline using full-text search, feeds the results into an AI reasoning prompt, and optionally triggers an action. The page loads the watcher list on mount via the list_watchers Tauri command and provides inline creation, enable/disable toggling, and deletion. Watchers are stored in a PostgreSQL table and executed by the runner\u0027s scheduler service.",
+    "metadata":  {
+                     "tags":  [
+                                  "screenpipe",
+                                  "watchers",
+                                  "scheduled-agents",
+                                  "reactive-automation",
+                                  "postgresql"
+                              ]
+                 }
 }

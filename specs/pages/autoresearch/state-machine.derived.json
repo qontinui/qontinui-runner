@@ -1,814 +1,817 @@
-{
-  "version": "1.0",
-  "id": "autoresearch",
-  "name": "AutoresearchPage",
-  "states": [
-    {
-      "id": "page-structure",
-      "name": "Page Structure & Layout",
-      "assertions": [
-        {
-          "id": "page-structure-elem-0",
-          "description": "Required element 0 for state Page Structure & Layout",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "heading"
-            },
-            "label": "Required element for Page Structure & Layout"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "page-structure-elem-1",
-          "description": "Required element 1 for state Page Structure & Layout",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Compare"
-            },
-            "label": "Required element for Page Structure & Layout"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Autoresearch page is a dev-only tab rendered in the main content area. It displays a header with the page title and a launch button, a list of existing comparison runs, and a detail panel for the selected run.",
-      "precondition": "No comparison runs exist in the database",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "workflow-selection",
-      "name": "Workflow Selection",
-      "assertions": [
-        {
-          "id": "workflow-selection-elem-0",
-          "description": "Required element 0 for state Workflow Selection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "combobox"
-            },
-            "label": "Required element for Workflow Selection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-selection-elem-1",
-          "description": "Required element 1 for state Workflow Selection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "alert"
-            },
-            "label": "Required element for Workflow Selection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "workflow-selection-elem-2",
-          "description": "Required element 2 for state Workflow Selection",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "combobox"
-            },
-            "label": "Required element for Workflow Selection"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Before starting a comparison, the user must select which unified workflow to run. The backend validates that the workflow exists in PostgreSQL via GET /unified-workflows/:id before accepting a POST /comparison/start request. The Tauri command start_comparison (plugin: qontinui_comparison) performs the same lookup before inserting the comparison_runs row.",
-      "precondition": "A workflow that no longer exists is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "comparison-launch",
-      "name": "Comparison Launch Form",
-      "assertions": [
-        {
-          "id": "comparison-launch-elem-0",
-          "description": "Required element 0 for state Comparison Launch Form",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "group"
-            },
-            "label": "Required element for Comparison Launch Form"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-launch-elem-1",
-          "description": "Required element 1 for state Comparison Launch Form",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "checkbox"
-            },
-            "label": "Required element for Comparison Launch Form"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-launch-elem-2",
-          "description": "Required element 2 for state Comparison Launch Form",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Run"
-            },
-            "label": "Required element for Comparison Launch Form"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-launch-elem-3",
-          "description": "Required element 3 for state Comparison Launch Form",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "list"
-            },
-            "label": "Required element for Comparison Launch Form"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-launch-elem-4",
-          "description": "Required element 4 for state Comparison Launch Form",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "list"
-            },
-            "label": "Required element for Comparison Launch Form"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The launch form or dialog allows the user to configure a new comparison run: select a workflow, choose a variation type (architecture or same), and optionally toggle worktree isolation. Submitting posts to POST /comparison/start via the runner HTTP API or via the Tauri qontinui_comparison.start_comparison command.",
-      "precondition": "A workflow is selected and a variation type is chosen",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "comparison-list",
-      "name": "Comparison Run List",
-      "assertions": [
-        {
-          "id": "comparison-list-elem-0",
-          "description": "Required element 0 for state Comparison Run List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "list"
-            },
-            "label": "Required element for Comparison Run List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-list-elem-1",
-          "description": "Required element 1 for state Comparison Run List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "list"
-            },
-            "label": "Required element for Comparison Run List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-list-elem-2",
-          "description": "Required element 2 for state Comparison Run List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "list"
-            },
-            "label": "Required element for Comparison Run List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-list-elem-3",
-          "description": "Required element 3 for state Comparison Run List",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button",
-              "text": "Refresh"
-            },
-            "label": "Required element for Comparison Run List"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The page lists recent comparison runs fetched from GET /comparisons (up to 50 most recent, returned as an array of ComparisonRunView). Each run shows its ID (or short ID), workflow ID, variation type, status, and creation date. The list is the primary navigation surface for entering a run's detail view.",
-      "precondition": "At least one comparison run exists",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "running-comparison-detail",
-      "name": "Running Comparison Detail View",
-      "assertions": [
-        {
-          "id": "running-comparison-detail-elem-0",
-          "description": "Required element 0 for state Running Comparison Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "list"
-            },
-            "label": "Required element for Running Comparison Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "running-comparison-detail-elem-1",
-          "description": "Required element 1 for state Running Comparison Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "list"
-            },
-            "label": "Required element for Running Comparison Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "running-comparison-detail-elem-2",
-          "description": "Required element 2 for state Running Comparison Detail View",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "main"
-            },
-            "label": "Required element for Running Comparison Detail View"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When a comparison run with status 'running' is selected, the detail view shows all entries and their individual live statuses. Entry statuses are fetched from GET /comparison/:id which enriches the stored entries with live task_run statuses from PostgreSQL. Entries transition from 'pending' → 'running' → 'completed'/'failed' as workflow runs progress.",
-      "precondition": "A running comparison run is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "completed-comparison-detail",
-      "name": "Completed Comparison Detail — Results Overview",
-      "assertions": [
-        {
-          "id": "completed-comparison-detail-elem-0",
-          "description": "Required element 0 for state Completed Comparison Detail — Results Overview",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "table"
-            },
-            "label": "Required element for Completed Comparison Detail — Results Overview"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "completed-comparison-detail-elem-1",
-          "description": "Required element 1 for state Completed Comparison Detail — Results Overview",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Completed Comparison Detail — Results Overview"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "completed-comparison-detail-elem-2",
-          "description": "Required element 2 for state Completed Comparison Detail — Results Overview",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Completed Comparison Detail — Results Overview"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "completed-comparison-detail-elem-3",
-          "description": "Required element 3 for state Completed Comparison Detail — Results Overview",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Completed Comparison Detail — Results Overview"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "completed-comparison-detail-discriminator",
-          "description": "Distinctness discriminator for state Completed Comparison Detail — Results Overview",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Completed Comparison Detail — Results Overview"
-            },
-            "label": "Discriminator for Completed Comparison Detail — Results Overview"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When a comparison run completes (status='completed'), the detail view shows the full result breakdown: per-entry results (success/fail, iteration count, duration_ms), the AI comparison report, and the AI recommendation with confidence score. The completed_at timestamp is shown. Status auto-transitions to 'completed' when the GET /comparison/:id handler detects all_done=true.",
-      "precondition": "A completed comparison run is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "metric-analysis",
-      "name": "Structured Metric Analysis",
-      "assertions": [
-        {
-          "id": "metric-analysis-elem-0",
-          "description": "Required element 0 for state Structured Metric Analysis",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "table"
-            },
-            "label": "Required element for Structured Metric Analysis"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "metric-analysis-elem-1",
-          "description": "Required element 1 for state Structured Metric Analysis",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Structured Metric Analysis"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "metric-analysis-elem-2",
-          "description": "Required element 2 for state Structured Metric Analysis",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "table"
-            },
-            "label": "Required element for Structured Metric Analysis"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "metric-analysis-elem-3",
-          "description": "Required element 3 for state Structured Metric Analysis",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Structured Metric Analysis"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "metric-analysis-elem-4",
-          "description": "Required element 4 for state Structured Metric Analysis",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Structured Metric Analysis"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "metric-analysis-discriminator",
-          "description": "Distinctness discriminator for state Structured Metric Analysis",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Structured Metric Analysis"
-            },
-            "label": "Discriminator for Structured Metric Analysis"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The page displays machine-readable metric comparisons across variants from StructuredComparisonReport (built by build_structured_report in comparison.rs). The HTTP API surfaces three metrics per completed entry from ComparisonEntryResultJson: success (bool → 1.0/0.0, higher=better), iterations (u32, lower=better), and duration_ms (u64, lower=better). A winner is identified by which variant wins the most metrics, with a confidence score expressed as winner_wins / total_metrics (0.0–1.0).",
-      "precondition": "A completed comparison run with at least 2 completed entries is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "comparison-algorithm-correctness",
-      "name": "Comparison Algorithm Correctness",
-      "assertions": [
-        {
-          "id": "comparison-algorithm-correctness-elem-0",
-          "description": "Required element 0 for state Comparison Algorithm Correctness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Comparison Algorithm Correctness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-algorithm-correctness-elem-1",
-          "description": "Required element 1 for state Comparison Algorithm Correctness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Comparison Algorithm Correctness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-algorithm-correctness-elem-2",
-          "description": "Required element 2 for state Comparison Algorithm Correctness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "list"
-            },
-            "label": "Required element for Comparison Algorithm Correctness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-algorithm-correctness-elem-3",
-          "description": "Required element 3 for state Comparison Algorithm Correctness",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Comparison Algorithm Correctness"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The winner and confidence in StructuredComparisonReport are derived by a specific algorithm in build_structured_report (comparison.rs): winner = variant with the most metric wins (tie-broken by highest success_rate); confidence = winner_metric_wins / total_metrics_count (0.0–1.0). With 3 metrics, valid confidence values are 0.33, 0.67, or 1.0. An AI verification workflow can check that displayed winner and confidence match these formulas applied to the visible metric values.",
-      "precondition": "A completed comparison run with at least 2 completed entries is displayed",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "comparison-states",
-      "name": "Comparison Status Lifecycle",
-      "assertions": [
-        {
-          "id": "comparison-states-elem-0",
-          "description": "Required element 0 for state Comparison Status Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Comparison Status Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-states-elem-1",
-          "description": "Required element 1 for state Comparison Status Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Comparison Status Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-states-elem-2",
-          "description": "Required element 2 for state Comparison Status Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Comparison Status Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-states-elem-3",
-          "description": "Required element 3 for state Comparison Status Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Comparison Status Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "comparison-states-discriminator",
-          "description": "Distinctness discriminator for state Comparison Status Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Comparison Status Lifecycle"
-            },
-            "label": "Discriminator for Comparison Status Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The page correctly reflects the status progression for comparison runs: running (entries launching and executing) → completed (all entries done, auto-transitioned by GET /comparison/:id when all_done=true). The 'comparing' status is a valid enum variant but requires a separate AI analysis pipeline to be set — the GET endpoint does not set it automatically. Failed state is shown when all entries fail on launch.",
-      "precondition": "A 'running' comparison run is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "research-config",
-      "name": "Research Configuration (Multi-Trial, Aspirational)",
-      "assertions": [
-        {
-          "id": "research-config-elem-0",
-          "description": "Required element 0 for state Research Configuration (Multi-Trial, Aspirational)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "form"
-            },
-            "label": "Required element for Research Configuration (Multi-Trial, Aspirational)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "research-config-elem-1",
-          "description": "Required element 1 for state Research Configuration (Multi-Trial, Aspirational)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "group"
-            },
-            "label": "Required element for Research Configuration (Multi-Trial, Aspirational)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "research-config-elem-2",
-          "description": "Required element 2 for state Research Configuration (Multi-Trial, Aspirational)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "region"
-            },
-            "label": "Required element for Research Configuration (Multi-Trial, Aspirational)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Beyond single-shot comparisons, the ResearchConfig data structure in comparison.rs defines multi-trial experiment parameters: trials_per_experiment, search_dimensions (model, multi_agent_mode, max_iterations, context_tokens, workflow_architecture, custom), mutation_strategy (sequential/random_perturbation/ai_guided), and acceptance_criteria. If this advanced configuration UI is implemented, it should surface these fields. Currently the HTTP API only supports single-trial comparisons and p_value is always null.",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Autoresearch Page — A dev-only dashboard for launching and analyzing parallel workflow architecture comparison runs with statistical A/B testing. Users select a workflow and a variation type (Architecture: Traditional vs Agentic Verification vs Multi-Agent Pipeline; Same: 3 identical runs for repeatability), then observe each entry's live status as workflows execute in isolated worktrees. When all entries complete, a structured metric comparison (success, iterations, duration_ms) and an AI-generated prose report identify the winning architecture with a confidence score. Comparison runs are stored in the comparison_runs PostgreSQL table and served via runner HTTP endpoints POST /comparison/start, GET /comparison/:id, GET /comparisons and Tauri commands under the qontinui_comparison plugin. This page surfaces the research infrastructure underlying architecture selection decisions.",
-  "metadata": {
-    "tags": [
-      "dev-only",
-      "comparison",
-      "a-b-testing",
-      "architectures",
-      "statistics",
-      "research"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "autoresearch",
+    "name":  "AutoresearchPage",
+    "states":  [
+                   {
+                       "id":  "page-structure",
+                       "name":  "Page Structure \u0026 Layout",
+                       "assertions":  [
+                                          {
+                                              "id":  "page-structure-elem-0",
+                                              "description":  "Required element 0 for state Page Structure \u0026 Layout",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "heading"
+                                                                          },
+                                                             "label":  "Required element for Page Structure \u0026 Layout"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "page-structure-elem-1",
+                                              "description":  "Required element 1 for state Page Structure \u0026 Layout",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Compare"
+                                                                          },
+                                                             "label":  "Required element for Page Structure \u0026 Layout"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Autoresearch page is a dev-only tab rendered in the main content area. It displays a header with the page title and a launch button, a list of existing comparison runs, and a detail panel for the selected run.",
+                       "precondition":  "No comparison runs exist in the database",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "workflow-selection",
+                       "name":  "Workflow Selection",
+                       "assertions":  [
+                                          {
+                                              "id":  "workflow-selection-elem-0",
+                                              "description":  "Required element 0 for state Workflow Selection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "combobox"
+                                                                          },
+                                                             "label":  "Required element for Workflow Selection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-selection-elem-1",
+                                              "description":  "Required element 1 for state Workflow Selection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "alert"
+                                                                          },
+                                                             "label":  "Required element for Workflow Selection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "workflow-selection-elem-2",
+                                              "description":  "Required element 2 for state Workflow Selection",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "combobox"
+                                                                          },
+                                                             "label":  "Required element for Workflow Selection"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Before starting a comparison, the user must select which unified workflow to run. The backend validates that the workflow exists in PostgreSQL via GET /unified-workflows/:id before accepting a POST /comparison/start request. The Tauri command start_comparison (plugin: qontinui_comparison) performs the same lookup before inserting the comparison_runs row.",
+                       "precondition":  "A workflow that no longer exists is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "comparison-launch",
+                       "name":  "Comparison Launch Form",
+                       "assertions":  [
+                                          {
+                                              "id":  "comparison-launch-elem-0",
+                                              "description":  "Required element 0 for state Comparison Launch Form",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "group"
+                                                                          },
+                                                             "label":  "Required element for Comparison Launch Form"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-launch-elem-1",
+                                              "description":  "Required element 1 for state Comparison Launch Form",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "checkbox"
+                                                                          },
+                                                             "label":  "Required element for Comparison Launch Form"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-launch-elem-2",
+                                              "description":  "Required element 2 for state Comparison Launch Form",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Run"
+                                                                          },
+                                                             "label":  "Required element for Comparison Launch Form"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-launch-elem-3",
+                                              "description":  "Required element 3 for state Comparison Launch Form",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "list"
+                                                                          },
+                                                             "label":  "Required element for Comparison Launch Form"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-launch-elem-4",
+                                              "description":  "Required element 4 for state Comparison Launch Form",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "list"
+                                                                          },
+                                                             "label":  "Required element for Comparison Launch Form"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The launch form or dialog allows the user to configure a new comparison run: select a workflow, choose a variation type (architecture or same), and optionally toggle worktree isolation. Submitting posts to POST /comparison/start via the runner HTTP API or via the Tauri qontinui_comparison.start_comparison command.",
+                       "precondition":  "A workflow is selected and a variation type is chosen",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "comparison-list",
+                       "name":  "Comparison Run List",
+                       "assertions":  [
+                                          {
+                                              "id":  "comparison-list-elem-0",
+                                              "description":  "Required element 0 for state Comparison Run List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "list"
+                                                                          },
+                                                             "label":  "Required element for Comparison Run List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-list-elem-1",
+                                              "description":  "Required element 1 for state Comparison Run List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "list"
+                                                                          },
+                                                             "label":  "Required element for Comparison Run List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-list-elem-2",
+                                              "description":  "Required element 2 for state Comparison Run List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "list"
+                                                                          },
+                                                             "label":  "Required element for Comparison Run List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-list-elem-3",
+                                              "description":  "Required element 3 for state Comparison Run List",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button",
+                                                                              "text":  "Refresh"
+                                                                          },
+                                                             "label":  "Required element for Comparison Run List"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The page lists recent comparison runs fetched from GET /comparisons (up to 50 most recent, returned as an array of ComparisonRunView). Each run shows its ID (or short ID), workflow ID, variation type, status, and creation date. The list is the primary navigation surface for entering a run\u0027s detail view.",
+                       "precondition":  "At least one comparison run exists",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "running-comparison-detail",
+                       "name":  "Running Comparison Detail View",
+                       "assertions":  [
+                                          {
+                                              "id":  "running-comparison-detail-elem-0",
+                                              "description":  "Required element 0 for state Running Comparison Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "list"
+                                                                          },
+                                                             "label":  "Required element for Running Comparison Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "running-comparison-detail-elem-1",
+                                              "description":  "Required element 1 for state Running Comparison Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "list"
+                                                                          },
+                                                             "label":  "Required element for Running Comparison Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "running-comparison-detail-elem-2",
+                                              "description":  "Required element 2 for state Running Comparison Detail View",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "main"
+                                                                          },
+                                                             "label":  "Required element for Running Comparison Detail View"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When a comparison run with status \u0027running\u0027 is selected, the detail view shows all entries and their individual live statuses. Entry statuses are fetched from GET /comparison/:id which enriches the stored entries with live task_run statuses from PostgreSQL. Entries transition from \u0027pending\u0027 → \u0027running\u0027 → \u0027completed\u0027/\u0027failed\u0027 as workflow runs progress.",
+                       "precondition":  "A running comparison run is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "completed-comparison-detail",
+                       "name":  "Completed Comparison Detail — Results Overview",
+                       "assertions":  [
+                                          {
+                                              "id":  "completed-comparison-detail-elem-0",
+                                              "description":  "Required element 0 for state Completed Comparison Detail — Results Overview",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "table"
+                                                                          },
+                                                             "label":  "Required element for Completed Comparison Detail — Results Overview"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "completed-comparison-detail-elem-1",
+                                              "description":  "Required element 1 for state Completed Comparison Detail — Results Overview",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Completed Comparison Detail — Results Overview"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "completed-comparison-detail-elem-2",
+                                              "description":  "Required element 2 for state Completed Comparison Detail — Results Overview",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Completed Comparison Detail — Results Overview"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "completed-comparison-detail-elem-3",
+                                              "description":  "Required element 3 for state Completed Comparison Detail — Results Overview",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Completed Comparison Detail — Results Overview"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "completed-comparison-detail-discriminator",
+                                              "description":  "Distinctness discriminator for state Completed Comparison Detail — Results Overview",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Completed Comparison Detail — Results Overview"
+                                                                          },
+                                                             "label":  "Discriminator for Completed Comparison Detail — Results Overview"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When a comparison run completes (status=\u0027completed\u0027), the detail view shows the full result breakdown: per-entry results (success/fail, iteration count, duration_ms), the AI comparison report, and the AI recommendation with confidence score. The completed_at timestamp is shown. Status auto-transitions to \u0027completed\u0027 when the GET /comparison/:id handler detects all_done=true.",
+                       "precondition":  "A completed comparison run is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "metric-analysis",
+                       "name":  "Structured Metric Analysis",
+                       "assertions":  [
+                                          {
+                                              "id":  "metric-analysis-elem-0",
+                                              "description":  "Required element 0 for state Structured Metric Analysis",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "table"
+                                                                          },
+                                                             "label":  "Required element for Structured Metric Analysis"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "metric-analysis-elem-1",
+                                              "description":  "Required element 1 for state Structured Metric Analysis",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Structured Metric Analysis"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "metric-analysis-elem-2",
+                                              "description":  "Required element 2 for state Structured Metric Analysis",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "table"
+                                                                          },
+                                                             "label":  "Required element for Structured Metric Analysis"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "metric-analysis-elem-3",
+                                              "description":  "Required element 3 for state Structured Metric Analysis",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Structured Metric Analysis"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "metric-analysis-elem-4",
+                                              "description":  "Required element 4 for state Structured Metric Analysis",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Structured Metric Analysis"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "metric-analysis-discriminator",
+                                              "description":  "Distinctness discriminator for state Structured Metric Analysis",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Structured Metric Analysis"
+                                                                          },
+                                                             "label":  "Discriminator for Structured Metric Analysis"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The page displays machine-readable metric comparisons across variants from StructuredComparisonReport (built by build_structured_report in comparison.rs). The HTTP API surfaces three metrics per completed entry from ComparisonEntryResultJson: success (bool → 1.0/0.0, higher=better), iterations (u32, lower=better), and duration_ms (u64, lower=better). A winner is identified by which variant wins the most metrics, with a confidence score expressed as winner_wins / total_metrics (0.0–1.0).",
+                       "precondition":  "A completed comparison run with at least 2 completed entries is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "comparison-algorithm-correctness",
+                       "name":  "Comparison Algorithm Correctness",
+                       "assertions":  [
+                                          {
+                                              "id":  "comparison-algorithm-correctness-elem-0",
+                                              "description":  "Required element 0 for state Comparison Algorithm Correctness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Comparison Algorithm Correctness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-algorithm-correctness-elem-1",
+                                              "description":  "Required element 1 for state Comparison Algorithm Correctness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Comparison Algorithm Correctness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-algorithm-correctness-elem-2",
+                                              "description":  "Required element 2 for state Comparison Algorithm Correctness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "list"
+                                                                          },
+                                                             "label":  "Required element for Comparison Algorithm Correctness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-algorithm-correctness-elem-3",
+                                              "description":  "Required element 3 for state Comparison Algorithm Correctness",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Comparison Algorithm Correctness"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The winner and confidence in StructuredComparisonReport are derived by a specific algorithm in build_structured_report (comparison.rs): winner = variant with the most metric wins (tie-broken by highest success_rate); confidence = winner_metric_wins / total_metrics_count (0.0–1.0). With 3 metrics, valid confidence values are 0.33, 0.67, or 1.0. An AI verification workflow can check that displayed winner and confidence match these formulas applied to the visible metric values.",
+                       "precondition":  "A completed comparison run with at least 2 completed entries is displayed",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "comparison-states",
+                       "name":  "Comparison Status Lifecycle",
+                       "assertions":  [
+                                          {
+                                              "id":  "comparison-states-elem-0",
+                                              "description":  "Required element 0 for state Comparison Status Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Comparison Status Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-states-elem-1",
+                                              "description":  "Required element 1 for state Comparison Status Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Comparison Status Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-states-elem-2",
+                                              "description":  "Required element 2 for state Comparison Status Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Comparison Status Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-states-elem-3",
+                                              "description":  "Required element 3 for state Comparison Status Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Comparison Status Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "comparison-states-discriminator",
+                                              "description":  "Distinctness discriminator for state Comparison Status Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Comparison Status Lifecycle"
+                                                                          },
+                                                             "label":  "Discriminator for Comparison Status Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The page correctly reflects the status progression for comparison runs: running (entries launching and executing) → completed (all entries done, auto-transitioned by GET /comparison/:id when all_done=true). The \u0027comparing\u0027 status is a valid enum variant but requires a separate AI analysis pipeline to be set — the GET endpoint does not set it automatically. Failed state is shown when all entries fail on launch.",
+                       "precondition":  "A \u0027running\u0027 comparison run is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "research-config",
+                       "name":  "Research Configuration (Multi-Trial, Aspirational)",
+                       "assertions":  [
+                                          {
+                                              "id":  "research-config-elem-0",
+                                              "description":  "Required element 0 for state Research Configuration (Multi-Trial, Aspirational)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "form"
+                                                                          },
+                                                             "label":  "Required element for Research Configuration (Multi-Trial, Aspirational)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "research-config-elem-1",
+                                              "description":  "Required element 1 for state Research Configuration (Multi-Trial, Aspirational)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "group"
+                                                                          },
+                                                             "label":  "Required element for Research Configuration (Multi-Trial, Aspirational)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "research-config-elem-2",
+                                              "description":  "Required element 2 for state Research Configuration (Multi-Trial, Aspirational)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "region"
+                                                                          },
+                                                             "label":  "Required element for Research Configuration (Multi-Trial, Aspirational)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Beyond single-shot comparisons, the ResearchConfig data structure in comparison.rs defines multi-trial experiment parameters: trials_per_experiment, search_dimensions (model, multi_agent_mode, max_iterations, context_tokens, workflow_architecture, custom), mutation_strategy (sequential/random_perturbation/ai_guided), and acceptance_criteria. If this advanced configuration UI is implemented, it should surface these fields. Currently the HTTP API only supports single-trial comparisons and p_value is always null.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Autoresearch Page — A dev-only dashboard for launching and analyzing parallel workflow architecture comparison runs with statistical A/B testing. Users select a workflow and a variation type (Architecture: Traditional vs Agentic Verification vs Multi-Agent Pipeline; Same: 3 identical runs for repeatability), then observe each entry\u0027s live status as workflows execute in isolated worktrees. When all entries complete, a structured metric comparison (success, iterations, duration_ms) and an AI-generated prose report identify the winning architecture with a confidence score. Comparison runs are stored in the comparison_runs PostgreSQL table and served via runner HTTP endpoints POST /comparison/start, GET /comparison/:id, GET /comparisons and Tauri commands under the qontinui_comparison plugin. This page surfaces the research infrastructure underlying architecture selection decisions.",
+    "metadata":  {
+                     "tags":  [
+                                  "dev-only",
+                                  "comparison",
+                                  "a-b-testing",
+                                  "architectures",
+                                  "statistics",
+                                  "research"
+                              ]
+                 }
 }

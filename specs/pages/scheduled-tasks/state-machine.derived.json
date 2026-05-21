@@ -1,619 +1,622 @@
-{
-  "version": "1.0",
-  "id": "scheduled-tasks",
-  "name": "SchedulerTab",
-  "states": [
-    {
-      "id": "scheduler-overview",
-      "name": "Scheduler Status and Task Inventory",
-      "assertions": [
-        {
-          "id": "scheduler-overview-elem-0",
-          "description": "Required element 0 for state Scheduler Status and Task Inventory",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Scheduled Tasks"
-            },
-            "label": "Required element for Scheduler Status and Task Inventory"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-overview-elem-1",
-          "description": "Required element 1 for state Scheduler Status and Task Inventory",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Running"
-            },
-            "label": "Required element for Scheduler Status and Task Inventory"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-overview-elem-2",
-          "description": "Required element 2 for state Scheduler Status and Task Inventory",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Scheduled"
-            },
-            "label": "Required element for Scheduler Status and Task Inventory"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Header with overall scheduler status (Running/Paused) and running-task count. Three sub-tabs (Scheduled / History / Settings) and an Auto-Fix shortcut. The Scheduled sub-tab shows the task inventory with per-task next-run, enable toggle, run-now, edit, and delete actions.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "scheduler-task-management",
-      "name": "Task Creation and Lifecycle",
-      "assertions": [
-        {
-          "id": "scheduler-task-management-elem-0",
-          "description": "Required element 0 for state Task Creation and Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "New Task"
-            },
-            "label": "Required element for Task Creation and Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-task-management-elem-1",
-          "description": "Required element 1 for state Task Creation and Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Scheduled"
-            },
-            "label": "Required element for Task Creation and Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-task-management-elem-2",
-          "description": "Required element 2 for state Task Creation and Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Task Creation and Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-task-management-elem-3",
-          "description": "Required element 3 for state Task Creation and Lifecycle",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Auto-Fix"
-            },
-            "label": "Required element for Task Creation and Lifecycle"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Users can create new tasks via the New Task button, edit existing tasks, run them on-demand via Run Now, toggle their enabled state, or delete them. Each row in the task list shows: task name, task-type label (e.g. 'Workflow', 'Prompt', 'Remote agent'), schedule expression, next-run delta, and per-task action buttons. The Auto-Fix Now button at the top triggers the auto-fix run outside any schedule.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "scheduler-history-settings",
-      "name": "Execution History and Settings",
-      "assertions": [
-        {
-          "id": "scheduler-history-settings-elem-0",
-          "description": "Required element 0 for state Execution History and Settings",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "History"
-            },
-            "label": "Required element for Execution History and Settings"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-history-settings-elem-1",
-          "description": "Required element 1 for state Execution History and Settings",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Settings"
-            },
-            "label": "Required element for Execution History and Settings"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-history-settings-elem-2",
-          "description": "Required element 2 for state Execution History and Settings",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button"
-            },
-            "label": "Required element for Execution History and Settings"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The History sub-tab shows the chronological log of executions per selected task. The Settings sub-tab exposes scheduler engine configuration (global enable, concurrency limits, etc).",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "scheduler-catch-up-policy",
-      "name": "Catch-up Policy Controls (Phase A/B/E)",
-      "assertions": [
-        {
-          "id": "scheduler-catch-up-policy-elem-0",
-          "description": "Required element 0 for state Catch-up Policy Controls (Phase A/B/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "catch-up-policy"
-            },
-            "label": "Required element for Catch-up Policy Controls (Phase A/B/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-catch-up-policy-elem-1",
-          "description": "Required element 1 for state Catch-up Policy Controls (Phase A/B/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "catch-up-grace"
-            },
-            "label": "Required element for Catch-up Policy Controls (Phase A/B/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-catch-up-policy-elem-2",
-          "description": "Required element 2 for state Catch-up Policy Controls (Phase A/B/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "catch-up-policy"
-            },
-            "label": "Required element for Catch-up Policy Controls (Phase A/B/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-catch-up-policy-elem-3",
-          "description": "Required element 3 for state Catch-up Policy Controls (Phase A/B/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "catch-up-policy"
-            },
-            "label": "Required element for Catch-up Policy Controls (Phase A/B/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When a runner is offline at a task's scheduled fire time, the catch-up reconciler decides what to do. Users select per-task behavior via the 'If the runner was down' selector, with three options that map to the runner's CatchUpPolicy enum: 'run_once' (default — collapse all missed slots into one execution after the runner returns), 'run' (execute each missed slot individually), and 'skip' (record each missed slot as MissedRunnerDown without executing). A 'Grace window' input sets the seconds of slack — slots within `now - grace` of restart are considered fresh and not eligible for catch-up. The selector is only relevant for time-based schedules (Cron / Once / Interval); condition-based schedules don't have missed slots.",
-      "precondition": "New Task form is open and a time-based schedule (Cron / Once / Interval) is selected",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "scheduler-remote-agent-form",
-      "name": "Remote Agent Task Type Form (Phase D/E)",
-      "assertions": [
-        {
-          "id": "scheduler-remote-agent-form-elem-0",
-          "description": "Required element 0 for state Remote Agent Task Type Form (Phase D/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Remote agent"
-            },
-            "label": "Required element for Remote Agent Task Type Form (Phase D/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-remote-agent-form-elem-1",
-          "description": "Required element 1 for state Remote Agent Task Type Form (Phase D/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "agent-prompt"
-            },
-            "label": "Required element for Remote Agent Task Type Form (Phase D/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-remote-agent-form-elem-2",
-          "description": "Required element 2 for state Remote Agent Task Type Form (Phase D/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "agent-working-directory"
-            },
-            "label": "Required element for Remote Agent Task Type Form (Phase D/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-remote-agent-form-elem-3",
-          "description": "Required element 3 for state Remote Agent Task Type Form (Phase D/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "agent-model"
-            },
-            "label": "Required element for Remote Agent Task Type Form (Phase D/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-remote-agent-form-elem-4",
-          "description": "Required element 4 for state Remote Agent Task Type Form (Phase D/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "agent-allowed-tools"
-            },
-            "label": "Required element for Remote Agent Task Type Form (Phase D/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-remote-agent-form-elem-5",
-          "description": "Required element 5 for state Remote Agent Task Type Form (Phase D/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "agent-allowed-tool-bash"
-            },
-            "label": "Required element for Remote Agent Task Type Form (Phase D/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-remote-agent-form-elem-6",
-          "description": "Required element 6 for state Remote Agent Task Type Form (Phase D/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "id": "agent-max-turns"
-            },
-            "label": "Required element for Remote Agent Task Type Form (Phase D/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The 'Remote agent' task type lets users schedule arbitrary Claude prompts without pre-registering them in the prompt library. When this radio is selected the form reveals a multi-line prompt textarea, optional working directory, model selector, allowed-tools chip group, and an Advanced disclosure containing max-turns, timeout, and MCP-connection editor. At dispatch time the runner's launch_remote_agent calls POST /prompts/run with these fields. The form's defaults match the runner-side defaults (model = sonnet-4-6, allowed_tools = Bash/Read/Write/Edit/Glob/Grep, max_turns = 50, timeout = 600s); drift between form defaults and runner defaults causes silent behavior changes.",
-      "precondition": "New Task form is open",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "scheduler-launch-failure-display",
-      "name": "Launch Failure Backoff Display in Task List (Phase C/E)",
-      "assertions": [
-        {
-          "id": "scheduler-launch-failure-display-elem-0",
-          "description": "Required element 0 for state Launch Failure Backoff Display in Task List (Phase C/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "launch failure"
-            },
-            "label": "Required element for Launch Failure Backoff Display in Task List (Phase C/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-launch-failure-display-elem-1",
-          "description": "Required element 1 for state Launch Failure Backoff Display in Task List (Phase C/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "after"
-            },
-            "label": "Required element for Launch Failure Backoff Display in Task List (Phase C/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "When a scheduled task's launch (start call) fails — e.g. workflow file missing, prompt-id not found, /prompts/run HTTP error, missing session_id — the runner increments task.consecutive_launch_failures and pushes next_run forward by min(base * 2^(failures-1), 86400) seconds. The task list surfaces this so the operator can see retries are being throttled. Required visual indicators: an orange 'launch_failed' badge on the task row, the next-run cell rendered as 'Next: in X (after N failures)' instead of plain 'Next: in X', and a tooltip explaining the wait. This is distinct from a runtime failure (status 'failed'), which doesn't push next_run forward — backoff applies only to LaunchFailed.",
-      "precondition": "At least one task in the list has consecutiveLaunchFailures > 0",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "scheduler-history-status-badges",
-      "name": "History Status Badges for New Statuses (Phase B/E)",
-      "assertions": [
-        {
-          "id": "scheduler-history-status-badges-elem-0",
-          "description": "Required element 0 for state History Status Badges for New Statuses (Phase B/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Launch failed"
-            },
-            "label": "Required element for History Status Badges for New Statuses (Phase B/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-history-status-badges-elem-1",
-          "description": "Required element 1 for state History Status Badges for New Statuses (Phase B/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Missed (runner offline)"
-            },
-            "label": "Required element for History Status Badges for New Statuses (Phase B/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-history-status-badges-elem-2",
-          "description": "Required element 2 for state History Status Badges for New Statuses (Phase B/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "(catch-up)"
-            },
-            "label": "Required element for History Status Badges for New Statuses (Phase B/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-history-status-badges-elem-3",
-          "description": "Required element 3 for state History Status Badges for New Statuses (Phase B/E)",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Scheduled for:"
-            },
-            "label": "Required element for History Status Badges for New Statuses (Phase B/E)"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The History sub-tab shows one row per execution. Beyond the original Pending/Running/Completed/Failed/Skipped/Cancelled, two new statuses landed in Phase B: 'launch_failed' (LaunchFailed — task could not start) and 'missed_runner_down' (MissedRunnerDown — slot was synthesized by the catch-up reconciler with policy=Skip). These need distinguishable visual treatment because they mean different things from generic Failed: launch_failed is retry-with-backoff, missed_runner_down is informational. Catch-up runs also tag the task name with '(catch-up)' so the operator can tell that a Completed row was a catch-up rather than a normal-schedule fire.",
-      "precondition": "History tab is selected and at least one execution record has status=launch_failed",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "scheduler-design",
-      "name": "Visual Design and Theme Compliance",
-      "assertions": [
-        {
-          "id": "scheduler-design-elem-0",
-          "description": "Required element 0 for state Visual Design and Theme Compliance",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Launch failed"
-            },
-            "label": "Required element for Visual Design and Theme Compliance"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-design-elem-1",
-          "description": "Required element 1 for state Visual Design and Theme Compliance",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Missed (runner offline)"
-            },
-            "label": "Required element for Visual Design and Theme Compliance"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "scheduler-design-discriminator",
-          "description": "Distinctness discriminator for state Visual Design and Theme Compliance",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "accessibleName": "Visual Design and Theme Compliance"
-            },
-            "label": "Discriminator for Visual Design and Theme Compliance"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Style-guide coverage: scheduler tab uses the runner's standard panel layout with semantic accent colors for status indicators. Critical theme tokens: orange for transient/retry states (launch_failed, launch-failure backoff badge), slate for neutral/informational (missed_runner_down), red for permanent failures (failed), green for completed, blue for running, yellow for pending/skipped. These accent semantics MUST stay consistent across the task list, history rows, and any new surface that displays task state, otherwise operators will misread severity.",
-      "precondition": "History tab is selected and at least one record has status=launch_failed",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Scheduled Tasks page — manages recurring task execution. A task pairs an arbitrary task type (Workflow / Prompt / Auto-Fix / Watcher / Background-capture / Remote agent) with a schedule (cron / interval / once / condition). The page surfaces the task list, execution history with launch-failure and missed-runner-down indicators, and scheduler engine settings, plus a New Task form covering all variants and catch-up policy.",
-  "metadata": {
-    "tags": [
-      "scheduler",
-      "scheduled-tasks",
-      "cron",
-      "recurring",
-      "remote-agent",
-      "catch-up-policy",
-      "launch-failure-backoff",
-      "dev-only"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "scheduled-tasks",
+    "name":  "SchedulerTab",
+    "states":  [
+                   {
+                       "id":  "scheduler-overview",
+                       "name":  "Scheduler Status and Task Inventory",
+                       "assertions":  [
+                                          {
+                                              "id":  "scheduler-overview-elem-0",
+                                              "description":  "Required element 0 for state Scheduler Status and Task Inventory",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Scheduled Tasks"
+                                                                          },
+                                                             "label":  "Required element for Scheduler Status and Task Inventory"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-overview-elem-1",
+                                              "description":  "Required element 1 for state Scheduler Status and Task Inventory",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Running"
+                                                                          },
+                                                             "label":  "Required element for Scheduler Status and Task Inventory"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-overview-elem-2",
+                                              "description":  "Required element 2 for state Scheduler Status and Task Inventory",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Scheduled"
+                                                                          },
+                                                             "label":  "Required element for Scheduler Status and Task Inventory"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Header with overall scheduler status (Running/Paused) and running-task count. Three sub-tabs (Scheduled / History / Settings) and an Auto-Fix shortcut. The Scheduled sub-tab shows the task inventory with per-task next-run, enable toggle, run-now, edit, and delete actions.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "scheduler-task-management",
+                       "name":  "Task Creation and Lifecycle",
+                       "assertions":  [
+                                          {
+                                              "id":  "scheduler-task-management-elem-0",
+                                              "description":  "Required element 0 for state Task Creation and Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "New Task"
+                                                                          },
+                                                             "label":  "Required element for Task Creation and Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-task-management-elem-1",
+                                              "description":  "Required element 1 for state Task Creation and Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Scheduled"
+                                                                          },
+                                                             "label":  "Required element for Task Creation and Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-task-management-elem-2",
+                                              "description":  "Required element 2 for state Task Creation and Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Task Creation and Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-task-management-elem-3",
+                                              "description":  "Required element 3 for state Task Creation and Lifecycle",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Auto-Fix"
+                                                                          },
+                                                             "label":  "Required element for Task Creation and Lifecycle"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Users can create new tasks via the New Task button, edit existing tasks, run them on-demand via Run Now, toggle their enabled state, or delete them. Each row in the task list shows: task name, task-type label (e.g. \u0027Workflow\u0027, \u0027Prompt\u0027, \u0027Remote agent\u0027), schedule expression, next-run delta, and per-task action buttons. The Auto-Fix Now button at the top triggers the auto-fix run outside any schedule.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "scheduler-history-settings",
+                       "name":  "Execution History and Settings",
+                       "assertions":  [
+                                          {
+                                              "id":  "scheduler-history-settings-elem-0",
+                                              "description":  "Required element 0 for state Execution History and Settings",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "History"
+                                                                          },
+                                                             "label":  "Required element for Execution History and Settings"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-history-settings-elem-1",
+                                              "description":  "Required element 1 for state Execution History and Settings",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Settings"
+                                                                          },
+                                                             "label":  "Required element for Execution History and Settings"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-history-settings-elem-2",
+                                              "description":  "Required element 2 for state Execution History and Settings",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "role":  "button"
+                                                                          },
+                                                             "label":  "Required element for Execution History and Settings"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The History sub-tab shows the chronological log of executions per selected task. The Settings sub-tab exposes scheduler engine configuration (global enable, concurrency limits, etc).",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "scheduler-catch-up-policy",
+                       "name":  "Catch-up Policy Controls (Phase A/B/E)",
+                       "assertions":  [
+                                          {
+                                              "id":  "scheduler-catch-up-policy-elem-0",
+                                              "description":  "Required element 0 for state Catch-up Policy Controls (Phase A/B/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "catch-up-policy"
+                                                                          },
+                                                             "label":  "Required element for Catch-up Policy Controls (Phase A/B/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-catch-up-policy-elem-1",
+                                              "description":  "Required element 1 for state Catch-up Policy Controls (Phase A/B/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "catch-up-grace"
+                                                                          },
+                                                             "label":  "Required element for Catch-up Policy Controls (Phase A/B/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-catch-up-policy-elem-2",
+                                              "description":  "Required element 2 for state Catch-up Policy Controls (Phase A/B/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "catch-up-policy"
+                                                                          },
+                                                             "label":  "Required element for Catch-up Policy Controls (Phase A/B/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-catch-up-policy-elem-3",
+                                              "description":  "Required element 3 for state Catch-up Policy Controls (Phase A/B/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "catch-up-policy"
+                                                                          },
+                                                             "label":  "Required element for Catch-up Policy Controls (Phase A/B/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When a runner is offline at a task\u0027s scheduled fire time, the catch-up reconciler decides what to do. Users select per-task behavior via the \u0027If the runner was down\u0027 selector, with three options that map to the runner\u0027s CatchUpPolicy enum: \u0027run_once\u0027 (default — collapse all missed slots into one execution after the runner returns), \u0027run\u0027 (execute each missed slot individually), and \u0027skip\u0027 (record each missed slot as MissedRunnerDown without executing). A \u0027Grace window\u0027 input sets the seconds of slack — slots within `now - grace` of restart are considered fresh and not eligible for catch-up. The selector is only relevant for time-based schedules (Cron / Once / Interval); condition-based schedules don\u0027t have missed slots.",
+                       "precondition":  "New Task form is open and a time-based schedule (Cron / Once / Interval) is selected",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "scheduler-remote-agent-form",
+                       "name":  "Remote Agent Task Type Form (Phase D/E)",
+                       "assertions":  [
+                                          {
+                                              "id":  "scheduler-remote-agent-form-elem-0",
+                                              "description":  "Required element 0 for state Remote Agent Task Type Form (Phase D/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Remote agent"
+                                                                          },
+                                                             "label":  "Required element for Remote Agent Task Type Form (Phase D/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-remote-agent-form-elem-1",
+                                              "description":  "Required element 1 for state Remote Agent Task Type Form (Phase D/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "agent-prompt"
+                                                                          },
+                                                             "label":  "Required element for Remote Agent Task Type Form (Phase D/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-remote-agent-form-elem-2",
+                                              "description":  "Required element 2 for state Remote Agent Task Type Form (Phase D/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "agent-working-directory"
+                                                                          },
+                                                             "label":  "Required element for Remote Agent Task Type Form (Phase D/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-remote-agent-form-elem-3",
+                                              "description":  "Required element 3 for state Remote Agent Task Type Form (Phase D/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "agent-model"
+                                                                          },
+                                                             "label":  "Required element for Remote Agent Task Type Form (Phase D/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-remote-agent-form-elem-4",
+                                              "description":  "Required element 4 for state Remote Agent Task Type Form (Phase D/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "agent-allowed-tools"
+                                                                          },
+                                                             "label":  "Required element for Remote Agent Task Type Form (Phase D/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-remote-agent-form-elem-5",
+                                              "description":  "Required element 5 for state Remote Agent Task Type Form (Phase D/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "agent-allowed-tool-bash"
+                                                                          },
+                                                             "label":  "Required element for Remote Agent Task Type Form (Phase D/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-remote-agent-form-elem-6",
+                                              "description":  "Required element 6 for state Remote Agent Task Type Form (Phase D/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "id":  "agent-max-turns"
+                                                                          },
+                                                             "label":  "Required element for Remote Agent Task Type Form (Phase D/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The \u0027Remote agent\u0027 task type lets users schedule arbitrary Claude prompts without pre-registering them in the prompt library. When this radio is selected the form reveals a multi-line prompt textarea, optional working directory, model selector, allowed-tools chip group, and an Advanced disclosure containing max-turns, timeout, and MCP-connection editor. At dispatch time the runner\u0027s launch_remote_agent calls POST /prompts/run with these fields. The form\u0027s defaults match the runner-side defaults (model = sonnet-4-6, allowed_tools = Bash/Read/Write/Edit/Glob/Grep, max_turns = 50, timeout = 600s); drift between form defaults and runner defaults causes silent behavior changes.",
+                       "precondition":  "New Task form is open",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "scheduler-launch-failure-display",
+                       "name":  "Launch Failure Backoff Display in Task List (Phase C/E)",
+                       "assertions":  [
+                                          {
+                                              "id":  "scheduler-launch-failure-display-elem-0",
+                                              "description":  "Required element 0 for state Launch Failure Backoff Display in Task List (Phase C/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "launch failure"
+                                                                          },
+                                                             "label":  "Required element for Launch Failure Backoff Display in Task List (Phase C/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-launch-failure-display-elem-1",
+                                              "description":  "Required element 1 for state Launch Failure Backoff Display in Task List (Phase C/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "after"
+                                                                          },
+                                                             "label":  "Required element for Launch Failure Backoff Display in Task List (Phase C/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "When a scheduled task\u0027s launch (start call) fails — e.g. workflow file missing, prompt-id not found, /prompts/run HTTP error, missing session_id — the runner increments task.consecutive_launch_failures and pushes next_run forward by min(base * 2^(failures-1), 86400) seconds. The task list surfaces this so the operator can see retries are being throttled. Required visual indicators: an orange \u0027launch_failed\u0027 badge on the task row, the next-run cell rendered as \u0027Next: in X (after N failures)\u0027 instead of plain \u0027Next: in X\u0027, and a tooltip explaining the wait. This is distinct from a runtime failure (status \u0027failed\u0027), which doesn\u0027t push next_run forward — backoff applies only to LaunchFailed.",
+                       "precondition":  "At least one task in the list has consecutiveLaunchFailures \u003e 0",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "scheduler-history-status-badges",
+                       "name":  "History Status Badges for New Statuses (Phase B/E)",
+                       "assertions":  [
+                                          {
+                                              "id":  "scheduler-history-status-badges-elem-0",
+                                              "description":  "Required element 0 for state History Status Badges for New Statuses (Phase B/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Launch failed"
+                                                                          },
+                                                             "label":  "Required element for History Status Badges for New Statuses (Phase B/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-history-status-badges-elem-1",
+                                              "description":  "Required element 1 for state History Status Badges for New Statuses (Phase B/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Missed (runner offline)"
+                                                                          },
+                                                             "label":  "Required element for History Status Badges for New Statuses (Phase B/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-history-status-badges-elem-2",
+                                              "description":  "Required element 2 for state History Status Badges for New Statuses (Phase B/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "(catch-up)"
+                                                                          },
+                                                             "label":  "Required element for History Status Badges for New Statuses (Phase B/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-history-status-badges-elem-3",
+                                              "description":  "Required element 3 for state History Status Badges for New Statuses (Phase B/E)",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Scheduled for:"
+                                                                          },
+                                                             "label":  "Required element for History Status Badges for New Statuses (Phase B/E)"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The History sub-tab shows one row per execution. Beyond the original Pending/Running/Completed/Failed/Skipped/Cancelled, two new statuses landed in Phase B: \u0027launch_failed\u0027 (LaunchFailed — task could not start) and \u0027missed_runner_down\u0027 (MissedRunnerDown — slot was synthesized by the catch-up reconciler with policy=Skip). These need distinguishable visual treatment because they mean different things from generic Failed: launch_failed is retry-with-backoff, missed_runner_down is informational. Catch-up runs also tag the task name with \u0027(catch-up)\u0027 so the operator can tell that a Completed row was a catch-up rather than a normal-schedule fire.",
+                       "precondition":  "History tab is selected and at least one execution record has status=launch_failed",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "scheduler-design",
+                       "name":  "Visual Design and Theme Compliance",
+                       "assertions":  [
+                                          {
+                                              "id":  "scheduler-design-elem-0",
+                                              "description":  "Required element 0 for state Visual Design and Theme Compliance",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Launch failed"
+                                                                          },
+                                                             "label":  "Required element for Visual Design and Theme Compliance"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-design-elem-1",
+                                              "description":  "Required element 1 for state Visual Design and Theme Compliance",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "textContains":  "Missed (runner offline)"
+                                                                          },
+                                                             "label":  "Required element for Visual Design and Theme Compliance"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "scheduler-design-discriminator",
+                                              "description":  "Distinctness discriminator for state Visual Design and Theme Compliance",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "accessibleName":  "Visual Design and Theme Compliance"
+                                                                          },
+                                                             "label":  "Discriminator for Visual Design and Theme Compliance"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Style-guide coverage: scheduler tab uses the runner\u0027s standard panel layout with semantic accent colors for status indicators. Critical theme tokens: orange for transient/retry states (launch_failed, launch-failure backoff badge), slate for neutral/informational (missed_runner_down), red for permanent failures (failed), green for completed, blue for running, yellow for pending/skipped. These accent semantics MUST stay consistent across the task list, history rows, and any new surface that displays task state, otherwise operators will misread severity.",
+                       "precondition":  "History tab is selected and at least one record has status=launch_failed",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Scheduled Tasks page — manages recurring task execution. A task pairs an arbitrary task type (Workflow / Prompt / Auto-Fix / Watcher / Background-capture / Remote agent) with a schedule (cron / interval / once / condition). The page surfaces the task list, execution history with launch-failure and missed-runner-down indicators, and scheduler engine settings, plus a New Task form covering all variants and catch-up policy.",
+    "metadata":  {
+                     "tags":  [
+                                  "scheduler",
+                                  "scheduled-tasks",
+                                  "cron",
+                                  "recurring",
+                                  "remote-agent",
+                                  "catch-up-policy",
+                                  "launch-failure-backoff",
+                                  "dev-only"
+                              ]
+                 }
 }

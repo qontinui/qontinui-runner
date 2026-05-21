@@ -1,282 +1,285 @@
-{
-  "version": "1.0",
-  "id": "run-tests",
-  "name": "TestResultsTab",
-  "states": [
-    {
-      "id": "tests-summary-overview",
-      "name": "Test Results Summary",
-      "assertions": [
-        {
-          "id": "tests-summary-overview-elem-0",
-          "description": "Required element 0 for state Test Results Summary",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "passed|failed|total"
-            },
-            "label": "Required element for Test Results Summary"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "tests-summary-overview-elem-1",
-          "description": "Required element 1 for state Test Results Summary",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Verification|iteration"
-            },
-            "label": "Required element for Test Results Summary"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "tests-summary-overview-elem-2",
-          "description": "Required element 2 for state Test Results Summary",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Test Results"
-            },
-            "label": "Required element for Test Results Summary"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Tests page opens with an aggregate summary of all test results from the workflow run. Users need to immediately understand the overall test health: how many passed, how many failed, how many were skipped, and the total count. This summary drives the user's next action — if everything passed they can move on, if tests failed they need to drill into the failures. The summary also includes a loop result banner when the workflow used iterative verification, showing whether verification ultimately passed across all iterations.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "tests-verification-results",
-      "name": "Verification Phase Results by Iteration",
-      "assertions": [
-        {
-          "id": "tests-verification-results-elem-0",
-          "description": "Required element 0 for state Verification Phase Results by Iteration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Iteration"
-            },
-            "label": "Required element for Verification Phase Results by Iteration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "tests-verification-results-elem-1",
-          "description": "Required element 1 for state Verification Phase Results by Iteration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Verification Step|step"
-            },
-            "label": "Required element for Verification Phase Results by Iteration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "tests-verification-results-elem-2",
-          "description": "Required element 2 for state Verification Phase Results by Iteration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Error|Console Output"
-            },
-            "label": "Required element for Verification Phase Results by Iteration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "tests-verification-results-elem-3",
-          "description": "Required element 3 for state Verification Phase Results by Iteration",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "assertions"
-            },
-            "label": "Required element for Verification Phase Results by Iteration"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "Verification results are grouped by iteration, reflecting the workflow loop structure. Each iteration is collapsible and shows its own pass/fail status and duration. Within each iteration, individual verification steps are displayed as test cards. Users can drill into any step to see console output, page snapshots, assertion counts, and error details. This hierarchical organization (iteration > step > details) mirrors the execution structure and helps users trace failures to specific verification phases and iterations.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "tests-playwright-results",
-      "name": "Playwright Test Results",
-      "assertions": [
-        {
-          "id": "tests-playwright-results-elem-0",
-          "description": "Required element 0 for state Playwright Test Results",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Playwright"
-            },
-            "label": "Required element for Playwright Test Results"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "tests-playwright-results-elem-1",
-          "description": "Required element 1 for state Playwright Test Results",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Failure Screenshot"
-            },
-            "label": "Required element for Playwright Test Results"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "tests-playwright-results-elem-2",
-          "description": "Required element 2 for state Playwright Test Results",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Page Snapshot"
-            },
-            "label": "Required element for Playwright Test Results"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "In addition to verification phase results, the page displays Playwright browser test results when the workflow included Playwright test execution. Playwright tests provide end-to-end browser verification and produce rich artifacts including failure screenshots, page snapshots (YAML), and console output. These results are displayed separately from verification results since they come from a different execution mechanism.",
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
-      "id": "tests-empty-and-running-states",
-      "name": "Empty and Running States",
-      "assertions": [
-        {
-          "id": "tests-empty-and-running-states-elem-0",
-          "description": "Required element 0 for state Empty and Running States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "Select a run"
-            },
-            "label": "Required element for Empty and Running States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "tests-empty-and-running-states-elem-1",
-          "description": "Required element 1 for state Empty and Running States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "after the run completes"
-            },
-            "label": "Required element for Empty and Running States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "tests-empty-and-running-states-elem-2",
-          "description": "Required element 2 for state Empty and Running States",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "text": "No test results"
-            },
-            "label": "Required element for Empty and Running States"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "description": "The Tests page handles several states gracefully. When no run is selected, it guides the user to select one. When the selected run is still executing, it informs the user that results will be available after completion. When no tests were executed during the run, it explains that tests appear when the workflow includes verification or test steps. These states prevent user confusion and set appropriate expectations.",
-      "provenance": {
-        "source": "migrated"
-      }
-    }
-  ],
-  "transitions": [],
-  "provenance": {
-    "source": "migrated"
-  },
-  "description": "Run Tests page — displays Playwright test results and verification phase results for a workflow run. Shows pass/fail summaries, individual test cards with assertions, console output, failure screenshots, error messages, and iteration-grouped verification results.",
-  "metadata": {
-    "tags": [
-      "run-tests",
-      "test-results",
-      "verification",
-      "playwright",
-      "observe"
-    ]
-  }
+﻿{
+    "version":  "1.0",
+    "id":  "run-tests",
+    "name":  "TestResultsTab",
+    "states":  [
+                   {
+                       "id":  "tests-summary-overview",
+                       "name":  "Test Results Summary",
+                       "assertions":  [
+                                          {
+                                              "id":  "tests-summary-overview-elem-0",
+                                              "description":  "Required element 0 for state Test Results Summary",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "passed|failed|total"
+                                                                          },
+                                                             "label":  "Required element for Test Results Summary"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "tests-summary-overview-elem-1",
+                                              "description":  "Required element 1 for state Test Results Summary",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Verification|iteration"
+                                                                          },
+                                                             "label":  "Required element for Test Results Summary"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "tests-summary-overview-elem-2",
+                                              "description":  "Required element 2 for state Test Results Summary",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Test Results"
+                                                                          },
+                                                             "label":  "Required element for Test Results Summary"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Tests page opens with an aggregate summary of all test results from the workflow run. Users need to immediately understand the overall test health: how many passed, how many failed, how many were skipped, and the total count. This summary drives the user\u0027s next action — if everything passed they can move on, if tests failed they need to drill into the failures. The summary also includes a loop result banner when the workflow used iterative verification, showing whether verification ultimately passed across all iterations.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "tests-verification-results",
+                       "name":  "Verification Phase Results by Iteration",
+                       "assertions":  [
+                                          {
+                                              "id":  "tests-verification-results-elem-0",
+                                              "description":  "Required element 0 for state Verification Phase Results by Iteration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Iteration"
+                                                                          },
+                                                             "label":  "Required element for Verification Phase Results by Iteration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "tests-verification-results-elem-1",
+                                              "description":  "Required element 1 for state Verification Phase Results by Iteration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Verification Step|step"
+                                                                          },
+                                                             "label":  "Required element for Verification Phase Results by Iteration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "tests-verification-results-elem-2",
+                                              "description":  "Required element 2 for state Verification Phase Results by Iteration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Error|Console Output"
+                                                                          },
+                                                             "label":  "Required element for Verification Phase Results by Iteration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "tests-verification-results-elem-3",
+                                              "description":  "Required element 3 for state Verification Phase Results by Iteration",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "assertions"
+                                                                          },
+                                                             "label":  "Required element for Verification Phase Results by Iteration"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "Verification results are grouped by iteration, reflecting the workflow loop structure. Each iteration is collapsible and shows its own pass/fail status and duration. Within each iteration, individual verification steps are displayed as test cards. Users can drill into any step to see console output, page snapshots, assertion counts, and error details. This hierarchical organization (iteration \u003e step \u003e details) mirrors the execution structure and helps users trace failures to specific verification phases and iterations.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "tests-playwright-results",
+                       "name":  "Playwright Test Results",
+                       "assertions":  [
+                                          {
+                                              "id":  "tests-playwright-results-elem-0",
+                                              "description":  "Required element 0 for state Playwright Test Results",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Playwright"
+                                                                          },
+                                                             "label":  "Required element for Playwright Test Results"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "tests-playwright-results-elem-1",
+                                              "description":  "Required element 1 for state Playwright Test Results",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Failure Screenshot"
+                                                                          },
+                                                             "label":  "Required element for Playwright Test Results"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "tests-playwright-results-elem-2",
+                                              "description":  "Required element 2 for state Playwright Test Results",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Page Snapshot"
+                                                                          },
+                                                             "label":  "Required element for Playwright Test Results"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "In addition to verification phase results, the page displays Playwright browser test results when the workflow included Playwright test execution. Playwright tests provide end-to-end browser verification and produce rich artifacts including failure screenshots, page snapshots (YAML), and console output. These results are displayed separately from verification results since they come from a different execution mechanism.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   },
+                   {
+                       "id":  "tests-empty-and-running-states",
+                       "name":  "Empty and Running States",
+                       "assertions":  [
+                                          {
+                                              "id":  "tests-empty-and-running-states-elem-0",
+                                              "description":  "Required element 0 for state Empty and Running States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "Select a run"
+                                                                          },
+                                                             "label":  "Required element for Empty and Running States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "tests-empty-and-running-states-elem-1",
+                                              "description":  "Required element 1 for state Empty and Running States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "after the run completes"
+                                                                          },
+                                                             "label":  "Required element for Empty and Running States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          },
+                                          {
+                                              "id":  "tests-empty-and-running-states-elem-2",
+                                              "description":  "Required element 2 for state Empty and Running States",
+                                              "category":  "element-presence",
+                                              "severity":  "critical",
+                                              "assertionType":  "exists",
+                                              "target":  {
+                                                             "type":  "search",
+                                                             "criteria":  {
+                                                                              "text":  "No test results"
+                                                                          },
+                                                             "label":  "Required element for Empty and Running States"
+                                                         },
+                                              "source":  "migrated",
+                                              "reviewed":  false,
+                                              "enabled":  true
+                                          }
+                                      ],
+                       "description":  "The Tests page handles several states gracefully. When no run is selected, it guides the user to select one. When the selected run is still executing, it informs the user that results will be available after completion. When no tests were executed during the run, it explains that tests appear when the workflow includes verification or test steps. These states prevent user confusion and set appropriate expectations.",
+                       "provenance":  {
+                                          "source":  "migrated"
+                                      }
+                   }
+               ],
+    "transitions":  [
+
+                    ],
+    "provenance":  {
+                       "source":  "migrated",
+                       "appId":  "qontinui-runner"
+                   },
+    "description":  "Run Tests page — displays Playwright test results and verification phase results for a workflow run. Shows pass/fail summaries, individual test cards with assertions, console output, failure screenshots, error messages, and iteration-grouped verification results.",
+    "metadata":  {
+                     "tags":  [
+                                  "run-tests",
+                                  "test-results",
+                                  "verification",
+                                  "playwright",
+                                  "observe"
+                              ]
+                 }
 }
