@@ -165,11 +165,29 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
         // path doesn't run the `npm run` PATH-injection lifecycle reliably
         // on all hosts, so `npm run dev` was failing with `next: ENOENT`
         // when the user POST'd `/processes/frontend/restart`.
+        //
+        // `--port 3001` pins the listener to the port the runner's UI Bridge
+        // proxy + supervisor health watchers expect (see `health_port` below
+        // and the hard-coded `localhost:3001` references in
+        // `executor::url_lock` and `commands::web_integration`). Without it,
+        // `next dev` defaults to 3000 and every health check + proxy hop
+        // misses.
+        //
+        // `--hostname 0.0.0.0` lets the runner (and, in container/WSL setups,
+        // other hosts on the bridge) reach the dev server; the Next.js
+        // default of `localhost` rejects non-loopback peers.
         services.push(ProcessConfig {
             id: dev_service_id(workspace, FRONTEND_SERVICE_ID_SUFFIX),
             name: "Frontend (Next.js)".to_string(),
             command: "npx".to_string(),
-            args: vec!["next".to_string(), "dev".to_string()],
+            args: vec![
+                "next".to_string(),
+                "dev".to_string(),
+                "--port".to_string(),
+                "3001".to_string(),
+                "--hostname".to_string(),
+                "0.0.0.0".to_string(),
+            ],
             cwd: frontend_dir.to_string_lossy().to_string(),
             env,
             health_port: Some(3001),
@@ -365,4 +383,82 @@ pub fn upgrade_and_dedupe_configs(configs: &mut Vec<ProcessConfig>, workspace: &
 /// Check if the current environment is development mode.
 pub fn is_dev_mode() -> bool {
     crate::runtime_env::detect_environment() == "development"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Build a minimal qontinui workspace skeleton so the dev-service
+    /// existence checks (`docker-compose.yml`, `pyproject.toml`,
+    /// `frontend/package.json`) all match and the corresponding
+    /// ProcessConfigs get emitted.
+    fn make_workspace() -> TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let web = root.join("qontinui-web");
+        let backend = web.join("backend");
+        let frontend = web.join("frontend");
+        fs::create_dir_all(&backend).unwrap();
+        fs::create_dir_all(&frontend).unwrap();
+        fs::create_dir_all(root.join("qontinui-runner")).unwrap();
+        fs::write(web.join("docker-compose.yml"), "services: {}\n").unwrap();
+        fs::write(backend.join("pyproject.toml"), "[project]\n").unwrap();
+        fs::write(frontend.join("package.json"), "{}\n").unwrap();
+        tmp
+    }
+
+    /// The frontend dev server MUST be told to listen on 3001 — Next's
+    /// default is 3000, but the runner's UI Bridge proxy, supervisor
+    /// watchers, and `health_port` on this very ProcessConfig all assume
+    /// 3001. Bind hostname to 0.0.0.0 so the runner host (and any peer
+    /// across a WSL/container bridge) can reach it.
+    #[test]
+    fn frontend_port_set() {
+        let tmp = make_workspace();
+        let services = get_default_dev_services(tmp.path());
+
+        let frontend = services
+            .iter()
+            .find(|s| s.health_port == Some(3001))
+            .expect(
+                "frontend dev service should be emitted for a workspace with frontend/package.json",
+            );
+
+        assert_eq!(frontend.command, "npx");
+        assert!(
+            frontend.args.iter().any(|a| a == "--port")
+                && frontend.args.iter().any(|a| a == "3001"),
+            "frontend args must include `--port 3001`; got {:?}",
+            frontend.args
+        );
+        assert!(
+            frontend.args.iter().any(|a| a == "--hostname")
+                && frontend.args.iter().any(|a| a == "0.0.0.0"),
+            "frontend args must include `--hostname 0.0.0.0`; got {:?}",
+            frontend.args
+        );
+        // Sanity: the port literal must immediately follow `--port` so Next
+        // parses it as the flag's value, not as a positional directory.
+        let port_idx = frontend
+            .args
+            .iter()
+            .position(|a| a == "--port")
+            .expect("--port present");
+        assert_eq!(
+            frontend.args.get(port_idx + 1).map(String::as_str),
+            Some("3001")
+        );
+        let host_idx = frontend
+            .args
+            .iter()
+            .position(|a| a == "--hostname")
+            .expect("--hostname present");
+        assert_eq!(
+            frontend.args.get(host_idx + 1).map(String::as_str),
+            Some("0.0.0.0")
+        );
+    }
 }
