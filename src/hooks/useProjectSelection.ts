@@ -96,11 +96,18 @@ export function useProjectSelection(): UseProjectSelectionReturn {
         return await invoke<Project[]>("get_user_projects");
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
-        // Retry once on auth failure (handles keychain race condition)
-        if (retryCount === 0 && errorMsg.includes("Not authenticated")) {
-          log.debug("Auth race condition, retrying in 500ms...");
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          return attemptLoad(1);
+        // Retry up to 3 times on auth failure (handles keychain race +
+        // in-flight auto-login). 500ms was insufficient when the temp
+        // runner's auto-login HTTP roundtrip is still in flight when
+        // App.tsx's auth-gated effect fires (iter 4 manual test).
+        const MAX_AUTH_RETRIES = 3;
+        if (retryCount < MAX_AUTH_RETRIES && errorMsg.includes("Not authenticated")) {
+          const delay = 1000 * (retryCount + 1);
+          log.debug(
+            `Auth race condition, retry ${retryCount + 1}/${MAX_AUTH_RETRIES} in ${delay}ms...`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          return attemptLoad(retryCount + 1);
         }
         throw err;
       }

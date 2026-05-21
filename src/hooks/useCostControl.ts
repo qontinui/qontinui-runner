@@ -11,6 +11,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AppEvent } from "@qontinui/shared-types/tauri-events";
+import { withTimeout } from "@/lib/withTimeout";
 import type {
   CostUpdateEvent,
   BudgetWarningEvent,
@@ -18,6 +19,15 @@ import type {
   CostDashboard,
   ActiveBudgetStatus,
 } from "../components/cost-control/types";
+
+/**
+ * Per-fetch timeout for the cost-control queries. Without this, an
+ * unresponsive backend leaves the CostControlPanel stuck on
+ * "Loading cost data..." indefinitely. 10s is generous: the get_cost_dashboard
+ * Tauri command is a PG read over the last 30 days. If it doesn't settle by
+ * then, surfacing an error + retry is more useful than blocking forever.
+ */
+const COST_FETCH_TIMEOUT_MS = 10_000;
 
 /**
  * Narrow `AppEvent` to a single variant by `event_type` discriminator.
@@ -63,7 +73,13 @@ export function useCostControl() {
   const [anomalies, setAnomalies] = useState<CostAnomalyEvent[]>([]);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Historical dashboard data
+  // Historical dashboard data.
+  //
+  // The invoke is wrapped in withTimeout so a hung backend surfaces as a
+  // visible error after COST_FETCH_TIMEOUT_MS rather than leaving the
+  // panel stuck on "Loading cost data...". The CostControlPanel renders
+  // status.errors as an inline banner and provides a refresh button that
+  // calls refetchDashboard/refetchBudget, satisfying the retry path.
   const {
     data: dashboard,
     isLoading: dashboardLoading,
@@ -72,14 +88,22 @@ export function useCostControl() {
     refetch: refetchDashboard,
   } = useQuery<CostDashboard>({
     queryKey: ["cost-dashboard"],
-    queryFn: () => invoke<CostDashboard>("get_cost_dashboard", { days: 30 }),
+    queryFn: () =>
+      withTimeout(
+        invoke<CostDashboard>("get_cost_dashboard", { days: 30 }),
+        COST_FETCH_TIMEOUT_MS,
+        "get_cost_dashboard",
+      ),
     staleTime: 30_000,
+    retry: 0,
   });
 
   // Active budget status (may not exist yet - degrade gracefully).
   // The queryFn swallows backend errors and returns null so the panel can
   // render a "no active budget" empty state. isError is therefore reserved
   // for unexpected query-layer failures (e.g. invalidation/serialization).
+  // The timeout protects the same way as get_cost_dashboard — a hung
+  // get_active_budget_status would otherwise wedge the refetchInterval poll.
   const {
     data: activeBudget,
     isLoading: budgetLoading,
@@ -90,7 +114,11 @@ export function useCostControl() {
     queryKey: ["active-budget-status"],
     queryFn: async () => {
       try {
-        return await invoke<ActiveBudgetStatus>("get_active_budget_status");
+        return await withTimeout(
+          invoke<ActiveBudgetStatus>("get_active_budget_status"),
+          COST_FETCH_TIMEOUT_MS,
+          "get_active_budget_status",
+        );
       } catch {
         return null;
       }

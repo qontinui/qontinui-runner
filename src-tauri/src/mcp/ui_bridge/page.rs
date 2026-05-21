@@ -219,7 +219,6 @@ const VALID_TAB_IDS: &[&str] = &[
     "unified-workflow-builder",
     "state-machine",
     "specs",
-    "wrappers",
     "capture",
     "config-log-sources",
     "config-findings",
@@ -1555,6 +1554,22 @@ mod tab_activate_tests {
         let req: TabActivateRequest =
             serde_json::from_str(r#"{"tabId": "specs"}"#).expect("parse camelCase");
         assert_eq!(req.tab_id, "specs");
+    }
+
+    /// Regression: `VALID_TAB_IDS` must contain every id exactly once. A
+    /// duplicate causes `/control/tabs` (and the `tabs_list` IPC response on
+    /// the frontend side) to advertise the same id twice, which agents have
+    /// no sane way to disambiguate. Surfaced 2026-05-20 for `"wrappers"`.
+    #[test]
+    fn valid_tab_ids_have_no_duplicates() {
+        let unique: std::collections::BTreeSet<&str> = VALID_TAB_IDS.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            VALID_TAB_IDS.len(),
+            "VALID_TAB_IDS contains duplicate entries (len {} vs unique {})",
+            VALID_TAB_IDS.len(),
+            unique.len(),
+        );
     }
 }
 

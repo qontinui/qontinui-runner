@@ -63,10 +63,21 @@ export function useEvaluationDatasets() {
   const queryClient = useQueryClient();
 
   // -- List datasets --------------------------------------------------------
+  // The `/api/v1/evaluation/datasets` REST endpoints are not yet implemented
+  // in the runner backend. When the endpoint returns 404, do not retry —
+  // TanStack Query's default 3-retries-with-backoff would otherwise spam the
+  // console with "API 404" errors. Once the backend lands, the retry policy
+  // returns to handling transient 5xx normally.
   const datasetsQuery = useQuery({
     queryKey: evaluationDatasetKeys.list(),
     queryFn: () => apiFetch<EvaluationDataset[]>("/api/v1/evaluation/datasets"),
     staleTime: 30_000,
+    retry: (failureCount, error) => {
+      if (error instanceof Error && error.message.includes("API 404")) {
+        return false;
+      }
+      return failureCount < 3;
+    },
   });
 
   // -- Create dataset -------------------------------------------------------
