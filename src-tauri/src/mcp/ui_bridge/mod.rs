@@ -40,6 +40,7 @@ pub mod screenshots;
 pub mod sdk_spec_sync;
 pub mod state_machine;
 pub mod stubs;
+pub mod tauri_audit;
 pub mod terminals;
 pub mod toasts;
 pub mod types;
@@ -357,6 +358,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(sdk_spec_sync::route_entries());
         all.extend_from_slice(state_machine::route_entries());
         all.extend_from_slice(stubs::route_entries());
+        all.extend_from_slice(tauri_audit::route_entries());
         all.extend_from_slice(terminals::route_entries());
         all.extend_from_slice(toasts::route_entries());
         all.extend_from_slice(vision_routes::route_entries());
@@ -405,6 +407,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(sdk_spec_sync::routes())
         .merge(state_machine::routes())
         .merge(stubs::routes())
+        .merge(tauri_audit::routes())
         .merge(terminals::routes())
         .merge(toasts::routes())
         .merge(vision_routes::routes())
@@ -783,6 +786,10 @@ mod manifest_drift_tests {
             ("GET", "/ui-bridge/control/page/playbook"),
             ("GET", "/ui-bridge/control/spec/{}"),
             ("GET", "/ui-bridge/control/tabs"),
+            // Tauri-command audit trail — runner-only, no SDK consumer
+            // (mobile / web don't have Tauri commands to record). See
+            // `mcp/ui_bridge/tauri_audit.rs` and `crate::tauri_command_audit`.
+            ("GET", "/ui-bridge/control/tauri-command-history"),
             ("GET", "/ui-bridge/control/toasts"),
             ("GET", "/ui-bridge/control/windows"),
             ("POST", "/ui-bridge/control/action-plan"),
