@@ -28,6 +28,11 @@ jobs:
         with:
           # Need full history so we can walk the PR's commit range.
           fetch-depth: 0
+          # Check out the PR head SHA directly — by default
+          # actions/checkout@v4 on `pull_request` creates a synthetic
+          # merge commit (`refs/pull/<n>/merge`) that has no trailer
+          # and would false-fail this gate.
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: Verify
         run: |
           set -euo pipefail
