@@ -1,0 +1,833 @@
+//! Unified Session primitive — plan
+//! [`2026-05-22-coord-native-session-coordination`] §D1 + §Phase 2.
+//!
+//! Today the runner has three parallel session concepts:
+//!
+//! - [`crate::terminal::TerminalManager`] (PTY-backed shell sessions)
+//! - [`crate::claude_session::ClaudeSession`] (Claude CLI subprocesses)
+//! - Workflow sessions (`unified_workflow_executor` + `project.sessions`)
+//!
+//! Plan §D1 makes them one [`Session`] lifecycle with a typed
+//! [`SessionKind`] discriminator. The transport for each kind lives under
+//! [`transport`]; the wire shapes (SessionKind, SessionState,
+//! SessionEventKind, Intent) mirror `qontinui-coord/src/sessions.rs`
+//! byte-for-byte so the runner-side struct serializes verbatim into
+//! `coord.sessions.intent` / `coord.sessions.session_kind` /
+//! `coord.sessions.state` columns.
+//!
+//! ## Phase 2 scope (this PR)
+//!
+//! - Wire shapes that match `coord.sessions` exactly
+//! - [`Session::start`] / [`SessionHandle`] lifecycle with transport
+//!   selection
+//! - [`Intent`] validation
+//! - Local outbox ([`local_store::OutboxWriter`]) — JSON-lines per
+//!   precedent in `wrappers/registry.rs` (see deviation note there); the
+//!   plan calls out SQLite, but adding rusqlite for an outbox we read
+//!   sequentially adds a new native dep + migration surface for no
+//!   benefit over a JSONL file.
+//! - Tauri command surface (see `commands::session`) — `session_start`,
+//!   `session_focus`, `session_close`, `session_describe`,
+//!   `session_steal {reason}`
+//!
+//! ## Out of scope (deferred to later phases)
+//!
+//! - **Phase 3** — the coord-sync push/heartbeat loop is a stub in
+//!   [`coord_sync`]. Local outbox is written; nothing pushes to coord yet.
+//! - **Phase 4** — frontend command callers (`SessionContext`) cut over
+//!   from the legacy `terminal_*` / `ai_session_*` commands.
+//! - **Phase 9** — the existing `commands/terminal.rs`,
+//!   `claude_session/` (9 files), and legacy session tables are kept in
+//!   place. They're load-bearing for ~24 consumers across `productivity`,
+//!   `coordinator`, `executor`, `mcp`, `fixer`, `follow_up`,
+//!   `zombie_sweep`. Phase 9 deletion happens after Phase 4 frontend
+//!   cutover routes the consumers through this primitive.
+//!
+//! ## Why an additive layer instead of a wholesale rewrite?
+//!
+//! Per `CLAUDE.md` "Delete over deprecate" and the plan's "no backward
+//! compat" stance, the long-term plan is deletion. But the plan's
+//! own §Phase 9 explicitly slates `commands/terminal.rs` + `claude_session/`
+//! for deletion AFTER Phase 4 wires the frontend to the new commands. The
+//! existing modules have ~24 in-crate consumers (productivity workers,
+//! coordinator deconflicter, etc.) and front-end Tauri commands that the
+//! runner UI calls today. Deleting them in Phase 2 would break the
+//! runner. Phase 2 is the **substrate** for Phase 4 — the new commands
+//! coexist with the old ones, and Phase 9 cleans up once the new path
+//! has fully absorbed the old surface.
+
+pub mod coord_sync;
+pub mod intent;
+pub mod local_store;
+pub mod transport;
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value as JsonValue};
+use thiserror::Error;
+use uuid::Uuid;
+
+pub use intent::{Intent, IntentError};
+pub use transport::{DynTransport, Transport, TransportError, TransportHandle};
+
+// ---------------------------------------------------------------------------
+// Wire types — must match `coord.sessions` (snake_case enum variants, exact
+// variant set). Cross-reference: qontinui-coord/src/sessions.rs ~146-202.
+// ---------------------------------------------------------------------------
+
+/// Discriminator for a [`Session`]. Mirrors the `coord.sessions.session_kind`
+/// CHECK constraint and Phase 1's wire enum 1:1 — the runner serializes
+/// directly into the coord column.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    TerminalShell,
+    TerminalClaude,
+    Agentic,
+    Workflow,
+    Automation,
+    Debug,
+}
+
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::TerminalShell => "terminal_shell",
+            SessionKind::TerminalClaude => "terminal_claude",
+            SessionKind::Agentic => "agentic",
+            SessionKind::Workflow => "workflow",
+            SessionKind::Automation => "automation",
+            SessionKind::Debug => "debug",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "terminal_shell" => SessionKind::TerminalShell,
+            "terminal_claude" => SessionKind::TerminalClaude,
+            "agentic" => SessionKind::Agentic,
+            "workflow" => SessionKind::Workflow,
+            "automation" => SessionKind::Automation,
+            "debug" => SessionKind::Debug,
+            _ => return None,
+        })
+    }
+}
+
+/// Mirrors `coord.sessions.state` CHECK constraint and Phase 1 wire enum
+/// 1:1.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Active,
+    PendingResolution,
+    Stale,
+    Closed,
+}
+
+impl SessionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionState::Active => "active",
+            SessionState::PendingResolution => "pending_resolution",
+            SessionState::Stale => "stale",
+            SessionState::Closed => "closed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "active" => SessionState::Active,
+            "pending_resolution" => SessionState::PendingResolution,
+            "stale" => SessionState::Stale,
+            "closed" => SessionState::Closed,
+            _ => return None,
+        })
+    }
+}
+
+/// Event kinds published on `qontinui.sessions.<tenant>.<machine>.<kind>`.
+/// Mirrors Phase 1 wire enum 1:1 — `OutputChunk` (Phase 8) and
+/// `HandoffRequest` (Phase 7) are pre-declared for stable wire shape.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEventKind {
+    Started,
+    StateChange,
+    Closed,
+    Heartbeat,
+    ClaimStolen,
+    /// Phase 8 — defined now, published when PTY streaming lands.
+    OutputChunk,
+    /// Phase 7 — defined now, published when handoff lands.
+    HandoffRequest,
+}
+
+impl SessionEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionEventKind::Started => "started",
+            SessionEventKind::StateChange => "state_change",
+            SessionEventKind::Closed => "closed",
+            SessionEventKind::Heartbeat => "heartbeat",
+            SessionEventKind::ClaimStolen => "claim_stolen",
+            SessionEventKind::OutputChunk => "output_chunk",
+            SessionEventKind::HandoffRequest => "handoff_request",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session + SessionHandle
+// ---------------------------------------------------------------------------
+
+/// Errors raised by the [`Session`] lifecycle.
+#[derive(Debug, Error)]
+pub enum SessionError {
+    #[error("invalid intent: {0}")]
+    Intent(#[from] IntentError),
+    #[error("transport error: {0}")]
+    Transport(#[from] TransportError),
+    #[error("steal reason too short ({got} < {min} chars)")]
+    StealReasonTooShort { got: usize, min: usize },
+    #[error("session not found: {0}")]
+    NotFound(Uuid),
+    #[error("local outbox error: {0}")]
+    Outbox(String),
+}
+
+/// Minimum chars on a steal reason — plan §D14.
+pub const MIN_STEAL_REASON_CHARS: usize = 10;
+
+/// Description of an existing session, returned by [`SessionHandle::describe`]
+/// and the `session_describe` Tauri command. Mirrors the subset of
+/// `SessionRow` the frontend needs (tenant + device omitted — those are
+/// constant per machine and the frontend already knows them).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDescription {
+    pub id: Uuid,
+    pub kind: SessionKind,
+    pub state: SessionState,
+    pub intent: Intent,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub closed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub parent_session_id: Option<Uuid>,
+    pub transport_handle_kind: &'static str,
+}
+
+/// Internal record stored in [`SessionRegistry`]. The transport is held as
+/// an `Arc<dyn Transport>` so the handle methods can route back to it
+/// without going through a global lookup.
+struct SessionRecord {
+    id: Uuid,
+    kind: SessionKind,
+    state: SessionState,
+    intent: Intent,
+    started_at: chrono::DateTime<chrono::Utc>,
+    last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    closed_at: Option<chrono::DateTime<chrono::Utc>>,
+    parent_session_id: Option<Uuid>,
+    transport: DynTransport,
+    transport_handle: TransportHandle,
+}
+
+impl SessionRecord {
+    fn describe(&self) -> SessionDescription {
+        SessionDescription {
+            id: self.id,
+            kind: self.kind,
+            state: self.state,
+            intent: self.intent.clone(),
+            started_at: self.started_at,
+            last_heartbeat_at: self.last_heartbeat_at,
+            closed_at: self.closed_at,
+            parent_session_id: self.parent_session_id,
+            transport_handle_kind: match &self.transport_handle {
+                TransportHandle::Pty { .. } => "pty",
+                TransportHandle::ClaudeCli { .. } => "claude_cli",
+                TransportHandle::Workflow { .. } => "workflow",
+            },
+        }
+    }
+}
+
+/// Process-wide registry of live sessions. Owns the in-memory map keyed by
+/// session UUID. Stored in Tauri state via `Arc<SessionRegistry>` and
+/// reached from the `commands::session` plugin.
+pub struct SessionRegistry {
+    machine_id: Uuid,
+    sessions: Mutex<HashMap<Uuid, SessionRecord>>,
+    transports: SessionTransports,
+    coord_sync: coord_sync::CoordSync,
+}
+
+/// Bag of per-kind transports.
+pub struct SessionTransports {
+    pub pty: DynTransport,
+    pub claude_cli: DynTransport,
+    pub workflow: DynTransport,
+}
+
+impl SessionTransports {
+    fn pick(&self, kind: SessionKind) -> DynTransport {
+        match kind {
+            SessionKind::TerminalShell => self.pty.clone(),
+            SessionKind::TerminalClaude | SessionKind::Agentic => self.claude_cli.clone(),
+            SessionKind::Workflow | SessionKind::Automation | SessionKind::Debug => {
+                self.workflow.clone()
+            }
+        }
+    }
+}
+
+impl SessionRegistry {
+    pub fn new(
+        machine_id: Uuid,
+        transports: SessionTransports,
+        coord_sync: coord_sync::CoordSync,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            machine_id,
+            sessions: Mutex::new(HashMap::new()),
+            transports,
+            coord_sync,
+        })
+    }
+
+    pub fn machine_id(&self) -> Uuid {
+        self.machine_id
+    }
+
+    /// Start a new session. Plan §D1 single-constructor surface.
+    pub fn start(self: &Arc<Self>, intent: Intent) -> Result<SessionHandle, SessionError> {
+        intent.validate()?;
+
+        let transport = self.transports.pick(intent.kind);
+        let transport_handle = transport.start(&intent)?;
+
+        let id = uuid_v7();
+        let now = chrono::Utc::now();
+
+        let record = SessionRecord {
+            id,
+            kind: intent.kind,
+            state: SessionState::Active,
+            intent: intent.clone(),
+            started_at: now,
+            last_heartbeat_at: Some(now),
+            closed_at: None,
+            parent_session_id: None,
+            transport: transport.clone(),
+            transport_handle,
+        };
+
+        // Outbox row first (durability before in-memory commit so a crash
+        // between insert and outbox-write doesn't lose the record).
+        let payload = json!({
+            "id": id,
+            "kind": intent.kind.as_str(),
+            "intent": intent,
+            "state": SessionState::Active.as_str(),
+            "started_at": now,
+        });
+        self.coord_sync
+            .outbox()
+            .record(self.machine_id, id, SessionEventKind::Started, payload)
+            .map_err(|e| SessionError::Outbox(e.to_string()))?;
+
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry poisoned");
+        sessions.insert(id, record);
+
+        Ok(SessionHandle {
+            id,
+            registry: Arc::clone(self),
+        })
+    }
+
+    fn with_record<R>(
+        &self,
+        id: Uuid,
+        f: impl FnOnce(&mut SessionRecord) -> R,
+    ) -> Result<R, SessionError> {
+        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+        match sessions.get_mut(&id) {
+            Some(rec) => Ok(f(rec)),
+            None => Err(SessionError::NotFound(id)),
+        }
+    }
+
+    fn describe(&self, id: Uuid) -> Result<SessionDescription, SessionError> {
+        let sessions = self.sessions.lock().expect("session registry poisoned");
+        sessions
+            .get(&id)
+            .map(SessionRecord::describe)
+            .ok_or(SessionError::NotFound(id))
+    }
+
+    fn list_all(&self) -> Vec<SessionDescription> {
+        let sessions = self.sessions.lock().expect("session registry poisoned");
+        sessions.values().map(SessionRecord::describe).collect()
+    }
+
+    fn close(&self, id: Uuid) -> Result<(), SessionError> {
+        // Snapshot the transport handle + transport ref under the lock,
+        // then drop the lock before calling transport.close (which may
+        // block on subprocess teardown).
+        let (transport, handle, payload) = {
+            let mut sessions = self.sessions.lock().expect("session registry poisoned");
+            let rec = sessions.get_mut(&id).ok_or(SessionError::NotFound(id))?;
+            if matches!(rec.state, SessionState::Closed) {
+                return Ok(()); // idempotent
+            }
+            rec.state = SessionState::Closed;
+            rec.closed_at = Some(chrono::Utc::now());
+            let payload = json!({
+                "id": id,
+                "state": SessionState::Closed.as_str(),
+                "closed_at": rec.closed_at,
+            });
+            // We must clone the transport + handle out of the record so we
+            // can drop the lock before close (close may take a while).
+            let transport = Arc::clone(&rec.transport);
+            let handle = clone_transport_handle(&rec.transport_handle);
+            (transport, handle, payload)
+        };
+
+        let close_result = transport.close(&handle);
+
+        // Outbox the close event regardless of transport close result —
+        // the dashboard wants to know we tried to close even if the
+        // subprocess was already dead.
+        if let Err(e) = self.coord_sync.outbox().record(
+            self.machine_id,
+            id,
+            SessionEventKind::Closed,
+            payload,
+        ) {
+            tracing::warn!("session {} close outbox write failed: {}", id, e);
+        }
+
+        close_result?;
+        Ok(())
+    }
+
+    /// Plan §D14 — steal-with-reason. Min 10 chars. Records a
+    /// `claim_stolen` event in the outbox; the actual claim release is
+    /// driven by `agent_claims` / coord and lands in Phase 6.
+    fn steal(&self, id: Uuid, reason: &str) -> Result<(), SessionError> {
+        if reason.chars().count() < MIN_STEAL_REASON_CHARS {
+            return Err(SessionError::StealReasonTooShort {
+                got: reason.chars().count(),
+                min: MIN_STEAL_REASON_CHARS,
+            });
+        }
+        // Confirm the session exists (so we don't write phantom events
+        // for unknown ids).
+        let _ = self.describe(id)?;
+
+        let payload = json!({
+            "id": id,
+            "reason": reason,
+            "stolen_at": chrono::Utc::now(),
+        });
+        self.coord_sync
+            .outbox()
+            .record(self.machine_id, id, SessionEventKind::ClaimStolen, payload)
+            .map_err(|e| SessionError::Outbox(e.to_string()))?;
+        Ok(())
+    }
+
+    /// "Focus" surfaces in Phase 4 as a frontend event — currently a
+    /// no-op stub that records a `state_change` heartbeat-like event so
+    /// the dashboard sees the operator paying attention.
+    fn focus(&self, id: Uuid) -> Result<(), SessionError> {
+        let now = chrono::Utc::now();
+        self.with_record(id, |rec| {
+            rec.last_heartbeat_at = Some(now);
+        })?;
+        let payload = json!({
+            "id": id,
+            "kind": "focus",
+            "at": now,
+        });
+        self.coord_sync
+            .outbox()
+            .record(self.machine_id, id, SessionEventKind::StateChange, payload)
+            .map_err(|e| SessionError::Outbox(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Borrow the coord-sync facade. Phase 3 will use this to drive the
+    /// drain loop from main.rs.
+    pub fn coord_sync(&self) -> &coord_sync::CoordSync {
+        &self.coord_sync
+    }
+
+    /// Read-only snapshot of all sessions. Used by the
+    /// `commands::session::session_list` Tauri command and by tests.
+    pub fn snapshot(&self) -> Vec<SessionDescription> {
+        self.list_all()
+    }
+
+    /// Describe-by-id surface used by the Tauri command layer (which
+    /// holds `tauri::State<Arc<SessionRegistry>>` and does not have a
+    /// [`SessionHandle`]).
+    pub fn describe_by_id(&self, id: Uuid) -> Result<SessionDescription, SessionError> {
+        self.describe(id)
+    }
+
+    /// Close-by-id — same idempotent semantics as
+    /// [`SessionHandle::close`].
+    pub fn close_by_id(&self, id: Uuid) -> Result<(), SessionError> {
+        self.close(id)
+    }
+
+    /// Focus-by-id surface for the Tauri command layer.
+    pub fn focus_by_id(&self, id: Uuid) -> Result<(), SessionError> {
+        self.focus(id)
+    }
+
+    /// Steal-by-id surface for the Tauri command layer.
+    pub fn steal_by_id(&self, id: Uuid, reason: &str) -> Result<(), SessionError> {
+        self.steal(id, reason)
+    }
+}
+
+fn clone_transport_handle(h: &TransportHandle) -> TransportHandle {
+    match h {
+        TransportHandle::Pty { terminal_id } => TransportHandle::Pty {
+            terminal_id: terminal_id.clone(),
+        },
+        TransportHandle::ClaudeCli { cli_session_id } => TransportHandle::ClaudeCli {
+            cli_session_id: cli_session_id.clone(),
+        },
+        TransportHandle::Workflow { task_run_id } => TransportHandle::Workflow {
+            task_run_id: task_run_id.clone(),
+        },
+    }
+}
+
+/// Lightweight handle returned to the caller of [`SessionRegistry::start`].
+/// Holds an Arc back to the registry so subsequent ops can find the
+/// record by id.
+#[derive(Clone)]
+pub struct SessionHandle {
+    id: Uuid,
+    registry: Arc<SessionRegistry>,
+}
+
+impl SessionHandle {
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    /// Render the current session state for the Tauri layer / dashboard.
+    pub fn describe(&self) -> Result<SessionDescription, SessionError> {
+        self.registry.describe(self.id)
+    }
+
+    /// Tear the session down. Idempotent.
+    pub fn close(self) -> Result<(), SessionError> {
+        self.registry.close(self.id)
+    }
+
+    /// Phase 4 "Focus this session" command — heartbeats the session
+    /// row so the dashboard knows the operator is on it.
+    pub fn focus(&self) -> Result<(), SessionError> {
+        self.registry.focus(self.id)
+    }
+
+    /// Plan §D14 — initiate a claim-steal with a typed reason.
+    pub fn steal(&self, reason: &str) -> Result<(), SessionError> {
+        self.registry.steal(self.id, reason)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// UUIDv7 (time-ordered) for session ids. Plan §Phase 2 calls UUIDv7 out
+/// explicitly so the runner-local outbox row sorts naturally with the
+/// coord row — UUIDv4 would still work for correctness but defeats the
+/// `(machine_id, session_id, seq)` "time-ordered" intuition.
+fn uuid_v7() -> Uuid {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ts = uuid::Timestamp::from_unix(uuid::NoContext, now.as_secs(), now.subsec_nanos());
+    Uuid::new_v7(ts)
+}
+
+/// Convert a [`JsonValue`] payload into a [`SessionDescription`]. Used by
+/// `commands::session::session_describe` to thread the registry response
+/// through the Tauri `CommandResponse` envelope without `serde_json::to_value`
+/// at the call site.
+pub fn description_to_json(desc: &SessionDescription) -> JsonValue {
+    serde_json::to_value(desc).unwrap_or(JsonValue::Null)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In-memory transport that records every call for test inspection.
+    /// Doesn't talk to a real PTY / subprocess — that's the point: tests
+    /// should not depend on Tauri runtime, OS shells, or external
+    /// processes.
+    struct FakeTransport {
+        kind_filter: SessionKind,
+        starts: AtomicUsize,
+        writes: AtomicUsize,
+        resizes: AtomicUsize,
+        closes: AtomicUsize,
+    }
+
+    impl FakeTransport {
+        fn new(kind_filter: SessionKind) -> Self {
+            Self {
+                kind_filter,
+                starts: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+                resizes: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Transport for FakeTransport {
+        fn start(&self, intent: &Intent) -> Result<TransportHandle, TransportError> {
+            if intent.kind != self.kind_filter {
+                return Err(TransportError::InvalidIntent(format!(
+                    "fake transport wants {:?}, got {:?}",
+                    self.kind_filter, intent.kind
+                )));
+            }
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(TransportHandle::Pty {
+                terminal_id: "fake-1".to_string(),
+            })
+        }
+        fn write_input(
+            &self,
+            _h: &TransportHandle,
+            _b: &[u8],
+        ) -> Result<(), TransportError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn resize(
+            &self,
+            _h: &TransportHandle,
+            _c: u16,
+            _r: u16,
+        ) -> Result<(), TransportError> {
+            self.resizes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn close(&self, _h: &TransportHandle) -> Result<(), TransportError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn make_registry() -> Arc<SessionRegistry> {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap(),
+        );
+        let coord_sync = coord_sync::CoordSync::new(outbox);
+
+        let pty = Arc::new(FakeTransport::new(SessionKind::TerminalShell)) as DynTransport;
+        let claude_cli =
+            Arc::new(FakeTransport::new(SessionKind::TerminalClaude)) as DynTransport;
+        let workflow = Arc::new(FakeTransport::new(SessionKind::Workflow)) as DynTransport;
+
+        SessionRegistry::new(
+            Uuid::new_v4(),
+            SessionTransports {
+                pty,
+                claude_cli,
+                workflow,
+            },
+            coord_sync,
+        )
+    }
+
+    fn shell_intent() -> Intent {
+        Intent {
+            kind: SessionKind::TerminalShell,
+            purpose: "smoke test".into(),
+            repo: None,
+            branch: None,
+            declared_paths: vec![],
+            share_output: false,
+            redact_secrets: None,
+        }
+    }
+
+    #[test]
+    fn session_kind_round_trips_snake_case() {
+        for k in [
+            SessionKind::TerminalShell,
+            SessionKind::TerminalClaude,
+            SessionKind::Agentic,
+            SessionKind::Workflow,
+            SessionKind::Automation,
+            SessionKind::Debug,
+        ] {
+            let json = serde_json::to_string(&k).unwrap();
+            let back: SessionKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(k, back);
+            // The serialized form must be the same string SessionKind::as_str
+            // returns — coord matches on these literals.
+            assert_eq!(json.trim_matches('"'), k.as_str());
+        }
+    }
+
+    #[test]
+    fn session_state_round_trips_snake_case() {
+        for s in [
+            SessionState::Active,
+            SessionState::PendingResolution,
+            SessionState::Stale,
+            SessionState::Closed,
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            let back: SessionState = serde_json::from_str(&json).unwrap();
+            assert_eq!(s, back);
+            assert_eq!(json.trim_matches('"'), s.as_str());
+        }
+    }
+
+    #[test]
+    fn session_event_kind_round_trips_snake_case() {
+        let kinds = [
+            SessionEventKind::Started,
+            SessionEventKind::StateChange,
+            SessionEventKind::Closed,
+            SessionEventKind::Heartbeat,
+            SessionEventKind::ClaimStolen,
+            SessionEventKind::OutputChunk,
+            SessionEventKind::HandoffRequest,
+        ];
+        for k in kinds {
+            let json = serde_json::to_string(&k).unwrap();
+            let back: SessionEventKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(k, back);
+            assert_eq!(json.trim_matches('"'), k.as_str());
+        }
+    }
+
+    #[test]
+    fn lifecycle_start_describe_close() {
+        let reg = make_registry();
+        let handle = reg.start(shell_intent()).unwrap();
+        let desc = handle.describe().unwrap();
+        assert_eq!(desc.kind, SessionKind::TerminalShell);
+        assert_eq!(desc.state, SessionState::Active);
+        assert_eq!(desc.intent.purpose, "smoke test");
+        assert!(desc.closed_at.is_none());
+
+        let id = handle.id();
+        handle.close().unwrap();
+
+        let again = reg.describe(id).unwrap();
+        assert_eq!(again.state, SessionState::Closed);
+        assert!(again.closed_at.is_some());
+    }
+
+    #[test]
+    fn close_is_idempotent() {
+        let reg = make_registry();
+        let handle = reg.start(shell_intent()).unwrap();
+        let id = handle.id();
+        handle.clone().close().unwrap();
+        // Second close — no panic, no error.
+        reg.close(id).unwrap();
+    }
+
+    #[test]
+    fn start_rejects_invalid_intent() {
+        let reg = make_registry();
+        let mut intent = shell_intent();
+        intent.purpose = "x".into();
+        let err = reg.start(intent).unwrap_err();
+        assert!(matches!(err, SessionError::Intent(_)));
+    }
+
+    #[test]
+    fn steal_requires_long_reason() {
+        let reg = make_registry();
+        let handle = reg.start(shell_intent()).unwrap();
+        let err = handle.steal("short").unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::StealReasonTooShort { got, min }
+            if got == 5 && min == MIN_STEAL_REASON_CHARS
+        ));
+        // Exact-min-chars reason is accepted.
+        handle.steal("1234567890").unwrap();
+    }
+
+    #[test]
+    fn focus_heartbeats_session() {
+        let reg = make_registry();
+        let handle = reg.start(shell_intent()).unwrap();
+        let before = handle.describe().unwrap().last_heartbeat_at;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        handle.focus().unwrap();
+        let after = handle.describe().unwrap().last_heartbeat_at;
+        assert!(after > before);
+    }
+
+    #[test]
+    fn snapshot_lists_all_sessions() {
+        let reg = make_registry();
+        let _a = reg.start(shell_intent()).unwrap();
+        let _b = reg.start(shell_intent()).unwrap();
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn transports_pick_routes_by_kind() {
+        // FakeTransport rejects non-matching kinds, so this proves the
+        // router picked the right transport.
+        let reg = make_registry();
+
+        let mut shell = shell_intent();
+        shell.kind = SessionKind::TerminalShell;
+        reg.start(shell).unwrap();
+
+        let mut claude = shell_intent();
+        claude.kind = SessionKind::TerminalClaude;
+        reg.start(claude).unwrap();
+
+        let mut wf = shell_intent();
+        wf.kind = SessionKind::Workflow;
+        reg.start(wf).unwrap();
+    }
+
+    #[test]
+    fn description_serializes_with_snake_case_enums() {
+        let reg = make_registry();
+        let handle = reg.start(shell_intent()).unwrap();
+        let desc = handle.describe().unwrap();
+        let json = serde_json::to_value(&desc).unwrap();
+        assert_eq!(json["kind"], "terminal_shell");
+        assert_eq!(json["state"], "active");
+    }
+}
