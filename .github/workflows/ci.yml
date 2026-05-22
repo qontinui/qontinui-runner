@@ -68,9 +68,15 @@ jobs:
           cache: "pnpm"
           cache-dependency-path: pnpm-lock.yaml
 
+      # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
+      # file overrides any other channel for every cargo invocation, so the
+      # rustfmt/clippy components must be installed for 1.95.0 specifically —
+      # otherwise `cargo fmt`/`cargo clippy` auto-switch to a component-less
+      # 1.95.0 and fail with "'cargo-fmt' is not installed".
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.95.0"
           components: rustfmt, clippy
 
       - name: Install dependencies (Ubuntu)
