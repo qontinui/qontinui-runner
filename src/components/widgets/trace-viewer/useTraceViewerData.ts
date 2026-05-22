@@ -11,7 +11,16 @@ async function fetchExecutionSpans(executionId: string): Promise<TraceSpan[]> {
   if (!response.ok) {
     throw new Error(`Failed to fetch spans: ${response.statusText}`);
   }
-  return response.json();
+  // The runner endpoint returns an envelope `{ count, filters, spans }`,
+  // not a bare array. Earlier consumers passed the envelope straight through,
+  // which slipped past TS (no runtime check) and surfaced as
+  // `spans is not iterable` inside computeInsights() when TraceViewerWidget
+  // was rendered for an empty/non-array shape. Unwrap defensively: accept
+  // either the envelope or a bare array, default to [].
+  const body = await response.json();
+  if (Array.isArray(body)) return body;
+  if (body && Array.isArray(body.spans)) return body.spans;
+  return [];
 }
 
 /** Hook to fetch execution spans for a task run. */
