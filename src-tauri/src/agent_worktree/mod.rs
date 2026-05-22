@@ -867,14 +867,19 @@ pub async fn allocate_and_materialize_with_claim(
 /// Convert a `ws://` or `wss://` coord URL into the matching HTTP base.
 /// Profiles store `coord_url` as a WebSocket URL because the `/ws`
 /// endpoint is the dominant runner-side use case; HTTP callers (this
-/// module, build_events POSTs) flip the scheme.
+/// module, build_events POSTs, fleet-health panel) flip the scheme AND
+/// strip the trailing `/ws` so paths like `/coord/fleet/health` don't
+/// get appended onto the WS upgrade path (which JWT-rejects with 401).
+/// Mirrors the supervisor's resolver at
+/// `qontinui-supervisor/src/fleet.rs::coord_http_base`.
 pub fn coord_ws_to_http(coord_url: &str) -> String {
-    if let Some(rest) = coord_url.strip_prefix("ws://") {
+    let trimmed = coord_url.trim_end_matches('/').trim_end_matches("/ws");
+    if let Some(rest) = trimmed.strip_prefix("ws://") {
         format!("http://{}", rest)
-    } else if let Some(rest) = coord_url.strip_prefix("wss://") {
+    } else if let Some(rest) = trimmed.strip_prefix("wss://") {
         format!("https://{}", rest)
     } else {
-        coord_url.to_string()
+        trimmed.to_string()
     }
 }
 
@@ -901,6 +906,22 @@ mod tests {
         assert_eq!(coord_ws_to_http("wss://h:9870"), "https://h:9870");
         assert_eq!(coord_ws_to_http("http://h:9870"), "http://h:9870");
         assert_eq!(coord_ws_to_http("https://h:9870"), "https://h:9870");
+    }
+
+    #[test]
+    fn coord_ws_to_http_strips_ws_suffix() {
+        // The dominant profile shape is `ws://host:port/ws` — the
+        // resolver MUST strip `/ws` so callers building
+        // `format!("{base}/coord/fleet/health")` don't end up at
+        // `/ws/coord/fleet/health` (the WS upgrade path, which 401s).
+        assert_eq!(coord_ws_to_http("ws://h:9870/ws"), "http://h:9870");
+        assert_eq!(coord_ws_to_http("wss://h:9870/ws"), "https://h:9870");
+        assert_eq!(coord_ws_to_http("http://h:9870/ws"), "http://h:9870");
+        // Trailing-slash tolerance: `ws://h:9870/ws/` collapses too.
+        assert_eq!(coord_ws_to_http("ws://h:9870/ws/"), "http://h:9870");
+        // Bare trailing slash (no `/ws`) is also stripped so callers
+        // don't double-slash when appending a path.
+        assert_eq!(coord_ws_to_http("ws://h:9870/"), "http://h:9870");
     }
 
     #[test]
