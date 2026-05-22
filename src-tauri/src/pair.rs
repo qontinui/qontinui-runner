@@ -259,13 +259,22 @@ pub fn pair_with_auth_token(base: &str, oauth_token: &str) -> Result<PairComplet
 /// Phase 5 of the unified-devices migration introduced this split so the
 /// E2E pair tests can target an in-process mock coord without mutating
 /// (or relying on) per-user files.
+///
+/// Routes through the web backend at `{base}/api/v1/devices/pair-cli`,
+/// not coord directly. The web backend is the only component allowed to
+/// resolve `tenant_id` from the authenticated user — coord's pair-cli
+/// requires `tenant_id` as of the 2026-05-20
+/// default-tenant-propagation plan, and threading that through the
+/// runner would leak tenancy concerns into a layer that doesn't need
+/// them. Callers pass the web-backend base URL (e.g.
+/// `http://127.0.0.1:8000`), NOT the coord URL.
 pub fn pair_with_auth_token_with_ids(
     base: &str,
     oauth_token: &str,
     device_id: &str,
     user_id: &str,
 ) -> Result<PairCompleteResponse, String> {
-    let url = format!("{}/coord/devices/pair-cli", base);
+    let url = format!("{}/api/v1/devices/pair-cli", base);
     let body = serde_json::json!({
         "device_id": device_id,
         "hostname":  detect_hostname(),
