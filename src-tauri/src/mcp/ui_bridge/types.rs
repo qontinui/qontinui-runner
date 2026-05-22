@@ -153,6 +153,8 @@ pub enum UiBridgeErrorCode {
     // Assertion errors
     AssertionFailed,
     UnknownAssertionType,
+    // Request-shape errors (rejected upstream of any IPC/recovery flow)
+    InvalidRequest,
     // System errors
     InternalError,
 }
@@ -232,6 +234,26 @@ impl UiBridgeError {
             message: format!("No element found matching criteria {}", selector),
             recovery: Some(RecoveryHint::Resnapshot),
             context: Some(serde_json::json!({"selector": selector})),
+        }
+    }
+
+    /// Reject an unknown action name BEFORE any IPC / RecoveryExecutor flow
+    /// can synthesize a misleading success. Mirrors the `tab/activate` ->
+    /// `knownTabs` prior art: hint carries the full supported-action list so
+    /// callers can self-correct without an extra round-trip.
+    pub fn invalid_action(unknown: &str, supported: &[&str]) -> Self {
+        Self {
+            code: UiBridgeErrorCode::InvalidRequest,
+            message: format!(
+                "Unknown action '{}'. Supported actions: {}",
+                unknown,
+                supported.join(", ")
+            ),
+            recovery: Some(RecoveryHint::Unrecoverable),
+            context: Some(serde_json::json!({
+                "action": unknown,
+                "supportedActions": supported,
+            })),
         }
     }
 
@@ -337,6 +359,7 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
         UiBridgeErrorCode::ActionFailed => RecoveryHint::Resnapshot,
         UiBridgeErrorCode::AssertionFailed => RecoveryHint::BroadenSelector,
         UiBridgeErrorCode::UnknownAssertionType => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::InvalidRequest => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::InternalError => RecoveryHint::Unrecoverable,
     }
 }
