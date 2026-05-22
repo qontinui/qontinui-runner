@@ -493,6 +493,12 @@ fn paired_user_path() -> Option<PathBuf> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PairedUserFile {
     user_id: String,
+    /// Mirror of `qontinui_runner_lib::pair::PairedUserFile::tenant_id`.
+    /// `#[serde(default)]` keeps legacy files (user_id-only) parsing.
+    /// The CLI bootstrap (`register_with_coord`) forwards this to coord
+    /// on `POST /coord/devices/register`; absent → JWT-claim fallback.
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 fn load_paired_user_id() -> Option<String> {
@@ -500,6 +506,17 @@ fn load_paired_user_id() -> Option<String> {
     let bytes = std::fs::read(&path).ok()?;
     let parsed: PairedUserFile = serde_json::from_slice(&bytes).ok()?;
     Some(parsed.user_id)
+}
+
+/// Load `(user_id, tenant_id_opt)` from `paired_user.json`. Returns
+/// `None` if the file doesn't exist or isn't parseable. Phase 2 of the
+/// default-tenant-propagation plan — the CLI bootstrap needs both
+/// fields to satisfy coord's `tenant_id_required` gate.
+fn load_paired_user() -> Option<(String, Option<String>)> {
+    let path = paired_user_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let parsed: PairedUserFile = serde_json::from_slice(&bytes).ok()?;
+    Some((parsed.user_id, parsed.tenant_id))
 }
 
 fn cmd_device_path() -> ExitCode {
@@ -586,12 +603,41 @@ fn cmd_device_init(name_arg: Option<&str>) -> ExitCode {
     // machine.json is the canonical record; coord.devices is a derived view
     // (qontinui-coord re-syncs from machine.json on next /coord/status POST).
     let display_name = file.name.clone().unwrap_or_else(|| file.hostname.clone());
-    let paired_user_id = load_paired_user_id();
+    let paired = load_paired_user();
+    let (paired_user_id, paired_tenant_id) = match paired {
+        Some((uid, tid)) => (Some(uid), tid),
+        None => (None, None),
+    };
+    // Resolve tenant_id for the register payload (coord rejects with
+    // 400 `tenant_id_required` otherwise). Order: paired_user.json
+    // → cached device-token JWT claim → hard error. Matches the
+    // heartbeat resolution chain in `fleet::resolve_tenant_id`.
+    let tenant_id = match paired_tenant_id {
+        Some(s) => s,
+        None => {
+            let token = qontinui_runner_lib::auth::AuthManager::new()
+                .get_access_token()
+                .unwrap_or_default();
+            match tenant_id_from_oauth_claim(&token) {
+                Some(s) => s,
+                None => {
+                    eprintln!(
+                        "warning: cannot register with coord — tenant_id unresolvable. \
+                         Run `qontinui_profile device pair --tenant-id <uuid> [--auth-token <oauth>]` \
+                         first so coord knows which tenant owns this device.\n\
+                         (machine.json was still written.)"
+                    );
+                    return ExitCode::SUCCESS;
+                }
+            }
+        }
+    };
     match register_with_coord(
         &file.device_id,
         &file.hostname,
         &display_name,
         paired_user_id.as_deref(),
+        &tenant_id,
     ) {
         Ok(()) => {
             println!("registered with coord via HTTP (POST /coord/devices/register)");
@@ -765,7 +811,7 @@ fn cmd_device_pair(
     };
     match result {
         Ok(resp) => {
-            if let Err(e) = persist_pairing(&resp) {
+            if let Err(e) = persist_pairing(&resp, tenant_id) {
                 eprintln!(
                     "error: pairing succeeded but persisting locally failed: {}",
                     e
@@ -811,6 +857,7 @@ fn register_with_coord(
     hostname: &str,
     name: &str,
     user_id: Option<&str>,
+    tenant_id: &str,
 ) -> Result<(), String> {
     // Validate UUID shape up front so a malformed machine.json fails fast
     // with a clear error instead of bouncing off a 400 from coord.
@@ -820,12 +867,18 @@ fn register_with_coord(
         uuid::Uuid::parse_str(uid)
             .map_err(|e| format!("paired user_id is not a valid UUID: {}", e))?;
     }
+    let _ = uuid::Uuid::parse_str(tenant_id)
+        .map_err(|e| format!("tenant_id is not a valid UUID: {}", e))?;
     let base = coord_http_base()?;
     let url = format!("{}/coord/devices/register", base);
     // `device_id` is the canonical name in coord.devices. We also emit
     // `machine_id` as a duplicate alias key for back-compat with a Phase-2
     // coord that still reads the old name — the field is removed once
     // Phase 2 is merged everywhere.
+    //
+    // `tenant_id` is REQUIRED by coord's `post_device_register` handler
+    // (`routes_phase3.rs:257-269` returns `400 tenant_id_required`
+    // otherwise). Phase 2 of the default-tenant-propagation plan.
     let body = serde_json::json!({
         "device_id":    device_id,
         "machine_id":   device_id,
@@ -835,6 +888,7 @@ fn register_with_coord(
         "os_version":   detect_os_version(),
         "capabilities": vec!["runner".to_string()],
         "user_id":      user_id,
+        "tenant_id":    tenant_id,
         "health_url":   serde_json::Value::Null,
     });
     let client = reqwest::blocking::Client::builder()
