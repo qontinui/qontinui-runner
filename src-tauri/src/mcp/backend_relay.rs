@@ -42,9 +42,9 @@
 //! migration); it is owned by the refresher's outbound HTTP to coord's
 //! pair-cli endpoint.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
@@ -143,6 +143,24 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// so we can detect dead/half-open connections faster than the heartbeat
 /// cadence would.
 const KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Maximum interval between inbound frames before we declare the WS dead
+/// and force a reconnect. Set to ~2.25x `KEEPALIVE_PING_INTERVAL` so a
+/// single missed pong is tolerated (network jitter) but two consecutive
+/// silent pings trip the reconnect. Without this gate, a half-open TCP
+/// session (server gone, runner still buffering Ping frames into a kernel
+/// send queue that hasn't yet faulted) keeps `wsConnected=true` on the
+/// runner side indefinitely while the backend's `device.ws_session_id`
+/// has long since been cleared by the cleanup task — the exact
+/// false-positive observed in 2026-05-22.
+const STALE_INBOUND_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// State for the backend relay client.
 pub struct BackendRelayState {
@@ -385,8 +403,17 @@ async fn relay_loop(
                 let state_heartbeat = api_state.clone();
                 let mut shutdown_clone = shutdown_rx.clone();
 
+                // Shared "last inbound frame at" epoch-ms, updated by the
+                // inbound handler on every received frame (Text, Ping, Pong,
+                // Binary, ...) and read by the keepalive pinger to detect a
+                // half-open TCP where local sends keep buffering successfully
+                // but nothing comes back from the server.
+                let last_inbound_ms = Arc::new(AtomicU64::new(now_epoch_ms()));
+                let last_inbound_inbound = last_inbound_ms.clone();
+                let last_inbound_keepalive = last_inbound_ms.clone();
+
                 tokio::select! {
-                    _ = handle_inbound(read, state_inbound, write_inbound) => {
+                    _ = handle_inbound(read, state_inbound, write_inbound, last_inbound_inbound) => {
                         warn!("Backend relay inbound handler ended");
                     }
                     _ = handle_outbound(&mut event_rx, write_outbound, state_outbound) => {
@@ -395,7 +422,7 @@ async fn relay_loop(
                     _ = run_heartbeat_sender(state_heartbeat, write_heartbeat) => {
                         warn!("Backend relay heartbeat sender ended");
                     }
-                    _ = run_keepalive_pinger(write_keepalive) => {
+                    _ = run_keepalive_pinger(write_keepalive, last_inbound_keepalive) => {
                         warn!("Backend relay keepalive detected dead connection");
                     }
                     _ = shutdown_clone.changed() => {
@@ -534,10 +561,19 @@ async fn handle_inbound<S>(
     write: Arc<
         Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
     >,
+    last_inbound_ms: Arc<AtomicU64>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     while let Some(msg_result) = read.next().await {
+        // Any inbound frame (including Pong, which we otherwise discard
+        // below) is proof the server is reachable. Stamp the shared
+        // timestamp before doing anything else so the keepalive pinger's
+        // staleness check stays accurate even when the read side is
+        // ahead of the message-routing code.
+        if msg_result.is_ok() {
+            last_inbound_ms.store(now_epoch_ms(), Ordering::Relaxed);
+        }
         match msg_result {
             Ok(Message::Text(text)) => match serde_json::from_str::<Value>(&text) {
                 Ok(data) => {
@@ -593,8 +629,15 @@ async fn handle_inbound<S>(
 /// shape is:
 ///
 /// ```json
-/// {"type": "connected", "runner_id": "<uuid>"}
+/// {"type": "connected", "device_id": "<uuid>"}
 /// ```
+///
+/// The backend's `/api/v1/devices/ws` handler sends `device_id` (post the
+/// 2026-05 unify-runner-concepts migration); this module historically
+/// only read `runner_id`, which left `runnerId: null` in
+/// `get_web_integration_status` forever and stymied any caller relying on
+/// it for routing. Accept either key so the relay is resilient to the
+/// backend's verbiage drift.
 async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
     let sm_state = match api_state.app_state.current_server_mode().await {
         Some(s) => s,
@@ -609,15 +652,20 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
 
     sm_state.set_ws_connected(true);
 
-    if let Some(rid_str) = data.get("runner_id").and_then(|v| v.as_str()) {
+    let id_str = data
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("runner_id").and_then(|v| v.as_str()));
+
+    if let Some(rid_str) = id_str {
         match Uuid::parse_str(rid_str) {
             Ok(rid) => {
                 sm_state.set_runner_id(rid).await;
-                info!("Backend assigned runner_id={}", rid);
+                info!("Backend assigned device/runner id={}", rid);
             }
             Err(e) => {
                 warn!(
-                    "Backend `connected` message had unparseable runner_id={}: {}",
+                    "Backend `connected` message had unparseable device/runner id={}: {}",
                     rid_str, e
                 );
             }
@@ -687,10 +735,19 @@ async fn run_heartbeat_sender<S>(
 /// Keepalive pinger. Sends a low-level Ping frame every 20s so we can
 /// detect dead/half-open TCP sessions even when the heartbeat send appears
 /// to succeed locally but the server-side socket has gone away.
+///
+/// Also gates on `last_inbound_ms`: if no frame has arrived from the
+/// server in `STALE_INBOUND_TIMEOUT`, declare the connection dead and
+/// return. The outer `tokio::select!` arm then drops the WS and the
+/// reconnect loop opens a fresh session. Without this check, a half-open
+/// TCP can keep `wsConnected=true` on the runner indefinitely while the
+/// backend has already cleared `device.ws_session_id` — the exact bug
+/// observed in 2026-05-22.
 async fn run_keepalive_pinger<S>(
     write: Arc<
         Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
     >,
+    last_inbound_ms: Arc<AtomicU64>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -698,6 +755,21 @@ async fn run_keepalive_pinger<S>(
     interval.tick().await;
     loop {
         interval.tick().await;
+
+        // Staleness check: if nothing has come from the server in
+        // STALE_INBOUND_TIMEOUT, force a reconnect.
+        let last = last_inbound_ms.load(Ordering::Relaxed);
+        let now = now_epoch_ms();
+        if now.saturating_sub(last) > STALE_INBOUND_TIMEOUT.as_millis() as u64 {
+            warn!(
+                "Backend relay keepalive: no inbound frame for {}ms (limit {}ms) — \
+                 connection appears half-open, forcing reconnect",
+                now.saturating_sub(last),
+                STALE_INBOUND_TIMEOUT.as_millis()
+            );
+            return;
+        }
+
         let mut w = write.lock().await;
         if let Err(e) = w.send(Message::Ping(vec![].into())).await {
             warn!("Keepalive ping failed: {}", e);
