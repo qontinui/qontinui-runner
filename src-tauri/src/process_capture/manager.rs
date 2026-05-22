@@ -129,6 +129,28 @@ impl ProcessCaptureManager {
             .get_mut(id)
             .ok_or_else(|| format!("Process '{}' not found", id))?;
 
+        // Loop B Item C — node-dependent process pre-flight.
+        //
+        // When a managed process invokes `npx next` (the Frontend Next.js
+        // dev service) or any `next`-based wrapper, the actual binary
+        // resolved is `<cwd>/node_modules/.bin/next`. With a broken
+        // pnpm-style install the `.pnpm/` tree can exist while the
+        // `.bin/` symlinks were never created — `npx` then falls through
+        // to PATH and emits the cryptic
+        // `'next' is not recognized as an internal or external command`,
+        // making it indistinguishable from "next was never installed"
+        // for the operator reading the Processes page.
+        //
+        // Fail-fast with an explicit, actionable message before spawning
+        // so the operator knows exactly what to fix.
+        if let Err(precheck_err) = preflight_node_bin_check(&process.config) {
+            warn!(
+                "start_process: pre-flight check rejected '{}': {}",
+                process.config.name, precheck_err
+            );
+            return Err(precheck_err);
+        }
+
         let msg_rx = process.start()?;
         let process_id = id.to_string();
         let process_name = process.config.name.clone();
@@ -1376,6 +1398,115 @@ impl ProcessCaptureManager {
     }
 }
 
+/// Loop B Item C — fail-fast pre-flight for node-dependent managed processes.
+///
+/// When the configured command is `npx`/`npm`/`pnpm`/`yarn` (or any direct
+/// `node_modules/.bin/<name>` invocation), the binary actually resolved at
+/// spawn time lives under `<cwd>/node_modules/.bin/`. A broken pnpm install
+/// can leave `<cwd>/node_modules/.pnpm/` populated while the `.bin/`
+/// symlinks were never created — `npx` then falls through to PATH and the
+/// child crashes with `'next' is not recognized` on Windows or
+/// `next: command not found` on Unix, which the operator cannot easily
+/// disambiguate from "next was never installed."
+///
+/// This pre-flight inspects the `command`+`args` to figure out which
+/// node-resolved binary the spawn expects, then verifies it exists under
+/// the configured `cwd/node_modules/.bin/`. When missing, returns
+/// `Err(...)` with the explicit fix-up command so the operator knows
+/// exactly what to run. Returns `Ok(())` when:
+///   - the process isn't a node-dependent invocation (no .bin lookup needed),
+///   - the expected `.bin/<name>` file exists,
+///   - the process's `cwd` doesn't have a `node_modules` directory yet
+///     (first-time install case — let the normal build path handle it).
+///
+/// Auto-heal was deliberately not chosen — silently masking a broken
+/// install accumulates state-drift; fail-fast surfaces it once.
+fn preflight_node_bin_check(config: &ProcessConfig) -> Result<(), String> {
+    let Some(bin_name) = expected_node_bin(config) else {
+        // Not a node-dependent invocation — nothing to pre-flight.
+        return Ok(());
+    };
+
+    let cwd = std::path::Path::new(&config.cwd);
+    let node_modules = cwd.join("node_modules");
+    if !node_modules.exists() {
+        // First-time install — `node_modules` itself missing is a clearer
+        // signal than ".bin/<x> missing" and the rebuild_enabled build
+        // command (e.g. `npx next build`) will surface it directly.
+        return Ok(());
+    }
+
+    let bin_dir = node_modules.join(".bin");
+    // Probe BOTH the bare name and the Windows shim variants
+    // (npm/pnpm/yarn emit either `.cmd` or `.ps1` wrappers on Windows).
+    #[cfg(windows)]
+    let candidates: [std::path::PathBuf; 3] = [
+        bin_dir.join(format!("{}.cmd", bin_name)),
+        bin_dir.join(format!("{}.ps1", bin_name)),
+        bin_dir.join(&bin_name),
+    ];
+    #[cfg(not(windows))]
+    let candidates: [std::path::PathBuf; 1] = [bin_dir.join(&bin_name)];
+
+    if candidates.iter().any(|p| p.exists()) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "frontend dependencies incomplete — node_modules/.bin/{name} not found at \
+         {bin_dir_disp}, run `npm install` in {cwd_disp}",
+        name = bin_name,
+        bin_dir_disp = bin_dir.display(),
+        cwd_disp = cwd.display(),
+    ))
+}
+
+/// Determine which `node_modules/.bin/<name>` a [`ProcessConfig`] expects
+/// to resolve at spawn time. Returns `None` when the command isn't a
+/// node-binary invocation we can pre-check.
+///
+/// Recognized shapes:
+///   - `command = "npx"`, args = `[<name>, ...]` → `Some(<name>)`
+///   - `command = "node_modules/.bin/<name>"` (relative) → `Some(<name>)`
+///   - `command = "<absolute>/node_modules/.bin/<name>"` → `Some(<name>)`
+///
+/// `npm run <script>` / `pnpm <script>` / `yarn <script>` are deliberately
+/// NOT pre-checked: the script body is in `package.json` and may invoke
+/// any number of binaries — pre-flighting would require parsing package.json
+/// and tracking which scripts our managed-process registry runs, which
+/// duplicates state the dev_services.rs config already encodes. We instead
+/// pin those configs to `npx <name>` in dev_services.rs (see the Frontend
+/// service block) so the pre-flight has a single shape to recognize.
+fn expected_node_bin(config: &ProcessConfig) -> Option<String> {
+    let cmd = config.command.trim();
+    if cmd.eq_ignore_ascii_case("npx") {
+        // First non-flag positional after the leading subcommand
+        // (npx supports `npx --quiet next dev`, etc.) is the binary name.
+        return config
+            .args
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .map(|s| s.to_string());
+    }
+    // Direct `.bin/<name>` invocations (relative or absolute). Match the
+    // bare segment so both `node_modules/.bin/<name>` (relative) and
+    // `<abs>/node_modules/.bin/<name>` shapes resolve.
+    let normalized = cmd.replace('\\', "/");
+    if let Some(idx) = normalized.rfind("node_modules/.bin/") {
+        let after = &normalized[idx + "node_modules/.bin/".len()..];
+        // Strip any platform shim suffix so the probe re-adds them all.
+        let stripped = after
+            .strip_suffix(".cmd")
+            .or_else(|| after.strip_suffix(".ps1"))
+            .or_else(|| after.strip_suffix(".exe"))
+            .unwrap_or(after);
+        if !stripped.is_empty() && !stripped.contains('/') {
+            return Some(stripped.to_string());
+        }
+    }
+    None
+}
+
 /// Pure resolution helper backing [`ProcessCaptureManager::resolve_process_id`].
 ///
 /// Each entry is `(id, name, category)`. Match precedence:
@@ -1474,5 +1605,190 @@ mod tests {
         // But the category itself is also ambiguous (both are "backend"),
         // so the category lookup also returns None.
         assert_eq!(resolve_process_id_from_entries(&e, "backend"), None);
+    }
+}
+
+#[cfg(test)]
+mod preflight_node_bin_tests {
+    //! Loop B Item C — fail-fast pre-flight for node-dependent processes.
+    //!
+    //! The pre-flight needs a real on-disk `cwd` because the broken-install
+    //! signal we're guarding against is the *absence* of a file inside
+    //! `<cwd>/node_modules/.bin/`. `tempfile::tempdir` (a dev-dep already
+    //! pulled in) gives us a per-test scratch directory with automatic
+    //! cleanup, so the tests are hermetic without mocking std::fs.
+    use super::{expected_node_bin, preflight_node_bin_check};
+    use crate::process_capture::types::*;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn npx_next_config(cwd: &Path) -> ProcessConfig {
+        ProcessConfig {
+            id: "test-frontend".to_string(),
+            name: "Frontend (Next.js)".to_string(),
+            command: "npx".to_string(),
+            args: vec![
+                "next".to_string(),
+                "dev".to_string(),
+                "--port".to_string(),
+                "3001".to_string(),
+            ],
+            cwd: cwd.to_string_lossy().to_string(),
+            env: HashMap::new(),
+            health_port: Some(3001),
+            parser: ParserType::JavaScript,
+            auto_start: true,
+            category: "frontend".to_string(),
+            buffer_size: 2000,
+            enabled: true,
+            ignore_patterns: vec![],
+            start_group: 1,
+            dev_only: true,
+            rebuild_enabled: true,
+            build_command: Some("npx".to_string()),
+            build_args: vec!["next".to_string(), "build".to_string()],
+        }
+    }
+
+    #[test]
+    fn expected_node_bin_npx_returns_first_positional() {
+        let tmp = tempdir().unwrap();
+        assert_eq!(
+            expected_node_bin(&npx_next_config(tmp.path())),
+            Some("next".to_string())
+        );
+    }
+
+    #[test]
+    fn expected_node_bin_npx_skips_flags_before_bin_name() {
+        // `npx --quiet next dev` should still resolve to `next`.
+        let tmp = tempdir().unwrap();
+        let mut cfg = npx_next_config(tmp.path());
+        cfg.args = vec![
+            "--quiet".to_string(),
+            "next".to_string(),
+            "dev".to_string(),
+        ];
+        assert_eq!(expected_node_bin(&cfg), Some("next".to_string()));
+    }
+
+    #[test]
+    fn expected_node_bin_direct_bin_path() {
+        let tmp = tempdir().unwrap();
+        let mut cfg = npx_next_config(tmp.path());
+        cfg.command = "node_modules/.bin/vite".to_string();
+        cfg.args = vec![];
+        assert_eq!(expected_node_bin(&cfg), Some("vite".to_string()));
+
+        // Absolute, with Windows shim suffix stripped.
+        cfg.command = "C:/proj/node_modules/.bin/next.cmd".to_string();
+        assert_eq!(expected_node_bin(&cfg), Some("next".to_string()));
+    }
+
+    #[test]
+    fn expected_node_bin_non_node_command_returns_none() {
+        let tmp = tempdir().unwrap();
+        let mut cfg = npx_next_config(tmp.path());
+        cfg.command = "poetry".to_string();
+        cfg.args = vec!["run".to_string(), "python".to_string()];
+        assert_eq!(expected_node_bin(&cfg), None);
+
+        cfg.command = "cargo".to_string();
+        cfg.args = vec!["run".to_string()];
+        assert_eq!(expected_node_bin(&cfg), None);
+    }
+
+    #[test]
+    fn preflight_passes_when_bin_present() {
+        // Healthy install: node_modules/.bin/next exists on disk.
+        let tmp = tempdir().unwrap();
+        let bin_dir = tmp.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        // On Windows, the real shim is `next.cmd`; on Unix, the bare name.
+        #[cfg(windows)]
+        fs::write(bin_dir.join("next.cmd"), "@echo off\nnext").unwrap();
+        #[cfg(not(windows))]
+        fs::write(bin_dir.join("next"), "#!/usr/bin/env node\n").unwrap();
+
+        let cfg = npx_next_config(tmp.path());
+        let res = preflight_node_bin_check(&cfg);
+        assert!(
+            res.is_ok(),
+            "pre-flight must pass when .bin/next exists; got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn preflight_fails_fast_when_bin_missing() {
+        // Broken pnpm-style install: `node_modules/.pnpm/` exists but
+        // `node_modules/.bin/` does not (or doesn't contain the binary).
+        let tmp = tempdir().unwrap();
+        let pnpm_dir = tmp.path().join("node_modules").join(".pnpm");
+        fs::create_dir_all(&pnpm_dir).unwrap();
+        // Deliberately omit `.bin/next`.
+
+        let cfg = npx_next_config(tmp.path());
+        let res = preflight_node_bin_check(&cfg);
+        let err = res.expect_err(
+            "pre-flight must fail-fast when node_modules exists but .bin/next is missing",
+        );
+        assert!(
+            err.contains("frontend dependencies incomplete"),
+            "error must surface the canonical fail-fast prefix; got: {}",
+            err
+        );
+        assert!(
+            err.contains("npm install"),
+            "error must tell the operator how to fix it; got: {}",
+            err
+        );
+        assert!(
+            err.contains("next"),
+            "error must name the missing binary; got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn preflight_skips_when_node_modules_absent() {
+        // First-time install case — `node_modules` itself doesn't exist
+        // yet. The rebuild_enabled build_command path will surface the
+        // need to install; the pre-flight has nothing more to add.
+        let tmp = tempdir().unwrap();
+        let cfg = npx_next_config(tmp.path());
+        let res = preflight_node_bin_check(&cfg);
+        assert!(
+            res.is_ok(),
+            "pre-flight must skip when node_modules itself is absent; got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn preflight_passes_for_non_node_processes() {
+        // Backend / Python / cargo etc. must not be touched by this check.
+        let tmp = tempdir().unwrap();
+        // Even with a broken node_modules tree present, a non-node command
+        // is still let through.
+        let bin_dir = tmp.path().join("node_modules").join(".pnpm");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let mut cfg = npx_next_config(tmp.path());
+        cfg.command = "poetry".to_string();
+        cfg.args = vec![
+            "run".to_string(),
+            "python".to_string(),
+            "run.py".to_string(),
+        ];
+        let res = preflight_node_bin_check(&cfg);
+        assert!(
+            res.is_ok(),
+            "pre-flight must be a no-op for non-node commands; got {:?}",
+            res
+        );
     }
 }

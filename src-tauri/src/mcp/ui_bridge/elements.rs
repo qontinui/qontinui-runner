@@ -625,6 +625,58 @@ pub(crate) fn validate_action_name(raw: &str) -> Result<&str, UiBridgeError> {
     Err(UiBridgeError::invalid_action(raw, SUPPORTED_ACTION_NAMES))
 }
 
+/// Extract the element's advertised `actions` list from a `get_element` IPC
+/// payload. The frontend snapshots elements with an `actions` array whose
+/// entries are either plain strings (action names) or objects with a `name` /
+/// `action` field — accept both shapes. Returns `None` when the field is
+/// absent OR present but not an array, so the caller can distinguish "we
+/// don't know which actions this element supports" from "we know it supports
+/// nothing." Empty array → `Some(vec![])` (= element advertised an explicit
+/// empty list).
+///
+/// Loop B Item A: feeds the `ACTION_NOT_SUPPORTED` discriminator that
+/// invalidates the misleading `success:true, recovery.commandChosen:null`
+/// envelope when the LLM fallback "recovered" against an element that
+/// doesn't actually accept the requested action.
+pub(crate) fn extract_supported_actions(elem_data: &serde_json::Value) -> Option<Vec<String>> {
+    let arr = elem_data.get("actions").and_then(|v| v.as_array())?;
+    let names: Vec<String> = arr
+        .iter()
+        .filter_map(|entry| {
+            if let Some(s) = entry.as_str() {
+                Some(s.to_string())
+            } else if let Some(obj) = entry.as_object() {
+                obj.get("name")
+                    .or_else(|| obj.get("action"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    Some(names)
+}
+
+/// True when the element advertises an explicit supported-actions list AND
+/// the requested action is not in it. `None` (we don't know) → returns
+/// `false` (don't accuse — degrade gracefully).
+///
+/// Match semantics mirror `SUPPORTED_ACTION_NAMES` membership in
+/// `validate_action_name`: exact (case-sensitive) string equality. The SDK
+/// emits canonical camelCase names in element metadata; aliases like
+/// `scroll_into_view` -> `scrollIntoView` are normalized SDK-side before the
+/// `actions` list is built, so an additional alias-fold here would be a
+/// distortion not a feature.
+pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>) -> bool {
+    match supported {
+        Some(list) => list.iter().any(|s| s == action),
+        // Unknown supported list (fetch failed or element didn't advertise
+        // any) — assume yes, so we don't manufacture false ACTION_NOT_SUPPORTED.
+        None => true,
+    }
+}
+
 pub async fn ui_bridge_execute_action_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -822,61 +874,72 @@ pub async fn ui_bridge_execute_action_handler(
     // Before dispatching the action, fetch the element state and reject
     // clicks on disabled elements early so callers get an explicit error
     // instead of a silent no-op.
-    if let Ok(elem_data) = ui_bridge_request_sync(
+    //
+    // Also capture the element's advertised `actions` list so the Loop B
+    // Item A `ACTION_NOT_SUPPORTED` discriminator below can compare the
+    // requested action against the element's metadata without an extra
+    // IPC round-trip. None on fetch failure → the discriminator skips
+    // (we never invent a supported list).
+    let element_supported_actions: Option<Vec<String>> = match ui_bridge_request_sync(
         &state,
         "get_element",
         serde_json::json!({ "elementId": id }),
     )
     .await
     {
-        let is_disabled = {
-            let props = elem_data
-                .get("properties")
-                .or_else(|| elem_data.get("props"));
-            let aria_disabled = elem_data
-                .get("ariaDisabled")
-                .and_then(|v| v.as_str())
-                .map(|s| s == "true")
-                .unwrap_or(false);
-            let disabled_attr = elem_data
-                .get("disabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let data_disabled = props
-                .and_then(|p| p.get("data-disabled"))
-                .and_then(|v| v.as_str())
-                .map(|s| s == "true")
-                .unwrap_or(false);
-            // Also check nested properties for aria-disabled / disabled
-            let prop_aria_disabled = props
-                .and_then(|p| p.get("aria-disabled"))
-                .and_then(|v| v.as_str())
-                .map(|s| s == "true")
-                .unwrap_or(false);
-            let prop_disabled = props
-                .and_then(|p| p.get("disabled"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            aria_disabled || disabled_attr || data_disabled || prop_aria_disabled || prop_disabled
-        };
+        Ok(elem_data) => {
+            let is_disabled = {
+                let props = elem_data
+                    .get("properties")
+                    .or_else(|| elem_data.get("props"));
+                let aria_disabled = elem_data
+                    .get("ariaDisabled")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "true")
+                    .unwrap_or(false);
+                let disabled_attr = elem_data
+                    .get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let data_disabled = props
+                    .and_then(|p| p.get("data-disabled"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "true")
+                    .unwrap_or(false);
+                // Also check nested properties for aria-disabled / disabled
+                let prop_aria_disabled = props
+                    .and_then(|p| p.get("aria-disabled"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "true")
+                    .unwrap_or(false);
+                let prop_disabled = props
+                    .and_then(|p| p.get("disabled"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                aria_disabled || disabled_attr || data_disabled || prop_aria_disabled || prop_disabled
+            };
 
-        if is_disabled {
-            warn!(
-                "execute_action: element {} is disabled, rejecting {} action early",
-                id, action_name
-            );
-            return Ok(Json(ApiResponse {
-                success: false,
-                data: Some(serde_json::json!({
-                    "error": "element is disabled",
-                    "elementState": elem_data,
-                })),
-                error: Some("element is disabled".to_string()),
-                error_detail: None,
-                hint: None,
-            }));
+            if is_disabled {
+                warn!(
+                    "execute_action: element {} is disabled, rejecting {} action early",
+                    id, action_name
+                );
+                return Ok(Json(ApiResponse {
+                    success: false,
+                    data: Some(serde_json::json!({
+                        "error": "element is disabled",
+                        "elementState": elem_data,
+                    })),
+                    error: Some("element is disabled".to_string()),
+                    error_detail: None,
+                    hint: None,
+                }));
+            }
+
+            extract_supported_actions(&elem_data)
         }
-    }
+        Err(_) => None,
+    };
 
     // ── Execute the action ─────────────────────────────────────────────
     let mut result =
@@ -1133,7 +1196,61 @@ pub async fn ui_bridge_execute_action_handler(
 
         if let Some(failure) = failure_body {
             let recovery = attempt_recovery(&state, &failure, &id, &payload, task_run_id).await;
-            if recovery.recovered {
+            // ── Loop B Item A — ACTION_NOT_SUPPORTED discriminator ──────
+            //
+            // Contract: `success:true, data.recovery.commandChosen:null` is
+            // a misleading shape — it claims "we recovered" while admitting
+            // no structured command was selected and no original-action
+            // retry succeeded. That can only happen when the LLM fallback
+            // synthesized a side-action (or no-op) against an element that
+            // doesn't actually advertise the requested action.
+            //
+            // Invariant we now enforce: when `recovery.recovered` AND
+            // `recovery.command_chosen` is None, return `success:false`
+            // with `code: ACTION_NOT_SUPPORTED` and
+            // `data.supported_actions: [...]` from the element's metadata.
+            // The recovery audit trail (`recovery.commandChosen:null`) is
+            // still surfaced so callers can see what was attempted.
+            //
+            // If `command_chosen` IS set, keep the existing
+            // success-on-recovery envelope — that's a structured retry,
+            // not the contract-violating no-op path.
+            let contract_violation =
+                recovery.recovered && recovery.command_chosen.is_none();
+            if contract_violation {
+                warn!(
+                    "execute_action: rejecting misleading recovered:true,commandChosen:null \
+                     for element {} action '{}' — returning ACTION_NOT_SUPPORTED",
+                    id, action_name
+                );
+                let supported: Vec<String> = element_supported_actions
+                    .clone()
+                    .unwrap_or_default();
+                let recovery_json = serde_json::to_value(&recovery)
+                    .unwrap_or(serde_json::Value::Null);
+                // Body carries the contract fields. `code` is hoisted into
+                // `data` so callers can match on it without parsing the
+                // outer envelope, mirroring the `data.code` shape that
+                // `wrap_ipc_result` already emits for IPC failure responses.
+                let body = serde_json::json!({
+                    "code": "ACTION_NOT_SUPPORTED",
+                    "supported_actions": supported,
+                    "requested_action": action_name,
+                    "recovery": recovery_json,
+                });
+                let envelope = ApiResponse::<serde_json::Value> {
+                    success: false,
+                    data: Some(body),
+                    error: Some(format!(
+                        "Action '{}' is not supported by element '{}'. \
+                         Element advertises: {:?}",
+                        action_name, id, supported
+                    )),
+                    error_detail: None,
+                    hint: None,
+                };
+                result = Ok(Json(envelope));
+            } else if recovery.recovered {
                 info!(
                     "execute_action: RecoveryExecutor recovered element {} via {:?} (command={:?})",
                     id, recovery.via, recovery.command_chosen
@@ -1491,13 +1608,18 @@ pub async fn ui_bridge_get_components_handler(
 
     merged.append(&mut ws_components);
     let components_array = serde_json::Value::Array(merged);
-    // F2 (Direction B): emit `{success, data:{components:[...]}, components:[...]}`.
-    // The top-level `components` is a deprecated mirror for back-compat;
-    // new callers should read `data.components`.
+    // F2 (Direction B): emit `{success, data:{components:[...]}}` — the
+    // canonical wrapper-SDK envelope shape.
+    //
+    // Loop B Item B: the previous emission also carried a top-level
+    // `components` field as a deprecated back-compat mirror, but it
+    // duplicated `data.components` byte-for-byte and confused callers
+    // about which key was authoritative. The mirror has been dropped;
+    // `data.components` is the single source of truth and the regression
+    // test `components_envelope_omits_top_level_mirror` locks it in.
     Ok(Json(serde_json::json!({
         "success": true,
-        "data": { "components": components_array.clone() },
-        "components": components_array,
+        "data": { "components": components_array },
     })))
 }
 
@@ -3935,10 +4057,16 @@ mod type_into_unicode_tests {
 }
 
 /// F2 — direct `/ui-bridge/control/components` envelope shape (Direction B).
-/// Verifies the response carries `data.components` AND the deprecated
-/// top-level `components` mirror. Pure unit test against the literal shape
-/// the handler emits; an axum-router-level integration test would need a
-/// fully constructed `ApiState`.
+/// Verifies the response carries `data.components` AS THE ONLY components
+/// field. Pure unit test against the literal shape the handler emits; an
+/// axum-router-level integration test would need a fully constructed
+/// `ApiState`.
+///
+/// Loop B Item B: the deprecated top-level `components` mirror was
+/// removed. `components_envelope_omits_top_level_mirror` locks the
+/// regression in — if a future refactor re-adds the duplicate it must
+/// also delete this assertion, making the contract change visible in
+/// review.
 #[cfg(test)]
 mod components_envelope_tests {
     use serde_json::json;
@@ -3950,8 +4078,7 @@ mod components_envelope_tests {
         let components_array = serde_json::Value::Array(components);
         json!({
             "success": true,
-            "data": { "components": components_array.clone() },
-            "components": components_array,
+            "data": { "components": components_array },
         })
     }
 
@@ -3970,26 +4097,31 @@ mod components_envelope_tests {
     }
 
     #[test]
-    fn direct_components_response_has_deprecated_top_level_mirror() {
-        // The top-level `components` field is a one-release back-compat
-        // mirror so callers reading the legacy shape keep working.
+    fn components_envelope_omits_top_level_mirror() {
+        // Loop B Item B regression — the top-level `components` field
+        // was a deprecated back-compat duplicate of `data.components`
+        // that confused callers about which key was authoritative. It
+        // has been dropped; `data.components` is the single source of
+        // truth. Re-adding the mirror must require deleting this test,
+        // which keeps the envelope-shape contract visible.
         let body = components_response(vec![json!({"id": "comp-a"})]);
-        let mirror = body
-            .get("components")
-            .and_then(|v| v.as_array())
-            .expect("deprecated top-level `components` mirror must be present");
-        assert_eq!(mirror.len(), 1);
-        // The mirror and `data.components` must be the same payload.
-        let canonical = body
+        assert!(
+            body.get("components").is_none(),
+            "top-level `components` mirror must NOT appear in the response — \
+             callers must read `data.components`. Found: {:?}",
+            body.get("components")
+        );
+        // Canonical path remains intact.
+        let inner = body
             .get("data")
             .and_then(|d| d.get("components"))
             .and_then(|v| v.as_array())
-            .unwrap();
-        assert_eq!(mirror, canonical);
+            .expect("data.components must still be present");
+        assert_eq!(inner.len(), 1);
     }
 
     #[test]
-    fn empty_components_still_has_both_fields() {
+    fn empty_components_still_has_canonical_field() {
         let body = components_response(vec![]);
         assert!(body
             .get("data")
@@ -3997,11 +4129,11 @@ mod components_envelope_tests {
             .and_then(|v| v.as_array())
             .map(|a| a.is_empty())
             .unwrap_or(false));
-        assert!(body
-            .get("components")
-            .and_then(|v| v.as_array())
-            .map(|a| a.is_empty())
-            .unwrap_or(false));
+        assert!(
+            body.get("components").is_none(),
+            "regression guard: top-level `components` must stay omitted even \
+             on the empty-list path"
+        );
     }
 }
 
@@ -4432,5 +4564,172 @@ mod validate_action_name_tests {
         // and prevents downstream "no handler" silent failures.
         let err = validate_action_name("Click").expect_err("Click must not be accepted");
         assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+    }
+}
+
+#[cfg(test)]
+mod action_not_supported_tests {
+    //! Loop B Item A — `setValue` against an element that doesn't advertise it
+    //! must NOT come back as `success:true, recovery.commandChosen:null`. This
+    //! module exercises the pure helpers (`extract_supported_actions`,
+    //! `is_action_advertised`) plus the ApiResponse envelope shape that the
+    //! handler builds on the contract-violation branch. The handler itself
+    //! is too IPC-coupled to spin up in a unit test (it needs `ApiState`,
+    //! the IPC dispatcher, the recovery executor's PG telemetry sink),
+    //! so we lock down the envelope by reconstructing it from the same
+    //! `serde_json::json!{...}` recipe the handler uses — if the body
+    //! template changes here, this test must change in lockstep, which
+    //! is exactly the regression guard we want.
+    use super::{
+        extract_supported_actions, is_action_advertised,
+    };
+    use crate::mcp::types::ApiResponse;
+    use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
+    use serde_json::json;
+
+    #[test]
+    fn extract_supported_actions_from_string_array() {
+        let elem = json!({
+            "id": "btn-1",
+            "actions": ["focus", "blur", "type", "clear", "click"],
+        });
+        let got = extract_supported_actions(&elem).expect("present array");
+        assert_eq!(got, vec!["focus", "blur", "type", "clear", "click"]);
+    }
+
+    #[test]
+    fn extract_supported_actions_from_object_array() {
+        // Some snapshot payloads carry per-action objects, not bare strings.
+        let elem = json!({
+            "id": "btn-1",
+            "actions": [
+                { "name": "focus" },
+                { "action": "click", "params": [] },
+            ],
+        });
+        let got = extract_supported_actions(&elem).expect("present array");
+        assert_eq!(got, vec!["focus", "click"]);
+    }
+
+    #[test]
+    fn extract_supported_actions_absent_is_none() {
+        let elem = json!({ "id": "btn-1" });
+        assert!(extract_supported_actions(&elem).is_none());
+    }
+
+    #[test]
+    fn extract_supported_actions_non_array_is_none() {
+        let elem = json!({ "id": "btn-1", "actions": "click" });
+        assert!(extract_supported_actions(&elem).is_none());
+    }
+
+    #[test]
+    fn is_action_advertised_matches_listed_action() {
+        let supported = Some(vec![
+            "focus".to_string(),
+            "blur".to_string(),
+            "type".to_string(),
+            "clear".to_string(),
+            "click".to_string(),
+        ]);
+        assert!(is_action_advertised("click", &supported));
+        assert!(is_action_advertised("type", &supported));
+    }
+
+    #[test]
+    fn is_action_advertised_rejects_unlisted_action() {
+        let supported = Some(vec![
+            "focus".to_string(),
+            "blur".to_string(),
+            "type".to_string(),
+            "clear".to_string(),
+            "click".to_string(),
+        ]);
+        assert!(!is_action_advertised("setValue", &supported));
+        assert!(!is_action_advertised("submit", &supported));
+    }
+
+    #[test]
+    fn is_action_advertised_unknown_supported_list_is_permissive() {
+        // None → we don't know what the element supports; never accuse.
+        assert!(is_action_advertised("setValue", &None));
+    }
+
+    #[test]
+    fn action_not_supported_envelope_has_required_fields() {
+        // Build the envelope the handler constructs on the contract-violation
+        // branch and verify the shape the spec requires:
+        //   200 (HTTP) but body { success:false, code:"ACTION_NOT_SUPPORTED",
+        //   data:{ supported_actions:[...] }, recovery:{ commandChosen:null,...} }
+        let action_name = "setValue";
+        let supported = vec![
+            "focus".to_string(),
+            "blur".to_string(),
+            "type".to_string(),
+            "clear".to_string(),
+            "click".to_string(),
+        ];
+        let recovery = RecoveryOutcome {
+            recovered: true,
+            via: RecoveryVia::LlmFallback,
+            command_chosen: None,
+            error_code: None,
+            result: None,
+        };
+        let recovery_json = serde_json::to_value(&recovery).unwrap();
+        let body = json!({
+            "code": "ACTION_NOT_SUPPORTED",
+            "supported_actions": supported,
+            "requested_action": action_name,
+            "recovery": recovery_json,
+        });
+        let envelope = ApiResponse::<serde_json::Value> {
+            success: false,
+            data: Some(body),
+            error: Some(format!(
+                "Action '{}' is not supported by element 'btn-1'. \
+                 Element advertises: {:?}",
+                action_name, supported
+            )),
+            error_detail: None,
+            hint: None,
+        };
+        let envelope_json = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(
+            envelope_json.get("success").and_then(|v| v.as_bool()),
+            Some(false),
+            "contract: envelope.success must be false (not the misleading true)"
+        );
+        let data = envelope_json
+            .get("data")
+            .expect("contract: data field must be present");
+        assert_eq!(
+            data.get("code").and_then(|v| v.as_str()),
+            Some("ACTION_NOT_SUPPORTED"),
+            "contract: data.code must be ACTION_NOT_SUPPORTED"
+        );
+        let supp = data
+            .get("supported_actions")
+            .and_then(|v| v.as_array())
+            .expect("contract: data.supported_actions must be an array");
+        let names: Vec<&str> = supp.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"click"));
+        assert!(names.contains(&"type"));
+        assert!(
+            !names.contains(&"setValue"),
+            "contract: requested action must NOT appear in the advertised list \
+             (else the discriminator wouldn't fire)"
+        );
+        // Recovery audit trail still surfaced — commandChosen is null
+        // exactly because that's the contract violation we're flagging.
+        let recovery_field = data
+            .get("recovery")
+            .expect("contract: data.recovery must be carried for audit");
+        assert!(
+            recovery_field.get("commandChosen").map(|v| v.is_null()).unwrap_or(false),
+            "contract: data.recovery.commandChosen must be null (this is the \
+             precondition that triggered ACTION_NOT_SUPPORTED)"
+        );
     }
 }
