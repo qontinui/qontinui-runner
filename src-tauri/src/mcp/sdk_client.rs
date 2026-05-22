@@ -1018,11 +1018,46 @@ async fn handle_element(
     }
 }
 
-/// Optional query parameters for SDK action execution (task_run_id for persistence).
+/// Optional query parameters for SDK action execution.
+///
+/// - `task_run_id` - persistence correlation for the audit event.
+/// - `tab_id` / `target_tab_id` - per-tab routing (UI Bridge Item #4). When a
+///   single relay (e.g. qontinui-web's dashboard at demo.staging.qontinui.io)
+///   has more than one browser tab connected - two operator machines each
+///   driving a headless tab - the relay's default dispatch routes to
+///   `primaryTabId`, which flips to whichever tab registered most recently.
+///   Supplying a `tabId` pins the forwarded command to that specific tab's
+///   pipe instead. Discover live ids via `GET /ui-bridge/sdk/tabs` (proxied to
+///   the relay's `GET /tabs`). All spellings accepted; `tabId` is the public
+///   query name, `targetTabId` the relay's internal option name.
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct SdkActionQueryParams {
     #[serde(default)]
     pub task_run_id: Option<i64>,
+    #[serde(
+        default,
+        alias = "tabId",
+        alias = "targetTabId",
+        alias = "target_tab_id"
+    )]
+    pub tab_id: Option<String>,
+}
+
+/// Append a `tabId=<id>` query parameter to an SDK-relay HTTP path, preserving
+/// any existing query string. Trims and skips empty ids. The SDK's Next.js /
+/// Express adapters sniff `?tabId=` (and the `X-UI-Bridge-Tab-Id` header) and
+/// thread it into the relay's per-tab command dispatch, so threading it onto
+/// the forwarded path is sufficient for the HTTP-transport arm. The
+/// WS-transport arm instead carries `targetTabId` inside the dispatched payload
+/// (the relay's `extractTabRouting` reads it from the command payload).
+fn append_tab_id_query(path: &str, tab_id: Option<&str>) -> String {
+    match tab_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            let sep = if path.contains('?') { '&' } else { '?' };
+            format!("{}{}tabId={}", path, sep, urlencoding::encode(id))
+        }
+        None => path.to_string(),
+    }
 }
 
 /// POST /ui-bridge/sdk/element/:id/action — Execute an action on an element
@@ -1041,8 +1076,22 @@ async fn handle_element_action(
     let start = std::time::Instant::now();
 
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    let ws_payload = serde_json::json!({ "id": id, "request": body.clone() });
-    let path = format!("/control/element/{}/action", id);
+    // Per-tab routing (Item #4): when a `tabId` is supplied, carry it as
+    // `targetTabId` in the WS payload (the relay's `extractTabRouting` reads it
+    // from the command payload) AND as a `?tabId=` query on the HTTP path (the
+    // SDK adapter sniffs the query). The relay rejects an unknown/stale tab with
+    // a structured `TAB_NOT_FOUND` / `TAB_STALE` envelope which we forward
+    // verbatim - no silent fall-through to the primary tab.
+    let tab_id = query
+        .tab_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let ws_payload = match tab_id {
+        Some(t) => serde_json::json!({ "id": id, "request": body.clone(), "targetTabId": t }),
+        None => serde_json::json!({ "id": id, "request": body.clone() }),
+    };
+    let path = append_tab_id_query(&format!("/control/element/{}/action", id), tab_id);
     let result = match dispatch_app_request(
         &state,
         "executeElementAction",
@@ -1168,12 +1217,24 @@ async fn handle_snapshot(
     };
     let want_disabled_only = query.get("withDisabledOnly").is_some_and(truthy)
         || query.get("with_disabled_only").is_some_and(truthy);
+    // Per-tab routing (Item #4): pin the snapshot to a specific connected tab
+    // when `?tabId=` (or `?targetTabId=`) is supplied. Lets a caller snapshot
+    // tab A while tab B is the relay's primary, instead of always getting the
+    // primary tab's view.
+    let tab_id = query
+        .get("tabId")
+        .or_else(|| query.get("targetTabId"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
     let mut ws_payload = serde_json::json!({});
     if let Some(r) = query.get("recency") {
         ws_payload["recency"] = serde_json::Value::String(r.clone());
     }
     if want_disabled_only {
         ws_payload["withDisabledOnly"] = serde_json::Value::Bool(true);
+    }
+    if let Some(t) = tab_id {
+        ws_payload["targetTabId"] = serde_json::Value::String(t.to_string());
     }
     // Forward recency + withDisabledOnly query params to the SDK app
     let mut query_parts: Vec<String> = Vec::new();
@@ -1182,6 +1243,9 @@ async fn handle_snapshot(
     }
     if want_disabled_only {
         query_parts.push("withDisabledOnly=true".to_string());
+    }
+    if let Some(t) = tab_id {
+        query_parts.push(format!("tabId={}", urlencoding::encode(t)));
     }
     let path = if query_parts.is_empty() {
         "/control/snapshot".to_string()
@@ -2145,9 +2209,35 @@ async fn handle_windows(
     super::ui_bridge::ui_bridge_list_windows_handler(axum::extract::State(state)).await
 }
 
-/// GET /ui-bridge/sdk/tabs — List connected browser tabs
-async fn handle_tabs(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::GET, "/tabs", None).await {
+/// GET /ui-bridge/sdk/tabs — List connected browser tabs.
+///
+/// Per-tab routing (Item #4/#15) discovery surface. Forwards the SDK relay's
+/// `?activeOnly=true` (drop tabs whose heartbeat went stale) and `?detailed=true`
+/// (enrich each entry with a live URL/pathname/title round-trip) query params so
+/// a caller can discover the exact `tabId` to pin a subsequent `?tabId=` command
+/// to. Each returned entry carries `tabId`, `isPrimary`, `isActive`, and
+/// `lastHeartbeat`.
+async fn handle_tabs(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let truthy = |v: &String| {
+        let s = v.trim();
+        s == "1" || s.eq_ignore_ascii_case("true")
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if query.get("activeOnly").is_some_and(truthy) {
+        parts.push("activeOnly=true".to_string());
+    }
+    if query.get("detailed").is_some_and(truthy) {
+        parts.push("detailed=true".to_string());
+    }
+    let path = if parts.is_empty() {
+        "/tabs".to_string()
+    } else {
+        format!("/tabs?{}", parts.join("&"))
+    };
+    match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -6508,5 +6598,78 @@ mod tests {
         )
         .await;
         assert_eq!(chosen, serde_json::Value::Null);
+    }
+
+    // ------------------------------------------------------------------
+    // Per-tab routing (Item #4) — `?tabId=` thread-through
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn append_tab_id_query_adds_first_param() {
+        assert_eq!(
+            append_tab_id_query("/control/element/btn/action", Some("tab-a")),
+            "/control/element/btn/action?tabId=tab-a"
+        );
+    }
+
+    #[test]
+    fn append_tab_id_query_appends_to_existing_query() {
+        assert_eq!(
+            append_tab_id_query("/control/snapshot?recency=current", Some("tab-b")),
+            "/control/snapshot?recency=current&tabId=tab-b"
+        );
+    }
+
+    #[test]
+    fn append_tab_id_query_url_encodes_special_chars() {
+        assert_eq!(
+            append_tab_id_query("/control/snapshot", Some("a b&c")),
+            "/control/snapshot?tabId=a%20b%26c"
+        );
+    }
+
+    #[test]
+    fn append_tab_id_query_noop_when_absent_or_blank() {
+        assert_eq!(
+            append_tab_id_query("/control/snapshot", None),
+            "/control/snapshot"
+        );
+        assert_eq!(
+            append_tab_id_query("/control/snapshot", Some("   ")),
+            "/control/snapshot",
+            "whitespace-only tab id must be treated as absent"
+        );
+    }
+
+    #[test]
+    fn sdk_action_query_params_accepts_tab_id_aliases() {
+        // serde aliases resolve identically for JSON and urlencoded inputs;
+        // axum's `Query` extractor feeds the same Deserialize impl. Drive it
+        // via serde_json (a direct dependency) to validate the alias wiring
+        // without pulling serde_urlencoded as a direct dev-dep.
+        let parse = |s: &str| -> SdkActionQueryParams {
+            serde_json::from_str(s).expect("parse SdkActionQueryParams")
+        };
+
+        assert_eq!(
+            parse(r#"{"tabId":"tab-a"}"#).tab_id.as_deref(),
+            Some("tab-a")
+        );
+        assert_eq!(
+            parse(r#"{"tab_id":"tab-a2"}"#).tab_id.as_deref(),
+            Some("tab-a2")
+        );
+        assert_eq!(
+            parse(r#"{"targetTabId":"tab-b"}"#).tab_id.as_deref(),
+            Some("tab-b")
+        );
+        assert_eq!(
+            parse(r#"{"target_tab_id":"tab-c"}"#).tab_id.as_deref(),
+            Some("tab-c")
+        );
+
+        let q = parse(r#"{"task_run_id":42}"#);
+        assert_eq!(q.task_run_id, Some(42));
+        assert_eq!(q.tab_id, None);
     }
 }

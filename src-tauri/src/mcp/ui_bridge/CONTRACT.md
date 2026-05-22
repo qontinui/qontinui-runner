@@ -131,6 +131,36 @@ params are silently ignored unless explicitly added. Example: the
 A new `?fooFilter=bar` will not work until a parallel `query.get("fooFilter")`
 line lands in the same handler.
 
+### Per-tab routing (`?tabId=`) is a thread-through, not a route
+The SDK relay (qontinui-web's `/api/ui-bridge/*`) supports pinning a `/control/*`
+command to a specific connected browser tab via `?tabId=<id>` (UI Bridge Item
+#4). When two relays/tabs are connected (e.g. two operator machines driving the
+same dashboard), the default dispatch targets the relay's `primaryTabId`, which
+flips to whichever tab registered last - so a command can route to the wrong
+session. `tabId` is **a query param on existing routes, not a new route**, so it
+does NOT touch `route_entries()` / the manifest tests; but per the discrete
+query-parsing rule above, each `/ui-bridge/sdk/*` wrapper must forward it
+explicitly or it silently drops.
+
+Wired today in `sdk_client.rs`:
+- `handle_element_action` (`/ui-bridge/sdk/element/:id/action`) - reads
+  `tabId`/`targetTabId`/`tab_id`/`target_tab_id` from `SdkActionQueryParams`,
+  carries it as `targetTabId` in the WS payload AND as `?tabId=` on the HTTP
+  path (`append_tab_id_query`).
+- `handle_snapshot` (`/ui-bridge/sdk/snapshot`) - same, for pinning a snapshot
+  to a non-primary tab.
+- `handle_tabs` (`/ui-bridge/sdk/tabs`) - forwards `?activeOnly=true` /
+  `?detailed=true` so callers can discover the live `tabId` (each entry carries
+  `tabId`, `isPrimary`, `isActive`, `lastHeartbeat`) before pinning.
+- Body-POST wrappers that forward the request body verbatim (`handle_discover`
+  for `find`, `handle_page_navigate`, the `clickByText`/`typeInto` convenience
+  handlers) need no Rust change: a caller supplying `{"tabId":"..."}` in the
+  body is threaded by the SDK's universal `relayCommand` -> `extractTabRouting`.
+
+An unknown/stale `tabId` is rejected by the relay with a structured
+`{success:false, code:"TAB_NOT_FOUND"|"TAB_STALE", ...}` envelope (NOT a silent
+fall-through to the primary tab); the runner forwards it verbatim.
+
 ### Status-code mapping is explicit
 Default `Json` responses are 200. The SDK's `expect`-style endpoints return
 422 on predicate timeout — `ui_bridge_expect_element_handler` at
