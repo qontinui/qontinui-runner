@@ -155,6 +155,18 @@ pub enum UiBridgeErrorCode {
     UnknownAssertionType,
     // Request-shape errors (rejected upstream of any IPC/recovery flow)
     InvalidRequest,
+    /// A request field is present but has the wrong shape / wrong name.
+    /// Issued specifically for per-action param-name validation (loop B
+    /// iter 2 — runner-side analogue of ui-bridge PR #33's SDK-boundary
+    /// `WRONG_TYPE_PARAM` gate). Carries a `didYouMean` recovery hint in
+    /// `context` so callers can self-correct without a round-trip.
+    InvalidParam,
+    /// A required request field is missing. Sibling of [`InvalidParam`]
+    /// for the "field absent" case. The runner emits this for
+    /// `{action:"type", params:{}}` (no `text`, no `value`) so callers
+    /// get a deterministic 400 instead of a recovered no-op via the
+    /// LLM fallback.
+    MissingParam,
     // System errors
     InternalError,
 }
@@ -253,6 +265,54 @@ impl UiBridgeError {
             context: Some(serde_json::json!({
                 "action": unknown,
                 "supportedActions": supported,
+            })),
+        }
+    }
+
+    /// Reject `{action:"type", params:{value:"..."}}` BEFORE the IPC + Phase 5
+    /// `RecoveryExecutor` chain can synthesize a misleading success. Issued
+    /// when the caller named `value` (the param for `setValue` / `select`)
+    /// instead of `text`. Mirrors the SDK-side `WRONG_TYPE_PARAM` envelope
+    /// added in ui-bridge PR #33 (`relay-handlers.ts::executeElementAction`)
+    /// for the non-SDK dispatch path that hits the runner directly. Docs
+    /// reference: `ui-bridge/docs-site/docs/api/runner-features.md` §
+    /// "Per-action param names" promises `HTTP 400` with the literal
+    /// `type: 'value' is unknown; did you mean 'text'?` message.
+    ///
+    /// `context.didYouMean` + `context.field` give callers a deterministic
+    /// self-correction hint without a round-trip — the
+    /// `recovery: { didYouMean: "text", field: "params.text" }` contract
+    /// documented in the loop B iter 2 spec.
+    pub fn type_param_invalid() -> Self {
+        Self {
+            code: UiBridgeErrorCode::InvalidParam,
+            message: "type: 'value' is unknown; did you mean 'text'?".to_string(),
+            recovery: Some(RecoveryHint::Unrecoverable),
+            context: Some(serde_json::json!({
+                "action": "type",
+                "provided": "value",
+                "didYouMean": "text",
+                "field": "params.text",
+            })),
+        }
+    }
+
+    /// Reject `{action:"type", params:{}}` (no `text`, no `value`) BEFORE
+    /// the recovery chain. Sibling of [`type_param_invalid`] for the
+    /// missing-field case. Returned as HTTP 400 with `code: MISSING_PARAM`
+    /// so the caller can distinguish "field absent" from "field present
+    /// with wrong name" without parsing the prose. Docs reference: same
+    /// section as `type_param_invalid` — the runner-side analogue of the
+    /// SDK's `MISSING_PARAM` envelope (ui-bridge PR #33).
+    pub fn type_param_missing() -> Self {
+        Self {
+            code: UiBridgeErrorCode::MissingParam,
+            message: "type requires 'text' parameter".to_string(),
+            recovery: Some(RecoveryHint::Unrecoverable),
+            context: Some(serde_json::json!({
+                "action": "type",
+                "required": ["text"],
+                "field": "params.text",
             })),
         }
     }
@@ -360,6 +420,8 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
         UiBridgeErrorCode::AssertionFailed => RecoveryHint::BroadenSelector,
         UiBridgeErrorCode::UnknownAssertionType => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::InvalidRequest => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::InvalidParam => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::MissingParam => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::InternalError => RecoveryHint::Unrecoverable,
     }
 }
