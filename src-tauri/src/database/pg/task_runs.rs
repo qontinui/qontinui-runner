@@ -1761,14 +1761,22 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        // NULL-guard: bind Option<String> to avoid uncatchable panic if a row
+        // has result_json = NULL (schema declares NOT NULL, but local-PG drift
+        // has been observed in the wild — see commit log). The defensive WHERE
+        // is belt-and-braces; the Option bind is the primary fix.
         let rows = conn.query(
-            "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 ORDER BY iteration ASC",
+            "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 AND result_json IS NOT NULL ORDER BY iteration ASC",
             &[&task_run_id],
         ).await.map_err(|e| format!("PG get_all_verification_phase_results: {}", e))?;
 
         let mut results = Vec::new();
         for row in &rows {
-            let json_str: String = row.get(0);
+            let json_opt: Option<String> = row.get(0);
+            let Some(json_str) = json_opt else {
+                // Defensive: WHERE filter should have excluded these.
+                continue;
+            };
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
                 results.push(parsed);
             }
@@ -1786,14 +1794,18 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
+        // NULL-guard: bind Option<String>. See get_all_verification_phase_results.
         let row = conn.query_opt(
-            "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 ORDER BY iteration DESC LIMIT 1",
+            "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 AND result_json IS NOT NULL ORDER BY iteration DESC LIMIT 1",
             &[&task_run_id],
         ).await.map_err(|e| format!("PG get_latest_verification_results: {}", e))?;
 
         match row {
             Some(r) => {
-                let json_str: String = r.get(0);
+                let json_opt: Option<String> = r.get(0);
+                let Some(json_str) = json_opt else {
+                    return Ok(None);
+                };
                 Ok(serde_json::from_str(&json_str).ok())
             }
             None => Ok(None),
