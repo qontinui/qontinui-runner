@@ -677,6 +677,84 @@ pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>
     }
 }
 
+/// Outcome of [`validate_type_action_params`] — the closed set of param-shape
+/// rejections the `type` action recognises. Carried as the `Err` arm so the
+/// handler can short-circuit with the matching HTTP-400 envelope before
+/// dispatching to IPC.
+///
+/// `Ok` is the bare success path — `params.text` (or the flat-form `text`
+/// field merged from `extra`) is present and is a string, so the request
+/// is well-formed and dispatch continues as normal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TypeParamError {
+    /// `params.value` (or flat `value`) is present but `text` is not. Caller
+    /// likely confused `type` with `setValue`/`select`. Returns HTTP 400
+    /// with `code: INVALID_PARAM` and a `didYouMean: "text"` hint.
+    WrongFieldValueInsteadOfText,
+    /// Neither `text` nor `value` was provided — the action is missing its
+    /// required input. Returns HTTP 400 with `code: MISSING_PARAM`.
+    MissingTextField,
+}
+
+/// Pre-IPC validator for the `type` action's required `text` parameter.
+///
+/// Loop B iter 2 — runner-side analogue of ui-bridge PR #33's SDK-boundary
+/// `WRONG_TYPE_PARAM` / `MISSING_PARAM` gate. The runner has its OWN
+/// action-dispatch path (Tauri-internal callers / non-SDK clients) that does
+/// NOT flow through `relay-handlers.ts::executeElementAction`, so the
+/// SDK-side gate alone is insufficient. Without this helper a malformed
+/// `{action:"type", params:{value:"foo"}}` request fell through the
+/// `validate_action_name` whitelist (`"type"` is a known action), reached
+/// `execute_action`, IPC-failed because the frontend's type handler needs
+/// `params.text`, then hit the Phase 5 `RecoveryExecutor::llm_fallback`
+/// which synthesized a non-null `commandChosen` and returned HTTP 200
+/// `success:true` — silently typing the literal string `"text"` (or worse,
+/// the element's `type` HTML attribute) instead of the caller's intent.
+/// That violates the documented contract at
+/// `ui-bridge/docs-site/docs/api/runner-features.md` § "Per-action param
+/// names" which promises HTTP 400 with `type: 'value' is unknown; did you
+/// mean 'text'?`.
+///
+/// Accepts both the canonical `params: { text: "..." }` shape AND the
+/// flat-form `{ text: "..." }` shape that the handler's `extra`-flatten
+/// merges into params (see the `merged_params` block in
+/// `ui_bridge_execute_action_handler` — flat-form is a back-compat surface
+/// for the `drag.targetPosition` family and must remain supported). Either
+/// presence-as-string counts as a valid `text`.
+///
+/// Returns `Ok(())` for non-`type` actions (the gate is per-action by
+/// design — `select`/`setValue` keep their own `value` semantics).
+pub(crate) fn validate_type_action_params(
+    action: &str,
+    params: &Option<serde_json::Value>,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), TypeParamError> {
+    if action != "type" {
+        return Ok(());
+    }
+    // Either nested-in-params OR top-level (flat-form) presence-as-string
+    // satisfies the contract — mirrors the `merged_params` shape the
+    // dispatcher actually sees downstream. Non-string values fall through
+    // as "missing": `text: null` / `text: 123` would still confuse the
+    // typing engine; treat them like absence so the structured 400 fires.
+    let params_text_is_str = params
+        .as_ref()
+        .and_then(|p| p.get("text"))
+        .map(|v| v.is_string())
+        .unwrap_or(false);
+    let extra_text_is_str = extra.get("text").map(|v| v.is_string()).unwrap_or(false);
+    if params_text_is_str || extra_text_is_str {
+        return Ok(());
+    }
+    let params_value_present = params.as_ref().and_then(|p| p.get("value")).is_some();
+    let extra_value_present = extra.contains_key("value");
+    if params_value_present || extra_value_present {
+        Err(TypeParamError::WrongFieldValueInsteadOfText)
+    } else {
+        Err(TypeParamError::MissingTextField)
+    }
+}
+
 pub async fn ui_bridge_execute_action_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -762,6 +840,38 @@ pub async fn ui_bridge_execute_action_handler(
             request.action,
             id,
             SUPPORTED_ACTION_NAMES.join(", ")
+        );
+        let msg = detail.message.clone();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error_detailed(msg, detail)),
+        ));
+    }
+
+    // ── Type-action param-shape gate ────────────────────────────────────
+    // Reject `{action:"type", params:{value:"foo"}}` and `{action:"type",
+    // params:{}}` BEFORE the IPC + Phase 5 RecoveryExecutor chain. Without
+    // this gate the malformed request fell into `llm_fallback`, which
+    // synthesized a non-null `commandChosen` against the `type` action and
+    // returned HTTP 200 success — silently typing the literal string
+    // `"text"` or the element's `type` HTML attribute instead of the
+    // caller's intent. Docs at `runner-features.md` § "Per-action param
+    // names" promise HTTP 400 + the literal `type: 'value' is unknown;
+    // did you mean 'text'?` message; we honour that here. Loop A iter 3
+    // (ui-bridge PR #33) added the analogous gate at the SDK boundary
+    // (`relay-handlers.ts::executeElementAction`); this is the runner-side
+    // mirror for non-SDK dispatch paths (Tauri-internal callers /
+    // direct HTTP clients that bypass the SDK relay). See
+    // `validate_type_action_params` for the shape contract.
+    if let Err(kind) = validate_type_action_params(&request.action, &request.params, &request.extra)
+    {
+        let detail = match kind {
+            TypeParamError::WrongFieldValueInsteadOfText => UiBridgeError::type_param_invalid(),
+            TypeParamError::MissingTextField => UiBridgeError::type_param_missing(),
+        };
+        warn!(
+            "execute_action: rejecting malformed type action on element {} ({:?}): {}",
+            id, kind, detail.message
         );
         let msg = detail.message.clone();
         return Err((
@@ -4732,6 +4842,277 @@ mod action_not_supported_tests {
                 .unwrap_or(false),
             "contract: data.recovery.commandChosen must be null (this is the \
              precondition that triggered ACTION_NOT_SUPPORTED)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod type_action_param_validation_tests {
+    //! Loop B iter 2 — `{action:"type", params:{value:"foo"}}` and
+    //! `{action:"type", params:{}}` must return HTTP 400 with the
+    //! documented `INVALID_PARAM` / `MISSING_PARAM` envelope BEFORE the
+    //! request can fall into `RecoveryExecutor::llm_fallback` and surface
+    //! a misleading 200. Runner-side analogue of ui-bridge PR #33's
+    //! SDK-boundary gate.
+    //!
+    //! Mirrors the `action_not_supported_tests` shape: exercises the pure
+    //! validator helper (`validate_type_action_params`) and the structured
+    //! error constructors (`UiBridgeError::type_param_{invalid,missing}`)
+    //! so the contract is locked down without spinning up an axum router.
+    //! The handler-side wiring (`api_error_detailed(msg, detail)` + HTTP
+    //! 400) is too IPC-coupled for a pure unit test, so the helper-level
+    //! tests act as the regression guard for the envelope shape.
+    use super::{api_error_detailed, validate_type_action_params, TypeParamError, UiBridgeError};
+    use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
+    use serde_json::{json, Map};
+
+    fn empty_extra() -> Map<String, serde_json::Value> {
+        Map::new()
+    }
+
+    // ── validator helper ─────────────────────────────────────────────────
+
+    #[test]
+    fn type_with_params_text_ok() {
+        let params = Some(json!({ "text": "hello" }));
+        assert_eq!(
+            validate_type_action_params("type", &params, &empty_extra()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn type_with_flat_text_ok() {
+        // Back-compat: `extra`-flatten merges top-level `text` into params.
+        // The validator must honor that — the dispatcher will see the
+        // merged shape downstream.
+        let mut extra = empty_extra();
+        extra.insert("text".into(), json!("hello"));
+        assert_eq!(validate_type_action_params("type", &None, &extra), Ok(()));
+    }
+
+    #[test]
+    fn type_with_params_value_is_wrong_field() {
+        let params = Some(json!({ "value": "foo" }));
+        assert_eq!(
+            validate_type_action_params("type", &params, &empty_extra()),
+            Err(TypeParamError::WrongFieldValueInsteadOfText)
+        );
+    }
+
+    #[test]
+    fn type_with_flat_value_is_wrong_field() {
+        // Flat-form `value` should hit the same gate — the dispatcher's
+        // `merged_params` will see `{value: "foo"}` either way.
+        let mut extra = empty_extra();
+        extra.insert("value".into(), json!("foo"));
+        assert_eq!(
+            validate_type_action_params("type", &None, &extra),
+            Err(TypeParamError::WrongFieldValueInsteadOfText)
+        );
+    }
+
+    #[test]
+    fn type_with_empty_params_is_missing() {
+        let params = Some(json!({}));
+        assert_eq!(
+            validate_type_action_params("type", &params, &empty_extra()),
+            Err(TypeParamError::MissingTextField)
+        );
+    }
+
+    #[test]
+    fn type_with_no_params_at_all_is_missing() {
+        assert_eq!(
+            validate_type_action_params("type", &None, &empty_extra()),
+            Err(TypeParamError::MissingTextField)
+        );
+    }
+
+    #[test]
+    fn type_with_non_string_text_is_missing() {
+        // `text: null` / `text: 123` would confuse the typing engine even
+        // if the field is technically present. Treat like absence so the
+        // 400 fires deterministically rather than letting a JSON-typed
+        // mismatch flow through to IPC.
+        let params = Some(json!({ "text": 42 }));
+        assert_eq!(
+            validate_type_action_params("type", &params, &empty_extra()),
+            Err(TypeParamError::MissingTextField)
+        );
+        let params = Some(json!({ "text": null }));
+        assert_eq!(
+            validate_type_action_params("type", &params, &empty_extra()),
+            Err(TypeParamError::MissingTextField)
+        );
+    }
+
+    #[test]
+    fn type_with_value_wins_over_missing_when_both_off() {
+        // If BOTH `value` and `text` (non-string) are present, the
+        // "wrong field" hint is more useful than "missing" — the caller
+        // clearly intended typing, just named the field wrong. The
+        // current rule is: if `text` is not a string AND `value` is
+        // present → WrongField (covered above). Sanity-double-check:
+        let params = Some(json!({ "text": null, "value": "foo" }));
+        assert_eq!(
+            validate_type_action_params("type", &params, &empty_extra()),
+            Err(TypeParamError::WrongFieldValueInsteadOfText)
+        );
+    }
+
+    #[test]
+    fn non_type_actions_are_not_gated() {
+        // The validator is per-action by design — `setValue` and friends
+        // own their own `value` semantics; we must NOT manufacture a
+        // 400 for them. Pass-through verified for every other action
+        // name in the supported list.
+        let params = Some(json!({ "value": "foo" }));
+        for action in &[
+            "setValue",
+            "select",
+            "click",
+            "doubleClick",
+            "double_click",
+            "double",
+            "right",
+            "middle",
+            "sendKeys",
+            "clear",
+            "focus",
+            "blur",
+            "hover",
+            "scroll",
+            "scrollIntoView",
+            "scroll_into_view",
+            "check",
+            "uncheck",
+            "toggle",
+            "drag",
+            "submit",
+            "reset",
+            "autocomplete",
+        ] {
+            assert_eq!(
+                validate_type_action_params(action, &params, &empty_extra()),
+                Ok(()),
+                "non-type action '{}' must not be gated by the type validator",
+                action
+            );
+        }
+    }
+
+    // ── error constructors ────────────────────────────────────────────────
+
+    #[test]
+    fn type_param_invalid_carries_documented_message_and_hint() {
+        // The exact docs message from
+        // `ui-bridge/docs-site/docs/api/runner-features.md:336-341`. The
+        // literal-string check is the regression guard — if anyone ever
+        // changes this prose, both docs AND this test must move in
+        // lockstep.
+        let err = UiBridgeError::type_param_invalid();
+        assert!(
+            matches!(err.code, UiBridgeErrorCode::InvalidParam),
+            "code must serialize to INVALID_PARAM"
+        );
+        assert_eq!(
+            err.message,
+            "type: 'value' is unknown; did you mean 'text'?"
+        );
+        let ctx = err.context.expect("context must carry didYouMean hint");
+        assert_eq!(ctx.get("didYouMean").and_then(|v| v.as_str()), Some("text"));
+        assert_eq!(
+            ctx.get("field").and_then(|v| v.as_str()),
+            Some("params.text")
+        );
+        assert_eq!(ctx.get("action").and_then(|v| v.as_str()), Some("type"));
+    }
+
+    #[test]
+    fn type_param_missing_carries_documented_message() {
+        let err = UiBridgeError::type_param_missing();
+        assert!(
+            matches!(err.code, UiBridgeErrorCode::MissingParam),
+            "code must serialize to MISSING_PARAM"
+        );
+        assert_eq!(err.message, "type requires 'text' parameter");
+        let ctx = err.context.expect("context must carry required-field hint");
+        let required = ctx
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required must be an array");
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].as_str(), Some("text"));
+    }
+
+    // ── envelope shape ────────────────────────────────────────────────────
+
+    #[test]
+    fn envelope_for_wrong_field_serializes_to_400_contract() {
+        // Build the body the handler will emit on the
+        // `WrongFieldValueInsteadOfText` branch and lock down the JSON
+        // shape that callers see. HTTP 400 is enforced by the handler;
+        // here we verify the body's contract surface.
+        let detail = UiBridgeError::type_param_invalid();
+        let msg = detail.message.clone();
+        let body = api_error_detailed(msg, detail);
+        let body_json = serde_json::to_value(&body).expect("serializes");
+
+        // success: false envelope.
+        assert_eq!(
+            body_json.get("success").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        // Top-level `error` carries the documented prose.
+        assert_eq!(
+            body_json.get("error").and_then(|v| v.as_str()),
+            Some("type: 'value' is unknown; did you mean 'text'?")
+        );
+        // `error_detail.code` is the machine-readable discriminator.
+        let detail_json = body_json
+            .get("error_detail")
+            .expect("error_detail must be carried");
+        assert_eq!(
+            detail_json.get("code").and_then(|v| v.as_str()),
+            Some("INVALID_PARAM"),
+            "code must serialize as SCREAMING_SNAKE_CASE INVALID_PARAM"
+        );
+        assert_eq!(
+            detail_json.get("message").and_then(|v| v.as_str()),
+            Some("type: 'value' is unknown; did you mean 'text'?")
+        );
+        // The recovery hint lives in `error_detail.context`
+        // (`didYouMean` + `field` per the loop B iter 2 spec).
+        let ctx = detail_json.get("context").expect("context must be carried");
+        assert_eq!(ctx.get("didYouMean").and_then(|v| v.as_str()), Some("text"));
+        assert_eq!(
+            ctx.get("field").and_then(|v| v.as_str()),
+            Some("params.text")
+        );
+    }
+
+    #[test]
+    fn envelope_for_missing_field_serializes_to_400_contract() {
+        let detail = UiBridgeError::type_param_missing();
+        let msg = detail.message.clone();
+        let body = api_error_detailed(msg, detail);
+        let body_json = serde_json::to_value(&body).expect("serializes");
+
+        assert_eq!(
+            body_json.get("success").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            body_json.get("error").and_then(|v| v.as_str()),
+            Some("type requires 'text' parameter")
+        );
+        let detail_json = body_json
+            .get("error_detail")
+            .expect("error_detail must be carried");
+        assert_eq!(
+            detail_json.get("code").and_then(|v| v.as_str()),
+            Some("MISSING_PARAM")
         );
     }
 }
