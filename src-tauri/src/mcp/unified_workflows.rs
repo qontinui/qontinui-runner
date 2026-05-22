@@ -381,6 +381,13 @@ pub async fn create_unified_workflow(
             );
             // Push to web backend (best-effort, fire-and-forget)
             tokio::spawn(push_to_backend(created.clone()));
+            // Phase 3.2: also enqueue a write-through to the web-PG
+            // mirror that the dashboard reads from (independent of the
+            // legacy unified-workflows push above).
+            crate::mcp::workflow_mirror_sync::enqueue_upsert(
+                crate::mcp::workflow_mirror_sync::global_queue(),
+                created.clone(),
+            );
             Ok(Json(ApiResponse::success(created)))
         }
         Err(e) => {
@@ -466,6 +473,11 @@ pub async fn update_unified_workflow(
             );
             // Push update to web backend (best-effort, fire-and-forget)
             tokio::spawn(update_on_backend(updated.clone()));
+            // Phase 3.2: also enqueue mirror write-through.
+            crate::mcp::workflow_mirror_sync::enqueue_upsert(
+                crate::mcp::workflow_mirror_sync::global_queue(),
+                updated.clone(),
+            );
             Ok(Json(ApiResponse::success(updated)))
         }
         Err(e) if e.contains("not found") => Err((
@@ -542,6 +554,11 @@ pub async fn delete_unified_workflow(
         Ok(true) => {
             // Delete from web backend (best-effort, fire-and-forget)
             tokio::spawn(delete_from_backend(id.clone()));
+            // Phase 3.2: also enqueue a mirror delete intent.
+            crate::mcp::workflow_mirror_sync::enqueue_delete(
+                crate::mcp::workflow_mirror_sync::global_queue(),
+                id.clone(),
+            );
             Ok(Json(ApiResponse::success(serde_json::json!({
                 "deleted": true,
                 "id": id
@@ -627,6 +644,11 @@ pub async fn duplicate_unified_workflow(
         Ok(duplicated) => {
             info!("Duplicated unified workflow: {} -> {}", id, duplicated.id);
             tokio::spawn(push_to_backend(duplicated.clone()));
+            // Phase 3.2: also enqueue mirror write-through.
+            crate::mcp::workflow_mirror_sync::enqueue_upsert(
+                crate::mcp::workflow_mirror_sync::global_queue(),
+                duplicated.clone(),
+            );
             Ok(Json(ApiResponse::success(duplicated)))
         }
         Err(e) => {
@@ -773,6 +795,11 @@ pub async fn import_unified_workflow(
             );
             // Push imported workflow to web backend (best-effort, fire-and-forget)
             tokio::spawn(push_to_backend(created.clone()));
+            // Phase 3.2: also enqueue mirror write-through.
+            crate::mcp::workflow_mirror_sync::enqueue_upsert(
+                crate::mcp::workflow_mirror_sync::global_queue(),
+                created.clone(),
+            );
             Ok(Json(ApiResponse::success(
                 crate::unified_workflows::ImportWorkflowResult {
                     workflow: created,
