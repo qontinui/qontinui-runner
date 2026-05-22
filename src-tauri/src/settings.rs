@@ -1119,6 +1119,58 @@ mod tier_tests {
         let json = serde_json::to_string(&RunnerTier::Local).unwrap();
         assert_eq!(json, "\"local\"");
     }
+
+    /// Env-var overlay must override a migrated Tier 2 down to Local — the
+    /// supervisor-spawned-temp-runner scenario where the shared settings.json
+    /// already inferred QontinuiAccount from the primary's `runner_token`.
+    #[test]
+    fn tier_env_overlay_local_demotes_qontinui_account() {
+        let mut s = Settings {
+            tier_initialized: true,
+            tier: RunnerTier::QontinuiAccount,
+            web_integration: WebIntegrationSettings {
+                runner_token: "qontinui_runner_primary".to_string(),
+                ..WebIntegrationSettings::default()
+            },
+            ..Settings::default()
+        };
+        apply_tier_env_overlay(&mut s, "local");
+        assert_eq!(s.tier, RunnerTier::Local);
+    }
+
+    #[test]
+    fn tier_env_overlay_accepts_all_three_values() {
+        let mut s = Settings::default();
+        apply_tier_env_overlay(&mut s, "qontinui_account");
+        assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+        apply_tier_env_overlay(&mut s, "local_provider");
+        assert_eq!(s.tier, RunnerTier::LocalProvider);
+        apply_tier_env_overlay(&mut s, "local");
+        assert_eq!(s.tier, RunnerTier::Local);
+    }
+
+    #[test]
+    fn tier_env_overlay_is_case_and_whitespace_tolerant() {
+        let mut s = Settings {
+            tier: RunnerTier::QontinuiAccount,
+            ..Settings::default()
+        };
+        apply_tier_env_overlay(&mut s, "  Local  ");
+        assert_eq!(s.tier, RunnerTier::Local);
+    }
+
+    /// An unrecognized value must leave the persisted tier untouched. The
+    /// supervisor should never send a bad value, but a typo in a CI script
+    /// shouldn't silently demote a Tier 2 runner.
+    #[test]
+    fn tier_env_overlay_unknown_value_preserves_tier() {
+        let mut s = Settings {
+            tier: RunnerTier::QontinuiAccount,
+            ..Settings::default()
+        };
+        apply_tier_env_overlay(&mut s, "nope");
+        assert_eq!(s.tier, RunnerTier::QontinuiAccount);
+    }
 }
 
 // ============================================================================
@@ -1754,6 +1806,17 @@ pub fn load_settings() -> Settings {
         }
     }
 
+    // Tier env-var overlay. In-memory only; never persisted. Lets a parent
+    // process (notably the supervisor spawning a temp runner) force the
+    // booted runner onto a specific tier without writing to the shared
+    // settings.json — which is keyed off `dirs::config_dir()` and is the
+    // same file for primary + temp + named runners. Persisting tier=Local
+    // for a temp runner would silently strip the primary runner's Tier 2
+    // state, so the only safe override is this in-memory overlay.
+    if let Ok(raw) = std::env::var("QONTINUI_RUNNER_TIER") {
+        apply_tier_env_overlay(&mut settings, &raw);
+    }
+
     // One-shot post-upgrade detector: if Tier 2 + has a runner_token + the
     // access_token slot does NOT look like a JWT (likely the legacy opaque
     // `qontinui_runner_<random>` bearer from pre-unified-devices days), log
@@ -1777,6 +1840,28 @@ pub fn load_settings() -> Settings {
     }
 
     settings
+}
+
+/// Parse a `QONTINUI_RUNNER_TIER` env-var value and apply it as an in-memory
+/// overlay on `settings.tier`. Applied AFTER `migrate_tier_in_place` so the
+/// env-var wins even when a non-empty `runner_token` was inferred to Tier 2
+/// in this process. An unrecognized value is logged and ignored — the
+/// (possibly migrated) persisted tier stands.
+///
+/// Factored out of `load_settings` so unit tests can exercise the parsing
+/// without mutating the process env (see `feedback_env_var_tests_serialize`).
+pub(crate) fn apply_tier_env_overlay(settings: &mut Settings, raw: &str) {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "local" => settings.tier = RunnerTier::Local,
+        "local_provider" => settings.tier = RunnerTier::LocalProvider,
+        "qontinui_account" => settings.tier = RunnerTier::QontinuiAccount,
+        other => {
+            error!(
+                "QONTINUI_RUNNER_TIER={:?} not recognized; expected local|local_provider|qontinui_account — keeping persisted tier {:?}",
+                other, settings.tier
+            );
+        }
+    }
 }
 
 /// One-shot tier inference. When `tier_initialized` is false (i.e. the
