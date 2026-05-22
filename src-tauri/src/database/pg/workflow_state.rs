@@ -385,9 +385,13 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         let iter_i32 = iteration as i32;
 
+        // NULL-guard: bind Option<String> to avoid an uncatchable panic in
+        // tokio-postgres if result_json is NULL (schema declares NOT NULL, but
+        // local-PG drift has been seen). The defensive `IS NOT NULL` in the
+        // WHERE is belt-and-braces; the Option bind is the primary fix.
         let row = conn
             .query_opt(
-                "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 AND iteration = $2 LIMIT 1",
+                "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 AND iteration = $2 AND result_json IS NOT NULL LIMIT 1",
                 &[&task_run_id, &iter_i32],
             )
             .await
@@ -395,7 +399,10 @@ impl PgDb {
 
         match row {
             Some(r) => {
-                let json_str: String = r.get(0);
+                let json_opt: Option<String> = r.get(0);
+                let Some(json_str) = json_opt else {
+                    return Ok(None);
+                };
                 let parsed: serde_json::Value = serde_json::from_str(&json_str)
                     .map_err(|e| format!("Failed to parse verification result JSON: {}", e))?;
                 Ok(Some(parsed))
