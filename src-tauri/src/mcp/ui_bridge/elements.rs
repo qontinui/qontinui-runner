@@ -742,17 +742,11 @@ pub(crate) fn validate_type_action_params(
         .and_then(|p| p.get("text"))
         .map(|v| v.is_string())
         .unwrap_or(false);
-    let extra_text_is_str = extra
-        .get("text")
-        .map(|v| v.is_string())
-        .unwrap_or(false);
+    let extra_text_is_str = extra.get("text").map(|v| v.is_string()).unwrap_or(false);
     if params_text_is_str || extra_text_is_str {
         return Ok(());
     }
-    let params_value_present = params
-        .as_ref()
-        .and_then(|p| p.get("value"))
-        .is_some();
+    let params_value_present = params.as_ref().and_then(|p| p.get("value")).is_some();
     let extra_value_present = extra.contains_key("value");
     if params_value_present || extra_value_present {
         Err(TypeParamError::WrongFieldValueInsteadOfText)
@@ -4868,9 +4862,7 @@ mod type_action_param_validation_tests {
     //! The handler-side wiring (`api_error_detailed(msg, detail)` + HTTP
     //! 400) is too IPC-coupled for a pure unit test, so the helper-level
     //! tests act as the regression guard for the envelope shape.
-    use super::{
-        api_error_detailed, validate_type_action_params, TypeParamError, UiBridgeError,
-    };
+    use super::{api_error_detailed, validate_type_action_params, TypeParamError, UiBridgeError};
     use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
     use serde_json::{json, Map};
 
@@ -4896,10 +4888,7 @@ mod type_action_param_validation_tests {
         // merged shape downstream.
         let mut extra = empty_extra();
         extra.insert("text".into(), json!("hello"));
-        assert_eq!(
-            validate_type_action_params("type", &None, &extra),
-            Ok(())
-        );
+        assert_eq!(validate_type_action_params("type", &None, &extra), Ok(()));
     }
 
     #[test]
@@ -4980,9 +4969,28 @@ mod type_action_param_validation_tests {
         // name in the supported list.
         let params = Some(json!({ "value": "foo" }));
         for action in &[
-            "setValue", "select", "click", "doubleClick", "double_click", "double", "right",
-            "middle", "sendKeys", "clear", "focus", "blur", "hover", "scroll", "scrollIntoView",
-            "scroll_into_view", "check", "uncheck", "toggle", "drag", "submit", "reset",
+            "setValue",
+            "select",
+            "click",
+            "doubleClick",
+            "double_click",
+            "double",
+            "right",
+            "middle",
+            "sendKeys",
+            "clear",
+            "focus",
+            "blur",
+            "hover",
+            "scroll",
+            "scrollIntoView",
+            "scroll_into_view",
+            "check",
+            "uncheck",
+            "toggle",
+            "drag",
+            "submit",
+            "reset",
             "autocomplete",
         ] {
             assert_eq!(
@@ -5008,7 +5016,10 @@ mod type_action_param_validation_tests {
             matches!(err.code, UiBridgeErrorCode::InvalidParam),
             "code must serialize to INVALID_PARAM"
         );
-        assert_eq!(err.message, "type: 'value' is unknown; did you mean 'text'?");
+        assert_eq!(
+            err.message,
+            "type: 'value' is unknown; did you mean 'text'?"
+        );
         let ctx = err.context.expect("context must carry didYouMean hint");
         assert_eq!(ctx.get("didYouMean").and_then(|v| v.as_str()), Some("text"));
         assert_eq!(
@@ -5074,10 +5085,7 @@ mod type_action_param_validation_tests {
         // The recovery hint lives in `error_detail.context`
         // (`didYouMean` + `field` per the loop B iter 2 spec).
         let ctx = detail_json.get("context").expect("context must be carried");
-        assert_eq!(
-            ctx.get("didYouMean").and_then(|v| v.as_str()),
-            Some("text")
-        );
+        assert_eq!(ctx.get("didYouMean").and_then(|v| v.as_str()), Some("text"));
         assert_eq!(
             ctx.get("field").and_then(|v| v.as_str()),
             Some("params.text")
