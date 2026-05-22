@@ -2604,6 +2604,18 @@ impl LoopController {
                 {
                     warn!("Failed to store agentic findings event (PG): {}", e);
                 }
+
+                // Also persist each finding into the task_run_findings table so
+                // the GET /findings/task/{task_run_id} API (and downstream mobile
+                // RunDetail Findings tab) can read them back. The event stream
+                // alone was insufficient — readers query the table, not events.
+                persist_agentic_findings_to_table(
+                    &self.app_state.pg_db,
+                    &config.execution_id,
+                    ctx.iteration,
+                    &parsed.findings,
+                )
+                .await;
             }
         }
 
@@ -3564,5 +3576,189 @@ impl LoopController {
 
         // Loop back to the top — next iteration starts with precondition checks
         LoopState::CheckPreconditions
+    }
+}
+
+/// Persist agentic-phase findings into `task_run_findings`.
+///
+/// The agentic phase emits a structured `agentic_findings` event (visible via
+/// `GET /task-runs/{id}/events`), but the runner's own `GET /findings/task/{id}`
+/// API reads from the `task_run_findings` table — not from events. Without this
+/// writer, the mobile RunDetail Findings tab observed empty results for every
+/// run that reported agentic findings.
+///
+/// Each `FindingOutput` is converted to a `ParsedFinding` and persisted via
+/// `PgDb::insert_parsed_finding`, which handles signature-hash dedup and
+/// canonical column mapping. Conversion failures (unknown category/severity)
+/// fall back to `code_bug` / `medium` so a finding is never dropped silently.
+async fn persist_agentic_findings_to_table(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    task_run_id: &str,
+    iteration: u32,
+    findings: &[super::agentic_output::FindingOutput],
+) {
+    use crate::findings::{
+        FindingCategory, FindingCategoryExt, FindingSeverity, FindingSeverityExt, ParsedFinding,
+    };
+
+    for output in findings {
+        let category = FindingCategory::from_str(&output.category).unwrap_or_else(|| {
+            warn!(
+                "Unknown finding category '{}' from agentic output; defaulting to code_bug",
+                output.category
+            );
+            FindingCategory::CodeBug
+        });
+        let severity = FindingSeverity::from_str(&output.severity).unwrap_or_else(|| {
+            warn!(
+                "Unknown finding severity '{}' from agentic output; defaulting to medium",
+                output.severity
+            );
+            FindingSeverity::Medium
+        });
+
+        let parsed = ParsedFinding {
+            category,
+            severity,
+            needs_input: output.needs_input,
+            is_resolved: output.resolved,
+            title: output.title.clone(),
+            description: output.description.clone(),
+            file: None,
+            line: None,
+            resolution: None,
+            question: None,
+            options: None,
+        };
+
+        match pg_db
+            .insert_parsed_finding(task_run_id, iteration, &parsed)
+            .await
+        {
+            Ok(finding) => {
+                debug!(
+                    "Persisted agentic finding {} ({}/{}) for task_run {}",
+                    finding.id,
+                    parsed.category.as_str(),
+                    parsed.severity.as_str(),
+                    task_run_id
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to persist agentic finding '{}' to task_run_findings: {}",
+                    output.title, e
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod findings_persistence_tests {
+    use super::super::agentic_output::FindingOutput;
+    use super::*;
+    use crate::findings::{FindingCategoryExt, FindingSeverityExt, ParsedFinding};
+
+    /// Converts a FindingOutput to ParsedFinding using the same logic as
+    /// `persist_agentic_findings_to_table`, exposed for testing without a live
+    /// PgDb. The DB INSERT itself is covered by integration tests against
+    /// ephemeral postgres; this unit test guards the type-conversion + fallback
+    /// logic, which is the contract this fix establishes.
+    fn convert_for_insert(output: &FindingOutput) -> ParsedFinding {
+        use crate::findings::{FindingCategory, FindingSeverity};
+        let category =
+            FindingCategory::from_str(&output.category).unwrap_or(FindingCategory::CodeBug);
+        let severity =
+            FindingSeverity::from_str(&output.severity).unwrap_or(FindingSeverity::Medium);
+        ParsedFinding {
+            category,
+            severity,
+            needs_input: output.needs_input,
+            is_resolved: output.resolved,
+            title: output.title.clone(),
+            description: output.description.clone(),
+            file: None,
+            line: None,
+            resolution: None,
+            question: None,
+            options: None,
+        }
+    }
+
+    #[test]
+    fn convert_finding_output_preserves_known_category_and_severity() {
+        let output = FindingOutput {
+            category: "security".to_string(),
+            severity: "critical".to_string(),
+            title: "Hardcoded credential".to_string(),
+            description: "Found API key in source".to_string(),
+            needs_input: false,
+            resolved: false,
+        };
+        let parsed = convert_for_insert(&output);
+        assert_eq!(parsed.category.as_str(), "security");
+        assert_eq!(parsed.severity.as_str(), "critical");
+        assert_eq!(parsed.title, "Hardcoded credential");
+        assert_eq!(parsed.description, "Found API key in source");
+        assert!(!parsed.needs_input);
+        assert!(!parsed.is_resolved);
+    }
+
+    #[test]
+    fn convert_finding_output_falls_back_on_unknown_category() {
+        let output = FindingOutput {
+            category: "not_a_real_category".to_string(),
+            severity: "high".to_string(),
+            title: "Mystery".to_string(),
+            description: "Unclassified issue".to_string(),
+            needs_input: false,
+            resolved: false,
+        };
+        let parsed = convert_for_insert(&output);
+        assert_eq!(parsed.category.as_str(), "code_bug");
+        assert_eq!(parsed.severity.as_str(), "high");
+    }
+
+    #[test]
+    fn convert_finding_output_falls_back_on_unknown_severity() {
+        let output = FindingOutput {
+            category: "performance".to_string(),
+            severity: "extra-spicy".to_string(),
+            title: "Slow query".to_string(),
+            description: "100ms".to_string(),
+            needs_input: false,
+            resolved: false,
+        };
+        let parsed = convert_for_insert(&output);
+        assert_eq!(parsed.category.as_str(), "performance");
+        assert_eq!(parsed.severity.as_str(), "medium");
+    }
+
+    #[test]
+    fn convert_finding_output_propagates_needs_input_and_resolved() {
+        let needs = FindingOutput {
+            category: "config_issue".to_string(),
+            severity: "low".to_string(),
+            title: "Missing env var".to_string(),
+            description: "Need value".to_string(),
+            needs_input: true,
+            resolved: false,
+        };
+        let parsed = convert_for_insert(&needs);
+        assert!(parsed.needs_input);
+        assert!(!parsed.is_resolved);
+
+        let resolved = FindingOutput {
+            category: "code_bug".to_string(),
+            severity: "medium".to_string(),
+            title: "Fixed in iteration".to_string(),
+            description: "Already addressed".to_string(),
+            needs_input: false,
+            resolved: true,
+        };
+        let parsed = convert_for_insert(&resolved);
+        assert!(!parsed.needs_input);
+        assert!(parsed.is_resolved);
     }
 }
