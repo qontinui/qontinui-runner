@@ -6,8 +6,8 @@
 //! the legacy commands (the old ones stay registered until Phase 4 lands)
 //! so the runner doesn't break between PRs.
 
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -15,9 +15,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::commands::CommandResponse;
-use crate::session::{
-    description_to_json, Intent, SessionError, SessionKind, SessionRegistry,
-};
+use crate::session::{description_to_json, Intent, SessionError, SessionKind, SessionRegistry};
 
 /// JSON shape accepted by `session_start`. Mirrors [`Intent`] verbatim;
 /// re-declared so the Tauri-side deserialization rejects unknown fields
@@ -131,7 +129,10 @@ pub fn session_describe(
     registry: tauri::State<'_, Arc<SessionRegistry>>,
     session_id: Uuid,
 ) -> Result<CommandResponse, String> {
-    let desc = registry.inner().describe_by_id(session_id).map_err(map_err)?;
+    let desc = registry
+        .inner()
+        .describe_by_id(session_id)
+        .map_err(map_err)?;
     Ok(CommandResponse {
         success: true,
         message: None,

@@ -53,11 +53,7 @@ impl Transport for WorkflowTransport {
         })
     }
 
-    fn write_input(
-        &self,
-        _handle: &TransportHandle,
-        _bytes: &[u8],
-    ) -> Result<(), TransportError> {
+    fn write_input(&self, _handle: &TransportHandle, _bytes: &[u8]) -> Result<(), TransportError> {
         // Workflows don't accept ad-hoc input — the workflow definition
         // is the input. Mid-run intervention happens via the workflow
         // executor's own surfaces (step injection etc.).

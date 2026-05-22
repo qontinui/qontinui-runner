@@ -68,13 +68,11 @@ pub trait Transport: Send + Sync + 'static {
     /// Write input bytes. For [`TransportHandle::Pty`] this is PTY stdin;
     /// for [`TransportHandle::ClaudeCli`] this is a stream-json user
     /// message; workflows do not accept ad-hoc input today.
-    fn write_input(&self, handle: &TransportHandle, bytes: &[u8])
-        -> Result<(), TransportError>;
+    fn write_input(&self, handle: &TransportHandle, bytes: &[u8]) -> Result<(), TransportError>;
 
     /// Resize the underlying terminal. No-op for transports that don't
     /// own a terminal.
-    fn resize(&self, handle: &TransportHandle, cols: u16, rows: u16)
-        -> Result<(), TransportError>;
+    fn resize(&self, handle: &TransportHandle, cols: u16, rows: u16) -> Result<(), TransportError>;
 
     /// Tear down the transport. Idempotent — calling `close` on an
     /// already-closed handle returns `Ok(())`.

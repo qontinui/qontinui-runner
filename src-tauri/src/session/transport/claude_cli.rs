@@ -105,11 +105,7 @@ impl Transport for ClaudeCliTransport {
         }
     }
 
-    fn write_input(
-        &self,
-        handle: &TransportHandle,
-        bytes: &[u8],
-    ) -> Result<(), TransportError> {
+    fn write_input(&self, handle: &TransportHandle, bytes: &[u8]) -> Result<(), TransportError> {
         match handle {
             TransportHandle::Pty { terminal_id } => {
                 let session = self.terminal_manager.get(terminal_id).ok_or_else(|| {
@@ -131,12 +127,7 @@ impl Transport for ClaudeCliTransport {
         }
     }
 
-    fn resize(
-        &self,
-        handle: &TransportHandle,
-        cols: u16,
-        rows: u16,
-    ) -> Result<(), TransportError> {
+    fn resize(&self, handle: &TransportHandle, cols: u16, rows: u16) -> Result<(), TransportError> {
         match handle {
             TransportHandle::Pty { terminal_id } => {
                 let session = self.terminal_manager.get(terminal_id).ok_or_else(|| {
@@ -154,12 +145,13 @@ impl Transport for ClaudeCliTransport {
 
     fn close(&self, handle: &TransportHandle) -> Result<(), TransportError> {
         match handle {
-            TransportHandle::Pty { terminal_id } => match self.terminal_manager.close(terminal_id)
-            {
-                Ok(()) => Ok(()),
-                Err(e) if e.contains("not found") => Ok(()),
-                Err(e) => Err(TransportError::Runtime(e)),
-            },
+            TransportHandle::Pty { terminal_id } => {
+                match self.terminal_manager.close(terminal_id) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.contains("not found") => Ok(()),
+                    Err(e) => Err(TransportError::Runtime(e)),
+                }
+            }
             TransportHandle::ClaudeCli { cli_session_id } => {
                 // For non-placeholder ids the workflow executor's close hook
                 // is the canonical teardown; the transport just records the

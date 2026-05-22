@@ -339,10 +339,7 @@ impl SessionRegistry {
             .record(self.machine_id, id, SessionEventKind::Started, payload)
             .map_err(|e| SessionError::Outbox(e.to_string()))?;
 
-        let mut sessions = self
-            .sessions
-            .lock()
-            .expect("session registry poisoned");
+        let mut sessions = self.sessions.lock().expect("session registry poisoned");
         sessions.insert(id, record);
 
         Ok(SessionHandle {
@@ -405,12 +402,11 @@ impl SessionRegistry {
         // Outbox the close event regardless of transport close result —
         // the dashboard wants to know we tried to close even if the
         // subprocess was already dead.
-        if let Err(e) = self.coord_sync.outbox().record(
-            self.machine_id,
-            id,
-            SessionEventKind::Closed,
-            payload,
-        ) {
+        if let Err(e) =
+            self.coord_sync
+                .outbox()
+                .record(self.machine_id, id, SessionEventKind::Closed, payload)
+        {
             tracing::warn!("session {} close outbox write failed: {}", id, e);
         }
 
@@ -523,6 +519,14 @@ pub struct SessionHandle {
     registry: Arc<SessionRegistry>,
 }
 
+impl std::fmt::Debug for SessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionHandle")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
 impl SessionHandle {
     pub fn id(&self) -> Uuid {
         self.id
@@ -620,20 +624,11 @@ mod tests {
                 terminal_id: "fake-1".to_string(),
             })
         }
-        fn write_input(
-            &self,
-            _h: &TransportHandle,
-            _b: &[u8],
-        ) -> Result<(), TransportError> {
+        fn write_input(&self, _h: &TransportHandle, _b: &[u8]) -> Result<(), TransportError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn resize(
-            &self,
-            _h: &TransportHandle,
-            _c: u16,
-            _r: u16,
-        ) -> Result<(), TransportError> {
+        fn resize(&self, _h: &TransportHandle, _c: u16, _r: u16) -> Result<(), TransportError> {
             self.resizes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -645,14 +640,12 @@ mod tests {
 
     fn make_registry() -> Arc<SessionRegistry> {
         let dir = tempfile::tempdir().unwrap();
-        let outbox = Arc::new(
-            local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap(),
-        );
+        let outbox =
+            Arc::new(local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
         let coord_sync = coord_sync::CoordSync::new(outbox);
 
         let pty = Arc::new(FakeTransport::new(SessionKind::TerminalShell)) as DynTransport;
-        let claude_cli =
-            Arc::new(FakeTransport::new(SessionKind::TerminalClaude)) as DynTransport;
+        let claude_cli = Arc::new(FakeTransport::new(SessionKind::TerminalClaude)) as DynTransport;
         let workflow = Arc::new(FakeTransport::new(SessionKind::Workflow)) as DynTransport;
 
         SessionRegistry::new(

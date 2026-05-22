@@ -106,7 +106,9 @@ impl Intent {
 pub enum IntentError {
     #[error("session purpose too short ({got} < {min} chars after trim)")]
     PurposeTooShort { got: usize, min: usize },
-    #[error("session intent has branch set but no repo — branch only makes sense scoped to a repo")]
+    #[error(
+        "session intent has branch set but no repo — branch only makes sense scoped to a repo"
+    )]
     BranchWithoutRepo,
     #[error("declared_paths contains an empty path")]
     EmptyDeclaredPath,

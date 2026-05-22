@@ -35,7 +35,10 @@ impl PtyTransport {
         }
     }
 
-    fn handle_terminal_id<'a>(&self, handle: &'a TransportHandle) -> Result<&'a str, TransportError> {
+    fn handle_terminal_id<'a>(
+        &self,
+        handle: &'a TransportHandle,
+    ) -> Result<&'a str, TransportError> {
         match handle {
             TransportHandle::Pty { terminal_id } => Ok(terminal_id.as_str()),
             other => Err(TransportError::Runtime(format!(
@@ -68,7 +71,14 @@ impl Transport for PtyTransport {
 
         let info = self
             .manager
-            .create(title, working_dir, None, None, None, self.app_handle.clone())
+            .create(
+                title,
+                working_dir,
+                None,
+                None,
+                None,
+                self.app_handle.clone(),
+            )
             .map_err(TransportError::Runtime)?;
 
         Ok(TransportHandle::Pty {
@@ -76,11 +86,7 @@ impl Transport for PtyTransport {
         })
     }
 
-    fn write_input(
-        &self,
-        handle: &TransportHandle,
-        bytes: &[u8],
-    ) -> Result<(), TransportError> {
+    fn write_input(&self, handle: &TransportHandle, bytes: &[u8]) -> Result<(), TransportError> {
         let id = self.handle_terminal_id(handle)?;
         let session = self
             .manager
@@ -89,12 +95,7 @@ impl Transport for PtyTransport {
         session.write(bytes).map_err(TransportError::Runtime)
     }
 
-    fn resize(
-        &self,
-        handle: &TransportHandle,
-        cols: u16,
-        rows: u16,
-    ) -> Result<(), TransportError> {
+    fn resize(&self, handle: &TransportHandle, cols: u16, rows: u16) -> Result<(), TransportError> {
         let id = self.handle_terminal_id(handle)?;
         let session = self
             .manager
