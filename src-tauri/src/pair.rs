@@ -7,7 +7,8 @@
 //! ## Public surface
 //!
 //! - [`pair_with_auth_token`] — headless flow: POST `Authorization: Bearer
-//!   <oauth-or-runner-token>` to coord's `POST /coord/devices/pair-cli`.
+//!   <user-jwt>` to the web backend's `POST /api/v1/devices/pair-cli`,
+//!   which proxies to coord with server-side-injected `tenant_id`.
 //!   Requires the device to already be browser-paired at least once
 //!   (uses the cached `user_id` from `paired_user.json`).
 //! - [`pair_via_browser`] — interactive flow: opens
@@ -46,8 +47,9 @@ use std::path::PathBuf;
 // Wire types — must match qontinui-coord/src/routes_phase3.rs exactly.
 // ============================================================================
 
-/// Canonical response shape for `POST /coord/devices/pair-cli` and
-/// `POST /coord/devices/pair-complete`. Coord serializes this as
+/// Canonical response shape for `POST /api/v1/devices/pair-cli` (proxied
+/// through the web backend) and `POST /coord/devices/pair-complete`
+/// (browser flow, called by coord directly). Coord serializes this as
 /// `{token, device_id, user_id, jti, exp}`. We accept the wire shape
 /// directly: no `serde(rename)` indirection — the struct field name *is*
 /// the wire name.
@@ -285,10 +287,11 @@ pub fn derive_web_base_from_coord(coord_base: &str) -> String {
 // Pair: headless (--auth-token)
 // ============================================================================
 
-/// POST `Authorization: Bearer <oauth-or-runner-token>` +
-/// `X-Qontinui-User-Id: <uuid>` to `POST /coord/devices/pair-cli`. Coord
-/// verifies the bearer token, looks up the device, and returns a fresh
-/// device-token JWT.
+/// POST `Authorization: Bearer <user-jwt>` +
+/// `X-Qontinui-User-Id: <uuid>` to `POST /api/v1/devices/pair-cli` (the
+/// web backend's pair-cli proxy, which injects `tenant_id` server-side
+/// and forwards to coord). Coord verifies the bearer token, looks up the
+/// device, and returns a fresh device-token JWT.
 ///
 /// Requirements (Defect 5):
 /// - `~/.qontinui/machine.json` must exist with a UUID `device_id`
@@ -300,7 +303,7 @@ pub fn derive_web_base_from_coord(coord_base: &str) -> String {
 /// Thin wrapper around [`pair_with_auth_token_with_ids`] — reads
 /// `device_id` and `user_id` from disk then delegates. Tests use the
 /// parameterized form directly so they can run hermetically against an
-/// in-process mock coord without touching `~/.qontinui` or the
+/// in-process mock web backend without touching `~/.qontinui` or the
 /// `data_local_dir`.
 /// Decode the unverified payload of a JWT and pull the `tenant_id`
 /// claim, if any. Returns `None` if the token isn't a JWT, the payload
@@ -348,7 +351,7 @@ pub fn pair_with_auth_token(
 /// and `user_id` as explicit arguments instead of reading them from
 /// `~/.qontinui/machine.json` + `{data_local_dir}/.../paired_user.json`.
 /// Phase 5 of the unified-devices migration introduced this split so the
-/// E2E pair tests can target an in-process mock coord without mutating
+/// E2E pair tests can target an in-process mock web backend without mutating
 /// (or relying on) per-user files.
 ///
 /// Routes through the web backend at `{base}/api/v1/devices/pair-cli`,
@@ -861,7 +864,7 @@ mod tests {
 }
 
 // ============================================================================
-// E2E pair tests against an in-process mock coord (Phase 5.1)
+// E2E pair tests against an in-process mock web backend (Phase 5.1)
 // ============================================================================
 //
 // These tests exercise `pair_with_auth_token_with_ids` against a real
@@ -910,8 +913,9 @@ mod pair_e2e_tests {
         response_body: String,
     }
 
-    /// Canonical-shape 200 body returned by coord's
-    /// `POST /coord/devices/pair-cli` on success.
+    /// Canonical-shape 200 body returned by the web-backend's
+    /// `POST /api/v1/devices/pair-cli` on success (passthrough of the
+    /// coord response).
     fn canonical_200_body(token: &str) -> String {
         serde_json::json!({
             "token": token,
@@ -923,7 +927,7 @@ mod pair_e2e_tests {
         .to_string()
     }
 
-    /// Handler for `POST /coord/devices/pair-cli`. Captures the inbound
+    /// Handler for `POST /api/v1/devices/pair-cli`. Captures the inbound
     /// request shape onto shared state then returns the canned response.
     async fn pair_cli_handler(
         State(state): State<MockState>,
@@ -944,10 +948,11 @@ mod pair_e2e_tests {
         (state.status, state.response_body.clone())
     }
 
-    /// Boot the mock coord on `127.0.0.1:0`. Returns
-    /// `(base_url, capture_handle, shutdown_signal)`. The caller drops
-    /// `shutdown_signal` (or sends on it) to terminate the server.
-    fn spawn_mock_coord(
+    /// Boot a mock web backend on `127.0.0.1:0` serving the pair-cli
+    /// proxy endpoint. Returns `(base_url, capture_handle, shutdown_signal)`.
+    /// The caller drops `shutdown_signal` (or sends on it) to terminate the
+    /// server.
+    fn spawn_mock_web_backend(
         status: StatusCode,
         response_body: String,
     ) -> (
@@ -1013,12 +1018,12 @@ mod pair_e2e_tests {
 
     #[test]
     fn pair_with_auth_token_e2e_200_persists_jwt() {
-        // Mock coord at 127.0.0.1:<port> returns the canonical 200 JSON;
+        // Mock web backend at 127.0.0.1:<port> returns the canonical 200 JSON;
         // assert the returned PairCompleteResponse.token matches the
         // synthetic JWT we configured the mock to emit.
         let expected_jwt = "header-segment.payload-segment.signature-segment";
         let (base, _capture, _shutdown) =
-            spawn_mock_coord(StatusCode::OK, canonical_200_body(expected_jwt));
+            spawn_mock_web_backend(StatusCode::OK, canonical_200_body(expected_jwt));
         let result = pair_with_auth_token_with_ids(
             &base,
             TEST_BEARER,
@@ -1040,7 +1045,7 @@ mod pair_e2e_tests {
         // Mock returns 401 with a coord-shaped error body; assert the
         // error string surfaces the status code + body so an operator
         // can diagnose by reading the log.
-        let (base, _capture, _shutdown) = spawn_mock_coord(
+        let (base, _capture, _shutdown) = spawn_mock_web_backend(
             StatusCode::UNAUTHORIZED,
             r#"{"error":"invalid bearer token"}"#.to_string(),
         );
@@ -1062,7 +1067,7 @@ mod pair_e2e_tests {
     fn pair_with_auth_token_e2e_500_returns_err() {
         // Coord-side bug → 500. Caller must surface the error rather
         // than silently treating it as a refresh-needed signal.
-        let (base, _capture, _shutdown) = spawn_mock_coord(
+        let (base, _capture, _shutdown) = spawn_mock_web_backend(
             StatusCode::INTERNAL_SERVER_ERROR,
             r#"{"error":"coord-side panic"}"#.to_string(),
         );
@@ -1087,7 +1092,7 @@ mod pair_e2e_tests {
         // `X-Qontinui-User-Id: <uuid>` header, and a JSON body containing
         // `device_id` + `hostname`.
         let (base, capture, _shutdown) =
-            spawn_mock_coord(StatusCode::OK, canonical_200_body("ignored-jwt"));
+            spawn_mock_web_backend(StatusCode::OK, canonical_200_body("ignored-jwt"));
         let _ = pair_with_auth_token_with_ids(
             &base,
             TEST_BEARER,
@@ -1098,7 +1103,7 @@ mod pair_e2e_tests {
         .expect("200 path");
 
         let captured = capture.lock().expect("capture mutex").clone();
-        assert!(captured.called, "mock coord must have been hit");
+        assert!(captured.called, "mock web backend must have been hit");
         assert_eq!(
             captured.authorization.as_deref(),
             Some(&*format!("Bearer {TEST_BEARER}")),
