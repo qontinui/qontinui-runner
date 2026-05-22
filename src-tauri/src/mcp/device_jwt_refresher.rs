@@ -183,9 +183,10 @@ pub(crate) async fn try_refresh_once(
 
     // Resolve tenant_id from the OAuth/runner token's `tenant_id` claim.
     // Phase 2 of the default-tenant-propagation plan makes tenant_id a
-    // required field on `POST /coord/devices/pair-cli`; the refresher
-    // reuses the same endpoint to re-mint the device JWT, so it must
-    // forward a tenant_id. Absent/malformed → keep the existing JWT.
+    // required field on `POST /api/v1/devices/pair-cli` (the web-backend
+    // proxy that fronts coord since PR #224); the refresher reuses the
+    // same endpoint to re-mint the device JWT, so it must forward a
+    // tenant_id. Absent/malformed → keep the existing JWT.
     let tenant_id = match qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)
         .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
     {
@@ -594,11 +595,11 @@ mod tests {
 #[cfg(test)]
 mod try_refresh_once_tests {
     //! Phase 5.2 integration tests — `try_refresh_once` against an
-    //! in-process mock coord. These exercise the JWT-preservation
+    //! in-process mock web backend. These exercise the JWT-preservation
     //! invariant: a non-2xx coord response MUST NOT clear the existing
     //! access_token slot.
     //!
-    //! Mock coord: inline axum server on `127.0.0.1:0`, same pattern as
+    //! Mock web backend: inline axum server on `127.0.0.1:0`, same pattern as
     //! `pair::pair_e2e_tests`. AuthManager: `with_storage(...)` +
     //! `SecureStorage::with_path(<temp_file>)` so each test has its own
     //! isolated tokens file.
@@ -713,7 +714,7 @@ mod try_refresh_once_tests {
     #[tokio::test]
     async fn refresher_handles_coord_401_without_clearing_jwt() {
         // Setup: AuthManager holds a valid-shape (not-yet-expired) JWT.
-        // Run: mock coord returns 401 on pair-cli.
+        // Run: mock web backend returns 401 on pair-cli.
         // Assert: access_token slot STILL holds the original JWT (not
         // cleared) AND the outcome is KeptExisting.
         let mgr = test_auth_manager("handles_coord_401_without_clearing");
@@ -731,7 +732,11 @@ mod try_refresh_once_tests {
             RefreshOutcome::KeptExisting,
             "401 must yield KeptExisting (not Replaced, not PersistFailed)"
         );
-        assert_eq!(*hits.lock().unwrap(), 1, "coord should be hit exactly once");
+        assert_eq!(
+            *hits.lock().unwrap(),
+            1,
+            "web backend pair-cli endpoint should be hit exactly once"
+        );
 
         let still = mgr.get_access_token().expect("token still present");
         assert_eq!(
@@ -767,7 +772,7 @@ mod try_refresh_once_tests {
     #[tokio::test]
     async fn refresher_handles_coord_200_replaces_jwt() {
         // Setup: AuthManager holds the OLD JWT.
-        // Run: mock coord returns canonical 200 with a NEW JWT.
+        // Run: mock web backend returns canonical 200 with a NEW JWT.
         // Assert: outcome is Replaced with the NEW JWT, and the
         // access_token slot now holds the NEW JWT.
         let mgr = test_auth_manager("handles_coord_200_replaces");
