@@ -1,0 +1,59 @@
+# Session-Id trailer gate.
+#
+# Walks every commit in a pull request and fails if any commit message
+# lacks a canonical `Session-Id: <uuid>` trailer. The auto-injecting
+# `prepare-commit-msg` hook (qontinui-dev-notes/scripts/git-hooks/)
+# handles this transparently for Claude Code agents; this workflow is
+# the belt-and-suspenders that catches commits made:
+#   - on machines where the hook isn't installed yet,
+#   - by sibling agents that opted out of the env var,
+#   - by direct push to a feature branch (no Claude Code session in
+#     the loop).
+#
+# Per `qontinui-dev-notes/memory/current_session_id.md` the trailer
+# value is the Claude Code session UUID (8-4-4-4-12 hex), NOT the
+# `/rename` slug. The regex below enforces UUID shape, not freeform.
+name: Session-Id trailer
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: Verify Session-Id trailer on every PR commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so we can walk the PR's commit range.
+          fetch-depth: 0
+      - name: Verify
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+          missing=0
+          total=0
+          for sha in $(git log --format=%H "$base..HEAD"); do
+            total=$((total+1))
+            if ! git log -1 --format=%B "$sha" \
+                 | grep -qE "^Session-Id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"; then
+              subj=$(git log -1 --format=%s "$sha")
+              echo "::error::commit $sha lacks 'Session-Id: <uuid>' trailer"
+              echo "         subject: $subj"
+              missing=$((missing+1))
+            fi
+          done
+          if [[ $missing -gt 0 ]]; then
+            echo ""
+            echo "::error::$missing of $total commit(s) missing the Session-Id trailer."
+            echo ""
+            echo "Fix options:"
+            echo "  - Run scripts/install-session-id-hook.sh once per machine"
+            echo "    (lives in qontinui-dev-notes). Future commits auto-inject."
+            echo "  - Retroactively: 'git rebase -i $base' and amend each commit"
+            echo "    with a 'Session-Id: <uuid>' trailer (uuid from your"
+            echo "    \$CLAUDE_CODE_SESSION_ID env var)."
+            exit 1
+          fi
+          echo "✓ All $total commit(s) carry a valid Session-Id trailer."
