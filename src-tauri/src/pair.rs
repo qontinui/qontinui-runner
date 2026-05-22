@@ -977,7 +977,12 @@ mod pair_e2e_tests {
                     response_body,
                 };
                 let app: Router = Router::new()
-                    .route("/coord/devices/pair-cli", post(pair_cli_handler))
+                    // Mirror the live route — pair_with_auth_token POSTs to
+                    // `{base}/api/v1/devices/pair-cli` (web-routed). The mock
+                    // used to register `/coord/devices/pair-cli` (the legacy
+                    // coord-direct path) and 404'd the request, panicking all
+                    // four pair_e2e tests. Tied to the call site at line 369.
+                    .route("/api/v1/devices/pair-cli", post(pair_cli_handler))
                     .with_state(mock_state);
                 let listener =
                     tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
