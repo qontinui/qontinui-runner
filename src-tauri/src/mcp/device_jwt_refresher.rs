@@ -294,16 +294,30 @@ async fn refresher_loop(
                 continue;
             }
             Decision::Pair => {
-                let runner_token = settings_snapshot
-                    .web_integration
-                    .runner_token
-                    .trim()
-                    .to_string();
                 // Post-2026-05-22: pair-cli now goes through the web
                 // backend (`/api/v1/devices/pair-cli`), not coord directly,
                 // so the backend can resolve `tenant_id` from the
-                // authenticated user. Use the web_integration's
-                // `backend_url` setting — same one the relay reads.
+                // authenticated user. The backend gates on the FastAPI
+                // user-JWT (`Authorization: Bearer <access_token>`) — not
+                // the legacy `runner_token`, which only coord ever
+                // accepted. Pull the user JWT that the runner stashed at
+                // sign-in time (`commands::auth::login` →
+                // `AuthManager::store_tokens`).
+                let bearer_token = match auth_manager.get_access_token() {
+                    Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    _ => {
+                        warn!(
+                            "device_jwt_refresher: access_token slot empty — user must \
+                             sign in to Qontinui before the refresher can pair"
+                        );
+                        if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
+                            .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                };
                 let pair_base = settings_snapshot
                     .web_integration
                     .backend_url
@@ -363,7 +377,7 @@ async fn refresher_loop(
                 let outcome = try_refresh_once(
                     &auth_manager,
                     &pair_base,
-                    &runner_token,
+                    &bearer_token,
                     &device_id,
                     &user_id,
                 )
