@@ -53,6 +53,7 @@ export type MainTabId =
   | "triggers"
   | "tasks"
   | "settings"
+  | "settings-account"
   | "settings-ai"
   | "settings-agentic"
   | "settings-self-healing"
@@ -152,6 +153,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "triggers",
   "tasks",
   "settings",
+  "settings-account",
   "settings-ai",
   "settings-agentic",
   "settings-self-healing",
@@ -262,6 +264,7 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   triggers: "Triggers",
   tasks: "Scheduler",
   settings: "Settings",
+  "settings-account": "Account Settings",
   "settings-ai": "AI Settings",
   "settings-agentic": "Agentic Settings",
   "settings-self-healing": "Self-Healing Settings",

@@ -947,6 +947,7 @@ export function TabContent({
       );
 
     case "settings":
+    case "settings-account":
     case "settings-ai":
     case "settings-agentic":
     case "settings-self-healing":
@@ -967,6 +968,7 @@ export function TabContent({
     case "settings-updates": {
       const settingsTabMap: Record<string, string> = {
         settings: "backend-connection",
+        "settings-account": "account",
         "settings-ai": "ai",
         "settings-agentic": "agentic",
         "settings-self-healing": "self-healing",
