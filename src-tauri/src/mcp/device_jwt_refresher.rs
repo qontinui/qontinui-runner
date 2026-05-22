@@ -154,10 +154,15 @@ pub fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
     })
 }
 
-/// Attempt one refresh against `coord_base` using `runner_token` as the
+/// Attempt one refresh against `pair_base` using `runner_token` as the
 /// bearer + `device_id` / `user_id` as the wire body / header fields.
 /// Factored out of the inline Pair-arm body so the Phase 5.2 tests can
-/// drive it directly against an in-process mock coord.
+/// drive it directly against an in-process mock backend.
+///
+/// `pair_base` is the web-backend URL (e.g. `http://127.0.0.1:8000`);
+/// the underlying [`pair_with_auth_token_with_ids`] hits
+/// `{pair_base}/api/v1/devices/pair-cli`, which the backend proxies to
+/// coord with `tenant_id` resolved from the authenticated user.
 ///
 /// Invariant: a non-2xx HTTP response, a network error, or a
 /// spawn_blocking join failure all collapse to
@@ -166,12 +171,12 @@ pub fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
 /// [`RefreshOutcome`].
 pub(crate) async fn try_refresh_once(
     auth_manager: &crate::auth::AuthManager,
-    coord_base: &str,
+    pair_base: &str,
     runner_token: &str,
     device_id: &str,
     user_id: &str,
 ) -> RefreshOutcome {
-    let base = coord_base.to_string();
+    let base = pair_base.to_string();
     let token = runner_token.to_string();
     let did = device_id.to_string();
     let uid = user_id.to_string();
@@ -309,15 +314,22 @@ async fn refresher_loop(
                 continue;
             }
             Decision::Pair => {
-                let runner_token = settings_snapshot
-                    .web_integration
-                    .runner_token
-                    .trim()
-                    .to_string();
-                let coord_base = match qontinui_runner_lib::pair::coord_http_base() {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("device_jwt_refresher: coord_url unresolved: {e}");
+                // Post-2026-05-22: pair-cli now goes through the web
+                // backend (`/api/v1/devices/pair-cli`), not coord directly,
+                // so the backend can resolve `tenant_id` from the
+                // authenticated user. The backend gates on the FastAPI
+                // user-JWT (`Authorization: Bearer <access_token>`) — not
+                // the legacy `runner_token`, which only coord ever
+                // accepted. Pull the user JWT that the runner stashed at
+                // sign-in time (`commands::auth::login` →
+                // `AuthManager::store_tokens`).
+                let bearer_token = match auth_manager.get_access_token() {
+                    Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    _ => {
+                        warn!(
+                            "device_jwt_refresher: access_token slot empty — user must \
+                             sign in to Qontinui before the refresher can pair"
+                        );
                         if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
                             .await
                         {
@@ -326,6 +338,21 @@ async fn refresher_loop(
                         continue;
                     }
                 };
+                let pair_base = settings_snapshot
+                    .web_integration
+                    .backend_url
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_string();
+                if pair_base.is_empty() {
+                    warn!("device_jwt_refresher: backend_url empty — cannot pair");
+                    if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
+                        .await
+                    {
+                        return;
+                    }
+                    continue;
+                }
 
                 // Resolve device_id + user_id from disk. Phase 5 split:
                 // these reads live here (operator-facing files) so the
@@ -369,8 +396,8 @@ async fn refresher_loop(
                 // the existing JWT on any non-2xx outcome.
                 let outcome = try_refresh_once(
                     &auth_manager,
-                    &coord_base,
-                    &runner_token,
+                    &pair_base,
+                    &bearer_token,
                     &device_id,
                     &user_id,
                 )
