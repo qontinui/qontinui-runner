@@ -1666,11 +1666,7 @@ mod preflight_node_bin_tests {
         // `npx --quiet next dev` should still resolve to `next`.
         let tmp = tempdir().unwrap();
         let mut cfg = npx_next_config(tmp.path());
-        cfg.args = vec![
-            "--quiet".to_string(),
-            "next".to_string(),
-            "dev".to_string(),
-        ];
+        cfg.args = vec!["--quiet".to_string(), "next".to_string(), "dev".to_string()];
         assert_eq!(expected_node_bin(&cfg), Some("next".to_string()));
     }
 

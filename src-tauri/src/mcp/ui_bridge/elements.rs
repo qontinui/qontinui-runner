@@ -916,7 +916,11 @@ pub async fn ui_bridge_execute_action_handler(
                     .and_then(|p| p.get("disabled"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                aria_disabled || disabled_attr || data_disabled || prop_aria_disabled || prop_disabled
+                aria_disabled
+                    || disabled_attr
+                    || data_disabled
+                    || prop_aria_disabled
+                    || prop_disabled
             };
 
             if is_disabled {
@@ -1215,19 +1219,16 @@ pub async fn ui_bridge_execute_action_handler(
             // If `command_chosen` IS set, keep the existing
             // success-on-recovery envelope — that's a structured retry,
             // not the contract-violating no-op path.
-            let contract_violation =
-                recovery.recovered && recovery.command_chosen.is_none();
+            let contract_violation = recovery.recovered && recovery.command_chosen.is_none();
             if contract_violation {
                 warn!(
                     "execute_action: rejecting misleading recovered:true,commandChosen:null \
                      for element {} action '{}' — returning ACTION_NOT_SUPPORTED",
                     id, action_name
                 );
-                let supported: Vec<String> = element_supported_actions
-                    .clone()
-                    .unwrap_or_default();
-                let recovery_json = serde_json::to_value(&recovery)
-                    .unwrap_or(serde_json::Value::Null);
+                let supported: Vec<String> = element_supported_actions.clone().unwrap_or_default();
+                let recovery_json =
+                    serde_json::to_value(&recovery).unwrap_or(serde_json::Value::Null);
                 // Body carries the contract fields. `code` is hoisted into
                 // `data` so callers can match on it without parsing the
                 // outer envelope, mirroring the `data.code` shape that
@@ -4580,9 +4581,7 @@ mod action_not_supported_tests {
     //! `serde_json::json!{...}` recipe the handler uses — if the body
     //! template changes here, this test must change in lockstep, which
     //! is exactly the regression guard we want.
-    use super::{
-        extract_supported_actions, is_action_advertised,
-    };
+    use super::{extract_supported_actions, is_action_advertised};
     use crate::mcp::types::ApiResponse;
     use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
     use serde_json::json;
@@ -4727,7 +4726,10 @@ mod action_not_supported_tests {
             .get("recovery")
             .expect("contract: data.recovery must be carried for audit");
         assert!(
-            recovery_field.get("commandChosen").map(|v| v.is_null()).unwrap_or(false),
+            recovery_field
+                .get("commandChosen")
+                .map(|v| v.is_null())
+                .unwrap_or(false),
             "contract: data.recovery.commandChosen must be null (this is the \
              precondition that triggered ACTION_NOT_SUPPORTED)"
         );
