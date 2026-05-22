@@ -139,6 +139,14 @@ pub(crate) fn paired_user_path() -> Option<PathBuf> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PairedUserFile {
     pub user_id: String,
+    /// Stringified UUID. `#[serde(default)]` keeps legacy files
+    /// (written before the 2026-05-22 schema bump) deserializing
+    /// — they carry only `user_id`. A heartbeat/register caller
+    /// that finds `None` here falls back to decoding the cached
+    /// device-token JWT via [`tenant_id_from_oauth_claim`]
+    /// (see `fleet::resolve_tenant_id`).
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 /// Read the cached `user_id` written by a prior browser-pair. Returns
@@ -155,6 +163,52 @@ fn read_paired_user_id() -> Option<String> {
     let bytes = std::fs::read(&path).ok()?;
     let parsed: PairedUserFile = serde_json::from_slice(&bytes).ok()?;
     Some(parsed.user_id)
+}
+
+/// Read the cached `tenant_id` from `paired_user.json`. Returns `None`
+/// if the file is missing OR the field is absent (legacy file written
+/// before the 2026-05-22 schema bump). Used by
+/// `fleet::resolve_tenant_id` as the primary resolution branch.
+pub fn read_paired_tenant_id_from_disk() -> Option<String> {
+    let path = paired_user_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let parsed: PairedUserFile = serde_json::from_slice(&bytes).ok()?;
+    parsed.tenant_id
+}
+
+/// Opportunistically rewrite `paired_user.json` with the supplied
+/// `tenant_id`, preserving the existing `user_id`. Used by
+/// `fleet::resolve_tenant_id`'s JWT-claim fallback so a legacy file
+/// gets backfilled on the first heartbeat after a runner upgrade.
+///
+/// No-op if the file doesn't exist (the JWT-claim path only fires
+/// when SOMETHING was paired previously, but we tolerate the race
+/// where pair-state was wiped between read and write). Returns
+/// `Err(String)` on filesystem failures so the caller can log them
+/// at `debug!` — the outer flow proceeds either way.
+pub fn backfill_paired_tenant_id(tenant_id: &uuid::Uuid) -> Result<(), String> {
+    let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No paired file → nothing to backfill. Quiet success.
+            return Ok(());
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let mut parsed: PairedUserFile =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    if parsed.tenant_id.as_deref() == Some(tenant_id.to_string().as_str()) {
+        // Already up-to-date; avoid an unnecessary disk write.
+        return Ok(());
+    }
+    parsed.tenant_id = Some(tenant_id.to_string());
+    let pretty = serde_json::to_vec_pretty(&parsed)
+        .map_err(|e| format!("serialize paired_user.json: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &pretty).map_err(|e| format!("write tmp: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
 }
 
 // ============================================================================
@@ -556,7 +610,7 @@ pub fn pair_via_browser(
 /// unused for the device-token flow (the device JWT has its own
 /// lifecycle managed by coord); we pass an empty string. See the
 /// format-change comment in `secure_storage.rs`.
-pub fn persist_pairing(resp: &PairCompleteResponse) -> Result<(), String> {
+pub fn persist_pairing(resp: &PairCompleteResponse, tenant_id: uuid::Uuid) -> Result<(), String> {
     use crate::auth::AuthManager;
     let mgr = AuthManager::new();
     mgr.store_tokens(&resp.token, "")
@@ -567,6 +621,7 @@ pub fn persist_pairing(resp: &PairCompleteResponse) -> Result<(), String> {
     }
     let pf = PairedUserFile {
         user_id: resp.user_id.clone(),
+        tenant_id: Some(tenant_id.to_string()),
     };
     let pretty =
         serde_json::to_vec_pretty(&pf).map_err(|e| format!("serialize paired_user.json: {e}"))?;
@@ -761,6 +816,38 @@ mod tests {
             parsed.is_err(),
             "legacy device_token-only payload must NOT decode (token field required)"
         );
+    }
+
+    /// Back-compat: a `paired_user.json` written by a pre-2026-05-22
+    /// runner has only the `user_id` field. The new `tenant_id` field
+    /// carries `#[serde(default)]` so such files must still deserialize
+    /// — they just yield `tenant_id == None` and the heartbeat path
+    /// falls through to the JWT-claim fallback.
+    #[test]
+    fn paired_user_file_back_compat_user_id_only_deserializes() {
+        let raw = r#"{"user_id":"22222222-2222-4222-8222-222222222222"}"#;
+        let parsed: PairedUserFile =
+            serde_json::from_str(raw).expect("legacy user_id-only must deserialize");
+        assert_eq!(parsed.user_id, "22222222-2222-4222-8222-222222222222");
+        assert!(
+            parsed.tenant_id.is_none(),
+            "legacy file must yield tenant_id = None"
+        );
+    }
+
+    /// Forward shape — a newly-written `paired_user.json` round-trips
+    /// both fields. Pins the serde representation against accidental
+    /// `#[serde(rename)]` / `#[serde(skip)]` regressions.
+    #[test]
+    fn paired_user_file_with_tenant_id_round_trips() {
+        let original = PairedUserFile {
+            user_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            tenant_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: PairedUserFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.user_id, original.user_id);
+        assert_eq!(parsed.tenant_id, original.tenant_id);
     }
 }
 

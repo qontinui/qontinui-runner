@@ -144,6 +144,63 @@ fn load_device_file() -> Option<DeviceFile> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Resolve the device's `tenant_id` for coord-side requests
+/// (`POST /coord/devices/register`). Returns the first hit:
+///
+/// 1. `paired_user.json::tenant_id` — present on newly-paired devices
+///    (written by `pair::persist_pairing` since 2026-05-22).
+/// 2. JWT-claim fallback — decode `tenant_id` from the cached
+///    device-token JWT via
+///    [`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`].
+///    On success, opportunistically rewrites `paired_user.json` with
+///    the resolved value so subsequent heartbeats hit branch 1.
+///    Best-effort: rewrite IO errors are swallowed.
+/// 3. `None` — neither source has a usable tenant_id. Callers must
+///    skip the request (coord rejects with `400 tenant_id_required`).
+fn resolve_tenant_id() -> Option<uuid::Uuid> {
+    // Branch 1 — paired_user.json
+    if let Some(s) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
+        if let Ok(t) = uuid::Uuid::parse_str(s.trim()) {
+            return Some(t);
+        }
+    }
+
+    // Branch 2 — cached device-token JWT
+    let token = crate::auth::AuthManager::new()
+        .get_access_token()
+        .ok()
+        .unwrap_or_default();
+    if token.is_empty() {
+        return None;
+    }
+    let claim = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)?;
+    let parsed = uuid::Uuid::parse_str(claim.trim()).ok()?;
+
+    // Opportunistic backfill — best-effort, ignore IO errors.
+    if let Err(e) = qontinui_runner_lib::pair::backfill_paired_tenant_id(&parsed) {
+        tracing::debug!("fleet::resolve_tenant_id: backfill non-fatal: {e}");
+    }
+
+    Some(parsed)
+}
+
+/// Dedupe the "tenant_id unresolvable" startup warning — the heartbeat
+/// ticks every 30s so logging on every miss would flood the journal.
+/// Fires exactly once per process lifetime; subsequent skips are silent
+/// (the operator already saw the recovery hint).
+static TENANT_ID_UNRESOLVABLE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn warn_tenant_id_unresolvable_once() {
+    if !TENANT_ID_UNRESOLVABLE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            "fleet::heartbeat: tenant_id unresolvable (no paired_user.json::tenant_id, \
+             no claim in cached device-token JWT); skipping all heartbeats until next runner \
+             restart. Re-run `qontinui_profile device pair --tenant-id <uuid>` to recover."
+        );
+    }
+}
+
 /// Cache file for the last successful budget payload. Inspectable when
 /// coord is unreachable; lets operators verify "what was advertised" from
 /// the runner side without coord access. Path: `~/.qontinui/last_budget.json`.
@@ -417,6 +474,13 @@ struct HeartbeatPayload {
     /// the heartbeat's hot path cheap.
     #[serde(skip_serializing_if = "is_false")]
     claude_code_available: bool,
+    /// REQUIRED by coord's `post_device_register` handler — absence
+    /// produces `400 tenant_id_required` (see qontinui-coord
+    /// `routes_phase3.rs:257-269`). Resolved via [`resolve_tenant_id`]
+    /// before the payload is constructed; if `None` there, the
+    /// heartbeat is skipped rather than 400-spamming coord.
+    /// Phase 2 of the default-tenant-propagation plan.
+    tenant_id: uuid::Uuid,
 }
 
 /// Suppress serializing the field when it's the default. Keeps the
@@ -470,12 +534,21 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         }
     };
 
+    let tenant_id = match resolve_tenant_id() {
+        Some(t) => t,
+        None => {
+            warn_tenant_id_unresolvable_once();
+            return Ok(());
+        }
+    };
+
     let claude_code_available = claude_code_probe();
 
     let payload = HeartbeatPayload {
         device_id,
         hostname: device.hostname.clone(),
         claude_code_available,
+        tenant_id,
     };
     let url = format!("{base}/coord/devices/register");
 
@@ -1144,6 +1217,7 @@ mod tests {
             device_id: uuid::Uuid::nil(),
             hostname: "test".into(),
             claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -1158,12 +1232,53 @@ mod tests {
             device_id: uuid::Uuid::nil(),
             hostname: "test".into(),
             claude_code_available: true,
+            tenant_id: uuid::Uuid::nil(),
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
             body.get("claude_code_available").and_then(|v| v.as_bool()),
             Some(true),
             "true value must appear on the heartbeat wire"
+        );
+    }
+
+    /// `tenant_id` is REQUIRED by coord — `post_device_register` rejects
+    /// with `400 tenant_id_required` if the field is absent. Pin that the
+    /// serialized wire shape includes the field as a UUID string.
+    /// Phase 2 of the default-tenant-propagation plan.
+    #[test]
+    fn heartbeat_payload_serializes_with_tenant_id() {
+        let tenant = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let p = HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: true,
+            tenant_id: tenant,
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            body.get("tenant_id").and_then(|v| v.as_str()),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "tenant_id must serialize as a UUID string on the heartbeat wire"
+        );
+    }
+
+    /// Regression guard against future refactors that drop
+    /// `claude_code_available` when extending `HeartbeatPayload`. PR #216
+    /// shipped this field; the auditor spawn path depends on it.
+    #[test]
+    fn heartbeat_payload_still_includes_claude_code_available() {
+        let p = HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: true,
+            tenant_id: uuid::Uuid::nil(),
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            body.get("claude_code_available").and_then(|v| v.as_bool()),
+            Some(true),
+            "claude_code_available must remain on the heartbeat wire (PR #216 shape)"
         );
     }
 }
