@@ -673,7 +673,12 @@ mod try_refresh_once_tests {
                     hits: hits_for_handler,
                 };
                 let app: Router = Router::new()
-                    .route("/coord/devices/pair-cli", post(handler))
+                    // Mirror the live route — pair::pair_with_auth_token_with_ids
+                    // POSTs to `{base}/api/v1/devices/pair-cli` (web-routed).
+                    // Was registered as `/coord/devices/pair-cli` (legacy
+                    // coord-direct) and 404'd the request, panicking both
+                    // try_refresh_once_tests. Sibling of the pair.rs:980 fix.
+                    .route("/api/v1/devices/pair-cli", post(handler))
                     .with_state(state);
                 let listener =
                     tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
