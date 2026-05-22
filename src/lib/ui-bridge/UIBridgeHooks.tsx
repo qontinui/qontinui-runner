@@ -72,6 +72,7 @@ const TAB_GROUPS = {
   tools: ["terminal", "specs", "state-machine", "generator-eval", "config-ui-bridge"],
   system: [
     "settings",
+    "settings-account",
     "settings-ai",
     "settings-agentic",
     "settings-self-healing",
