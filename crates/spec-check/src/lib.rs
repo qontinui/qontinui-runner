@@ -7,6 +7,7 @@
 
 pub mod confidence;
 pub mod criteria;
+pub mod derive;
 pub mod diff;
 pub mod evaluator;
 pub mod fetch;
