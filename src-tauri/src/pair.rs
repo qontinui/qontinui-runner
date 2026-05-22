@@ -399,6 +399,116 @@ pub fn pair_with_auth_token_with_ids(
 }
 
 // ============================================================================
+// Pair: pair-code (--pair-code <CODE>)
+// ============================================================================
+
+/// On-wire response shape for ``POST /api/v1/devices/pair-codes/{code}/redeem``.
+///
+/// The web backend mirrors the canonical ``PairCompleteResponse`` shape
+/// returned by ``pair-cli`` so the runner can use a single decoder for
+/// both paths. This struct is named for the field set declared in the
+/// web schema (``app/schemas/pair_code.py::PairCodeRedeemOut``):
+/// ``{user_id, tenant_id, device_id, expires_at?, device_token_jwt}``.
+///
+/// The redeem path returns ``device_token_jwt`` (not ``token``) for
+/// disambiguation in the web schema, so we accept both spellings via
+/// `serde(alias)` to remain compatible if the API ever renames back.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PairCodeRedeemResponse {
+    pub user_id: String,
+    pub tenant_id: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Coord-issued device-token JWT. The web schema names this field
+    /// ``device_token_jwt`` to make its intent unambiguous; we accept
+    /// the legacy ``token`` alias too in case the API ever renames.
+    #[serde(alias = "token")]
+    pub device_token_jwt: String,
+}
+
+impl PairCodeRedeemResponse {
+    /// Convert to the canonical ``PairCompleteResponse`` shape so the
+    /// caller can use the same decoder + ``persist_pairing`` path for
+    /// pair-code-mediated pairing as for ``pair-cli``.
+    pub fn into_pair_complete(self) -> PairCompleteResponse {
+        // Best-effort tenant UUID parsing; the field is on the wire as
+        // a string, but ``PairCompleteResponse::tenant_id`` is
+        // ``Option<String>`` (the canonical decoder is lenient — see
+        // its doc-comment), so we just pass the raw string through.
+        PairCompleteResponse {
+            token: self.device_token_jwt,
+            user_id: self.user_id,
+            device_id: Some(self.device_id),
+            jti: None,
+            exp: None,
+            tenant_id: Some(self.tenant_id),
+        }
+    }
+}
+
+/// Headless pair flow that consumes a 6-char single-use pair code (no
+/// browser, no OAuth round-trip). The operator mints the code on the
+/// dashboard's ``Auth Tokens`` tab and types it into the runner's
+/// Settings UI; this function POSTs the code to the web backend's
+/// ``POST /api/v1/devices/pair-codes/{code}/redeem`` endpoint and gets
+/// back the same ``PairCompleteResponse`` shape that ``pair-cli``
+/// returns.
+///
+/// **Unauthenticated by design** — the pair code IS the credential.
+/// The resulting device JWT is tenant-scoped to the **code's**
+/// mint-time tenant (the web backend burns the issuing operator's
+/// tenant into the code row and refuses to let the runner override
+/// it).
+///
+/// `base` is the web-backend base URL (e.g. ``http://127.0.0.1:8000``),
+/// NOT the coord URL — the pair-code endpoints live exclusively on
+/// qontinui-web. `code` is the 6-char code the operator typed in;
+/// it is upper-cased server-side so casing doesn't matter, but we
+/// upper-case here too for symmetric display.
+pub fn pair_with_pair_code(
+    base: &str,
+    code: &str,
+    device_id: &str,
+) -> Result<PairCompleteResponse, String> {
+    if code.trim().is_empty() {
+        return Err("pair code is empty".to_string());
+    }
+    let url = format!(
+        "{}/api/v1/devices/pair-codes/{}/redeem",
+        base.trim_end_matches('/'),
+        code.trim().to_uppercase()
+    );
+    let body = serde_json::json!({
+        "device_id": device_id,
+        "hostname":  detect_hostname(),
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {}", e))?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("POST {} failed: {}", url, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp
+            .text()
+            .unwrap_or_else(|_| "<unable to read response body>".to_string());
+        // Translate the web's structured-detail shape into a friendlier
+        // single-line operator message. We don't need to JSON-decode it
+        // — the calling UI surfaces the raw string verbatim.
+        return Err(format!("POST {} -> HTTP {}: {}", url, status, body_text));
+    }
+    let redeem: PairCodeRedeemResponse = resp
+        .json()
+        .map_err(|e| format!("decode redeem response failed: {}", e))?;
+    Ok(redeem.into_pair_complete())
+}
+
+// ============================================================================
 // Pair: browser (--browser, default)
 // ============================================================================
 
@@ -845,6 +955,82 @@ mod tests {
             parsed.tenant_id.is_none(),
             "legacy file must yield tenant_id = None"
         );
+    }
+
+    /// Pair-code redeem response decodes the web schema's
+    /// ``PairCodeRedeemOut`` shape: ``{user_id, tenant_id, device_id,
+    /// device_token_jwt, expires_at?}``. The runner must accept the
+    /// ``device_token_jwt`` spelling AND fall back gracefully if the
+    /// API ever renames back to ``token`` (via the serde alias).
+    #[test]
+    fn pair_code_redeem_response_decodes_web_schema_shape() {
+        let wire = serde_json::json!({
+            "user_id":          "22222222-2222-4222-8222-222222222222",
+            "tenant_id":        "11111111-2222-3333-4444-555555555555",
+            "device_id":        "00000000-0000-4000-8000-000000000000",
+            "device_token_jwt": "abc.def.ghi",
+            "expires_at":       "2026-05-23T00:00:00Z",
+        });
+        let parsed: PairCodeRedeemResponse =
+            serde_json::from_value(wire).expect("decode web schema shape");
+        assert_eq!(parsed.device_token_jwt, "abc.def.ghi");
+        assert_eq!(parsed.tenant_id, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(parsed.device_id, "00000000-0000-4000-8000-000000000000");
+    }
+
+    /// Backward-compat: if the web schema ever renames
+    /// ``device_token_jwt`` back to ``token``, the runner still
+    /// decodes it (via serde alias).
+    #[test]
+    fn pair_code_redeem_response_decodes_legacy_token_alias() {
+        let wire = serde_json::json!({
+            "user_id":   "22222222-2222-4222-8222-222222222222",
+            "tenant_id": "11111111-2222-3333-4444-555555555555",
+            "device_id": "00000000-0000-4000-8000-000000000000",
+            "token":     "legacy.jwt.xyz",
+        });
+        let parsed: PairCodeRedeemResponse =
+            serde_json::from_value(wire).expect("decode legacy token alias");
+        assert_eq!(parsed.device_token_jwt, "legacy.jwt.xyz");
+    }
+
+    /// ``PairCodeRedeemResponse::into_pair_complete`` produces a
+    /// ``PairCompleteResponse`` with the same fields callers expect
+    /// from ``pair-cli``, so ``persist_pairing`` can consume it
+    /// unmodified.
+    #[test]
+    fn pair_code_redeem_response_converts_to_pair_complete() {
+        let redeem = PairCodeRedeemResponse {
+            user_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            tenant_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            device_id: "00000000-0000-4000-8000-000000000000".to_string(),
+            expires_at: None,
+            device_token_jwt: "abc.def.ghi".to_string(),
+        };
+        let pc = redeem.into_pair_complete();
+        assert_eq!(pc.token, "abc.def.ghi");
+        assert_eq!(pc.user_id, "22222222-2222-4222-8222-222222222222");
+        assert_eq!(
+            pc.device_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000000")
+        );
+        assert_eq!(
+            pc.tenant_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    /// ``pair_with_pair_code`` upper-cases the code before posting so
+    /// operator typing casing doesn't reach the server (web upper-cases
+    /// too — defense in depth).
+    #[test]
+    fn pair_with_pair_code_rejects_blank_code() {
+        // We can't easily invoke the real HTTP call from a unit test,
+        // but the empty-code guard is pure and worth pinning here.
+        let result = pair_with_pair_code("http://unused", "   ", "device-x");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
     }
 
     /// Forward shape — a newly-written `paired_user.json` round-trips

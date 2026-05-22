@@ -630,6 +630,114 @@ pub async fn start_web_token_flow<R: Runtime>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// redeem_pair_code — paste-pair via single-use 5-min code (Phase 2a.3)
+// ---------------------------------------------------------------------------
+
+/// Wire response for [`redeem_pair_code`].
+///
+/// Mirrors the runner-side ``PairCompleteResponse`` shape so the frontend
+/// can show the operator a uniform "paired!" confirmation regardless of
+/// which pair flow was used. The device-token JWT is NOT returned to JS
+/// — it's persisted to the auth store on the Rust side via
+/// ``pair::persist_pairing``.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedeemPairCodeResponse {
+    pub user_id: String,
+    pub tenant_id: String,
+    pub device_id: String,
+}
+
+/// Redeem a 6-char single-use pair code against the active profile's web
+/// backend. Single round-trip; on success persists the device JWT +
+/// updates `paired_user.json` so the WS relay picks it up.
+///
+/// Phase 2a.3 of plan
+/// ``D:/qontinui-root/plans/2026-05-22-mtc-iter3-remediation-web-dashboard.md``.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if:
+/// - `code` is blank.
+/// - The active profile has no `coord_url` (we can't derive the web base).
+/// - The device has not been initialised (`~/.qontinui/machine.json`
+///   missing).
+/// - The web backend returns 4xx/5xx (`Err` carries the structured error
+///   from the response so the UI can surface "expired" / "already
+///   redeemed" / "unknown code").
+/// - Network failure.
+/// - Persisting the resulting JWT to local storage failed (in which case
+///   the device IS paired server-side but the runner cannot use the
+///   credential — operator should retry).
+#[tauri::command]
+pub async fn redeem_pair_code(code: String) -> Result<RedeemPairCodeResponse, String> {
+    use qontinui_runner_lib::pair::{
+        coord_http_base, derive_web_base_from_coord, pair_with_pair_code, persist_pairing,
+        read_device_id_from_disk,
+    };
+
+    let code_trimmed = code.trim().to_string();
+    if code_trimmed.is_empty() {
+        return Err("pair code is empty".to_string());
+    }
+
+    // Resolve the device_id from disk. The runner must have been
+    // initialised at least once (machine.json present) — typically true
+    // for any installed runner; surfacing a clear error if not.
+    let device_id =
+        read_device_id_from_disk().map_err(|e| format!("could not read device identity: {}", e))?;
+
+    // Resolve the web base. Pair-code endpoints live on qontinui-web,
+    // not coord. Derive via the same recipe used by the browser flow;
+    // operator can override via QONTINUI_WEB_BASE if web + coord are
+    // split across hosts.
+    let coord_base = coord_http_base().map_err(|e| format!("active profile: {}", e))?;
+    let web_base = std::env::var("QONTINUI_WEB_BASE")
+        .ok()
+        .unwrap_or_else(|| derive_web_base_from_coord(&coord_base));
+
+    // Run the blocking HTTP call on a tokio blocking thread so we don't
+    // tie up the async runtime. `pair_with_pair_code` uses a 30-second
+    // timeout internally, so this never hangs indefinitely.
+    let code_for_blocking = code_trimmed.clone();
+    let device_id_for_blocking = device_id.clone();
+    let web_base_for_blocking = web_base.clone();
+    let resp = tokio::task::spawn_blocking(move || {
+        pair_with_pair_code(
+            &web_base_for_blocking,
+            &code_for_blocking,
+            &device_id_for_blocking,
+        )
+    })
+    .await
+    .map_err(|e| format!("pair-code redeem task panicked: {e}"))??;
+
+    // Parse the tenant_id off the response so we can pass it through to
+    // persist_pairing.
+    let tenant_id_str = resp
+        .tenant_id
+        .as_deref()
+        .ok_or_else(|| "server omitted tenant_id in pair-code redeem response".to_string())?;
+    let tenant_id = uuid::Uuid::parse_str(tenant_id_str.trim())
+        .map_err(|e| format!("server returned malformed tenant_id: {e}"))?;
+
+    persist_pairing(&resp, tenant_id).map_err(|e| format!("persist pairing: {}", e))?;
+
+    let response_device_id = resp.device_id.clone().unwrap_or_else(|| device_id.clone());
+
+    info!(
+        "redeem_pair_code: device paired (user_id={}, tenant_id={}, device_id={})",
+        resp.user_id, tenant_id_str, response_device_id
+    );
+
+    Ok(RedeemPairCodeResponse {
+        user_id: resp.user_id,
+        tenant_id: tenant_id_str.to_string(),
+        device_id: response_device_id,
+    })
+}
+
 /// Tauri plugin exposing all web-integration commands.
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_web_integration")
@@ -638,6 +746,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             save_web_integration_settings,
             test_web_integration_connection,
             start_web_token_flow,
+            redeem_pair_code,
         ])
         .build()
 }

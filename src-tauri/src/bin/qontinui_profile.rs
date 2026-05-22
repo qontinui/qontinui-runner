@@ -57,8 +57,8 @@
 
 use clap::{Parser, Subcommand};
 use qontinui_runner_lib::pair::{
-    coord_http_base, pair_via_browser, pair_with_auth_token, persist_pairing,
-    tenant_id_from_oauth_claim, PairCompleteResponse,
+    coord_http_base, derive_web_base_from_coord, pair_via_browser, pair_with_auth_token,
+    pair_with_pair_code, persist_pairing, tenant_id_from_oauth_claim, PairCompleteResponse,
 };
 use qontinui_runner_lib::profiles::{
     load_strict, profiles_path, AuthConfig, BlobConfig, Profile, ProfilesFile,
@@ -146,16 +146,25 @@ enum DeviceCmd {
     /// JWT + paired user_id locally.
     Pair {
         /// Headless mode: use a pre-issued OAuth token. Mutually exclusive
-        /// with `--browser`.
+        /// with `--browser` and `--pair-code`.
         #[arg(long, value_name = "OAUTH_TOKEN")]
         auth_token: Option<String>,
-        /// Browser mode (default). Mutually exclusive with `--auth-token`.
+        /// Headless mode: redeem a 6-char single-use pair code minted from
+        /// the dashboard's Auth Tokens tab. Mutually exclusive with
+        /// `--browser` and `--auth-token`. The pair code itself is the
+        /// credential — no OAuth token required.
+        #[arg(long, value_name = "CODE")]
+        pair_code: Option<String>,
+        /// Browser mode (default). Mutually exclusive with `--auth-token`
+        /// and `--pair-code`.
         #[arg(long)]
         browser: bool,
         /// Explicit tenant scope for the new device. Overrides any
         /// `tenant_id` claim auto-extracted from the OAuth token.
         /// Required for `--browser` mode (no OAuth token to read a claim
-        /// from). Phase 2 of the default-tenant-propagation plan
+        /// from). Ignored for `--pair-code` — the tenant is burned into
+        /// the code at mint time and propagates through the redeem
+        /// response. Phase 2 of the default-tenant-propagation plan
         /// (Q3 resolution: OAuth claim with `--tenant-id` override).
         #[arg(long, value_name = "UUID")]
         tenant_id: Option<String>,
@@ -183,9 +192,15 @@ fn main() -> ExitCode {
             DeviceCmd::Path => cmd_device_path(),
             DeviceCmd::Pair {
                 auth_token,
+                pair_code,
                 browser,
                 tenant_id,
-            } => cmd_device_pair(auth_token.as_deref(), browser, tenant_id.as_deref()),
+            } => cmd_device_pair(
+                auth_token.as_deref(),
+                pair_code.as_deref(),
+                browser,
+                tenant_id.as_deref(),
+            ),
         },
     }
 }
@@ -728,14 +743,25 @@ fn cmd_device_show() -> ExitCode {
 enum PairMode {
     Browser,
     AuthToken(String),
+    PairCode(String),
 }
 
-fn select_pair_mode(auth_token: Option<&str>, _browser: bool) -> Result<PairMode, String> {
-    // clap's `Pair` variant carries both `--browser` and `--auth-token`. The
-    // mutually-exclusive constraint is enforced here (we can't use clap's
-    // `conflicts_with` because `browser` is a bool flag with a default of
-    // false). If `--auth-token` is set, that wins; otherwise browser is the
-    // default mode (whether or not `--browser` was explicitly passed).
+fn select_pair_mode(
+    auth_token: Option<&str>,
+    pair_code: Option<&str>,
+    _browser: bool,
+) -> Result<PairMode, String> {
+    // clap's `Pair` variant carries `--browser`, `--auth-token`, and
+    // `--pair-code`. The mutually-exclusive constraint is enforced here
+    // (we can't use clap's `conflicts_with` because `browser` is a bool
+    // flag with a default of false). Priority: pair_code > auth_token >
+    // browser-default.
+    if let Some(code) = pair_code {
+        if code.is_empty() {
+            return Err("--pair-code requires a value: --pair-code <CODE>".to_string());
+        }
+        return Ok(PairMode::PairCode(code.to_string()));
+    }
     match auth_token {
         Some(token) => {
             if token.is_empty() {
@@ -749,16 +775,18 @@ fn select_pair_mode(auth_token: Option<&str>, _browser: bool) -> Result<PairMode
 
 fn cmd_device_pair(
     auth_token: Option<&str>,
+    pair_code: Option<&str>,
     browser: bool,
     tenant_id_flag: Option<&str>,
 ) -> ExitCode {
-    // clap can't express "exactly one of browser/auth_token"; reject the
-    // combination by hand.
-    if auth_token.is_some() && browser {
-        eprintln!("error: --browser and --auth-token are mutually exclusive");
+    // clap can't express "exactly one of browser/auth_token/pair_code";
+    // reject the combinations by hand.
+    let exclusive_set = [auth_token.is_some(), pair_code.is_some(), browser];
+    if exclusive_set.iter().filter(|b| **b).count() > 1 {
+        eprintln!("error: --browser, --auth-token, and --pair-code are mutually exclusive");
         return ExitCode::from(2);
     }
-    let mode = match select_pair_mode(auth_token, browser) {
+    let mode = match select_pair_mode(auth_token, pair_code, browser) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -773,45 +801,101 @@ fn cmd_device_pair(
         }
     };
 
-    // Resolve tenant_id: explicit `--tenant-id` flag wins; otherwise pull
-    // from the OAuth token's `tenant_id` claim (headless mode only — the
-    // browser flow has no OAuth token here). Phase 2 of the
-    // default-tenant-propagation plan.
-    let resolved_tenant_id: Result<uuid::Uuid, String> = match tenant_id_flag {
-        Some(s) => uuid::Uuid::parse_str(s.trim())
-            .map_err(|e| format!("--tenant-id is not a valid UUID: {e}")),
-        None => match &mode {
-            PairMode::AuthToken(token) => match tenant_id_from_oauth_claim(token) {
-                Some(s) => uuid::Uuid::parse_str(s.trim()).map_err(|e| {
-                    format!(
-                        "OAuth token's tenant_id claim is not a valid UUID ({e}); \
-                         pass --tenant-id <uuid> to override"
-                    )
-                }),
-                None => Err("no `tenant_id` claim found in OAuth token; \
-                     pass --tenant-id <uuid> explicitly"
-                    .to_string()),
-            },
-            PairMode::Browser => Err("--tenant-id <uuid> is required for the browser pair flow \
-                 (no OAuth token to read a claim from)"
-                .to_string()),
-        },
-    };
-    let tenant_id = match resolved_tenant_id {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            return ExitCode::from(2);
+    // Resolve tenant_id when needed. For PairCode mode the tenant is
+    // carried back in the redeem response (we resolve it from there
+    // post-pair); for AuthToken + Browser we need an explicit value
+    // up-front. Phase 2 of the default-tenant-propagation plan.
+    let preflight_tenant_id: Option<uuid::Uuid> = match &mode {
+        PairMode::PairCode(_) => None,
+        _ => {
+            let resolved: Result<uuid::Uuid, String> = match tenant_id_flag {
+                Some(s) => uuid::Uuid::parse_str(s.trim())
+                    .map_err(|e| format!("--tenant-id is not a valid UUID: {e}")),
+                None => match &mode {
+                    PairMode::AuthToken(token) => match tenant_id_from_oauth_claim(token) {
+                        Some(s) => uuid::Uuid::parse_str(s.trim()).map_err(|e| {
+                            format!(
+                                "OAuth token's tenant_id claim is not a valid UUID ({e}); \
+                                 pass --tenant-id <uuid> to override"
+                            )
+                        }),
+                        None => Err("no `tenant_id` claim found in OAuth token; \
+                             pass --tenant-id <uuid> explicitly"
+                            .to_string()),
+                    },
+                    PairMode::Browser => {
+                        Err("--tenant-id <uuid> is required for the browser pair flow \
+                             (no OAuth token to read a claim from)"
+                            .to_string())
+                    }
+                    PairMode::PairCode(_) => unreachable!("handled above"),
+                },
+            };
+            match resolved {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    return ExitCode::from(2);
+                }
+            }
         }
     };
 
-    let result: Result<PairCompleteResponse, String> = match mode {
-        PairMode::AuthToken(token) => pair_with_auth_token(&base, &token, tenant_id),
-        PairMode::Browser => pair_via_browser(&base, tenant_id),
+    let result: Result<PairCompleteResponse, String> = match &mode {
+        PairMode::PairCode(code) => {
+            let device_id = match qontinui_runner_lib::pair::read_device_id_from_disk() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    return ExitCode::from(2);
+                }
+            };
+            // Pair codes redeem against the web backend. Derive the web
+            // base from the active profile's coord_url just like
+            // pair_via_browser does — operator can override via
+            // QONTINUI_WEB_BASE.
+            let web_base = std::env::var("QONTINUI_WEB_BASE")
+                .ok()
+                .unwrap_or_else(|| derive_web_base_from_coord(&base));
+            pair_with_pair_code(&web_base, code, &device_id)
+        }
+        PairMode::AuthToken(token) => {
+            pair_with_auth_token(&base, token, preflight_tenant_id.expect("set above"))
+        }
+        PairMode::Browser => pair_via_browser(&base, preflight_tenant_id.expect("set above")),
     };
+
     match result {
         Ok(resp) => {
-            if let Err(e) = persist_pairing(&resp, tenant_id) {
+            // For PairCode mode the tenant came back in the response;
+            // for the other modes we resolved it pre-flight.
+            let effective_tenant_id: uuid::Uuid = match preflight_tenant_id {
+                Some(t) => t,
+                None => {
+                    // PairCode path: the redeem response sets
+                    // PairCompleteResponse.tenant_id (Option<String>).
+                    // Parse it; bail if missing / malformed (would indicate
+                    // a backend protocol break, not a runner-side bug).
+                    match resp.tenant_id.as_deref() {
+                        Some(s) => match uuid::Uuid::parse_str(s.trim()) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!(
+                                    "error: pairing succeeded but server returned malformed tenant_id ({e}); not persisting"
+                                );
+                                return ExitCode::from(2);
+                            }
+                        },
+                        None => {
+                            eprintln!(
+                                "error: pairing succeeded but server omitted tenant_id; not persisting"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+            };
+            if let Err(e) = persist_pairing(&resp, effective_tenant_id) {
                 eprintln!(
                     "error: pairing succeeded but persisting locally failed: {}",
                     e
@@ -1211,11 +1295,13 @@ mod tests {
                 sub:
                     DeviceCmd::Pair {
                         auth_token,
+                        pair_code,
                         browser,
                         tenant_id,
                     },
             }) => {
                 assert_eq!(auth_token.as_deref(), Some("oauth"));
+                assert!(pair_code.is_none());
                 assert!(!browser);
                 assert!(tenant_id.is_none());
             }
@@ -1232,15 +1318,46 @@ mod tests {
                 sub:
                     DeviceCmd::Pair {
                         auth_token,
+                        pair_code,
                         browser,
                         tenant_id,
                     },
             }) => {
                 assert!(auth_token.is_none());
+                assert!(pair_code.is_none());
                 assert!(browser);
                 assert!(tenant_id.is_none());
             }
             other => panic!("expected Device::Pair {{browser}}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn device_pair_parses_with_pair_code_flag() {
+        let cli = Cli::try_parse_from([
+            "qontinui_profile",
+            "device",
+            "pair",
+            "--pair-code",
+            "A7K2P3",
+        ])
+        .expect("parses");
+        match cli.cmd {
+            Some(Cmd::Device {
+                sub:
+                    DeviceCmd::Pair {
+                        auth_token,
+                        pair_code,
+                        browser,
+                        tenant_id,
+                    },
+            }) => {
+                assert!(auth_token.is_none());
+                assert_eq!(pair_code.as_deref(), Some("A7K2P3"));
+                assert!(!browser);
+                assert!(tenant_id.is_none());
+            }
+            other => panic!("expected Device::Pair {{pair_code}}, got {:?}", other),
         }
     }
 
