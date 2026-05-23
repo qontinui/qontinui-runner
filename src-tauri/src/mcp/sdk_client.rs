@@ -346,6 +346,32 @@ pub async fn dispatch_app_request_by_id(
         .map_err(dispatch_err_to_string)
 }
 
+/// Whether an SDK app is currently the active connection.
+///
+/// This is the exact condition `AppDispatcher::dispatch_active` uses to decide
+/// whether to relay over WebSocket/HTTP vs. return `DispatchError::NotConnected`
+/// (see `app_dispatch.rs`: `active_connection().ok_or(DispatchError::NotConnected)`).
+///
+/// Handlers use it to gate the IPC/self-webview fallback: when an SDK app IS
+/// connected and the relayed action *fails*, the failure must be surfaced to
+/// the caller — falling back to the runner's own Tauri webview would silently
+/// execute the action against the wrong UI and report bogus success. The
+/// IPC fallback is only legitimate when NO SDK app is connected (the
+/// runner-self case), mirroring the per-app-id snapshot path which already
+/// skips fallback for the same reason.
+async fn sdk_app_connected(state: &Arc<ApiState>) -> bool {
+    manager_has_active(&*state.sdk_connection.lock().await)
+}
+
+/// Pure predicate over a locked `SdkConnectionManager`: is an SDK app the
+/// active connection? Extracted so the connected-vs-runner-self decision can
+/// be unit-tested without constructing a full `ApiState` (mirrors the
+/// `select_app_payload` extraction). This is the same `active_connection()`
+/// check `AppDispatcher::dispatch_active` uses to gate `NotConnected`.
+fn manager_has_active(manager: &SdkConnectionManager) -> bool {
+    manager.active_connection().is_some()
+}
+
 // =============================================================================
 // Handlers
 // =============================================================================
@@ -1018,11 +1044,46 @@ async fn handle_element(
     }
 }
 
-/// Optional query parameters for SDK action execution (task_run_id for persistence).
+/// Optional query parameters for SDK action execution.
+///
+/// - `task_run_id` — persistence correlation for the audit event.
+/// - `tab_id` / `target_tab_id` — per-tab routing (UI Bridge Item #4). When a
+///   single relay (e.g. qontinui-web's dashboard at `demo.staging.qontinui.io`)
+///   has more than one browser tab connected — two operator machines each
+///   driving a headless tab — the relay's default dispatch routes to
+///   `primaryTabId`, which flips to whichever tab registered most recently.
+///   Supplying a `tabId` pins the forwarded command to that specific tab's
+///   pipe instead. Discover live ids via `GET /ui-bridge/sdk/tabs` (proxied to
+///   the relay's `GET /tabs`). Both spellings are accepted; `tabId` is the
+///   public/query name, `targetTabId` the relay's internal option name.
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct SdkActionQueryParams {
     #[serde(default)]
     pub task_run_id: Option<i64>,
+    #[serde(
+        default,
+        alias = "tabId",
+        alias = "targetTabId",
+        alias = "target_tab_id"
+    )]
+    pub tab_id: Option<String>,
+}
+
+/// Append a `tabId=<id>` query parameter to an SDK-relay HTTP path, preserving
+/// any existing query string. Trims and skips empty ids. The SDK's Next.js /
+/// Express adapters sniff `?tabId=` (and the `X-UI-Bridge-Tab-Id` header) and
+/// thread it into the relay's per-tab command dispatch, so threading it onto
+/// the forwarded path is sufficient for the HTTP-transport arm. The WS-transport
+/// arm instead carries `targetTabId` inside the dispatched payload (the relay's
+/// `extractTabRouting` reads it from the command payload).
+fn append_tab_id_query(path: &str, tab_id: Option<&str>) -> String {
+    match tab_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            let sep = if path.contains('?') { '&' } else { '?' };
+            format!("{}{}tabId={}", path, sep, urlencoding::encode(id))
+        }
+        None => path.to_string(),
+    }
 }
 
 /// POST /ui-bridge/sdk/element/:id/action — Execute an action on an element
@@ -1041,8 +1102,22 @@ async fn handle_element_action(
     let start = std::time::Instant::now();
 
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    let ws_payload = serde_json::json!({ "id": id, "request": body.clone() });
-    let path = format!("/control/element/{}/action", id);
+    // Per-tab routing (Item #4): when a `tabId` is supplied, carry it as
+    // `targetTabId` in the WS payload (the relay's `extractTabRouting` reads it
+    // from the command payload) AND as a `?tabId=` query on the HTTP path (the
+    // SDK adapter sniffs the query). The relay rejects an unknown/stale tab with
+    // a structured `TAB_NOT_FOUND` / `TAB_STALE` envelope which we forward
+    // verbatim — no silent fall-through to the primary tab.
+    let tab_id = query
+        .tab_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let ws_payload = match tab_id {
+        Some(t) => serde_json::json!({ "id": id, "request": body.clone(), "targetTabId": t }),
+        None => serde_json::json!({ "id": id, "request": body.clone() }),
+    };
+    let path = append_tab_id_query(&format!("/control/element/{}/action", id), tab_id);
     let result = match dispatch_app_request(
         &state,
         "executeElementAction",
@@ -1060,43 +1135,56 @@ async fn handle_element_action(
                 .unwrap_or(true);
             (Json(data), success, None)
         }
-        Err(_) => {
-            // Fall back to IPC — wrap action in an object to match the format
-            // expected by the TypeScript handler (action.action, action.params, etc.)
-            let params = body
-                .get("params")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            let wait_options = body
-                .get("waitOptions")
-                .cloned()
-                .unwrap_or(serde_json::json!(null));
-            let payload = serde_json::json!({
-                "elementId": id,
-                "action": {
-                    "action": action_name,
-                    "params": params,
-                    "waitOptions": wait_options
-                }
-            });
-            match ui_bridge_request_sync(&state, "execute_action", payload).await {
-                Ok(data) => {
-                    if data.get("success") == Some(&serde_json::json!(false)) {
-                        let err = data.get("error").and_then(|v| v.as_str()).map(String::from);
-                        (Json(data), false, err)
-                    } else {
-                        (
-                            Json(serde_json::json!({ "success": true, "data": data })),
-                            true,
-                            None,
-                        )
-                    }
-                }
-                Err(e) => (
+        Err(e) => {
+            // An SDK app is connected but rejected the relayed action — surface
+            // the real error instead of silently retargeting the runner's own
+            // webview (which would report bogus success against the wrong UI).
+            // Only fall back to IPC when NO SDK app is connected.
+            if sdk_app_connected(&state).await {
+                let err = e.clone();
+                (
                     Json(serde_json::json!({ "success": false, "error": e })),
                     false,
-                    Some(e),
-                ),
+                    Some(err),
+                )
+            } else {
+                // Fall back to IPC — wrap action in an object to match the format
+                // expected by the TypeScript handler (action.action, action.params, etc.)
+                let params = body
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::json!(null));
+                let wait_options = body
+                    .get("waitOptions")
+                    .cloned()
+                    .unwrap_or(serde_json::json!(null));
+                let payload = serde_json::json!({
+                    "elementId": id,
+                    "action": {
+                        "action": action_name,
+                        "params": params,
+                        "waitOptions": wait_options
+                    }
+                });
+                match ui_bridge_request_sync(&state, "execute_action", payload).await {
+                    Ok(data) => {
+                        if data.get("success") == Some(&serde_json::json!(false)) {
+                            let err = data.get("error").and_then(|v| v.as_str()).map(String::from);
+                            (Json(data), false, err)
+                        } else {
+                            (
+                                Json(serde_json::json!({ "success": true, "data": data })),
+                                true,
+                                None,
+                            )
+                        }
+                    }
+                    Err(e) => (
+                        Json(serde_json::json!({ "success": false, "error": e })),
+                        false,
+                        Some(e),
+                    ),
+                }
             }
         }
     };
@@ -1168,12 +1256,24 @@ async fn handle_snapshot(
     };
     let want_disabled_only = query.get("withDisabledOnly").is_some_and(truthy)
         || query.get("with_disabled_only").is_some_and(truthy);
+    // Per-tab routing (Item #4): pin the snapshot to a specific connected tab
+    // when `?tabId=` (or `?targetTabId=`) is supplied. Lets a caller snapshot
+    // tab A while tab B is the relay's primary, instead of always getting the
+    // primary tab's view.
+    let tab_id = query
+        .get("tabId")
+        .or_else(|| query.get("targetTabId"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
     let mut ws_payload = serde_json::json!({});
     if let Some(r) = query.get("recency") {
         ws_payload["recency"] = serde_json::Value::String(r.clone());
     }
     if want_disabled_only {
         ws_payload["withDisabledOnly"] = serde_json::Value::Bool(true);
+    }
+    if let Some(t) = tab_id {
+        ws_payload["targetTabId"] = serde_json::Value::String(t.to_string());
     }
     // Forward recency + withDisabledOnly query params to the SDK app
     let mut query_parts: Vec<String> = Vec::new();
@@ -1182,6 +1282,9 @@ async fn handle_snapshot(
     }
     if want_disabled_only {
         query_parts.push("withDisabledOnly=true".to_string());
+    }
+    if let Some(t) = tab_id {
+        query_parts.push(format!("tabId={}", urlencoding::encode(t)));
     }
     let path = if query_parts.is_empty() {
         "/control/snapshot".to_string()
@@ -2145,9 +2248,35 @@ async fn handle_windows(
     super::ui_bridge::ui_bridge_list_windows_handler(axum::extract::State(state)).await
 }
 
-/// GET /ui-bridge/sdk/tabs — List connected browser tabs
-async fn handle_tabs(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::GET, "/tabs", None).await {
+/// GET /ui-bridge/sdk/tabs — List connected browser tabs.
+///
+/// Per-tab routing (Item #4/#15) discovery surface. Forwards the SDK relay's
+/// `?activeOnly=true` (drop tabs whose heartbeat went stale) and `?detailed=true`
+/// (enrich each entry with a live URL/pathname/title round-trip) query params so
+/// a caller can discover the exact `tabId` to pin a subsequent `?tabId=` command
+/// to. Each returned entry carries `tabId`, `isPrimary`, `isActive`, and
+/// `lastHeartbeat`.
+async fn handle_tabs(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let truthy = |v: &String| {
+        let s = v.trim();
+        s == "1" || s.eq_ignore_ascii_case("true")
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if query.get("activeOnly").is_some_and(truthy) {
+        parts.push("activeOnly=true".to_string());
+    }
+    if query.get("detailed").is_some_and(truthy) {
+        parts.push("detailed=true".to_string());
+    }
+    let path = if parts.is_empty() {
+        "/tabs".to_string()
+    } else {
+        format!("/tabs?{}", parts.join("&"))
+    };
+    match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -5810,7 +5939,13 @@ async fn handle_click_by_text(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // An SDK app is connected but rejected the relayed action — surface
+            // the real error instead of silently retargeting the runner's own
+            // webview. Only fall back to IPC when NO SDK app is connected.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "click_by_text", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -5837,7 +5972,12 @@ async fn handle_click_by_selector(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "click_by_selector", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -5864,7 +6004,12 @@ async fn handle_type_into(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "type_into", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -5891,7 +6036,12 @@ async fn handle_read_value(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "read_value", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -5918,7 +6068,12 @@ async fn handle_find_by_text(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "find_by_text", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -5989,7 +6144,12 @@ async fn handle_navigate_by_adapter(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "navigate_by_adapter", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -6508,5 +6668,156 @@ mod tests {
         )
         .await;
         assert_eq!(chosen, serde_json::Value::Null);
+    }
+
+    // ------------------------------------------------------------------
+    // Per-tab routing (Item #4) — `?tabId=` thread-through
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn append_tab_id_query_adds_first_param() {
+        assert_eq!(
+            append_tab_id_query("/control/element/btn/action", Some("tab-a")),
+            "/control/element/btn/action?tabId=tab-a"
+        );
+    }
+
+    #[test]
+    fn append_tab_id_query_appends_to_existing_query() {
+        assert_eq!(
+            append_tab_id_query("/control/snapshot?recency=current", Some("tab-b")),
+            "/control/snapshot?recency=current&tabId=tab-b"
+        );
+    }
+
+    #[test]
+    fn append_tab_id_query_url_encodes_special_chars() {
+        // Tab ids are relay-generated (`anon_<ts>_<rand>` / uuids), but a
+        // caller could pass anything — encode defensively so the forwarded
+        // query never breaks.
+        assert_eq!(
+            append_tab_id_query("/control/snapshot", Some("a b&c")),
+            "/control/snapshot?tabId=a%20b%26c"
+        );
+    }
+
+    #[test]
+    fn append_tab_id_query_noop_when_absent_or_blank() {
+        assert_eq!(
+            append_tab_id_query("/control/snapshot", None),
+            "/control/snapshot"
+        );
+        assert_eq!(
+            append_tab_id_query("/control/snapshot", Some("   ")),
+            "/control/snapshot",
+            "whitespace-only tab id must be treated as absent"
+        );
+    }
+
+    #[test]
+    fn sdk_action_query_params_accepts_tab_id_aliases() {
+        // serde aliases resolve identically for JSON and urlencoded inputs;
+        // axum's `Query` extractor feeds the same Deserialize impl. Drive it
+        // via serde_json (a direct dependency) to validate the alias wiring
+        // without pulling serde_urlencoded as a direct dev-dep.
+        let parse = |s: &str| -> SdkActionQueryParams {
+            serde_json::from_str(s).expect("parse SdkActionQueryParams")
+        };
+
+        // Canonical public query name used by the SDK adapter + docs.
+        assert_eq!(
+            parse(r#"{"tabId":"tab-a"}"#).tab_id.as_deref(),
+            Some("tab-a")
+        );
+        // snake_case field name.
+        assert_eq!(
+            parse(r#"{"tab_id":"tab-a2"}"#).tab_id.as_deref(),
+            Some("tab-a2")
+        );
+        // camelCase relay-internal spelling.
+        assert_eq!(
+            parse(r#"{"targetTabId":"tab-b"}"#).tab_id.as_deref(),
+            Some("tab-b")
+        );
+        // snake_case relay-internal spelling.
+        assert_eq!(
+            parse(r#"{"target_tab_id":"tab-c"}"#).tab_id.as_deref(),
+            Some("tab-c")
+        );
+
+        // Coexists with task_run_id, and absence leaves tab_id None.
+        let q = parse(r#"{"task_run_id":42}"#);
+        assert_eq!(q.task_run_id, Some(42));
+        assert_eq!(q.tab_id, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Connected-SDK vs. runner-self fallback gate
+    //
+    // Regression guard: when an SDK app IS connected and a relayed command
+    // action fails, the handlers must surface the error — NOT silently fall
+    // back to the runner's own Tauri webview (which would execute against the
+    // wrong UI and report bogus success). `manager_has_active` is the exact
+    // predicate the handlers use to choose; it must mirror
+    // `AppDispatcher::dispatch_active`'s `active_connection()` NotConnected gate.
+    // ------------------------------------------------------------------
+
+    fn manager_with_active_conn(app_id: &str, url: &str) -> SdkConnectionManager {
+        let mut mgr = SdkConnectionManager::new();
+        let info = SdkAppInfo {
+            app_id: app_id.to_string(),
+            app_name: "t".into(),
+            app_type: "web".into(),
+            framework: None,
+            version: None,
+            capabilities: vec![],
+            port: 0,
+        };
+        let conn = SdkConnection {
+            app_url: url.to_string(),
+            base_path: "".into(),
+            app_info: info,
+            client: reqwest::Client::new(),
+            connected_at: 0,
+            transport_kind: None,
+            physical_device_id: None,
+        };
+        mgr.connections.insert(url.to_string(), conn);
+        mgr.active_url = Some(url.to_string());
+        mgr
+    }
+
+    #[test]
+    fn manager_has_active_false_when_no_connection() {
+        // No SDK app connected => fallback to runner-self IPC is legitimate.
+        let mgr = SdkConnectionManager::new();
+        assert!(
+            !manager_has_active(&mgr),
+            "empty manager must report no active SDK app (IPC fallback allowed)"
+        );
+    }
+
+    #[test]
+    fn manager_has_active_true_when_app_connected() {
+        // SDK app connected => a failed relayed action MUST surface the error,
+        // not fall back to the runner's own webview.
+        let mgr = manager_with_active_conn("wapp", "http://127.0.0.1:3000");
+        assert!(
+            manager_has_active(&mgr),
+            "connected SDK app must report active (error surfaced, no IPC fallback)"
+        );
+    }
+
+    #[test]
+    fn manager_has_active_false_when_connection_present_but_inactive() {
+        // A registered connection with no active_url (e.g. after disconnecting
+        // the active one) is treated as not-connected — matches
+        // `active_connection()` returning None.
+        let mut mgr = manager_with_active_conn("wapp", "http://127.0.0.1:3000");
+        mgr.active_url = None;
+        assert!(
+            !manager_has_active(&mgr),
+            "no active_url must report not-active even if a connection lingers"
+        );
     }
 }
