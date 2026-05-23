@@ -121,7 +121,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
           { tenantId: trimmed },
         );
       } catch (e) {
-        throw new Error(String(e));
+        throw new Error(String(e), { cause: e });
       }
       // Optimistic update; refresh reconciles.
       setActiveTenantId(trimmed);
