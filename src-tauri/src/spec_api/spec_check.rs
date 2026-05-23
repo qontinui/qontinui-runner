@@ -322,7 +322,45 @@ pub(crate) async fn fetch_fresh_snapshot(
     )
     .await
     {
-        Ok(value) => spec_check::wrap_snapshot(value, app_id, app_version, route, bridge_version),
+        Ok(value) => {
+            // dispatch_app_request returns the full HTTP response body
+            // (`{success: true, data: {...snapshot...}}`) — wrap_snapshot's
+            // strict `serde_json::from_value::<UIBridgeSnapshot>` would parse
+            // the envelope as a default zero-element snapshot, silently
+            // producing matchRate=0 on every downstream evaluate(). Unwrap
+            // `data` (mirroring fetch_self_snapshot, ~line 408 below) and
+            // route through adapt_supplied_snapshot so the SDK control-mode
+            // shape (no canonical `identifier`/`state`/`registeredAt`/
+            // `mounted` fields on elements) is normalized before strict
+            // parse. Then synthesize the fingerprint directly — avoids a
+            // serde round-trip through wrap_snapshot.
+            let inner = value.get("data").cloned().unwrap_or(value.clone());
+            let snapshot = adapt_supplied_snapshot(inner).map_err(|e| {
+                spec_check::SnapshotFetchError::Malformed(format!("sdk-snapshot adapt: {e}"))
+            })?;
+            let content_sha256 =
+                qontinui_types::canonical_hash::canonical_hash(&value).map_err(|e| {
+                    spec_check::SnapshotFetchError::Malformed(format!("canonical hash: {e}"))
+                })?;
+            let snapshot_timestamp =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(snapshot.timestamp)
+                    .ok_or_else(|| {
+                        spec_check::SnapshotFetchError::Malformed(
+                            "timestamp out of range".to_string(),
+                        )
+                    })?
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let fingerprint = qontinui_types::spec_check::BridgeFingerprint {
+                app_id,
+                app_version,
+                route,
+                bridge_version,
+                snapshot_timestamp,
+                element_count: snapshot.elements.len() as u32,
+            };
+            let snapshot_id = format!("scs_{}", uuid::Uuid::now_v7());
+            Ok((snapshot, fingerprint, snapshot_id, content_sha256))
+        }
         Err(e) => Err(classify_sdk_error(&e)),
     }
 }
