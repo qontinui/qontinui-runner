@@ -129,6 +129,15 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   const [helpTokenOpen, setHelpTokenOpen] = useState(false);
   const [helpWhatOpen, setHelpWhatOpen] = useState(false);
 
+  // --- Pair-code paste flow (Phase 2a.3) -------------------------------------
+  // Single-use 5-char-from-32-alphabet code minted by the operator on
+  // qontinui-web's /runners Auth Tokens tab and typed in here.
+  const [pairCodeInput, setPairCodeInput] = useState("");
+  const [pairCodeState, setPairCodeState] = useState<{
+    state: "idle" | "redeeming" | "success" | "error";
+    message?: string;
+  }>({ state: "idle" });
+
   // --- Tick to keep "last heartbeat <relative> ago" alive --------------------
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -352,6 +361,43 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     }
   }, [formBackendUrl, formEnabled, formToken, tokenEdited, onLog, refreshStatus]);
 
+  /**
+   * Redeem a 6-char one-time pair code minted from the dashboard.
+   *
+   * Phase 2a.3 of plan
+   * `D:/qontinui-root/plans/2026-05-22-mtc-iter3-remediation-web-dashboard.md`.
+   * Calls the Rust-side `redeem_pair_code` command which POSTs to
+   * `/api/v1/devices/pair-codes/{code}/redeem` and persists the
+   * resulting device JWT.
+   */
+  const handleRedeemPairCode = useCallback(async () => {
+    const trimmed = pairCodeInput.trim().toUpperCase();
+    if (!trimmed) {
+      setPairCodeState({ state: "error", message: "Enter a pair code first." });
+      return;
+    }
+    setPairCodeState({ state: "redeeming" });
+    try {
+      const result = await invoke<{
+        userId: string;
+        tenantId: string;
+        deviceId: string;
+      }>("redeem_pair_code", { code: trimmed });
+      setPairCodeInput("");
+      setPairCodeState({
+        state: "success",
+        message: `Paired (device ${result.deviceId.slice(0, 8)}…).`,
+      });
+      onLog("info", `Paired via one-time code (user=${result.userId})`);
+      // Refresh status so the UI picks up the new auth + ws state.
+      void refreshStatus();
+    } catch (err) {
+      const msg = String(err);
+      setPairCodeState({ state: "error", message: msg });
+      onLog("error", `Pair-code redeem failed: ${msg}`);
+    }
+  }, [pairCodeInput, onLog, refreshStatus]);
+
   const handleStartWebTokenFlow = useCallback(async () => {
     try {
       await invoke<void>("start_web_token_flow", {
@@ -554,6 +600,61 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           ) : (
             <p className="text-[10px] text-muted-foreground">
               Base URL of the qontinui-web backend this runner will register with.
+            </p>
+          )}
+        </div>
+
+        {/* Pair code paste flow (Phase 2a.3) — recommended for new pairs.
+            Sits above the long-lived runner-token input because pair
+            codes are the simpler/safer path for new operators. */}
+        <div className="space-y-1.5">
+          <label htmlFor="web-integration-pair-code" className="text-xs font-medium">
+            Pair code (6 chars)
+          </label>
+          <div className="flex items-stretch gap-2">
+            <input
+              id="web-integration-pair-code"
+              type="text"
+              inputMode="text"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+              maxLength={6}
+              value={pairCodeInput}
+              onChange={(e) => {
+                setPairCodeInput(e.target.value.toUpperCase());
+                if (pairCodeState.state !== "idle") {
+                  setPairCodeState({ state: "idle" });
+                }
+              }}
+              placeholder="A7K2P3"
+              className="flex-1 min-w-0 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono tracking-[0.3em] uppercase"
+            />
+            <button
+              type="button"
+              onClick={handleRedeemPairCode}
+              disabled={
+                pairCodeState.state === "redeeming" || pairCodeInput.trim().length === 0
+              }
+              className="px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+            >
+              {pairCodeState.state === "redeeming" ? "Pairing…" : "Pair"}
+            </button>
+          </div>
+          {pairCodeState.state === "success" && pairCodeState.message && (
+            <p className="text-[10px] text-green-500 flex items-center gap-1">
+              <CheckCircle2 className="w-3 h-3" /> {pairCodeState.message}
+            </p>
+          )}
+          {pairCodeState.state === "error" && pairCodeState.message && (
+            <p className="text-[10px] text-destructive flex items-center gap-1">
+              <AlertTriangle className="w-3 h-3" /> {truncate(pairCodeState.message, 120)}
+            </p>
+          )}
+          {pairCodeState.state === "idle" && (
+            <p className="text-[10px] text-muted-foreground">
+              Generate a one-time pair code on qontinui-web (Runners &rarr; Auth
+              Tokens) and paste it here. The code expires after 5 minutes.
             </p>
           )}
         </div>
