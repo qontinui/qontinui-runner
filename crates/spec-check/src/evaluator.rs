@@ -110,6 +110,79 @@ pub fn evaluate_with_validation(
     result
 }
 
+/// Evaluate using a caller-supplied fingerprint + snapshot identity.
+///
+/// HTTP / MCP adapters that go through [`crate::wrap_snapshot`] already mint
+/// the real `app_id`, `snapshot_id`, and `content_sha256`. Use this entrypoint
+/// to thread those values into the result struct instead of the in-process
+/// sentinels written by [`evaluate`].
+///
+/// `content_sha256` populates [`SpecCheckResult::snapshot_sha256`]. Pass
+/// `String::new()` to omit it; the field skips serialization when None.
+///
+/// In-process callers that legitimately want sentinels (the distinctness
+/// validator, internal scoring) should keep using [`evaluate`].
+pub fn evaluate_with_identity(
+    snapshot: &UIBridgeSnapshot,
+    spec: &IrPageSpec,
+    fingerprint: BridgeFingerprint,
+    snapshot_id: String,
+    content_sha256: String,
+) -> SpecCheckResult {
+    evaluate_with_identity_and_validation(
+        snapshot,
+        spec,
+        fingerprint,
+        snapshot_id,
+        content_sha256,
+        None,
+    )
+}
+
+/// Identity-bearing twin of [`evaluate_with_validation`].
+///
+/// Preserves the in-process compute's `element_count` on the returned
+/// fingerprint — both values are derived from the same snapshot and must
+/// agree. In debug builds, a mismatch between the caller's non-zero
+/// `element_count` and the indexed snapshot's emits a `tracing::warn!`
+/// rather than panicking — a telemetry disagreement should never crash a
+/// production evaluator.
+pub fn evaluate_with_identity_and_validation(
+    snapshot: &UIBridgeSnapshot,
+    spec: &IrPageSpec,
+    fingerprint: BridgeFingerprint,
+    snapshot_id: String,
+    content_sha256: String,
+    validation: Option<&SpecValidation>,
+) -> SpecCheckResult {
+    #[cfg(debug_assertions)]
+    {
+        let snap_count = snapshot.elements.len() as u32;
+        if fingerprint.element_count != 0 && fingerprint.element_count != snap_count {
+            tracing::warn!(
+                fingerprint_element_count = fingerprint.element_count,
+                snapshot_element_count = snap_count,
+                "evaluate_with_identity: caller fingerprint.element_count disagrees with snapshot.elements.len; keeping snapshot value"
+            );
+        }
+    }
+
+    let mut result = evaluate_with_validation(snapshot, spec, validation);
+    // Stitch the caller's identity into the result. Preserve the in-process
+    // `element_count` (it was computed from the same snapshot bytes, so both
+    // values are correct; the in-process compute is the cross-check).
+    let preserved_element_count = result.bridge_fingerprint.element_count;
+    result.bridge_fingerprint = BridgeFingerprint {
+        element_count: preserved_element_count,
+        ..fingerprint
+    };
+    result.snapshot_id = snapshot_id;
+    if !content_sha256.is_empty() {
+        result.snapshot_sha256 = Some(content_sha256);
+    }
+    result
+}
+
 /// Multi-spec evaluation against a single snapshot. Builds [`IndexedSnapshot`]
 /// once — shared read-only across all specs — then fan-outs across `specs`
 /// via rayon. Load-bearing for the §5.14 batch endpoint.
@@ -161,6 +234,10 @@ fn evaluate_with_indexed(
     SpecCheckResult {
         result_schema_version: RESULT_SCHEMA_VERSION,
         snapshot_id: SENTINEL_SNAPSHOT_ID.to_string(),
+        // In-process evaluator path: no raw snapshot bytes to hash. HTTP/MCP
+        // adapters that mint a real `snapshot_sha256` via wrap_snapshot
+        // override this via `evaluate_with_identity`.
+        snapshot_sha256: None,
         spec_content_hash,
         spec_version: spec.version.clone(),
         page_id: spec.id.clone(),
