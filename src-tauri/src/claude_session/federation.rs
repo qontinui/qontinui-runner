@@ -280,9 +280,16 @@ fn encode_workspace_path(working_dir: &str) -> String {
 /// `"default"`. The label is purely for telemetry — the bridge keys on
 /// `device_id` + `tenant_id`, not account name.
 fn derive_account_name(config_dir: &str) -> String {
-    let basename = std::path::Path::new(config_dir)
-        .file_name()
-        .and_then(|s| s.to_str())
+    // Take the last segment regardless of host OS path conventions:
+    // `effective_config_dir` may carry Windows-style backslashes even
+    // when this binary runs on Linux (e.g. cross-platform tests, paths
+    // round-tripped through JSON config), and std::path::Path::file_name
+    // only honors the host's separator. Normalize both `\` and `/`
+    // before splitting so "C:\claude\.claude-hotmail" reduces to
+    // ".claude-hotmail" on Linux just as it does on Windows.
+    let basename = config_dir
+        .rsplit(|c| c == '/' || c == '\\')
+        .find(|s| !s.is_empty())
         .unwrap_or(config_dir);
     let stripped = basename
         .trim_start_matches('.')
@@ -333,10 +340,15 @@ mod tests {
 
     #[test]
     fn derives_account_name_from_hotmail_dir() {
+        // Backslash form must work on every host OS — std::path::Path on
+        // Linux does NOT treat `\` as a separator, so this was previously
+        // returning "default" on ubuntu CI.
         assert_eq!(
             derive_account_name("C:\\claude\\.claude-hotmail"),
             "hotmail"
         );
+        // Forward-slash form (the shape on real Linux deployments).
+        assert_eq!(derive_account_name("/home/user/.claude-hotmail"), "hotmail");
     }
 
     #[test]
