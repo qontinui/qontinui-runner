@@ -494,6 +494,37 @@ impl SessionRegistry {
     pub fn steal_by_id(&self, id: Uuid, reason: &str) -> Result<(), SessionError> {
         self.steal(id, reason)
     }
+
+    /// Plan §Phase 3 — flip an in-memory session's state without
+    /// recording a wire event. Used by the coord-sync drain loop when it
+    /// observes a 409 conflict (→ `PendingResolution`) and by the
+    /// heartbeat loop when it observes an elapsed session (→ `Stale`).
+    ///
+    /// The state change is local-only — the corresponding coord update
+    /// flows through whatever event the caller is already emitting (the
+    /// 409 itself is the wire signal for `PendingResolution`; the stale
+    /// flag is a UI cue, not a coord column).
+    pub fn set_state(&self, id: Uuid, state: SessionState) {
+        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+        if let Some(rec) = sessions.get_mut(&id) {
+            rec.state = state;
+        }
+    }
+
+    /// Test-only: rewind a session's `last_heartbeat_at` so the
+    /// heartbeat-loop's elapsed-time check trips deterministically
+    /// without sleeping for the real autoclose interval.
+    #[cfg(test)]
+    pub fn force_heartbeat_to_for_test(&self, id: Uuid, when: chrono::DateTime<chrono::Utc>) {
+        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+        if let Some(rec) = sessions.get_mut(&id) {
+            rec.last_heartbeat_at = Some(when);
+            // The autoclose path uses `last_heartbeat_at.unwrap_or(started_at)`,
+            // so also rewind started_at to match — otherwise a brand-new
+            // session with `started_at = now` would clamp elapsed to ~0.
+            rec.started_at = when;
+        }
+    }
 }
 
 fn clone_transport_handle(h: &TransportHandle) -> TransportHandle {
@@ -638,7 +669,11 @@ mod tests {
         }
     }
 
-    fn make_registry() -> Arc<SessionRegistry> {
+    /// Returns the registry plus the backing [`TempDir`]. The caller MUST
+    /// keep the `TempDir` alive for the test's duration: the outbox reopens
+    /// its file on every `record`, so a dropped temp dir (deleted on drop)
+    /// makes subsequent writes fail with `ENOENT`.
+    fn make_registry() -> (Arc<SessionRegistry>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let outbox =
             Arc::new(local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
@@ -648,7 +683,7 @@ mod tests {
         let claude_cli = Arc::new(FakeTransport::new(SessionKind::TerminalClaude)) as DynTransport;
         let workflow = Arc::new(FakeTransport::new(SessionKind::Workflow)) as DynTransport;
 
-        SessionRegistry::new(
+        let registry = SessionRegistry::new(
             Uuid::new_v4(),
             SessionTransports {
                 pty,
@@ -656,7 +691,8 @@ mod tests {
                 workflow,
             },
             coord_sync,
-        )
+        );
+        (registry, dir)
     }
 
     fn shell_intent() -> Intent {
@@ -726,7 +762,7 @@ mod tests {
 
     #[test]
     fn lifecycle_start_describe_close() {
-        let reg = make_registry();
+        let (reg, _dir) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let desc = handle.describe().unwrap();
         assert_eq!(desc.kind, SessionKind::TerminalShell);
@@ -744,7 +780,7 @@ mod tests {
 
     #[test]
     fn close_is_idempotent() {
-        let reg = make_registry();
+        let (reg, _dir) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let id = handle.id();
         handle.clone().close().unwrap();
@@ -754,7 +790,7 @@ mod tests {
 
     #[test]
     fn start_rejects_invalid_intent() {
-        let reg = make_registry();
+        let (reg, _dir) = make_registry();
         let mut intent = shell_intent();
         intent.purpose = "x".into();
         let err = reg.start(intent).unwrap_err();
@@ -763,7 +799,7 @@ mod tests {
 
     #[test]
     fn steal_requires_long_reason() {
-        let reg = make_registry();
+        let (reg, _dir) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let err = handle.steal("short").unwrap_err();
         assert!(matches!(
@@ -777,7 +813,7 @@ mod tests {
 
     #[test]
     fn focus_heartbeats_session() {
-        let reg = make_registry();
+        let (reg, _dir) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let before = handle.describe().unwrap().last_heartbeat_at;
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -788,7 +824,7 @@ mod tests {
 
     #[test]
     fn snapshot_lists_all_sessions() {
-        let reg = make_registry();
+        let (reg, _dir) = make_registry();
         let _a = reg.start(shell_intent()).unwrap();
         let _b = reg.start(shell_intent()).unwrap();
         let snap = reg.snapshot();
@@ -799,7 +835,7 @@ mod tests {
     fn transports_pick_routes_by_kind() {
         // FakeTransport rejects non-matching kinds, so this proves the
         // router picked the right transport.
-        let reg = make_registry();
+        let (reg, _dir) = make_registry();
 
         let mut shell = shell_intent();
         shell.kind = SessionKind::TerminalShell;
@@ -816,7 +852,7 @@ mod tests {
 
     #[test]
     fn description_serializes_with_snake_case_enums() {
-        let reg = make_registry();
+        let (reg, _dir) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let desc = handle.describe().unwrap();
         let json = serde_json::to_value(&desc).unwrap();

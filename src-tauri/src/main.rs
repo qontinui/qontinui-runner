@@ -1794,6 +1794,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         uuid::Uuid::parse_str(s).ok()
                     })
                     .unwrap_or_else(uuid::Uuid::new_v4);
+                // Phase 3 — wire the coord-sync drain + heartbeat loops.
+                // `attach_app_handle` enables the conflict-event emit;
+                // `attach_registry` gives the heartbeat loop a way to
+                // enumerate active sessions for stale/autoclose sweeps.
+                coord_sync_facade.attach_app_handle(app_handle.clone());
                 let registry = session::SessionRegistry::new(
                     machine_id,
                     session::SessionTransports {
@@ -1801,10 +1806,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         claude_cli: claude_cli_transport,
                         workflow: workflow_transport,
                     },
-                    coord_sync_facade,
+                    coord_sync_facade.clone(),
                 );
-                // Phase 3 will start the drain task here.
-                registry.coord_sync().start_drain_task();
+                coord_sync_facade.attach_registry(&registry);
+                // Plan §Phase 3 — start both background loops. JoinHandles
+                // are intentionally dropped: the tasks live for the
+                // lifetime of the process and we let tokio reap them on
+                // shutdown.
+                let _drain = registry.coord_sync().start_drain_task();
+                let _heartbeat = registry.coord_sync().start_heartbeat_task();
                 app.manage(registry);
 
             }

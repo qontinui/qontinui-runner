@@ -68,15 +68,21 @@ pub struct OutboxRecord {
 
 /// Append-only outbox backed by a single JSON-lines file.
 ///
-/// `Mutex<File>` rather than `Mutex<BufWriter<File>>` so each write is
-/// fsynced and visible to a fresh `OutboxWriter::open` from another
-/// process (the Tauri runner is single-process today but the supervisor
-/// may want to read the file out-of-band).
+/// We deliberately do NOT cache an open file handle. `ack`/`compact`
+/// rewrite the file via temp-file + atomic rename (see [`rewrite_all`]),
+/// which orphans any long-lived append handle — on Unix the rename unlinks
+/// the old inode, so a cached handle keeps appending to a deleted file and
+/// every subsequent `record` write is silently lost. Instead, `record`
+/// opens a fresh append handle each call and fsyncs it, while `write_lock`
+/// serializes all file operations (append, rewrite, read) so a `record`
+/// can never interleave with an in-flight `ack` rename.
 #[derive(Debug)]
 pub struct OutboxWriter {
     path: PathBuf,
     next_seqs: Mutex<HashMap<(Uuid, Uuid), i64>>,
-    file: Mutex<File>,
+    /// Serializes every file operation. Holds no handle by design (see the
+    /// struct-level note on the rename-orphan hazard).
+    write_lock: Mutex<()>,
 }
 
 impl OutboxWriter {
@@ -91,16 +97,14 @@ impl OutboxWriter {
 
         let next_seqs = scan_next_seqs(&path)?;
 
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&path)?;
+        // Ensure the file exists so a brand-new outbox has a readable path;
+        // we drop the handle immediately — `record` reopens per write.
+        OpenOptions::new().append(true).create(true).open(&path)?;
 
         Ok(Self {
             path,
             next_seqs: Mutex::new(next_seqs),
-            file: Mutex::new(file),
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -134,7 +138,13 @@ impl OutboxWriter {
         let mut line = serde_json::to_string(&rec).map_err(std::io::Error::other)?;
         line.push('\n');
 
-        let mut file = self.file.lock().expect("outbox file poisoned");
+        // Open a fresh append handle under the lock so the write always
+        // lands in the current file even after an `ack`/`compact` rename.
+        let _guard = self.write_lock.lock().expect("outbox lock poisoned");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)?;
         file.write_all(line.as_bytes())?;
         file.sync_data()?;
 
@@ -144,7 +154,7 @@ impl OutboxWriter {
     /// Return all not-yet-acked records, in seq order per session. Used
     /// by [`crate::session::coord_sync`] to drive the push loop.
     pub fn pending(&self) -> std::io::Result<Vec<OutboxRecord>> {
-        let _guard = self.file.lock().expect("outbox file poisoned");
+        let _guard = self.write_lock.lock().expect("outbox lock poisoned");
         let mut pending: Vec<OutboxRecord> = read_all(&self.path)?
             .into_iter()
             .filter(|r| r.acked_at.is_none())
@@ -160,7 +170,7 @@ impl OutboxWriter {
         if acks.is_empty() {
             return Ok(());
         }
-        let _guard = self.file.lock().expect("outbox file poisoned");
+        let _guard = self.write_lock.lock().expect("outbox lock poisoned");
 
         let mut all = read_all(&self.path)?;
         let now = Utc::now();
@@ -178,7 +188,7 @@ impl OutboxWriter {
     /// every batch and available as a manual sweep for cron-style
     /// callers.
     pub fn compact(&self) -> std::io::Result<()> {
-        let _guard = self.file.lock().expect("outbox file poisoned");
+        let _guard = self.write_lock.lock().expect("outbox lock poisoned");
         let all = read_all(&self.path)?;
         let kept: Vec<_> = all.into_iter().filter(|r| r.acked_at.is_none()).collect();
         rewrite_all(&self.path, &kept)
@@ -353,6 +363,34 @@ mod tests {
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].seq, 3);
+    }
+
+    #[test]
+    fn record_after_ack_survives_rewrite() {
+        // Regression: `ack` rewrites the file via temp-file + atomic rename.
+        // A cached append handle would be orphaned by the rename and silently
+        // drop every later `record`. Opening a fresh handle per write keeps
+        // the post-ack record landing in the live file.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let outbox = OutboxWriter::open(&path).unwrap();
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+
+        let r1 = outbox
+            .record(m, s, SessionEventKind::Started, json!({}))
+            .unwrap();
+        outbox.ack(&[(r1.session_id, r1.seq)]).unwrap();
+
+        // This append happens AFTER the ack's rewrite/rename.
+        let r2 = outbox
+            .record(m, s, SessionEventKind::Heartbeat, json!({}))
+            .unwrap();
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "post-ack record must survive the rewrite");
+        assert_eq!(pending[0].seq, r2.seq);
+        assert_eq!(pending[0].event_kind, "heartbeat");
     }
 
     #[test]
