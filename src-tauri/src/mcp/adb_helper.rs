@@ -35,6 +35,44 @@ fn default_server_addr() -> SocketAddrV4 {
     "127.0.0.1:5037".parse().expect("static addr parses")
 }
 
+/// Best-effort classifier for an adb serial / transport id.
+///
+/// Used by the vision frame-source resolver to decide whether an opaque
+/// `target` string should be routed to `adb` (device framebuffer) when it
+/// isn't a registered physical device or app. Conservative on purpose — a
+/// false positive routes a non-adb id to adb and surfaces a clean "device
+/// not found" error, never a panic.
+///
+/// Matches the three shapes `adb devices` actually emits:
+///   - emulator transport ids: `emulator-5554` (`emulator-<digits>`)
+///   - networked devices: `host:port`, e.g. `192.168.1.20:5555` (contains `:`)
+///   - USB hardware serials: non-empty run of `[A-Za-z0-9._-]` (e.g.
+///     `R3CN30XXXXX`, `0123456789ABCDEF`). Rejects strings with spaces,
+///     slashes, or other punctuation that an app-id / arbitrary label might
+///     carry.
+pub fn is_adb_serial(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    // emulator-<digits>
+    if let Some(rest) = s.strip_prefix("emulator-") {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    }
+    // host:port (networked adb). Require a port-ish suffix after the last ':'.
+    if let Some((host, port)) = s.rsplit_once(':') {
+        let host_ok = !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+        let port_ok = !port.is_empty() && port.chars().all(|c| c.is_ascii_digit());
+        return host_ok && port_ok;
+    }
+    // USB hardware serial: alphanumeric with the limited punctuation adb allows.
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 // ----------------------------------------------------------------------------
 // Operations
 // ----------------------------------------------------------------------------
@@ -249,4 +287,34 @@ pub async fn forward_remove_all() -> Result<(), String> {
 #[allow(dead_code)]
 fn _keep_cursor_in_scope() -> Cursor<Vec<u8>> {
     Cursor::new(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_adb_serial;
+
+    #[test]
+    fn classifies_adb_serials() {
+        // emulator transport ids
+        assert!(is_adb_serial("emulator-5554"));
+        assert!(is_adb_serial("emulator-0"));
+        // networked devices (host:port)
+        assert!(is_adb_serial("192.168.1.20:5555"));
+        assert!(is_adb_serial("phone.local:5555"));
+        // USB hardware serials
+        assert!(is_adb_serial("R3CN30ABCDEF"));
+        assert!(is_adb_serial("0123456789ABCDEF"));
+        assert!(is_adb_serial("HT4-A1B2"));
+
+        // Non-serials
+        assert!(!is_adb_serial(""));
+        assert!(!is_adb_serial("   "));
+        assert!(!is_adb_serial("emulator-"));
+        assert!(!is_adb_serial("emulator-abc"));
+        assert!(!is_adb_serial("192.168.1.20:")); // empty port
+        assert!(!is_adb_serial(":5555")); // empty host
+        assert!(!is_adb_serial("host:notaport"));
+        assert!(!is_adb_serial("my app id")); // space
+        assert!(!is_adb_serial("https://example.com/app")); // slash + scheme
+    }
 }
