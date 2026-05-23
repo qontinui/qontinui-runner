@@ -477,6 +477,7 @@ mod tests {
         SpecCheckResult {
             result_schema_version: 1,
             snapshot_id: "scs_test".to_string(),
+            snapshot_sha256: None,
             spec_content_hash: "sha256-test".to_string(),
             spec_version: "1.0".to_string(),
             page_id: "page".to_string(),

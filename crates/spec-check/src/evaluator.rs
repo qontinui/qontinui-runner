@@ -161,6 +161,7 @@ fn evaluate_with_indexed(
     SpecCheckResult {
         result_schema_version: RESULT_SCHEMA_VERSION,
         snapshot_id: SENTINEL_SNAPSHOT_ID.to_string(),
+        snapshot_sha256: None,
         spec_content_hash,
         spec_version: spec.version.clone(),
         page_id: spec.id.clone(),

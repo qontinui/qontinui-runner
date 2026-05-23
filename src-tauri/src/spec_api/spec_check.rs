@@ -1766,6 +1766,7 @@ mod tests {
         let mk = |outcome: MatchOutcome, rate: f32| SpecCheckResult {
             result_schema_version: 1,
             snapshot_id: String::new(),
+            snapshot_sha256: None,
             spec_content_hash: String::new(),
             spec_version: "1.0".into(),
             page_id: "p".into(),
