@@ -106,6 +106,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial tenant load on mount; refresh is the explicit synchronization point with the backend
     void refresh();
   }, [refresh]);
 
