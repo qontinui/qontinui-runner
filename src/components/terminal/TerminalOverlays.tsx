@@ -3,8 +3,7 @@ import { KeyboardShortcutsOverlay } from "./KeyboardShortcutsOverlay";
 import { CommandPalette } from "./CommandPalette";
 import { ZoneDiffOverlay } from "./ZoneDiffOverlay";
 import {
-  useTerminalCore,
-  useSessionState,
+  useTerminalSession,
   useZoneMetadata,
   useTransitionEffects,
   useUIStateCx,
@@ -18,8 +17,9 @@ interface TerminalOverlaysProps {
 
 const noop = () => {};
 export function TerminalOverlays({ onSortZones = noop, onExport = noop }: TerminalOverlaysProps) {
-  const { tabs, zoneLayout, terminalRefs } = useTerminalCore();
-  const { sessionStates, lastOutputLines, snapshots } = useSessionState();
+  const session = useTerminalSession();
+  const { tabs, zoneLayout, terminalRefs } = session;
+  const { sessionStates, lastOutputLines, snapshots } = session;
   const { labelsAndTags, incrementMetric, addHistoryEvent } = useZoneMetadata();
   const transitionEffects = useTransitionEffects();
   const { state: uiState, dispatch, toggleFocusMode } = useUIStateCx();

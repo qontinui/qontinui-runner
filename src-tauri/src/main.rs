@@ -1437,6 +1437,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::session::session_list,
             commands::session::session_start,
             commands::session::session_steal,
+            // Plan 2026-05-22-coord-native-session-coordination §D12 / Phase 4 —
+            // active tenant resolver for the frontend TenantContext.
+            commands::tenant::get_active_tenant,
+            commands::tenant::set_active_tenant,
             commands::setup_wizard::check_setup_completed,
             commands::setup_wizard::complete_setup,
             commands::setup_wizard::detect_project_framework_for_setup,

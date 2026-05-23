@@ -10,7 +10,7 @@
  *
  * Why a module singleton: the IPC dispatch path (`useUIBridgeEventHandler`)
  * lives outside the terminal-page subtree, so it can't reach into
- * `TerminalCoreContext` directly. Rather than threading the context through
+ * `TerminalSessionContext` directly. Rather than threading the context through
  * every sub-hook or fanning out a custom DOM event, the page publishes its
  * snapshot here and the new `useTerminalsEvents` hook reads it. The
  * registry mirrors how `instanceStorage[ACTIVE_TAB_STORAGE_KEY]` is used

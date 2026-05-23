@@ -33,11 +33,9 @@ import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { TerminalTab } from "./useTerminalManager";
 import { instanceStorage } from "@/lib/instance-storage";
 import {
-  useTerminalCore,
-  useSessionState,
+  useTerminalSession,
   useZoneMetadata,
   useTransitionEffects,
-  useAiFeatures,
   useUIStateCx,
 } from "./contexts";
 
@@ -87,7 +85,8 @@ const STATE_LABELS: Record<SessionState, string> = {
 
 export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStatusBarProps) {
   // Read all data from contexts instead of props
-  const { tabs, zoneLayout } = useTerminalCore();
+  const session = useTerminalSession();
+  const { tabs, zoneLayout } = session;
   const assignments = zoneLayout.assignments;
   const {
     sessionStates,
@@ -95,7 +94,7 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
     lastOutputLines,
     stateTimeAccum: stateTimeAccumRef,
     activeFindings,
-  } = useSessionState();
+  } = session;
   const { labelsAndTags, eventHistory, metrics: metricsRef } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;
   const labelColorMap = labelsAndTags.labelColorMap;
@@ -117,7 +116,7 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
   const autoApproveCount = transitionEffects.autoApproveCount;
   const autoRestart = transitionEffects.autoRestart;
   const autoRestartCount = transitionEffects.autoRestartCount;
-  const { workflowGen, analysis, findingsActions, sessionManager } = useAiFeatures();
+  const { workflowGen, analysis, findingsActions, sessionManager } = session;
   const showSidebar = workflowGen.showSidebar;
   const isGenerating = workflowGen.isGenerating;
   const isAnalyzing = analysis.isAnalyzing;
