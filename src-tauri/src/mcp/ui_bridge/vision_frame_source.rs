@@ -207,11 +207,33 @@ pub async fn resolve_frame_provider(
     }
 
     // 3. adb serial / emulator transport id → framebuffer.
-    if id.starts_with("emulator-") || adb_helper::is_adb_serial(id) {
+    //
+    // The registries are now exhausted. `is_adb_serial` is a permissive
+    // syntactic classifier — an arbitrary label like `bogus-id` is alphanumeric
+    // with a dash and so *looks* like a USB serial. Routing every such string to
+    // adb produced a misleading "ADB device … not found" error for what is
+    // really an unknown target. Gate on actual adb presence: a string only goes
+    // to `AdbScreencapSource` when it is serial-shaped AND adb currently lists it
+    // as a connected device. A real serial still routes; `bogus-id` falls through
+    // to the intended "unknown vision target" error.
+    let connected = adb_helper::is_connected_device(id).await;
+    if should_route_to_adb(id, connected) {
         return Ok(Box::new(AdbScreencapSource { serial: id.clone() }));
     }
 
     Err(format!("unknown vision target '{id}'"))
+}
+
+/// Pure routing decision for step 3 of [`resolve_frame_provider`]: a target the
+/// device + app registries did not claim is routed to adb only when it is
+/// serial-shaped AND adb reports it as a connected device.
+///
+/// Separated from the async resolver (which needs an `ApiState` + a live adb
+/// server) so the bogus-id-vs-real-serial distinction is unit-testable in
+/// isolation. `connected` is the result of [`adb_helper::is_connected_device`].
+fn should_route_to_adb(id: &str, connected: bool) -> bool {
+    let serial_shaped = id.starts_with("emulator-") || adb_helper::is_adb_serial(id);
+    serial_shaped && connected
 }
 
 #[cfg(test)]
@@ -277,5 +299,50 @@ mod tests {
     fn malformed_base64_is_an_error_not_a_panic() {
         let body = serde_json::json!({ "data": { "screenshot": "not-base64!!!", "width": 10 } });
         assert!(frame_from_screenshot_json(&body).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // adb routing gate (step 3 of resolve_frame_provider)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bogus_id_does_not_route_to_adb() {
+        // `bogus-id` is syntactically serial-shaped (alphanumeric + dash), so the
+        // permissive `is_adb_serial` classifier accepts it. The presence gate is
+        // what saves us: adb does not list it, so it must NOT route to adb and
+        // the resolver falls through to "unknown vision target '<id>'".
+        assert!(
+            adb_helper::is_adb_serial("bogus-id"),
+            "precondition: bogus-id is serial-shaped, so syntax alone can't reject it"
+        );
+        assert!(
+            !should_route_to_adb("bogus-id", false),
+            "an unknown, not-connected id must not route to adb"
+        );
+    }
+
+    #[test]
+    fn real_serial_routes_to_adb_when_connected() {
+        // A genuine USB serial that adb lists routes to AdbScreencapSource.
+        assert!(should_route_to_adb("R3CN30ABCDE", true));
+        // An emulator transport id that adb lists also routes.
+        assert!(should_route_to_adb("emulator-5554", true));
+    }
+
+    #[test]
+    fn serial_shaped_but_absent_does_not_route() {
+        // Even a perfectly serial-shaped id is rejected if adb doesn't list it —
+        // e.g. a device that was unplugged. Better to report "unknown target"
+        // than to hand a dead serial to the framebuffer puller.
+        assert!(!should_route_to_adb("R3CN30ABCDE", false));
+        assert!(!should_route_to_adb("emulator-5554", false));
+    }
+
+    #[test]
+    fn non_serial_shaped_never_routes_even_if_claimed_connected() {
+        // Defense in depth: a string that isn't serial-shaped never routes,
+        // regardless of the presence flag.
+        assert!(!should_route_to_adb("has spaces", true));
+        assert!(!should_route_to_adb("app/with/slashes", true));
     }
 }

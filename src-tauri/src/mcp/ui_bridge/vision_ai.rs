@@ -32,6 +32,22 @@ use tracing::{debug, warn};
 
 /// Default llama-swap host endpoint. Matches `verification::mode::DEFAULT_ENDPOINT`.
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8100";
+
+/// Canonical OCR model alias. **Environment dependency:** llama-swap must
+/// expose a model under this alias or `vision/extract` (and any path that runs
+/// OCR) returns the endpoint's non-success status (a 400/404 surfaced as
+/// [`AiError::Status`]).
+///
+/// As of this writing the checked-in `qontinui/docker/llama-swap/config.yaml`
+/// defines `qontinui-grounding-v1` (the VLM default below) but does **not**
+/// define a `paddleocr` model — so a stock local llama-swap will 400 on OCR.
+/// This is a llama-swap *config* gap (out of this repo), NOT a wrong default:
+/// `paddleocr` is the intended canonical OCR alias (see the PaddleOCR
+/// references in `vision_routes.rs` and this module's header). Do NOT "fix" the
+/// 400 by repointing this constant at some other loaded model — that would
+/// silently change OCR behavior for everyone and mask the missing config.
+/// The fix is to add a `paddleocr` entry to the llama-swap config (or override
+/// [`ENV_OCR_MODEL`] at process start to a loaded OCR-capable alias).
 pub const DEFAULT_OCR_MODEL: &str = "paddleocr";
 pub const DEFAULT_VLM_MODEL: &str = "qontinui-grounding-v1";
 
