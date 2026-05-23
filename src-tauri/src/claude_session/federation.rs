@@ -285,10 +285,7 @@ fn derive_account_name(config_dir: &str) -> String {
     // `"C:\\claude\\.claude-hotmail"` resolves to one big basename on
     // Linux CI runners. Split on both separators ourselves to get the
     // last segment regardless of host OS.
-    let basename = config_dir
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(config_dir);
+    let basename = config_dir.rsplit(['/', '\\']).next().unwrap_or(config_dir);
     let stripped = basename
         .trim_start_matches('.')
         .strip_prefix("claude-")
