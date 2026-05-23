@@ -167,6 +167,7 @@ pub fn save_ai_settings(
         interactive_sessions_enabled: interactive_sessions_enabled
             .unwrap_or(existing_settings.interactive_sessions_enabled),
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+        memory_federation_enabled: existing_settings.memory_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -260,6 +261,7 @@ pub fn save_gemini_settings(
         routing: existing_settings.routing,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+        memory_federation_enabled: existing_settings.memory_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -317,6 +319,7 @@ pub fn save_ollama_settings(
         routing: existing_settings.routing,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+        memory_federation_enabled: existing_settings.memory_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -373,6 +376,7 @@ pub fn save_openai_compatible_settings(
         routing: existing_settings.routing,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+        memory_federation_enabled: existing_settings.memory_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {
@@ -980,6 +984,7 @@ pub fn save_agentic_settings(
         routing: routing_config,
         interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
         ai_path_prediction_enabled: existing_settings.ai_path_prediction_enabled,
+        memory_federation_enabled: existing_settings.memory_federation_enabled,
     };
 
     settings::save_ai_settings(ai_settings).map_err(|e| {

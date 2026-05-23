@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use tauri::Manager;
 
 pub mod accessibility;
+pub mod observable_bridge;
 pub mod profiles;
 pub mod relay_envelopes;
 pub mod schema_export;

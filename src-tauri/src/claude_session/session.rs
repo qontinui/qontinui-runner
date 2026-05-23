@@ -15,6 +15,11 @@ use std::time::{Duration, Instant};
 use tauri::Emitter;
 use tracing::{debug, error, info, warn};
 
+// `RunnerObservableBridge` is in scope so `bridge.pull` / `bridge.reconcile`
+// resolve through the trait — `MemoryBridge`'s impl is the only one
+// today and the receiver `Arc<MemoryBridge>` requires the trait.
+use qontinui_runner_lib::observable_bridge::RunnerObservableBridge;
+
 use crate::claude_protocol::request_id::next_request_id;
 use crate::claude_protocol::types::{OutgoingControlRequest, UserInputMessage};
 use crate::findings::{
@@ -118,6 +123,15 @@ pub struct ClaudeSession {
     /// git worktree. `None` means the session is running in the original
     /// working directory (the default for fresh sessions).
     worktree: Option<WorktreeInfo>,
+    /// Memory-federation context for this session, when federation is
+    /// enabled and identity could be resolved at spawn time. The waiter
+    /// thread (see `wait_for_child` callsite) reads it on subprocess
+    /// exit to fire the session-end reconcile + Tauri event broadcast.
+    /// `None` means federation is disabled or unconfigured — the session
+    /// runs purely against the local memory dir.
+    ///
+    /// Plan: `2026-05-22-memories-on-coord-cross-machine.md` Phase 5.D.
+    federation_ctx: Option<qontinui_runner_lib::observable_bridge::SessionContext>,
 }
 
 // SAFETY: ClaudeSession contains a raw Windows handle (RawHandle = *mut c_void) for the stdout
@@ -203,9 +217,78 @@ impl ClaudeSession {
             cmd.env("CLAUDE_CONFIG_DIR", config_dir.as_str());
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn Claude CLI: {}", e))?;
+        // ── Memory federation: spawn-time pull + start watcher ────────
+        //
+        // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.D.
+        // The materialization MUST land before `cmd.spawn()` because
+        // Claude's auto-memory subsystem reads `memory_dir` during init.
+        // The watcher starts immediately after pull so in-session writes
+        // get pushed to coord without waiting for session-end. All
+        // identity / toggle short-circuits return `None` so federation
+        // never blocks the spawn.
+        let federation_ctx = if crate::claude_session::federation::federation_enabled() {
+            super::federation::build_federation_ctx(
+                session_id,
+                working_dir,
+                &ai_settings.claude_cli,
+            )
+        } else {
+            debug!(
+                "memory federation disabled via settings; skipping pull/watch for session {}",
+                session_id
+            );
+            None
+        };
+        let federation_ctx = if let (Some(mut ctx), Some(bridge)) = (
+            federation_ctx,
+            qontinui_runner_lib::observable_bridge::global().cloned(),
+        ) {
+            let pull_result = Self::block_on_async(async {
+                bridge.pull(&mut ctx).await
+            });
+            match pull_result {
+                Ok(()) => {
+                    if let Err(e) = Self::block_on_async(async {
+                        bridge.start_watcher(ctx.clone()).await
+                    }) {
+                        warn!(
+                            "memory federation: start_watcher failed for session {} ({}); \
+                             continuing without watcher — reconcile will still run",
+                            session_id, e
+                        );
+                    }
+                    Some(ctx)
+                }
+                Err(e) => {
+                    warn!(
+                        "memory federation: pull failed for session {} ({}); \
+                         skipping watcher + reconcile",
+                        session_id, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                // Clean up the memory-federation watcher we just started
+                // so a spawn failure doesn't leave an orphaned `notify`
+                // hook running for the lifetime of the runner process.
+                if let (Some(ctx), Some(bridge)) = (
+                    federation_ctx.as_ref(),
+                    qontinui_runner_lib::observable_bridge::global().cloned(),
+                ) {
+                    Self::block_on_async(async {
+                        bridge.stop_watcher(ctx.session_id).await
+                    });
+                }
+                return Err(format!("Failed to spawn Claude CLI: {}", e));
+            }
+        };
 
         // Assign to Windows Job Object for crash safety (auto-kill on runner exit)
         #[cfg(target_os = "windows")]
@@ -838,6 +921,10 @@ impl ClaudeSession {
         let app_handle_for_waiter = app_handle.clone();
         let session_ctx_for_waiter = session_ctx.clone();
         let shared_stderr_for_waiter = shared_stderr;
+        // Memory federation: clone the federation context into the
+        // waiter so reconcile fires when the subprocess actually exits
+        // (NOT when `spawn()` returns, which is just after init).
+        let federation_ctx_for_waiter = federation_ctx.clone();
 
         thread::spawn(move || {
             // Wait for the child process to exit
@@ -856,6 +943,29 @@ impl ClaudeSession {
 
             // Brief pause to let the stderr reader thread finish
             thread::sleep(Duration::from_millis(200));
+
+            // ── Memory federation: session-end reconcile ─────────────
+            //
+            // Fires AFTER the subprocess exits (not after `spawn()`
+            // returns — `spawn` returns once init handshakes, the
+            // session continues until the CLI itself exits). Stops
+            // the watcher (idempotent), re-snapshots the memory dir,
+            // pushes any deltas the watcher missed, broadcasts a
+            // Tauri event for the React frontend banner. Plan Phase 5.D.
+            if let (Some(ctx), Some(bridge)) = (
+                federation_ctx_for_waiter.as_ref(),
+                qontinui_runner_lib::observable_bridge::global().cloned(),
+            ) {
+                let report = Self::block_on_async(async {
+                    bridge.stop_watcher(ctx.session_id).await;
+                    bridge.reconcile(ctx).await
+                });
+                super::federation::emit_federation_report(
+                    &app_handle_for_waiter,
+                    ctx,
+                    report,
+                );
+            }
 
             // Check if the exit was due to rate-limiting
             let stderr_output = shared_stderr_for_waiter
@@ -973,7 +1083,20 @@ impl ClaudeSession {
             persisted_output_len,
             turn_persist_tx: turn_persist_tx_option,
             worktree,
+            federation_ctx,
         })
+    }
+
+    /// Bridge sync → async for the memory-federation calls made from
+    /// the spawn site (pull / start_watcher) and the wait-for-child
+    /// thread (stop_watcher / reconcile). Prefers the caller's tokio
+    /// runtime when one exists (we're typically inside Tauri's), falls
+    /// back to Tauri's process-wide runtime for std-thread callers.
+    pub(super) fn block_on_async<F: std::future::Future>(fut: F) -> F::Output {
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => tokio::task::block_in_place(|| rt.block_on(fut)),
+            Err(_) => tauri::async_runtime::block_on(fut),
+        }
     }
 
     /// Get the current session state.

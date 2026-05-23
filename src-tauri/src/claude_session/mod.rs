@@ -11,6 +11,7 @@
 //! - Autonomous-to-interactive context switching
 
 pub mod dispatcher;
+pub mod federation;
 pub mod manager;
 pub mod resume;
 pub mod runner;

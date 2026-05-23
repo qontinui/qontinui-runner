@@ -1687,6 +1687,29 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // to the webview without taking an AppHandle parameter.
             tauri_app_handle::set(app.handle().clone());
 
+            // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.G —
+            // initialize the process-wide memory-federation bridge. The
+            // bridge mediates the per-session pull / watcher / reconcile
+            // lifecycle that materializes the tenant memory pool into the
+            // about-to-spawn Claude CLI's per-account memory dir, watches
+            // for in-session writes, and pushes them back to coord. Init
+            // failure is non-fatal — the spawn sites short-circuit when
+            // `observable_bridge::global()` returns `None`.
+            match qontinui_runner_lib::observable_bridge::memory::MemoryBridge::new() {
+                Ok(bridge) => {
+                    let arc = std::sync::Arc::new(bridge);
+                    qontinui_runner_lib::observable_bridge::init_global(arc.clone());
+                    app.manage(arc);
+                    info!("memory federation bridge initialized");
+                }
+                Err(e) => {
+                    warn!(
+                        "memory federation bridge init failed ({}); feature disabled this session",
+                        e
+                    );
+                }
+            }
+
             // Phase F.1 — register the deep-link `on_open_url` callback so
             // `qontinui://wake?intent=...` URLs delivered by the OS (cold
             // start) or forwarded by the single-instance plugin (warm start)
