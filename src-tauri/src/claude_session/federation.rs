@@ -280,9 +280,14 @@ fn encode_workspace_path(working_dir: &str) -> String {
 /// `"default"`. The label is purely for telemetry — the bridge keys on
 /// `device_id` + `tenant_id`, not account name.
 fn derive_account_name(config_dir: &str) -> String {
-    let basename = std::path::Path::new(config_dir)
-        .file_name()
-        .and_then(|s| s.to_str())
+    // Cross-platform path parsing: `std::path::Path::new` on Linux treats
+    // `\` as part of the filename, so a Windows-style path like
+    // `"C:\\claude\\.claude-hotmail"` resolves to one big basename on
+    // Linux CI runners. Split on both separators ourselves to get the
+    // last segment regardless of host OS.
+    let basename = config_dir
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
         .unwrap_or(config_dir);
     let stripped = basename
         .trim_start_matches('.')
