@@ -110,6 +110,64 @@ pub fn evaluate_with_validation(
     result
 }
 
+/// Evaluate a spec against a snapshot using a caller-supplied fingerprint
+/// and snapshot identity. Use this from HTTP/MCP adapters that already minted
+/// the real values via `wrap_snapshot` or an equivalent fetch path — the
+/// resulting `SpecCheckResult` will carry those values through to
+/// serialization instead of the in-process sentinels.
+///
+/// The supplied `content_sha256` populates `SpecCheckResult.snapshot_sha256`.
+/// Pass `String::new()` to omit it (serialized as null via skip_serializing_if).
+///
+/// In-process callers that want sentinel values (validator, distinctness
+/// checks, internal scoring) should keep using `evaluate()`.
+pub fn evaluate_with_identity(
+    snapshot: &UIBridgeSnapshot,
+    spec: &IrPageSpec,
+    fingerprint: BridgeFingerprint,
+    snapshot_id: String,
+    content_sha256: String,
+) -> SpecCheckResult {
+    evaluate_with_identity_and_validation(snapshot, spec, fingerprint, snapshot_id, content_sha256, None)
+}
+
+pub fn evaluate_with_identity_and_validation(
+    snapshot: &UIBridgeSnapshot,
+    spec: &IrPageSpec,
+    fingerprint: BridgeFingerprint,
+    snapshot_id: String,
+    content_sha256: String,
+    validation: Option<&SpecValidation>,
+) -> SpecCheckResult {
+    let mut result = evaluate_with_validation(snapshot, spec, validation);
+
+    // element_count cross-check: both the caller's fp and the in-process
+    // index computed it from the same snapshot; they must agree. Warn (don't
+    // panic) on mismatch in debug builds; release trusts the caller.
+    #[cfg(debug_assertions)]
+    if fingerprint.element_count != snapshot.elements.len() as u32
+        && fingerprint.element_count != 0
+    {
+        tracing::warn!(
+            "evaluate_with_identity: caller fp.element_count={} disagrees with snapshot.elements.len={}; using caller's value",
+            fingerprint.element_count,
+            snapshot.elements.len(),
+        );
+    }
+
+    // Keep the in-process element_count (correct + equal); take the rest from
+    // the caller-supplied fingerprint.
+    result.bridge_fingerprint = BridgeFingerprint {
+        element_count: result.bridge_fingerprint.element_count,
+        ..fingerprint
+    };
+    result.snapshot_id = snapshot_id;
+    if !content_sha256.is_empty() {
+        result.snapshot_sha256 = Some(content_sha256);
+    }
+    result
+}
+
 /// Multi-spec evaluation against a single snapshot. Builds [`IndexedSnapshot`]
 /// once — shared read-only across all specs — then fan-outs across `specs`
 /// via rayon. Load-bearing for the §5.14 batch endpoint.
@@ -161,6 +219,7 @@ fn evaluate_with_indexed(
     SpecCheckResult {
         result_schema_version: RESULT_SCHEMA_VERSION,
         snapshot_id: SENTINEL_SNAPSHOT_ID.to_string(),
+        snapshot_sha256: None,
         spec_content_hash,
         spec_version: spec.version.clone(),
         page_id: spec.id.clone(),
@@ -849,6 +908,133 @@ mod tests {
         assert_eq!(result.summary.match_outcome, MatchOutcome::NoMatch);
         assert_eq!(result.summary.overall_match_rate, 0.0);
         assert!(result.state_results.is_empty());
+    }
+
+    // ----- evaluate_with_identity -----
+
+    /// Build a caller-supplied fingerprint with a real `app_id` (not the
+    /// sentinel) for the identity tests.
+    fn caller_fingerprint(app_id: &str, element_count: u32) -> BridgeFingerprint {
+        BridgeFingerprint {
+            app_id: app_id.to_string(),
+            app_version: Some("2.1.0".to_string()),
+            route: Some("/operations".to_string()),
+            bridge_version: Some("react".to_string()),
+            snapshot_timestamp: "2026-05-23T11:03:11.087Z".to_string(),
+            element_count,
+        }
+    }
+
+    fn identity_fixture() -> (UIBridgeSnapshot, IrPageSpec) {
+        let s = snap(vec![elem(
+            "btn-save",
+            "#btn-save",
+            Some("button"),
+            Some("Save"),
+            true,
+        )]);
+        let a = assertion(
+            "a1",
+            "critical",
+            json!({ "role": "button", "text": "Save" }),
+            true,
+        );
+        let st = state("s1", "Loaded", Some(true), vec![a]);
+        let spec = page_spec("page-1", vec![st]);
+        (s, spec)
+    }
+
+    #[test]
+    fn evaluate_with_identity_writes_caller_fingerprint() {
+        let (s, spec) = identity_fixture();
+        let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
+        let result = evaluate_with_identity(
+            &s,
+            &spec,
+            fp,
+            "scs_018f-abc".to_string(),
+            String::new(),
+        );
+        // Caller's app_id flows through; NOT the sentinel.
+        assert_eq!(result.bridge_fingerprint.app_id, "qontinui-web");
+        assert_ne!(result.bridge_fingerprint.app_id, "internal-evaluator");
+        assert_eq!(
+            result.bridge_fingerprint.app_version.as_deref(),
+            Some("2.1.0")
+        );
+        assert_eq!(
+            result.bridge_fingerprint.route.as_deref(),
+            Some("/operations")
+        );
+        // element_count is preserved from the in-process index (== caller's).
+        assert_eq!(result.bridge_fingerprint.element_count, 1);
+    }
+
+    #[test]
+    fn evaluate_with_identity_writes_caller_snapshot_id() {
+        let (s, spec) = identity_fixture();
+        let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
+        let result = evaluate_with_identity(
+            &s,
+            &spec,
+            fp,
+            "scs_018f-abc".to_string(),
+            String::new(),
+        );
+        assert_eq!(result.snapshot_id, "scs_018f-abc");
+        assert_ne!(result.snapshot_id, "scs_internal_eval");
+    }
+
+    #[test]
+    fn evaluate_with_identity_populates_snapshot_sha256() {
+        let (s, spec) = identity_fixture();
+
+        // Non-empty hash => Some(hash).
+        let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
+        let result = evaluate_with_identity(
+            &s,
+            &spec,
+            fp,
+            "scs_x".to_string(),
+            "sha256-cafebabe".to_string(),
+        );
+        assert_eq!(result.snapshot_sha256.as_deref(), Some("sha256-cafebabe"));
+
+        // Empty hash => None (serialized as null via skip_serializing_if).
+        let fp2 = caller_fingerprint("qontinui-web", s.elements.len() as u32);
+        let result2 = evaluate_with_identity(
+            &s,
+            &spec,
+            fp2,
+            "scs_x".to_string(),
+            String::new(),
+        );
+        assert!(result2.snapshot_sha256.is_none());
+    }
+
+    #[test]
+    fn evaluate_with_identity_preserves_match_outcome() {
+        let (s, spec) = identity_fixture();
+        let plain = evaluate(&s, &spec);
+        let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
+        let identity = evaluate_with_identity(
+            &s,
+            &spec,
+            fp,
+            "scs_x".to_string(),
+            "sha256-abc".to_string(),
+        );
+        // The matching outcome must be identical regardless of entrypoint —
+        // only the identity fields differ.
+        assert_eq!(
+            identity.summary.match_outcome,
+            plain.summary.match_outcome
+        );
+        assert_eq!(
+            identity.summary.overall_match_rate,
+            plain.summary.overall_match_rate
+        );
+        assert_eq!(identity.state_results.len(), plain.state_results.len());
     }
 
     // ----- Severity routing -----

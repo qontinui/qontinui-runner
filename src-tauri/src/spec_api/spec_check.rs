@@ -598,7 +598,7 @@ pub async fn post_spec_check(
     };
 
     // Fetch snapshot (fresh or supplied).
-    let (snapshot, _fingerprint, snapshot_id, _content_hash) = match req.snapshot {
+    let (snapshot, fingerprint, snapshot_id, content_hash) = match req.snapshot {
         Some(raw) => {
             // Caller-supplied path: try-strict-then-adapt to accept both the
             // canonical UIBridgeSnapshot shape and the SDK control-mode shape
@@ -649,8 +649,16 @@ pub async fn post_spec_check(
     invoke_emit(&req.app_id, &snapshot_id, vec![req.page_id.clone()], "http");
     let started_ms = events::now_ms();
 
-    // Evaluate — pure crate call, no logic here.
-    let result = spec_check::evaluate(&snapshot, &ir);
+    // Evaluate — pure crate call, no logic here. Thread the real fingerprint
+    // + snapshot identity (minted by fetch_fresh_snapshot or synthesized on
+    // the supplied path) into the result instead of the in-process sentinels.
+    let result = spec_check::evaluate_with_identity(
+        &snapshot,
+        &ir,
+        fingerprint,
+        snapshot_id.clone(),
+        content_hash,
+    );
 
     info!(
         "spec_check page_id={} snapshot_id={} match_outcome={:?} match_rate={:.3}",
@@ -740,17 +748,32 @@ pub async fn post_spec_check_batch(
 
     // Resolve snapshot once. The batch handler Arc-shares the snapshot
     // itself and forwards `snapshot_id` as the response field/header.
-    let (snapshot, snapshot_id) = match req.snapshot.source.as_str() {
+    let (snapshot, fingerprint, content_hash, snapshot_id) = match req.snapshot.source.as_str() {
         "fresh" => match fetch_fresh_snapshot(&state).await {
-            Ok((s, _fp, id, _hash)) => (Arc::new(s), id),
+            Ok((s, fp, id, hash)) => (Arc::new(s), fp, hash, id),
             Err(err) => return snapshot_error_to_response(err),
         },
         "supplied" => match req.snapshot.blob {
             Some(raw) => match adapt_supplied_snapshot(raw) {
-                Ok(s) => (
-                    Arc::new(s),
-                    format!("scs_supplied_{}", uuid::Uuid::now_v7()),
-                ),
+                Ok(s) => {
+                    // Mirror the single supplied path: bind the synthesized
+                    // fingerprint to the requested app; no raw bytes hashed
+                    // on the supplied path (content hash stays empty).
+                    let fp = qontinui_types::spec_check::BridgeFingerprint {
+                        app_id: req.app_id.clone(),
+                        app_version: None,
+                        route: None,
+                        bridge_version: None,
+                        snapshot_timestamp: String::new(),
+                        element_count: s.elements.len() as u32,
+                    };
+                    (
+                        Arc::new(s),
+                        fp,
+                        String::new(),
+                        format!("scs_supplied_{}", uuid::Uuid::now_v7()),
+                    )
+                }
                 Err(detail) => {
                     return (
                         StatusCode::UNPROCESSABLE_ENTITY,
@@ -834,6 +857,8 @@ pub async fn post_spec_check_batch(
             req.app_id.clone(),
             snapshot,
             snapshot_id,
+            fingerprint,
+            content_hash,
             root,
             req.pages,
             req.shared_policy,
@@ -849,6 +874,8 @@ pub async fn post_spec_check_batch(
         let shared_policy = req.shared_policy.clone();
         let snapshot_id_owned = snapshot_id.clone();
         let app_id_owned = req.app_id.clone();
+        let fingerprint_owned = fingerprint.clone();
+        let content_hash_owned = content_hash.clone();
         set.spawn(async move {
             evaluate_one(
                 &app_id_owned,
@@ -856,6 +883,8 @@ pub async fn post_spec_check_batch(
                 &entry,
                 &snapshot,
                 &snapshot_id_owned,
+                &fingerprint_owned,
+                &content_hash_owned,
                 shared_policy.as_ref(),
             )
             .await
@@ -976,12 +1005,15 @@ impl BatchElementResult {
 
 /// Evaluate one batch entry. Identical to the single-shot handler except
 /// errors become per-element statuses, not HTTP responses (§5.14).
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_one(
     app_id: &str,
     root: &std::path::Path,
     entry: &BatchPageEntry,
     snapshot: &Arc<UIBridgeSnapshot>,
     snapshot_id: &str,
+    fingerprint: &qontinui_types::spec_check::BridgeFingerprint,
+    content_sha256: &str,
     shared_policy: Option<&SpecCheckPolicy>,
 ) -> BatchElementResult {
     if invalid_page_id(&entry.page_id) {
@@ -996,7 +1028,15 @@ async fn evaluate_one(
 
     // Pure crate call. `evaluate` is sync + rayon-internal; for v1 N ≤ 256
     // we run it inline on the spawned task (see Risks §"contention").
-    let result = spec_check::evaluate(snapshot, &ir);
+    // Thread the batch's shared fingerprint + snapshot identity through so
+    // the per-element result carries real telemetry, not the sentinel.
+    let result = spec_check::evaluate_with_identity(
+        snapshot,
+        &ir,
+        fingerprint.clone(),
+        snapshot_id.to_string(),
+        content_sha256.to_string(),
+    );
 
     // Per-entry override wins over the shared policy.
     let policy = entry.policy_override.as_ref().or(shared_policy);
@@ -1022,10 +1062,13 @@ async fn evaluate_one(
 ///
 /// Stream D: `app_id` is threaded through so per-page evaluation routes to
 /// the right specs root and `SpecCheckCompleted` emits on the right channel.
+#[allow(clippy::too_many_arguments)]
 async fn stream_batch_results(
     app_id: String,
     snapshot: Arc<UIBridgeSnapshot>,
     snapshot_id: String,
+    fingerprint: qontinui_types::spec_check::BridgeFingerprint,
+    content_hash: String,
     root: Arc<std::path::PathBuf>,
     pages: Vec<BatchPageEntry>,
     shared_policy: Option<SpecCheckPolicy>,
@@ -1063,6 +1106,8 @@ async fn stream_batch_results(
         let shared_policy = shared_policy.clone();
         let snap_id = snapshot_id_for_completion.clone();
         let app_id = app_id.clone();
+        let fingerprint = fingerprint.clone();
+        let content_hash = content_hash.clone();
         async move {
             let entry = match st.iter.next() {
                 Some(e) => e,
@@ -1098,6 +1143,8 @@ async fn stream_batch_results(
                 &entry,
                 &snapshot,
                 &snap_id,
+                &fingerprint,
+                &content_hash,
                 shared_policy.as_ref(),
             )
             .await;
@@ -1157,6 +1204,22 @@ mod tests {
             "elements": [],
             "components": []
         })
+    }
+
+    /// A real-ish fingerprint for `evaluate_one` test callsites, bound to a
+    /// fixed `app_id` so the adapted assertions can verify the caller value
+    /// flows through instead of the sentinel.
+    fn test_fingerprint(
+        snapshot: &UIBridgeSnapshot,
+    ) -> qontinui_types::spec_check::BridgeFingerprint {
+        qontinui_types::spec_check::BridgeFingerprint {
+            app_id: "test-app".to_string(),
+            app_version: None,
+            route: None,
+            bridge_version: None,
+            snapshot_timestamp: String::new(),
+            element_count: snapshot.elements.len() as u32,
+        }
     }
 
     #[test]
@@ -1250,7 +1313,18 @@ mod tests {
             page_id: "no-such-page".to_string(),
             policy_override: None,
         };
-        let r = evaluate_one(RUNNER_APP_ID, &root, &entry, &snapshot, "scs_test", None).await;
+        let fp = test_fingerprint(&snapshot);
+        let r = evaluate_one(
+            RUNNER_APP_ID,
+            &root,
+            &entry,
+            &snapshot,
+            "scs_test",
+            &fp,
+            "",
+            None,
+        )
+        .await;
         assert_eq!(r.status, "spec-not-found");
         assert!(r.result.is_none());
         assert_eq!(r.page_id, "no-such-page");
@@ -1266,7 +1340,18 @@ mod tests {
             page_id: "../escape".to_string(),
             policy_override: None,
         };
-        let r = evaluate_one(RUNNER_APP_ID, &root, &entry, &snapshot, "scs_test", None).await;
+        let fp = test_fingerprint(&snapshot);
+        let r = evaluate_one(
+            RUNNER_APP_ID,
+            &root,
+            &entry,
+            &snapshot,
+            "scs_test",
+            &fp,
+            "",
+            None,
+        )
+        .await;
         assert_eq!(r.status, "eval-error");
         assert_eq!(r.error.as_deref(), Some("invalid-page-id"));
     }
@@ -1323,11 +1408,28 @@ mod tests {
             page_id: "batch-page".to_string(),
             policy_override: None,
         };
-        let r = evaluate_one(RUNNER_APP_ID, root, &entry, &snapshot, "scs_test", None).await;
+        let fp = test_fingerprint(&snapshot);
+        let r = evaluate_one(
+            RUNNER_APP_ID,
+            root,
+            &entry,
+            &snapshot,
+            "scs_test",
+            &fp,
+            "",
+            None,
+        )
+        .await;
         assert_eq!(r.status, "ok");
         let result = r.result.expect("ok status carries a result");
         assert_eq!(result.page_id, "batch-page");
         assert_eq!(result.result_schema_version, 1);
+        // The caller-supplied fingerprint + snapshot identity flow through
+        // instead of the in-process sentinel.
+        assert_eq!(result.bridge_fingerprint.app_id, "test-app");
+        assert_eq!(result.snapshot_id, "scs_test");
+        // Empty content_sha256 ("") leaves snapshot_sha256 as None.
+        assert_eq!(result.snapshot_sha256, None);
     }
 
     #[tokio::test]
@@ -1390,12 +1492,15 @@ mod tests {
 
         let mut rx = events::subscribe(RUNNER_APP_ID);
         let marker = "scs_batch_emit_test_marker_xyz";
+        let fp = test_fingerprint(&snapshot);
         let r = evaluate_one(
             RUNNER_APP_ID,
             root,
             &entry,
             &snapshot,
             marker,
+            &fp,
+            "",
             Some(&policy),
         )
         .await;
@@ -1766,6 +1871,7 @@ mod tests {
         let mk = |outcome: MatchOutcome, rate: f32| SpecCheckResult {
             result_schema_version: 1,
             snapshot_id: String::new(),
+            snapshot_sha256: None,
             spec_content_hash: String::new(),
             spec_version: "1.0".into(),
             page_id: "p".into(),
