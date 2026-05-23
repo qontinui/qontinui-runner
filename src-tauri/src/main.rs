@@ -139,6 +139,7 @@ mod secure_storage;
 mod security;
 mod semantic_conventions;
 mod server_mode;
+mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
 mod settings;
 // `startup_panic` is a minimal, dep-free panic-hook installer called from
 // the very top of `main()` so early-init crashes (DB connect, Tauri builder,
@@ -556,7 +557,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Create session manager for interactive Claude CLI sessions
     let session_manager = Arc::new(claude_session::SessionManager::new());
 
-    // Create terminal manager for embedded PTY terminals
+    // Create terminal manager for embedded PTY terminals.
+    // Plan 2026-05-22-coord-native-session-coordination Phase 2 — the unified
+    // Session primitive's PTY/Claude-CLI transports reach this manager via
+    // `app.state::<Arc<TerminalManager>>()` inside `.setup(...)` so it stays
+    // shared with the legacy `terminal_*` Tauri commands until Phase 9
+    // collapses both paths.
     let terminal_manager = Arc::new(terminal::TerminalManager::new());
 
     // Create shared AppState for both Tauri and MCP API
@@ -1422,6 +1428,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::self_healing_settings::has_self_healing_api_key,
             commands::self_healing_settings::save_self_healing_api_key,
             commands::self_healing_settings::save_self_healing_settings,
+            // Plan 2026-05-22-coord-native-session-coordination Phase 2 —
+            // unified Session primitive commands (coexist with legacy
+            // `terminal_*` and `ai_session_*` until Phase 4 frontend cutover).
+            commands::session::session_close,
+            commands::session::session_describe,
+            commands::session::session_focus,
+            commands::session::session_list,
+            commands::session::session_start,
+            commands::session::session_steal,
             commands::setup_wizard::check_setup_completed,
             commands::setup_wizard::complete_setup,
             commands::setup_wizard::detect_project_framework_for_setup,
@@ -1708,6 +1723,86 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         e
                     );
                 }
+            }
+
+            // Plan 2026-05-22-coord-native-session-coordination Phase 2 —
+            // unified Session primitive. Materialize the registry here
+            // because the PTY / Claude-CLI transports need an `AppHandle`
+            // (only available inside .setup). The registry is .manage()'d
+            // so `commands::session::*` can pull it via `tauri::State`.
+            //
+            // The terminal manager is fetched via `app.state::<>()` so we
+            // don't need a `move` closure on `.setup()` (other captures in
+            // the existing setup body rely on non-`move` semantics; see
+            // the comment block above this closure).
+            {
+                let app_handle = app.handle().clone();
+                let term_state: tauri::State<'_, std::sync::Arc<terminal::TerminalManager>> =
+                    app.state();
+                let term_for_session = term_state.inner().clone();
+                let outbox_path = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".qontinui")
+                    .join("runner")
+                    .join("session-outbox.jsonl");
+                let outbox = match session::local_store::OutboxWriter::open(&outbox_path) {
+                    Ok(o) => std::sync::Arc::new(o),
+                    Err(e) => {
+                        // Fall back to a tempdir outbox so the registry
+                        // still works in dev / first-launch scenarios
+                        // where ~/.qontinui isn't writable.
+                        tracing::warn!(
+                            error = %e,
+                            path = %outbox_path.display(),
+                            "session: outbox open failed — using ephemeral fallback"
+                        );
+                        let fallback = std::env::temp_dir()
+                            .join("qontinui-runner-session-outbox.jsonl");
+                        std::sync::Arc::new(
+                            session::local_store::OutboxWriter::open(&fallback)
+                                .expect("session: ephemeral outbox open failed"),
+                        )
+                    }
+                };
+                let coord_sync_facade = session::coord_sync::CoordSync::new(outbox);
+                let pty_transport: session::DynTransport =
+                    std::sync::Arc::new(session::transport::pty::PtyTransport::new(
+                        term_for_session.clone(),
+                        app_handle.clone(),
+                    ));
+                let claude_cli_transport: session::DynTransport = std::sync::Arc::new(
+                    session::transport::claude_cli::ClaudeCliTransport::new(
+                        term_for_session.clone(),
+                        app_handle.clone(),
+                    ),
+                );
+                let workflow_transport: session::DynTransport = std::sync::Arc::new(
+                    session::transport::workflow::WorkflowTransport::new(),
+                );
+                let machine_id = dirs::home_dir()
+                    .and_then(|h| std::fs::read(h.join(".qontinui").join("machine.json")).ok())
+                    .and_then(|b| {
+                        let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
+                        let s = v
+                            .get("device_id")
+                            .and_then(|x| x.as_str())
+                            .or_else(|| v.get("machine_id").and_then(|x| x.as_str()))?;
+                        uuid::Uuid::parse_str(s).ok()
+                    })
+                    .unwrap_or_else(uuid::Uuid::new_v4);
+                let registry = session::SessionRegistry::new(
+                    machine_id,
+                    session::SessionTransports {
+                        pty: pty_transport,
+                        claude_cli: claude_cli_transport,
+                        workflow: workflow_transport,
+                    },
+                    coord_sync_facade,
+                );
+                // Phase 3 will start the drain task here.
+                registry.coord_sync().start_drain_task();
+                app.manage(registry);
+
             }
 
             // Phase F.1 — register the deep-link `on_open_url` callback so
