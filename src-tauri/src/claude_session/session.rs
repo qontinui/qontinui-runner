@@ -243,14 +243,12 @@ impl ClaudeSession {
             federation_ctx,
             qontinui_runner_lib::observable_bridge::global().cloned(),
         ) {
-            let pull_result = Self::block_on_async(async {
-                bridge.pull(&mut ctx).await
-            });
+            let pull_result = Self::block_on_async(async { bridge.pull(&mut ctx).await });
             match pull_result {
                 Ok(()) => {
-                    if let Err(e) = Self::block_on_async(async {
-                        bridge.start_watcher(ctx.clone()).await
-                    }) {
+                    if let Err(e) =
+                        Self::block_on_async(async { bridge.start_watcher(ctx.clone()).await })
+                    {
                         warn!(
                             "memory federation: start_watcher failed for session {} ({}); \
                              continuing without watcher — reconcile will still run",
@@ -282,9 +280,7 @@ impl ClaudeSession {
                     federation_ctx.as_ref(),
                     qontinui_runner_lib::observable_bridge::global().cloned(),
                 ) {
-                    Self::block_on_async(async {
-                        bridge.stop_watcher(ctx.session_id).await
-                    });
+                    Self::block_on_async(async { bridge.stop_watcher(ctx.session_id).await });
                 }
                 return Err(format!("Failed to spawn Claude CLI: {}", e));
             }
@@ -960,11 +956,7 @@ impl ClaudeSession {
                     bridge.stop_watcher(ctx.session_id).await;
                     bridge.reconcile(ctx).await
                 });
-                super::federation::emit_federation_report(
-                    &app_handle_for_waiter,
-                    ctx,
-                    report,
-                );
+                super::federation::emit_federation_report(&app_handle_for_waiter, ctx, report);
             }
 
             // Check if the exit was due to rate-limiting

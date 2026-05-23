@@ -181,7 +181,10 @@ fn snapshot_dir(dir: &Path) -> Result<DirSnapshot> {
         let content = match std::fs::read(&path) {
             Ok(c) => c,
             Err(e) => {
-                warn!("observable_bridge::memory: read {} failed: {e}", path.display());
+                warn!(
+                    "observable_bridge::memory: read {} failed: {e}",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -341,10 +344,7 @@ impl RunnerObservableBridge for MemoryBridge {
     async fn pull(&self, session_ctx: &mut SessionContext) -> Result<()> {
         if !session_ctx.memory_dir.exists() {
             std::fs::create_dir_all(&session_ctx.memory_dir).with_context(|| {
-                format!(
-                    "create memory_dir: {}",
-                    session_ctx.memory_dir.display()
-                )
+                format!("create memory_dir: {}", session_ctx.memory_dir.display())
             })?;
         }
 
@@ -459,11 +459,7 @@ impl RunnerObservableBridge for MemoryBridge {
         Ok(())
     }
 
-    async fn push(
-        &self,
-        change: ObservableChange,
-        session_ctx: &SessionContext,
-    ) -> Result<()> {
+    async fn push(&self, change: ObservableChange, session_ctx: &SessionContext) -> Result<()> {
         let token = match self.device_token() {
             Some(t) if !t.is_empty() => t,
             _ => {
@@ -538,8 +534,7 @@ impl RunnerObservableBridge for MemoryBridge {
         };
 
         let mut report = ReconcileReport::default();
-        let pre_names: HashSet<&str> =
-            post_pull.files.iter().map(|f| f.name.as_str()).collect();
+        let pre_names: HashSet<&str> = post_pull.files.iter().map(|f| f.name.as_str()).collect();
         let post_names: HashSet<&str> =
             post_session.files.iter().map(|f| f.name.as_str()).collect();
 

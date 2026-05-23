@@ -51,6 +51,7 @@ import { ToastContainer } from "./components/ToastContainer";
 import { BuildRefreshBanner } from "./components/BuildRefreshBanner";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
+import { MemoryFederationBanner } from "./components/MemoryFederationBanner";
 import { WebIntegrationAuthBanner } from "./components/WebIntegrationAuthBanner";
 import { ApprovalDialog } from "./components/dag-workflow-editor";
 import StatusIndicator from "./components/StatusIndicator";
@@ -676,6 +677,7 @@ function AppContent() {
           */}
           <ConflictModal />
           <StolenBanner />
+          <MemoryFederationBanner />
         </div>
       </RenderLogWrapper>
     </ProfilerWrapper>

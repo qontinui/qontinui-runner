@@ -119,11 +119,7 @@ pub trait RunnerObservableBridge: Send + Sync {
     async fn pull(&self, session_ctx: &mut SessionContext) -> Result<()>;
 
     /// During-session: invoked on a debounced local change event.
-    async fn push(
-        &self,
-        change: ObservableChange,
-        session_ctx: &SessionContext,
-    ) -> Result<()>;
+    async fn push(&self, change: ObservableChange, session_ctx: &SessionContext) -> Result<()>;
 
     /// Session-end: re-snapshot, diff against `post_pull_snapshot`,
     /// push anything the watcher missed, return aggregate counts.

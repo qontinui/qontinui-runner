@@ -28,8 +28,8 @@ use tauri::Emitter;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use qontinui_runner_lib::observable_bridge::{ReconcileReport, SessionContext};
 use crate::settings::ClaudeCliSettings;
+use qontinui_runner_lib::observable_bridge::{ReconcileReport, SessionContext};
 
 /// Tauri event channel for reconcile-result broadcasts. The React
 /// frontend listens here to render the "Memory federation: N pushed,
@@ -301,8 +301,14 @@ mod tests {
 
     #[test]
     fn encodes_drive_letter_path() {
-        assert_eq!(encode_workspace_path("D:\\qontinui-root"), "D--qontinui-root");
-        assert_eq!(encode_workspace_path("D:/qontinui-root"), "D--qontinui-root");
+        assert_eq!(
+            encode_workspace_path("D:\\qontinui-root"),
+            "D--qontinui-root"
+        );
+        assert_eq!(
+            encode_workspace_path("D:/qontinui-root"),
+            "D--qontinui-root"
+        );
     }
 
     #[test]
