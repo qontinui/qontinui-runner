@@ -1228,46 +1228,29 @@ pub(super) fn parse_findings_from_response(text: &str) -> Vec<ParsedFinding> {
 }
 
 /// Store parsed findings in the database for a given task run (PG).
+///
+/// Routes through the canonical writer `PgDb::insert_parsed_finding`, which
+/// handles signature-hash dedup and INSERTs the canonical column shape that
+/// `GET /findings/task/{id}` reads back. The canonical `task_run_findings`
+/// schema uses `detected_in_session` / `detected_at` (NOT `session_num` /
+/// `created_at`) and has no `is_resolved` / `evidence` / `ai_model` columns
+/// — the resolved state is encoded via the `status` column ('resolved' vs
+/// 'detected'), which `insert_parsed_finding` derives from
+/// `ParsedFinding::is_resolved` internally. See
+/// `database/pg/findings.rs::insert_parsed_finding` for the column mapping;
+/// do NOT add a second divergent writer.
 pub(super) async fn store_parsed_findings(
     pg_db: &std::sync::Arc<PgDb>,
     task_run_id: &str,
     findings: &[ParsedFinding],
 ) {
     for (idx, parsed) in findings.iter().enumerate() {
-        let session_num = (idx + 1) as i32;
-        let id = uuid::Uuid::new_v4().to_string();
-        let signature = format!(
-            "{}:{}:{}:{}",
-            task_run_id,
-            session_num,
-            parsed.category.as_str(),
-            parsed.title
-        );
-        use sha2::{Digest, Sha256};
-        let signature_hash = format!("{:x}", Sha256::digest(signature.as_bytes()));
-
+        let session_num = (idx + 1) as u32;
         match pg_db
-            .insert_finding_pg(
-                &id,
-                task_run_id,
-                session_num,
-                &parsed.title,
-                &parsed.description,
-                parsed.category.as_str(),
-                parsed.severity.as_str(),
-                &signature_hash,
-                if parsed.is_resolved {
-                    "resolved"
-                } else {
-                    "detected"
-                },
-                parsed.is_resolved,
-                None, // evidence not available in ParsedFinding
-                None,
-            )
+            .insert_parsed_finding(task_run_id, session_num, parsed)
             .await
         {
-            Ok(()) => {
+            Ok(_) => {
                 info!(
                     "Response mode: stored finding [{}:{}] '{}'",
                     parsed.category.as_str(),

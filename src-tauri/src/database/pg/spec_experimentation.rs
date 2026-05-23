@@ -1431,58 +1431,6 @@ impl PgDb {
     }
 
     // ========================================================================
-    // Finding insertion (for claude_session, phase_helpers, test_executor)
-    // ========================================================================
-
-    /// Insert a finding into task_run_findings (PG equivalent of finding_storage::insert_finding).
-    pub async fn insert_finding_pg(
-        &self,
-        id: &str,
-        task_run_id: &str,
-        session_num: i32,
-        title: &str,
-        description: &str,
-        category: &str,
-        severity: &str,
-        signature_hash: &str,
-        status: &str,
-        is_resolved: bool,
-        evidence: Option<&str>,
-        ai_model: Option<&str>,
-    ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
-        let now = chrono::Utc::now().to_rfc3339();
-
-        conn.execute(
-            r#"INSERT INTO task_run_findings (
-                id, task_run_id, session_num, title, description,
-                category, severity, signature_hash, status,
-                is_resolved, evidence, ai_model, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            ON CONFLICT (id) DO NOTHING"#,
-            &[
-                &id,
-                &task_run_id,
-                &session_num,
-                &title,
-                &description,
-                &category,
-                &severity,
-                &signature_hash,
-                &status,
-                &is_resolved,
-                &evidence as &(dyn tokio_postgres::types::ToSql + Sync),
-                &ai_model as &(dyn tokio_postgres::types::ToSql + Sync),
-                &now,
-            ],
-        )
-        .await
-        .map_err(|e| format!("Failed to insert finding: {e}"))?;
-
-        Ok(())
-    }
-
-    // ========================================================================
     // Causal events (PG equivalents for reflection/causal.rs)
     // ========================================================================
 
