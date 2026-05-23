@@ -43,6 +43,26 @@ pub const EVENT_CLAIM_CONFLICT: &str = "agent-claim-conflict";
 /// Tauri event subject the webview's StolenBanner subscribes to.
 pub const EVENT_CLAIM_STOLEN: &str = "agent-claim-stolen";
 
+/// Metadata about the *other* session holding (or stealing) the
+/// contested claim. Plan reference: Phase 6 of
+/// `2026-05-22-coord-native-session-coordination.md` — payload-shape
+/// enrichment so the dashboard and runner toast can render the full
+/// holder context without an extra round-trip.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
 /// Payload shape emitted on `agent-claim-stolen`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +71,15 @@ pub struct StolenEventPayload {
     pub resource_key: String,
     pub current_holder: Option<String>,
     pub agent_id: String,
+    /// Phase 6: typed reason provided by the stealer (passed through
+    /// from `POST /sessions/:id/steal`). `None` for legacy steals or
+    /// non-session claims.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Phase 6: stealer-side session context, populated when the
+    /// steal originated from a coord-native session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_metadata: Option<SessionMetadata>,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, ClaimHeartbeatHandle>>> = OnceLock::new();
@@ -161,6 +190,22 @@ fn emit_stolen_event(
     resource_key: &str,
     current_holder: Option<String>,
 ) {
+    emit_stolen_event_with_context(agent_id, kind, resource_key, current_holder, None, None);
+}
+
+/// Phase 6 extension of [`emit_stolen_event`] that carries the stealer's
+/// typed reason + session_metadata downstream. The heartbeat path uses
+/// the simpler overload — those steals originate from coord's TTL-eviction
+/// of the local heartbeat, which carries no reason. Session-initiated
+/// steals (`POST /sessions/:id/steal {reason}`) should route through here.
+pub fn emit_stolen_event_with_context(
+    agent_id: &str,
+    kind: &str,
+    resource_key: &str,
+    current_holder: Option<String>,
+    reason: Option<String>,
+    session_metadata: Option<SessionMetadata>,
+) {
     // Drop from the registry so a subsequent /claims/acquire for the
     // same agent doesn't race against the now-stale handle.
     if let Ok(mut reg) = registry().lock() {
@@ -172,6 +217,8 @@ fn emit_stolen_event(
         resource_key: resource_key.to_string(),
         current_holder,
         agent_id: agent_id.to_string(),
+        reason,
+        session_metadata,
     };
     match crate::tauri_app_handle::current() {
         Some(app) => {
@@ -193,11 +240,31 @@ fn emit_stolen_event(
 /// from the webview — the HTTP `/agents/allocate-local` path returns
 /// the conflict as a structured 409 body, and the IPC translator
 /// surfaces it as an event here.
+///
+/// Backward-compatible thin wrapper around
+/// [`emit_conflict_event_with_context`]; callers that have
+/// `reason` / `session_metadata` (Phase 6 spawn path through
+/// `POST /sessions`) should call the `_with_context` variant directly.
 pub fn emit_conflict_event(
     kind: &str,
     resource_key: &str,
     current_holder: &str,
     intent: Option<&str>,
+) {
+    emit_conflict_event_with_context(kind, resource_key, current_holder, intent, None, None);
+}
+
+/// Phase 6: emit `agent-claim-conflict` with the enriched payload
+/// (reason + session_metadata). The frontend toast renders the new
+/// fields when present and falls back to the legacy display when
+/// they're omitted.
+pub fn emit_conflict_event_with_context(
+    kind: &str,
+    resource_key: &str,
+    current_holder: &str,
+    intent: Option<&str>,
+    reason: Option<String>,
+    session_metadata: Option<SessionMetadata>,
 ) {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -207,12 +274,18 @@ pub fn emit_conflict_event(
         current_holder: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         intent: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_metadata: Option<SessionMetadata>,
     }
     let payload = ConflictPayload {
         kind,
         resource_key,
         current_holder,
         intent,
+        reason,
+        session_metadata,
     };
     match crate::tauri_app_handle::current() {
         Some(app) => {
