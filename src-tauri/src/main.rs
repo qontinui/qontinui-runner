@@ -1437,6 +1437,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::session::session_list,
             commands::session::session_start,
             commands::session::session_steal,
+            // Plan 2026-05-23-coord-native-sessions-phase-7-10 §Phase 7 —
+            // "Continue elsewhere" cross-machine handoff trigger.
+            commands::session::session_handoff,
             // Plan 2026-05-22-coord-native-session-coordination §D12 / Phase 4 —
             // active tenant resolver for the frontend TenantContext.
             commands::tenant::get_active_tenant,
@@ -1815,6 +1818,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // shutdown.
                 let _drain = registry.coord_sync().start_drain_task();
                 let _heartbeat = registry.coord_sync().start_heartbeat_task();
+                // Plan §Phase 7 — start the cross-machine handoff receiver.
+                // Polls coord for handoffs addressed to this device and
+                // materializes each as a child session (parent_session_id
+                // = source). JoinHandle dropped — lives for the process.
+                let _handoff_rx = session::handoff::start_receiver_task(registry.clone());
                 app.manage(registry);
 
             }

@@ -174,6 +174,33 @@ pub fn session_steal(
     })
 }
 
+/// Plan §Phase 7 — "Continue elsewhere". Publish a handoff request that
+/// moves `session_id` to `target_device_id`. The target runner's
+/// receiver loop materializes the child session and closes this one.
+///
+/// This is the runner-initiated trigger; the dashboard's "Continue
+/// elsewhere" button reaches the same coord endpoint through the web
+/// backend proxy. Async because it POSTs to coord.
+#[tauri::command]
+pub async fn session_handoff(
+    registry: tauri::State<'_, Arc<SessionRegistry>>,
+    session_id: Uuid,
+    target_device_id: Uuid,
+) -> Result<CommandResponse, String> {
+    let (http, coord_url) = {
+        let cs = registry.inner().coord_sync();
+        (cs.http_client(), cs.coord_url().to_string())
+    };
+    crate::session::handoff::trigger_handoff(&http, &coord_url, session_id, target_device_id)
+        .await
+        .map_err(|e| format!("session:handoff_failed: {e}"))?;
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
 /// Tauri plugin bundle. main.rs adds one `.plugin(commands::session::plugin())`
 /// to wire all five commands.
 pub fn plugin() -> TauriPlugin<tauri::Wry> {
@@ -185,6 +212,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             session_describe,
             session_list,
             session_steal,
+            session_handoff,
         ])
         .build()
 }
