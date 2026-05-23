@@ -14,7 +14,7 @@
 import React, { useMemo, useState, useCallback, useRef, useEffect } from "react";
 import type { TerminalTab } from "./useTerminalManager";
 import { instanceStorage } from "@/lib/instance-storage";
-import { useTerminalCore, useSessionState, useZoneMetadata, useUIStateCx } from "./contexts";
+import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
 import {
   LayoutGrid,
   ChevronLeft,
@@ -700,13 +700,14 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
   onCreateTerminal,
 }: ZoneControlPanelProps) {
   // Read from contexts
-  const { tabs, zoneLayout, createTerminal, pageId } = useTerminalCore();
+  const session = useTerminalSession();
+  const { tabs, zoneLayout, createTerminal, pageId } = session;
   const assignments = zoneLayout.assignments;
   const focusedZone = zoneLayout.focusedZone;
   const zoneCount = zoneLayout.layout.zones.length;
   const onFocusZone = zoneLayout.setFocusedZone;
   const layoutId = zoneLayout.layoutId;
-  const { sessionStates, lastOutputLines } = useSessionState();
+  const { sessionStates, lastOutputLines } = session;
   const { labelsAndTags } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;
   const zoneNotes = labelsAndTags.zoneNotes;

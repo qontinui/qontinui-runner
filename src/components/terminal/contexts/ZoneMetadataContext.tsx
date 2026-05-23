@@ -2,11 +2,12 @@
  * ZoneMetadataContext
  *
  * Owns zone labels, tags, pins, event history, focus history, and metrics.
- * Reads from TerminalCoreContext for layout and zone assignment data.
+ * Reads from TerminalSessionContext for layout and zone assignment data
+ * (the collapsed-into-one context per Phase 4 plan).
  */
 
 import { createContext, useMemo, type ReactNode } from "react";
-import { useTerminalCore } from "./useTerminalCore";
+import { useTerminalSession } from "./TerminalSessionContext";
 import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
 import { useEventHistory } from "../useEventHistory";
 import { useFocusHistory } from "../useFocusHistory";
@@ -31,7 +32,7 @@ interface ZoneMetadataProviderProps {
 }
 
 export function ZoneMetadataProvider({ children }: ZoneMetadataProviderProps) {
-  const { pageId, zoneLayout } = useTerminalCore();
+  const { pageId, zoneLayout } = useTerminalSession();
 
   const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments, pageId);
 

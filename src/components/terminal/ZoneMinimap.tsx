@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { X } from "lucide-react";
 import type { SessionState } from "./useZoneLayout";
-import { useTerminalCore, useSessionState, useZoneMetadata } from "./contexts";
+import { useTerminalSession, useZoneMetadata } from "./contexts";
 
 const STATE_COLORS: Record<SessionState, string> = {
   idle: "#565f89",
@@ -23,12 +23,13 @@ function parseGridValue(value: string, _totalTracks: number): [number, number] {
 }
 
 export function ZoneMinimap() {
-  const { zoneLayout } = useTerminalCore();
+  const session = useTerminalSession();
+  const zoneLayout = session.zoneLayout;
   const layout = zoneLayout.layout;
   const assignments = zoneLayout.assignments;
   const focusedZone = zoneLayout.focusedZone;
   const onFocusZone = zoneLayout.setFocusedZone;
-  const { sessionStates } = useSessionState();
+  const sessionStates = session.sessionStates;
   const { labelsAndTags } = useZoneMetadata();
   const zoneTags = labelsAndTags.zoneTags;
   const labelColorMap = labelsAndTags.labelColorMap;

@@ -11,6 +11,8 @@ import {
 import { RenderLogWrapper, UIBridgeHooks } from "./lib/ui-bridge";
 import { AuthProvider, useAuth } from "./components/AuthProvider";
 import { TutorialProvider } from "./contexts/TutorialContext";
+import { TenantProvider } from "./contexts/TenantContext";
+import { SessionProvider } from "./contexts/SessionContext";
 import { ContextualTutorial } from "./components/tutorial";
 import { DemoVisualOverlay } from "./components/demo-video/DemoVisualOverlay";
 import { getGraphQLClient } from "./lib/graphql-client";
@@ -929,19 +931,31 @@ export default function App() {
           contentDiscovery={{ enabled: true, maxContentElements: 200 }}
         >
           <AuthProvider>
-            <NavigationProvider>
-              <EventManagerProvider>
-                <ExecutionProvider
-                  onLog={(_level, _message) => {
-                    // Logs are handled by LogManager through event handlers
-                  }}
-                >
-                  <AutoContinueProvider>
-                    <AppWithTutorials />
-                  </AutoContinueProvider>
-                </ExecutionProvider>
-              </EventManagerProvider>
-            </NavigationProvider>
+            {/*
+              Plan 2026-05-22-coord-native-session-coordination §D12 + §Phase 4.
+              TenantProvider wraps SessionProvider per plan: the active tenant
+              is the default stamp for new sessions started via SessionContext.
+              Sits inside AuthProvider so the tenant resolver can react to
+              future auth state (paired_user.json reads happen at the Rust
+              layer; placement here is for symmetry with NavigationProvider).
+            */}
+            <TenantProvider>
+              <SessionProvider>
+                <NavigationProvider>
+                  <EventManagerProvider>
+                    <ExecutionProvider
+                      onLog={(_level, _message) => {
+                        // Logs are handled by LogManager through event handlers
+                      }}
+                    >
+                      <AutoContinueProvider>
+                        <AppWithTutorials />
+                      </AutoContinueProvider>
+                    </ExecutionProvider>
+                  </EventManagerProvider>
+                </NavigationProvider>
+              </SessionProvider>
+            </TenantProvider>
           </AuthProvider>
         </AutoRegisterProvider>
       </UIBridgeProvider>

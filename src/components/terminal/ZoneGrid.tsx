@@ -25,11 +25,9 @@ import {
   countMatches,
 } from "./zone-grid";
 import {
-  useTerminalCore,
-  useSessionState,
+  useTerminalSession,
   useZoneMetadata,
   useTransitionEffects,
-  useAiFeatures,
   useUIStateCx,
 } from "./contexts";
 
@@ -124,6 +122,7 @@ export function ZoneGrid({
   onUserInputLine,
 }: ZoneGridProps) {
   // Read all data from contexts
+  const session = useTerminalSession();
   const {
     tabs,
     zoneLayout,
@@ -131,7 +130,7 @@ export function ZoneGrid({
     pageId,
     markReconnected,
     renameTab,
-  } = useTerminalCore();
+  } = session;
   // terminalRefsRef holds a stable Map<tabId, ref> — it's a per-tab ref cache
   // that's written by TerminalInstance's ref callbacks, not state that drives
   // rendering. The Map identity is stable for the component's lifetime, so
@@ -144,7 +143,7 @@ export function ZoneGrid({
   const focusedZone = zoneLayout.focusedZone;
   const maximizedZone = zoneLayout.maximizedZone;
   const onAssignTab = zoneLayout.assignTabToZone;
-  const stateTracking = useSessionState();
+  const stateTracking = session;
   const sessionStates = stateTracking.sessionStates;
   const lastOutputLines = stateTracking.lastOutputLines;
   const stateDurations = stateTracking.stateDurations;
@@ -206,7 +205,7 @@ export function ZoneGrid({
   const onRestartInZone = transitionEffects.handleRestartInZone;
   const pendingRestarts = transitionEffects.pendingRestarts;
   const onCancelRestart = transitionEffects.cancelPendingRestart;
-  const { shellIntegration } = useAiFeatures();
+  const { shellIntegration } = session;
   const onFirstInput = shellIntegration.handleFirstInput;
   const onShellIntegration = shellIntegration.handleShellIntegration;
   const commandHistories = shellIntegration.commandHistories;

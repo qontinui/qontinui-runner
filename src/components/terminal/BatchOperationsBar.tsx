@@ -2,8 +2,7 @@ import { useState, useCallback, useMemo } from "react";
 import { CheckCheck, X, Send, AlertTriangle, MousePointerClick, HelpCircle } from "lucide-react";
 import type { SessionState } from "./useZoneLayout";
 import {
-  useTerminalCore,
-  useSessionState,
+  useTerminalSession,
   useZoneMetadata,
   useTransitionEffects,
   useUIStateCx,
@@ -22,9 +21,10 @@ function expandTemplate(
 
 export function BatchOperationsBar() {
   // Read from contexts
-  const { tabs, zoneLayout, terminalRefs } = useTerminalCore();
+  const session = useTerminalSession();
+  const { tabs, zoneLayout, terminalRefs } = session;
   const assignments = zoneLayout.assignments;
-  const { sessionStates } = useSessionState();
+  const { sessionStates } = session;
   const { labelsAndTags, incrementMetric, addHistoryEvent } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;
   const transitionEffects = useTransitionEffects();

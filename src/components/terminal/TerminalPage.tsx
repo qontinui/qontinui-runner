@@ -12,18 +12,12 @@ import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
 import { useTerminalPageId } from "./TerminalPageContext";
 import {
-  TerminalCoreProvider,
-  useTerminalCore,
-  SessionStateProvider,
-  useSessionState,
+  TerminalSessionProvider,
+  useTerminalSession,
   ZoneMetadataProvider,
   useZoneMetadata,
   TransitionEffectsProvider,
   useTransitionEffects,
-  AiFeaturesProvider,
-  useAiFeatures,
-  ShellInfraProvider,
-  useShellInfra,
   UIStateProvider,
   useUIStateCx,
 } from "./contexts";
@@ -60,24 +54,19 @@ interface TerminalPageProps {
 export function TerminalPage(props: TerminalPageProps) {
   const pageId = useTerminalPageId();
   return (
-    <TerminalCoreProvider pageId={pageId}>
-      <SessionStateProvider>
-        <ZoneMetadataProvider>
-          <TransitionEffectsProvider>
-            <UIStateProvider>
-              <ShellInfraProvider>
-                <AiFeaturesProvider
-                  onNavigateToBuilder={props.onNavigateToBuilder}
-                  onNavigateToActive={props.onNavigateToActive}
-                >
-                  <TerminalPageInner {...props} />
-                </AiFeaturesProvider>
-              </ShellInfraProvider>
-            </UIStateProvider>
-          </TransitionEffectsProvider>
-        </ZoneMetadataProvider>
-      </SessionStateProvider>
-    </TerminalCoreProvider>
+    <TerminalSessionProvider
+      pageId={pageId}
+      onNavigateToBuilder={props.onNavigateToBuilder}
+      onNavigateToActive={props.onNavigateToActive}
+    >
+      <ZoneMetadataProvider>
+        <TransitionEffectsProvider>
+          <UIStateProvider>
+            <TerminalPageInner {...props} />
+          </UIStateProvider>
+        </TransitionEffectsProvider>
+      </ZoneMetadataProvider>
+    </TerminalSessionProvider>
   );
 }
 
@@ -86,6 +75,9 @@ function TerminalPageInner({
   onNavigateToActive: _onNavigateToActive,
   onSessionCountChange,
 }: TerminalPageProps) {
+  // Phase 4 — single context replaces the prior 4-way split. Field set
+  // is identical (the new context spreads the same returns).
+  const session = useTerminalSession();
   const {
     tabs,
     activeId,
@@ -102,7 +94,7 @@ function TerminalPageInner({
     zoneLayout,
     terminalRefs,
     pendingProfileSessionsRef,
-  } = useTerminalCore();
+  } = session;
 
   // Register page-level UI Bridge actions so AI agents can discover
   // and invoke terminal operations without knowing element IDs.
@@ -148,7 +140,7 @@ function TerminalPageInner({
     pendingYieldRequests,
     pendingLongWaitSignals,
     sessionPersistence,
-  } = useShellInfra();
+  } = session;
 
   // Re-key per-tab fileLockStates (keyed by tab.id) onto session ids so
   // SessionCard can render a "blocked on …" subtitle. session.sessionId
@@ -279,7 +271,11 @@ function TerminalPageInner({
     focusHistory,
   } = useZoneMetadata();
 
-  const stateTracking = useSessionState();
+  // The collapsed context spreads the session-state fields, so the
+  // entire context value doubles as the stateTracking reference for
+  // downstream call shapes that take it whole (useZoneActions,
+  // useKeyboardShortcuts).
+  const stateTracking = session;
 
   // Publish a snapshot of the current tabs + per-tab session state to the
   // module-level `terminal-sessions-registry`. The UI Bridge IPC handlers
@@ -315,7 +311,7 @@ function TerminalPageInner({
   const transitionEffects = useTransitionEffects();
   const { handleRestartInZone } = transitionEffects;
 
-  const { workflowGen, sessionManager } = useAiFeatures();
+  const { workflowGen, sessionManager } = session;
 
   const {
     state: uiState,

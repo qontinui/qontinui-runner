@@ -3,9 +3,10 @@ import { TerminalAnalysisPanel } from "./TerminalAnalysisPanel";
 import { TerminalFindingsPanel } from "./TerminalFindingsPanel";
 import { FileOwnershipHeatmap } from "./FileOwnershipHeatmap";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
-import { useAiFeatures, useSessionState } from "./contexts";
+import { useTerminalSession } from "./contexts";
 
 export function TerminalRightPanel() {
+  const session = useTerminalSession();
   const {
     workflowGen,
     analysis,
@@ -15,8 +16,9 @@ export function TerminalRightPanel() {
     sessionSummary,
     sessionSummaryLoading,
     handleSummarizeSession,
-  } = useAiFeatures();
-  const { activeFindings, allFindings } = useSessionState();
+    activeFindings,
+    allFindings,
+  } = session;
 
   const rightPanelMode = workflowGen.rightPanelMode;
 

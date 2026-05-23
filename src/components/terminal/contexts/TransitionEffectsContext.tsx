@@ -7,8 +7,7 @@
  */
 
 import { createContext, useCallback, useEffect, useMemo, useRef, type ReactNode } from "react";
-import { useTerminalCore } from "./useTerminalCore";
-import { useSessionState } from "./useSessionState";
+import { useTerminalSession } from "./TerminalSessionContext";
 import { useZoneMetadata } from "./useZoneMetadata";
 import { useStateTransitionEffects } from "../useStateTransitionEffects";
 import { useWindowTitle } from "../useWindowTitle";
@@ -27,8 +26,12 @@ interface TransitionEffectsProviderProps {
 }
 
 export function TransitionEffectsProvider({ children }: TransitionEffectsProviderProps) {
-  const { tabs, createTerminal, zoneLayout, terminalRefs } = useTerminalCore();
-  const stateTracking = useSessionState();
+  // Phase 4 — single upstream provider replaces the prior
+  // TerminalCore + SessionState pair. `stateTracking` shape is
+  // preserved via spread in `useTerminalSession()`'s value-object.
+  const session = useTerminalSession();
+  const { tabs, createTerminal, zoneLayout, terminalRefs } = session;
+  const stateTracking = session;
   const { labelsAndTags, addHistoryEvent } = useZoneMetadata();
 
   const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
