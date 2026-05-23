@@ -104,7 +104,8 @@ pub struct FindingCodeContext {
 /// Renamed in the schema registry to `RunnerFindingUserInput` to
 /// disambiguate from `qontinui_types::findings::FindingUserInput`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(title = "RunnerFindingUserInput")]
+#[serde(rename_all = "camelCase")]
+#[schemars(rename_all = "camelCase", title = "RunnerFindingUserInput")]
 pub struct FindingUserInput {
     pub question: String,
     #[serde(default = "default_input_type")]

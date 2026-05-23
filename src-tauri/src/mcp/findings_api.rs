@@ -5,7 +5,7 @@
 //! underlying logic as the Tauri commands in `commands/findings.rs`.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -44,6 +44,128 @@ pub struct UserResponseRequest {
 pub struct FindingMutationResponse {
     pub finding_id: String,
     pub status: String,
+}
+
+/// Query string for `GET /findings`.
+#[derive(Debug, Deserialize, Default)]
+pub struct ListFindingsQuery {
+    /// Optional status filter (e.g. "needs_input", "detected").
+    pub status: Option<String>,
+    /// Optional category filter (e.g. "code_bug", "test_failure").
+    pub category: Option<String>,
+    /// Page size (clamped to 1..=200; defaults to 50).
+    pub limit: Option<i64>,
+    /// 1-based page index (defaults to 1).
+    pub page: Option<i64>,
+}
+
+/// Envelope for paginated finding listings.
+#[derive(Debug, Serialize)]
+pub struct ListFindingsResponse {
+    pub items: Vec<Finding>,
+    pub page: i64,
+    pub limit: i64,
+    pub count: usize,
+}
+
+/// GET /findings/:finding_id
+///
+/// Returns a single finding by id, or 404 if not found.
+pub async fn get_finding_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(finding_id): Path<String>,
+) -> Result<Json<ApiResponse<Finding>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.pg_db.get_finding(&finding_id).await {
+        Ok(Some(finding)) => Ok(Json(ApiResponse::success(finding))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Finding not found: {}", finding_id))),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get finding: {}", e))),
+        )),
+    }
+}
+
+/// GET /findings
+///
+/// Paginated cross-task-run listing. Supports `status`, `category`, `limit`,
+/// `page` query parameters. Results are ordered by `detected_at` DESC.
+pub async fn list_findings_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<ListFindingsQuery>,
+) -> Result<Json<ApiResponse<ListFindingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let page = q.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
+
+    match state
+        .app_state
+        .pg_db
+        .list_findings(q.status.as_deref(), q.category.as_deref(), limit, offset)
+        .await
+    {
+        Ok(items) => {
+            let count = items.len();
+            Ok(Json(ApiResponse::success(ListFindingsResponse {
+                items,
+                page,
+                limit,
+                count,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to list findings: {}", e))),
+        )),
+    }
+}
+
+/// GET /findings/by-status/:status
+///
+/// Shortcut for `GET /findings?status=<status>` with default pagination.
+pub async fn findings_by_status_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(status): Path<String>,
+    Query(q): Query<ListFindingsQuery>,
+) -> Result<Json<ApiResponse<ListFindingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Validate the status value up front so callers get a 400 rather than an
+    // empty list when they typo the variant.
+    if FindingStatus::from_str(&status).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("Invalid status: {}", status))),
+        ));
+    }
+
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let page = q.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
+
+    match state
+        .app_state
+        .pg_db
+        .list_findings(Some(&status), q.category.as_deref(), limit, offset)
+        .await
+    {
+        Ok(items) => {
+            let count = items.len();
+            Ok(Json(ApiResponse::success(ListFindingsResponse {
+                items,
+                page,
+                limit,
+                count,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to list findings by status: {}",
+                e
+            ))),
+        )),
+    }
 }
 
 /// GET /findings/task/:task_run_id
@@ -169,6 +291,23 @@ pub async fn user_response_handler(
             )
         })?;
 
+    // Transition status `needs_input` -> `in_progress` so downstream consumers
+    // (and the mutation response below) reflect what the docstring promises.
+    state
+        .app_state
+        .pg_db
+        .update_finding_status(&finding_id, "in_progress", None, None)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to transition finding to in_progress: {}",
+                    e
+                ))),
+            )
+        })?;
+
     info!("HTTP: Set user response for finding {}", finding_id);
 
     Ok(Json(ApiResponse::success(FindingMutationResponse {
@@ -242,10 +381,23 @@ pub async fn clear_all_findings_handler(
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post, put};
     axum::Router::new()
+        .route("/findings", get(list_findings_handler))
+        .route(
+            "/findings/by-status/{status}",
+            get(findings_by_status_handler),
+        )
         .route(
             "/findings/task/{task_run_id}",
             get(get_task_findings_handler),
         )
+        .route(
+            "/findings/task/{task_run_id}/clear-all",
+            post(clear_all_findings_handler),
+        )
+        // Capture routes go last so the literal `/findings/task/...` and
+        // `/findings/by-status/...` patterns above take priority in axum 0.8's
+        // matchit router.
+        .route("/findings/{finding_id}", get(get_finding_handler))
         .route(
             "/findings/{finding_id}/status",
             put(update_finding_status_handler),
@@ -257,9 +409,5 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/findings/{finding_id}/user-response",
             post(user_response_handler),
-        )
-        .route(
-            "/findings/task/{task_run_id}/clear-all",
-            post(clear_all_findings_handler),
         )
 }
