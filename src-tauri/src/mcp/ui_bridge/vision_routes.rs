@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use super::screenshots::lookup_element_normalized_rect;
 use super::vision_ai::{self, OcrClient, VlmClient};
+use super::vision_frame_source::resolve_frame_provider;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
@@ -171,6 +172,12 @@ pub struct CaptureRequest {
     /// `{ captures: { name: CaptureResponse } }`.
     #[serde(default)]
     pub captures: Option<Vec<NamedCapture>>,
+    /// Optional frame source. `None` (default) captures the runner's own
+    /// desktop window (legacy behavior). A device/app id sources the frame
+    /// from that target instead — see [`super::vision_frame_source`].
+    /// Participates in the cache key via the request's `Debug` formatting.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -200,6 +207,9 @@ impl From<&NamedCapture> for CaptureRequest {
             redact: n.redact.clone(),
             force: None,
             captures: None,
+            // Parent `target` is threaded through `do_multi_capture` separately,
+            // not via NamedCapture (which carries no per-capture target).
+            target: None,
         }
     }
 }
@@ -258,6 +268,9 @@ impl From<CaptureSpec> for CaptureRequest {
             redact: s.redact,
             force: None,
             captures: None,
+            // `CaptureSpec` carries no target; callers (diff, baseline) set it
+            // explicitly on the produced `CaptureRequest` when needed.
+            target: None,
         }
     }
 }
@@ -272,6 +285,10 @@ pub struct DiffRequest {
     /// the other modes — clustering / side-by-side composition is Phase 3.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Optional frame source for *both* baseline and comparison captures.
+    /// `None` (default) = runner desktop. See [`super::vision_frame_source`].
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -305,6 +322,10 @@ pub struct ExtractRequest {
     /// Bypass the read-side cache.
     #[serde(default)]
     pub force: Option<bool>,
+    /// Optional frame source. `None` (default) = runner desktop. See
+    /// [`super::vision_frame_source`]. Participates in the cache key.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -339,6 +360,10 @@ pub struct DescribeRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub force: Option<bool>,
+    /// Optional frame source. `None` (default) = runner desktop. See
+    /// [`super::vision_frame_source`]. Participates in the cache key.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -367,6 +392,10 @@ pub struct RawRequest {
     pub element: Option<String>,
     /// Audit reason — required when the gate env is on.
     pub reason: Option<String>,
+    /// Optional frame source. `None` (default) = runner desktop. See
+    /// [`super::vision_frame_source`]. Participates in the cache key.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -468,7 +497,7 @@ fn capture_runner_window_rgba(
 /// then-thrashes" pattern documented in `proj_supervisor_build_pool.md` —
 /// the bounded permit pool (size 2) prevents thrash under multi-agent load.
 /// Permit is held for the entire `spawn_blocking` span and released on drop.
-async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result<Frame, String> {
+pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result<Frame, String> {
     use tauri::Manager;
 
     let window = state
@@ -710,7 +739,7 @@ async fn vision_capture_handler(
     let mut req = body.map(|b| b.0).unwrap_or_default();
     if let Some(captures) = req.captures.take() {
         let force = req.force.unwrap_or(false);
-        let captures_map = do_multi_capture(&state, captures, force).await?;
+        let captures_map = do_multi_capture(&state, captures, force, &req.target).await?;
         return Ok(Json(ApiResponse::success(VisionCaptureResp::Multi {
             captures: captures_map,
         })));
@@ -811,7 +840,11 @@ async fn do_capture(
         }
     }
 
-    let frame = capture_runner_window_frame(state)
+    let provider = resolve_frame_provider(state, &req.target)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let frame = provider
+        .frame(state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
@@ -892,6 +925,7 @@ async fn do_multi_capture(
     state: &Arc<ApiState>,
     captures: Vec<NamedCapture>,
     force: bool,
+    target: &Option<String>,
 ) -> Result<std::collections::HashMap<String, CaptureResponse>, (StatusCode, Json<ApiResponse<()>>)>
 {
     use std::collections::HashMap;
@@ -926,7 +960,11 @@ async fn do_multi_capture(
     let mut results: HashMap<String, CaptureResponse> = HashMap::new();
     let mut misses: Vec<Pending> = Vec::new();
     for cap in &captures {
-        let req = CaptureRequest::from(cap);
+        let mut req = CaptureRequest::from(cap);
+        // Propagate the parent request's frame source onto each derived
+        // capture so its cache key namespaces by target (NamedCapture has no
+        // per-capture target of its own).
+        req.target = target.clone();
         let contract = resolve_contract(req.contract.as_deref())
             .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
         let format = pick_format(&contract).expect("contract has at least one format");
@@ -982,7 +1020,11 @@ async fn do_multi_capture(
 
     // Capture frame once (one xcap, one permit) and run each missed pipeline
     // against a clone of the same Frame.
-    let frame = capture_runner_window_frame(state)
+    let provider = resolve_frame_provider(state, target)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let frame = provider
+        .frame(state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
     let frame_w = frame.width;
@@ -1086,8 +1128,13 @@ async fn vision_diff_handler(
         ));
     }
 
-    let baseline_req: CaptureRequest = req.baseline.into();
-    let comparison_req: CaptureRequest = req.comparison.into();
+    let mut baseline_req: CaptureRequest = req.baseline.into();
+    let mut comparison_req: CaptureRequest = req.comparison.into();
+    // A single top-level `target` drives both captures. Threading it onto each
+    // derived request makes `produce_intermediate_frame` source from the target
+    // and namespaces the diff cache key (which Debug-formats both reqs).
+    baseline_req.target = req.target.clone();
+    comparison_req.target = req.target.clone();
 
     // We need both raw RGBA buffers to compute a meaningful diff before encoding.
     // Run each spec's crop + alpha-flatten + resize but skip the encoder, then
@@ -1206,7 +1253,11 @@ async fn produce_intermediate_frame(
     let contract = resolve_contract(req.contract.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
 
-    let frame = capture_runner_window_frame(state)
+    let provider = resolve_frame_provider(state, &req.target)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let frame = provider
+        .frame(state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
@@ -1370,6 +1421,7 @@ async fn vision_raw_handler(
         region: None,
         element: None,
         reason: None,
+        target: None,
     });
     let reason = req.reason.clone().unwrap_or_default();
     if !matches!(reason.as_str(), "vga_grounding" | "regression_baseline") {
@@ -1388,7 +1440,11 @@ async fn vision_raw_handler(
         "vision/raw invoked (Phase 2: tracing audit; PG audit table is Phase 3)"
     );
 
-    let frame = capture_runner_window_frame(&state)
+    let provider = resolve_frame_provider(&state, &req.target)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let frame = provider
+        .frame(&state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
@@ -1490,7 +1546,7 @@ async fn vision_extract_handler(
     }
 
     // Miss → capture + encode + call OCR.
-    let png_bytes = capture_and_encode_png(&state, &req.region, &req.element)
+    let png_bytes = capture_and_encode_png(&state, &req.region, &req.element, &req.target)
         .await
         .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
     let (blocks, aggregate_text) = client
@@ -1575,7 +1631,7 @@ async fn vision_describe_handler(
         }
     }
 
-    let png_bytes = capture_and_encode_png(&state, &req.region, &req.element)
+    let png_bytes = capture_and_encode_png(&state, &req.region, &req.element, &req.target)
         .await
         .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
     let vlm = client
@@ -1618,8 +1674,13 @@ async fn capture_and_encode_png(
     state: &Arc<ApiState>,
     region_req: &Option<RegionRequest>,
     element_id: &Option<String>,
+    target: &Option<String>,
 ) -> Result<Vec<u8>, (StatusCode, String)> {
-    let frame = capture_runner_window_frame(state)
+    let provider = resolve_frame_provider(state, target)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let frame = provider
+        .frame(state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let crop =
@@ -1790,6 +1851,11 @@ pub struct AnalyzeRequest {
     pub region: Option<RegionRequest>,
     #[serde(default)]
     pub element: Option<String>,
+    /// Optional vision target. `None` analyzes the runner's own desktop
+    /// window; a device/app id sources the frame from that target instead —
+    /// see [`super::vision_frame_source`].
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1819,6 +1885,11 @@ pub struct AssertRequest {
     /// snapshot text fall back to these.
     #[serde(default)]
     pub ocr_blocks: Option<Vec<vision_ai::OcrBlock>>,
+    /// Optional vision target. `None` asserts against the runner's own
+    /// desktop window; a device/app id sources the frame from that target
+    /// instead — see [`super::vision_frame_source`].
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1839,6 +1910,11 @@ pub struct BaselineRequest {
     /// the full window with the PNG-strict contract.
     #[serde(default)]
     pub capture: Option<CaptureSpec>,
+    /// Optional vision target. `None` baselines the runner's own desktop
+    /// window; a device/app id sources the frame from that target instead —
+    /// see [`super::vision_frame_source`].
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1864,7 +1940,14 @@ async fn vision_analyze_handler(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<AnalyzeRequest>,
 ) -> Result<Json<ApiResponse<AnalyzeResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let frame = capture_runner_window_frame(&state)
+    // `target` selects the frame source: None = runner desktop (today's
+    // behavior); a device/app id sources from that target. visual-audit relies
+    // on this to analyze a paired device rather than the runner window.
+    let provider = resolve_frame_provider(&state, &req.target)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let frame = provider
+        .frame(&state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
     let width = frame.width;
@@ -1899,7 +1982,14 @@ async fn vision_assert_handler(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<AssertRequest>,
 ) -> Result<Json<ApiResponse<AssertResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let frame = capture_runner_window_frame(&state)
+    // `target` selects the frame source: None = runner desktop (today's
+    // behavior); a device/app id sources from that target. visual-audit relies
+    // on this to assert against a paired device rather than the runner window.
+    let provider = resolve_frame_provider(&state, &req.target)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let frame = provider
+        .frame(&state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
@@ -1970,7 +2060,14 @@ async fn vision_baseline_handler(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<BaselineRequest>,
 ) -> Result<Json<ApiResponse<BaselineCreateResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let frame = capture_runner_window_frame(&state)
+    // `target` selects the frame source: None = runner desktop (today's
+    // behavior); a device/app id sources from that target so a baseline can be
+    // captured from a paired device rather than the runner window.
+    let provider = resolve_frame_provider(&state, &req.target)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let frame = provider
+        .frame(&state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
