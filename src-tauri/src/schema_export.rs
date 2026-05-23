@@ -35,11 +35,12 @@ pub fn export_all_schemas() -> Value {
     use qontinui_types::{
         accessibility as qa, ai_workflows as qaw, app_events as qae, apps as qap, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn, geometry as qg,
-        ir as qir, mcp_config as qmc, orchestration_config as qoc, process_management as qpm,
-        rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae, spec_check as qsc,
-        state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
-        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
-        worker_output as qwo, workflow as qw, workflow_step as qws,
+        ir as qir, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
+        process_management as qpm, rag as qr, runner as qrn, scheduler as qs,
+        spec_api_events as qsae, spec_check as qsc, state_machine as qsm, targets as qt,
+        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
+        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
+        workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -676,6 +677,17 @@ pub fn export_all_schemas() -> Value {
     // ── qontinui-types: spec_api_events (Plan 06 broadcast taxonomy) ──
     add!("SpecApiEvent", qsae::SpecApiEvent);
 
+    // ── qontinui-types: memory (coord-mediated memory federation —
+    // plan 2026-05-22-memories-on-coord-cross-machine.md Phase 6) ──
+    add!("MemoryUpsertRequest", qmem::MemoryUpsertRequest);
+    add!("MemoryUpsertResponse", qmem::MemoryUpsertResponse);
+    add!("MemoryRestoreRequest", qmem::MemoryRestoreRequest);
+    add!("MemoryListQuery", qmem::MemoryListQuery);
+    add!("MemoryRow", qmem::MemoryRow);
+    add!("MemorySummary", qmem::MemorySummary);
+    add!("MemoryWithHistory", qmem::MemoryWithHistory);
+    add!("MemoryListResponse", qmem::MemoryListResponse);
+
     // ── qontinui-types: apps (multi-tenant Spec API registry — Stream A) ──
     add!("App", qap::App);
     add!("RegisterAppRequest", qap::RegisterAppRequest);
@@ -766,7 +778,7 @@ mod tests {
             obj.contains_key("SpecApiEvent"),
             "Missing SpecApiEvent schema (Plan 06)"
         );
-        assert_eq!(obj.len(), 483, "Expected 483 schema entries");
+        assert_eq!(obj.len(), 491, "Expected 491 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

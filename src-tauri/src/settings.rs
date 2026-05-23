@@ -262,6 +262,15 @@ pub struct AiSettings {
     /// regex extractor is always on regardless of this flag.
     #[serde(default = "default_ai_path_prediction_enabled")]
     pub ai_path_prediction_enabled: bool,
+    /// Federate Claude memory writes through coord. When true (default),
+    /// each spawned Claude session pulls the tenant memory pool before
+    /// spawn, runs a file watcher during the session that pushes
+    /// changes to coord, and reconciles on session end. When false,
+    /// each session is local-only (the per-account memory dir is
+    /// untouched by the runner). UI surface for this is deferred —
+    /// flip via direct settings edit.
+    #[serde(default = "default_memory_federation_enabled")]
+    pub memory_federation_enabled: bool,
 }
 
 fn default_interactive_sessions_enabled() -> bool {
@@ -269,6 +278,10 @@ fn default_interactive_sessions_enabled() -> bool {
 }
 
 fn default_ai_path_prediction_enabled() -> bool {
+    true
+}
+
+fn default_memory_federation_enabled() -> bool {
     true
 }
 
@@ -292,6 +305,7 @@ impl Default for AiSettings {
             routing: RoutingConfig::default(),
             interactive_sessions_enabled: default_interactive_sessions_enabled(),
             ai_path_prediction_enabled: default_ai_path_prediction_enabled(),
+            memory_federation_enabled: default_memory_federation_enabled(),
         }
     }
 }
