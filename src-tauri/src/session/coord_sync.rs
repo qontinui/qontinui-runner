@@ -75,8 +75,9 @@ use serde_json::{json, Value as JsonValue};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use super::dual_write::DualWriteGate;
 use super::local_store::{OutboxRecord, OutboxWriter};
-use super::{SessionEventKind, SessionRegistry, SessionState};
+use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
 
 // ---------------------------------------------------------------------------
 // Env tunables
@@ -164,6 +165,12 @@ struct CoordSyncInner {
     /// itself owns the `CoordSync`, so a strong handle here would
     /// cycle.
     registry: Mutex<Option<Weak<SessionRegistry>>>,
+    /// Phase 10 cutover gate (plan
+    /// `2026-05-23-coord-native-sessions-phase-7-10.md` §Phase 10).
+    /// Caches the per-tenant `session_coordination_enabled` flag;
+    /// default dormant. The poll task ([`CoordSync::start_flag_poll_task`])
+    /// refreshes it from coord's `/tenant-policy` endpoint.
+    dual_write: DualWriteGate,
 }
 
 impl std::fmt::Debug for CoordSync {
@@ -214,6 +221,7 @@ impl CoordSync {
                 has_been_online: AtomicBool::new(false),
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
+                dual_write: DualWriteGate::new(),
             }),
         }
     }
@@ -243,6 +251,7 @@ impl CoordSync {
                 has_been_online: AtomicBool::new(false),
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
+                dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
             }),
         }
     }
@@ -314,6 +323,98 @@ impl CoordSync {
     pub fn start_heartbeat_task(&self) -> JoinHandle<()> {
         let inner = Arc::clone(&self.inner);
         tokio::spawn(run_heartbeat_loop(inner))
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 10 — flag-gated dual-write (plan
+    // `2026-05-23-coord-native-sessions-phase-7-10.md` §Phase 10).
+    //
+    // DORMANT by default. The gate is closed unless the runner's tenant
+    // has flipped `coord.tenant_policies.session_coordination_enabled`.
+    // With the flag off there is ZERO production behavior change: the
+    // poll task refreshes a `false` atom and `mirror_legacy_session` is
+    // a no-op. See `super::dual_write` for the full safety argument.
+    // -----------------------------------------------------------------
+
+    /// Hot-path read of the cutover gate. `true` only when the resolved
+    /// tenant has flipped the flag. Default `false` (dormant).
+    pub fn dual_write_enabled(&self) -> bool {
+        self.inner.dual_write.enabled()
+    }
+
+    /// Test-only: force the cutover gate to a given value, simulating
+    /// what the poll loop does when a tenant flips the flag.
+    #[cfg(test)]
+    pub fn force_dual_write_for_test(&self, value: bool) {
+        self.inner.dual_write.apply(value);
+    }
+
+    /// Start the Phase 10 flag-refresh task. Polls coord's
+    /// `/tenant-policy?tenant_id=<id>` on a slow cadence and caches the
+    /// `session_coordination_enabled` flag into the [`DualWriteGate`].
+    ///
+    /// Short-circuits to a permanent no-op when no `active_tenant_id`
+    /// resolved from `machine.json` (single-tenant operators, MSI today)
+    /// — the gate then never opens regardless of any tenant's flag.
+    /// Returns `None` in that case so `main.rs` doesn't hold a dead
+    /// handle.
+    pub fn start_flag_poll_task(&self) -> Option<JoinHandle<()>> {
+        let tenant_id = self.inner.dual_write.tenant_id()?;
+        let inner = Arc::clone(&self.inner);
+        Some(tokio::spawn(run_flag_poll_loop(inner, tenant_id)))
+    }
+
+    /// Phase 10 dual-write entry point — called by the **legacy** session
+    /// surface (`commands/terminal.rs`, `claude_session/`) right after it
+    /// spawns its PTY / CLI subprocess. When the cutover flag is OFF
+    /// (default), returns `None` immediately without touching the
+    /// registry, the outbox, or coord — the legacy path behaves exactly
+    /// as it does today.
+    ///
+    /// When the flag is ON, mirrors the legacy session into the
+    /// coord-native primitive via [`SessionRegistry::register_external`]
+    /// so the dashboard renders the same session from `coord.sessions`.
+    /// `register_external` does NOT spawn a transport — the operator's
+    /// real PTY / CLI subprocess is owned by the legacy path, so the
+    /// mirror is pure bookkeeping (no double-spawn, no second window).
+    ///
+    /// The returned [`Uuid`] is the coord-native session id, which the
+    /// legacy caller should retain so it can close the mirror when the
+    /// legacy session ends (via `registry.close_by_id(id)`, surfaced in a
+    /// later wiring step). Errors are logged and swallowed — a mirror
+    /// failure must never break the legacy session the operator actually
+    /// wants.
+    ///
+    /// `registry` is passed in (rather than read from the weak back-
+    /// pointer) so the legacy caller, which already holds the managed
+    /// `Arc<SessionRegistry>` via `tauri::State`, drives the mirror
+    /// without this facade needing a strong upgrade.
+    pub fn mirror_legacy_session(
+        &self,
+        registry: &Arc<SessionRegistry>,
+        intent: Intent,
+    ) -> Option<Uuid> {
+        if !self.dual_write_enabled() {
+            // Dormant — the overwhelming common case. No allocation, no
+            // I/O, no behavior change.
+            return None;
+        }
+        match registry.register_external(intent) {
+            Ok(id) => {
+                tracing::info!(
+                    session = %id,
+                    "dual_write: mirrored legacy session into coord-native primitive"
+                );
+                Some(id)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "dual_write: mirror session register failed — legacy session unaffected"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -760,6 +861,68 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 10 — flag-refresh loop
+// ---------------------------------------------------------------------------
+
+/// Poll coord's `/tenant-policy?tenant_id=<id>` and cache the
+/// `session_coordination_enabled` flag into the [`DualWriteGate`].
+///
+/// Only spawned when a tenant resolved (see
+/// [`CoordSync::start_flag_poll_task`]). Robust to coord being down: a
+/// fetch failure leaves the cached value untouched (so a transient outage
+/// never spuriously flips the gate) and the loop simply tries again next
+/// tick. The flag is a rollout knob that changes rarely, so the default
+/// 60s cadence is plenty.
+async fn run_flag_poll_loop(inner: Arc<CoordSyncInner>, tenant_id: Uuid) {
+    let interval = inner.dual_write.poll_interval();
+    tracing::info!(
+        %tenant_id,
+        ?interval,
+        "coord_sync: Phase 10 cutover-flag poll loop starting (dormant until flag flips)"
+    );
+    loop {
+        match fetch_session_coordination_flag(&inner, tenant_id).await {
+            Ok(enabled) => inner.dual_write.apply(enabled),
+            Err(e) => {
+                // Leave the cached value as-is — a coord hiccup must not
+                // flip the gate in either direction.
+                tracing::debug!(
+                    %tenant_id,
+                    error = %e,
+                    "coord_sync: tenant-policy fetch failed; keeping cached cutover flag"
+                );
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// GET `/tenant-policy?tenant_id=<id>` and pull out
+/// `session_coordination_enabled`. Returns the bool on success; any
+/// transport / non-2xx / shape error is an `Err` the caller treats as
+/// "keep the cached value".
+async fn fetch_session_coordination_flag(
+    inner: &Arc<CoordSyncInner>,
+    tenant_id: Uuid,
+) -> Result<bool, String> {
+    let base = inner.coord_url.trim_end_matches('/');
+    let url = format!("{base}/tenant-policy?tenant_id={tenant_id}");
+    let resp = inner
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("transport: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("status {}", resp.status()));
+    }
+    let body: JsonValue = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    body.get("session_coordination_enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "missing session_coordination_enabled field".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -934,6 +1097,63 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[test]
+    fn dual_write_dormant_by_default() {
+        // The test CoordSync ctor pins the gate to no-tenant → permanently
+        // dormant. mirror_legacy_session must be a no-op: returns None and
+        // writes NOTHING to the outbox.
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let registry = build_registry(coord.clone());
+
+        assert!(!coord.dual_write_enabled(), "gate defaults closed");
+        let mirror = coord.mirror_legacy_session(&registry, make_test_intent());
+        assert!(mirror.is_none(), "dormant gate mirrors nothing");
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "no outbox row written when dual-write is off — zero behavior change"
+        );
+        // And no session landed in the registry either.
+        assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn dual_write_mirrors_when_flag_on() {
+        // Force the gate open via the DualWriteGate's apply path (the
+        // poll loop's effect) and assert mirror_legacy_session registers
+        // an external session + writes a Started outbox row.
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let registry = build_registry(coord.clone());
+
+        // Open the gate as the poll loop would on a flipped tenant.
+        coord.force_dual_write_for_test(true);
+        assert!(coord.dual_write_enabled());
+
+        let mirror = coord.mirror_legacy_session(&registry, make_test_intent());
+        let id = mirror.expect("flag on → mirror created");
+        let desc = registry.describe_by_id(id).unwrap();
+        assert_eq!(desc.transport_handle_kind, "external");
+        // A Started row is queued for the drain loop.
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_kind, SessionEventKind::Started);
     }
 
     #[tokio::test]
