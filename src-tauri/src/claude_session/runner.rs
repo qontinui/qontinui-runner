@@ -425,14 +425,11 @@ fn run_claude_session_inline(
         // pull + start_watcher must run in async context. Inline runner
         // is invoked from a sync worker thread that itself runs inside
         // Tauri's tokio runtime — match the `demo_workflows.rs` idiom.
-        let pull_result = run_async_inline(async {
-            bridge.pull(&mut ctx).await
-        });
+        let pull_result = run_async_inline(async { bridge.pull(&mut ctx).await });
         match pull_result {
             Ok(()) => {
-                let watcher_result = run_async_inline(async {
-                    bridge.start_watcher(ctx.clone()).await
-                });
+                let watcher_result =
+                    run_async_inline(async { bridge.start_watcher(ctx.clone()).await });
                 if let Err(e) = watcher_result {
                     warn!(
                         "memory federation: start_watcher failed for session {} ({}); \
@@ -464,9 +461,7 @@ fn run_claude_session_inline(
                 federation_ctx_opt.as_ref(),
                 qontinui_runner_lib::observable_bridge::global().cloned(),
             ) {
-                run_async_inline(async {
-                    bridge.stop_watcher(ctx.session_id).await
-                });
+                run_async_inline(async { bridge.stop_watcher(ctx.session_id).await });
             }
             return Err(format!("Failed to spawn Claude CLI: {}", e));
         }
