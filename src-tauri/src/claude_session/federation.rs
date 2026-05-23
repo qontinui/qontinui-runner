@@ -286,7 +286,7 @@ fn derive_account_name(config_dir: &str) -> String {
     // Linux CI runners. Split on both separators ourselves to get the
     // last segment regardless of host OS.
     let basename = config_dir
-        .rsplit(|c| c == '/' || c == '\\')
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(config_dir);
     let stripped = basename
