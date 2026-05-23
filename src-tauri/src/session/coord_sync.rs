@@ -597,11 +597,7 @@ fn steal_body(rec: &OutboxRecord) -> JsonValue {
     })
 }
 
-async fn handle_conflict(
-    inner: &Arc<CoordSyncInner>,
-    rec: &OutboxRecord,
-    row: Option<JsonValue>,
-) {
+async fn handle_conflict(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord, row: Option<JsonValue>) {
     tracing::warn!(
         session = %rec.session_id,
         "coord_sync: POST /sessions returned 409 — conflict on acquire"
@@ -731,12 +727,11 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
                 "id": id,
                 "at": now,
             });
-            if let Err(e) = inner.outbox.record(
-                machine_id,
-                *id,
-                SessionEventKind::Heartbeat,
-                payload,
-            ) {
+            if let Err(e) =
+                inner
+                    .outbox
+                    .record(machine_id, *id, SessionEventKind::Heartbeat, payload)
+            {
                 tracing::warn!(
                     session = %id,
                     error = %e,
@@ -1133,7 +1128,8 @@ mod tests {
 
         wait_until(Duration::from_secs(5), || {
             let r = rec.try_lock();
-            r.map(|g| g.deletes.iter().any(|d| *d == id)).unwrap_or(false)
+            r.map(|g| g.deletes.iter().any(|d| *d == id))
+                .unwrap_or(false)
         })
         .await;
 
