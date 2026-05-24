@@ -61,6 +61,7 @@ pub mod dual_write;
 pub mod handoff;
 pub mod intent;
 pub mod local_store;
+pub mod output_pipe;
 pub mod transport;
 
 use std::collections::HashMap;
@@ -235,6 +236,11 @@ struct SessionRecord {
     parent_session_id: Option<Uuid>,
     transport: DynTransport,
     transport_handle: TransportHandle,
+    /// Phase 8 (plan §D10) — the opt-in output-streaming pipe task, present
+    /// only when `intent.share_output` was true at start. Held so it lives
+    /// for the session's lifetime; aborted on close. `None` for the
+    /// default (non-shared) session — zero overhead off the opt-in path.
+    output_pipe: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SessionRecord {
@@ -336,6 +342,33 @@ impl SessionRegistry {
         let id = uuid_v7();
         let now = chrono::Utc::now();
 
+        // Phase 8 (plan §D10/§D11) — opt-in PTY output streaming. Only when
+        // the session declared `share_output`: tap the transport's output
+        // broadcast and spawn the publish pipe. Off by default → no tap, no
+        // task, zero overhead. coord resolves the session's tenant
+        // server-side, so the pipe only needs the session id + coord
+        // client (held by `coord_sync`).
+        let output_pipe = if intent.share_output {
+            match transport.tap_output(&transport_handle) {
+                Some(rx) => Some(output_pipe::spawn(
+                    self.coord_sync.clone(),
+                    id,
+                    rx,
+                    intent.effective_redact_secrets(),
+                )),
+                None => {
+                    tracing::debug!(
+                        session = %id,
+                        kind = intent.kind.as_str(),
+                        "session: share_output set but transport exposes no output tap — skipping pipe"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let record = SessionRecord {
             id,
             kind: intent.kind,
@@ -347,6 +380,7 @@ impl SessionRegistry {
             parent_session_id,
             transport: transport.clone(),
             transport_handle,
+            output_pipe,
         };
 
         // Outbox row first (durability before in-memory commit so a crash
@@ -428,6 +462,11 @@ impl SessionRegistry {
             parent_session_id: None,
             transport,
             transport_handle: TransportHandle::External,
+            // Externally-owned mirror — the real PTY belongs to the legacy
+            // path, so no output pipe (the legacy path doesn't share output
+            // through this primitive). Phase 8 streaming only attaches to
+            // sessions started via `start`/`start_with_parent`.
+            output_pipe: None,
         };
 
         let payload = json!({
@@ -485,6 +524,14 @@ impl SessionRegistry {
             }
             rec.state = SessionState::Closed;
             rec.closed_at = Some(chrono::Utc::now());
+            // Phase 8 — stop the output pipe (if any). Aborting drops the
+            // broadcast receiver; the pipe also exits on its own when the
+            // terminal's sender drops (transport.close below), but the
+            // explicit abort is immediate + idempotent. The pipe does a
+            // best-effort final flush on Closed via its own RecvError path.
+            if let Some(pipe) = rec.output_pipe.take() {
+                pipe.abort();
+            }
             let payload = json!({
                 "id": id,
                 "state": SessionState::Closed.as_str(),
@@ -806,6 +853,105 @@ mod tests {
             share_output: false,
             redact_secrets: None,
         }
+    }
+
+    /// Phase 8 — a transport that exposes a real output broadcast so the
+    /// `share_output` path can spawn its pipe. `start` returns a Pty handle;
+    /// `tap_output` hands back a fresh receiver on the held sender.
+    struct TappingTransport {
+        tx: tokio::sync::broadcast::Sender<String>,
+    }
+
+    impl TappingTransport {
+        fn new() -> Self {
+            let (tx, _) = tokio::sync::broadcast::channel(16);
+            Self { tx }
+        }
+    }
+
+    impl Transport for TappingTransport {
+        fn start(&self, _intent: &Intent) -> Result<TransportHandle, TransportError> {
+            Ok(TransportHandle::Pty {
+                terminal_id: "tap-1".to_string(),
+            })
+        }
+        fn write_input(&self, _h: &TransportHandle, _b: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn resize(&self, _h: &TransportHandle, _c: u16, _r: u16) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn close(&self, _h: &TransportHandle) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn tap_output(
+            &self,
+            _h: &TransportHandle,
+        ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+            Some(self.tx.subscribe())
+        }
+    }
+
+    fn make_tapping_registry() -> (Arc<SessionRegistry>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox =
+            Arc::new(local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let coord_sync = coord_sync::CoordSync::new(outbox);
+        let pty = Arc::new(TappingTransport::new()) as DynTransport;
+        let claude_cli = Arc::new(FakeTransport::new(SessionKind::TerminalClaude)) as DynTransport;
+        let workflow = Arc::new(FakeTransport::new(SessionKind::Workflow)) as DynTransport;
+        let registry = SessionRegistry::new(
+            Uuid::new_v4(),
+            SessionTransports {
+                pty,
+                claude_cli,
+                workflow,
+            },
+            coord_sync,
+        );
+        (registry, dir)
+    }
+
+    #[tokio::test]
+    async fn share_output_spawns_pipe_and_close_aborts_it() {
+        let (reg, _dir) = make_tapping_registry();
+        let mut intent = shell_intent();
+        intent.share_output = true;
+        let handle = reg.start(intent).unwrap();
+        let id = handle.id();
+        // The pipe task is held on the record.
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let rec = sessions.get(&id).unwrap();
+            assert!(
+                rec.output_pipe.is_some(),
+                "share_output=true must spawn the output pipe"
+            );
+        }
+        // Closing aborts + clears the pipe handle.
+        handle.close().unwrap();
+        {
+            let sessions = reg.sessions.lock().unwrap();
+            let rec = sessions.get(&id).unwrap();
+            assert!(
+                rec.output_pipe.is_none(),
+                "close must take + abort the output pipe"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_share_output_spawns_no_pipe() {
+        let (reg, _dir) = make_tapping_registry();
+        // Default intent has share_output=false.
+        let handle = reg.start(shell_intent()).unwrap();
+        let id = handle.id();
+        let sessions = reg.sessions.lock().unwrap();
+        let rec = sessions.get(&id).unwrap();
+        assert!(
+            rec.output_pipe.is_none(),
+            "default (non-shared) session pays zero overhead — no pipe"
+        );
     }
 
     #[test]

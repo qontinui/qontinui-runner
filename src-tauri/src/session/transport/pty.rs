@@ -119,4 +119,17 @@ impl Transport for PtyTransport {
             Err(e) => Err(TransportError::Runtime(e)),
         }
     }
+
+    /// Phase 8 (plan §D10) — tap the terminal's output broadcast for opt-in
+    /// streaming. Looks up the `TerminalSession` by id and subscribes to its
+    /// output channel (base64 chunks). Returns `None` if the terminal isn't
+    /// found (already closed) or the handle is the wrong kind.
+    fn tap_output(
+        &self,
+        handle: &TransportHandle,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        let id = self.handle_terminal_id(handle).ok()?;
+        let session = self.manager.get(id)?;
+        Some(session.subscribe_output())
+    }
 }
