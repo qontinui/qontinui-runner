@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::skills::SkillDefinition;
 
@@ -102,9 +103,32 @@ pub struct ApproveSkillRequest {
     pub status: String, // "approved" | "rejected" | "pending"
 }
 
+impl RequestHints for ApproveSkillRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `status` (one of: \"approved\", \"rejected\", \"pending\")."
+                .to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "allowedStatuses": ["approved", "rejected", "pending"] }))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BumpVersionRequest {
     pub bump_type: String, // "patch" | "minor" | "major"
+}
+
+impl RequestHints for BumpVersionRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `bump_type` (one of: \"patch\", \"minor\", \"major\").".to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "allowedBumpTypes": ["patch", "minor", "major"] }))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,7 +431,7 @@ pub async fn import_skills(
 pub async fn approve_skill(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-    Json(req): Json<ApproveSkillRequest>,
+    UiBridgeJson(req): UiBridgeJson<ApproveSkillRequest>,
 ) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let valid_statuses = ["approved", "rejected", "pending"];
     if !valid_statuses.contains(&req.status.as_str()) {
@@ -731,7 +755,7 @@ fn bump_semver(version: &str, bump_type: &str) -> String {
 pub async fn bump_version(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-    Json(req): Json<BumpVersionRequest>,
+    UiBridgeJson(req): UiBridgeJson<BumpVersionRequest>,
 ) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Don't allow bumping builtin skills
     if id.starts_with("builtin:") {
@@ -818,4 +842,115 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/skills/{id}/fork", post(fork_skill))
         .route("/skills/{id}/bump-version", post(bump_version))
         .route("/skills/{id}/increment-usage", post(increment_usage))
+}
+
+// ============================================================================
+// Unit tests — Phase A4 UiBridgeJson migration
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use super::{ApproveSkillRequest, BumpVersionRequest};
+    use crate::mcp::envelope::UiBridgeJson;
+
+    // ── helper ────────────────────────────────────────────────────────────────
+
+    async fn send_uib<T>(body: &'static str) -> (StatusCode, serde_json::Value)
+    where
+        T: serde::de::DeserializeOwned + crate::mcp::envelope::RequestHints + Send + 'static,
+    {
+        async fn handler<
+            T: serde::de::DeserializeOwned + crate::mcp::envelope::RequestHints + Send,
+        >(
+            UiBridgeJson(_): UiBridgeJson<T>,
+        ) -> axum::http::StatusCode {
+            axum::http::StatusCode::OK
+        }
+
+        let app = Router::new().route("/test", post(handler::<T>));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    // ── ApproveSkillRequest ───────────────────────────────────────────────────
+
+    /// Missing `status` field → 422 with `allowedStatuses` in hint.
+    #[tokio::test]
+    async fn approve_skill_request_422_carries_allowed_statuses() {
+        let (status, body) =
+            send_uib::<ApproveSkillRequest>(r#"{"wrong_field": "approved"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        let suggestions = body["suggestions"].as_array().expect("suggestions array");
+        assert!(!suggestions.is_empty(), "suggestions must not be empty");
+        let hint = &body["hint"];
+        assert!(!hint.is_null(), "hint must carry allowedStatuses");
+        let statuses = hint["allowedStatuses"]
+            .as_array()
+            .expect("allowedStatuses array");
+        assert_eq!(statuses.len(), 3, "must expose all 3 approval statuses");
+        assert!(
+            statuses.iter().any(|s| s.as_str() == Some("approved")),
+            "approved must be listed"
+        );
+        assert!(
+            statuses.iter().any(|s| s.as_str() == Some("rejected")),
+            "rejected must be listed"
+        );
+        assert!(
+            statuses.iter().any(|s| s.as_str() == Some("pending")),
+            "pending must be listed"
+        );
+    }
+
+    // ── BumpVersionRequest ────────────────────────────────────────────────────
+
+    /// Missing `bump_type` field → 422 with `allowedBumpTypes` in hint.
+    #[tokio::test]
+    async fn bump_version_request_422_carries_allowed_bump_types() {
+        let (status, body) = send_uib::<BumpVersionRequest>(r#"{"wrong_field": "patch"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        let suggestions = body["suggestions"].as_array().expect("suggestions array");
+        assert!(!suggestions.is_empty(), "suggestions must not be empty");
+        let hint = &body["hint"];
+        assert!(!hint.is_null(), "hint must carry allowedBumpTypes");
+        let bump_types = hint["allowedBumpTypes"]
+            .as_array()
+            .expect("allowedBumpTypes array");
+        assert_eq!(bump_types.len(), 3, "must expose all 3 bump types");
+        assert!(
+            bump_types.iter().any(|t| t.as_str() == Some("patch")),
+            "patch must be listed"
+        );
+        assert!(
+            bump_types.iter().any(|t| t.as_str() == Some("minor")),
+            "minor must be listed"
+        );
+        assert!(
+            bump_types.iter().any(|t| t.as_str() == Some("major")),
+            "major must be listed"
+        );
+    }
 }
