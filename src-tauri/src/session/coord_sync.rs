@@ -72,7 +72,7 @@ use chrono::Utc;
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
-use tokio::task::JoinHandle;
+use tauri::async_runtime::JoinHandle;
 use uuid::Uuid;
 
 use super::dual_write::DualWriteGate;
@@ -323,14 +323,14 @@ impl CoordSync {
     /// keep it alive for the lifetime of the process.
     pub fn start_drain_task(&self) -> JoinHandle<()> {
         let inner = Arc::clone(&self.inner);
-        tokio::spawn(run_drain_loop(inner))
+        tauri::async_runtime::spawn(run_drain_loop(inner))
     }
 
     /// Start the heartbeat task. Returns the [`JoinHandle`] so `main.rs`
     /// can keep it alive.
     pub fn start_heartbeat_task(&self) -> JoinHandle<()> {
         let inner = Arc::clone(&self.inner);
-        tokio::spawn(run_heartbeat_loop(inner))
+        tauri::async_runtime::spawn(run_heartbeat_loop(inner))
     }
 
     // -----------------------------------------------------------------
@@ -369,7 +369,9 @@ impl CoordSync {
     pub fn start_flag_poll_task(&self) -> Option<JoinHandle<()>> {
         let tenant_id = self.inner.dual_write.tenant_id()?;
         let inner = Arc::clone(&self.inner);
-        Some(tokio::spawn(run_flag_poll_loop(inner, tenant_id)))
+        Some(tauri::async_runtime::spawn(run_flag_poll_loop(
+            inner, tenant_id,
+        )))
     }
 
     /// Phase 10 dual-write entry point — called by the **legacy** session
