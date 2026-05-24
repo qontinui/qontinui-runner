@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tracing::{debug, error, info};
 
-use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 use super::types::UiBridgeError;
+use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
 use super::helpers::{direct_webview_evaluate_with_result, evaluate_js_expression, safe_evaluate};
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
