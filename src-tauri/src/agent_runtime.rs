@@ -80,6 +80,8 @@ pub struct LaunchPayload {
     pub plan_slug: Option<String>,
     #[serde(default)]
     pub plan_phase: Option<u32>,
+    #[serde(default)]
+    pub correlation_topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -392,6 +394,10 @@ async fn run_agent_subprocess(payload: LaunchPayload) -> anyhow::Result<()> {
         .worktree_path
         .clone();
 
+    // Write .mcp.json so the spawned claude process auto-discovers
+    // the coord MCP server for coordination tooling.
+    write_coord_mcp_config(&primary_wt, &payload);
+
     let log_path = agent_log_path(payload.agent_id);
 
     // Step 2: heartbeat task — runs for the agent's whole life.
@@ -553,6 +559,132 @@ fn qontinui_root_dir() -> Option<PathBuf> {
     dirs::home_dir()
         .map(|h| h.join("qontinui-root"))
         .filter(|p| p.is_dir())
+}
+
+/// Resolve the coord MCP server path. Checks:
+/// 1. `COORD_MCP_SERVER_PATH` env var if set
+/// 2. Derive from the runner's own binary location (up to workspace root + `qontinui-coord/mcp/coord-mcp.mjs`)
+/// 3. `QONTINUI_ROOT/qontinui-coord/mcp/coord-mcp.mjs` as a fallback
+/// 4. Hard-coded `D:/qontinui-root/qontinui-coord/mcp/coord-mcp.mjs` on Windows
+///
+/// Returns `None` when no candidate exists on disk.
+fn resolve_coord_mcp_server_path() -> Option<PathBuf> {
+    // 1. Explicit env override.
+    if let Ok(p) = std::env::var("COORD_MCP_SERVER_PATH") {
+        let path = PathBuf::from(&p);
+        if path.is_file() {
+            return Some(path);
+        }
+        warn!(
+            "agent_runtime: COORD_MCP_SERVER_PATH={} does not exist; falling through",
+            p
+        );
+    }
+
+    // 2. Derive from the runner's own binary location.
+    if let Ok(exe) = std::env::current_exe() {
+        // Walk up from the binary to find the workspace root.
+        // Typical layout: <workspace>/qontinui-runner/target/<profile>/qontinui-runner(.exe)
+        // We need to go up past target/<profile> to reach qontinui-runner, then up once more for the workspace.
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..6 {
+            if let Some(ref d) = dir {
+                let candidate = d.join("qontinui-coord").join("mcp").join("coord-mcp.mjs");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                dir = d.parent().map(|p| p.to_path_buf());
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 3. QONTINUI_ROOT-based fallback.
+    if let Some(root) = qontinui_root_dir() {
+        let candidate = root
+            .join("qontinui-coord")
+            .join("mcp")
+            .join("coord-mcp.mjs");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 4. Hard-coded Windows workspace path.
+    #[cfg(target_os = "windows")]
+    {
+        let candidate = PathBuf::from("D:/qontinui-root/qontinui-coord/mcp/coord-mcp.mjs");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Write `.mcp.json` into the agent's primary worktree directory so the
+/// spawned `claude` process auto-discovers the coord MCP server. If the
+/// server file doesn't exist on disk, logs a warning and returns without
+/// writing (graceful degradation).
+fn write_coord_mcp_config(primary_wt: &str, payload: &LaunchPayload) {
+    let server_path = match resolve_coord_mcp_server_path() {
+        Some(p) => p,
+        None => {
+            warn!(
+                "agent_runtime: coord MCP server not found on disk; \
+                 skipping .mcp.json for agent_id={}",
+                payload.agent_id
+            );
+            return;
+        }
+    };
+
+    let coord_url =
+        std::env::var("COORD_HTTP_URL").unwrap_or_else(|_| "http://localhost:9870".to_string());
+
+    let agent_name = payload.agent_id.to_string();
+    let topic = payload
+        .correlation_topic
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "coord-mcp": {
+                "command": "node",
+                "args": [server_path.to_string_lossy()],
+                "env": {
+                    "AGENT_NAME": agent_name,
+                    "AGENT_LANE": format!("coord-lane/{}", agent_name),
+                    "TOPIC": topic,
+                    "DEVICE_ID": payload.target_device_id.to_string(),
+                    "COORD_JWT": payload.jwt,
+                    "COORD_URL": coord_url,
+                }
+            }
+        }
+    });
+
+    let mcp_path = Path::new(primary_wt).join(".mcp.json");
+    match std::fs::write(
+        &mcp_path,
+        serde_json::to_string_pretty(&mcp_config).unwrap_or_default(),
+    ) {
+        Ok(()) => {
+            info!(
+                "agent_runtime: wrote .mcp.json for coord-mcp in {}",
+                primary_wt
+            );
+        }
+        Err(e) => {
+            warn!(
+                "agent_runtime: failed to write .mcp.json in {}: {e}",
+                primary_wt
+            );
+        }
+    }
 }
 
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
@@ -845,6 +977,7 @@ mod tests {
             claim_token: "agent:00000000-0000-0000-0000-000000000000".to_string(),
             plan_slug: Some("readiness".to_string()),
             plan_phase: Some(4),
+            correlation_topic: Some("my-coordination-topic".to_string()),
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
