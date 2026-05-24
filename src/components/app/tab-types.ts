@@ -71,6 +71,10 @@ export type MainTabId =
   | "settings-instances"
   | "settings-debug"
   | "settings-security"
+  | "settings-notifications"
+  | "settings-otel"
+  | "settings-containers"
+  | "settings-lock-yield"
   | "accessibility-explorer"
   | "settings-updates"
   | "orchestration-loop"
@@ -171,6 +175,10 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-instances",
   "settings-debug",
   "settings-security",
+  "settings-notifications",
+  "settings-otel",
+  "settings-containers",
+  "settings-lock-yield",
   "accessibility-explorer",
   "settings-updates",
   "orchestration-loop",
@@ -282,6 +290,10 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   "settings-instances": "Instances Settings",
   "settings-debug": "Debug Settings",
   "settings-security": "Security Settings",
+  "settings-notifications": "Notification Settings",
+  "settings-otel": "OpenTelemetry Settings",
+  "settings-containers": "Container Isolation Settings",
+  "settings-lock-yield": "Lock-yield Policy Settings",
   "accessibility-explorer": "Accessibility Explorer",
   "settings-updates": "Updates Settings",
   "orchestration-loop": "Orchestration Loop",

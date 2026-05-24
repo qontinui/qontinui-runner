@@ -150,6 +150,15 @@ pub enum UiBridgeErrorCode {
     ElementStale,
     // Action errors
     ActionFailed,
+    /// The requested action name is not in the element's advertised
+    /// `actions` list. Issued pre-IPC by `ui_bridge_execute_action_handler`
+    /// so the caller gets a flat HTTP 400 with the supported-action list in
+    /// `context.supported_actions` BEFORE the Phase 5 RecoveryExecutor can
+    /// synthesize a misleading `recovered:true` success against a side-action.
+    /// Loop iter-2 item 2 — mirrors the post-recovery contract-violation
+    /// branch's `data.code = "ACTION_NOT_SUPPORTED"` shape so callers see a
+    /// consistent envelope on both pre-IPC and post-recovery rejection.
+    ActionNotSupported,
     // Assertion errors
     AssertionFailed,
     UnknownAssertionType,
@@ -167,6 +176,13 @@ pub enum UiBridgeErrorCode {
     /// get a deterministic 400 instead of a recovered no-op via the
     /// LLM fallback.
     MissingParam,
+    /// The `state` parameter on a `wait-for-element-state` request is not
+    /// one of the recognised enum values (`visible|enabled|focused`).
+    /// Issued as a flat HTTP 400 with `context.allowed_states: [...]` so
+    /// callers can self-correct without parsing prose. Loop iter-2 item 3 —
+    /// mirrors the `tab/activate` -> `knownTabs` and the action-name gate's
+    /// envelope shape.
+    InvalidState,
     // System errors
     InternalError,
 }
@@ -317,6 +333,29 @@ impl UiBridgeError {
         }
     }
 
+    /// Reject `wait-for-element-state` when the `state` parameter is not in
+    /// the recognised enum (`visible|enabled|focused`). Loop iter-2 item 3 —
+    /// previously returned an `api_error(prose)` envelope with no machine-
+    /// readable code, making the error indistinguishable from any other
+    /// transport failure. Now: HTTP 400 with `error_detail.code:
+    /// "INVALID_STATE"` and `context.allowed_states` for self-correction.
+    pub fn invalid_state(provided: &str, allowed: &[&str]) -> Self {
+        Self {
+            code: UiBridgeErrorCode::InvalidState,
+            message: format!(
+                "wait-for-element-state: unknown state '{}', expected {}",
+                provided,
+                allowed.join("|")
+            ),
+            recovery: Some(RecoveryHint::Unrecoverable),
+            context: Some(serde_json::json!({
+                "code": "INVALID_STATE",
+                "provided_state": provided,
+                "allowed_states": allowed,
+            })),
+        }
+    }
+
     pub fn element_not_visible(selector: &str, total_found: usize) -> Self {
         Self {
             code: UiBridgeErrorCode::ElementNotVisible,
@@ -422,6 +461,8 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
         UiBridgeErrorCode::InvalidRequest => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::InvalidParam => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::MissingParam => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::InvalidState => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::ActionNotSupported => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::InternalError => RecoveryHint::Unrecoverable,
     }
 }

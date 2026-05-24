@@ -21,10 +21,11 @@ use axum::{
 };
 use tracing::{error, info};
 
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
 use super::helpers::glob_match;
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
+use super::types::UiBridgeError;
 
 /// Wait for a deterministic "navigation complete" signal from the SDK.
 /// Falls back to idle-based detection if no explicit signal arrives.
@@ -301,16 +302,23 @@ pub async fn ui_bridge_wait_for_element_state_handler(
     // Map the simple state name to the field on the registered element that
     // we're polling. The registry exposes these as booleans on the element
     // object's `state` block.
+    //
+    // Loop iter-2 item 3 — on an unknown state name return a flat HTTP 400
+    // envelope carrying `error_detail.code = "INVALID_STATE"` and the
+    // `context.allowed_states` enum so callers can self-correct without
+    // parsing prose. Previously emitted `api_error(prose)` with no code,
+    // making the error indistinguishable from a generic transport failure.
+    const ALLOWED_STATES: &[&str] = &["visible", "enabled", "focused"];
     let state_field = match state_name.as_str() {
         "visible" => "visible",
         "enabled" => "enabled",
         "focused" => "focused",
         other => {
+            let detail = UiBridgeError::invalid_state(other, ALLOWED_STATES);
+            let msg = detail.message.clone();
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(format!(
-                    "wait-for-element-state: unknown state '{other}', expected visible|enabled|focused"
-                ))),
+                Json(api_error_detailed(msg, detail)),
             ));
         }
     };
@@ -574,4 +582,95 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/wait-for-idle/{signal}"),
         ("POST", "/ui-bridge/control/wait-for-targets"),
     ]
+}
+
+#[cfg(test)]
+mod invalid_state_envelope_tests {
+    //! Iter-2 item 3 — `wait-for-element-state` with an unknown `state`
+    //! value must return a flat HTTP 400 envelope whose machine-readable
+    //! `error_detail.code` is `INVALID_STATE` and whose
+    //! `error_detail.context.allowed_states` enumerates the valid options.
+    //!
+    //! Locks down the constructor's shape so callers can match on
+    //! `error_detail.code` and self-correct via `context.allowed_states`
+    //! without parsing the prose `error` field. The handler-side wiring
+    //! (`api_error_detailed(msg, detail)` + HTTP 400) is too IPC-coupled
+    //! for a pure unit test; this test guards the envelope contract.
+    use super::UiBridgeError;
+    use crate::mcp::types::api_error_detailed;
+    use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
+
+    const ALLOWED: &[&str] = &["visible", "enabled", "focused"];
+
+    #[test]
+    fn invalid_state_constructor_sets_code_and_context() {
+        let detail = UiBridgeError::invalid_state("banana", ALLOWED);
+        assert!(
+            matches!(detail.code, UiBridgeErrorCode::InvalidState),
+            "code must be InvalidState"
+        );
+        assert!(
+            detail.message.contains("banana"),
+            "message echoes the rejected value"
+        );
+        assert!(
+            detail.message.contains("visible|enabled|focused"),
+            "message lists the allowed states pipe-separated"
+        );
+        let ctx = detail
+            .context
+            .as_ref()
+            .expect("context must carry the structured payload");
+        assert_eq!(
+            ctx.get("code").and_then(|v| v.as_str()),
+            Some("INVALID_STATE")
+        );
+        assert_eq!(
+            ctx.get("provided_state").and_then(|v| v.as_str()),
+            Some("banana")
+        );
+        let allowed_arr = ctx
+            .get("allowed_states")
+            .and_then(|v| v.as_array())
+            .expect("context.allowed_states must be an array");
+        let names: Vec<&str> = allowed_arr.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(names, vec!["visible", "enabled", "focused"]);
+    }
+
+    #[test]
+    fn invalid_state_envelope_serialises_with_code_key() {
+        // The "flat envelope with code key" the spec asks for: the response
+        // body must include a machine-readable `code` discoverable without
+        // parsing the prose `error` field. `error_detail.code` is the
+        // canonical channel; `error_detail.context.code` mirrors it so
+        // callers that key on `data.code` (per the iter-2 spec example) see
+        // it without an extra dereference.
+        let detail = UiBridgeError::invalid_state("banana", ALLOWED);
+        let msg = detail.message.clone();
+        let envelope = api_error_detailed(msg, detail);
+        let env_json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            env_json.get("success").and_then(|v| v.as_bool()),
+            Some(false),
+            "contract: success:false"
+        );
+        let ed = env_json
+            .get("error_detail")
+            .expect("contract: error_detail field must be present (camelCased ApiResponse)");
+        assert_eq!(
+            ed.get("code").and_then(|v| v.as_str()),
+            Some("INVALID_STATE"),
+            "contract: error_detail.code must be the literal 'INVALID_STATE'"
+        );
+        let ctx = ed.get("context").expect("error_detail.context must be present");
+        assert_eq!(
+            ctx.get("code").and_then(|v| v.as_str()),
+            Some("INVALID_STATE"),
+            "contract: context.code mirrors error_detail.code so flat consumers see it"
+        );
+        assert!(
+            env_json.get("error").and_then(|v| v.as_str()).is_some(),
+            "contract: prose `error` field must still be populated for human readers"
+        );
+    }
 }
