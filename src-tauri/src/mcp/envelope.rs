@@ -40,6 +40,32 @@ use serde::de::DeserializeOwned;
 
 use crate::mcp::types::ApiResponse;
 
+// ─── RequestHints trait ───────────────────────────────────────────────────────
+
+/// Per-request-type recovery hints surfaced on a 422 (body shape) rejection.
+///
+/// Implement this trait on request structs that benefit from type-specific
+/// guidance so callers can recover from a shape error without reading the
+/// source. The defaults return `None` (no hints); override only the arms
+/// relevant to your type.
+///
+/// **Do NOT add a blanket impl** — Rust's orphan + no-specialization rules
+/// would prevent any specific impl from ever winning. Add an explicit
+/// `impl RequestHints for T {}` (empty body = all defaults) for request
+/// types that genuinely have no useful hint.
+pub trait RequestHints {
+    /// Human-readable recovery suggestions surfaced in `suggestions` on a
+    /// shape error (e.g. missing field, wrong type).
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        None
+    }
+    /// Structured allowed-values payload surfaced in `data` on a shape error
+    /// (e.g. `{"allowedModes": ["hard", "soft"]}`).
+    fn shape_error_data() -> Option<serde_json::Value> {
+        None
+    }
+}
+
 // ─── Code constants ──────────────────────────────────────────────────────────
 
 const CODE_UNSUPPORTED_MEDIA_TYPE: &str = "UNSUPPORTED_MEDIA_TYPE";
@@ -97,8 +123,9 @@ pub fn envelope_422(msg: impl Into<String>) -> (StatusCode, Json<ApiResponse<()>
 /// error envelope at extraction time.
 ///
 /// Drop-in replacement for `axum::Json<T>` on handlers that want per-handler
-/// envelope control. A1 stages the type; later phases migrate individual
-/// handlers.
+/// envelope control. The bound `T: RequestHints` allows per-request-type
+/// recovery suggestions and allowed-values data to be surfaced on a 422
+/// (body shape) rejection.
 ///
 /// ```rust,ignore
 /// async fn my_handler(UiBridgeJson(body): UiBridgeJson<MyRequest>) -> impl IntoResponse {
@@ -110,30 +137,43 @@ pub struct UiBridgeJson<T>(pub T);
 impl<S, T> FromRequest<S> for UiBridgeJson<T>
 where
     S: Send + Sync,
-    T: DeserializeOwned,
+    T: DeserializeOwned + RequestHints,
 {
     type Rejection = (StatusCode, Json<ApiResponse<()>>);
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(UiBridgeJson(value)),
-            Err(rejection) => Err(map_json_rejection(rejection)),
+            Err(rejection) => Err(map_json_rejection_with_hints::<T>(rejection)),
         }
     }
 }
 
-/// Map a [`JsonRejection`] to the canonical envelope tuple.
+/// Map a [`JsonRejection`] to the canonical envelope tuple, folding in
+/// type-specific [`RequestHints`] on the 422 arm.
 ///
 /// The `JsonRejection` enum (axum 0.8) is `#[non_exhaustive]` with variants:
 /// - `JsonDataError`         — syntactically valid JSON, failed to deserialize into T (→ 422)
 /// - `JsonSyntaxError`       — JSON parse error (→ 400)
 /// - `MissingJsonContentType`— no / wrong Content-Type header (→ 415)
 /// - `BytesRejection`        — body read failure (→ 400)
-fn map_json_rejection(rejection: JsonRejection) -> (StatusCode, Json<ApiResponse<()>>) {
+fn map_json_rejection_with_hints<T: RequestHints>(
+    rejection: JsonRejection,
+) -> (StatusCode, Json<ApiResponse<()>>) {
     match rejection {
         JsonRejection::MissingJsonContentType(_) => envelope_415(),
-        JsonRejection::JsonSyntaxError(e) => envelope_400(e.to_string()),
-        JsonRejection::JsonDataError(e) => envelope_422(e.to_string()),
+        JsonRejection::JsonSyntaxError(e) => {
+            // Syntax errors (e.g. truncated JSON, bad escape) benefit from
+            // shape hints too — a caller who sends `{action:"click"}` with
+            // bad JSON likely still wants the allowed-values list.
+            envelope_400_with_hints::<T>(e.to_string())
+        }
+        JsonRejection::JsonDataError(e) => {
+            // Primary target for hints: the body was valid JSON but didn't
+            // match the expected shape (wrong field type, missing required
+            // field, unknown tag value).
+            envelope_422_with_hints::<T>(e.to_string())
+        }
         JsonRejection::BytesRejection(e) => {
             // BytesRejection fires when the body read itself fails (connection
             // reset, body-limit exceeded before the limit layer fires, etc.).
@@ -150,6 +190,60 @@ fn map_json_rejection(rejection: JsonRejection) -> (StatusCode, Json<ApiResponse
                 CODE_BAD_REQUEST,
             )),
         ),
+    }
+}
+
+/// Build a 400 envelope optionally enriched with type-level hints.
+fn envelope_400_with_hints<T: RequestHints>(
+    msg: impl Into<String>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    let msg = msg.into();
+    match T::shape_error_suggestions() {
+        Some(suggestions) if !suggestions.is_empty() => {
+            let mut resp = ApiResponse::<()>::error_with_code_and_suggestions(
+                &msg,
+                CODE_INVALID_JSON,
+                suggestions,
+            );
+            resp.data = T::shape_error_data().map(|_| ());
+            // Can't attach arbitrary data to `ApiResponse<()>` — surface the
+            // allowed-values payload in the `hint` field instead so no info
+            // is lost (hint is a `serde_json::Value`, not typed by T).
+            let mut base_resp = ApiResponse::<()>::error_with_code_and_suggestions(
+                msg,
+                CODE_INVALID_JSON,
+                T::shape_error_suggestions().unwrap_or_default(),
+            );
+            base_resp.hint = T::shape_error_data();
+            (StatusCode::BAD_REQUEST, Json(base_resp))
+        }
+        _ => envelope_400(msg),
+    }
+}
+
+/// Build a 422 envelope enriched with type-level hints (suggestions + data).
+fn envelope_422_with_hints<T: RequestHints>(
+    msg: impl Into<String>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    let msg = msg.into();
+    let suggestions = T::shape_error_suggestions();
+    let data = T::shape_error_data();
+
+    match (suggestions, data) {
+        (None, None) => envelope_422(msg),
+        (suggestions, data) => {
+            let mut resp = match suggestions {
+                Some(s) if !s.is_empty() => {
+                    ApiResponse::<()>::error_with_code_and_suggestions(msg, CODE_INVALID_REQUEST, s)
+                }
+                _ => ApiResponse::<()>::error_with_code(msg, CODE_INVALID_REQUEST),
+            };
+            // Surface the allowed-values payload in `hint` (a
+            // `serde_json::Value` free field) so structured data like
+            // `{"allowedModes":["hard","soft"]}` reaches the caller.
+            resp.hint = data;
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(resp))
+        }
     }
 }
 
@@ -270,6 +364,8 @@ mod tests {
         value: String,
     }
 
+    impl super::RequestHints for Probe {}
+
     /// Handler that echoes `value` back in the success envelope.
     async fn probe_handler(axum::Json(body): axum::Json<Probe>) -> Json<ApiResponse<String>> {
         Json(ApiResponse::success(body.value))
@@ -388,5 +484,244 @@ mod tests {
             "already-JSON 4xx must not be rewritten"
         );
         assert_eq!(body["error"], "explicit handler error");
+    }
+
+    // ── Phase A3 tests: per-type hints on 422 ────────────────────────────────
+
+    /// Helper: build a UiBridgeJson<T> router + send a malformed body.
+    async fn send_uib<T>(body: &'static str) -> (StatusCode, serde_json::Value)
+    where
+        T: serde::de::DeserializeOwned + RequestHints + Send + 'static,
+    {
+        async fn handler<T: serde::de::DeserializeOwned + RequestHints + Send>(
+            UiBridgeJson(_): UiBridgeJson<T>,
+        ) -> impl IntoResponse {
+            StatusCode::OK
+        }
+
+        let app = Router::new().route("/test", axum::routing::post(handler::<T>));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    // ── PageNavigateRequest: allowedModes in hint + INVALID_REQUEST code ──────
+
+    #[derive(Debug, serde::Deserialize)]
+    struct PageNavigateRequestStub {
+        #[allow(dead_code)]
+        url: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        mode: Option<String>,
+    }
+
+    impl RequestHints for PageNavigateRequestStub {
+        fn shape_error_suggestions() -> Option<Vec<String>> {
+            Some(vec![
+                "Required field: `url` (string). Optional: `mode` (\"hard\" | \"soft\")."
+                    .to_string(),
+            ])
+        }
+        fn shape_error_data() -> Option<serde_json::Value> {
+            Some(serde_json::json!({ "allowedModes": ["hard", "soft"] }))
+        }
+    }
+
+    /// 422 with `allowedModes` in `hint` and `INVALID_REQUEST` code.
+    #[tokio::test]
+    async fn page_navigate_request_422_carries_allowed_modes_hint() {
+        // Missing required `url` field → JsonDataError → 422
+        let (status, body) = send_uib::<PageNavigateRequestStub>(r#"{"mode": "hard"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(
+            body["code"], "INVALID_REQUEST",
+            "code must be INVALID_REQUEST on shape error"
+        );
+        let suggestions = body["suggestions"].as_array().expect("suggestions array");
+        assert!(!suggestions.is_empty(), "suggestions must not be empty");
+        let hint = &body["hint"];
+        assert!(
+            !hint.is_null(),
+            "hint must be populated with allowedModes for navigate"
+        );
+        let modes = hint["allowedModes"].as_array().expect("allowedModes array");
+        assert!(
+            modes.iter().any(|m| m.as_str() == Some("hard")),
+            "allowedModes must contain 'hard'"
+        );
+        assert!(
+            modes.iter().any(|m| m.as_str() == Some("soft")),
+            "allowedModes must contain 'soft'"
+        );
+    }
+
+    // ── AssertRequestStub: allowedAssertionTypes in hint ─────────────────────
+
+    #[derive(Debug, serde::Deserialize)]
+    struct AssertRequestStub {
+        #[allow(dead_code)]
+        assertions: Vec<serde_json::Value>,
+    }
+
+    impl RequestHints for AssertRequestStub {
+        fn shape_error_suggestions() -> Option<Vec<String>> {
+            Some(vec![
+                "Required field: `assertions` (array of Assertion objects).".to_string(),
+                "Assertion `type` values: no_overlap, contains_text, text_fits_container, \
+                 aligned_horizontally, aligned_vertically, color_within, \
+                 typography_consistent, no_layout_shift_since, no_clipping, \
+                 animation_settled, contrast_meets_wcag."
+                    .to_string(),
+            ])
+        }
+        fn shape_error_data() -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "allowedAssertionTypes": [
+                    "no_overlap", "contains_text", "text_fits_container",
+                    "aligned_horizontally", "aligned_vertically", "color_within",
+                    "typography_consistent", "no_layout_shift_since", "no_clipping",
+                    "animation_settled", "contrast_meets_wcag"
+                ]
+            }))
+        }
+    }
+
+    /// 422 with `allowedAssertionTypes` in `hint`.
+    #[tokio::test]
+    async fn assert_request_422_carries_assertion_types_hint() {
+        // Missing required `assertions` field → 422
+        let (status, body) = send_uib::<AssertRequestStub>(r#"{"target": "foo"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        let hint = &body["hint"];
+        assert!(!hint.is_null(), "hint must carry assertion DSL info");
+        let types = hint["allowedAssertionTypes"]
+            .as_array()
+            .expect("allowedAssertionTypes array");
+        assert!(
+            types.iter().any(|t| t.as_str() == Some("no_overlap")),
+            "no_overlap must be in allowed types"
+        );
+        assert!(
+            types
+                .iter()
+                .any(|t| t.as_str() == Some("contrast_meets_wcag")),
+            "contrast_meets_wcag must be in allowed types"
+        );
+    }
+
+    // ── AnalyzeRequestStub: allowedAnalyzers in hint ──────────────────────────
+
+    #[derive(Debug, serde::Deserialize)]
+    struct AnalyzeRequestStub {
+        #[allow(dead_code)]
+        analyzer: String,
+    }
+
+    impl RequestHints for AnalyzeRequestStub {
+        fn shape_error_suggestions() -> Option<Vec<String>> {
+            Some(vec![
+                "Required field: `analyzer` (one of: \"layout\", \"typography\", \
+                 \"color\", \"dynamic\", \"elements\")."
+                    .to_string(),
+            ])
+        }
+        fn shape_error_data() -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "allowedAnalyzers": ["layout", "typography", "color", "dynamic", "elements"]
+            }))
+        }
+    }
+
+    /// 422 with `allowedAnalyzers` in `hint`.
+    #[tokio::test]
+    async fn analyze_request_422_carries_allowed_analyzers_hint() {
+        // Missing required `analyzer` field → 422
+        let (status, body) = send_uib::<AnalyzeRequestStub>(r#"{"target": "foo"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        let hint = &body["hint"];
+        assert!(!hint.is_null(), "hint must carry analyzer info");
+        let analyzers = hint["allowedAnalyzers"]
+            .as_array()
+            .expect("allowedAnalyzers");
+        assert_eq!(analyzers.len(), 5, "should expose all 5 analyzers");
+        assert!(
+            analyzers.iter().any(|a| a.as_str() == Some("layout")),
+            "layout must be listed"
+        );
+    }
+
+    // ── NavigateAndWaitRequestStub: allowedActions in hint ────────────────────
+
+    #[derive(Debug, serde::Deserialize)]
+    struct NavigateAndWaitRequestStub {
+        #[allow(dead_code)]
+        element_id: String,
+    }
+
+    impl RequestHints for NavigateAndWaitRequestStub {
+        fn shape_error_suggestions() -> Option<Vec<String>> {
+            Some(vec!["Required field: `elementId` (string).".to_string()])
+        }
+        fn shape_error_data() -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "allowedActions": ["click", "doubleClick", "hover", "type"]
+            }))
+        }
+    }
+
+    /// 422 with `allowedActions` in `hint`.
+    #[tokio::test]
+    async fn navigate_and_wait_request_422_carries_allowed_actions_hint() {
+        // Missing required `elementId` field → 422
+        let (status, body) = send_uib::<NavigateAndWaitRequestStub>(r#"{"action": "click"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        let hint = &body["hint"];
+        assert!(!hint.is_null(), "hint must carry allowedActions");
+        let actions = hint["allowedActions"].as_array().expect("allowedActions");
+        assert!(
+            actions.iter().any(|a| a.as_str() == Some("click")),
+            "click must be in allowedActions"
+        );
+    }
+
+    // ── Hint-less request: no suggestions or hint fields ─────────────────────
+
+    #[derive(Debug, serde::Deserialize)]
+    struct NakedRequest {
+        #[allow(dead_code)]
+        value: String,
+    }
+
+    impl RequestHints for NakedRequest {}
+
+    /// A type with no hints produces the baseline 422 envelope without
+    /// `suggestions` or `hint` fields.
+    #[tokio::test]
+    async fn naked_request_422_has_no_hint_or_suggestions() {
+        let (status, body) = send_uib::<NakedRequest>(r#"{"other": "oops"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        // No hints provided — these fields must be absent (null in serde_json::Value terms).
+        assert!(body["suggestions"].is_null(), "suggestions must be absent");
+        assert!(body["hint"].is_null(), "hint must be absent");
     }
 }
