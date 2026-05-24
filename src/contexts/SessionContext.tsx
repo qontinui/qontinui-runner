@@ -175,6 +175,12 @@ export interface SessionContextValue {
   closeSession: (id: string) => Promise<void>;
   /** Plan §D14 — min 10 chars on reason; server enforces. */
   stealSession: (id: string, reason: string) => Promise<void>;
+  /**
+   * Plan §Phase 7 — "Continue elsewhere". Publish a handoff request so the
+   * target device materializes the session and closes this one. Returns
+   * once coord has accepted the request (the actual transfer is async).
+   */
+  handoffSession: (id: string, targetDeviceId: string) => Promise<void>;
   /** Re-fetch the full list. Local mirror is refreshed best-effort on every
    * mutation; this is the explicit knob when an external surface (CLI, peer
    * runner) might have changed coord state. */
@@ -366,6 +372,28 @@ export function SessionProvider({ children }: SessionProviderProps) {
     [refresh],
   );
 
+  const handoffSession = useCallback(
+    async (id: string, targetDeviceId: string): Promise<void> => {
+      if (!targetDeviceId.trim()) {
+        throw new SessionContextError(
+          "session:intent_invalid: targetDeviceId is required",
+        );
+      }
+      try {
+        await invoke<CommandResponse>("session_handoff", {
+          sessionId: id,
+          targetDeviceId,
+        });
+      } catch (e) {
+        throw wrapInvokeError(e);
+      }
+      // The source session transitions to `closed` once the target
+      // materializes; refresh so the list mirror catches that delta.
+      void refresh();
+    },
+    [refresh],
+  );
+
   const subscribeEvents = useCallback(
     (id: string, cb: (e: SessionEvent) => void): (() => void) => {
       let set = perSessionSubs.current.get(id);
@@ -393,6 +421,7 @@ export function SessionProvider({ children }: SessionProviderProps) {
       focusSession,
       closeSession,
       stealSession,
+      handoffSession,
       refresh,
       subscribeEvents,
     }),
@@ -403,6 +432,7 @@ export function SessionProvider({ children }: SessionProviderProps) {
       focusSession,
       closeSession,
       stealSession,
+      handoffSession,
       refresh,
       subscribeEvents,
     ],

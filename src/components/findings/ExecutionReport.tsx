@@ -32,6 +32,7 @@ import { findingsTracker, getVisibleCategories, getCategoryById } from "../../se
 import { CategorySection } from "./CategorySection";
 import { useAiTaskPolling, useSearchEvents } from "../../hooks";
 import type { SearchEventResult, SearchEventSourceTable } from "../../hooks";
+import { useApiFindings } from "../../hooks/useApiFindings";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
@@ -193,8 +194,24 @@ export function ExecutionReport({
     }
   }, [autoFixEnabled, autoFixLoading]);
 
-  // Use report findings if available, otherwise use live findings
-  const findings = report?.findings || liveFindings;
+  // PR #255 cross-run findings — pulled in as a fallback so the Findings tab
+  // is no longer a permanent "No Findings Yet" stub once data exists in the
+  // `task_run_findings` table. Skipped when an explicit run is selected
+  // (RunSelectionContext owns that surface). Also skipped when the in-memory
+  // tracker already has live findings — those are higher-fidelity (they carry
+  // the live `pendingQuestion` + auto-fix metadata the report UI mutates).
+  const shouldFetchApiFindings = !selectedRun && liveFindings.length === 0 && !report;
+  const { findings: apiFindings } = useApiFindings({
+    enabled: shouldFetchApiFindings,
+    poll: shouldFetchApiFindings,
+    limit: 200,
+  });
+
+  // Use report findings if available, then live (in-memory) findings, then
+  // API-backed cross-run findings as a final fallback.
+  const findings =
+    report?.findings ??
+    (liveFindings.length > 0 ? liveFindings : apiFindings);
 
   // ---------------------------------------------------------------------------
   // Full-text search (Tauri `search_events` command)

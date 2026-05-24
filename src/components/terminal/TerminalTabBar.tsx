@@ -485,11 +485,21 @@ export function TerminalTabBar({
       aria-label="Terminal sessions"
       className="flex items-center bg-[#13141f] border-b border-[#2a2d3d] h-9 shrink-0"
     >
-      {/* Aria-live indicator that reflects current terminal-tab count for accessibility / spec snapshots. */}
+      {/* Aria-live indicator that reflects current terminal-tab count for
+          accessibility / spec snapshots.
+          NOTE: previously used `role="status"`, which page-health auto-classifies
+          as a transient toast (causing the terminal-count line to show up as a
+          26h-stale toast in the page-health audit). Switched to a plain
+          `aria-live="polite"` span with `data-page-element="status-indicator"`
+          so the spec snapshot treats this as a persistent status indicator
+          rather than a toast. Screen readers still announce changes via
+          `aria-live`; the missing `role="status"` doesn't break a11y because
+          aria-live alone is sufficient on a non-interactive span. */}
       <span
-        role="status"
         aria-live="polite"
         aria-label={tabs.length === 0 ? "No terminals open" : `${tabs.length} terminal${tabs.length === 1 ? "" : "s"} open`}
+        data-page-element="status-indicator"
+        data-indicator="terminal-count"
         className="sr-only"
       >
         {tabs.length === 0 ? "No terminals open" : `${tabs.length} terminal${tabs.length === 1 ? "" : "s"} open`}

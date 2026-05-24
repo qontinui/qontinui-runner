@@ -54,6 +54,7 @@ import { BuildRefreshBanner } from "./components/BuildRefreshBanner";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
 import { MemoryFederationBanner } from "./components/MemoryFederationBanner";
+import { IncomingHandoffToastBridge } from "./components/session/IncomingHandoffToastBridge";
 import { WebIntegrationAuthBanner } from "./components/WebIntegrationAuthBanner";
 import { ApprovalDialog } from "./components/dag-workflow-editor";
 import StatusIndicator from "./components/StatusIndicator";
@@ -667,6 +668,9 @@ function AppContent() {
 
           <ApprovalDialog />
           <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+          {/* Surfaces incoming cross-machine session handoffs as toasts.
+              Listens for `session-event` with kind=handoff_request — PR #258. */}
+          <IncomingHandoffToastBridge />
           <PerformanceOverlay position="bottom-right" />
           <GiantSCCFixture />
           <CommandPalette />

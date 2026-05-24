@@ -13,7 +13,7 @@ export function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
       "gui-automation": { name: "Execute", section: "run", breadcrumb: ["Run", "Execute"] },
       active: { name: "Active Dashboard", section: "run", breadcrumb: ["Run", "Active Dashboard"] },
       history: { name: "History", section: "run", breadcrumb: ["Run", "History"] },
-      runs: { name: "History", section: "run", breadcrumb: ["Run", "History"] },
+      runs: { name: "Runs", section: "run", breadcrumb: ["Run", "Runs"] },
       "workflow-queue": {
         name: "Workflow Queue",
         section: "run",
