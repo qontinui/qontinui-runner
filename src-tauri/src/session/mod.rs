@@ -57,6 +57,7 @@
 //! has fully absorbed the old surface.
 
 pub mod coord_sync;
+pub mod dual_write;
 pub mod handoff;
 pub mod intent;
 pub mod local_store;
@@ -72,7 +73,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use intent::{Intent, IntentError};
-pub use transport::{DynTransport, Transport, TransportError, TransportHandle};
+pub use transport::{DynTransport, ExternalTransport, Transport, TransportError, TransportHandle};
 
 // ---------------------------------------------------------------------------
 // Wire types — must match `coord.sessions` (snake_case enum variants, exact
@@ -251,6 +252,7 @@ impl SessionRecord {
                 TransportHandle::Pty { .. } => "pty",
                 TransportHandle::ClaudeCli { .. } => "claude_cli",
                 TransportHandle::Workflow { .. } => "workflow",
+                TransportHandle::External => "external",
             },
         }
     }
@@ -389,6 +391,61 @@ impl SessionRegistry {
         };
         transport.write_input(&handle, bytes)?;
         Ok(())
+    }
+
+    /// Register a coord-native mirror of an **externally-owned** session
+    /// (plan §Phase 10 dual-write). Unlike [`SessionRegistry::start`],
+    /// this does NOT spawn a transport — the real PTY / CLI subprocess is
+    /// owned and torn down by the legacy `terminal_create` /
+    /// `claude_session` path. The mirror exists purely so the dashboard
+    /// renders the session from `coord.sessions` during the dual-write
+    /// window.
+    ///
+    /// Validates the intent, writes a `Started` outbox row (which the
+    /// drain loop pushes to coord), and inserts a record backed by the
+    /// no-op [`transport::ExternalTransport`]. Closing the mirror (by id)
+    /// records a `Closed` event but never touches the operator's real
+    /// terminal.
+    ///
+    /// Called only when the cutover flag is ON (see
+    /// [`coord_sync::CoordSync::mirror_legacy_session`]); with the flag
+    /// off this is never reached.
+    pub fn register_external(self: &Arc<Self>, intent: Intent) -> Result<Uuid, SessionError> {
+        intent.validate()?;
+
+        let id = uuid_v7();
+        let now = chrono::Utc::now();
+        let transport: DynTransport = Arc::new(transport::ExternalTransport);
+
+        let record = SessionRecord {
+            id,
+            kind: intent.kind,
+            state: SessionState::Active,
+            intent: intent.clone(),
+            started_at: now,
+            last_heartbeat_at: Some(now),
+            closed_at: None,
+            parent_session_id: None,
+            transport,
+            transport_handle: TransportHandle::External,
+        };
+
+        let payload = json!({
+            "id": id,
+            "kind": intent.kind.as_str(),
+            "intent": intent,
+            "state": SessionState::Active.as_str(),
+            "started_at": now,
+        });
+        self.coord_sync
+            .outbox()
+            .record(self.machine_id, id, SessionEventKind::Started, payload)
+            .map_err(|e| SessionError::Outbox(e.to_string()))?;
+
+        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+        sessions.insert(id, record);
+
+        Ok(id)
     }
 
     fn with_record<R>(
@@ -581,6 +638,7 @@ fn clone_transport_handle(h: &TransportHandle) -> TransportHandle {
         TransportHandle::Workflow { task_run_id } => TransportHandle::Workflow {
             task_run_id: task_run_id.clone(),
         },
+        TransportHandle::External => TransportHandle::External,
     }
 }
 
@@ -837,6 +895,41 @@ mod tests {
         let mut intent = shell_intent();
         intent.purpose = "x".into();
         let err = reg.start(intent).unwrap_err();
+        assert!(matches!(err, SessionError::Intent(_)));
+    }
+
+    #[test]
+    fn register_external_does_not_spawn_transport() {
+        // Phase 10 dual-write: the mirror must NOT start a transport —
+        // the real process is owned by the legacy path. We assert the
+        // FakeTransport's `start` counter stays at zero across a mirror.
+        let (reg, _dir) = make_registry();
+        let id = reg.register_external(shell_intent()).unwrap();
+        let desc = reg.describe(id).unwrap();
+        assert_eq!(desc.kind, SessionKind::TerminalShell);
+        assert_eq!(desc.state, SessionState::Active);
+        // The external mirror reports the no-op transport handle kind.
+        assert_eq!(desc.transport_handle_kind, "external");
+    }
+
+    #[test]
+    fn register_external_closeable_by_id_without_touching_real_process() {
+        // Closing the mirror records a Closed event and never errors —
+        // the no-op ExternalTransport's close is a clean Ok(()).
+        let (reg, _dir) = make_registry();
+        let id = reg.register_external(shell_intent()).unwrap();
+        reg.close_by_id(id).unwrap();
+        let again = reg.describe(id).unwrap();
+        assert_eq!(again.state, SessionState::Closed);
+        assert!(again.closed_at.is_some());
+    }
+
+    #[test]
+    fn register_external_rejects_invalid_intent() {
+        let (reg, _dir) = make_registry();
+        let mut intent = shell_intent();
+        intent.purpose = "x".into();
+        let err = reg.register_external(intent).unwrap_err();
         assert!(matches!(err, SessionError::Intent(_)));
     }
 

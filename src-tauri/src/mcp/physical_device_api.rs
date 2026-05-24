@@ -251,6 +251,55 @@ async fn disconnect_device(
     }))))
 }
 
+/// DELETE /ui-bridge/devices/:id
+///
+/// Unregister a physical device: drop any active SDK connection pointed at its
+/// transports, then remove the registry entry entirely. Returns 200 with
+/// `{deviceId, removed:true}`; 404 if the device is absent.
+///
+/// Note: the LAN TCP proxy task spawned at `register-lan` is not currently
+/// tracked by the registry (its `JoinHandle` is dropped at creation), so there
+/// is no handle to abort here. Removing the registry entry severs all routing
+/// to the device; the orphaned proxy listener (if any) is harmless and is reaped
+/// on runner shutdown. Tracking proxy handles for explicit teardown is a
+/// separate change and intentionally out of scope.
+async fn unregister_device(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // 404 if the device isn't known — distinguish "removed" from "never existed".
+    let device = match state.physical_device_registry.get_device(&id).await {
+        Some(d) => d,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error(format!("Device '{}' not found", id))),
+            ));
+        }
+    };
+
+    // Drop any active SDK connection that targets one of this device's
+    // transports, so a follow-up SDK request doesn't dangle on a removed device.
+    {
+        let mut manager = state.sdk_connection.lock().await;
+        for transport in &device.transports {
+            manager.connections.remove(&transport.proxy_url);
+            if manager.active_url.as_deref() == Some(transport.proxy_url.as_str()) {
+                manager.active_url = None;
+            }
+        }
+    }
+
+    // Remove the registry entry (this drops all transport metadata for the device).
+    state.physical_device_registry.remove_device(&id).await;
+
+    info!(device_id = %id, "Physical device unregistered");
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "deviceId": id,
+        "removed": true
+    }))))
+}
+
 /// GET /ui-bridge/devices/:id/transport
 async fn get_transport_info(
     State(state): State<Arc<ApiState>>,
@@ -477,7 +526,10 @@ async fn register_lan_device(
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/ui-bridge/devices", get(list_devices))
-        .route("/ui-bridge/devices/{id}", get(get_device))
+        .route(
+            "/ui-bridge/devices/{id}",
+            get(get_device).delete(unregister_device),
+        )
         .route("/ui-bridge/devices/{id}/connect", post(connect_device))
         .route(
             "/ui-bridge/devices/{id}/disconnect",

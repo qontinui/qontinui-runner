@@ -30,16 +30,27 @@ impl PgDb {
         };
         let now = chrono::Utc::now().to_rfc3339();
         let session: Option<i32> = session_num.map(|s| s as i32);
+        // tokio_postgres requires concrete Option<String> (not Option<&str>) so
+        // the parameter type is inferred as `text` rather than failing with
+        // "serializing parameter 2" when NULL is passed.
+        let resolution_owned: Option<String> = resolution.map(|s| s.to_owned());
+        let status_owned: String = status.to_owned();
+        let id_owned: String = id.to_owned();
 
+        // Explicit `$N::text` / `$N::int4` casts force PG to infer parameter
+        // types up front so tokio_postgres can pre-encode `None` as a typed
+        // NULL. Without these casts COALESCE($2, resolution) gives $2 no
+        // inherent type and tokio_postgres errors with "error serializing
+        // parameter N" the moment we pass `None`.
         conn.execute(
-            "UPDATE task_run_findings SET status = $1, resolution = COALESCE($2, resolution), resolved_at = COALESCE($3, resolved_at), resolved_in_session = COALESCE($4, resolved_in_session), updated_at = $5 WHERE id = $6",
+            "UPDATE task_run_findings SET status = $1::text, resolution = COALESCE($2::text, resolution), resolved_at = COALESCE($3::text::timestamptz, resolved_at), resolved_in_session = COALESCE($4::int4, resolved_in_session), updated_at = $5::text::timestamptz WHERE id = $6::text",
             &[
-                &status as &(dyn tokio_postgres::types::ToSql + Sync),
-                &resolution as &(dyn tokio_postgres::types::ToSql + Sync),
+                &status_owned as &(dyn tokio_postgres::types::ToSql + Sync),
+                &resolution_owned as &(dyn tokio_postgres::types::ToSql + Sync),
                 &resolved_at as &(dyn tokio_postgres::types::ToSql + Sync),
                 &session as &(dyn tokio_postgres::types::ToSql + Sync),
                 &now as &(dyn tokio_postgres::types::ToSql + Sync),
-                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &id_owned as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
         ).await.map_err(|e| format!("PG update_finding_status: {}", e))?;
 
@@ -69,6 +80,46 @@ impl PgDb {
             .map_err(|e| format!("PG get_finding: {}", e))?;
 
         Ok(row.map(|r| pg_row_to_finding(&r)))
+    }
+
+    /// List findings across all task runs, optionally filtered by status and/or
+    /// category. `limit` is clamped to [1, 500]; `offset` is non-negative.
+    /// Returns rows ordered by `detected_at DESC` (most recent first).
+    pub async fn list_findings(
+        &self,
+        status: Option<&str>,
+        category: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Finding>, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let status_owned: Option<String> = status.map(|s| s.to_owned());
+        let category_owned: Option<String> = category.map(|s| s.to_owned());
+
+        // Use COALESCE-style NULL guards so a single prepared statement covers
+        // every filter combination without dynamic SQL.
+        let sql = r#"SELECT id, task_run_id, detected_in_session, category, severity, status,
+                       action_type, title, description, resolution, file_path, line_number,
+                       column_number, code_snippet, signature_hash, needs_input, question,
+                       input_options, user_response, detected_at, resolved_at,
+                       resolved_in_session, updated_at
+                FROM task_run_findings
+                WHERE ($1::text IS NULL OR status = $1)
+                  AND ($2::text IS NULL OR category = $2)
+                ORDER BY detected_at DESC
+                LIMIT $3 OFFSET $4"#;
+
+        let rows = conn
+            .query(sql, &[&status_owned, &category_owned, &limit, &offset])
+            .await
+            .map_err(|e| format!("PG list_findings: {}", e))?;
+
+        Ok(rows.iter().map(pg_row_to_finding).collect())
     }
 
     /// Get all findings for a task run.

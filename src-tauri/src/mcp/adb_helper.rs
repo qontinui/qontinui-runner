@@ -106,6 +106,23 @@ pub async fn list_devices() -> Vec<AdbDeviceInfo> {
     .unwrap_or_default()
 }
 
+/// Whether `serial` is currently listed by the local adb server as a device.
+///
+/// Used by the vision frame-source resolver to distinguish a real adb target
+/// from an arbitrary label that merely *looks* serial-shaped (e.g. `bogus-id`).
+/// A device in the `offline`/`unauthorized` state still counts as "connected"
+/// here — it is a genuine adb target, just not ready; surfacing the adb-side
+/// error is more useful than masking it as "unknown vision target".
+///
+/// Returns `false` when adb is unreachable or the serial is absent.
+pub async fn is_connected_device(serial: &str) -> bool {
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return false;
+    }
+    list_devices().await.iter().any(|d| d.serial == serial)
+}
+
 fn parse_device_line(line: &str) -> AdbDeviceInfo {
     let parts: Vec<&str> = line.split_whitespace().collect();
     let serial = parts.first().map(|s| (*s).to_string()).unwrap_or_default();
