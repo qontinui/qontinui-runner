@@ -86,14 +86,23 @@ impl FrameProvider for DeviceScreenshotSource {
 
         let client = reqwest::Client::builder()
             .timeout(SCREENSHOT_HTTP_TIMEOUT)
+            // A short connect timeout so a dead/unreachable host fails fast
+            // instead of stalling the whole vision call on the (longer) total
+            // read timeout.
+            .connect_timeout(Duration::from_secs(3))
             .build()
             .map_err(|e| format!("build screenshot client: {e}"))?;
 
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("device screenshot request to {url}: {e}"))?;
+        let resp = client.get(&url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                format!(
+                    "device screenshot at {url} did not respond within {SCREENSHOT_HTTP_TIMEOUT:?} \
+                     — the device app may be backgrounded or its screen off"
+                )
+            } else {
+                format!("device screenshot request to {url}: {e}")
+            }
+        })?;
         if !resp.status().is_success() {
             return Err(format!(
                 "device screenshot {url} returned HTTP {}",
@@ -119,6 +128,29 @@ impl FrameProvider for DeviceScreenshotSource {
 fn frame_from_screenshot_json(body: &serde_json::Value) -> Result<Frame, String> {
     // Prefer the `data` envelope; fall back to a flat top-level object.
     let payload = body.get("data").unwrap_or(body);
+
+    // Before treating a missing `screenshot` field as "no provider", check for
+    // an explicit failure envelope. A backgrounded phone / screen-off device
+    // answers the request but reports `success: false` and/or a non-empty
+    // `error`; relaying the device's own reason is far more useful than the
+    // misleading "no screenshotProvider configured" fallback below. Look at
+    // both the `data` envelope and the top level (the failure flag often lives
+    // at the top while a `data` object may be absent or empty).
+    let explicit_failure = |v: &serde_json::Value| -> Option<String> {
+        let success_false = v.get("success").and_then(|s| s.as_bool()) == Some(false);
+        let error_text = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .filter(|s| !s.trim().is_empty());
+        if success_false || error_text.is_some() {
+            Some(error_text.unwrap_or("unknown error").to_string())
+        } else {
+            None
+        }
+    };
+    if let Some(error) = explicit_failure(body).or_else(|| explicit_failure(payload)) {
+        return Err(format!("device screenshot capture failed: {error}"));
+    }
 
     let b64 = payload
         .get("screenshot")
@@ -292,6 +324,44 @@ mod tests {
         assert!(
             err.contains("screenshotProvider"),
             "error should name the missing provider, got: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_failure_envelope_relays_device_error() {
+        // A backgrounded / screen-off device answers the request but reports an
+        // explicit failure. We must surface the device's own reason, NOT the
+        // misleading "no screenshotProvider configured" fallback.
+        let body = serde_json::json!({ "success": false, "error": "app not foregrounded" });
+        let err = frame_from_screenshot_json(&body).expect_err("must error");
+        assert!(
+            err.contains("capture failed"),
+            "error should say capture failed, got: {err}"
+        );
+        assert!(
+            err.contains("app not foregrounded"),
+            "error should relay the device's reason, got: {err}"
+        );
+        // It must NOT misreport as a missing-provider condition.
+        assert!(
+            !err.contains("screenshotProvider"),
+            "an explicit device failure must not be reported as a missing provider, got: {err}"
+        );
+    }
+
+    #[test]
+    fn success_shaped_without_screenshot_reports_missing_provider() {
+        // A response that looks successful (no failure flag, no error) but
+        // simply lacks a `screenshot` field is the genuine no-provider case.
+        let body = serde_json::json!({ "success": true, "data": { "width": 100 } });
+        let err = frame_from_screenshot_json(&body).expect_err("must error");
+        assert!(
+            err.contains("screenshotProvider"),
+            "error should name the missing provider, got: {err}"
+        );
+        assert!(
+            !err.contains("capture failed"),
+            "a missing field is not an explicit capture failure, got: {err}"
         );
     }
 
