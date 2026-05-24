@@ -1153,7 +1153,7 @@ mod tests {
         // A Started row is queued for the drain loop.
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].event_kind, SessionEventKind::Started);
+        assert_eq!(pending[0].event_kind, SessionEventKind::Started.as_str());
     }
 
     #[tokio::test]
