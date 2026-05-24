@@ -5,7 +5,7 @@
  * Active operations (capture, storage cleanup) have been moved to dedicated tabs.
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
 import { GeneralSettings } from "./GeneralSettings";
@@ -102,6 +102,43 @@ const SETTINGS_TABS = [
 
 const VALID_TABS = SETTINGS_TABS.map((t) => t.id);
 
+/**
+ * Sub-tab id → main `MainTabId` id mapping for the `ui-bridge-set-tab` event
+ * that mirrors the sub-tab into the global activeTab so `/control/tabs`
+ * reports the right value after a sub-tab click.
+ *
+ * Most sub-tabs map by simple `settings-${id}` prefix concatenation; the
+ * outliers (where the SETTINGS_TABS id and the MainTabId stem disagree) are
+ * listed explicitly. Update both lists when adding a new sub-tab. Iter-2
+ * item 1: manual-test-loop.
+ */
+const SUB_TAB_TO_MAIN_TAB: Record<SettingsTab, string> = {
+  account: "settings-account",
+  "backend-connection": "settings-backend-connection",
+  ai: "settings-ai",
+  agentic: "settings-agentic",
+  "self-healing": "settings-self-healing",
+  "world-state-verifier": "settings-world-state-verifier",
+  playwright: "settings-playwright",
+  mobile: "settings-mobile",
+  discovery: "settings-discovery",
+  mcp: "settings-mcp",
+  "log-sources": "settings-log-sources",
+  "execution-variables": "settings-execution-variables",
+  notifications: "settings-notifications",
+  general: "settings-general",
+  storage: "settings-storage",
+  backup: "settings-backup",
+  instances: "settings-instances",
+  otel: "settings-otel",
+  containers: "settings-containers",
+  security: "settings-security",
+  "lock-yield": "settings-lock-yield",
+  // SETTINGS_TABS id is "advanced" (label "Debug"); MainTabId is "settings-debug"
+  advanced: "settings-debug",
+  updates: "settings-updates",
+};
+
 function migrateStoredTab(stored: string | null): SettingsTab {
   if (!stored) return "backend-connection";
   if ((VALID_TABS as readonly string[]).includes(stored)) {
@@ -111,12 +148,39 @@ function migrateStoredTab(stored: string | null): SettingsTab {
 }
 
 export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps) {
-  const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
+  const [activeTab, setActiveTabRaw] = useState<SettingsTab>(() => {
     if (defaultTab && (VALID_TABS as readonly string[]).includes(defaultTab)) {
       return defaultTab as SettingsTab;
     }
     return migrateStoredTab(instanceStorage.getItem(STORAGE_KEY));
   });
+
+  /**
+   * Wraps `setActiveTabRaw` so a sub-tab switch ALSO updates the runner's
+   * top-level activeTab (read by `/control/tabs`).
+   *
+   * Iter-1 added the sub-tab nav buttons but their onClick only set the
+   * local component state; the runner's main `activeTab` (the value
+   * `useAppNavigation` persists into ACTIVE_TAB_STORAGE_KEY and `/control/tabs`
+   * surfaces) stayed at `"settings"` forever. UI Bridge consumers couldn't
+   * tell which sub-panel was on screen — manual-test-loop iter 2 item 1.
+   *
+   * We mirror the sub-tab id into the global tab id by firing the same
+   * `ui-bridge-set-tab` window event that the F4 `tab_activate` handler
+   * already dispatches; `useAppNavigation` listens for it and calls
+   * `setActiveTabAndPersist("settings-<subtab>")`. The id form
+   * `settings-<subtab>` matches the existing `MainTabId` union in
+   * `tab-types.ts` (e.g. `settings-account`, `settings-ai`, `settings-mobile`).
+   */
+  const setActiveTab = useCallback((next: SettingsTab) => {
+    setActiveTabRaw(next);
+    const mainTabId = SUB_TAB_TO_MAIN_TAB[next] ?? `settings-${next}`;
+    window.dispatchEvent(
+      new CustomEvent<{ tab: string }>("ui-bridge-set-tab", {
+        detail: { tab: mainTabId },
+      }),
+    );
+  }, []);
 
   // Sync with defaultTab prop when it changes (from navigation)
   useEffect(() => {
@@ -242,6 +306,41 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
 
   return (
     <div className="h-full flex flex-col p-4 gap-3 overflow-hidden">
+      {/*
+        Sub-tab navigation. Without this bar the Settings page renders only
+        the currently active sub-panel and gives the user no way to switch
+        between Account / AI / Storage / etc. from inside the Settings tab —
+        they had to use the sidebar one row per sub-tab. The bar lets a single
+        `settings`-tab activation see and reach every subsection.
+
+        Clicking a button calls our wrapping `setActiveTab` which both flips
+        local state AND fires `ui-bridge-set-tab` so the runner's main
+        activeTab (the one surfaced at GET /control/tabs) tracks the sub-tab.
+      */}
+      <nav
+        aria-label="Settings sub-tabs"
+        className="flex flex-wrap gap-1 border-b border-zinc-700 pb-2"
+      >
+        {SETTINGS_TABS.map((tab) => {
+          const isActive = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={isActive}
+              onClick={() => setActiveTab(tab.id)}
+              className={`px-3 py-1 rounded text-sm transition-colors ${
+                isActive
+                  ? "bg-blue-600 text-white"
+                  : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+              }`}
+            >
+              {tab.label}
+            </button>
+          );
+        })}
+      </nav>
       <div className="flex-1 overflow-y-auto scrollbar-dark">{settingsContent}</div>
     </div>
   );
