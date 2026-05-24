@@ -147,8 +147,7 @@ impl GitOpBridge {
             message: op.message,
             metadata: op.metadata,
         };
-        if let Err(e) =
-            git_ops_client::record(&self.http, &base, &token, ctx.tenant_id, &req).await
+        if let Err(e) = git_ops_client::record(&self.http, &base, &token, ctx.tenant_id, &req).await
         {
             warn!(
                 "observable_bridge::git_op::emit record {} failed: {e}",
@@ -186,7 +185,9 @@ fn origin_url_basename(config_path: &Path) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_origin = trimmed.replace(' ', "").eq_ignore_ascii_case("[remote\"origin\"]");
+            in_origin = trimmed
+                .replace(' ', "")
+                .eq_ignore_ascii_case("[remote\"origin\"]");
             continue;
         }
         if in_origin {
@@ -206,10 +207,7 @@ fn origin_url_basename(config_path: &Path) -> Option<String> {
 /// → `repo`.
 fn repo_basename_from_url(url: &str) -> String {
     let url = url.trim().trim_end_matches('/');
-    let last = url
-        .rsplit(|c| c == '/' || c == ':')
-        .next()
-        .unwrap_or(url);
+    let last = url.rsplit(|c| c == '/' || c == ':').next().unwrap_or(url);
     last.strip_suffix(".git").unwrap_or(last).to_string()
 }
 
@@ -443,9 +441,7 @@ fn self_heal_hook(hooks_dir: &Path) {
     if backup.exists() {
         if let Err(e) = std::fs::rename(&backup, &pre_push) {
             // rename can fail across edge cases; fall back to copy+remove.
-            warn!(
-                "observable_bridge::git_op: self-heal restore rename failed ({e}); trying copy"
-            );
+            warn!("observable_bridge::git_op: self-heal restore rename failed ({e}); trying copy");
             if std::fs::copy(&backup, &pre_push).is_ok() {
                 let _ = std::fs::remove_file(&backup);
             }
@@ -484,13 +480,14 @@ fn install_hook(hooks_dir: &Path, push_file: &Path) -> bool {
     }
 
     if let Err(e) = std::fs::write(&pre_push, hook_body(push_file)) {
-        warn!(
-            "observable_bridge::git_op: write pre-push hook failed: {e}"
-        );
+        warn!("observable_bridge::git_op: write pre-push hook failed: {e}");
         return false;
     }
     make_executable(&pre_push);
-    debug!("observable_bridge::git_op: installed pre-push hook at {}", pre_push.display());
+    debug!(
+        "observable_bridge::git_op: installed pre-push hook at {}",
+        pre_push.display()
+    );
     true
 }
 
@@ -751,11 +748,7 @@ fn list_branch_refs(git_dir: &Path) -> std::collections::HashSet<String> {
     out
 }
 
-fn collect_branch_files(
-    base: &Path,
-    dir: &Path,
-    out: &mut std::collections::HashSet<String>,
-) {
+fn collect_branch_files(base: &Path, dir: &Path, out: &mut std::collections::HashSet<String>) {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(_) => return,
@@ -841,11 +834,10 @@ impl RunnerObservableBridge for GitOpBridge {
         // (2) notify-watch the .git dir (recursive: refs/heads/, logs/…).
         let (tx, rx) = mpsc::channel::<notify::Result<Event>>(512);
         let tx_git = tx.clone();
-        let mut git_watcher =
-            notify::recommended_watcher(move |res: notify::Result<Event>| {
-                let _ = tx_git.blocking_send(res);
-            })
-            .context("observable_bridge::git_op: build .git notify watcher")?;
+        let mut git_watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            let _ = tx_git.blocking_send(res);
+        })
+        .context("observable_bridge::git_op: build .git notify watcher")?;
         git_watcher
             .watch(&git_dir, RecursiveMode::Recursive)
             .with_context(|| format!("notify::watch on {}", git_dir.display()))?;
@@ -861,11 +853,10 @@ impl RunnerObservableBridge for GitOpBridge {
             );
         }
         let tx_push = tx.clone();
-        let mut push_watcher =
-            notify::recommended_watcher(move |res: notify::Result<Event>| {
-                let _ = tx_push.blocking_send(res);
-            })
-            .context("observable_bridge::git_op: build push-file notify watcher")?;
+        let mut push_watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            let _ = tx_push.blocking_send(res);
+        })
+        .context("observable_bridge::git_op: build push-file notify watcher")?;
         if let Err(e) = push_watcher.watch(&push_file, RecursiveMode::NonRecursive) {
             warn!(
                 "observable_bridge::git_op: watch push temp file failed: {e}; \
@@ -992,7 +983,8 @@ mod tests {
 
     #[test]
     fn parse_reflog_checkout_line() {
-        let line = "abc123 def456 Josh <j@x.io> 1716500001 +0000\tcheckout: moving from main to feature";
+        let line =
+            "abc123 def456 Josh <j@x.io> 1716500001 +0000\tcheckout: moving from main to feature";
         let e = parse_reflog_line(line).expect("parse");
         assert_eq!(e.new_sha, "def456");
         assert_eq!(e.verb, "checkout");
@@ -1062,9 +1054,18 @@ mod tests {
 
     #[test]
     fn repo_basename_handles_ssh_and_https() {
-        assert_eq!(repo_basename_from_url("git@github.com:qontinui/qontinui-runner.git"), "qontinui-runner");
-        assert_eq!(repo_basename_from_url("https://github.com/qontinui/qontinui-runner.git"), "qontinui-runner");
-        assert_eq!(repo_basename_from_url("https://github.com/qontinui/qontinui-runner"), "qontinui-runner");
+        assert_eq!(
+            repo_basename_from_url("git@github.com:qontinui/qontinui-runner.git"),
+            "qontinui-runner"
+        );
+        assert_eq!(
+            repo_basename_from_url("https://github.com/qontinui/qontinui-runner.git"),
+            "qontinui-runner"
+        );
+        assert_eq!(
+            repo_basename_from_url("https://github.com/qontinui/qontinui-runner"),
+            "qontinui-runner"
+        );
         assert_eq!(repo_basename_from_url("/local/path/myrepo/"), "myrepo");
     }
 
@@ -1078,7 +1079,10 @@ mod tests {
             "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = git@github.com:qontinui/qontinui-runner.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
         )
         .unwrap();
-        assert_eq!(origin_url_basename(&config).as_deref(), Some("qontinui-runner"));
+        assert_eq!(
+            origin_url_basename(&config).as_deref(),
+            Some("qontinui-runner")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1137,7 +1141,10 @@ mod tests {
         self_heal_hook(&hooks);
         assert!(!backup.exists(), "backup should be consumed");
         let restored = std::fs::read_to_string(&pre_push).unwrap();
-        assert!(restored.contains("user hook"), "user hook should be restored");
+        assert!(
+            restored.contains("user hook"),
+            "user hook should be restored"
+        );
         assert!(!restored.contains(HOOK_SENTINEL));
         std::fs::remove_dir_all(&hooks).ok();
     }
