@@ -56,6 +56,8 @@ pub mod discovery;
 pub mod dom_capture;
 pub mod entity_profiles_api;
 pub mod envelope;
+#[cfg(debug_assertions)]
+pub mod envelope_audit;
 pub mod error_monitor;
 pub mod executor;
 pub mod extraction;
