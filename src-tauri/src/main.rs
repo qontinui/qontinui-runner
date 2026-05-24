@@ -1080,6 +1080,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution_variables::get_resolved_execution_context,
             commands::execution_variables::save_execution_variables_settings,
             commands::execution_variables::test_env_var,
+            commands::federation::get_federation_reports,
             commands::extraction::create_extraction_session,
             commands::extraction::export_state_structure,
             commands::extraction::export_training_data,

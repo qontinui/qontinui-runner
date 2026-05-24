@@ -88,6 +88,9 @@ export const PAGE_TO_TAB: Record<string, MainTabId> = {
   skills: "skills",
   help: "help",
   "accessibility-explorer": "accessibility-explorer",
+  // Memory Federation
+  "memory-federation": "memory-federation",
+  "admin/memory-federation": "memory-federation",
   // Legacy aliases
   ai: "run-ai-output",
   history: "runs",

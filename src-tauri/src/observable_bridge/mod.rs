@@ -68,6 +68,10 @@ pub struct SessionContext {
     /// Used by `reconcile` to diff against final state at session end.
     /// `None` until `pull` runs.
     pub post_pull_snapshot: Option<DirSnapshot>,
+    /// Count of files pulled from coord during the `pull` phase.
+    /// Populated by `MemoryBridge::pull`; read by `reconcile` to fill
+    /// the `ReconcileReport.pulled` field.
+    pub pulled_count: u32,
 }
 
 /// A single file's identity in a memory directory snapshot.
@@ -104,6 +108,9 @@ pub struct ReconcileReport {
     pub pulled: u32,
     pub unchanged: u32,
     pub failed: u32,
+    /// Names of files that failed during reconcile (for debugging).
+    #[serde(default)]
+    pub failed_names: Vec<String>,
 }
 
 /// The trait every federated observable category implements.

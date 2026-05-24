@@ -374,7 +374,7 @@ impl RunnerObservableBridge for MemoryBridge {
         };
 
         // Step 1: list coord's tenant pool.
-        let listing = match memory_client::list(&self.http, &base, &token).await {
+        let listing = match memory_client::list(&self.http, &base, &token, session_ctx.tenant_id).await {
             Ok(l) => l,
             Err(e) => {
                 warn!(
@@ -396,7 +396,7 @@ impl RunnerObservableBridge for MemoryBridge {
         let mut coord_names: HashSet<String> = HashSet::new();
         for summary in &listing.items {
             coord_names.insert(summary.name.clone());
-            let full = match memory_client::get(&self.http, &base, &token, &summary.name).await {
+            let full = match memory_client::get(&self.http, &base, &token, session_ctx.tenant_id, &summary.name).await {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(
@@ -440,7 +440,7 @@ impl RunnerObservableBridge for MemoryBridge {
                 written_by_agent: Some(session_ctx.session_id.to_string()),
                 written_by_device: Some(session_ctx.device_id.to_string()),
             };
-            if let Err(e) = memory_client::upsert(&self.http, &base, &token, &req).await {
+            if let Err(e) = memory_client::upsert(&self.http, &base, &token, session_ctx.tenant_id, &req).await {
                 warn!(
                     "observable_bridge::memory::pull: first-contact upsert {} failed: {e}",
                     fp.name
@@ -455,7 +455,28 @@ impl RunnerObservableBridge for MemoryBridge {
 
         // Step 4: re-snapshot — the post-pull baseline is what
         // `reconcile` diffs against at session end.
-        session_ctx.post_pull_snapshot = Some(snapshot_dir(&session_ctx.memory_dir)?);
+        let post_pull = snapshot_dir(&session_ctx.memory_dir)?;
+
+        // Compute pulled count: files that are new or changed compared
+        // to the pre-pull snapshot (i.e., files that coord wrote locally).
+        let mut pulled_count: u32 = 0;
+        for fp in &post_pull.files {
+            match local_pre.get(&fp.name) {
+                None => pulled_count = pulled_count.saturating_add(1), // new file
+                Some(prev) if prev.sha256 != fp.sha256 => {
+                    pulled_count = pulled_count.saturating_add(1); // changed file
+                }
+                _ => {} // unchanged
+            }
+        }
+        // Files deleted by tombstone also count as pulled changes.
+        for fp in &local_pre.files {
+            if post_pull.get(&fp.name).is_none() {
+                pulled_count = pulled_count.saturating_add(1);
+            }
+        }
+        session_ctx.pulled_count = pulled_count;
+        session_ctx.post_pull_snapshot = Some(post_pull);
         Ok(())
     }
 
@@ -485,12 +506,12 @@ impl RunnerObservableBridge for MemoryBridge {
                     written_by_agent: Some(session_ctx.session_id.to_string()),
                     written_by_device: Some(session_ctx.device_id.to_string()),
                 };
-                if let Err(e) = memory_client::upsert(&self.http, &base, &token, &req).await {
+                if let Err(e) = memory_client::upsert(&self.http, &base, &token, session_ctx.tenant_id, &req).await {
                     warn!("observable_bridge::memory::push upsert {name} failed: {e}");
                 }
             }
             ObservableChange::Deleted { name } => {
-                if let Err(e) = memory_client::delete(&self.http, &base, &token, &name).await {
+                if let Err(e) = memory_client::delete(&self.http, &base, &token, session_ctx.tenant_id, &name).await {
                     warn!("observable_bridge::memory::push delete {name} failed: {e}");
                 }
             }
@@ -534,6 +555,7 @@ impl RunnerObservableBridge for MemoryBridge {
         };
 
         let mut report = ReconcileReport::default();
+        report.pulled = session_ctx.pulled_count;
         let pre_names: HashSet<&str> = post_pull.files.iter().map(|f| f.name.as_str()).collect();
         let post_names: HashSet<&str> =
             post_session.files.iter().map(|f| f.name.as_str()).collect();
@@ -554,6 +576,7 @@ impl RunnerObservableBridge for MemoryBridge {
                         path.display()
                     );
                     report.failed = report.failed.saturating_add(1);
+                    report.failed_names.push(fp.name.clone());
                     continue;
                 }
             };
@@ -565,7 +588,7 @@ impl RunnerObservableBridge for MemoryBridge {
                 written_by_agent: Some(session_ctx.session_id.to_string()),
                 written_by_device: Some(session_ctx.device_id.to_string()),
             };
-            match memory_client::upsert(&self.http, &base, &token, &req).await {
+            match memory_client::upsert(&self.http, &base, &token, session_ctx.tenant_id, &req).await {
                 Ok(_) => report.pushed = report.pushed.saturating_add(1),
                 Err(e) => {
                     warn!(
@@ -573,13 +596,14 @@ impl RunnerObservableBridge for MemoryBridge {
                         fp.name
                     );
                     report.failed = report.failed.saturating_add(1);
+                    report.failed_names.push(fp.name.clone());
                 }
             }
         }
 
         // Deletes: name in pre_pull but gone now.
         for name in pre_names.difference(&post_names) {
-            match memory_client::delete(&self.http, &base, &token, name).await {
+            match memory_client::delete(&self.http, &base, &token, session_ctx.tenant_id, name).await {
                 Ok(_) => report.pushed = report.pushed.saturating_add(1),
                 Err(e) => {
                     warn!(
@@ -587,13 +611,14 @@ impl RunnerObservableBridge for MemoryBridge {
                         name
                     );
                     report.failed = report.failed.saturating_add(1);
+                    report.failed_names.push(name.to_string());
                 }
             }
         }
 
         info!(
-            "observable_bridge::memory::reconcile: pushed={} unchanged={} failed={}",
-            report.pushed, report.unchanged, report.failed
+            "observable_bridge::memory::reconcile: pushed={} pulled={} unchanged={} failed={}",
+            report.pushed, report.pulled, report.unchanged, report.failed
         );
         Ok(report)
     }

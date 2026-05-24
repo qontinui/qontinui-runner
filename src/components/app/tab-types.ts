@@ -102,7 +102,8 @@ export type MainTabId =
   | "project-explainer"
   | "wrappers"
   | "productivity"
-  | "regression";
+  | "regression"
+  | "memory-federation";
 
 const VALID_TAB_IDS: MainTabId[] = [
   "prompt-home",
@@ -207,6 +208,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "wrappers",
   "productivity",
   "regression",
+  "memory-federation",
 ];
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
@@ -322,6 +324,7 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   wrappers: "Wrappers",
   productivity: "Productivity",
   regression: "Regression",
+  "memory-federation": "Memory Federation",
 };
 
 /**
