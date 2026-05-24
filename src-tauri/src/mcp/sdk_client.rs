@@ -346,6 +346,33 @@ pub async fn dispatch_app_request_by_id(
         .map_err(dispatch_err_to_string)
 }
 
+/// Whether an SDK app is currently the active connection.
+///
+/// This is the exact condition `AppDispatcher::dispatch_active` uses to decide
+/// whether to relay over WebSocket/HTTP vs. return `DispatchError::NotConnected`
+/// (see `app_dispatch.rs`: `active_connection().ok_or(DispatchError::NotConnected)`).
+///
+/// Handlers use it to gate the IPC/self-webview fallback: when an SDK app IS
+/// connected and the relayed action *fails*, the failure must be surfaced to
+/// the caller — falling back to the runner's own Tauri webview would silently
+/// execute the action against the wrong UI and report bogus success. The
+/// IPC fallback is only legitimate when NO SDK app is connected (the
+/// runner-self case), mirroring the per-app-id snapshot path which already
+/// skips fallback for the same reason.
+async fn sdk_app_connected(state: &Arc<ApiState>) -> bool {
+    let guard = state.sdk_connection.lock().await;
+    manager_has_active(&guard)
+}
+
+/// Pure predicate over a locked `SdkConnectionManager`: is an SDK app the
+/// active connection? Extracted so the connected-vs-runner-self decision can
+/// be unit-tested without constructing a full `ApiState` (mirrors the
+/// `select_app_payload` extraction). This is the same `active_connection()`
+/// check `AppDispatcher::dispatch_active` uses to gate `NotConnected`.
+fn manager_has_active(manager: &SdkConnectionManager) -> bool {
+    manager.active_connection().is_some()
+}
+
 // =============================================================================
 // Handlers
 // =============================================================================
@@ -5900,7 +5927,13 @@ async fn handle_click_by_text(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // An SDK app is connected but rejected the relayed action — surface
+            // the real error instead of silently retargeting the runner's own
+            // webview. Only fall back to IPC when NO SDK app is connected.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "click_by_text", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -5927,7 +5960,12 @@ async fn handle_click_by_selector(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "click_by_selector", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -5954,7 +5992,12 @@ async fn handle_type_into(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "type_into", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -5981,7 +6024,12 @@ async fn handle_read_value(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "read_value", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -6008,7 +6056,12 @@ async fn handle_find_by_text(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "find_by_text", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -6079,7 +6132,12 @@ async fn handle_navigate_by_adapter(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(e) => {
+            // SDK app connected but rejected the action — surface the error
+            // rather than falling back to the runner's own webview.
+            if sdk_app_connected(&state).await {
+                return Json(serde_json::json!({ "success": false, "error": e }));
+            }
             let payload = serde_json::json!({ "params": body });
             match ui_bridge_request_sync(&state, "navigate_by_adapter", payload).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -6671,5 +6729,75 @@ mod tests {
         let q = parse(r#"{"task_run_id":42}"#);
         assert_eq!(q.task_run_id, Some(42));
         assert_eq!(q.tab_id, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Connected-SDK vs. runner-self fallback gate
+    //
+    // Regression guard: when an SDK app IS connected and a relayed command
+    // action fails, the handlers must surface the error — NOT silently fall
+    // back to the runner's own Tauri webview (which would execute against the
+    // wrong UI and report bogus success). `manager_has_active` is the exact
+    // predicate the handlers use to choose; it must mirror
+    // `AppDispatcher::dispatch_active`'s `active_connection()` NotConnected gate.
+    // ------------------------------------------------------------------
+
+    fn manager_with_active_conn(app_id: &str, url: &str) -> SdkConnectionManager {
+        let mut mgr = SdkConnectionManager::new();
+        let info = SdkAppInfo {
+            app_id: app_id.to_string(),
+            app_name: "t".into(),
+            app_type: "web".into(),
+            framework: None,
+            version: None,
+            capabilities: vec![],
+            port: 0,
+        };
+        let conn = SdkConnection {
+            app_url: url.to_string(),
+            base_path: "".into(),
+            app_info: info,
+            client: reqwest::Client::new(),
+            connected_at: 0,
+            transport_kind: None,
+            physical_device_id: None,
+        };
+        mgr.connections.insert(url.to_string(), conn);
+        mgr.active_url = Some(url.to_string());
+        mgr
+    }
+
+    #[test]
+    fn manager_has_active_false_when_no_connection() {
+        // No SDK app connected => fallback to runner-self IPC is legitimate.
+        let mgr = SdkConnectionManager::new();
+        assert!(
+            !manager_has_active(&mgr),
+            "empty manager must report no active SDK app (IPC fallback allowed)"
+        );
+    }
+
+    #[test]
+    fn manager_has_active_true_when_app_connected() {
+        // SDK app connected => a failed relayed action MUST surface the error,
+        // not fall back to the runner's own webview.
+        let mgr = manager_with_active_conn("wapp", "http://127.0.0.1:3000");
+        assert!(
+            manager_has_active(&mgr),
+            "connected SDK app must report active (error surfaced, no IPC fallback)"
+        );
+    }
+
+    #[test]
+    fn manager_has_active_false_when_connection_present_but_inactive() {
+        // A registered connection with no active_url (e.g. after disconnecting
+        // the active one) is treated as not-connected — matches
+        // `active_connection()` returning None.
+        let mut mgr = manager_with_active_conn("wapp", "http://127.0.0.1:3000");
+        mgr.active_url = None;
+        assert!(
+            !manager_has_active(&mgr),
+            "no active_url must report not-active even if a connection lingers"
+        );
     }
 }

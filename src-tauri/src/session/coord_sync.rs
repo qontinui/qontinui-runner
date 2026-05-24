@@ -1356,8 +1356,7 @@ mod tests {
 
         wait_until(Duration::from_secs(5), || {
             let r = rec.try_lock();
-            r.map(|g| g.deletes.iter().any(|d| *d == id))
-                .unwrap_or(false)
+            r.map(|g| g.deletes.contains(&id)).unwrap_or(false)
         })
         .await;
 
