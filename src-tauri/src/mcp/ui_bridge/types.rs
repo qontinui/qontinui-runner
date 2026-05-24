@@ -183,6 +183,16 @@ pub enum UiBridgeErrorCode {
     /// mirrors the `tab/activate` -> `knownTabs` and the action-name gate's
     /// envelope shape.
     InvalidState,
+    /// The `tabId` on a `tab/activate` request is not in the static
+    /// `VALID_TAB_IDS` registry. Issued as a flat HTTP 400 with
+    /// `context.knownTabs: [...]` so callers can self-correct without
+    /// parsing prose. Loop iter-3 item 1 — previously the rejection
+    /// envelope had `error_detail = None`, so `error_detail.code` came
+    /// back as `null` even though the `error` prose and `data.knownTabs`
+    /// payload were present. Now the machine-readable code lives in
+    /// `error_detail.code = "INVALID_TAB_ID"` to match the rest of the
+    /// envelope taxonomy.
+    InvalidTabId,
     // System errors
     InternalError,
 }
@@ -356,6 +366,48 @@ impl UiBridgeError {
         }
     }
 
+    /// Reject `tab/activate` when the `tabId` parameter is not in the
+    /// static `VALID_TAB_IDS` registry. Loop iter-3 item 1 — previously
+    /// the handler returned `ApiResponse { error_detail: None, ... }`,
+    /// so `error_detail.code` came back as `null` even though the prose
+    /// `error` and `data.knownTabs` payload were present. Now: HTTP 400
+    /// with `error_detail.code: "INVALID_TAB_ID"` and `context.knownTabs`
+    /// for self-correction, matching the rest of the envelope taxonomy.
+    pub fn invalid_tab_id(provided: &str, known: &[&str]) -> Self {
+        Self {
+            code: UiBridgeErrorCode::InvalidTabId,
+            message: format!("Unknown tabId: \"{}\"", provided),
+            recovery: Some(RecoveryHint::Unrecoverable),
+            context: Some(serde_json::json!({
+                "code": "INVALID_TAB_ID",
+                "tabId": provided,
+                "knownTabs": known,
+            })),
+        }
+    }
+
+    /// Reject `GET /control/element/:id` when the registry has no entry
+    /// for the requested element id. Loop iter-3 item 3 — previously
+    /// `wrap_ipc_result` produced `ApiResponse { success:false, error_detail
+    /// .code: null, error: "" }` on the empty-error case because the
+    /// frontend's `get_element` IPC handler returns `{ success:false,
+    /// error: "" }` for unknown ids (no element to report on). Now: HTTP
+    /// 400 with `error_detail.code: "ELEMENT_NOT_FOUND"` and
+    /// `context.elementId` carrying the rejected id, matching the rest of
+    /// the envelope taxonomy and the existing `element_not_found(selector)`
+    /// factory.
+    pub fn element_not_found_by_id(element_id: &str) -> Self {
+        Self {
+            code: UiBridgeErrorCode::ElementNotFound,
+            message: format!("No element with id {}", element_id),
+            recovery: Some(RecoveryHint::Resnapshot),
+            context: Some(serde_json::json!({
+                "code": "ELEMENT_NOT_FOUND",
+                "elementId": element_id,
+            })),
+        }
+    }
+
     pub fn element_not_visible(selector: &str, total_found: usize) -> Self {
         Self {
             code: UiBridgeErrorCode::ElementNotVisible,
@@ -462,7 +514,83 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
         UiBridgeErrorCode::InvalidParam => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::MissingParam => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::InvalidState => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::InvalidTabId => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::ActionNotSupported => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::InternalError => RecoveryHint::Unrecoverable,
+    }
+}
+
+#[cfg(test)]
+mod iter3_factory_tests {
+    //! Iter-3 — lock down the envelope shape of the new error-code
+    //! factories so the wire contracts callers depend on can't drift.
+    //! The `UiBridgeError` struct serialises to JSON with camelCase
+    //! field names; the `code` is the SCREAMING_SNAKE_CASE wire string;
+    //! the `context` carries structured self-correction payload.
+
+    use super::{UiBridgeError, UiBridgeErrorCode};
+
+    /// Iter-3 item 3 — `element_not_found_by_id` produces a
+    /// `ELEMENT_NOT_FOUND`-coded detail whose `context.elementId`
+    /// echoes the rejected id. Locks down what callers see in
+    /// `error_detail.code` and `error_detail.context.elementId`
+    /// when `GET /control/element/:id` rejects an unknown id.
+    #[test]
+    fn element_not_found_by_id_envelope_shape() {
+        let detail = UiBridgeError::element_not_found_by_id("does-not-exist");
+        assert!(
+            matches!(detail.code, UiBridgeErrorCode::ElementNotFound),
+            "code must be ElementNotFound"
+        );
+        assert!(
+            detail.message.contains("does-not-exist"),
+            "message echoes the rejected element id, got: {}",
+            detail.message
+        );
+        let ctx = detail
+            .context
+            .as_ref()
+            .expect("context must carry the structured payload");
+        assert_eq!(
+            ctx.get("code").and_then(|v| v.as_str()),
+            Some("ELEMENT_NOT_FOUND")
+        );
+        assert_eq!(
+            ctx.get("elementId").and_then(|v| v.as_str()),
+            Some("does-not-exist")
+        );
+    }
+
+    /// Iter-3 item 1 — `invalid_tab_id` factory contract: code is
+    /// `INVALID_TAB_ID`, `context.tabId` echoes the rejected id, and
+    /// `context.knownTabs` enumerates the full registry. This is the
+    /// canonical structured surface; the prose `error` field is for
+    /// human-readable debugging.
+    #[test]
+    fn invalid_tab_id_factory_envelope_shape() {
+        let known = &["specs", "fleet", "terminal"];
+        let detail = UiBridgeError::invalid_tab_id("not-a-tab", known);
+        assert!(
+            matches!(detail.code, UiBridgeErrorCode::InvalidTabId),
+            "code must be InvalidTabId"
+        );
+        assert!(
+            detail.message.contains("not-a-tab"),
+            "message echoes the rejected id"
+        );
+        let ctx = detail
+            .context
+            .as_ref()
+            .expect("context must carry the structured payload");
+        assert_eq!(
+            ctx.get("code").and_then(|v| v.as_str()),
+            Some("INVALID_TAB_ID")
+        );
+        let known_arr = ctx
+            .get("knownTabs")
+            .and_then(|v| v.as_array())
+            .expect("context.knownTabs must be an array");
+        let names: Vec<&str> = known_arr.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(names, vec!["specs", "fleet", "terminal"]);
     }
 }

@@ -297,6 +297,34 @@ pub async fn ui_bridge_get_element_handler(
         data
     });
 
+    // Iter-3 item 3 — detect the "unknown element id" IPC failure shape
+    // BEFORE handing off to `wrap_ipc_result`. The frontend's `get_element`
+    // IPC handler returns `{ success: false, error: "" }` (or a generic
+    // "element not found" prose) for ids that aren't in the registry; the
+    // generic `wrap_ipc_result` path then forwards an empty `error` and
+    // `error_detail.code = INTERNAL_ERROR` (the default of
+    // `classify_transport_error` for unknown patterns), making the rejection
+    // indistinguishable from a true transport failure. Detect the shape
+    // here and override with the canonical `ELEMENT_NOT_FOUND` envelope so
+    // callers see `error_detail.code = "ELEMENT_NOT_FOUND"` and
+    // `context.elementId` for self-correction.
+    if let Ok(ref data) = filtered_result {
+        if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            let error_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            let is_not_found_shape = error_msg.is_empty()
+                || error_msg.to_lowercase().contains("not found")
+                || error_msg.to_lowercase().contains("no element");
+            if is_not_found_shape {
+                let detail = super::types::UiBridgeError::element_not_found_by_id(&id);
+                let message = detail.message.clone();
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(crate::mcp::types::api_error_detailed(message, detail)),
+                ));
+            }
+        }
+    }
+
     wrap_ipc_result(filtered_result)
 }
 
@@ -1920,7 +1948,54 @@ pub async fn ui_bridge_execute_component_action_handler(
         };
     }
 
-    wrap_ipc_result(ui_bridge_request_sync(&state, "execute_component_action", payload).await)
+    // Iter-3 item 4 — detect "component not found" / "action not found"
+    // inner-failure shapes BEFORE wrap_ipc_result flattens them to the
+    // default INTERNAL_ERROR envelope. The frontend's
+    // `execute_component_action` IPC handler returns
+    // `{ success:false, error: "Component not found: ..." }` or
+    // `{ success:false, error: "Action <X> not found on component <Y>" }`
+    // for the two miss cases; both should map to the canonical
+    // `ELEMENT_NOT_FOUND` taxonomy entry (the closest available — the
+    // canonical schema has no `UB-COMPONENT-NOT-AVAILABLE` yet) instead
+    // of being misclassified as a transport-level INTERNAL_ERROR.
+    let ipc_result = ui_bridge_request_sync(&state, "execute_component_action", payload).await;
+    if let Ok(ref data) = ipc_result {
+        if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            let error_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            let is_component_missing = extract_error_code(data)
+                == Some(CanonicalCode::UbElemNotFound)
+                || error_msg.to_lowercase().contains("component not found")
+                || error_msg.to_lowercase().contains("not registered");
+            let is_action_missing = error_msg.to_lowercase().contains("action")
+                && (error_msg.to_lowercase().contains("not found")
+                    || error_msg.to_lowercase().contains("unknown"));
+            if is_component_missing {
+                let detail = UiBridgeError::element_not_found(&id);
+                let message = format!("Component not found: {}", id);
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(api_error_detailed(message, detail)),
+                ));
+            }
+            if is_action_missing {
+                let detail = UiBridgeError {
+                    code: super::types::UiBridgeErrorCode::ActionNotSupported,
+                    message: error_msg.to_string(),
+                    recovery: Some(super::types::RecoveryHint::Unrecoverable),
+                    context: Some(serde_json::json!({
+                        "componentId": id,
+                        "actionId": action_id,
+                    })),
+                };
+                let message = detail.message.clone();
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error_detailed(message, detail)),
+                ));
+            }
+        }
+    }
+    wrap_ipc_result(ipc_result)
 }
 
 /// Discover controllable elements in the UI.
