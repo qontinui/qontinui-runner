@@ -1819,9 +1819,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let _drain = registry.coord_sync().start_drain_task();
                 let _heartbeat = registry.coord_sync().start_heartbeat_task();
                 // Plan §Phase 7 — start the cross-machine handoff receiver.
-                // Polls coord for handoffs addressed to this device and
-                // materializes each as a child session (parent_session_id
-                // = source). JoinHandle dropped — lives for the process.
+                // Push-driven: subscribes to coord's `/ws` Redis fan-out
+                // (`qontinui.sessions.*`) for handoff_request frames
+                // addressed to this device + a one-shot catch-up GET on
+                // every (re)connect, then materializes each as a child
+                // session (parent_session_id = source). JoinHandle dropped
+                // — lives for the process.
                 let _handoff_rx = session::handoff::start_receiver_task(registry.clone());
                 app.manage(registry);
 
