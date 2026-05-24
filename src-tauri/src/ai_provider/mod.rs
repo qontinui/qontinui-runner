@@ -10,6 +10,7 @@
 //! Other modules should use this module to interact with AI providers.
 
 pub mod account_usage;
+pub(crate) mod anthropic_auth;
 pub mod cache_aware_builder;
 pub mod circuit_breaker;
 mod claude_api;
