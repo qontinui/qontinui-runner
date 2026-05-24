@@ -422,14 +422,15 @@ pub(super) fn run_claude_api_cached(
     let request_body = builder.build(&prompt.user_message);
 
     retry_with_backoff("Claude API (cached)", || {
-        let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send();
+        let request = super::anthropic_auth::apply_blocking(
+            client.post("https://api.anthropic.com/v1/messages"),
+            &api_key,
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
+        .header("content-type", "application/json")
+        .json(&request_body);
+        let response = request.send();
 
         match response {
             Ok(resp) => {

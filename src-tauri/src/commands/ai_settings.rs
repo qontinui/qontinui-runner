@@ -1083,6 +1083,27 @@ pub(crate) fn read_oauth_token(config_dir: &str) -> Result<String, String> {
         .ok_or_else(|| "No accessToken in credentials".to_string())
 }
 
+/// Whether the OAuth credentials at `creds_path` carry an `expiresAt` that is
+/// already in the past. Returns `false` on any read/parse failure or when the
+/// field is absent — callers fall back to the existing error-surfacing path.
+pub(crate) fn is_oauth_token_expired(creds_path: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(creds_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    let expires_at_ms = json["claudeAiOauth"]["expiresAt"].as_i64().unwrap_or(0);
+    if expires_at_ms <= 0 {
+        return false;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    now_ms >= expires_at_ms
+}
+
 /// Probe a single account for its weekly rate limit utilization.
 ///
 /// Makes a minimal API call (1 token, cheapest model) and reads the
@@ -1093,6 +1114,16 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| config_dir.clone());
+
+    // Pre-flight: if the stored OAuth token is already expired, attempt a
+    // silent refresh BEFORE issuing the probe. Mirrors the warm-path discipline
+    // at `claude_api_warm.rs:174-188`. Refresh failure is non-fatal — we still
+    // try the probe with whatever token we have so the caller sees a real auth
+    // error rather than a swallowed "couldn't refresh."
+    let creds_path = std::path::PathBuf::from(&config_dir).join(".credentials.json");
+    if is_oauth_token_expired(&creds_path) {
+        let _ = crate::ai_provider::oauth_refresh::try_refresh_credentials(&creds_path);
+    }
 
     let token = match read_oauth_token(&config_dir) {
         Ok(t) => t,
@@ -1113,20 +1144,23 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
         }
     };
 
-    // Make a minimal API call — Haiku with max_tokens=1 is the cheapest possible
+    // Make a minimal API call — Haiku with max_tokens=1 is the cheapest possible.
+    // OAuth tokens (`sk-ant-oat*`) must go via `Authorization: Bearer` +
+    // `anthropic-beta: oauth-2025-04-20`; API keys (`sk-ant-api*`) go via
+    // `x-api-key`. `anthropic_auth::apply_async` dispatches on token prefix.
     let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &token)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .send()
-        .await;
+    let request = crate::ai_provider::anthropic_auth::apply_async(
+        client.post("https://api.anthropic.com/v1/messages"),
+        &token,
+    )
+    .header("anthropic-version", "2023-06-01")
+    .header("content-type", "application/json")
+    .json(&serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]
+    }));
+    let response = request.send().await;
 
     match response {
         Ok(resp) => {

@@ -9,8 +9,9 @@
 //!   across calls (first call ~150ms handshake, subsequent <10ms pool reuse).
 //! - Credential resolution that prefers an explicit API key, then falls
 //!   through to the Claude CLI's OAuth `accessToken` read from
-//!   `.credentials.json`. Both credentials are sent as `x-api-key` — Anthropic
-//!   accepts either through that header.
+//!   `.credentials.json`. Auth header shape is dispatched by token prefix via
+//!   [`super::anthropic_auth`]: `sk-ant-oat*` → `Authorization: Bearer` +
+//!   `anthropic-beta: oauth-2025-04-20`; anything else → `x-api-key`.
 //! - The `anthropic-beta: prompt-caching-2024-07-31` header so `cache_control`
 //!   markers on the system prompt actually fire once Phase B fattens the
 //!   prompt past the ~1024-token Haiku minimum.
@@ -326,14 +327,15 @@ pub(crate) fn run_claude_api_warm(
     let client = warm_client();
 
     retry_with_backoff("Claude API (warm)", || {
-        let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", credential.token())
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send();
+        let request = super::anthropic_auth::apply_blocking(
+            client.post("https://api.anthropic.com/v1/messages"),
+            credential.token(),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
+        .header("content-type", "application/json")
+        .json(&request_body);
+        let response = request.send();
 
         match response {
             Ok(resp) => {
