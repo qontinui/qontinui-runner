@@ -242,6 +242,37 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
 
   return (
     <div className="h-full flex flex-col p-4 gap-3 overflow-hidden">
+      {/*
+        Sub-tab navigation. Without this bar the Settings page renders only the
+        currently active sub-panel and gives the user no way to switch between
+        Account / AI / Storage / etc. from inside the Settings tab — they had
+        to use the sidebar one row per sub-tab. The bar lets a single
+        `settings`-tab activation see and reach every subsection.
+      */}
+      <nav
+        aria-label="Settings sub-tabs"
+        className="flex flex-wrap gap-1 border-b border-zinc-700 pb-2"
+      >
+        {SETTINGS_TABS.map((tab) => {
+          const isActive = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={isActive}
+              onClick={() => setActiveTab(tab.id)}
+              className={`px-3 py-1 rounded text-sm transition-colors ${
+                isActive
+                  ? "bg-blue-600 text-white"
+                  : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"
+              }`}
+            >
+              {tab.label}
+            </button>
+          );
+        })}
+      </nav>
       <div className="flex-1 overflow-y-auto scrollbar-dark">{settingsContent}</div>
     </div>
   );

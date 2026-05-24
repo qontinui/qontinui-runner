@@ -351,15 +351,28 @@ function AppContent() {
     // `get_user_projects` invoke runs only after the access token is in
     // place. The retry-on-Not-authenticated inside `loadProjects` still
     // covers the rare keychain-write/read ordering blip.
+    // Phase 2 gate: only call the backend `get_user_projects` IPC on a
+    // Tier-2 (qontinui_account) runner. On Tier 0/1 the AuthProvider
+    // synthesizes a `local-guest` authStatus with `authenticated: true` so
+    // downstream UI keeps working, but the backend's `require_tier_2` gate
+    // would reject the call and `console.error` "[PROJECT_SELECTION] …
+    // Tier 0/1 (Local / LocalProvider) — Qontinui account commands are
+    // unavailable" — surfaced when opening LLM Analytics or anywhere else
+    // that triggers a render past this effect on a local-only runner.
+    // Gating on `tier === "qontinui_account"` keeps the error from firing
+    // and leaves projectSelection at its initial empty state, which the
+    // UI already handles (StatusIndicator + Capture / LLM Analytics tabs
+    // all degrade gracefully on a null selectedProjectId).
     if (
       auth.authStatus?.authenticated &&
       !auth.loading &&
-      !auth.devAutoLoginPending
+      !auth.devAutoLoginPending &&
+      auth.tier === "qontinui_account"
     ) {
       projectSelection.loadProjects();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- loadProjects changes with selectedProjectId; including it would reload projects on every selection change
-  }, [auth.authStatus?.authenticated, auth.loading, auth.devAutoLoginPending]);
+  }, [auth.authStatus?.authenticated, auth.loading, auth.devAutoLoginPending, auth.tier]);
 
   useEffect(() => {
     if (projectSelection.selectedProjectId && projectSelection.selectedProjectName) {

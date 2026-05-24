@@ -227,6 +227,7 @@ const VALID_TAB_IDS: &[&str] = &[
     "triggers",
     "tasks",
     "settings",
+    "settings-account",
     "settings-ai",
     "settings-agentic",
     "settings-self-healing",

@@ -1816,11 +1816,17 @@ pub async fn ui_bridge_get_last_discovered_handler(
 /// Supports optional query-string filters applied after the snapshot is
 /// fetched from the SDK:
 ///   - `?visibleOnly=true` — drop elements whose `state.visible` is false.
-///   - `?currentRouteOnly=true` — drop elements whose `page.pathname` (when
-///     present) does not match the snapshot-level page pathname. In a
-///     standard SPA every registered element belongs to the current route, so
-///     this is usually a no-op, but we forward it consistently for callers
-///     that rely on the filter existing end-to-end.
+///   - `?currentRouteOnly=true` — drop elements whose registry-captured
+///     `route` does not match the snapshot's top-level `route`. The SDK's
+///     `serializeRegisteredElement` mirrors `el.route` onto each snapshot
+///     element (captured at registration time), and `getControlSnapshot`
+///     emits the top-level `route` from `window.location.pathname`. We
+///     compare those two fields. Elements without a `route` field (e.g.
+///     unregistered DOM-fallback entries, or pre-route-capture shapes) are
+///     kept — better to over-include than silently drop. Historical note: an
+///     earlier implementation compared `el.page.pathname` against
+///     `data.page.pathname`, neither of which the SDK actually emits, so
+///     the filter no-op'd on every snapshot.
 ///   - `?withDisabledOnly=true` (manual-test remediation 2026-05-10
 ///     Item 2) — keep only elements that report disabled by ANY signal in
 ///     `state`: `disabled === true`, `ariaDisabled === "true"`, or
@@ -1890,14 +1896,16 @@ pub async fn ui_bridge_get_snapshot_handler(
             // since older snapshot shapes and DOM-fallback entries may not
             // populate it — better to over-include than silently drop.
             //
-            // `currentRouteOnly`: drop elements whose optional `page.pathname`
-            // disagrees with the snapshot's top-level `page.pathname`. This is
-            // a no-op in SPAs where the registry only holds current-route
-            // elements, but we forward it so the filter works end-to-end.
+            // `currentRouteOnly`: drop elements whose registry-captured
+            // `route` disagrees with the snapshot's top-level `route`. The
+            // SDK's `getControlSnapshot` emits the top-level `route` from
+            // `window.location.pathname`; `serializeRegisteredElement`
+            // copies the registration-time `el.route` onto each element.
+            // Elements with no `route` (DOM-fallback, older shapes) are
+            // kept — over-include rather than silently drop.
             if visible_only || current_route_only || with_disabled_only {
-                let snapshot_pathname = data
-                    .get("page")
-                    .and_then(|p| p.get("pathname"))
+                let snapshot_route = data
+                    .get("route")
                     .and_then(|p| p.as_str())
                     .map(|s| s.to_string());
 
@@ -1918,13 +1926,11 @@ pub async fn ui_bridge_get_snapshot_handler(
                                     }
                                 }
                                 if current_route_only {
-                                    if let (Some(el_path), Some(snap_path)) = (
-                                        el.get("page")
-                                            .and_then(|p| p.get("pathname"))
-                                            .and_then(|p| p.as_str()),
-                                        snapshot_pathname.as_deref(),
+                                    if let (Some(el_route), Some(snap_route)) = (
+                                        el.get("route").and_then(|p| p.as_str()),
+                                        snapshot_route.as_deref(),
                                     ) {
-                                        if el_path != snap_path {
+                                        if el_route != snap_route {
                                             return false;
                                         }
                                     }
