@@ -37,6 +37,11 @@ pub enum TransportHandle {
     /// transport just records the `task_run_id` for log/observation
     /// hookups.
     Workflow { task_run_id: String },
+    /// Externally-owned session (plan §Phase 10 dual-write). The real
+    /// process is owned by the legacy path; this handle carries the
+    /// legacy id purely for cross-referencing in the dashboard. No
+    /// transport op touches the underlying process.
+    External,
 }
 
 /// Errors raised by transports. Boxed so the variant set is open and each
@@ -82,3 +87,38 @@ pub trait Transport: Send + Sync + 'static {
 /// Convenience alias for the dyn-trait form used by the [`super::Session`]
 /// lifecycle.
 pub type DynTransport = Arc<dyn Transport>;
+
+/// No-op transport for **externally-owned** sessions (plan §Phase 10
+/// dual-write). The underlying process — a legacy `terminal_create` PTY
+/// or `claude_session` subprocess — is owned and torn down by the legacy
+/// path; the coord-native mirror created via
+/// [`super::SessionRegistry::register_external`] is pure bookkeeping for
+/// the dashboard. All [`Transport`] ops are no-ops: nothing to spawn,
+/// nothing to write, nothing to tear down (close is idempotent and never
+/// touches the real process — closing the mirror must not kill the
+/// operator's actual terminal).
+#[derive(Debug, Default)]
+pub struct ExternalTransport;
+
+impl Transport for ExternalTransport {
+    fn start(&self, _intent: &Intent) -> Result<TransportHandle, TransportError> {
+        // register_external never calls start (the real process is
+        // already running). Defined for trait completeness; returns an
+        // external handle so a misuse is observable rather than panicking.
+        Ok(TransportHandle::External)
+    }
+    fn write_input(&self, _handle: &TransportHandle, _bytes: &[u8]) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn resize(
+        &self,
+        _handle: &TransportHandle,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn close(&self, _handle: &TransportHandle) -> Result<(), TransportError> {
+        Ok(())
+    }
+}

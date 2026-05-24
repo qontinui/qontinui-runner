@@ -10,12 +10,14 @@ use tracing::{info, warn};
 use crate::claude_session::SessionManager;
 use crate::commands::CommandResponse;
 use crate::error::AppError;
+use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::{strip_ansi, TerminalManager};
 
 /// Create a new terminal session.
 #[tauri::command]
 pub fn terminal_create(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    session_registry: tauri::State<'_, Arc<SessionRegistry>>,
     app_handle: tauri::AppHandle,
     title: Option<String>,
     working_dir: Option<String>,
@@ -23,7 +25,41 @@ pub fn terminal_create(
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> Result<CommandResponse, String> {
-    let info = terminal_manager.create(title, working_dir, page_id, cols, rows, app_handle)?;
+    let info = terminal_manager.create(
+        title.clone(),
+        working_dir.clone(),
+        page_id,
+        cols,
+        rows,
+        app_handle,
+    )?;
+
+    // Plan §Phase 10 dual-write (DORMANT by default). When the tenant's
+    // `session_coordination_enabled` flag is flipped on, also register a
+    // coord-native mirror of this PTY so the dashboard renders it from
+    // `coord.sessions`. With the flag OFF — the default — this is a
+    // no-op: `mirror_legacy_session` returns immediately without touching
+    // the registry, the outbox, or coord, so the legacy terminal path
+    // behaves exactly as it does today (zero prod behavior change).
+    let purpose = title
+        .filter(|t| t.trim().len() >= 3)
+        .unwrap_or_else(|| "Terminal shell session".to_string());
+    let intent = Intent {
+        kind: SessionKind::TerminalShell,
+        purpose,
+        repo: None,
+        branch: None,
+        declared_paths: working_dir
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .collect(),
+        share_output: false,
+        redact_secrets: None,
+    };
+    let _mirror_id = session_registry
+        .inner()
+        .coord_sync()
+        .mirror_legacy_session(session_registry.inner(), intent);
 
     Ok(CommandResponse {
         success: true,

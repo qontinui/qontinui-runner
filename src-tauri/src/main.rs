@@ -1815,6 +1815,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // shutdown.
                 let _drain = registry.coord_sync().start_drain_task();
                 let _heartbeat = registry.coord_sync().start_heartbeat_task();
+                // Plan §Phase 10 — start the cutover-flag poll loop. Only
+                // spawns when an `active_tenant_id` resolved from
+                // machine.json; returns None (no task) otherwise. The
+                // flag defaults FALSE so dual-write stays dormant until an
+                // operator flips `session_coordination_enabled` for the
+                // tenant. JoinHandle dropped like the other loops.
+                let _flag_poll = registry.coord_sync().start_flag_poll_task();
                 app.manage(registry);
 
             }
