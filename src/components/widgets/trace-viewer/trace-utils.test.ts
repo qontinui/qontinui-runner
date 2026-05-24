@@ -3,9 +3,12 @@ import type { TraceSpan, TraceTreeNode } from "./types";
 import {
   buildFlameData,
   flattenFlameNodes,
+  flattenTree,
+  filterSpans,
   alignSpans,
   computeComparisonSummary,
   computeCriticalPath,
+  computeInsights,
   buildTraceTree,
   computeTokenInsights,
   getTokenHeat,
@@ -664,5 +667,96 @@ describe("deriveReplaySteps", () => {
     ];
     const steps = deriveReplaySteps(spans);
     expect(steps).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defensive guards for non-array input
+// ---------------------------------------------------------------------------
+
+describe("defensive guards for non-array input", () => {
+  it("computeInsights returns empty result for undefined", () => {
+    // @ts-expect-error - testing runtime defense against non-array input
+    const result = computeInsights(undefined);
+    expect(result.spanCount).toBe(0);
+    expect(result.totalDurationMs).toBe(0);
+  });
+
+  it("computeInsights returns empty result for object input", () => {
+    // @ts-expect-error - testing runtime defense against envelope object
+    const result = computeInsights({ spans: [] });
+    expect(result.spanCount).toBe(0);
+    expect(result.totalDurationMs).toBe(0);
+  });
+
+  it("computeInsights returns empty result for null", () => {
+    // @ts-expect-error
+    const result = computeInsights(null);
+    expect(result.spanCount).toBe(0);
+  });
+
+  it("buildTraceTree returns empty array for null", () => {
+    // @ts-expect-error
+    expect(buildTraceTree(null)).toEqual([]);
+  });
+
+  it("buildTraceTree returns empty array for undefined", () => {
+    // @ts-expect-error
+    expect(buildTraceTree(undefined)).toEqual([]);
+  });
+
+  it("buildTraceTree returns empty array for object", () => {
+    // @ts-expect-error
+    expect(buildTraceTree({ spans: [] })).toEqual([]);
+  });
+
+  it("flattenTree returns empty array for undefined", () => {
+    // @ts-expect-error
+    expect(flattenTree(undefined)).toEqual([]);
+  });
+
+  it("flattenTree returns empty array for null", () => {
+    // @ts-expect-error
+    expect(flattenTree(null)).toEqual([]);
+  });
+
+  it("filterSpans returns empty array for non-array", () => {
+    // @ts-expect-error
+    expect(filterSpans(undefined, { nameSearch: "", minDurationMs: null, phase: "all", status: "all" })).toEqual([]);
+  });
+
+  it("buildFlameData returns empty array for non-array", () => {
+    // @ts-expect-error
+    expect(buildFlameData(null)).toEqual([]);
+  });
+
+  it("flattenFlameNodes returns empty array for non-array", () => {
+    // @ts-expect-error
+    expect(flattenFlameNodes(undefined)).toEqual([]);
+  });
+
+  it("alignSpans returns empty array for non-array inputs", () => {
+    // @ts-expect-error
+    expect(alignSpans(null, [])).toEqual([]);
+    // @ts-expect-error
+    expect(alignSpans([], undefined)).toEqual([]);
+    // @ts-expect-error
+    expect(alignSpans(null, null)).toEqual([]);
+  });
+
+  it("computeTokenInsights returns empty result for non-array", () => {
+    // @ts-expect-error
+    const result = computeTokenInsights(undefined);
+    expect(result.totalInputTokens).toBe(0);
+    expect(result.totalOutputTokens).toBe(0);
+    expect(result.totalCostCents).toBe(0);
+    expect(result.phaseTokens).toEqual({});
+  });
+
+  it("computeTokenInsights returns empty result for object input", () => {
+    // @ts-expect-error
+    const result = computeTokenInsights({ spans: [] });
+    expect(result.totalInputTokens).toBe(0);
+    expect(result.maxInputTokens).toBe(0);
   });
 });
