@@ -561,107 +561,34 @@ fn qontinui_root_dir() -> Option<PathBuf> {
         .filter(|p| p.is_dir())
 }
 
-/// Resolve the coord MCP server path. Checks:
-/// 1. `COORD_MCP_SERVER_PATH` env var if set
-/// 2. Derive from the runner's own binary location (up to workspace root + `qontinui-coord/mcp/coord-mcp.mjs`)
-/// 3. `QONTINUI_ROOT/qontinui-coord/mcp/coord-mcp.mjs` as a fallback
-/// 4. Hard-coded `D:/qontinui-root/qontinui-coord/mcp/coord-mcp.mjs` on Windows
-///
-/// Returns `None` when no candidate exists on disk.
-fn resolve_coord_mcp_server_path() -> Option<PathBuf> {
-    // 1. Explicit env override.
-    if let Ok(p) = std::env::var("COORD_MCP_SERVER_PATH") {
-        let path = PathBuf::from(&p);
-        if path.is_file() {
-            return Some(path);
-        }
-        warn!(
-            "agent_runtime: COORD_MCP_SERVER_PATH={} does not exist; falling through",
-            p
-        );
-    }
-
-    // 2. Derive from the runner's own binary location.
-    if let Ok(exe) = std::env::current_exe() {
-        // Walk up from the binary to find the workspace root.
-        // Typical layout: <workspace>/qontinui-runner/target/<profile>/qontinui-runner(.exe)
-        // We need to go up past target/<profile> to reach qontinui-runner, then up once more for the workspace.
-        let mut dir = exe.parent().map(|p| p.to_path_buf());
-        for _ in 0..6 {
-            if let Some(ref d) = dir {
-                let candidate = d.join("qontinui-coord").join("mcp").join("coord-mcp.mjs");
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                dir = d.parent().map(|p| p.to_path_buf());
-            } else {
-                break;
-            }
-        }
-    }
-
-    // 3. QONTINUI_ROOT-based fallback.
-    if let Some(root) = qontinui_root_dir() {
-        let candidate = root
-            .join("qontinui-coord")
-            .join("mcp")
-            .join("coord-mcp.mjs");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    // 4. Hard-coded Windows workspace path.
-    #[cfg(target_os = "windows")]
-    {
-        let candidate = PathBuf::from("D:/qontinui-root/qontinui-coord/mcp/coord-mcp.mjs");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    None
-}
-
 /// Write `.mcp.json` into the agent's primary worktree directory so the
-/// spawned `claude` process auto-discovers the coord MCP server. If the
-/// server file doesn't exist on disk, logs a warning and returns without
-/// writing (graceful degradation).
+/// spawned `claude` process auto-discovers the coord MCP server.
+///
+/// Targets the **coord-native** streamable-HTTP MCP server at
+/// `{COORD_HTTP_URL}/mcp` (Bearer-authenticated with the agent's own JWT),
+/// rather than spawning a local `coord-mcp.mjs` Node sidecar. The agent's
+/// identity (device_id, tenant_id, correlation topic) is derived server-side
+/// from the validated JWT claims, so no `AGENT_NAME`/`AGENT_LANE`/`TOPIC`/
+/// `DEVICE_ID` env vars are needed in the config.
+///
+/// DEPLOY GATING — DO NOT MERGE/DEPLOY THIS RUNNER CHANGE BEFORE the
+/// coord-native `/mcp` endpoint (coord branch `feat/coord-native-coordination-mcp`)
+/// is live on the target coord deployment (staging). If this config points at
+/// a coord that has no `/mcp` route, agents get an unreachable MCP server:
+/// Claude Code degrades gracefully and runs *without* coord tools, which is a
+/// silent coordination regression. Sequence the coord deploy first.
 fn write_coord_mcp_config(primary_wt: &str, payload: &LaunchPayload) {
-    let server_path = match resolve_coord_mcp_server_path() {
-        Some(p) => p,
-        None => {
-            warn!(
-                "agent_runtime: coord MCP server not found on disk; \
-                 skipping .mcp.json for agent_id={}",
-                payload.agent_id
-            );
-            return;
-        }
-    };
-
     let coord_url =
         std::env::var("COORD_HTTP_URL").unwrap_or_else(|_| "http://localhost:9870".to_string());
-
-    let agent_name = payload.agent_id.to_string();
-    let topic = payload
-        .correlation_topic
-        .as_deref()
-        .unwrap_or("")
-        .to_string();
+    let mcp_url = format!("{}/mcp", coord_url.trim_end_matches('/'));
 
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "coord-mcp": {
-                "command": "node",
-                "args": [server_path.to_string_lossy()],
-                "env": {
-                    "AGENT_NAME": agent_name,
-                    "AGENT_LANE": format!("coord-lane/{}", agent_name),
-                    "TOPIC": topic,
-                    "DEVICE_ID": payload.target_device_id.to_string(),
-                    "COORD_JWT": payload.jwt,
-                    "COORD_URL": coord_url,
+                "type": "http",
+                "url": mcp_url,
+                "headers": {
+                    "Authorization": format!("Bearer {}", payload.jwt),
                 }
             }
         }
@@ -1030,6 +957,61 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
             None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
+        }
+    }
+
+    #[test]
+    fn write_coord_mcp_config_emits_http_bearer_shape() {
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-cfg-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let primary_wt = tmp.to_string_lossy().to_string();
+
+        let prev = std::env::var("COORD_HTTP_URL").ok();
+        std::env::set_var("COORD_HTTP_URL", "https://coord.example.test/");
+
+        let payload = LaunchPayload {
+            agent_id: uuid::Uuid::now_v7(),
+            agent_session_id: None,
+            target_device_id: uuid::Uuid::now_v7(),
+            worktrees: vec![],
+            jwt: "header.payload.sig".to_string(),
+            jwt_exp: 0,
+            initial_prompt: "go".to_string(),
+            claim_token: "agent:x".to_string(),
+            plan_slug: None,
+            plan_phase: None,
+            correlation_topic: Some("my-coordination-topic".to_string()),
+        };
+
+        write_coord_mcp_config(&primary_wt, &payload);
+
+        let written = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let server = &v["mcpServers"]["coord-mcp"];
+
+        // HTTP transport pointing at coord /mcp, Bearer-authenticated.
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "https://coord.example.test/mcp");
+        assert_eq!(
+            server["headers"]["Authorization"],
+            "Bearer header.payload.sig"
+        );
+
+        // No Node-sidecar/subprocess residue, and no identity env vars
+        // (identity is derived server-side from the JWT claims).
+        assert!(server.get("command").is_none(), "must not spawn a command");
+        assert!(server.get("args").is_none(), "must not pass node args");
+        assert!(server.get("env").is_none(), "identity must come from JWT");
+        assert!(
+            !written.contains("node") && !written.contains("coord-mcp.mjs"),
+            "config must not reference the Node sidecar: {written}"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(p) => std::env::set_var("COORD_HTTP_URL", p),
+            None => std::env::remove_var("COORD_HTTP_URL"),
         }
     }
 
