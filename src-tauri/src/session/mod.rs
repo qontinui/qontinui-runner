@@ -58,6 +58,7 @@
 
 pub mod coord_sync;
 pub mod dual_write;
+pub mod handoff;
 pub mod intent;
 pub mod local_store;
 pub mod transport;
@@ -306,6 +307,27 @@ impl SessionRegistry {
 
     /// Start a new session. Plan §D1 single-constructor surface.
     pub fn start(self: &Arc<Self>, intent: Intent) -> Result<SessionHandle, SessionError> {
+        self.start_inner(intent, None)
+    }
+
+    /// Plan §Phase 7 — start a session whose lineage points back to a
+    /// source session on another machine. Used by the handoff receiver
+    /// to materialize the child of a cross-machine move; the
+    /// `parent_session_id` lands in the `started` outbox payload so coord
+    /// stamps `coord.sessions.parent_session_id` on the create.
+    pub fn start_with_parent(
+        self: &Arc<Self>,
+        intent: Intent,
+        parent_session_id: Uuid,
+    ) -> Result<SessionHandle, SessionError> {
+        self.start_inner(intent, Some(parent_session_id))
+    }
+
+    fn start_inner(
+        self: &Arc<Self>,
+        intent: Intent,
+        parent_session_id: Option<Uuid>,
+    ) -> Result<SessionHandle, SessionError> {
         intent.validate()?;
 
         let transport = self.transports.pick(intent.kind);
@@ -322,19 +344,23 @@ impl SessionRegistry {
             started_at: now,
             last_heartbeat_at: Some(now),
             closed_at: None,
-            parent_session_id: None,
+            parent_session_id,
             transport: transport.clone(),
             transport_handle,
         };
 
         // Outbox row first (durability before in-memory commit so a crash
         // between insert and outbox-write doesn't lose the record).
+        // `parent_session_id` is threaded into the payload so the drain
+        // loop's `rebuild_create_body` forwards it to coord's
+        // `CreateSessionRequest.parent_session_id`.
         let payload = json!({
             "id": id,
             "kind": intent.kind.as_str(),
             "intent": intent,
             "state": SessionState::Active.as_str(),
             "started_at": now,
+            "parent_session_id": parent_session_id,
         });
         self.coord_sync
             .outbox()
@@ -348,6 +374,23 @@ impl SessionRegistry {
             id,
             registry: Arc::clone(self),
         })
+    }
+
+    /// Write input bytes to a live session's transport. Plan §Phase 7
+    /// uses this to replay warm-tier PTY scrollback into a freshly
+    /// materialized handoff child. Routes through the same transport the
+    /// session was started on.
+    pub fn write_input(&self, id: Uuid, bytes: &[u8]) -> Result<(), SessionError> {
+        let (transport, handle) = {
+            let sessions = self.sessions.lock().expect("session registry poisoned");
+            let rec = sessions.get(&id).ok_or(SessionError::NotFound(id))?;
+            (
+                Arc::clone(&rec.transport),
+                clone_transport_handle(&rec.transport_handle),
+            )
+        };
+        transport.write_input(&handle, bytes)?;
+        Ok(())
     }
 
     /// Register a coord-native mirror of an **externally-owned** session

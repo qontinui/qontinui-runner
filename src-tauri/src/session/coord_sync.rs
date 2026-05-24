@@ -261,10 +261,18 @@ impl CoordSync {
         &self.inner.outbox
     }
 
-    /// Coord URL the loops POST/PATCH/DELETE against. Surfaced for tests.
-    #[allow(dead_code)]
+    /// Coord URL the loops POST/PATCH/DELETE against. Surfaced for tests
+    /// and reused by the Phase 7 handoff trigger + receiver so they hit
+    /// the same coord this runner already syncs to.
     pub fn coord_url(&self) -> &str {
         &self.inner.coord_url
+    }
+
+    /// The shared reqwest client (connection-pooled, 30s timeout). The
+    /// Phase 7 handoff trigger + receiver reuse it rather than minting a
+    /// fresh client per call.
+    pub fn http_client(&self) -> reqwest::Client {
+        self.inner.http.clone()
     }
 
     /// Heartbeat interval. Surfaced for tests + tracing.
