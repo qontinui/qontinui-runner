@@ -207,7 +207,7 @@ fn origin_url_basename(config_path: &Path) -> Option<String> {
 /// → `repo`.
 fn repo_basename_from_url(url: &str) -> String {
     let url = url.trim().trim_end_matches('/');
-    let last = url.rsplit(|c| c == '/' || c == ':').next().unwrap_or(url);
+    let last = url.rsplit(['/', ':']).next().unwrap_or(url);
     last.strip_suffix(".git").unwrap_or(last).to_string()
 }
 

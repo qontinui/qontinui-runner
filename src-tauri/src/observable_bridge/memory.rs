@@ -590,8 +590,10 @@ impl RunnerObservableBridge for MemoryBridge {
             }
         };
 
-        let mut report = ReconcileReport::default();
-        report.pulled = session_ctx.pulled_count;
+        let mut report = ReconcileReport {
+            pulled: session_ctx.pulled_count,
+            ..Default::default()
+        };
         let pre_names: HashSet<&str> = post_pull.files.iter().map(|f| f.name.as_str()).collect();
         let post_names: HashSet<&str> =
             post_session.files.iter().map(|f| f.name.as_str()).collect();
