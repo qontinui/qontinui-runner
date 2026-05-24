@@ -1812,27 +1812,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     coord_sync_facade.clone(),
                 );
                 coord_sync_facade.attach_registry(&registry);
-                // Plan §Phase 3 — start both background loops. JoinHandles
-                // are intentionally dropped: the tasks live for the
-                // lifetime of the process and we let tokio reap them on
-                // shutdown.
-                let _drain = registry.coord_sync().start_drain_task();
-                let _heartbeat = registry.coord_sync().start_heartbeat_task();
-                // Plan §Phase 7 — start the cross-machine handoff receiver.
-                // Push-driven: subscribes to coord's `/ws` Redis fan-out
-                // (`qontinui.sessions.*`) for handoff_request frames
-                // addressed to this device + a one-shot catch-up GET on
-                // every (re)connect, then materializes each as a child
-                // session (parent_session_id = source). JoinHandle dropped
-                // — lives for the process.
-                let _handoff_rx = session::handoff::start_receiver_task(registry.clone());
-                // Plan §Phase 10 — start the cutover-flag poll loop. Only
-                // spawns when an `active_tenant_id` resolved from
-                // machine.json; returns None (no task) otherwise. The
-                // flag defaults FALSE so dual-write stays dormant until an
-                // operator flips `session_coordination_enabled` for the
-                // tenant. JoinHandle dropped like the other loops.
-                let _flag_poll = registry.coord_sync().start_flag_poll_task();
+                // Plan §Phase 3/7/10 — start the coord-sync background loops
+                // (drain, heartbeat, Phase 7 handoff receiver, Phase 10
+                // cutover-flag poll). `.setup()` runs synchronously with no
+                // ambient Tokio reactor, so these helpers' internal
+                // `tokio::spawn` panics ("there is no reactor running, must be
+                // called from the context of a Tokio 1.x runtime"). Wrap the
+                // starts in `tauri::async_runtime::spawn` so they execute on
+                // Tauri's managed runtime — matching the other setup-time
+                // spawns below. Handles are intentionally dropped; the tasks
+                // run detached for the lifetime of the process.
+                //   Phase 7 receiver subscribes to coord's `/ws` Redis fan-out
+                //   (`qontinui.sessions.*`) + a one-shot on-(re)connect catch-up
+                //   GET, materializing each handoff_request as a child session.
+                //   Phase 10 flag-poll only spawns when an `active_tenant_id`
+                //   resolved from machine.json (None → dormant); dual-write
+                //   stays off until `session_coordination_enabled` flips.
+                let loop_registry = registry.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _drain = loop_registry.coord_sync().start_drain_task();
+                    let _heartbeat = loop_registry.coord_sync().start_heartbeat_task();
+                    let _handoff_rx =
+                        session::handoff::start_receiver_task(loop_registry.clone());
+                    let _flag_poll = loop_registry.coord_sync().start_flag_poll_task();
+                });
                 app.manage(registry);
 
             }
