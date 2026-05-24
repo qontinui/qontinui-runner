@@ -55,6 +55,7 @@ pub mod device_jwt_refresher;
 pub mod discovery;
 pub mod dom_capture;
 pub mod entity_profiles_api;
+pub mod envelope;
 pub mod error_monitor;
 pub mod executor;
 pub mod extraction;
