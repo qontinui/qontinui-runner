@@ -662,7 +662,9 @@ mod invalid_state_envelope_tests {
             Some("INVALID_STATE"),
             "contract: error_detail.code must be the literal 'INVALID_STATE'"
         );
-        let ctx = ed.get("context").expect("error_detail.context must be present");
+        let ctx = ed
+            .get("context")
+            .expect("error_detail.context must be present");
         assert_eq!(
             ctx.get("code").and_then(|v| v.as_str()),
             Some("INVALID_STATE"),
