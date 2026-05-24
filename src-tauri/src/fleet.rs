@@ -225,9 +225,21 @@ struct DeviceBudgetRequest {
     max_concurrent_builds: i32,
 }
 
-/// Resolve the coord HTTP base from `~/.qontinui/profiles.json` active
-/// profile's `coord_url`. Mirrors the CLI helper of the same name.
+/// Resolve the coord HTTP base. Source-of-truth chain: env `COORD_HTTP_URL`
+/// → `~/.qontinui/profiles.json` active profile's `coord_url` (ws→http).
+///
+/// Honors `COORD_HTTP_URL` to match `mcp::agent_worktrees::coord_http_base`,
+/// `commands::claims`, and `commands::productivity`, so per-machine
+/// staging-pointing of the heartbeat no longer requires a profiles.json edit.
+/// Unlike those resolvers this deliberately returns `None` (rather than
+/// defaulting to `http://localhost:9870`) when nothing is configured, so the
+/// heartbeat cleanly skips instead of spamming connection errors every tick.
 fn coord_http_base() -> Option<String> {
+    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
     let coord_url = qontinui_runner_lib::profiles::load_strict()
         .ok()?
         .coord_url?;

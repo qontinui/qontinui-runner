@@ -213,8 +213,8 @@ pub async fn trigger_handoff(
 /// addressed to this device the instant coord fans it out. On every
 /// (re)connect it also runs a single catch-up GET so anything published
 /// while the runner was offline is replayed. Plan §Phase 7.
-pub fn start_receiver_task(registry: Arc<SessionRegistry>) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(run_receiver_loop(registry))
+pub fn start_receiver_task(registry: Arc<SessionRegistry>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_receiver_loop(registry))
 }
 
 /// Derive coord's `/ws` URL (with the session pattern) from the resolved

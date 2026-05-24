@@ -2499,7 +2499,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 ))
                             }
                         };
-                        tokio::spawn(async move {
+                        tauri::async_runtime::spawn(async move {
                             if let Err(e) = restate::http_endpoint::start_restate_endpoint(
                                 endpoint_port,
                                 restate_app_state,
@@ -2512,7 +2512,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Register our endpoint with the Restate server once both are ready
                     let rs = restate_settings.clone();
-                    tokio::spawn(async move {
+                    tauri::async_runtime::spawn(async move {
                         // When using an external Restate server we cannot probe a
                         // local port for it — trust that it's up and skip the wait.
                         let admin_ready = if rs.is_external() {

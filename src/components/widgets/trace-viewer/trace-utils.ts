@@ -24,7 +24,7 @@ export function inferPhase(name: string): WorkflowPhase {
 
 /** Build a tree from flat span data. */
 export function buildTraceTree(spans: TraceSpan[]): TraceTreeNode[] {
-  if (spans.length === 0) return [];
+  if (!Array.isArray(spans) || spans.length === 0) return [];
 
   // Sort by start timestamp
   const sorted = [...spans].sort(
@@ -64,6 +64,7 @@ export function buildTraceTree(spans: TraceSpan[]): TraceTreeNode[] {
 
 /** Flatten a tree into DFS order for rendering. */
 export function flattenTree(roots: TraceTreeNode[]): TraceTreeNode[] {
+  if (!Array.isArray(roots) || roots.length === 0) return [];
   const result: TraceTreeNode[] = [];
 
   function dfs(node: TraceTreeNode) {
@@ -84,6 +85,7 @@ export function flattenTree(roots: TraceTreeNode[]): TraceTreeNode[] {
 
 /** Filter spans based on filter criteria. */
 export function filterSpans(nodes: TraceTreeNode[], filter: SpanFilter): TraceTreeNode[] {
+  if (!Array.isArray(nodes) || nodes.length === 0) return [];
   return nodes.filter((node) => {
     const span = node.span;
 
@@ -112,7 +114,7 @@ export function filterSpans(nodes: TraceTreeNode[], filter: SpanFilter): TraceTr
 
 /** Compute performance insights from spans. */
 export function computeInsights(spans: TraceSpan[]): TraceInsights {
-  if (spans.length === 0) {
+  if (!Array.isArray(spans) || spans.length === 0) {
     return {
       totalDurationMs: 0,
       spanCount: 0,
@@ -175,7 +177,7 @@ export function formatDuration(ms: number): string {
  * Each node's x range [xStart, xEnd] is a fraction of the total active time.
  */
 export function buildFlameData(roots: TraceTreeNode[]): FlameNode[] {
-  if (roots.length === 0) return [];
+  if (!Array.isArray(roots) || roots.length === 0) return [];
 
   /**
    * Build a FlameNode with gap-collapsed children.
@@ -224,6 +226,7 @@ export function buildFlameData(roots: TraceTreeNode[]): FlameNode[] {
 
 /** Flatten flame nodes into a flat list for rendering. */
 export function flattenFlameNodes(roots: FlameNode[]): FlameNode[] {
+  if (!Array.isArray(roots) || roots.length === 0) return [];
   const result: FlameNode[] = [];
   function dfs(node: FlameNode) {
     result.push(node);
@@ -246,6 +249,7 @@ function spanMatchKey(span: TraceSpan): string {
 
 /** Align spans from two runs and produce match results. */
 export function alignSpans(spansA: TraceSpan[], spansB: TraceSpan[]): SpanMatch[] {
+  if (!Array.isArray(spansA) || !Array.isArray(spansB)) return [];
   const mapA = new Map<string, TraceSpan>();
   const mapB = new Map<string, TraceSpan>();
 
@@ -499,6 +503,17 @@ export function computeTokenInsights(spans: TraceSpan[]): {
   maxCostCents: number;
   phaseTokens: Record<string, { input: number; output: number; cost: number }>;
 } {
+  if (!Array.isArray(spans) || spans.length === 0) {
+    return {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCostCents: 0,
+      maxInputTokens: 0,
+      maxOutputTokens: 0,
+      maxCostCents: 0,
+      phaseTokens: {},
+    };
+  }
   let totalInputTokens = 0,
     totalOutputTokens = 0,
     totalCostCents = 0;
