@@ -149,6 +149,24 @@ impl PhysicalDeviceRegistry {
         map.get(id).cloned()
     }
 
+    /// Whether the device has a live transport of `kind`.
+    ///
+    /// Returns `false` for unknown devices and for known devices whose
+    /// `transports` list contains no entry of the requested kind. The USB
+    /// scanner uses this to decide whether to re-establish an `adb forward`
+    /// after the health monitor evicted a stale transport (3 consecutive
+    /// failures → `remove_transport` leaves the device entry behind with
+    /// `transports: []` and `health_state: Unreachable`). A naive
+    /// `get_device(...).is_some()` dedup matches that stuck state too, which
+    /// stranded the device permanently unreachable in the registry while it
+    /// was still a live adb target. See `mcp_api.rs` USB scanner loop.
+    pub async fn has_transport_kind(&self, id: &str, kind: TransportKind) -> bool {
+        let map = self.devices.read().await;
+        map.get(id)
+            .map(|d| d.transports.iter().any(|t| t.kind == kind))
+            .unwrap_or(false)
+    }
+
     /// Clone and return all registered devices.
     pub async fn list_all(&self) -> Vec<PhysicalDevice> {
         let map = self.devices.read().await;
@@ -307,4 +325,148 @@ impl Default for PhysicalDeviceRegistry {
 /// Sort transports by priority (lowest number = highest priority).
 fn sort_transports(transports: &mut Vec<ActiveTransport>) {
     transports.sort_by_key(|t| t.kind.priority());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_info(id: &str) -> PhysicalDeviceInfo {
+        PhysicalDeviceInfo {
+            id: id.to_string(),
+            os: DeviceOs::Android,
+            device_kind: "physical".to_string(),
+            model: Some("SM-S911B".to_string()),
+            app_id: None,
+            ui_bridge_version: None,
+            first_seen_at: 1_000,
+            pairing_token: None,
+        }
+    }
+
+    fn usb_transport(port: u16) -> ActiveTransport {
+        ActiveTransport {
+            kind: TransportKind::Usb,
+            proxy_url: format!("http://127.0.0.1:{}", port),
+            established_at: 1_000,
+            last_healthy_at: 1_000,
+            fail_count: 0,
+        }
+    }
+
+    /// has_transport_kind returns false for unknown devices.
+    #[tokio::test]
+    async fn has_transport_kind_false_for_unknown_device() {
+        let registry = PhysicalDeviceRegistry::new();
+        assert!(
+            !registry
+                .has_transport_kind("ghost", TransportKind::Usb)
+                .await
+        );
+    }
+
+    /// has_transport_kind returns true immediately after register.
+    #[tokio::test]
+    async fn has_transport_kind_true_after_register() {
+        let registry = PhysicalDeviceRegistry::new();
+        registry
+            .register(sample_info("RFCW6041HHN"), usb_transport(51583))
+            .await;
+
+        assert!(
+            registry
+                .has_transport_kind("RFCW6041HHN", TransportKind::Usb)
+                .await,
+            "freshly-registered device must report a USB transport"
+        );
+        // Sanity: not registered for LAN.
+        assert!(
+            !registry
+                .has_transport_kind("RFCW6041HHN", TransportKind::Lan)
+                .await
+        );
+    }
+
+    /// The bug reproducer: register a device, then have the health monitor
+    /// evict its USB transport via `remove_transport`. The entry remains in
+    /// the registry (so the old `get_device().is_some()` dedup matched it
+    /// and skipped re-establishment forever — leaving the API responding
+    /// with `transports: []` and `healthState: unreachable` even though the
+    /// adb device was reachable). The new `has_transport_kind` predicate
+    /// must return `false` in this state so the scanner re-establishes
+    /// the forward.
+    #[tokio::test]
+    async fn has_transport_kind_false_after_health_monitor_eviction() {
+        let registry = PhysicalDeviceRegistry::new();
+        registry
+            .register(sample_info("RFCW6041HHN"), usb_transport(51583))
+            .await;
+        assert!(
+            registry
+                .has_transport_kind("RFCW6041HHN", TransportKind::Usb)
+                .await
+        );
+
+        // Simulate the health monitor's 3-consecutive-failure path: it
+        // calls `remove_transport`, which leaves the device entry behind
+        // with `transports: []` and `health_state: Unreachable`.
+        registry
+            .remove_transport("RFCW6041HHN", TransportKind::Usb)
+            .await;
+
+        // Device entry still exists (the bug: legacy dedup
+        // `get_device().is_some()` would have matched this and the scanner
+        // would never have retried `establish_forward`).
+        let device = registry.get_device("RFCW6041HHN").await.expect(
+            "entry must persist after remove_transport so the registry can record \
+             the unreachable state",
+        );
+        assert!(device.transports.is_empty());
+        assert!(matches!(device.health_state, HealthState::Unreachable));
+
+        // The new predicate must distinguish this "stuck" state from a
+        // genuinely-live USB transport so the scanner re-establishes.
+        assert!(
+            !registry
+                .has_transport_kind("RFCW6041HHN", TransportKind::Usb)
+                .await,
+            "device with empty transports must not be treated as USB-live"
+        );
+    }
+
+    /// Re-establishment via `register` on a stuck entry must populate the
+    /// new transport and flip health back to Healthy. This is what the USB
+    /// scanner does on the next 30s tick after the predicate fix lets it
+    /// through.
+    #[tokio::test]
+    async fn reregister_restores_usb_transport_and_health() {
+        let registry = PhysicalDeviceRegistry::new();
+        registry
+            .register(sample_info("RFCW6041HHN"), usb_transport(51583))
+            .await;
+        registry
+            .remove_transport("RFCW6041HHN", TransportKind::Usb)
+            .await;
+        assert!(
+            !registry
+                .has_transport_kind("RFCW6041HHN", TransportKind::Usb)
+                .await
+        );
+
+        // Scanner re-registers with a freshly-allocated local port.
+        registry
+            .register(sample_info("RFCW6041HHN"), usb_transport(62001))
+            .await;
+
+        assert!(
+            registry
+                .has_transport_kind("RFCW6041HHN", TransportKind::Usb)
+                .await
+        );
+        let device = registry.get_device("RFCW6041HHN").await.unwrap();
+        assert!(matches!(device.health_state, HealthState::Healthy));
+        assert_eq!(device.transports.len(), 1);
+        assert_eq!(device.transports[0].proxy_url, "http://127.0.0.1:62001");
+        assert_eq!(device.transports[0].fail_count, 0);
+    }
 }
