@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(pending[0].event_kind, SessionEventKind::Started.as_str());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_started_event_as_post_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -1203,7 +1203,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_treats_409_as_acked_for_started() {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -1240,7 +1240,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_retries_after_5xx() {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -1267,7 +1267,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeat_emits_outbox_rows_for_active_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -1301,7 +1301,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeat_records_patch_to_coord() {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
@@ -1328,7 +1328,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn autoclose_fires_delete_after_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
