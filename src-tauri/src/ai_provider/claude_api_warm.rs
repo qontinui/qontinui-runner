@@ -469,14 +469,15 @@ pub(crate) fn run_claude_api_warm_with_structured_output(
     let client = warm_client();
 
     retry_with_backoff("Claude API (warm, structured)", || {
-        let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", credential.token())
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send();
+        let response = super::anthropic_auth::apply_blocking(
+            client.post("https://api.anthropic.com/v1/messages"),
+            credential.token(),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", PROMPT_CACHING_BETA_HEADER)
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send();
 
         match response {
             Ok(resp) => {
