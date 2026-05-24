@@ -127,6 +127,7 @@ pub fn build_federation_ctx(
         device_id,
         account_name,
         memory_dir,
+        working_dir: PathBuf::from(working_dir),
         session_id: session_uuid(session_id),
         post_pull_snapshot: None,
         pulled_count: 0,
@@ -265,6 +266,35 @@ pub fn log_federation_report(ctx: &SessionContext, report: Result<ReconcileRepor
             account = %ctx.account_name,
             error = %e,
             "memory federation reconcile failed"
+        ),
+    }
+}
+
+/// Generic per-bridge reconcile telemetry for non-memory observable
+/// categories. Logs the aggregate `ReconcileReport` via `tracing` tagged
+/// with the bridge `category`. Unlike [`emit_federation_report`] it does
+/// NOT POST to coord or broadcast the memory-specific Tauri banner event —
+/// each non-memory bridge owns its own coord telemetry inside its
+/// `reconcile`/client. Keeps the session-end path crash-free for any
+/// number of registered bridges.
+pub fn log_bridge_report(category: &str, ctx: &SessionContext, report: Result<ReconcileReport>) {
+    match report {
+        Ok(r) => info!(
+            category = %category,
+            session_id = %ctx.session_id,
+            account = %ctx.account_name,
+            pushed = r.pushed,
+            pulled = r.pulled,
+            unchanged = r.unchanged,
+            failed = r.failed,
+            "federation reconcile complete"
+        ),
+        Err(e) => warn!(
+            category = %category,
+            session_id = %ctx.session_id,
+            account = %ctx.account_name,
+            error = %e,
+            "federation reconcile failed"
         ),
     }
 }

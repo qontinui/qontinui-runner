@@ -35,7 +35,7 @@ pub fn export_all_schemas() -> Value {
     use qontinui_types::{
         accessibility as qa, ai_workflows as qaw, app_events as qae, apps as qap, config as qcfg,
         constraints as qc, discovery as qdc, execution as qe, findings as qfn, geometry as qg,
-        ir as qir, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
+        git_ops as qgo, ir as qir, mcp_config as qmc, memory as qmem, orchestration_config as qoc,
         process_management as qpm, rag as qr, runner as qrn, scheduler as qs,
         spec_api_events as qsae, spec_check as qsc, state_machine as qsm, targets as qt,
         task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
@@ -687,6 +687,13 @@ pub fn export_all_schemas() -> Value {
     add!("MemorySummary", qmem::MemorySummary);
     add!("MemoryWithHistory", qmem::MemoryWithHistory);
     add!("MemoryListResponse", qmem::MemoryListResponse);
+
+    // ── qontinui-types: git_ops (coord-mediated GitOp federation —
+    // plan 2026-05-24-federation-verify-and-gitop.md Phase 5) ──
+    add!("RecordGitOpRequest", qgo::RecordGitOpRequest);
+    add!("GitOpRecord", qgo::GitOpRecord);
+    add!("GitOpListResponse", qgo::GitOpListResponse);
+    add!("DeviceBranchSummary", qgo::DeviceBranchSummary);
 
     // ── qontinui-types: apps (multi-tenant Spec API registry — Stream A) ──
     add!("App", qap::App);

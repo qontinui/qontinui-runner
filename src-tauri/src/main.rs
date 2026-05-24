@@ -1710,27 +1710,56 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // to the webview without taking an AppHandle parameter.
             tauri_app_handle::set(app.handle().clone());
 
-            // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.G —
-            // initialize the process-wide memory-federation bridge. The
-            // bridge mediates the per-session pull / watcher / reconcile
-            // lifecycle that materializes the tenant memory pool into the
-            // about-to-spawn Claude CLI's per-account memory dir, watches
-            // for in-session writes, and pushes them back to coord. Init
-            // failure is non-fatal — the spawn sites short-circuit when
-            // `observable_bridge::global()` returns `None`.
-            match qontinui_runner_lib::observable_bridge::memory::MemoryBridge::new() {
-                Ok(bridge) => {
-                    let arc = std::sync::Arc::new(bridge);
-                    qontinui_runner_lib::observable_bridge::init_global(arc.clone());
-                    app.manage(arc);
-                    info!("memory federation bridge initialized");
+            // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.G,
+            // generalized by 2026-05-24-federation-verify-and-gitop.md
+            // Phase 4 — initialize the process-wide observable-bridge
+            // registry. Each bridge mediates a per-session pull / watch /
+            // reconcile lifecycle (memory federation; git-ops next). Init
+            // failure is non-fatal — the spawn sites iterate the registry
+            // and an empty registry short-circuits all federation.
+            {
+                let mut bridges: Vec<
+                    std::sync::Arc<dyn qontinui_runner_lib::observable_bridge::RunnerObservableBridge>,
+                > = Vec::new();
+                match qontinui_runner_lib::observable_bridge::memory::MemoryBridge::new() {
+                    Ok(bridge) => {
+                        let arc = std::sync::Arc::new(bridge);
+                        // Keep the concrete Arc available as Tauri State
+                        // (e.g. for runner-shutdown `shutdown_all`), and
+                        // register it as a trait object for dispatch.
+                        app.manage(arc.clone());
+                        bridges.push(arc);
+                        info!("memory federation bridge initialized");
+                    }
+                    Err(e) => {
+                        warn!(
+                            "memory federation bridge init failed ({}); feature disabled this session",
+                            e
+                        );
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "memory federation bridge init failed ({}); feature disabled this session",
-                        e
-                    );
+                // GitOpBridge — the second observable category (`git_op`).
+                // Registered unconditionally (default ON), mirroring the
+                // memory bridge. Init failure is non-fatal and independent:
+                // a failed git bridge must not disable memory federation.
+                match qontinui_runner_lib::observable_bridge::git_ops::GitOpBridge::new() {
+                    Ok(bridge) => {
+                        let arc = std::sync::Arc::new(bridge);
+                        // Keep the concrete Arc as Tauri State for
+                        // runner-shutdown `shutdown_all` (hook teardown),
+                        // and register it as a trait object for dispatch.
+                        app.manage(arc.clone());
+                        bridges.push(arc);
+                        info!("git-op federation bridge initialized");
+                    }
+                    Err(e) => {
+                        warn!(
+                            "git-op federation bridge init failed ({}); git federation disabled this session",
+                            e
+                        );
+                    }
                 }
+                qontinui_runner_lib::observable_bridge::init_registry(bridges);
             }
 
             // Plan 2026-05-22-coord-native-session-coordination Phase 2 —
