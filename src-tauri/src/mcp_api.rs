@@ -1223,7 +1223,21 @@ pub fn create_router(
                 let devices = usb_transport.scan_devices().await;
                 let registry = &state.physical_device_registry;
 
-                // Register newly connected physical devices
+                // Register newly connected physical devices.
+                //
+                // Re-establishment after transport eviction: the dedup below
+                // skips a device only when it already has a live USB transport
+                // entry in the registry. If the health monitor removed the
+                // USB transport (3 consecutive failures → `remove_transport`
+                // leaves the device entry with `transports: []` and
+                // `health_state: Unreachable`), the next scanner pass must
+                // retry `establish_forward` — otherwise the device is
+                // permanently dead in the registry while still being a live
+                // adb target. Previously the dedup checked `get_device(...).is_some()`,
+                // which also matched the empty-transport "stuck" state and
+                // produced `transports: []` + `healthState: unreachable`
+                // responses on /ui-bridge/devices even though raw probes to
+                // localhost:<ui_bridge_port> succeeded.
                 for (device_id, status, model) in &devices {
                     if status != "device" {
                         continue;
@@ -1232,8 +1246,13 @@ pub fn create_router(
                         continue; // Skip emulators — handled by app_discovery
                     }
 
-                    // Skip already-registered devices
-                    if registry.get_device(device_id).await.is_some() {
+                    // Skip devices that already have a live USB transport.
+                    // A device entry with empty `transports` (or only
+                    // non-USB transports) falls through to re-establishment.
+                    if registry
+                        .has_transport_kind(device_id, crate::mcp::transport::TransportKind::Usb)
+                        .await
+                    {
                         continue;
                     }
 
@@ -1742,13 +1761,22 @@ pub fn create_router(
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
         .layer(axum::Extension(graphql_schema))
-        // Outermost layer: catch panics from any handler/middleware below and
-        // convert them into a JSON 500 matching the runner's `ApiResponse<()>`
-        // shape. Without this, a handler panic surfaces to the client as
-        // "empty reply from server" — diagnostically indistinguishable from a
-        // legitimate empty success response. `.layer()` is bottom-up, so the
-        // LAST `.layer()` call wraps the rest. `with_state` must remain
-        // terminal.
+        // Layer ordering (`.layer()` is bottom-up — last call = outermost):
+        //
+        //   [CatchPanicLayer]              ← outermost: panics → 500 JSON
+        //     [envelope_rewrite_middleware] ← rewrites 4xx text/plain → JSON envelope
+        //       [TraceLayer, CORS, BodyLimit, ...]
+        //         [handlers]
+        //
+        // The panic layer must remain outermost so it can catch panics that
+        // originate in any layer below, including the envelope middleware itself.
+        // The envelope layer sits immediately inside so it rewrites axum's own
+        // rejection bodies (missing Content-Type, bad JSON, etc.) before they
+        // reach the client. `application/json` responses — including
+        // async-graphql errors — are never rewritten (text/plain guard).
+        .layer(axum::middleware::from_fn(
+            crate::mcp::envelope::envelope_rewrite_middleware,
+        ))
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(
             runner_panic_handler,
         ))

@@ -297,6 +297,34 @@ pub async fn ui_bridge_get_element_handler(
         data
     });
 
+    // Iter-3 item 3 — detect the "unknown element id" IPC failure shape
+    // BEFORE handing off to `wrap_ipc_result`. The frontend's `get_element`
+    // IPC handler returns `{ success: false, error: "" }` (or a generic
+    // "element not found" prose) for ids that aren't in the registry; the
+    // generic `wrap_ipc_result` path then forwards an empty `error` and
+    // `error_detail.code = INTERNAL_ERROR` (the default of
+    // `classify_transport_error` for unknown patterns), making the rejection
+    // indistinguishable from a true transport failure. Detect the shape
+    // here and override with the canonical `ELEMENT_NOT_FOUND` envelope so
+    // callers see `error_detail.code = "ELEMENT_NOT_FOUND"` and
+    // `context.elementId` for self-correction.
+    if let Ok(ref data) = filtered_result {
+        if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            let error_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            let is_not_found_shape = error_msg.is_empty()
+                || error_msg.to_lowercase().contains("not found")
+                || error_msg.to_lowercase().contains("no element");
+            if is_not_found_shape {
+                let detail = super::types::UiBridgeError::element_not_found_by_id(&id);
+                let message = detail.message.clone();
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(crate::mcp::types::api_error_detailed(message, detail)),
+                ));
+            }
+        }
+    }
+
     wrap_ipc_result(filtered_result)
 }
 
@@ -1047,6 +1075,8 @@ pub async fn ui_bridge_execute_action_handler(
                     error: Some("element is disabled".to_string()),
                     error_detail: None,
                     hint: None,
+                    code: None,
+                    suggestions: None,
                 }));
             }
 
@@ -1054,6 +1084,69 @@ pub async fn ui_bridge_execute_action_handler(
         }
         Err(_) => None,
     };
+
+    // ── Pre-IPC ACTION_NOT_SUPPORTED gate ──────────────────────────────
+    //
+    // When the element explicitly advertises a `actions: [...]` list AND the
+    // requested action is not in it, short-circuit with a flat HTTP 400 envelope
+    // BEFORE we hit IPC / the Phase 5 RecoveryExecutor / LLM fallback.
+    //
+    // Without this gate, e.g. `scrollIntoView` against a `<button>` whose
+    // actions are `["click", "focus", "blur"]` would:
+    //   1. pass the `validate_action_name` whitelist (scrollIntoView is a
+    //      runner-known action name),
+    //   2. dispatch to IPC,
+    //   3. IPC fail with whatever shape the SDK emits for "this element
+    //      doesn't handle that action" (often a PARSE_ERROR-flavoured envelope
+    //      because the SDK tries to delegate to a non-existent handler),
+    //   4. fall through to `attempt_recovery` → LLM fallback, which sometimes
+    //      synthesizes a non-null `command_chosen` (a side-action like
+    //      `focus`) and surfaces HTTP 200 `success:true, recovered:true`.
+    //
+    // That violates the contract: the runner declared the element supports
+    // a closed action set; we should respect the element's declaration and
+    // reject upstream of any recovery. Returns the same envelope shape used
+    // by the post-recovery ACTION_NOT_SUPPORTED branch below so callers see
+    // a consistent body in both paths. Loop iter-2 item 2.
+    //
+    // Permissive case (no advertised list / fetch failed) falls through —
+    // `is_action_advertised` returns `true` for `None`, preserving
+    // backward-compat for elements without an `actions` field. The
+    // post-recovery gate at the bottom still catches the misleading
+    // recovered-with-null-command case for those.
+    if !is_action_advertised(&action_name, &element_supported_actions) {
+        let supported: Vec<String> = element_supported_actions.clone().unwrap_or_default();
+        warn!(
+            "execute_action: rejecting {} on element {} pre-IPC — element advertises {:?}",
+            action_name, id, supported
+        );
+        // Use a structured UiBridgeError so `error_detail.code` is
+        // `ACTION_NOT_SUPPORTED` and `error_detail.context` carries the
+        // supported-action list — same shape the post-recovery branch
+        // serialises into `data.code` / `data.supported_actions`. The Err
+        // arm here can't carry a free-form `data` payload (the handler's
+        // Err type is `Json<ApiResponse<()>>`); the structured detail is
+        // the canonical machine-readable surface in that envelope shape.
+        let detail = UiBridgeError {
+            code: super::types::UiBridgeErrorCode::ActionNotSupported,
+            message: format!(
+                "Action '{}' is not supported by element '{}'. \
+                 Element advertises: {:?}",
+                action_name, id, supported
+            ),
+            recovery: Some(super::types::RecoveryHint::Unrecoverable),
+            context: Some(serde_json::json!({
+                "code": "ACTION_NOT_SUPPORTED",
+                "supported_actions": supported,
+                "requested_action": action_name,
+            })),
+        };
+        let msg = detail.message.clone();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error_detailed(msg, detail)),
+        ));
+    }
 
     // ── Execute the action ─────────────────────────────────────────────
     let mut result =
@@ -1359,6 +1452,8 @@ pub async fn ui_bridge_execute_action_handler(
                     )),
                     error_detail: None,
                     hint: None,
+                    code: None,
+                    suggestions: None,
                 };
                 result = Ok(Json(envelope));
             } else if recovery.recovered {
@@ -1857,7 +1952,54 @@ pub async fn ui_bridge_execute_component_action_handler(
         };
     }
 
-    wrap_ipc_result(ui_bridge_request_sync(&state, "execute_component_action", payload).await)
+    // Iter-3 item 4 — detect "component not found" / "action not found"
+    // inner-failure shapes BEFORE wrap_ipc_result flattens them to the
+    // default INTERNAL_ERROR envelope. The frontend's
+    // `execute_component_action` IPC handler returns
+    // `{ success:false, error: "Component not found: ..." }` or
+    // `{ success:false, error: "Action <X> not found on component <Y>" }`
+    // for the two miss cases; both should map to the canonical
+    // `ELEMENT_NOT_FOUND` taxonomy entry (the closest available — the
+    // canonical schema has no `UB-COMPONENT-NOT-AVAILABLE` yet) instead
+    // of being misclassified as a transport-level INTERNAL_ERROR.
+    let ipc_result = ui_bridge_request_sync(&state, "execute_component_action", payload).await;
+    if let Ok(ref data) = ipc_result {
+        if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            let error_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            let is_component_missing = extract_error_code(data)
+                == Some(CanonicalCode::UbElemNotFound)
+                || error_msg.to_lowercase().contains("component not found")
+                || error_msg.to_lowercase().contains("not registered");
+            let is_action_missing = error_msg.to_lowercase().contains("action")
+                && (error_msg.to_lowercase().contains("not found")
+                    || error_msg.to_lowercase().contains("unknown"));
+            if is_component_missing {
+                let detail = UiBridgeError::element_not_found(&id);
+                let message = format!("Component not found: {}", id);
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(api_error_detailed(message, detail)),
+                ));
+            }
+            if is_action_missing {
+                let detail = UiBridgeError {
+                    code: super::types::UiBridgeErrorCode::ActionNotSupported,
+                    message: error_msg.to_string(),
+                    recovery: Some(super::types::RecoveryHint::Unrecoverable),
+                    context: Some(serde_json::json!({
+                        "componentId": id,
+                        "actionId": action_id,
+                    })),
+                };
+                let message = detail.message.clone();
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error_detailed(message, detail)),
+                ));
+            }
+        }
+    }
+    wrap_ipc_result(ipc_result)
 }
 
 /// Discover controllable elements in the UI.
@@ -2607,6 +2749,8 @@ fn api_error_to_value(message: impl Into<String>) -> ApiResponse<serde_json::Val
         error: Some(message.into()),
         error_detail: None,
         hint: None,
+        code: None,
+        suggestions: None,
     }
 }
 
@@ -2844,6 +2988,8 @@ fn apply_strict_timeout_reshape(
                 error: err.error,
                 error_detail: err.error_detail,
                 hint: err.hint,
+                code: err.code,
+                suggestions: err.suggestions,
             };
             Err((status, Json(widened)))
         }
@@ -3610,6 +3756,8 @@ pub async fn ui_bridge_expect_element_handler(
                 )),
                 error_detail: None,
                 hint: Some(envelope.data.unwrap_or(serde_json::Value::Null)),
+                code: None,
+                suggestions: None,
             }),
         ))
     }
@@ -4691,7 +4839,7 @@ mod action_not_supported_tests {
     //! `serde_json::json!{...}` recipe the handler uses — if the body
     //! template changes here, this test must change in lockstep, which
     //! is exactly the regression guard we want.
-    use super::{extract_supported_actions, is_action_advertised};
+    use super::{extract_supported_actions, is_action_advertised, UiBridgeError};
     use crate::mcp::types::ApiResponse;
     use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
     use serde_json::json;
@@ -4802,6 +4950,8 @@ mod action_not_supported_tests {
             )),
             error_detail: None,
             hint: None,
+            code: None,
+            suggestions: None,
         };
         let envelope_json = serde_json::to_value(&envelope).unwrap();
 
@@ -4842,6 +4992,73 @@ mod action_not_supported_tests {
                 .unwrap_or(false),
             "contract: data.recovery.commandChosen must be null (this is the \
              precondition that triggered ACTION_NOT_SUPPORTED)"
+        );
+    }
+
+    /// Iter-2 item 2 — pre-IPC gate envelope. When the element advertises
+    /// `actions: [...]` and the requested action is not in that list, the
+    /// handler short-circuits BEFORE IPC / RecoveryExecutor / LLM fallback
+    /// and returns HTTP 400 with `error_detail.code = "ACTION_NOT_SUPPORTED"`
+    /// and `error_detail.context.supported_actions` carrying the element's
+    /// advertised list.
+    #[test]
+    fn pre_ipc_action_not_supported_envelope_shape() {
+        let action_name = "scrollIntoView";
+        let supported = vec!["click".to_string(), "focus".to_string()];
+        let detail = UiBridgeError {
+            code: crate::mcp::ui_bridge::types::UiBridgeErrorCode::ActionNotSupported,
+            message: format!(
+                "Action '{}' is not supported by element 'btn-1'. \
+                 Element advertises: {:?}",
+                action_name, supported
+            ),
+            recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::Unrecoverable),
+            context: Some(json!({
+                "code": "ACTION_NOT_SUPPORTED",
+                "supported_actions": supported,
+                "requested_action": action_name,
+            })),
+        };
+        let envelope = ApiResponse::<()> {
+            success: false,
+            data: None,
+            error: Some(detail.message.clone()),
+            error_detail: Some(detail),
+            hint: None,
+            code: None,
+            suggestions: None,
+        };
+        let env_json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            env_json.get("success").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let ed = env_json
+            .get("error_detail")
+            .expect("contract: error_detail must serialise (camelCase via #[serde(rename_all)])");
+        assert_eq!(
+            ed.get("code").and_then(|v| v.as_str()),
+            Some("ACTION_NOT_SUPPORTED"),
+            "contract: error_detail.code must be ACTION_NOT_SUPPORTED on the pre-IPC path"
+        );
+        let ctx = ed
+            .get("context")
+            .expect("contract: error_detail.context must carry the supported-action list");
+        let supp = ctx
+            .get("supported_actions")
+            .and_then(|v| v.as_array())
+            .expect("contract: context.supported_actions must be an array");
+        let names: Vec<&str> = supp.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"click"));
+        assert!(names.contains(&"focus"));
+        assert!(
+            !names.contains(&"scrollIntoView"),
+            "contract: requested action must NOT appear in the advertised list"
+        );
+        assert_eq!(
+            ctx.get("requested_action").and_then(|v| v.as_str()),
+            Some("scrollIntoView"),
+            "contract: context.requested_action echoes the rejected action"
         );
     }
 }

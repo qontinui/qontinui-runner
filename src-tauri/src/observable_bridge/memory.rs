@@ -8,11 +8,12 @@
 //!    files coord doesn't know about (first-contact import), delete
 //!    tombstoned files, snapshot the resulting state into
 //!    `session_ctx.post_pull_snapshot`.
-//! 2. **`start_watcher`** (during-session, helper not in trait): spawn
-//!    a `notify` file watcher on `memory_dir`, debounce per-file events
-//!    250ms, route to `push`.
-//! 3. **`push`** (per-event): upsert or delete to coord. Best-effort —
-//!    failures are logged, never propagated.
+//! 2. **`start_watching`** (during-session, trait method): spawn a
+//!    `notify` file watcher on `memory_dir`, debounce per-file events
+//!    250ms, route to the inherent `push`.
+//! 3. **`push`** (per-event, inherent — NOT on the trait): upsert or
+//!    delete to coord. Best-effort — failures are logged, never
+//!    propagated. Called only by this bridge's own watch loop.
 //! 4. **`reconcile`** (session-end): stop watcher, re-snapshot, diff
 //!    against `post_pull_snapshot`, push any deltas the watcher missed,
 //!    return aggregate `ReconcileReport`.
@@ -32,15 +33,24 @@ use uuid::Uuid;
 
 use super::memory_client;
 use super::{
-    DirSnapshot, FileFingerprint, ObservableChange, ReconcileReport, RunnerObservableBridge,
-    SessionContext,
+    DirSnapshot, FileFingerprint, ReconcileReport, RunnerObservableBridge, SessionContext,
 };
 
 const DEBOUNCE_MS: u64 = 250;
 const MD_EXT: &str = "md";
 
+/// Local-change event surfaced by the memory file watcher to
+/// [`MemoryBridge::push`]. Bridge-internal — never crosses the
+/// [`RunnerObservableBridge`] trait, because other categories
+/// (e.g. git-ops) have a structurally different change shape.
+#[derive(Debug, Clone)]
+enum ObservableChange {
+    Upserted { name: String, content: String },
+    Deleted { name: String },
+}
+
 /// Reusable bridge for the lifetime of one runner process. `pull`,
-/// `push`, `reconcile`, and `start_watcher` can all be called multiple
+/// `push`, `reconcile`, and `start_watching` can all be called multiple
 /// times for *concurrent* sessions — watchers are keyed by
 /// `session_id`, so a hotmail session and a gmail session can run
 /// against their own memory dirs simultaneously without trampling each
@@ -48,7 +58,7 @@ const MD_EXT: &str = "md";
 pub struct MemoryBridge {
     http: reqwest::Client,
     /// Async-aware mutex so locks can be held across `.await` points
-    /// (e.g., when `start_watcher` registers a new handle).
+    /// (e.g., when `start_watching` registers a new handle).
     watchers: tokio::sync::Mutex<HashMap<Uuid, WatcherHandle>>,
 }
 
@@ -70,70 +80,6 @@ impl MemoryBridge {
         })
     }
 
-    /// Start the per-session file watcher. Must be called AFTER `pull`
-    /// (so the post-pull snapshot is the watcher's starting baseline).
-    /// Idempotent per `session_id`: re-calling with the same id cleanly
-    /// cancels the prior watcher before installing the new one.
-    pub async fn start_watcher(self: &Arc<Self>, session_ctx: SessionContext) -> Result<()> {
-        let session_id = session_ctx.session_id;
-        let mut guard = self.watchers.lock().await;
-        if let Some(prev) = guard.remove(&session_id) {
-            prev.cancel.cancel();
-        }
-
-        if !session_ctx.memory_dir.exists() {
-            std::fs::create_dir_all(&session_ctx.memory_dir).with_context(|| {
-                format!(
-                    "create memory_dir for watcher: {}",
-                    session_ctx.memory_dir.display()
-                )
-            })?;
-        }
-
-        let (tx, rx) = mpsc::channel::<notify::Result<Event>>(256);
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            // The notify callback is a sync std-thread closure; use the
-            // blocking_send variant to push into the tokio channel
-            // without an executor handle.
-            let _ = tx.blocking_send(res);
-        })
-        .context("observable_bridge::memory: build notify watcher")?;
-        watcher
-            .watch(&session_ctx.memory_dir, RecursiveMode::NonRecursive)
-            .with_context(|| {
-                format!(
-                    "notify::watch on memory_dir: {}",
-                    session_ctx.memory_dir.display()
-                )
-            })?;
-
-        let cancel = CancellationToken::new();
-        let bridge = Arc::clone(self);
-        let task_cancel = cancel.clone();
-        tokio::spawn(async move {
-            run_watch_loop(bridge, session_ctx, rx, task_cancel).await;
-        });
-
-        guard.insert(
-            session_id,
-            WatcherHandle {
-                _notify: watcher,
-                cancel,
-            },
-        );
-        Ok(())
-    }
-
-    /// Stop the watcher for `session_id` if one is running. Called by
-    /// `reconcile` so the final snapshot reflects a quiesced directory.
-    /// No-op when the id isn't registered.
-    pub async fn stop_watcher(&self, session_id: Uuid) {
-        let mut guard = self.watchers.lock().await;
-        if let Some(prev) = guard.remove(&session_id) {
-            prev.cancel.cancel();
-        }
-    }
-
     /// Cancel every active watcher. Called at runner shutdown to
     /// guarantee no `notify` hooks linger past process exit.
     pub async fn shutdown_all(&self) {
@@ -148,6 +94,55 @@ impl MemoryBridge {
     /// short-circuits in that case (best-effort posture).
     fn device_token(&self) -> Option<String> {
         crate::auth::AuthManager::new().get_access_token().ok()
+    }
+
+    /// Push one local change to coord. Inherent (NOT a trait method):
+    /// only this bridge's own watch loop calls it, never the dispatch
+    /// site through the trait object. Best-effort — failures are logged,
+    /// never propagated.
+    async fn push(&self, change: ObservableChange, session_ctx: &SessionContext) -> Result<()> {
+        let token = match self.device_token() {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                debug!("observable_bridge::memory::push: no device token; dropping change");
+                return Ok(());
+            }
+        };
+        let base = match memory_client::coord_http_base() {
+            Some(b) => b,
+            None => {
+                debug!("observable_bridge::memory::push: no coord_url; dropping change");
+                return Ok(());
+            }
+        };
+
+        match change {
+            ObservableChange::Upserted { name, content } => {
+                let req = MemoryUpsertRequest {
+                    name: name.clone(),
+                    content,
+                    description: None,
+                    r#type: None,
+                    written_by_agent: Some(session_ctx.session_id.to_string()),
+                    written_by_device: Some(session_ctx.device_id.to_string()),
+                };
+                if let Err(e) =
+                    memory_client::upsert(&self.http, &base, &token, session_ctx.tenant_id, &req)
+                        .await
+                {
+                    warn!("observable_bridge::memory::push upsert {name} failed: {e}");
+                }
+            }
+            ObservableChange::Deleted { name } => {
+                if let Err(e) =
+                    memory_client::delete(&self.http, &base, &token, session_ctx.tenant_id, &name)
+                        .await
+                {
+                    warn!("observable_bridge::memory::push delete {name} failed: {e}");
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -374,17 +369,18 @@ impl RunnerObservableBridge for MemoryBridge {
         };
 
         // Step 1: list coord's tenant pool.
-        let listing = match memory_client::list(&self.http, &base, &token).await {
-            Ok(l) => l,
-            Err(e) => {
-                warn!(
-                    "observable_bridge::memory::pull: list failed ({e}); \
+        let listing =
+            match memory_client::list(&self.http, &base, &token, session_ctx.tenant_id).await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(
+                        "observable_bridge::memory::pull: list failed ({e}); \
                      leaving memory_dir untouched, snapshot = local"
-                );
-                session_ctx.post_pull_snapshot = Some(local_pre);
-                return Ok(());
-            }
-        };
+                    );
+                    session_ctx.post_pull_snapshot = Some(local_pre);
+                    return Ok(());
+                }
+            };
 
         // Step 2: for each coord entry, GET full payload (the list
         // response omits content + hash to keep the metadata call
@@ -396,7 +392,15 @@ impl RunnerObservableBridge for MemoryBridge {
         let mut coord_names: HashSet<String> = HashSet::new();
         for summary in &listing.items {
             coord_names.insert(summary.name.clone());
-            let full = match memory_client::get(&self.http, &base, &token, &summary.name).await {
+            let full = match memory_client::get(
+                &self.http,
+                &base,
+                &token,
+                session_ctx.tenant_id,
+                &summary.name,
+            )
+            .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(
@@ -440,7 +444,9 @@ impl RunnerObservableBridge for MemoryBridge {
                 written_by_agent: Some(session_ctx.session_id.to_string()),
                 written_by_device: Some(session_ctx.device_id.to_string()),
             };
-            if let Err(e) = memory_client::upsert(&self.http, &base, &token, &req).await {
+            if let Err(e) =
+                memory_client::upsert(&self.http, &base, &token, session_ctx.tenant_id, &req).await
+            {
                 warn!(
                     "observable_bridge::memory::pull: first-contact upsert {} failed: {e}",
                     fp.name
@@ -455,51 +461,102 @@ impl RunnerObservableBridge for MemoryBridge {
 
         // Step 4: re-snapshot — the post-pull baseline is what
         // `reconcile` diffs against at session end.
-        session_ctx.post_pull_snapshot = Some(snapshot_dir(&session_ctx.memory_dir)?);
+        let post_pull = snapshot_dir(&session_ctx.memory_dir)?;
+
+        // Compute pulled count: files that are new or changed compared
+        // to the pre-pull snapshot (i.e., files that coord wrote locally).
+        let mut pulled_count: u32 = 0;
+        for fp in &post_pull.files {
+            match local_pre.get(&fp.name) {
+                None => pulled_count = pulled_count.saturating_add(1), // new file
+                Some(prev) if prev.sha256 != fp.sha256 => {
+                    pulled_count = pulled_count.saturating_add(1); // changed file
+                }
+                _ => {} // unchanged
+            }
+        }
+        // Files deleted by tombstone also count as pulled changes.
+        for fp in &local_pre.files {
+            if post_pull.get(&fp.name).is_none() {
+                pulled_count = pulled_count.saturating_add(1);
+            }
+        }
+        session_ctx.pulled_count = pulled_count;
+        session_ctx.post_pull_snapshot = Some(post_pull);
         Ok(())
     }
 
-    async fn push(&self, change: ObservableChange, session_ctx: &SessionContext) -> Result<()> {
-        let token = match self.device_token() {
-            Some(t) if !t.is_empty() => t,
-            _ => {
-                debug!("observable_bridge::memory::push: no device token; dropping change");
-                return Ok(());
-            }
-        };
-        let base = match memory_client::coord_http_base() {
-            Some(b) => b,
-            None => {
-                debug!("observable_bridge::memory::push: no coord_url; dropping change");
-                return Ok(());
-            }
-        };
-
-        match change {
-            ObservableChange::Upserted { name, content } => {
-                let req = MemoryUpsertRequest {
-                    name: name.clone(),
-                    content,
-                    description: None,
-                    r#type: None,
-                    written_by_agent: Some(session_ctx.session_id.to_string()),
-                    written_by_device: Some(session_ctx.device_id.to_string()),
-                };
-                if let Err(e) = memory_client::upsert(&self.http, &base, &token, &req).await {
-                    warn!("observable_bridge::memory::push upsert {name} failed: {e}");
-                }
-            }
-            ObservableChange::Deleted { name } => {
-                if let Err(e) = memory_client::delete(&self.http, &base, &token, &name).await {
-                    warn!("observable_bridge::memory::push delete {name} failed: {e}");
-                }
-            }
+    /// Start the per-session file watcher. Must be called AFTER `pull`
+    /// (so the post-pull snapshot is the watcher's starting baseline).
+    /// Idempotent per `session_id`: re-calling with the same id cleanly
+    /// cancels the prior watcher before installing the new one.
+    ///
+    /// Takes `self: Arc<Self>` so it can `Arc::clone` itself into the
+    /// detached `notify` watch-loop task, and clones the borrowed `ctx`
+    /// internally before moving it into that task.
+    async fn start_watching(self: Arc<Self>, ctx: &SessionContext) -> Result<()> {
+        let session_ctx = ctx.clone();
+        let session_id = session_ctx.session_id;
+        let mut guard = self.watchers.lock().await;
+        if let Some(prev) = guard.remove(&session_id) {
+            prev.cancel.cancel();
         }
+
+        if !session_ctx.memory_dir.exists() {
+            std::fs::create_dir_all(&session_ctx.memory_dir).with_context(|| {
+                format!(
+                    "create memory_dir for watcher: {}",
+                    session_ctx.memory_dir.display()
+                )
+            })?;
+        }
+
+        let (tx, rx) = mpsc::channel::<notify::Result<Event>>(256);
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            // The notify callback is a sync std-thread closure; use the
+            // blocking_send variant to push into the tokio channel
+            // without an executor handle.
+            let _ = tx.blocking_send(res);
+        })
+        .context("observable_bridge::memory: build notify watcher")?;
+        watcher
+            .watch(&session_ctx.memory_dir, RecursiveMode::NonRecursive)
+            .with_context(|| {
+                format!(
+                    "notify::watch on memory_dir: {}",
+                    session_ctx.memory_dir.display()
+                )
+            })?;
+
+        let cancel = CancellationToken::new();
+        let bridge = Arc::clone(&self);
+        let task_cancel = cancel.clone();
+        tokio::spawn(async move {
+            run_watch_loop(bridge, session_ctx, rx, task_cancel).await;
+        });
+
+        guard.insert(
+            session_id,
+            WatcherHandle {
+                _notify: watcher,
+                cancel,
+            },
+        );
         Ok(())
+    }
+
+    /// Stop the watcher for `session_id` if one is running. Called by
+    /// `reconcile` (and the dispatch site) so the final snapshot reflects
+    /// a quiesced directory. No-op when the id isn't registered.
+    async fn stop_watching(&self, session_id: Uuid) {
+        let mut guard = self.watchers.lock().await;
+        if let Some(prev) = guard.remove(&session_id) {
+            prev.cancel.cancel();
+        }
     }
 
     async fn reconcile(&self, session_ctx: &SessionContext) -> Result<ReconcileReport> {
-        self.stop_watcher(session_ctx.session_id).await;
+        self.stop_watching(session_ctx.session_id).await;
 
         let post_pull = match &session_ctx.post_pull_snapshot {
             Some(s) => s.clone(),
@@ -533,7 +590,10 @@ impl RunnerObservableBridge for MemoryBridge {
             }
         };
 
-        let mut report = ReconcileReport::default();
+        let mut report = ReconcileReport {
+            pulled: session_ctx.pulled_count,
+            ..Default::default()
+        };
         let pre_names: HashSet<&str> = post_pull.files.iter().map(|f| f.name.as_str()).collect();
         let post_names: HashSet<&str> =
             post_session.files.iter().map(|f| f.name.as_str()).collect();
@@ -554,6 +614,7 @@ impl RunnerObservableBridge for MemoryBridge {
                         path.display()
                     );
                     report.failed = report.failed.saturating_add(1);
+                    report.failed_names.push(fp.name.clone());
                     continue;
                 }
             };
@@ -565,7 +626,9 @@ impl RunnerObservableBridge for MemoryBridge {
                 written_by_agent: Some(session_ctx.session_id.to_string()),
                 written_by_device: Some(session_ctx.device_id.to_string()),
             };
-            match memory_client::upsert(&self.http, &base, &token, &req).await {
+            match memory_client::upsert(&self.http, &base, &token, session_ctx.tenant_id, &req)
+                .await
+            {
                 Ok(_) => report.pushed = report.pushed.saturating_add(1),
                 Err(e) => {
                     warn!(
@@ -573,13 +636,16 @@ impl RunnerObservableBridge for MemoryBridge {
                         fp.name
                     );
                     report.failed = report.failed.saturating_add(1);
+                    report.failed_names.push(fp.name.clone());
                 }
             }
         }
 
         // Deletes: name in pre_pull but gone now.
         for name in pre_names.difference(&post_names) {
-            match memory_client::delete(&self.http, &base, &token, name).await {
+            match memory_client::delete(&self.http, &base, &token, session_ctx.tenant_id, name)
+                .await
+            {
                 Ok(_) => report.pushed = report.pushed.saturating_add(1),
                 Err(e) => {
                     warn!(
@@ -587,13 +653,14 @@ impl RunnerObservableBridge for MemoryBridge {
                         name
                     );
                     report.failed = report.failed.saturating_add(1);
+                    report.failed_names.push(name.to_string());
                 }
             }
         }
 
         info!(
-            "observable_bridge::memory::reconcile: pushed={} unchanged={} failed={}",
-            report.pushed, report.unchanged, report.failed
+            "observable_bridge::memory::reconcile: pushed={} pulled={} unchanged={} failed={}",
+            report.pushed, report.pulled, report.unchanged, report.failed
         );
         Ok(report)
     }

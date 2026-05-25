@@ -311,6 +311,16 @@ pub struct ApiResponse<T: Serialize> {
     /// suggestions or workaround guidance to callers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<serde_json::Value>,
+    /// Canonical SCREAMING_SNAKE_CASE error code for transport-layer and
+    /// handler-level rejections (e.g. `INVALID_JSON`, `INVALID_REQUEST`,
+    /// `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`). Absent on success
+    /// responses and on legacy error paths that predate the envelope plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Optional human-readable recovery suggestions surfaced to callers
+    /// alongside `code`. Absent when no actionable guidance is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<Vec<String>>,
 }
 
 impl<T: Serialize> ApiResponse<T> {
@@ -321,6 +331,8 @@ impl<T: Serialize> ApiResponse<T> {
             error: None,
             error_detail: None,
             hint: None,
+            code: None,
+            suggestions: None,
         }
     }
 
@@ -331,6 +343,8 @@ impl<T: Serialize> ApiResponse<T> {
             error: Some(message.into()),
             error_detail: None,
             hint: None,
+            code: None,
+            suggestions: None,
         }
     }
 
@@ -344,6 +358,42 @@ impl<T: Serialize> ApiResponse<T> {
             error: Some(message.into()),
             error_detail: Some(detail),
             hint: None,
+            code: None,
+            suggestions: None,
+        }
+    }
+
+    /// Build an error response with a canonical SCREAMING_SNAKE_CASE `code`.
+    /// Use for transport-layer rejections (JSON parse errors, missing
+    /// Content-Type, body-too-large) where callers need a machine-readable
+    /// discriminator in addition to the human-readable `error` message.
+    pub fn error_with_code(message: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message.into()),
+            error_detail: None,
+            hint: None,
+            code: Some(code.into()),
+            suggestions: None,
+        }
+    }
+
+    /// Like `error_with_code` but also attaches a list of human-readable
+    /// recovery suggestions surfaced to callers alongside the `code`.
+    pub fn error_with_code_and_suggestions(
+        message: impl Into<String>,
+        code: impl Into<String>,
+        suggestions: Vec<String>,
+    ) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message.into()),
+            error_detail: None,
+            hint: None,
+            code: Some(code.into()),
+            suggestions: Some(suggestions),
         }
     }
 }
@@ -356,6 +406,8 @@ pub fn api_error(message: impl Into<String>) -> ApiResponse<()> {
         error: Some(message.into()),
         error_detail: None,
         hint: None,
+        code: None,
+        suggestions: None,
     }
 }
 
@@ -370,6 +422,8 @@ pub fn api_error_detailed(
         error: Some(message.into()),
         error_detail: Some(detail),
         hint: None,
+        code: None,
+        suggestions: None,
     }
 }
 
@@ -390,6 +444,8 @@ pub fn api_error_with_hint(
         error: Some(message.into()),
         error_detail: Some(detail),
         hint: Some(hint),
+        code: None,
+        suggestions: None,
     }
 }
 

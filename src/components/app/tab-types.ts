@@ -71,6 +71,10 @@ export type MainTabId =
   | "settings-instances"
   | "settings-debug"
   | "settings-security"
+  | "settings-notifications"
+  | "settings-otel"
+  | "settings-containers"
+  | "settings-lock-yield"
   | "accessibility-explorer"
   | "settings-updates"
   | "orchestration-loop"
@@ -98,7 +102,8 @@ export type MainTabId =
   | "project-explainer"
   | "wrappers"
   | "productivity"
-  | "regression";
+  | "regression"
+  | "memory-federation";
 
 const VALID_TAB_IDS: MainTabId[] = [
   "prompt-home",
@@ -171,6 +176,10 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-instances",
   "settings-debug",
   "settings-security",
+  "settings-notifications",
+  "settings-otel",
+  "settings-containers",
+  "settings-lock-yield",
   "accessibility-explorer",
   "settings-updates",
   "orchestration-loop",
@@ -199,6 +208,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "wrappers",
   "productivity",
   "regression",
+  "memory-federation",
 ];
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
@@ -282,6 +292,10 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   "settings-instances": "Instances Settings",
   "settings-debug": "Debug Settings",
   "settings-security": "Security Settings",
+  "settings-notifications": "Notification Settings",
+  "settings-otel": "OpenTelemetry Settings",
+  "settings-containers": "Container Isolation Settings",
+  "settings-lock-yield": "Lock-yield Policy Settings",
   "accessibility-explorer": "Accessibility Explorer",
   "settings-updates": "Updates Settings",
   "orchestration-loop": "Orchestration Loop",
@@ -310,6 +324,7 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   wrappers: "Wrappers",
   productivity: "Productivity",
   regression: "Regression",
+  "memory-federation": "Memory Federation",
 };
 
 /**

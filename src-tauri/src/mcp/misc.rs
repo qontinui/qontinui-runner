@@ -587,6 +587,8 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
                         error: Some(format!("Failed to launch Chrome: {}", e)),
                         error_detail: None,
                         hint: None,
+                        code: None,
+                        suggestions: None,
                     })
                 }
             }
@@ -599,6 +601,8 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
                 error: Some("Chrome not found. Please close Chrome and launch it manually with: chrome.exe --remote-debugging-port=9222".to_string()),
                 error_detail: None,
                 hint: None,
+                code: None,
+                suggestions: None,
             })
         }
     }

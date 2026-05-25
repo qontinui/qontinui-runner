@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tracing::{debug, error, info};
 
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use super::types::UiBridgeError;
+use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
 use super::helpers::{direct_webview_evaluate_with_result, evaluate_js_expression, safe_evaluate};
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
@@ -227,6 +228,7 @@ const VALID_TAB_IDS: &[&str] = &[
     "triggers",
     "tasks",
     "settings",
+    "settings-account",
     "settings-ai",
     "settings-agentic",
     "settings-self-healing",
@@ -244,6 +246,10 @@ const VALID_TAB_IDS: &[&str] = &[
     "settings-instances",
     "settings-debug",
     "settings-security",
+    "settings-notifications",
+    "settings-otel",
+    "settings-containers",
+    "settings-lock-yield",
     "accessibility-explorer",
     "settings-updates",
     "orchestration-loop",
@@ -1087,25 +1093,36 @@ pub async fn ui_bridge_activate_tab_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let trimmed = tab_id.trim().to_string();
     if trimmed.is_empty() {
+        // Iter-3 item 1 — empty tab id is structurally invalid; populate
+        // `error_detail.code = "INVALID_TAB_ID"` for the same reason the
+        // wrong-id branch below does, so both rejection paths share the
+        // machine-readable envelope.
+        let detail = UiBridgeError::invalid_tab_id("", VALID_TAB_IDS);
+        let message = detail.message.clone();
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error(
-                "activate-tab: `tab_id` path parameter is required (non-empty string)".to_string(),
-            )),
+            Json(api_error_detailed(message, detail)),
         ));
     }
 
     if !VALID_TAB_IDS.contains(&trimmed.as_str()) {
+        // Iter-3 item 1 — populate `error_detail.code = "INVALID_TAB_ID"`
+        // so callers can match on the machine-readable code instead of
+        // parsing the prose `error` field. `error_detail.context.knownTabs`
+        // carries the full registry; the prose `error` keeps the
+        // human-readable preview for terminal-friendly debugging.
+        let detail = UiBridgeError::invalid_tab_id(&trimmed, VALID_TAB_IDS);
         let preview: Vec<&str> = VALID_TAB_IDS.iter().take(12).copied().collect();
+        let message = format!(
+            "activate-tab: unknown tab_id `{}`. Valid tab_ids include: {} (and {} more — \
+             see src/components/app/tab-types.ts for the full list).",
+            trimmed,
+            preview.join(", "),
+            VALID_TAB_IDS.len() - preview.len()
+        );
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error(format!(
-                "activate-tab: unknown tab_id `{}`. Valid tab_ids include: {} (and {} more — \
-                 see src/components/app/tab-types.ts for the full list).",
-                trimmed,
-                preview.join(", "),
-                VALID_TAB_IDS.len() - preview.len()
-            ))),
+            Json(api_error_detailed(message, detail)),
         ));
     }
 
@@ -1191,24 +1208,31 @@ pub async fn ui_bridge_tab_activate_handler(
     let tab_id = match validate_tab_id(&request.tab_id) {
         Ok(id) => id,
         Err(known) => {
-            // Build a `data` payload whose shape matches the cheatsheet —
-            // `{ knownTabs: [...], tabId: "<rejected>" }`. The cheatsheet
-            // promises `knownTabs` is reachable from the response, and
-            // callers disambiguate via inline help when `unknown_tab`
-            // surfaces. We bypass `api_error(..)` because that helper
-            // doesn't carry a `data` payload.
+            // Iter-3 item 1 — populate `error_detail.code = "INVALID_TAB_ID"`
+            // so callers can match on the machine-readable code instead of
+            // parsing the prose `error` field. Keep the `data.knownTabs`
+            // payload for backward compat with callers that read it from
+            // there (the cheatsheet contract), and ALSO surface knownTabs
+            // inside `error_detail.context` for callers using the structured
+            // envelope. Two-tier presentation: legacy `data` shape preserved,
+            // new `error_detail` carries the canonical machine-readable
+            // payload.
             let data_payload = serde_json::json!({
                 "knownTabs": known,
                 "tabId": request.tab_id,
             });
+            let detail = UiBridgeError::invalid_tab_id(&request.tab_id, &known);
+            let message = detail.message.clone();
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ApiResponse {
                     success: false,
                     data: Some(data_payload),
-                    error: Some(format!("unknown_tab: \"{}\"", request.tab_id)),
-                    error_detail: None,
+                    error: Some(message),
+                    error_detail: Some(detail),
                     hint: None,
+                    code: None,
+                    suggestions: None,
                 }),
             ));
         }
@@ -1229,6 +1253,8 @@ pub async fn ui_bridge_tab_activate_handler(
                     error: Some(e),
                     error_detail: None,
                     hint: None,
+                    code: None,
+                    suggestions: None,
                 }),
             ))
         }
@@ -1554,6 +1580,48 @@ mod tab_activate_tests {
         let req: TabActivateRequest =
             serde_json::from_str(r#"{"tabId": "specs"}"#).expect("parse camelCase");
         assert_eq!(req.tab_id, "specs");
+    }
+
+    /// Iter-3 item 1 — the `invalid_tab_id` factory must produce a
+    /// `UiBridgeError` whose `code = INVALID_TAB_ID`, whose `message`
+    /// echoes the rejected id, and whose `context` carries both the
+    /// rejected id and the full `knownTabs` list. Locks down the
+    /// envelope contract callers depend on: `error_detail.code` is the
+    /// machine-readable surface, `error_detail.context.knownTabs` is
+    /// the self-correction payload.
+    #[test]
+    fn invalid_tab_id_factory_envelope_shape() {
+        use crate::mcp::ui_bridge::types::{UiBridgeError, UiBridgeErrorCode};
+        let detail = UiBridgeError::invalid_tab_id("nonexistent", VALID_TAB_IDS);
+        assert!(
+            matches!(detail.code, UiBridgeErrorCode::InvalidTabId),
+            "code must be InvalidTabId"
+        );
+        assert!(
+            detail.message.contains("nonexistent"),
+            "message echoes the rejected id"
+        );
+        let ctx = detail
+            .context
+            .as_ref()
+            .expect("context must carry the structured payload");
+        assert_eq!(
+            ctx.get("code").and_then(|v| v.as_str()),
+            Some("INVALID_TAB_ID")
+        );
+        assert_eq!(
+            ctx.get("tabId").and_then(|v| v.as_str()),
+            Some("nonexistent")
+        );
+        let known_arr = ctx
+            .get("knownTabs")
+            .and_then(|v| v.as_array())
+            .expect("context.knownTabs must be an array");
+        assert_eq!(
+            known_arr.len(),
+            VALID_TAB_IDS.len(),
+            "knownTabs must include every entry from the registry"
+        );
     }
 
     /// Regression: `VALID_TAB_IDS` must contain every id exactly once. A

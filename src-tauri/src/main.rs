@@ -1080,6 +1080,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution_variables::get_resolved_execution_context,
             commands::execution_variables::save_execution_variables_settings,
             commands::execution_variables::test_env_var,
+            commands::federation::get_federation_reports,
             commands::extraction::create_extraction_session,
             commands::extraction::export_state_structure,
             commands::extraction::export_training_data,
@@ -1709,27 +1710,56 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // to the webview without taking an AppHandle parameter.
             tauri_app_handle::set(app.handle().clone());
 
-            // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.G —
-            // initialize the process-wide memory-federation bridge. The
-            // bridge mediates the per-session pull / watcher / reconcile
-            // lifecycle that materializes the tenant memory pool into the
-            // about-to-spawn Claude CLI's per-account memory dir, watches
-            // for in-session writes, and pushes them back to coord. Init
-            // failure is non-fatal — the spawn sites short-circuit when
-            // `observable_bridge::global()` returns `None`.
-            match qontinui_runner_lib::observable_bridge::memory::MemoryBridge::new() {
-                Ok(bridge) => {
-                    let arc = std::sync::Arc::new(bridge);
-                    qontinui_runner_lib::observable_bridge::init_global(arc.clone());
-                    app.manage(arc);
-                    info!("memory federation bridge initialized");
+            // Plan 2026-05-22-memories-on-coord-cross-machine.md Phase 5.G,
+            // generalized by 2026-05-24-federation-verify-and-gitop.md
+            // Phase 4 — initialize the process-wide observable-bridge
+            // registry. Each bridge mediates a per-session pull / watch /
+            // reconcile lifecycle (memory federation; git-ops next). Init
+            // failure is non-fatal — the spawn sites iterate the registry
+            // and an empty registry short-circuits all federation.
+            {
+                let mut bridges: Vec<
+                    std::sync::Arc<dyn qontinui_runner_lib::observable_bridge::RunnerObservableBridge>,
+                > = Vec::new();
+                match qontinui_runner_lib::observable_bridge::memory::MemoryBridge::new() {
+                    Ok(bridge) => {
+                        let arc = std::sync::Arc::new(bridge);
+                        // Keep the concrete Arc available as Tauri State
+                        // (e.g. for runner-shutdown `shutdown_all`), and
+                        // register it as a trait object for dispatch.
+                        app.manage(arc.clone());
+                        bridges.push(arc);
+                        info!("memory federation bridge initialized");
+                    }
+                    Err(e) => {
+                        warn!(
+                            "memory federation bridge init failed ({}); feature disabled this session",
+                            e
+                        );
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "memory federation bridge init failed ({}); feature disabled this session",
-                        e
-                    );
+                // GitOpBridge — the second observable category (`git_op`).
+                // Registered unconditionally (default ON), mirroring the
+                // memory bridge. Init failure is non-fatal and independent:
+                // a failed git bridge must not disable memory federation.
+                match qontinui_runner_lib::observable_bridge::git_ops::GitOpBridge::new() {
+                    Ok(bridge) => {
+                        let arc = std::sync::Arc::new(bridge);
+                        // Keep the concrete Arc as Tauri State for
+                        // runner-shutdown `shutdown_all` (hook teardown),
+                        // and register it as a trait object for dispatch.
+                        app.manage(arc.clone());
+                        bridges.push(arc);
+                        info!("git-op federation bridge initialized");
+                    }
+                    Err(e) => {
+                        warn!(
+                            "git-op federation bridge init failed ({}); git federation disabled this session",
+                            e
+                        );
+                    }
                 }
+                qontinui_runner_lib::observable_bridge::init_registry(bridges);
             }
 
             // Plan 2026-05-22-coord-native-session-coordination Phase 2 —
@@ -1812,27 +1842,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     coord_sync_facade.clone(),
                 );
                 coord_sync_facade.attach_registry(&registry);
-                // Plan §Phase 3 — start both background loops. JoinHandles
-                // are intentionally dropped: the tasks live for the
-                // lifetime of the process and we let tokio reap them on
-                // shutdown.
-                let _drain = registry.coord_sync().start_drain_task();
-                let _heartbeat = registry.coord_sync().start_heartbeat_task();
-                // Plan §Phase 7 — start the cross-machine handoff receiver.
-                // Push-driven: subscribes to coord's `/ws` Redis fan-out
-                // (`qontinui.sessions.*`) for handoff_request frames
-                // addressed to this device + a one-shot catch-up GET on
-                // every (re)connect, then materializes each as a child
-                // session (parent_session_id = source). JoinHandle dropped
-                // — lives for the process.
-                let _handoff_rx = session::handoff::start_receiver_task(registry.clone());
-                // Plan §Phase 10 — start the cutover-flag poll loop. Only
-                // spawns when an `active_tenant_id` resolved from
-                // machine.json; returns None (no task) otherwise. The
-                // flag defaults FALSE so dual-write stays dormant until an
-                // operator flips `session_coordination_enabled` for the
-                // tenant. JoinHandle dropped like the other loops.
-                let _flag_poll = registry.coord_sync().start_flag_poll_task();
+                // Plan §Phase 3/7/10 — start the coord-sync background loops
+                // (drain, heartbeat, Phase 7 handoff receiver, Phase 10
+                // cutover-flag poll). `.setup()` runs synchronously with no
+                // ambient Tokio reactor, so these helpers' internal
+                // `tokio::spawn` panics ("there is no reactor running, must be
+                // called from the context of a Tokio 1.x runtime"). Wrap the
+                // starts in `tauri::async_runtime::spawn` so they execute on
+                // Tauri's managed runtime — matching the other setup-time
+                // spawns below. Handles are intentionally dropped; the tasks
+                // run detached for the lifetime of the process.
+                //   Phase 7 receiver subscribes to coord's `/ws` Redis fan-out
+                //   (`qontinui.sessions.*`) + a one-shot on-(re)connect catch-up
+                //   GET, materializing each handoff_request as a child session.
+                //   Phase 10 flag-poll only spawns when an `active_tenant_id`
+                //   resolved from machine.json (None → dormant); dual-write
+                //   stays off until `session_coordination_enabled` flips.
+                let loop_registry = registry.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _drain = loop_registry.coord_sync().start_drain_task();
+                    let _heartbeat = loop_registry.coord_sync().start_heartbeat_task();
+                    let _handoff_rx =
+                        session::handoff::start_receiver_task(loop_registry.clone());
+                    let _flag_poll = loop_registry.coord_sync().start_flag_poll_task();
+                });
                 app.manage(registry);
 
             }
@@ -2496,7 +2529,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 ))
                             }
                         };
-                        tokio::spawn(async move {
+                        tauri::async_runtime::spawn(async move {
                             if let Err(e) = restate::http_endpoint::start_restate_endpoint(
                                 endpoint_port,
                                 restate_app_state,
@@ -2509,7 +2542,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Register our endpoint with the Restate server once both are ready
                     let rs = restate_settings.clone();
-                    tokio::spawn(async move {
+                    tauri::async_runtime::spawn(async move {
                         // When using an external Restate server we cannot probe a
                         // local port for it — trust that it's up and skip the wait.
                         let admin_ready = if rs.is_external() {

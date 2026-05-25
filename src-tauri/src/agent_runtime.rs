@@ -80,6 +80,8 @@ pub struct LaunchPayload {
     pub plan_slug: Option<String>,
     #[serde(default)]
     pub plan_phase: Option<u32>,
+    #[serde(default)]
+    pub correlation_topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -392,6 +394,10 @@ async fn run_agent_subprocess(payload: LaunchPayload) -> anyhow::Result<()> {
         .worktree_path
         .clone();
 
+    // Write .mcp.json so the spawned claude process auto-discovers
+    // the coord MCP server for coordination tooling.
+    write_coord_mcp_config(&primary_wt, &payload);
+
     let log_path = agent_log_path(payload.agent_id);
 
     // Step 2: heartbeat task — runs for the agent's whole life.
@@ -553,6 +559,59 @@ fn qontinui_root_dir() -> Option<PathBuf> {
     dirs::home_dir()
         .map(|h| h.join("qontinui-root"))
         .filter(|p| p.is_dir())
+}
+
+/// Write `.mcp.json` into the agent's primary worktree directory so the
+/// spawned `claude` process auto-discovers the coord MCP server.
+///
+/// Targets the **coord-native** streamable-HTTP MCP server at
+/// `{COORD_HTTP_URL}/mcp` (Bearer-authenticated with the agent's own JWT),
+/// rather than spawning a local `coord-mcp.mjs` Node sidecar. The agent's
+/// identity (device_id, tenant_id, correlation topic) is derived server-side
+/// from the validated JWT claims, so no `AGENT_NAME`/`AGENT_LANE`/`TOPIC`/
+/// `DEVICE_ID` env vars are needed in the config.
+///
+/// DEPLOY GATING — DO NOT MERGE/DEPLOY THIS RUNNER CHANGE BEFORE the
+/// coord-native `/mcp` endpoint (coord branch `feat/coord-native-coordination-mcp`)
+/// is live on the target coord deployment (staging). If this config points at
+/// a coord that has no `/mcp` route, agents get an unreachable MCP server:
+/// Claude Code degrades gracefully and runs *without* coord tools, which is a
+/// silent coordination regression. Sequence the coord deploy first.
+fn write_coord_mcp_config(primary_wt: &str, payload: &LaunchPayload) {
+    let coord_url =
+        std::env::var("COORD_HTTP_URL").unwrap_or_else(|_| "http://localhost:9870".to_string());
+    let mcp_url = format!("{}/mcp", coord_url.trim_end_matches('/'));
+
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "coord-mcp": {
+                "type": "http",
+                "url": mcp_url,
+                "headers": {
+                    "Authorization": format!("Bearer {}", payload.jwt),
+                }
+            }
+        }
+    });
+
+    let mcp_path = Path::new(primary_wt).join(".mcp.json");
+    match std::fs::write(
+        &mcp_path,
+        serde_json::to_string_pretty(&mcp_config).unwrap_or_default(),
+    ) {
+        Ok(()) => {
+            info!(
+                "agent_runtime: wrote .mcp.json for coord-mcp in {}",
+                primary_wt
+            );
+        }
+        Err(e) => {
+            warn!(
+                "agent_runtime: failed to write .mcp.json in {}: {e}",
+                primary_wt
+            );
+        }
+    }
 }
 
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
@@ -845,6 +904,7 @@ mod tests {
             claim_token: "agent:00000000-0000-0000-0000-000000000000".to_string(),
             plan_slug: Some("readiness".to_string()),
             plan_phase: Some(4),
+            correlation_topic: Some("my-coordination-topic".to_string()),
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
@@ -897,6 +957,61 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
             None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
+        }
+    }
+
+    #[test]
+    fn write_coord_mcp_config_emits_http_bearer_shape() {
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-cfg-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let primary_wt = tmp.to_string_lossy().to_string();
+
+        let prev = std::env::var("COORD_HTTP_URL").ok();
+        std::env::set_var("COORD_HTTP_URL", "https://coord.example.test/");
+
+        let payload = LaunchPayload {
+            agent_id: uuid::Uuid::now_v7(),
+            agent_session_id: None,
+            target_device_id: uuid::Uuid::now_v7(),
+            worktrees: vec![],
+            jwt: "header.payload.sig".to_string(),
+            jwt_exp: 0,
+            initial_prompt: "go".to_string(),
+            claim_token: "agent:x".to_string(),
+            plan_slug: None,
+            plan_phase: None,
+            correlation_topic: Some("my-coordination-topic".to_string()),
+        };
+
+        write_coord_mcp_config(&primary_wt, &payload);
+
+        let written = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let server = &v["mcpServers"]["coord-mcp"];
+
+        // HTTP transport pointing at coord /mcp, Bearer-authenticated.
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "https://coord.example.test/mcp");
+        assert_eq!(
+            server["headers"]["Authorization"],
+            "Bearer header.payload.sig"
+        );
+
+        // No Node-sidecar/subprocess residue, and no identity env vars
+        // (identity is derived server-side from the JWT claims).
+        assert!(server.get("command").is_none(), "must not spawn a command");
+        assert!(server.get("args").is_none(), "must not pass node args");
+        assert!(server.get("env").is_none(), "identity must come from JWT");
+        assert!(
+            !written.contains("node") && !written.contains("coord-mcp.mjs"),
+            "config must not reference the Node sidecar: {written}"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(p) => std::env::set_var("COORD_HTTP_URL", p),
+            None => std::env::remove_var("COORD_HTTP_URL"),
         }
     }
 

@@ -96,13 +96,14 @@ pub(super) fn run_claude_api(
     });
 
     retry_with_backoff("Claude API", || {
-        let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send();
+        let response = super::anthropic_auth::apply_blocking(
+            client.post("https://api.anthropic.com/v1/messages"),
+            &api_key,
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send();
 
         match response {
             Ok(resp) => {
@@ -202,13 +203,14 @@ pub(super) fn run_claude_api_with_overrides(
     }
 
     retry_with_backoff("Claude API (overrides)", || {
-        let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send();
+        let response = super::anthropic_auth::apply_blocking(
+            client.post("https://api.anthropic.com/v1/messages"),
+            &api_key,
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send();
 
         match response {
             Ok(resp) => {
@@ -317,13 +319,14 @@ pub(super) fn run_claude_api_multimodal(
     }
 
     retry_with_backoff("Claude API (multimodal)", || {
-        let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send();
+        let response = super::anthropic_auth::apply_blocking(
+            client.post("https://api.anthropic.com/v1/messages"),
+            &api_key,
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send();
 
         match response {
             Ok(resp) => {
@@ -569,13 +572,14 @@ pub(super) fn run_claude_api_with_structured_output(
     }
 
     retry_with_backoff("Claude API (structured output)", || {
-        let response = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send();
+        let response = super::anthropic_auth::apply_blocking(
+            client.post("https://api.anthropic.com/v1/messages"),
+            &api_key,
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send();
 
         match response {
             Ok(resp) => {

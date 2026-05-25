@@ -128,11 +128,15 @@ export function MemoryFederationBanner() {
             <div style={actionsColumnStyle}>
               {hasFailures ? (
                 <a
-                  href="#/admin/memory-federation"
+                  href="#/memory-federation"
                   style={linkStyle}
                   onClick={(e) => {
                     e.preventDefault();
-                    window.location.hash = "#/admin/memory-federation";
+                    window.dispatchEvent(
+                      new CustomEvent("ui-bridge-navigate", {
+                        detail: { page: "memory-federation" },
+                      }),
+                    );
                   }}
                 >
                   Open log

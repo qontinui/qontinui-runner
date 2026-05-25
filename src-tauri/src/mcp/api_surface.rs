@@ -185,6 +185,8 @@ async fn handle_scan(
                 error: Some(format!("Scan task failed: {}", e)),
                 error_detail: None,
                 hint: None,
+                code: None,
+                suggestions: None,
             }),
         )
     })?;
@@ -195,6 +197,8 @@ async fn handle_scan(
         error: None,
         error_detail: None,
         hint: None,
+        code: None,
+        suggestions: None,
     }))
 }
 

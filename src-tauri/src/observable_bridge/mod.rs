@@ -14,8 +14,12 @@
 //!     → Fan-out: pulls into other runners' next session prep
 //!
 //! The [`RunnerObservableBridge`] trait abstracts this lifecycle.
-//! [`MemoryBridge`] is the reference implementation; subsequent
-//! categories (e.g. `GitOpBridge`) reuse the trait without modification.
+//! [`MemoryBridge`] is the reference implementation. A second category
+//! (`GitOpBridge`) implements the same trait — the trait is
+//! category-generic: it carries no memory-specific types. Bridge-internal
+//! concerns (the memory watcher's `push` + its `ObservableChange` change
+//! type) live inside [`memory`], not on the shared interface, because a
+//! git-op change has nothing structurally in common with a memory upsert.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,31 +29,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub mod git_ops;
+pub mod git_ops_client;
 pub mod memory;
 pub mod memory_client;
 
-/// Process-wide singleton `MemoryBridge` set once at runner init by
-/// `main.rs::setup`. Spawn-site call paths (`claude_session::runner`,
-/// `claude_session::session`) reach it via [`global`] because they run
-/// in the binary tree without access to Tauri `State`.
+/// Process-wide registry of every enabled observable bridge, set once at
+/// runner init by `main.rs::setup`. Spawn-site call paths
+/// (`claude_session::runner`, `claude_session::session`) reach it via
+/// [`global_registry`] because they run in the binary tree without
+/// access to Tauri `State`, and iterate every bridge for pull / watch /
+/// reconcile.
 ///
-/// `None` if init failed (e.g., no profile, no reqwest builder) — every
-/// caller short-circuits on that and the spawn proceeds without
-/// federation.
-static GLOBAL_BRIDGE: OnceCell<Arc<memory::MemoryBridge>> = OnceCell::new();
+/// Empty (or unset) if init failed (e.g., no profile, no reqwest
+/// builder) — every caller iterates zero bridges and the spawn proceeds
+/// without federation.
+static GLOBAL_REGISTRY: OnceCell<Vec<Arc<dyn RunnerObservableBridge>>> = OnceCell::new();
 
-/// Install the process-wide `MemoryBridge`. Idempotent — subsequent
-/// calls are silently ignored so accidental double-init (e.g., from
-/// two Tauri `.setup` closures during testing) does not panic.
-pub fn init_global(bridge: Arc<memory::MemoryBridge>) {
-    let _ = GLOBAL_BRIDGE.set(bridge);
+/// Install the process-wide observable-bridge registry. Idempotent —
+/// subsequent calls are silently ignored so accidental double-init
+/// (e.g., from two Tauri `.setup` closures during testing) does not
+/// panic.
+pub fn init_registry(bridges: Vec<Arc<dyn RunnerObservableBridge>>) {
+    let _ = GLOBAL_REGISTRY.set(bridges);
 }
 
-/// Read the process-wide `MemoryBridge`. Returns `None` until
-/// [`init_global`] runs successfully — federation-aware call sites
-/// must treat this as the "feature disabled this session" signal.
-pub fn global() -> Option<&'static Arc<memory::MemoryBridge>> {
-    GLOBAL_BRIDGE.get()
+/// Read the process-wide observable-bridge registry. Returns an empty
+/// slice until [`init_registry`] runs successfully — federation-aware
+/// call sites iterate it and a zero-length registry is the
+/// "feature disabled this session" signal.
+pub fn global_registry() -> &'static [Arc<dyn RunnerObservableBridge>] {
+    GLOBAL_REGISTRY.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
 /// Per-session context every bridge receives.
@@ -63,11 +73,19 @@ pub struct SessionContext {
     pub device_id: Uuid,
     pub account_name: String,
     pub memory_dir: PathBuf,
+    /// The working directory the session spawned in. `MemoryBridge`
+    /// derives `memory_dir` from it upstream and does not read this
+    /// field; `GitOpBridge` reads it to locate `<working_dir>/.git/`.
+    pub working_dir: PathBuf,
     pub session_id: Uuid,
     /// Snapshot of `memory_dir` taken immediately after `pull` completed.
     /// Used by `reconcile` to diff against final state at session end.
     /// `None` until `pull` runs.
     pub post_pull_snapshot: Option<DirSnapshot>,
+    /// Count of files pulled from coord during the `pull` phase.
+    /// Populated by `MemoryBridge::pull`; read by `reconcile` to fill
+    /// the `ReconcileReport.pulled` field.
+    pub pulled_count: u32,
 }
 
 /// A single file's identity in a memory directory snapshot.
@@ -90,13 +108,6 @@ impl DirSnapshot {
     }
 }
 
-/// Local-change event surfaced by a bridge's file watcher to `push`.
-#[derive(Debug, Clone)]
-pub enum ObservableChange {
-    Upserted { name: String, content: String },
-    Deleted { name: String },
-}
-
 /// Aggregate counts from a `reconcile` pass — useful for UI banner.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReconcileReport {
@@ -104,26 +115,53 @@ pub struct ReconcileReport {
     pub pulled: u32,
     pub unchanged: u32,
     pub failed: u32,
+    /// Names of files that failed during reconcile (for debugging).
+    #[serde(default)]
+    pub failed_names: Vec<String>,
 }
 
 /// The trait every federated observable category implements.
+///
+/// The interface is category-generic: it carries no memory-specific
+/// types. How a bridge detects local changes during a session (a file
+/// watcher, a git hook, …) and how it represents those changes are
+/// bridge-internal — they never cross this trait. `MemoryBridge`'s
+/// `push` + `ObservableChange` live inside [`memory`] for exactly this
+/// reason.
 #[async_trait]
 pub trait RunnerObservableBridge: Send + Sync {
     /// Stable category name — used as the `coord.<category>` table name
-    /// and the dashboard route segment. Memories: `"memory"`. Git-ops
-    /// (future): `"git_op"`.
+    /// and the dashboard route segment. Memories: `"memory"`. Git-ops:
+    /// `"git_op"`.
     fn category(&self) -> &'static str;
 
     /// Spawn-time: pull the tenant pool from coord, materialize locally.
-    /// Populates `session_ctx.post_pull_snapshot`.
-    async fn pull(&self, session_ctx: &mut SessionContext) -> Result<()>;
+    /// May record per-session baseline state on `ctx` (e.g.
+    /// `post_pull_snapshot`) for `reconcile` to diff against.
+    async fn pull(&self, ctx: &mut SessionContext) -> Result<()>;
 
-    /// During-session: invoked on a debounced local change event.
-    async fn push(&self, change: ObservableChange, session_ctx: &SessionContext) -> Result<()>;
+    /// During-session: start watching for local changes and push them to
+    /// coord best-effort.
+    ///
+    /// The receiver is `self: Arc<Self>` (NOT `&self`): an
+    /// implementation may `Arc::clone(&self)` into a detached watch task
+    /// so the watcher can keep calling its own internal push after this
+    /// returns. `&self` cannot produce that owned `Arc`, and `&Arc<Self>`
+    /// is not object-safe. `Arc<Self>` IS object-safe — callable on
+    /// `Arc<dyn RunnerObservableBridge>` — so the dispatch site passes
+    /// `Arc::clone(b)`. `ctx` is borrowed; the impl clones it internally
+    /// before moving the clone into any spawned task.
+    async fn start_watching(self: Arc<Self>, ctx: &SessionContext) -> Result<()>;
 
-    /// Session-end: re-snapshot, diff against `post_pull_snapshot`,
-    /// push anything the watcher missed, return aggregate counts.
-    async fn reconcile(&self, session_ctx: &SessionContext) -> Result<ReconcileReport>;
+    /// Stop the watcher for `session_id` if one is running. Idempotent —
+    /// a no-op when no watcher is registered for the id. Safe to call
+    /// before `reconcile` (which may also stop internally).
+    async fn stop_watching(&self, session_id: Uuid);
+
+    /// Session-end: stop watching, diff final state against the post-pull
+    /// baseline, push anything the watcher missed, return aggregate
+    /// counts.
+    async fn reconcile(&self, ctx: &SessionContext) -> Result<ReconcileReport>;
 }
 
 #[cfg(test)]

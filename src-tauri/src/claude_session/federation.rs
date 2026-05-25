@@ -127,8 +127,10 @@ pub fn build_federation_ctx(
         device_id,
         account_name,
         memory_dir,
+        working_dir: PathBuf::from(working_dir),
         session_id: session_uuid(session_id),
         post_pull_snapshot: None,
+        pulled_count: 0,
     })
 }
 
@@ -142,8 +144,8 @@ struct ReconcilePayload<'a> {
 }
 
 /// Surface a `reconcile` result on stderr (`tracing`) + the Tauri event
-/// channel. Best-effort — emit failures are swallowed because telemetry
-/// must never block the session-end cleanup path.
+/// channel + best-effort POST to coord. Emit failures are swallowed
+/// because telemetry must never block the session-end cleanup path.
 pub fn emit_federation_report(
     app_handle: &tauri::AppHandle,
     ctx: &SessionContext,
@@ -160,6 +162,11 @@ pub fn emit_federation_report(
                 failed = r.failed,
                 "memory federation reconcile complete"
             );
+
+            // Best-effort POST to coord — fire-and-forget so we never
+            // block the session-end cleanup path.
+            post_report_to_coord(ctx, &r);
+
             let payload = ReconcilePayload {
                 session_id: ctx.session_id.to_string(),
                 account: &ctx.account_name,
@@ -182,6 +189,59 @@ pub fn emit_federation_report(
     }
 }
 
+/// Best-effort POST of the reconcile report to coord's federation reports
+/// endpoint. Runs in a detached `tokio::spawn` so the caller is never
+/// blocked. Errors are logged but never propagated.
+fn post_report_to_coord(ctx: &SessionContext, report: &ReconcileReport) {
+    use qontinui_runner_lib::observable_bridge::memory_client;
+
+    let token = match crate::auth::AuthManager::new().get_access_token() {
+        Ok(t) if !t.is_empty() => t,
+        _ => return, // not paired
+    };
+    let base = match memory_client::coord_http_base() {
+        Some(b) => b,
+        None => return, // no coord URL
+    };
+
+    let failed_names: Option<serde_json::Value> = if report.failed_names.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!(report.failed_names))
+    };
+
+    let body = serde_json::json!({
+        "device_id": ctx.device_id,
+        "session_id": ctx.session_id,
+        "account_name": ctx.account_name,
+        "pushed": report.pushed,
+        "pulled": report.pulled,
+        "unchanged": report.unchanged,
+        "failed": report.failed,
+        "failed_names": failed_names,
+        "metadata": {
+            "coord_url": base,
+        },
+    });
+
+    let http = match memory_client::build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("federation report: build_client failed: {e} (non-fatal)");
+            return;
+        }
+    };
+
+    let tenant_id = ctx.tenant_id;
+    tokio::spawn(async move {
+        if let Err(e) =
+            memory_client::post_federation_report(&http, &base, &token, tenant_id, &body).await
+        {
+            debug!("federation report: coord POST failed: {e} (non-fatal)");
+        }
+    });
+}
+
 /// Reachable from contexts that have a `tracing` logger but no Tauri
 /// `AppHandle` (the inline path uses `tracing` only — see plan Phase 5.C
 /// "If the inline path doesn't have an `AppHandle` accessible, emit via
@@ -189,20 +249,52 @@ pub fn emit_federation_report(
 /// minus the Tauri broadcast.
 pub fn log_federation_report(ctx: &SessionContext, report: Result<ReconcileReport>) {
     match report {
+        Ok(r) => {
+            info!(
+                session_id = %ctx.session_id,
+                account = %ctx.account_name,
+                pushed = r.pushed,
+                pulled = r.pulled,
+                unchanged = r.unchanged,
+                failed = r.failed,
+                "memory federation reconcile complete"
+            );
+            post_report_to_coord(ctx, &r);
+        }
+        Err(e) => warn!(
+            session_id = %ctx.session_id,
+            account = %ctx.account_name,
+            error = %e,
+            "memory federation reconcile failed"
+        ),
+    }
+}
+
+/// Generic per-bridge reconcile telemetry for non-memory observable
+/// categories. Logs the aggregate `ReconcileReport` via `tracing` tagged
+/// with the bridge `category`. Unlike [`emit_federation_report`] it does
+/// NOT POST to coord or broadcast the memory-specific Tauri banner event —
+/// each non-memory bridge owns its own coord telemetry inside its
+/// `reconcile`/client. Keeps the session-end path crash-free for any
+/// number of registered bridges.
+pub fn log_bridge_report(category: &str, ctx: &SessionContext, report: Result<ReconcileReport>) {
+    match report {
         Ok(r) => info!(
+            category = %category,
             session_id = %ctx.session_id,
             account = %ctx.account_name,
             pushed = r.pushed,
             pulled = r.pulled,
             unchanged = r.unchanged,
             failed = r.failed,
-            "memory federation reconcile complete"
+            "federation reconcile complete"
         ),
         Err(e) => warn!(
+            category = %category,
             session_id = %ctx.session_id,
             account = %ctx.account_name,
             error = %e,
-            "memory federation reconcile failed"
+            "federation reconcile failed"
         ),
     }
 }

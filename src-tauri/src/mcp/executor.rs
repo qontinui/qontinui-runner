@@ -125,6 +125,8 @@ pub async fn restart_executor(
                         error: Some("Bridge manager not initialised".to_string()),
                         error_detail: None,
                         hint: None,
+                        code: None,
+                        suggestions: None,
                     }),
                 ));
             }
@@ -215,6 +217,8 @@ pub async fn restart_executor(
                 error: Some(format!("Failed to spawn Python executor: {}", e)),
                 error_detail: None,
                 hint: None,
+                code: None,
+                suggestions: None,
             }),
         ));
     }
@@ -300,6 +304,8 @@ pub async fn restart_executor(
                     error: Some(message),
                     error_detail: None,
                     hint: None,
+                    code: None,
+                    suggestions: None,
                 }),
             ))
         }

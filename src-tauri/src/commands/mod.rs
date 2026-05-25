@@ -186,6 +186,7 @@ pub mod execution;
 pub mod execution_reporting;
 pub mod execution_variables; // Execution variables (auth source, custom variables)
 pub mod extraction;
+pub mod federation; // Memory federation reports from coord
 pub mod file_browser; // Safe read-only filesystem browsing for mobile
 pub mod findings;
 pub mod flow; // Flow designer commands

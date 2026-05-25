@@ -418,36 +418,41 @@ fn run_claude_session_inline(
         );
         None
     };
-    let federation_ctx_opt = if let (Some(mut ctx), Some(bridge)) = (
-        federation_ctx_opt,
-        qontinui_runner_lib::observable_bridge::global().cloned(),
-    ) {
-        // pull + start_watcher must run in async context. Inline runner
+    let federation_ctx_opt = if let Some(mut ctx) = federation_ctx_opt {
+        // pull + start_watching must run in async context. Inline runner
         // is invoked from a sync worker thread that itself runs inside
         // Tauri's tokio runtime — match the `demo_workflows.rs` idiom.
-        let pull_result = run_async_inline(async { bridge.pull(&mut ctx).await });
-        match pull_result {
-            Ok(()) => {
-                let watcher_result =
-                    run_async_inline(async { bridge.start_watcher(ctx.clone()).await });
-                if let Err(e) = watcher_result {
-                    warn!(
-                        "memory federation: start_watcher failed for session {} ({}); \
-                         continuing without in-session watcher — reconcile will still run",
-                        session_id, e
-                    );
+        // Iterate every registered observable bridge: a per-bridge pull
+        // failure skips that bridge's watcher but never kills the session
+        // or the other bridges. Returns the ctx (with any post-pull
+        // baselines recorded) so the exit path can reconcile.
+        run_async_inline(async {
+            for b in qontinui_runner_lib::observable_bridge::global_registry() {
+                match b.pull(&mut ctx).await {
+                    Ok(()) => {
+                        if let Err(e) = std::sync::Arc::clone(b).start_watching(&ctx).await {
+                            warn!(
+                                "federation[{}]: start_watching failed for session {} ({}); \
+                                 continuing without in-session watcher — reconcile will still run",
+                                b.category(),
+                                session_id,
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "federation[{}]: pull failed for session {} ({}); \
+                             skipping watcher for this bridge",
+                            b.category(),
+                            session_id,
+                            e
+                        );
+                    }
                 }
-                Some(ctx)
             }
-            Err(e) => {
-                warn!(
-                    "memory federation: pull failed for session {} ({}); \
-                     skipping watcher + reconcile for this session",
-                    session_id, e
-                );
-                None
-            }
-        }
+        });
+        Some(ctx)
     } else {
         None
     };
@@ -455,13 +460,14 @@ fn run_claude_session_inline(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            // Stop the memory-federation watcher we just installed so a
+            // Stop every federation watcher we just installed so a
             // spawn failure does not leak an orphan `notify` hook.
-            if let (Some(ctx), Some(bridge)) = (
-                federation_ctx_opt.as_ref(),
-                qontinui_runner_lib::observable_bridge::global().cloned(),
-            ) {
-                run_async_inline(async { bridge.stop_watcher(ctx.session_id).await });
+            if let Some(ctx) = federation_ctx_opt.as_ref() {
+                run_async_inline(async {
+                    for b in qontinui_runner_lib::observable_bridge::global_registry() {
+                        b.stop_watching(ctx.session_id).await;
+                    }
+                });
             }
             return Err(format!("Failed to spawn Claude CLI: {}", e));
         }
@@ -1967,15 +1973,22 @@ fn run_claude_session_inline(
     // the watcher missed, and emits a report on Tauri's event bus +
     // tracing. `app_handle` is in scope here, so we use the full
     // emit_federation_report path.
-    if let (Some(ctx), Some(bridge)) = (
-        federation_ctx_opt.as_ref(),
-        qontinui_runner_lib::observable_bridge::global().cloned(),
-    ) {
-        let report = run_async_inline(async {
-            bridge.stop_watcher(ctx.session_id).await;
-            bridge.reconcile(ctx).await
-        });
-        crate::claude_session::federation::emit_federation_report(app_handle, ctx, report);
+    if let Some(ctx) = federation_ctx_opt.as_ref() {
+        for b in qontinui_runner_lib::observable_bridge::global_registry() {
+            let category = b.category();
+            let report = run_async_inline(async {
+                b.stop_watching(ctx.session_id).await;
+                b.reconcile(ctx).await
+            });
+            // The memory category keeps its full Tauri-banner + coord
+            // telemetry surface; other categories log-and-continue so a
+            // second observable never crashes the session-end path.
+            if category == "memory" {
+                crate::claude_session::federation::emit_federation_report(app_handle, ctx, report);
+            } else {
+                crate::claude_session::federation::log_bridge_report(category, ctx, report);
+            }
+        }
     }
 
     Ok(CliSessionOutput {
