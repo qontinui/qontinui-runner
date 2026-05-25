@@ -121,6 +121,79 @@ pub(crate) fn should_relay_idle(settings: &crate::settings::Settings) -> bool {
     )
 }
 
+/// Diagnostic snapshot of the relay's idle-gating inputs + live connection
+/// state, served at `GET /web-integration/status` on the runner's local API.
+///
+/// Sourced from exactly the same places the relay loop reads when deciding
+/// whether to idle ([`should_relay_idle`]): `settings.tier`,
+/// `settings.web_integration.enabled`, the AuthManager device-JWT slot, and
+/// the live `ServerModeState` (WS connection + last connection error). This
+/// lets an operator see *why* the runner never appears to the mobile app /
+/// cloud — instead of every gate being invisible.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WebIntegrationStatus {
+    /// The runner tier (`local` / `local_provider` / `qontinui_account`).
+    /// Anything other than `qontinui_account` idles the relay (gate 1).
+    pub tier: crate::settings::RunnerTier,
+    /// User-facing master switch `settings.web_integration.enabled` (gate 2).
+    pub web_integration_enabled: bool,
+    /// Whether AuthManager's `access_token` slot holds a non-empty
+    /// device-JWT (gate 3). The actual token is never exposed.
+    pub has_device_jwt: bool,
+    /// Whether the relay currently holds an open, post-handshake WS
+    /// connection. False whenever the relay is idling or reconnecting.
+    pub ws_connected: bool,
+    /// The most recent relay connection error (e.g. handshake 401, DNS
+    /// failure), or `None` if the last attempt succeeded / none yet.
+    pub last_error: Option<String>,
+}
+
+/// Build the diagnostic [`WebIntegrationStatus`] from the same settings +
+/// relay state the idle gate reads. Pure-ish (only reads): used by both the
+/// HTTP handler and any future caller that wants the gating snapshot.
+pub(crate) async fn web_integration_status(api_state: &Arc<ApiState>) -> WebIntegrationStatus {
+    let settings = crate::settings::load_settings();
+    let has_device_jwt = match crate::auth::AuthManager::new().get_access_token() {
+        Ok(t) => !t.trim().is_empty(),
+        Err(_) => false,
+    };
+
+    let (ws_connected, last_error) = match api_state.app_state.current_server_mode().await {
+        Some(sm) => (sm.is_ws_connected(), sm.registration_error().await),
+        None => (false, None),
+    };
+
+    WebIntegrationStatus {
+        tier: settings.tier,
+        web_integration_enabled: settings.web_integration.enabled,
+        has_device_jwt,
+        ws_connected,
+        last_error,
+    }
+}
+
+/// `GET /web-integration/status` — local-only diagnostic endpoint exposing
+/// the relay's idle-gating inputs + live connection state. Unauthenticated,
+/// consistent with the rest of the runner's localhost-bound API surface
+/// (see the CORS rationale in `mcp_api::start_server`). Returns the JSON
+/// `{ tier, web_integration_enabled, has_device_jwt, ws_connected,
+/// last_error }`.
+async fn web_integration_status_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> axum::response::Json<WebIntegrationStatus> {
+    axum::response::Json(web_integration_status(&state).await)
+}
+
+/// Router exposing the relay's web-integration diagnostic endpoint. Merged
+/// into the base router in `mcp_api::start_server`.
+pub fn routes() -> axum::Router<Arc<ApiState>> {
+    axum::Router::new().route(
+        "/web-integration/status",
+        axum::routing::get(web_integration_status_handler),
+    )
+}
+
 /// Return true iff `e` is a tungstenite handshake error with HTTP 401
 /// (Unauthorized). Used by [`relay_loop`] to detect a stale device-JWT
 /// and kick the refresher BEFORE serving out the backoff sleep.

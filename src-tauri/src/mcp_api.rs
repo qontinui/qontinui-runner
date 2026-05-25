@@ -1642,6 +1642,10 @@ pub fn create_router(
         .route("/health", get(health))
         .route("/ui-bridge/health", get(health))
         .route("/ui-bridge/status", get(health))
+        // Relay web-integration diagnostic — exposes the idle-gating state
+        // (tier, enabled, device-JWT presence, WS connection, last error) so
+        // an operator can see WHY a runner never appears to the cloud/mobile.
+        .merge(crate::mcp::backend_relay::routes())
         // AWAS routes (imported directly)
         .route("/awas/discover", post(awas_discover))
         .route("/awas/execute", post(awas_execute))
