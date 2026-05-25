@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::findings::{Finding, FindingStatus, FindingStatusExt};
+use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 /// Request body for updating finding status
@@ -23,6 +24,27 @@ pub struct UpdateFindingStatusRequest {
     pub status: String,
     /// Optional resolution text
     pub resolution: Option<String>,
+}
+
+impl RequestHints for UpdateFindingStatusRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `status` (one of: \"detected\", \"in_progress\", \"needs_input\", \
+             \"resolved\", \"wont_fix\", \"deferred\"). Optional: `resolution` (string)."
+                .to_string(),
+            "Terminal statuses (resolved, wont_fix, deferred) cannot be undone via this endpoint."
+                .to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "allowedStatuses": [
+                "detected", "in_progress", "needs_input",
+                "resolved", "wont_fix", "deferred"
+            ],
+            "terminalStatuses": ["resolved", "wont_fix", "deferred"]
+        }))
+    }
 }
 
 /// Request body for resolving a finding
@@ -197,7 +219,7 @@ pub async fn get_task_findings_handler(
 pub async fn update_finding_status_handler(
     State(state): State<Arc<ApiState>>,
     Path(finding_id): Path<String>,
-    Json(req): Json<UpdateFindingStatusRequest>,
+    UiBridgeJson(req): UiBridgeJson<UpdateFindingStatusRequest>,
 ) -> Result<Json<ApiResponse<FindingMutationResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let status = FindingStatus::from_str(&req.status).ok_or_else(|| {
         (
@@ -410,4 +432,134 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/findings/{finding_id}/user-response",
             post(user_response_handler),
         )
+}
+
+// ============================================================================
+// Unit tests — Phase A4 UiBridgeJson migration
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::put,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use super::UpdateFindingStatusRequest;
+    use crate::mcp::envelope::UiBridgeJson;
+
+    // ── helper ────────────────────────────────────────────────────────────────
+
+    async fn send_uib<T>(body: &'static str) -> (StatusCode, serde_json::Value)
+    where
+        T: serde::de::DeserializeOwned + crate::mcp::envelope::RequestHints + Send + 'static,
+    {
+        async fn handler<
+            T: serde::de::DeserializeOwned + crate::mcp::envelope::RequestHints + Send,
+        >(
+            UiBridgeJson(_): UiBridgeJson<T>,
+        ) -> axum::http::StatusCode {
+            axum::http::StatusCode::OK
+        }
+
+        let app = Router::new().route("/test", put(handler::<T>));
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    // ── UpdateFindingStatusRequest ────────────────────────────────────────────
+
+    /// Missing `status` field → 422 with `allowedStatuses` + `terminalStatuses` in hint.
+    #[tokio::test]
+    async fn update_finding_status_request_422_carries_allowed_statuses() {
+        let (status, body) =
+            send_uib::<UpdateFindingStatusRequest>(r#"{"resolution": "fixed it"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        let suggestions = body["suggestions"].as_array().expect("suggestions array");
+        assert!(!suggestions.is_empty(), "suggestions must not be empty");
+        let hint = &body["hint"];
+        assert!(!hint.is_null(), "hint must carry allowedStatuses");
+        let statuses = hint["allowedStatuses"]
+            .as_array()
+            .expect("allowedStatuses array");
+        assert_eq!(
+            statuses.len(),
+            6,
+            "must expose all 6 FindingStatus variants"
+        );
+        // Spot-check a few
+        assert!(
+            statuses.iter().any(|s| s.as_str() == Some("detected")),
+            "detected must be listed"
+        );
+        assert!(
+            statuses.iter().any(|s| s.as_str() == Some("in_progress")),
+            "in_progress must be listed"
+        );
+        assert!(
+            statuses.iter().any(|s| s.as_str() == Some("needs_input")),
+            "needs_input must be listed"
+        );
+        assert!(
+            statuses.iter().any(|s| s.as_str() == Some("resolved")),
+            "resolved must be listed"
+        );
+        assert!(
+            statuses.iter().any(|s| s.as_str() == Some("wont_fix")),
+            "wont_fix must be listed"
+        );
+        assert!(
+            statuses.iter().any(|s| s.as_str() == Some("deferred")),
+            "deferred must be listed"
+        );
+        // Terminal statuses also surfaced for caller guidance
+        let terminal = hint["terminalStatuses"]
+            .as_array()
+            .expect("terminalStatuses array");
+        assert_eq!(terminal.len(), 3, "must expose 3 terminal statuses");
+    }
+
+    /// Valid body (status present) → extractor succeeds (200, no rejection).
+    #[tokio::test]
+    async fn update_finding_status_request_valid_body_succeeds() {
+        // Use the standalone extractor path — a valid body must NOT be rejected.
+        // The inner handler returns 200 with an empty body; we only check the status.
+        async fn handler_ok(
+            UiBridgeJson(_): UiBridgeJson<UpdateFindingStatusRequest>,
+        ) -> axum::http::StatusCode {
+            axum::http::StatusCode::OK
+        }
+
+        let app = Router::new().route("/test", put(handler_ok));
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"status": "resolved", "resolution": "fixed"}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "valid body must extract successfully"
+        );
+    }
 }

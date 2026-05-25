@@ -12,6 +12,7 @@ use tracing::{error, info};
 
 use crate::commands::ai_generation::build_provider_settings;
 use crate::executor::with_default_bridge;
+use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
@@ -64,6 +65,18 @@ pub struct GeneratePromptRequest {
     pub user_prompt: String,
     /// Mode: "generate" or "improve"
     pub mode: String,
+}
+
+impl RequestHints for GeneratePromptRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required fields: `user_prompt` (string), `mode` (\"generate\" | \"improve\").".to_string(),
+            "Use \"generate\" to create a new prompt from scratch; use \"improve\" to enhance an existing one.".to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "allowedModes": ["generate", "improve"] }))
+    }
 }
 
 /// Request body for POST /ai/generate-macro
@@ -320,7 +333,7 @@ pub async fn generate_context_handler(
 /// Generate or improve an AI task prompt via the Python bridge.
 pub async fn generate_prompt_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<GeneratePromptRequest>,
+    UiBridgeJson(request): UiBridgeJson<GeneratePromptRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     use crate::settings;
 
@@ -631,4 +644,96 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ai/suggest-exploration-strategy",
             post(suggest_exploration_strategy_handler),
         )
+}
+
+// ============================================================================
+// Unit tests — Phase A4 UiBridgeJson migration
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use super::GeneratePromptRequest;
+    use crate::mcp::envelope::UiBridgeJson;
+
+    // ── helper ────────────────────────────────────────────────────────────────
+
+    async fn send_uib<T>(body: &'static str) -> (StatusCode, serde_json::Value)
+    where
+        T: serde::de::DeserializeOwned + crate::mcp::envelope::RequestHints + Send + 'static,
+    {
+        async fn handler<
+            T: serde::de::DeserializeOwned + crate::mcp::envelope::RequestHints + Send,
+        >(
+            UiBridgeJson(_): UiBridgeJson<T>,
+        ) -> axum::http::StatusCode {
+            axum::http::StatusCode::OK
+        }
+
+        let app = Router::new().route("/test", post(handler::<T>));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    // ── GeneratePromptRequest ─────────────────────────────────────────────────
+
+    /// Missing `mode` field → 422 with `allowedModes` in hint.
+    #[tokio::test]
+    async fn generate_prompt_request_422_carries_allowed_modes() {
+        let (status, body) =
+            send_uib::<GeneratePromptRequest>(r#"{"user_prompt": "write a button test"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        let suggestions = body["suggestions"].as_array().expect("suggestions array");
+        assert!(!suggestions.is_empty(), "suggestions must not be empty");
+        let hint = &body["hint"];
+        assert!(!hint.is_null(), "hint must carry allowedModes");
+        let modes = hint["allowedModes"].as_array().expect("allowedModes array");
+        assert_eq!(
+            modes.len(),
+            2,
+            "must expose both generate and improve modes"
+        );
+        assert!(
+            modes.iter().any(|m| m.as_str() == Some("generate")),
+            "generate must be listed"
+        );
+        assert!(
+            modes.iter().any(|m| m.as_str() == Some("improve")),
+            "improve must be listed"
+        );
+    }
+
+    /// Missing `user_prompt` field → 422 with suggestions (both fields are required).
+    #[tokio::test]
+    async fn generate_prompt_request_missing_user_prompt_gives_422() {
+        let (status, body) = send_uib::<GeneratePromptRequest>(r#"{"mode": "generate"}"#).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        // suggestions and hint both populated by RequestHints impl
+        assert!(
+            !body["suggestions"].is_null(),
+            "suggestions must be present even when user_prompt is missing"
+        );
+    }
 }
