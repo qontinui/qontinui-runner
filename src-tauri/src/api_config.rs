@@ -8,6 +8,7 @@
 //!
 //! | Variable                    | Service                                | Default                                  |
 //! |-----------------------------|----------------------------------------|------------------------------------------|
+//! | `QONTINUI_WEB_BACKEND_URL`  | qontinui-web FastAPI backend (override)| (falls through to `QONTINUI_API_URL`)    |
 //! | `QONTINUI_API_URL`          | qontinui-web FastAPI backend           | `http://127.0.0.1:8000` (debug) / prod   |
 //! | `QONTINUI_RUNNER_API_URL`   | This runner's MCP HTTP API             | `http://127.0.0.1:{actual_port}`         |
 //! | `QONTINUI_PORT`             | Bootstrap port for runner MCP API      | `9876`                                   |
@@ -33,19 +34,32 @@ pub const PROD_API_BASE_URL: &str = "https://api.qontinui.io";
 
 /// Get API base URL for qontinui-web backend.
 ///
+/// This is the SINGLE source of truth for the web-backend base across every
+/// runner subsystem (auth, workflow-sync, heartbeat, task-sync, …). Previously
+/// `heartbeat.rs` honored `QONTINUI_WEB_BACKEND_URL` while workflow-sync only
+/// honored `QONTINUI_API_URL`, so the two could resolve to different hosts and
+/// silently diverge (one path 401'ing against the wrong backend). Folding both
+/// vars in here guarantees every caller resolves to the same host.
+///
 /// Resolution order:
-/// 1. `QONTINUI_API_URL` environment variable (if set)
-/// 2. Debug builds: `http://127.0.0.1:8000` (IPv4 — backend only binds IPv4,
+/// 1. `QONTINUI_WEB_BACKEND_URL` environment variable (web-integration override)
+/// 2. `QONTINUI_API_URL` environment variable
+/// 3. Debug builds: `http://127.0.0.1:8000` (IPv4 — backend only binds IPv4,
 ///    localhost may resolve to IPv6 `::1` first)
-/// 3. Release builds: `PROD_API_BASE_URL`
+/// 4. Release builds: `PROD_API_BASE_URL`
+///
+/// A trailing slash is trimmed so callers can safely `format!("{base}/api/...")`.
 pub fn get_api_base_url() -> String {
-    std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
-        if cfg!(debug_assertions) {
-            format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
-        } else {
-            PROD_API_BASE_URL.to_string()
-        }
-    })
+    let raw = std::env::var("QONTINUI_WEB_BACKEND_URL")
+        .or_else(|_| std::env::var("QONTINUI_API_URL"))
+        .unwrap_or_else(|_| {
+            if cfg!(debug_assertions) {
+                format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT)
+            } else {
+                PROD_API_BASE_URL.to_string()
+            }
+        });
+    raw.trim().trim_end_matches('/').to_string()
 }
 
 /// MCP API base URL for the runner's own HTTP server.

@@ -688,6 +688,57 @@ pub fn get_test_auto_login(
     }
 }
 
+/// Headless/back-end auto-login for supervisor-spawned test runners.
+///
+/// The webview-driven auto-login (`get_test_auto_login` → React `AuthProvider`)
+/// only fires once the frontend mounts. A supervisor-spawned temp runner that
+/// stays headless (no webview, or a slow/cold WebView2 init) therefore never
+/// authenticates, so the device-JWT is never minted and backend heartbeats /
+/// the WS relay stay disabled (`runner_token_empty=true`, 401 on workflow
+/// sync — the staging device-registration gap). This routine performs the same
+/// login from the Rust side at startup, independent of the webview, whenever
+/// `QONTINUI_TEST_AUTO_LOGIN_EMAIL` / `_PASSWORD` are present.
+///
+/// Fire-and-forget; safe no-op (with a grep-able `headless_auto_login_skipped`
+/// reason) when creds are absent, the runner isn't tier-2, or tokens already
+/// exist (e.g. the webview path or a prior run already authenticated).
+pub fn spawn_headless_auto_login(launch_env: crate::launch_env::SharedLaunchEnv) {
+    let creds = match launch_env.auto_login.as_ref() {
+        Some(c) => (c.email.clone(), c.password.clone()),
+        None => {
+            let reason = launch_env.auto_login_skip_reason.unwrap_or("unknown");
+            info!(reason = %reason, "headless_auto_login_skipped");
+            return;
+        }
+    };
+
+    tauri::async_runtime::spawn(async move {
+        // Tier gate: login requires tier 2 (QontinuiAccount). Skip quietly
+        // otherwise rather than emitting a misleading login-failed warning.
+        if settings::load_settings().tier != settings::RunnerTier::QontinuiAccount {
+            info!(reason = "not_tier_2", "headless_auto_login_skipped");
+            return;
+        }
+
+        // Already authenticated (webview path won the race, or a prior run)?
+        let auth_manager = AuthManager::new();
+        if auth_manager.has_tokens() {
+            info!("headless_auto_login: tokens already present — skipping");
+            return;
+        }
+
+        let (email, password) = creds;
+        info!(email = %email, "headless_auto_login: attempting backend login");
+        match login_impl(email, password).await {
+            Ok(resp) => info!(
+                user = %resp.user.id,
+                "headless_auto_login: login succeeded — device-JWT mint + heartbeat can proceed"
+            ),
+            Err(e) => warn!(error = %String::from(e), "headless_auto_login: login failed"),
+        }
+    });
+}
+
 /// Returns the current runner tier. Frontend gates its auth-touching effects
 /// on this — see `AuthProvider.tsx`.
 #[tauri::command]

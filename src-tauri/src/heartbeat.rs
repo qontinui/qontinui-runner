@@ -74,8 +74,10 @@ impl From<crate::crash_dumps::RecentCrash> for HeartbeatRecentCrash {
 /// every 30 seconds. If this is a secondary instance (`QONTINUI_PRIMARY_PORT`
 /// is set), also sends a heartbeat to the primary runner every 15 seconds.
 pub fn start_heartbeat(app_state: Arc<AppState>) {
-    let backend_url = std::env::var("QONTINUI_WEB_BACKEND_URL")
-        .unwrap_or_else(|_| crate::api_config::get_api_base_url());
+    // `get_api_base_url()` is the single resolver: it already honors
+    // `QONTINUI_WEB_BACKEND_URL` → `QONTINUI_API_URL` → default, so heartbeat
+    // and workflow-sync can no longer resolve to different hosts.
+    let backend_url = crate::api_config::get_api_base_url();
 
     // Backend renamed the route from `/api/v1/dev-dashboard/heartbeat` to
     // `/api/v1/operations/heartbeat` as part of the operations-rename refactor
