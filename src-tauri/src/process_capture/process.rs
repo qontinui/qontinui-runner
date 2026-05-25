@@ -71,6 +71,13 @@ pub(crate) struct ManagedProcess {
     task_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Health check task handle.
     health_task: Option<tokio::task::JoinHandle<()>>,
+    /// Always-on per-process reconcile loop handle (Phase B1).
+    ///
+    /// Spawned once from `register` and kept alive across stop/start cycles so
+    /// the loop can detect Stopped→ExternallyOwned drift while the managed
+    /// process is not running. Never aborted by `stop()` — use
+    /// `abort_reconcile_loop` to shut it down.
+    pub reconcile_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ManagedProcess {
@@ -83,6 +90,7 @@ impl ManagedProcess {
             early_exit: Arc::new(std::sync::Mutex::new(None)),
             task_handles: Vec::new(),
             health_task: None,
+            reconcile_task: None,
         }
     }
 
