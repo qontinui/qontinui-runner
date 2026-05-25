@@ -65,6 +65,15 @@ use uuid::Uuid;
 
 use crate::mcp::types::ApiState;
 
+/// Maximum size (bytes) of a request or response body the generic
+/// `http_request` relay arm will carry over the WS in a single
+/// `command_response` frame. Requests with a decoded body larger than this
+/// are rejected with 413 before issuing the local call; local responses
+/// whose body exceeds this are likewise replaced with a 413 error reply so
+/// the runner never emits a multi-megabyte WS frame (head-of-line blocking
+/// / memory-blowup guard). See plan §3.1 (option (a) + cap).
+const RELAY_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Pure idle predicate: given the three relay gates, should the loop
 /// idle (await a kick) instead of connecting? True iff *any* gate is unmet:
 ///
@@ -975,6 +984,17 @@ async fn handle_relay_command(
         }
 
         // --------------------------------------------------------------
+        // Generic HTTP relay (mobile remote-runner connection). The web
+        // backend's `runner_proxy` handler relays a mobile client's HTTP
+        // control call down this WS as a top-level `http_request` envelope
+        // and waits (by `request_id`) for a `command_response`. We self-call
+        // the runner's OWN local Axum server over loopback and return the
+        // response. This relays *every* runner route transparently — see
+        // `plans/2026-05-25-mobile-backend-remote-runner-relay.md` §1a/§2.
+        // --------------------------------------------------------------
+        "http_request" => handle_http_request(api_state, data).await,
+
+        // --------------------------------------------------------------
         // Mobile chat session relay (carry-over from legacy relay)
         // --------------------------------------------------------------
         "chat_message" => handle_chat_message(api_state, data).await,
@@ -1047,6 +1067,212 @@ async fn handle_relay_command(
             None
         }
     }
+}
+
+/// Hop-by-hop request headers that must NOT be forwarded to the local
+/// loopback call (they describe the WS-relayed transport, not the inner
+/// request). Lowercased for case-insensitive comparison.
+const RELAY_SKIP_REQUEST_HEADERS: &[&str] =
+    &["host", "connection", "transfer-encoding", "content-length"];
+
+/// Hop-by-hop / framing response headers that must NOT be echoed back over
+/// the WS (reqwest already decoded the body; `content-length` would be
+/// wrong post-base64 round-trip and `transfer-encoding` is meaningless off
+/// the wire). Lowercased.
+const RELAY_SKIP_RESPONSE_HEADERS: &[&str] = &[
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "content-length",
+];
+
+/// Build the `command_response` reply frame the backend's `dispatch_and_wait`
+/// correlates on. `headers` is a JSON object of string→string; `body_b64` is
+/// the (already base64-encoded) body. Carries the originating `request_id`
+/// verbatim so the waiter wakes and maps the reply.
+fn http_relay_response(request_id: &Value, status: u16, headers: Value, body_b64: String) -> Value {
+    serde_json::json!({
+        "type": "command_response",
+        "request_id": request_id,
+        "status": status,
+        "headers": headers,
+        "body_b64": body_b64,
+    })
+}
+
+/// Build a small JSON-body error reply (`command_response`) with the given
+/// status. The body is `{"error": <message>}` base64-encoded; the header set
+/// advertises `content-type: application/json`.
+fn http_relay_error(request_id: &Value, status: u16, message: &str) -> Value {
+    let body = serde_json::json!({ "error": message }).to_string();
+    let headers = serde_json::json!({ "content-type": "application/json" });
+    http_relay_response(
+        request_id,
+        status,
+        headers,
+        STANDARD.encode(body.as_bytes()),
+    )
+}
+
+/// Handle a generic `http_request` relay command (mobile remote-runner
+/// connection). Self-calls the runner's own local Axum server over loopback
+/// and returns the response as a `command_response` frame. See
+/// `plans/2026-05-25-mobile-backend-remote-runner-relay.md` §2 / Phase 2.
+///
+/// Always returns `Some(command_response)` — even on error — so the backend's
+/// `dispatch_and_wait` wakes and maps the reply rather than timing out.
+async fn handle_http_request(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+    // Build the loopback base URL from the runner's OWN bound port (never
+    // hardcode 9876 — secondary/temp runners bind elsewhere), then delegate
+    // to the transport-agnostic core (testable without an `ApiState`).
+    let base = crate::mcp::types::get_self_base_url(&api_state.app_state);
+    Some(relay_http_to_base(&base, data).await)
+}
+
+/// Transport-agnostic core of the `http_request` relay: given the loopback
+/// base URL (e.g. `http://localhost:9876`) and the inbound envelope, issue
+/// the local call and build the `command_response` reply frame. Split out so
+/// it can be unit-tested against a real local server without constructing a
+/// full `ApiState`. Always returns a `command_response` value.
+async fn relay_http_to_base(base: &str, data: &Value) -> Value {
+    // `request_id` is echoed verbatim (may be string/null); the backend
+    // correlates the reply purely on it.
+    let request_id = data.get("request_id").cloned().unwrap_or(Value::Null);
+
+    let method_str = data
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("GET")
+        .to_uppercase();
+    let method = match reqwest::Method::from_bytes(method_str.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            warn!("http_request relay: invalid method {:?}", method_str);
+            return http_relay_error(&request_id, 400, "invalid HTTP method");
+        }
+    };
+
+    let path = data
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let query = data.get("query").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Decode the request body (base64). Empty / absent => no body.
+    let body_b64 = data.get("body_b64").and_then(|v| v.as_str()).unwrap_or("");
+    let body_bytes: Vec<u8> = if body_b64.is_empty() {
+        Vec::new()
+    } else {
+        match STANDARD.decode(body_b64) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("http_request relay: invalid body_b64: {}", e);
+                return http_relay_error(&request_id, 400, "invalid base64 request body");
+            }
+        }
+    };
+
+    if body_bytes.len() > RELAY_MAX_BODY_BYTES {
+        warn!(
+            "http_request relay: request body {} bytes exceeds cap {}",
+            body_bytes.len(),
+            RELAY_MAX_BODY_BYTES
+        );
+        return http_relay_error(&request_id, 413, "request body exceeds relay size limit");
+    }
+
+    // Build the loopback URL from the supplied base (caller derives it from
+    // the runner's OWN bound port via `get_self_base_url`).
+    let mut url = format!("{}/{}", base.trim_end_matches('/'), path);
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(query);
+    }
+
+    // Forward request headers minus hop-by-hop.
+    let mut header_map = reqwest::header::HeaderMap::new();
+    if let Some(obj) = data.get("headers").and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            let lk = k.to_lowercase();
+            if RELAY_SKIP_REQUEST_HEADERS.contains(&lk.as_str()) {
+                continue;
+            }
+            let val = match v.as_str() {
+                Some(s) => s.to_string(),
+                None => v.to_string(),
+            };
+            match (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&val),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    header_map.insert(name, value);
+                }
+                _ => {
+                    warn!("http_request relay: skipping invalid header {:?}", k);
+                }
+            }
+        }
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("http_request relay: failed to build client: {}", e);
+            return http_relay_error(&request_id, 502, "failed to build relay client");
+        }
+    };
+
+    let mut req = client.request(method, &url).headers(header_map);
+    if !body_bytes.is_empty() {
+        req = req.body(body_bytes);
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("http_request relay: local call to {} failed: {}", url, e);
+            return http_relay_error(&request_id, 502, "runner local HTTP call failed");
+        }
+    };
+
+    let status = resp.status().as_u16();
+
+    // Collect response headers minus hop-by-hop, as a JSON string->string map.
+    let mut headers_obj = serde_json::Map::new();
+    for (name, value) in resp.headers().iter() {
+        let lname = name.as_str().to_lowercase();
+        if RELAY_SKIP_RESPONSE_HEADERS.contains(&lname.as_str()) {
+            continue;
+        }
+        if let Ok(s) = value.to_str() {
+            headers_obj.insert(name.as_str().to_string(), Value::String(s.to_string()));
+        }
+    }
+
+    let resp_body = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("http_request relay: reading response body failed: {}", e);
+            return http_relay_error(&request_id, 502, "reading runner response body failed");
+        }
+    };
+
+    if resp_body.len() > RELAY_MAX_BODY_BYTES {
+        warn!(
+            "http_request relay: response body {} bytes exceeds cap {}",
+            resp_body.len(),
+            RELAY_MAX_BODY_BYTES
+        );
+        return http_relay_error(&request_id, 413, "response body exceeds relay size limit");
+    }
+
+    let body_out = STANDARD.encode(&resp_body);
+    http_relay_response(&request_id, status, Value::Object(headers_obj), body_out)
 }
 
 /// Handle an inbound `dispatch` message from the backend. Spawns the
@@ -2023,5 +2249,172 @@ mod tests {
             !is_unauthorized(&err),
             "ConnectionClosed MUST NOT trigger a refresher kick"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // `http_request` relay arm (Phase 2 mobile remote-runner relay).
+    //
+    // These exercise `relay_http_to_base` — the transport-agnostic core of
+    // the `http_request` arm — against a real ephemeral axum server, so the
+    // full status/header/body round-trip (incl. binary base64 integrity) is
+    // verified end-to-end without constructing a full `ApiState`. The pure
+    // error-reply construction (400/413/502) is verified server-free.
+    // ------------------------------------------------------------------
+
+    use axum::{
+        body::Bytes,
+        extract::Query,
+        http::{HeaderMap, StatusCode as AxumStatus},
+        routing::{get, post},
+        Router,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    /// Spawn a tiny axum server on an ephemeral loopback port and return its
+    /// base URL (e.g. `http://127.0.0.1:54321`). The server stays alive for
+    /// the duration of the test process (task is detached).
+    async fn spawn_test_server(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve");
+        });
+        // Give the accept loop a beat to come up.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        format!("http://{}", addr)
+    }
+
+    fn b64_decode(s: &str) -> Vec<u8> {
+        STANDARD.decode(s).expect("valid base64 in reply body_b64")
+    }
+
+    #[tokio::test]
+    async fn relay_get_round_trips_status_headers_query_and_body() {
+        // Echo handler: returns query param `foo` and a custom request header
+        // in a JSON body, with a custom response header + 201 status.
+        async fn handler(
+            Query(params): Query<HashMap<String, String>>,
+            headers: HeaderMap,
+        ) -> impl axum::response::IntoResponse {
+            let foo = params.get("foo").cloned().unwrap_or_default();
+            let xv = headers
+                .get("x-test")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let body = json!({ "foo": foo, "x_test": xv }).to_string();
+            (
+                AxumStatus::CREATED,
+                [("content-type", "application/json"), ("x-reply", "yes")],
+                body,
+            )
+        }
+        let base = spawn_test_server(Router::new().route("/echo", get(handler))).await;
+
+        let env = json!({
+            "type": "http_request",
+            "request_id": "req-1",
+            "method": "GET",
+            "path": "/echo",
+            "query": "foo=bar",
+            "headers": { "x-test": "hello", "host": "should-be-stripped" },
+            "body_b64": ""
+        });
+
+        let reply = relay_http_to_base(&base, &env).await;
+
+        assert_eq!(reply["type"], "command_response");
+        assert_eq!(reply["request_id"], "req-1");
+        assert_eq!(reply["status"], 201);
+        // Response header forwarded; content-length stripped.
+        assert_eq!(reply["headers"]["x-reply"], "yes");
+        assert!(
+            reply["headers"].get("content-length").is_none(),
+            "content-length must be stripped from the response headers"
+        );
+
+        let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["foo"], "bar", "query forwarded");
+        assert_eq!(parsed["x_test"], "hello", "request header forwarded");
+    }
+
+    #[tokio::test]
+    async fn relay_post_round_trips_binary_body_intact() {
+        // Echo the raw request bytes straight back, unchanged.
+        async fn handler(body: Bytes) -> impl axum::response::IntoResponse {
+            (AxumStatus::OK, body)
+        }
+        let base = spawn_test_server(Router::new().route("/bin", post(handler))).await;
+
+        // Bytes that are not valid UTF-8 — proves we carry raw binary, not text.
+        let raw: Vec<u8> = vec![0x00, 0xff, 0x10, 0x80, 0x7f, 0xfe, 0x01];
+        let env = json!({
+            "type": "http_request",
+            "request_id": "req-bin",
+            "method": "POST",
+            "path": "bin",
+            "body_b64": STANDARD.encode(&raw),
+        });
+
+        let reply = relay_http_to_base(&base, &env).await;
+
+        assert_eq!(reply["status"], 200);
+        let returned = b64_decode(reply["body_b64"].as_str().unwrap());
+        assert_eq!(returned, raw, "binary body must round-trip byte-for-byte");
+    }
+
+    #[tokio::test]
+    async fn relay_request_body_over_cap_returns_413_without_calling() {
+        // Point at an unroutable base; the 413 must fire BEFORE any call.
+        let oversize = STANDARD.encode(vec![0u8; RELAY_MAX_BODY_BYTES + 1]);
+        let env = json!({
+            "type": "http_request",
+            "request_id": "req-big",
+            "method": "POST",
+            "path": "anything",
+            "body_b64": oversize,
+        });
+
+        let reply = relay_http_to_base("http://127.0.0.1:1", &env).await;
+
+        assert_eq!(reply["type"], "command_response");
+        assert_eq!(reply["request_id"], "req-big");
+        assert_eq!(reply["status"], 413);
+        let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+        assert!(body.contains("exceeds relay size limit"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn relay_unreachable_local_server_returns_502() {
+        // Port 1 has no listener -> reqwest connect error -> 502 reply.
+        let env = json!({
+            "type": "http_request",
+            "request_id": "req-502",
+            "method": "GET",
+            "path": "health",
+            "body_b64": "",
+        });
+
+        let reply = relay_http_to_base("http://127.0.0.1:1", &env).await;
+
+        assert_eq!(reply["type"], "command_response");
+        assert_eq!(reply["request_id"], "req-502");
+        assert_eq!(reply["status"], 502);
+    }
+
+    #[test]
+    fn http_relay_error_builds_command_response_with_json_body() {
+        let reply = http_relay_error(&json!("rid-7"), 400, "invalid HTTP method");
+        assert_eq!(reply["type"], "command_response");
+        assert_eq!(reply["request_id"], "rid-7");
+        assert_eq!(reply["status"], 400);
+        assert_eq!(reply["headers"]["content-type"], "application/json");
+        let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "invalid HTTP method");
     }
 }
