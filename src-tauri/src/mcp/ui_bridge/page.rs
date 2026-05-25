@@ -20,6 +20,7 @@ use tauri::Emitter;
 use tracing::{debug, error, info};
 
 use super::types::UiBridgeError;
+use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
 use super::helpers::{direct_webview_evaluate_with_result, evaluate_js_expression, safe_evaluate};
@@ -63,6 +64,28 @@ pub struct NavigateAndWaitRequest {
     pub timeout_ms: u64,
 }
 
+impl RequestHints for NavigateAndWaitRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required fields: `elementId` (string). Optional: `action` (default \"click\"), \
+             `params`, `waitForStableMs` (default 800), `timeoutMs` (default 8000)."
+                .to_string(),
+            "The `action` field must be a supported element action (click, type, hover, etc.)."
+                .to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "allowedActions": [
+                "click", "doubleClick", "double_click", "double", "right", "middle",
+                "type", "sendKeys", "clear", "select", "focus", "blur", "hover",
+                "scroll", "scrollIntoView", "scroll_into_view", "check", "uncheck",
+                "toggle", "drag", "setValue", "submit", "reset", "autocomplete"
+            ]
+        }))
+    }
+}
+
 fn default_nav_action() -> String {
     "click".into()
 }
@@ -86,6 +109,22 @@ pub struct PageNavigateRequest {
     pub(crate) mode: Option<String>,
 }
 
+impl RequestHints for PageNavigateRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `url` (string). Optional: `mode` (\"hard\" | \"soft\", \
+             default \"hard\")."
+                .to_string(),
+            "\"hard\" performs a full webview reload; \"soft\" does SPA-style \
+             history.pushState and preserves injected window state."
+                .to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "allowedModes": ["hard", "soft"] }))
+    }
+}
+
 /// Request for CSS selector query
 #[derive(Debug, Deserialize)]
 pub struct QuerySelectorRequest {
@@ -94,6 +133,16 @@ pub struct QuerySelectorRequest {
     pub action: Option<String>,
     /// Index of the matched element to perform the action on (default: 0)
     pub index: Option<u32>,
+}
+
+impl RequestHints for QuerySelectorRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `selector` (CSS selector string). \
+             Optional: `action` (\"click\"), `index` (number, default 0)."
+                .to_string(),
+        ])
+    }
 }
 
 /// Request for page evaluation
@@ -121,11 +170,30 @@ pub struct PageEvaluateRequest {
     pub allow_network_requests: Option<bool>,
 }
 
+impl RequestHints for PageEvaluateRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec!["Required field: `expression` (JavaScript string). \
+             Optional: `timeoutMs` (number, 1000–600000), `awaitPromise` (bool), \
+             `unwrap` (bool), `allowNetworkRequests` (bool)."
+            .to_string()])
+    }
+}
+
 /// Request to evaluate multiple JS expressions in one round-trip.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchEvaluateRequest {
     pub expressions: Vec<BatchExpression>,
+}
+
+impl RequestHints for BatchEvaluateRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `expressions` (array of `{id, expression}` objects). \
+             Maximum 50 expressions per batch."
+                .to_string(),
+        ])
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -152,6 +220,17 @@ pub struct SetTabRequest {
     pub tab: String,
 }
 
+impl RequestHints for SetTabRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `tab` (string). Must be a known tab id from VALID_TAB_IDS \
+             (e.g. \"specs\", \"tasks\", \"terminal\", \"settings\"). \
+             Use GET /ui-bridge/control/tabs for the full list."
+                .to_string(),
+        ])
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetTabResponse {
@@ -167,6 +246,17 @@ pub struct SetTabResponse {
 #[serde(rename_all = "camelCase")]
 pub struct TabActivateRequest {
     pub tab_id: String,
+}
+
+impl RequestHints for TabActivateRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `tabId` (string). Must be a known tab id \
+             (e.g. \"specs\", \"tasks\", \"terminal\", \"settings\"). \
+             Use GET /ui-bridge/control/tabs for the full list."
+                .to_string(),
+        ])
+    }
 }
 
 // ============================================================================
@@ -286,7 +376,7 @@ const VALID_TAB_IDS: &[&str] = &[
 
 pub async fn ui_bridge_navigate_and_wait_handler(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<NavigateAndWaitRequest>,
+    UiBridgeJson(req): UiBridgeJson<NavigateAndWaitRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     use tokio::time::{sleep, Instant};
 
@@ -483,7 +573,7 @@ pub async fn ui_bridge_page_close_request_handler(
 /// work.
 pub async fn ui_bridge_page_navigate_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<PageNavigateRequest>,
+    UiBridgeJson(request): UiBridgeJson<PageNavigateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
         "UI Bridge API: Page navigate to {} (mode={:?})",
@@ -592,7 +682,7 @@ pub async fn ui_bridge_page_go_forward_handler(
 /// Query elements by CSS selector, optionally performing an action.
 pub async fn ui_bridge_query_selector_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<QuerySelectorRequest>,
+    UiBridgeJson(request): UiBridgeJson<QuerySelectorRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Query selector '{}'", request.selector);
 
@@ -897,7 +987,7 @@ mod static_guard_hint_tests {
 /// Evaluate a JavaScript expression in the webview.
 pub async fn ui_bridge_page_evaluate_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<PageEvaluateRequest>,
+    UiBridgeJson(request): UiBridgeJson<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let timeout = request.timeout_ms.map(|ms| ms.clamp(1000, 600_000));
     let unwrap = request.unwrap.unwrap_or(false);
@@ -930,7 +1020,7 @@ pub async fn ui_bridge_page_evaluate_raw_handler(
 /// POST /ui-bridge/control/page/evaluate-safe
 pub async fn ui_bridge_page_evaluate_safe_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<PageEvaluateRequest>,
+    UiBridgeJson(request): UiBridgeJson<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let preview: String = request.expression.chars().take(80).collect();
     info!("UI Bridge API: Safe evaluate ({}...)", preview);
@@ -947,7 +1037,7 @@ pub async fn ui_bridge_page_evaluate_safe_handler(
 /// POST /ui-bridge/control/page/evaluate-batch
 pub async fn ui_bridge_page_evaluate_batch_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<BatchEvaluateRequest>,
+    UiBridgeJson(request): UiBridgeJson<BatchEvaluateRequest>,
 ) -> Result<Json<ApiResponse<Vec<BatchExpressionResult>>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
         "UI Bridge API: Batch evaluate ({} expressions)",
@@ -1018,7 +1108,7 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
 /// POST /ui-bridge/control/page/set-tab
 pub async fn ui_bridge_page_set_tab_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<SetTabRequest>,
+    UiBridgeJson(request): UiBridgeJson<SetTabRequest>,
 ) -> Result<Json<ApiResponse<SetTabResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let tab = request.tab.trim().to_string();
     if tab.is_empty() {
@@ -1202,7 +1292,7 @@ pub async fn ui_bridge_tabs_list_handler(
 /// guard in case the two lists ever diverge.
 pub async fn ui_bridge_tab_activate_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<TabActivateRequest>,
+    UiBridgeJson(request): UiBridgeJson<TabActivateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)>
 {
     let tab_id = match validate_tab_id(&request.tab_id) {

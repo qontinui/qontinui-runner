@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 use super::screenshots::lookup_element_normalized_rect;
 use super::vision_ai::{self, OcrClient, VlmClient};
 use super::vision_frame_source::resolve_frame_provider;
+use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
@@ -289,6 +290,20 @@ pub struct DiffRequest {
     /// `None` (default) = runner desktop. See [`super::vision_frame_source`].
     #[serde(default)]
     pub target: Option<String>,
+}
+
+impl RequestHints for DiffRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required fields: `baseline` and `comparison` (CaptureSpec objects with optional \
+             `region`, `element`, `contract`, `annotations`, `redact`). \
+             Optional: `mode` (default \"delta\"), `target` (device/app id)."
+                .to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "allowedModes": ["delta", "overlay", "side_by_side"] }))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1118,7 +1133,7 @@ async fn do_multi_capture(
 /// `POST /ui-bridge/vision/diff` — capture twice + naive pixel diff.
 async fn vision_diff_handler(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<DiffRequest>,
+    UiBridgeJson(req): UiBridgeJson<DiffRequest>,
 ) -> Result<Json<ApiResponse<DiffResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let mode = req.mode.as_deref().unwrap_or("delta").to_lowercase();
     if !["delta", "overlay", "side_by_side"].contains(&mode.as_str()) {
@@ -1858,6 +1873,25 @@ pub struct AnalyzeRequest {
     pub target: Option<String>,
 }
 
+impl RequestHints for AnalyzeRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `analyzer` (one of: \"layout\", \"typography\", \"color\", \
+             \"dynamic\", \"elements\"). \
+             Optional: `snapshot` (ElementSnapshot), `region`, `element`, `target`."
+                .to_string(),
+            "Use `vision/assert` for targeted pass/fail checks; \
+             use `vision/analyze` for broad findings across a frame."
+                .to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "allowedAnalyzers": ["layout", "typography", "color", "dynamic", "elements"]
+        }))
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyzeResponse {
@@ -1892,6 +1926,44 @@ pub struct AssertRequest {
     pub target: Option<String>,
 }
 
+impl RequestHints for AssertRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `assertions` (array of Assertion objects). \
+             Each assertion has a `type` discriminator plus type-specific fields."
+                .to_string(),
+            "Assertion `type` values: no_overlap, contains_text, text_fits_container, \
+             aligned_horizontally, aligned_vertically, color_within, typography_consistent, \
+             no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag."
+                .to_string(),
+            "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
+             `ocr_blocks` (from /vision/extract), `target` (device/app id)."
+                .to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "allowedAssertionTypes": [
+                "no_overlap",
+                "contains_text",
+                "text_fits_container",
+                "aligned_horizontally",
+                "aligned_vertically",
+                "color_within",
+                "typography_consistent",
+                "no_layout_shift_since",
+                "no_clipping",
+                "animation_settled",
+                "contrast_meets_wcag"
+            ],
+            "exampleAssertion": {
+                "type": "no_overlap",
+                "elements": ["element-id-a", "element-id-b"]
+            }
+        }))
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssertResponse {
@@ -1917,6 +1989,20 @@ pub struct BaselineRequest {
     pub target: Option<String>,
 }
 
+impl RequestHints for BaselineRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required fields: `name` (string identifier for the baseline), \
+             `snapshot` (ElementSnapshot with an `elements` array from /discover). \
+             Optional: `capture` (CaptureSpec), `target` (device/app id)."
+                .to_string(),
+            "Capture the snapshot first via POST /ui-bridge/sdk/discover or \
+             /ui-bridge/control/discover, then pass the result here."
+                .to_string(),
+        ])
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaselineCreateResponse {
@@ -1938,7 +2024,7 @@ pub struct BaselineListResponse {
 /// structured findings; never pixels.
 async fn vision_analyze_handler(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<AnalyzeRequest>,
+    UiBridgeJson(req): UiBridgeJson<AnalyzeRequest>,
 ) -> Result<Json<ApiResponse<AnalyzeResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `target` selects the frame source: None = runner desktop (today's
     // behavior); a device/app id sources from that target. visual-audit relies
@@ -1980,7 +2066,7 @@ async fn vision_analyze_handler(
 /// Returns per-assertion pass/fail + reason.
 async fn vision_assert_handler(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<AssertRequest>,
+    UiBridgeJson(req): UiBridgeJson<AssertRequest>,
 ) -> Result<Json<ApiResponse<AssertResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `target` selects the frame source: None = runner desktop (today's
     // behavior); a device/app id sources from that target. visual-audit relies
@@ -2058,7 +2144,7 @@ async fn vision_assert_handler(
 /// against the recorded bboxes.
 async fn vision_baseline_handler(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<BaselineRequest>,
+    UiBridgeJson(req): UiBridgeJson<BaselineRequest>,
 ) -> Result<Json<ApiResponse<BaselineCreateResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `target` selects the frame source: None = runner desktop (today's
     // behavior); a device/app id sources from that target so a baseline can be

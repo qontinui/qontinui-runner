@@ -32,6 +32,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::mcp::app_dispatch::AppDispatcher;
 use crate::mcp::app_registry::{AppRegistry, AppTransport};
+use crate::mcp::envelope::UiBridgeJson;
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
 use super::diagnostics::{extract_error_code, CanonicalCode};
@@ -1921,7 +1922,7 @@ pub async fn ui_bridge_get_component_handler(
 pub async fn ui_bridge_execute_component_action_handler(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
-    Json(request): Json<UIBridgeComponentActionRequest>,
+    UiBridgeJson(request): UiBridgeJson<UIBridgeComponentActionRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
         "UI Bridge API: Executing action {} on component {}",

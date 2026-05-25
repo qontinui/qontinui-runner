@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::mcp::envelope::RequestHints;
+
 /// Request to execute an action on an element
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +34,29 @@ pub struct UIBridgeActionRequest {
     pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
+impl RequestHints for UIBridgeActionRequest {
+    fn shape_error_suggestions() -> Option<Vec<String>> {
+        Some(vec![
+            "Required field: `action` (string). \
+             Optional: `params` (object), `waitOptions` (object), `expectChange` (bool or object)."
+                .to_string(),
+            "Use the element's advertised actions. Common values: click, type, hover, \
+             scroll, focus, blur, clear, select, setValue."
+                .to_string(),
+        ])
+    }
+    fn shape_error_data() -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "allowedActions": [
+                "click", "doubleClick", "double_click", "double", "right", "middle",
+                "type", "sendKeys", "clear", "select", "focus", "blur", "hover",
+                "scroll", "scrollIntoView", "scroll_into_view", "check", "uncheck",
+                "toggle", "drag", "setValue", "submit", "reset", "autocomplete"
+            ]
+        }))
+    }
+}
+
 /// Request to execute an action on a component
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +64,8 @@ pub struct UIBridgeComponentActionRequest {
     #[serde(default)]
     pub(crate) params: Option<serde_json::Value>,
 }
+
+impl RequestHints for UIBridgeComponentActionRequest {}
 
 /// Discovery options request
 #[derive(Debug, Default, Deserialize)]
