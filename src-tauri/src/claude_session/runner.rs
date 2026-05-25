@@ -430,9 +430,7 @@ fn run_claude_session_inline(
             for b in qontinui_runner_lib::observable_bridge::global_registry() {
                 match b.pull(&mut ctx).await {
                     Ok(()) => {
-                        if let Err(e) =
-                            std::sync::Arc::clone(b).start_watching(&ctx).await
-                        {
+                        if let Err(e) = std::sync::Arc::clone(b).start_watching(&ctx).await {
                             warn!(
                                 "federation[{}]: start_watching failed for session {} ({}); \
                                  continuing without in-session watcher — reconcile will still run",
@@ -1986,9 +1984,7 @@ fn run_claude_session_inline(
             // telemetry surface; other categories log-and-continue so a
             // second observable never crashes the session-end path.
             if category == "memory" {
-                crate::claude_session::federation::emit_federation_report(
-                    app_handle, ctx, report,
-                );
+                crate::claude_session::federation::emit_federation_report(app_handle, ctx, report);
             } else {
                 crate::claude_session::federation::log_bridge_report(category, ctx, report);
             }

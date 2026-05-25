@@ -247,9 +247,7 @@ impl ClaudeSession {
                 for b in qontinui_runner_lib::observable_bridge::global_registry() {
                     match b.pull(&mut ctx).await {
                         Ok(()) => {
-                            if let Err(e) =
-                                std::sync::Arc::clone(b).start_watching(&ctx).await
-                            {
+                            if let Err(e) = std::sync::Arc::clone(b).start_watching(&ctx).await {
                                 warn!(
                                     "federation[{}]: start_watching failed for session {} ({}); \
                                      continuing without watcher — reconcile will still run",

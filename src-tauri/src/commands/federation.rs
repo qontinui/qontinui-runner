@@ -72,10 +72,8 @@ async fn get_federation_reports_impl(
         url.push_str(&params.join("&"));
     }
 
-    let tenant_id =
-        qontinui_runner_lib::pair::read_paired_tenant_id_from_disk().and_then(|s| {
-            uuid::Uuid::parse_str(s.trim()).ok()
-        });
+    let tenant_id = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk()
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
 
     let mut req = client.get(&url);
     if let Some(tid) = tenant_id {
