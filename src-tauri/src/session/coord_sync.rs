@@ -1177,9 +1177,13 @@ mod tests {
             Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
-        let _drain = coord.start_drain_task();
-
+        // Establish the session (writes the `started` row) BEFORE starting
+        // the drain loop. On a multi_thread runtime the loop runs at once;
+        // if it polls an empty outbox first it sleeps a full TICK_IDLE (5s)
+        // before re-polling, colliding with the 5s budget (~50% flake).
+        // Ordering the row first makes the drain's first poll find work.
         let _handle = registry.start(make_test_intent()).unwrap();
+        let _drain = coord.start_drain_task();
 
         wait_until(Duration::from_secs(5), || {
             let r = rec.try_lock();
@@ -1218,10 +1222,11 @@ mod tests {
             Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
-        let _drain = coord.start_drain_task();
-
+        // See drain_pushes: start the session before the drain loop so its
+        // first poll finds the `started` row instead of sleeping TICK_IDLE.
         let handle = registry.start(make_test_intent()).unwrap();
         let id = handle.id();
+        let _drain = coord.start_drain_task();
 
         wait_until(Duration::from_secs(5), || {
             let r = rec.try_lock();
@@ -1255,9 +1260,10 @@ mod tests {
             Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
-        let _drain = coord.start_drain_task();
-
+        // See drain_pushes: session before the drain loop to avoid the
+        // empty-poll TICK_IDLE sleep racing the test budget.
         let _h = registry.start(make_test_intent()).unwrap();
+        let _drain = coord.start_drain_task();
 
         // Backoff escalates after each fail (1s, 2s, …). After two 5xx
         // failures + one success the queue is empty.
@@ -1283,10 +1289,11 @@ mod tests {
             Duration::from_secs(600),
         );
         let registry = build_registry(coord.clone());
-        let _hb = coord.start_heartbeat_task();
-
+        // Session before the heartbeat loop, consistent with the drain
+        // tests (establish state before starting background loops).
         let handle = registry.start(make_test_intent()).unwrap();
         let id = handle.id();
+        let _hb = coord.start_heartbeat_task();
 
         // Wait for at least one heartbeat outbox row to land.
         wait_until(Duration::from_secs(5), || {
@@ -1314,10 +1321,10 @@ mod tests {
             Duration::from_secs(600),
         );
         let registry = build_registry(coord.clone());
+        // Session before the loops (see drain_pushes).
+        let _h = registry.start(make_test_intent()).unwrap();
         let _drain = coord.start_drain_task();
         let _hb = coord.start_heartbeat_task();
-
-        let _h = registry.start(make_test_intent()).unwrap();
 
         // Wait for at least one PATCH carrying heartbeat=true.
         wait_until(Duration::from_secs(10), || {
@@ -1344,15 +1351,21 @@ mod tests {
             Duration::from_millis(120),
         );
         let registry = build_registry(coord.clone());
-        let _drain = coord.start_drain_task();
-        let _hb = coord.start_heartbeat_task();
 
-        // Force the session's last_heartbeat backwards so the auto-
-        // close trigger fires on the first sweep without waiting for
-        // real wall-clock to pass beyond the threshold mid-loop.
+        // Start the session and force its last_heartbeat far into the past
+        // BEFORE spawning the heartbeat/drain loops. On a multi_thread
+        // runtime the loops run concurrently: if they were started first,
+        // the heartbeat sweep could race ahead of the force, see the
+        // session as still "active", and emit a fresh heartbeat row — so
+        // the autoclose never fires and the DELETE never lands (observed
+        // ~65% flake). Forcing it stale first makes the very first sweep
+        // autoclose it deterministically.
         let handle = registry.start(make_test_intent()).unwrap();
         let id = handle.id();
         registry.force_heartbeat_to_for_test(id, Utc::now() - chrono::Duration::seconds(10));
+
+        let _drain = coord.start_drain_task();
+        let _hb = coord.start_heartbeat_task();
 
         wait_until(Duration::from_secs(5), || {
             let r = rec.try_lock();
