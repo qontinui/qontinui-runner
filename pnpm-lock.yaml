@@ -5,7 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  '@qontinui/shared-types': ^0.3.0
+  '@qontinui/shared-types': ^0.6.0
 
 importers:
 
@@ -27,8 +27,8 @@ importers:
         specifier: ^0.1.0
         version: 0.1.1(@qontinui/ui-bridge@0.8.0(@qontinui/ui-bridge-auto@0.1.6(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react@19.2.5)
       '@qontinui/shared-types':
-        specifier: ^0.3.0
-        version: 0.3.0
+        specifier: ^0.6.0
+        version: 0.6.0
       '@qontinui/ui-bridge':
         specifier: ^0.8.0
         version: 0.8.0(@qontinui/ui-bridge-auto@0.1.6(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
@@ -1128,8 +1128,8 @@ packages:
       react:
         optional: true
 
-  '@qontinui/shared-types@0.3.0':
-    resolution: {integrity: sha512-FRyHnWges9lZ2ND9W84HWgZ6nUsabQVgwuSzTv4ZDO7+2+iISsb7rad15sNb1QWRrcaWWLz6v85ci7mU0gL9Nw==}
+  '@qontinui/shared-types@0.6.0':
+    resolution: {integrity: sha512-dnxCeekllKF5U3nK4Nlb5d1ciTi60uqZ/gDBnSG9nPHCsBdl/eawn0IGLYIIsUdaMFtMblupu67g2QYbGXD/TQ==}
 
   '@qontinui/ui-bridge-auto@0.1.6':
     resolution: {integrity: sha512-PpzXxaDIJN7eDyZfML+N1MR/UAKji1LFX/yw0VYf1KhAyM7yuJ4qtiHlbBx/e9IQTZo3Dws4r5CyJyL0ul+mIw==}
@@ -6141,11 +6141,11 @@ snapshots:
       '@qontinui/ui-bridge': 0.8.0(@qontinui/ui-bridge-auto@0.1.6(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
       react: 19.2.5
 
-  '@qontinui/shared-types@0.3.0': {}
+  '@qontinui/shared-types@0.6.0': {}
 
   '@qontinui/ui-bridge-auto@0.1.6(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)':
     dependencies:
-      '@qontinui/shared-types': 0.3.0
+      '@qontinui/shared-types': 0.6.0
       '@qontinui/ui-bridge': 0.3.9(@qontinui/ui-bridge-auto@0.1.6(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.20.0)
       ts-morph: 27.0.2
     transitivePeerDependencies:
@@ -6186,7 +6186,7 @@ snapshots:
 
   '@qontinui/workflow-ui@0.1.0(@xyflow/react@12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(lucide-react@1.14.0(react@19.2.5))(mermaid@11.14.0)(react-window@2.2.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5))(react@19.2.5)':
     dependencies:
-      '@qontinui/shared-types': 0.3.0
+      '@qontinui/shared-types': 0.6.0
       '@qontinui/workflow-utils': 0.1.0
       '@xyflow/react': 12.10.2(@types/react@19.2.14)(immer@11.1.4)(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
       lucide-react: 1.14.0(react@19.2.5)
@@ -6197,7 +6197,7 @@ snapshots:
 
   '@qontinui/workflow-utils@0.1.0':
     dependencies:
-      '@qontinui/shared-types': 0.3.0
+      '@qontinui/shared-types': 0.6.0
 
   '@radix-ui/number@1.1.1': {}
 
