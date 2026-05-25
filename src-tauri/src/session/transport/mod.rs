@@ -82,6 +82,25 @@ pub trait Transport: Send + Sync + 'static {
     /// Tear down the transport. Idempotent — calling `close` on an
     /// already-closed handle returns `Ok(())`.
     fn close(&self, handle: &TransportHandle) -> Result<(), TransportError>;
+
+    /// Phase 8 (plan §D10) — subscribe to the session's output stream for
+    /// opt-in PTY-output streaming. Returns a broadcast receiver yielding
+    /// base64-encoded output chunks (the same stream the runner frontend
+    /// renders), or `None` when this transport doesn't expose a tappable
+    /// output stream.
+    ///
+    /// Default `None`: only the PTY transport implements this today; the
+    /// claude_cli + workflow transports return `None` and the
+    /// [`super::output_pipe`] is simply never spawned for them. The
+    /// registry only calls this when `intent.share_output` is true, so a
+    /// non-shared session never reaches here (zero overhead off the
+    /// opt-in path).
+    fn tap_output(
+        &self,
+        _handle: &TransportHandle,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        None
+    }
 }
 
 /// Convenience alias for the dyn-trait form used by the [`super::Session`]
