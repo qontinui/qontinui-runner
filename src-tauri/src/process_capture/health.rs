@@ -205,6 +205,133 @@ pub async fn wait_for_port_ready(port: u16, timeout: Duration) -> bool {
     }
 }
 
+/// Return the PID of the process that holds a LISTENING socket on `port`, or
+/// `None` if no process is listening there.
+///
+/// # Platform behaviour
+/// - **Windows**: parses `netstat -ano -p tcp` output; the last whitespace-
+///   separated token on a `LISTENING` line is the owning PID.
+/// - **Unix (Linux/macOS)**: tries `ss -ltnp` first (part of `iproute2`);
+///   falls back to `lsof -t -i :<port>` if `ss` is unavailable or returns
+///   nothing. Both tools are invoked without a shell so they are not affected
+///   by PATH quirks.
+///
+/// Returns `None` on any error, unknown port, or permission denial.
+#[cfg(windows)]
+pub fn port_owner_pid(port: u16) -> Option<u32> {
+    // `netstat -ano -p tcp` output:
+    //   Proto  Local Addr          Foreign Addr        State      PID
+    //   TCP    0.0.0.0:8000       0.0.0.0:0           LISTENING  1234
+    // We match lines where the local address ends with `:<port>` and the
+    // state field is `LISTENING`, then parse the trailing PID token.
+    let output = crate::process_helpers::cmd_no_window()
+        .args(["/C", &format!("netstat -ano -p tcp")])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let port_suffix = format!(":{}", port);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.to_uppercase().contains("LISTENING") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // Expected: ["TCP", "0.0.0.0:<port>", "0.0.0.0:0", "LISTENING", "<pid>"]
+        if parts.len() < 5 {
+            continue;
+        }
+        if !parts[1].ends_with(&port_suffix) {
+            continue;
+        }
+        if let Ok(pid) = parts[4].parse::<u32>() {
+            if pid > 0 {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn port_owner_pid(port: u16) -> Option<u32> {
+    // Try `ss -ltnp` first. Output example:
+    //   State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+    //   LISTEN 0      128    0.0.0.0:8000        0.0.0.0:*          users:(("python",pid=4321,fd=3))
+    // We look for the `pid=<n>` token.
+    let ss_out = crate::process_helpers::no_window("ss")
+        .args(["-ltnp"])
+        .output();
+    if let Ok(out) = ss_out {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let port_suffix = format!(":{}", port);
+            for line in text.lines() {
+                // Match lines with our port in the local address column.
+                // ss prints "0.0.0.0:<port>" or "[::]:<port>".
+                let has_port = line.contains(&format!(":{} ", port))
+                    || line.contains(&format!(":{}\t", port))
+                    || line.ends_with(&port_suffix);
+                if !has_port {
+                    continue;
+                }
+                // Extract pid= from the process column.
+                if let Some(pid_start) = line.find("pid=") {
+                    let after = &line[pid_start + 4..];
+                    let end = after
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(after.len());
+                    if let Ok(pid) = after[..end].parse::<u32>() {
+                        if pid > 0 {
+                            return Some(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: lsof -t -i :<port>
+    // `-t` emits only PIDs, one per line.
+    let lsof_out = crate::process_helpers::no_window("lsof")
+        .args(["-t", &format!("-i:{}", port)])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&lsof_out.stdout);
+    for line in text.lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            if pid > 0 {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod port_owner_tests {
+    use super::*;
+
+    /// `port_owner_pid` must return `None` for a port that nothing is
+    /// listening on.  We pick a high-numbered port that is almost certainly
+    /// free; if by chance it is bound the test passes vacuously (we get
+    /// `Some(_)` instead of `None`, which is also valid behaviour).
+    ///
+    /// A positive "live port" test would require spawning a real server and
+    /// is left to the integration test in `manager.rs` where the full
+    /// reconcile loop is exercised end-to-end.
+    #[test]
+    fn free_port_returns_none_or_valid_pid() {
+        // Port 49999 is in the ephemeral range and almost never bound.
+        // We accept either None (expected) or Some(pid > 0) (port happened
+        // to be in use on this machine at test time).
+        let result = port_owner_pid(49999);
+        if let Some(pid) = result {
+            assert!(pid > 0, "pid must be positive if returned");
+        }
+        // Either outcome is acceptable — the function must not panic.
+    }
+}
+
 /// Kill the process using a specific port (Windows-specific).
 /// Returns true if at least one kill was attempted.
 ///

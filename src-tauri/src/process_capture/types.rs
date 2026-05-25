@@ -95,6 +95,7 @@ impl ProcessStateExt for ProcessState {
             ProcessState::Healthy => "healthy",
             ProcessState::Stopping => "stopping",
             ProcessState::Failed => "failed",
+            ProcessState::ExternallyOwned => "externally_owned",
         }
     }
 }
