@@ -11,10 +11,12 @@
 //!   which proxies to coord with server-side-injected `tenant_id`.
 //!   Requires the device to already be browser-paired at least once
 //!   (uses the cached `user_id` from `paired_user.json`).
-//! - [`pair_via_browser`] — interactive flow: opens
-//!   `{web_backend}/connect-runner` in the user's default browser, spins
-//!   up a localhost callback server, and exchanges the captured nonce
-//!   with coord's `POST /coord/devices/pair-complete`.
+//! - [`pair_via_browser`] — interactive flow: calls coord's
+//!   `POST /coord/devices/pair-start` to register the flow, opens the
+//!   coord-provided redirect URL in the user's default browser, spins
+//!   up a localhost callback server, and captures the device-token JWT
+//!   from the browser redirect (coord's `pair-complete` is called by the
+//!   web frontend, not the runner).
 //! - [`persist_pairing`] — writes the device-token JWT into
 //!   `AuthManager`'s access-token slot + the paired user_id to
 //!   `paired_user.json`.
@@ -77,6 +79,21 @@ pub struct PairCompleteResponse {
     /// wire. `#[serde(default)]` tolerates pre-tenant coord builds.
     #[serde(default)]
     pub tenant_id: Option<String>,
+}
+
+/// Wire shape for `POST /coord/devices/pair-start` response. Coord returns
+/// `{state, redirect_url, expires_in}` — the state nonce is coord-minted
+/// and registered in the pairing-flow store with a TTL.
+#[derive(Debug, Clone, Deserialize)]
+struct PairStartResponseWire {
+    /// Coord-minted one-time state nonce.
+    pub state: String,
+    /// URL the runner should open in the user's browser.
+    pub redirect_url: String,
+    /// TTL hint (seconds) — the flow expires after this. Informational.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub expires_in: Option<i64>,
 }
 
 // ============================================================================
@@ -320,6 +337,15 @@ pub fn derive_web_base_from_coord(coord_base: &str) -> String {
 /// `mcp::device_jwt_refresher` to resolve tenant_id at refresh time
 /// from the stored OAuth/runner token.
 pub fn tenant_id_from_oauth_claim(token: &str) -> Option<String> {
+    tenant_id_from_jwt_claim(token, "tenant_id")
+}
+
+/// Extract an arbitrary string claim from the unverified JWT payload.
+/// Used by `tenant_id_from_oauth_claim` (claim = "tenant_id") and the
+/// browser-pair flow (claim = "sub" / "user_id") to decode fields from
+/// the coord-issued device-token without signature verification (coord
+/// is the authority — we just need the value for local persistence).
+fn tenant_id_from_jwt_claim(token: &str, claim: &str) -> Option<String> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let mut parts = token.splitn(3, '.');
     let _header = parts.next()?;
@@ -328,7 +354,7 @@ pub fn tenant_id_from_oauth_claim(token: &str) -> Option<String> {
     let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
     let payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
     payload_json
-        .get("tenant_id")
+        .get(claim)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
@@ -527,10 +553,12 @@ pub(crate) struct CallbackCapture {
     pub token_id: Option<String>,
 }
 
-/// Browser-mediated pair. Spins up a localhost axum server, opens the
-/// browser to `/connect-runner?state=…&callback=…`, waits for the user's
-/// click + redirect, then exchanges the captured `(state, token)` with
-/// coord's `POST /coord/devices/pair-complete` for the device-token JWT.
+/// Browser-mediated pair. Spins up a localhost axum server, calls coord's
+/// `POST /coord/devices/pair-start` to register the flow and obtain a
+/// coord-minted state nonce + redirect URL, opens the browser, waits for
+/// the user's click + redirect which delivers the device-token JWT
+/// directly via the callback query params (coord's `pair-complete` is
+/// called by the web frontend, not the runner).
 pub fn pair_via_browser(
     coord_base: &str,
     tenant_id: uuid::Uuid,
@@ -538,14 +566,10 @@ pub fn pair_via_browser(
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    // Generate state nonce. 32 bytes of randomness; hex-encoded so it
-    // survives a URL round-trip without escaping.
-    let mut state_bytes = [0u8; 32];
-    use rand::TryRngCore;
-    rand::rng()
-        .try_fill_bytes(&mut state_bytes)
-        .map_err(|e| format!("rand fill failed: {e}"))?;
-    let state_nonce = hex::encode(state_bytes);
+    // Read device_id from machine.json — required for the pair-start
+    // request and for the browser URL so the web page can forward it to
+    // coord's pair-complete.
+    let device_id = read_device_id()?;
 
     // Web backend URL is read from the active profile's `coord_url`
     // host (assuming web + coord co-locate in dev). If they diverge,
@@ -568,20 +592,61 @@ pub fn pair_via_browser(
         .set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking failed: {e}"))?;
 
+    let callback_url = format!("http://127.0.0.1:{}/auth/runner-token-callback", port);
+
+    // Step 1: Call coord's pair-start to register the pairing flow and
+    // obtain a coord-minted state nonce + redirect URL.
+    let web_pair_url = format!("{}/connect-runner", web_base.trim_end_matches('/'));
+    let pair_start_url = format!("{}/coord/devices/pair-start", coord_base);
+    let pair_start_body = serde_json::json!({
+        "callback_url":    callback_url,
+        "device_hostname": hostname_now,
+        "device_name":     hostname_now,
+        "web_pair_url":    web_pair_url,
+        "tenant_id":       tenant_id.to_string(),
+    });
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {e}"))?;
+    let resp = client
+        .post(&pair_start_url)
+        .json(&pair_start_body)
+        .send()
+        .map_err(|e| format!("POST {} failed: {e}", pair_start_url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp
+            .text()
+            .unwrap_or_else(|_| "<unable to read response body>".to_string());
+        return Err(format!(
+            "POST {} -> HTTP {}: {}",
+            pair_start_url, status, body_text
+        ));
+    }
+    let pair_start_resp: PairStartResponseWire = resp
+        .json()
+        .map_err(|e| format!("decode pair-start response failed: {e}"))?;
+
+    let state_nonce = pair_start_resp.state;
+
+    // Append device_id to the coord-provided redirect_url so the web
+    // page can forward it to pair-complete.
+    let separator = if pair_start_resp.redirect_url.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    let connect_url = format!(
+        "{}{}device_id={}",
+        pair_start_resp.redirect_url,
+        separator,
+        urlencoding::encode(&device_id),
+    );
+
     let received: Arc<Mutex<Option<CallbackCapture>>> = Arc::new(Mutex::new(None));
     let received_clone = received.clone();
     let state_expected = state_nonce.clone();
-
-    // Build the redirect URL the browser will land back on. The state
-    // round-trips so we can reject mismatched callbacks.
-    let callback_url = format!("http://127.0.0.1:{}/auth/runner-token-callback", port);
-    let connect_url = format!(
-        "{}/connect-runner?state={}&callback={}&device_name={}",
-        web_base.trim_end_matches('/'),
-        urlencoding::encode(&state_nonce),
-        urlencoding::encode(&callback_url),
-        urlencoding::encode(&hostname_now),
-    );
 
     // Spawn a current-thread tokio runtime + axum server on a worker
     // thread. We could use the existing src/mcp/auth_callback.rs route,
@@ -679,41 +744,32 @@ pub fn pair_via_browser(
     // is still running; it'll time out on its own.
     drop(server_handle);
 
-    // Exchange (state, token) for the device-token JWT. `tenant_id` is a
-    // defensive forward — coord's authoritative source is `flow.tenant_id`
-    // carried from `pair-start`, but the browser pair flow currently mints
-    // its state nonce locally instead of going through coord's pair-start,
-    // so we forward the runner's best-known value here as a hint. Coord
-    // re-validates per Phase 4 of the default-tenant-propagation plan.
-    let url = format!("{}/coord/devices/pair-complete", coord_base);
-    let body = serde_json::json!({
-        "state":      state_nonce,
-        "token":      capture.token,
-        "device_id":  capture.token_id,
-        "hostname":   hostname_now,
-        "name":       hostname_now,
-        "os":         detect_os(),
-        "os_version": detect_os_version(),
-        "tenant_id":  tenant_id.to_string(),
-    });
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("reqwest client build failed: {}", e))?;
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .map_err(|e| format!("POST {} failed: {}", url, e))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp
-            .text()
-            .unwrap_or_else(|_| "<unable to read response body>".to_string());
-        return Err(format!("POST {} -> HTTP {}: {}", url, status, body_text));
-    }
-    resp.json::<PairCompleteResponse>()
-        .map_err(|e| format!("decode pair-complete response failed: {}", e))
+    // The JWT is already in the callback redirect — coord's pair-complete
+    // was called by the web frontend (step 4 of the browser-pair flow),
+    // which minted the JWT and forwarded it via the redirect's `?token=`
+    // param. No second HTTP call to coord is needed; we build the
+    // PairCompleteResponse directly from the captured token.
+    //
+    // `capture.token` = device-token JWT (coord-issued).
+    // `capture.token_id` = device_id forwarded by the web redirect.
+    // `user_id` is decoded from the JWT payload (best-effort; persist
+    //  path re-validates).
+    let user_id = tenant_id_from_jwt_claim(&capture.token, "sub")
+        .or_else(|| tenant_id_from_jwt_claim(&capture.token, "user_id"))
+        .unwrap_or_default();
+    let resp_device_id = capture
+        .token_id
+        .clone()
+        .unwrap_or_else(|| device_id.clone());
+
+    Ok(PairCompleteResponse {
+        token: capture.token,
+        user_id,
+        device_id: Some(resp_device_id),
+        jti: None,
+        exp: None,
+        tenant_id: Some(tenant_id.to_string()),
+    })
 }
 
 // ============================================================================
