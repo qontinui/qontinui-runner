@@ -1075,6 +1075,8 @@ pub async fn ui_bridge_execute_action_handler(
                     error: Some("element is disabled".to_string()),
                     error_detail: None,
                     hint: None,
+                    code: None,
+                    suggestions: None,
                 }));
             }
 
@@ -1450,6 +1452,8 @@ pub async fn ui_bridge_execute_action_handler(
                     )),
                     error_detail: None,
                     hint: None,
+                    code: None,
+                    suggestions: None,
                 };
                 result = Ok(Json(envelope));
             } else if recovery.recovered {
@@ -2745,6 +2749,8 @@ fn api_error_to_value(message: impl Into<String>) -> ApiResponse<serde_json::Val
         error: Some(message.into()),
         error_detail: None,
         hint: None,
+        code: None,
+        suggestions: None,
     }
 }
 
@@ -2982,6 +2988,8 @@ fn apply_strict_timeout_reshape(
                 error: err.error,
                 error_detail: err.error_detail,
                 hint: err.hint,
+                code: err.code,
+                suggestions: err.suggestions,
             };
             Err((status, Json(widened)))
         }
@@ -3748,6 +3756,8 @@ pub async fn ui_bridge_expect_element_handler(
                 )),
                 error_detail: None,
                 hint: Some(envelope.data.unwrap_or(serde_json::Value::Null)),
+                code: None,
+                suggestions: None,
             }),
         ))
     }
@@ -4940,6 +4950,8 @@ mod action_not_supported_tests {
             )),
             error_detail: None,
             hint: None,
+            code: None,
+            suggestions: None,
         };
         let envelope_json = serde_json::to_value(&envelope).unwrap();
 
@@ -5013,6 +5025,8 @@ mod action_not_supported_tests {
             error: Some(detail.message.clone()),
             error_detail: Some(detail),
             hint: None,
+            code: None,
+            suggestions: None,
         };
         let env_json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(

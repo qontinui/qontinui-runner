@@ -1398,6 +1398,8 @@ async fn get_prompt_optimization_status_handler(
         error: None,
         error_detail: None,
         hint: None,
+        code: None,
+        suggestions: None,
     }))
 }
 
@@ -1417,6 +1419,8 @@ async fn get_prompt_group_metrics_handler(
         error: None,
         error_detail: None,
         hint: None,
+        code: None,
+        suggestions: None,
     }))
 }
 
@@ -1448,6 +1452,8 @@ async fn get_prompt_optimization_evidence_handler(
         error: None,
         error_detail: None,
         hint: None,
+        code: None,
+        suggestions: None,
     }))
 }
 
@@ -1471,6 +1477,8 @@ async fn get_prompt_evolution_handler(
         error: None,
         error_detail: None,
         hint: None,
+        code: None,
+        suggestions: None,
     }))
 }
 

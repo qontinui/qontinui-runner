@@ -89,6 +89,8 @@ pub(crate) fn classify_terminal_session_get_response(
                 error: Some(format!("unknown terminal session: \"{}\"", id)),
                 error_detail: None,
                 hint: None,
+                code: None,
+                suggestions: None,
             };
             Err((StatusCode::NOT_FOUND, Json(body)))
         }
@@ -105,6 +107,8 @@ pub(crate) fn classify_terminal_session_get_response(
                 ),
                 error_detail: None,
                 hint: None,
+                code: None,
+                suggestions: None,
             };
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(body)))
         }
@@ -135,6 +139,8 @@ pub async fn ui_bridge_terminal_session_get_handler(
                 error: Some(e),
                 error_detail: None,
                 hint: None,
+                code: None,
+                suggestions: None,
             };
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(body)))
         }

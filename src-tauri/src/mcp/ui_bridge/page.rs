@@ -1231,6 +1231,8 @@ pub async fn ui_bridge_tab_activate_handler(
                     error: Some(message),
                     error_detail: Some(detail),
                     hint: None,
+                    code: None,
+                    suggestions: None,
                 }),
             ));
         }
@@ -1251,6 +1253,8 @@ pub async fn ui_bridge_tab_activate_handler(
                     error: Some(e),
                     error_detail: None,
                     hint: None,
+                    code: None,
+                    suggestions: None,
                 }),
             ))
         }

@@ -1761,13 +1761,22 @@ pub fn create_router(
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
         .layer(axum::Extension(graphql_schema))
-        // Outermost layer: catch panics from any handler/middleware below and
-        // convert them into a JSON 500 matching the runner's `ApiResponse<()>`
-        // shape. Without this, a handler panic surfaces to the client as
-        // "empty reply from server" — diagnostically indistinguishable from a
-        // legitimate empty success response. `.layer()` is bottom-up, so the
-        // LAST `.layer()` call wraps the rest. `with_state` must remain
-        // terminal.
+        // Layer ordering (`.layer()` is bottom-up — last call = outermost):
+        //
+        //   [CatchPanicLayer]              ← outermost: panics → 500 JSON
+        //     [envelope_rewrite_middleware] ← rewrites 4xx text/plain → JSON envelope
+        //       [TraceLayer, CORS, BodyLimit, ...]
+        //         [handlers]
+        //
+        // The panic layer must remain outermost so it can catch panics that
+        // originate in any layer below, including the envelope middleware itself.
+        // The envelope layer sits immediately inside so it rewrites axum's own
+        // rejection bodies (missing Content-Type, bad JSON, etc.) before they
+        // reach the client. `application/json` responses — including
+        // async-graphql errors — are never rewritten (text/plain guard).
+        .layer(axum::middleware::from_fn(
+            crate::mcp::envelope::envelope_rewrite_middleware,
+        ))
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(
             runner_panic_handler,
         ))
