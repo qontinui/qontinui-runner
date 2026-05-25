@@ -1246,6 +1246,36 @@ pub fn create_router(
                         continue; // Skip emulators — handled by app_discovery
                     }
 
+                    // Reverse the runner HTTP API port back to the device so the
+                    // qontinui-mobile app's data path can reach the runner at
+                    // `localhost:<port>` on the phone. Without this, USB-attached
+                    // phones see "Network request failed". This is independent of
+                    // UI Bridge discovery below — the data path is needed whenever
+                    // a physical device is attached, registered or not — so it runs
+                    // before the already-registered skip. Idempotent + only logged
+                    // on first install per serial (re-runs are skipped via the
+                    // active_reverses map).
+                    if usb_transport
+                        .active_reverses
+                        .lock()
+                        .await
+                        .get(device_id)
+                        .is_none()
+                    {
+                        let runner_port = state.app_state.api_port.load(Ordering::Relaxed);
+                        if let Err(e) = usb_transport
+                            .establish_reverse(device_id, runner_port)
+                            .await
+                        {
+                            tracing::debug!(
+                                "Failed to establish ADB reverse for {} (port {}): {}",
+                                device_id,
+                                runner_port,
+                                e
+                            );
+                        }
+                    }
+
                     // Skip devices that already have a live USB transport.
                     // A device entry with empty `transports` (or only
                     // non-USB transports) falls through to re-establishment.
@@ -1335,6 +1365,24 @@ pub fn create_router(
                             .await;
                         let _ = usb_transport.release_forward(&device.info.id).await;
                         tracing::info!("USB device disconnected: {}", device.info.id);
+                    }
+                }
+
+                // Tear down ADB reverses for devices no longer attached. Reverses
+                // are installed for every physical device (even those without a UI
+                // Bridge, which never register in the registry above), so they need
+                // their own disconnect sweep keyed off the live `adb devices` list.
+                let reversed_serials: Vec<String> = {
+                    let reverses = usb_transport.active_reverses.lock().await;
+                    reverses.keys().cloned().collect()
+                };
+                for serial in reversed_serials {
+                    let still_connected = devices
+                        .iter()
+                        .any(|(id, status, _)| id == &serial && status == "device");
+                    if !still_connected {
+                        let _ = usb_transport.release_reverse(&serial).await;
+                        tracing::info!("USB device reverse released (disconnected): {}", serial);
                     }
                 }
             }

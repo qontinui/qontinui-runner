@@ -259,6 +259,32 @@ pub async fn forward_tcp(serial: String, local_port: u16, remote_port: u16) -> R
     .map_err(|e| format!("task join failed: {e}"))?
 }
 
+/// Establish an `adb reverse tcp:<device_port> tcp:<host_port>` on the device.
+///
+/// This is the mirror of [`forward_tcp`]: it makes the *device* listen on
+/// `device_port` and tunnel those connections back to `host_port` on the
+/// machine running the runner. The qontinui-mobile app's data path dials the
+/// runner HTTP API (default 9876) at `localhost:<device_port>` on the phone;
+/// without this reverse the request fails with "Network request failed"
+/// because nothing on the USB-attached phone serves that port.
+///
+/// Argument order matches `adb_client`'s `reverse(remote, local)` and the ADB
+/// wire format `reverse:forward:<remote>;<local>`, where `remote` is the
+/// device-side listen port and `local` is the host-side target port.
+///
+/// Idempotent: re-running an identical reverse simply overwrites the existing
+/// rule in adb (it does not error), so this is safe to call on every scan tick.
+pub async fn reverse_tcp(serial: String, device_port: u16, host_port: u16) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
+        device
+            .reverse(format!("tcp:{device_port}"), format!("tcp:{host_port}"))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task join failed: {e}"))?
+}
+
 /// Pick a free loopback TCP port by briefly binding to `127.0.0.1:0`.
 ///
 /// The OS returns a port that's free at the moment of binding; there is a

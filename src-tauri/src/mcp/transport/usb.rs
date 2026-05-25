@@ -37,6 +37,11 @@ pub struct UsbTransport {
     pub adb_path: PathBuf,
     /// Maps ADB serial number → locally forwarded TCP port.
     pub active_forwards: Arc<Mutex<HashMap<String, u16>>>,
+    /// Maps ADB serial number → device-side port currently reversed back to the
+    /// runner HTTP API (`adb reverse tcp:<port> tcp:<port>`). Tracked so the
+    /// shutdown / disconnect paths can `adb reverse --remove` exactly the rules
+    /// this process installed, rather than nuking every reverse on the machine.
+    pub active_reverses: Arc<Mutex<HashMap<String, u16>>>,
 }
 
 impl UsbTransport {
@@ -44,6 +49,7 @@ impl UsbTransport {
         Self {
             adb_path,
             active_forwards: Arc::new(Mutex::new(HashMap::new())),
+            active_reverses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -126,7 +132,96 @@ impl UsbTransport {
         Ok(())
     }
 
-    /// Release all active forwards.  Errors are logged but do not stop teardown.
+    /// Establish an `adb reverse tcp:<runner_port> tcp:<runner_port>` so the
+    /// USB-attached device can reach the runner's HTTP API (default 9876) at
+    /// `localhost:<runner_port>` on the phone.
+    ///
+    /// This is the data-path counterpart to [`establish_forward`] (which is the
+    /// control-path: host → device UI Bridge). Without it, qontinui-mobile's
+    /// requests to the runner API fail with "Network request failed" because
+    /// nothing on the phone serves that port. Same port on both ends — the
+    /// device dials the identical port number it would use on the host.
+    ///
+    /// Idempotent: adb overwrites an identical reverse rule without erroring, so
+    /// this is safe to re-run on every scan tick. Records the rule for teardown.
+    ///
+    /// [`establish_forward`]: UsbTransport::establish_forward
+    pub async fn establish_reverse(
+        &self,
+        adb_serial: &str,
+        runner_port: u16,
+    ) -> Result<(), TransportError> {
+        adb_helper::reverse_tcp(adb_serial.to_string(), runner_port, runner_port)
+            .await
+            .map_err(|e| TransportError::ForwardFailed {
+                device_id: adb_serial.to_string(),
+                reason: e,
+            })?;
+
+        info!(
+            serial = %adb_serial,
+            runner_port,
+            "ADB reverse established (device -> runner API)"
+        );
+
+        self.active_reverses
+            .lock()
+            .await
+            .insert(adb_serial.to_string(), runner_port);
+
+        Ok(())
+    }
+
+    /// Remove the ADB reverse for the given device and clean up the map entry.
+    ///
+    /// `adb_client` 3.x exposes only `reverse_remove_all` (which would stomp
+    /// every reverse on the machine), so per-rule removal shells out to
+    /// `adb -s <serial> reverse --remove tcp:<port>`, mirroring
+    /// [`release_forward`].
+    ///
+    /// [`release_forward`]: UsbTransport::release_forward
+    pub async fn release_reverse(&self, adb_serial: &str) -> Result<(), TransportError> {
+        let port = {
+            let reverses = self.active_reverses.lock().await;
+            match reverses.get(adb_serial).copied() {
+                Some(p) => p,
+                None => {
+                    debug!(serial = %adb_serial, "release_reverse: no active reverse found");
+                    return Ok(());
+                }
+            }
+        };
+
+        let output = crate::process_helpers::tokio_no_window(&self.adb_path)
+            .args([
+                "-s",
+                adb_serial,
+                "reverse",
+                "--remove",
+                &format!("tcp:{}", port),
+            ])
+            .output()
+            .await
+            .map_err(|e| TransportError::AdbCommandFailed(e.to_string()))?;
+
+        if !output.status.success() {
+            warn!(
+                serial = %adb_serial,
+                port,
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "Failed to remove ADB reverse (device may be disconnected)"
+            );
+        }
+
+        let mut reverses = self.active_reverses.lock().await;
+        reverses.remove(adb_serial);
+
+        debug!(serial = %adb_serial, port, "ADB reverse released");
+        Ok(())
+    }
+
+    /// Release all active forwards and reverses. Errors are logged but do not
+    /// stop teardown.
     pub async fn release_all(&self) {
         let serials: Vec<String> = {
             let forwards = self.active_forwards.lock().await;
@@ -135,6 +230,16 @@ impl UsbTransport {
         for serial in serials {
             if let Err(e) = self.release_forward(&serial).await {
                 warn!(serial = %serial, error = %e, "Error releasing ADB forward");
+            }
+        }
+
+        let reverse_serials: Vec<String> = {
+            let reverses = self.active_reverses.lock().await;
+            reverses.keys().cloned().collect()
+        };
+        for serial in reverse_serials {
+            if let Err(e) = self.release_reverse(&serial).await {
+                warn!(serial = %serial, error = %e, "Error releasing ADB reverse");
             }
         }
     }
