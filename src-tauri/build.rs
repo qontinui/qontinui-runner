@@ -116,7 +116,8 @@ fn main() {
 ///
 /// The IR build is gated to avoid running by default on every cargo build:
 ///   - If `QONTINUI_BUILD_IR=1` is set, always attempt.
-///   - Otherwise, attempt only when both `npm` is on PATH and the runner's
+///   - Otherwise, attempt only when a package manager (pnpm preferred when
+///     `pnpm-lock.yaml` exists, else npm) is on PATH and the runner's
 ///     `package.json` has a `build-ir` script.
 ///   - Otherwise skip silently with a `cargo:warning=` hint.
 fn refresh_ir_if_stale() {
@@ -147,30 +148,31 @@ fn refresh_ir_if_stale() {
         return;
     }
 
-    // Gate: explicit env var, OR npm-on-PATH + package.json has build-ir script.
+    // Gate: explicit env var, OR package-manager-on-PATH + package.json has build-ir script.
     let force = std::env::var("QONTINUI_BUILD_IR").ok().as_deref() == Some("1");
-    let auto_eligible = npm_available() && package_json_has_build_ir();
+    let pm = detect_package_manager();
+    let auto_eligible = pm.is_some() && package_json_has_build_ir();
     if !force && !auto_eligible {
         println!(
-            "cargo:warning=qontinui-runner IR is stale but build-ir was skipped (set QONTINUI_BUILD_IR=1 or ensure npm is on PATH with a `build-ir` script in package.json)"
+            "cargo:warning=qontinui-runner IR is stale but build-ir was skipped (set QONTINUI_BUILD_IR=1 or ensure npm/pnpm is on PATH with a `build-ir` script in package.json)"
         );
         return;
     }
 
-    // Run `npm run build-ir` in the qontinui-runner root (one level above
-    // src-tauri). Capture both streams so failures show up in cargo output.
     let runner_root = Path::new("..");
-    // On Windows, `npm` is `npm.cmd` and bare `npm` doesn't resolve through
-    // std::process::Command — wrap via `cmd /C` for portability.
+    let pm_cmd = pm.unwrap_or("npm");
+
+    // On Windows, npm/pnpm are .cmd shims that bare std::process::Command
+    // can't resolve — wrap via `cmd /C` for portability.
     #[cfg(windows)]
     let mut cmd = {
         let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "npm", "run", "build-ir"]);
+        c.args(["/C", pm_cmd, "run", "build-ir"]);
         c
     };
     #[cfg(not(windows))]
     let mut cmd = {
-        let mut c = std::process::Command::new("npm");
+        let mut c = std::process::Command::new(pm_cmd);
         c.args(["run", "build-ir"]);
         c
     };
@@ -244,15 +246,28 @@ fn newest_tsx_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
     newest
 }
 
-/// Probe whether `npm` is available on PATH. Fast and side-effect-free.
-fn npm_available() -> bool {
-    #[cfg(windows)]
-    let probe = std::process::Command::new("cmd")
-        .args(["/C", "npm", "--version"])
-        .output();
-    #[cfg(not(windows))]
-    let probe = std::process::Command::new("npm").arg("--version").output();
-    matches!(probe, Ok(o) if o.status.success())
+/// Detect the project's package manager by lockfile, then verify it's on PATH.
+/// Returns `Some("pnpm")` or `Some("npm")`, or `None` if neither is available.
+fn detect_package_manager() -> Option<&'static str> {
+    let has_pnpm_lock = std::path::Path::new("../pnpm-lock.yaml").exists();
+
+    let probe = |name: &str| -> bool {
+        #[cfg(windows)]
+        let result = std::process::Command::new("cmd")
+            .args(["/C", name, "--version"])
+            .output();
+        #[cfg(not(windows))]
+        let result = std::process::Command::new(name).arg("--version").output();
+        matches!(result, Ok(o) if o.status.success())
+    };
+
+    if has_pnpm_lock && probe("pnpm") {
+        return Some("pnpm");
+    }
+    if probe("npm") {
+        return Some("npm");
+    }
+    None
 }
 
 /// Check whether `../package.json` declares a `build-ir` script. We do a
