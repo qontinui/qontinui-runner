@@ -31,7 +31,7 @@ import { useAiSession } from "../../hooks/useAiSession";
 interface ProcessStatus {
   id: string;
   name: string;
-  state: "stopped" | "starting" | "building" | "running" | "healthy" | "stopping" | "failed";
+  state: "stopped" | "starting" | "building" | "running" | "healthy" | "stopping" | "failed" | "externally_owned";
   pid: number | null;
   uptime_secs: number | null;
   port_healthy: boolean | null;
@@ -558,7 +558,7 @@ Be concise and actionable.`;
   });
 
   const isRunning = (state: string) =>
-    ["starting", "building", "running", "healthy", "stopping"].includes(state);
+    ["starting", "building", "running", "healthy", "stopping", "externally_owned"].includes(state);
 
   const selected = selectedId ? processes.find((p) => p.id === selectedId) : null;
 
@@ -688,7 +688,24 @@ Be concise and actionable.`;
 
                 {/* Action buttons */}
                 <div className="flex items-center gap-1 shrink-0">
-                  {!isRunning(proc.state) ? (
+                  {proc.state === "externally_owned" ? (
+                    <>
+                      <button
+                        disabled
+                        className="p-1.5 text-zinc-600 cursor-not-allowed rounded"
+                        title="A process is already running on this port. Stop the external process first."
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        disabled
+                        className="p-1.5 text-zinc-600 cursor-not-allowed rounded"
+                        title="Externally owned — this runner doesn't manage its lifecycle."
+                      >
+                        <Square className="w-3.5 h-3.5" />
+                      </button>
+                    </>
+                  ) : !isRunning(proc.state) ? (
                     <button
                       onClick={(e) => handleStart(proc.id, e)}
                       className="p-1.5 text-green-500 hover:text-green-400 hover:bg-green-500/10 rounded transition-colors"
@@ -728,12 +745,16 @@ Be concise and actionable.`;
                       onClick={(e) => handleRebuildAndRestart(proc.id, e)}
                       className={cn(
                         "p-1.5 rounded transition-colors",
-                        proc.state === "building"
+                        proc.state === "building" || proc.state === "externally_owned"
                           ? "text-amber-500/50 cursor-not-allowed"
                           : "text-amber-500 hover:text-amber-400 hover:bg-amber-500/10",
                       )}
-                      title="Rebuild & Restart"
-                      disabled={proc.state === "building"}
+                      title={
+                        proc.state === "externally_owned"
+                          ? "Externally owned — this runner doesn't manage its lifecycle."
+                          : "Rebuild & Restart"
+                      }
+                      disabled={proc.state === "building" || proc.state === "externally_owned"}
                     >
                       <Hammer className="w-3.5 h-3.5" />
                     </button>
