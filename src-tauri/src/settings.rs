@@ -878,6 +878,41 @@ impl Default for ExecutionVariablesSettings {
 }
 
 // ============================================================================
+// Process Management Settings
+// ============================================================================
+
+/// Policy settings for managed-process lifecycle behaviour.
+///
+/// These knobs let operators tune how the runner handles externally-started
+/// processes (e.g. a dev server started outside the runner) without editing
+/// code or recompiling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessManagementSettings {
+    /// When `true` (default) and the runner is in dev-mode
+    /// (`dev_services::is_dev_mode()`), the reconcile loop will adopt a
+    /// foreign process that is already bound to a configured health port
+    /// (transitioning the config's state to `ExternallyOwned`).
+    ///
+    /// Setting this to `false` forces the "refuse / kill" posture even in
+    /// dev: the port owner is killed before the runner spawns its own copy,
+    /// exactly as in production.
+    #[serde(default = "default_external_adoption_in_dev")]
+    pub external_adoption_in_dev: bool,
+}
+
+fn default_external_adoption_in_dev() -> bool {
+    true
+}
+
+impl Default for ProcessManagementSettings {
+    fn default() -> Self {
+        Self {
+            external_adoption_in_dev: default_external_adoption_in_dev(),
+        }
+    }
+}
+
+// ============================================================================
 // Debug Settings
 // ============================================================================
 
@@ -1346,6 +1381,9 @@ pub struct Settings {
     /// Managed process configurations for process capture
     #[serde(default)]
     pub managed_processes: Vec<crate::process_capture::ProcessConfig>,
+    /// Policy settings for managed-process lifecycle (adoption, kill posture, etc.).
+    #[serde(default)]
+    pub process_management: ProcessManagementSettings,
     #[serde(default)]
     pub execution_variables: ExecutionVariablesSettings,
     /// Global default: Run pre-flight environment check at start of Setup phase (default: true)
