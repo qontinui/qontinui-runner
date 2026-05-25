@@ -41,6 +41,16 @@ interface ProcessStatus {
   has_build_command: boolean;
 }
 
+/** Wire-format payload emitted on the `reconcile-tick` Tauri event (Phase B4). */
+interface ReconcileTickPayload {
+  process_id: string;
+  state: string;
+  observed_port_owned: boolean;
+  observed_pid_alive: boolean;
+  /** Number of confirmed state transitions in the last 60 seconds. */
+  transitions_in_last_minute: number;
+}
+
 interface ProcessConfig {
   id: string;
   name: string;
@@ -98,6 +108,11 @@ export function ProcessManagerTab() {
    * click into the row.
    */
   const [stderrTails, setStderrTails] = useState<Record<string, string>>({});
+  /**
+   * Latest reconcile-tick payload per process id, updated on every
+   * `reconcile-tick` Tauri event. Used to derive the flap-count badge.
+   */
+  const [reconcileTicks, setReconcileTicks] = useState<Record<string, ReconcileTickPayload>>({});
 
   // AI Fix session state
   const [aiFixActive, setAiFixActive] = useState(false);
@@ -161,6 +176,25 @@ export function ProcessManagerTab() {
 
     return () => {
       if (unlistenRef.current) unlistenRef.current();
+    };
+  }, []);
+
+  // Subscribe to reconcile-tick events for flap-count badge (Phase B4).
+  // Each payload carries `transitions_in_last_minute` which the UI shows as
+  // a subtle "↻ N" indicator next to the status chip when N > 0.
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    const setup = async () => {
+      unlisten = await listen<ReconcileTickPayload>("reconcile-tick", (event) => {
+        setReconcileTicks((prev) => ({
+          ...prev,
+          [event.payload.process_id]: event.payload,
+        }));
+      });
+    };
+    setup();
+    return () => {
+      if (unlisten) unlisten();
     };
   }, []);
 
@@ -667,6 +701,17 @@ Be concise and actionable.`;
                       uptimeSecs={proc.uptime_secs}
                       stderrTail={stderrTails[proc.id]}
                     />
+                    {/* Flap-count badge: shown when the reconcile loop has observed
+                        more than zero transitions in the last 60 seconds. Subtle
+                        orange pill so it doesn't clutter stable processes. */}
+                    {(reconcileTicks[proc.id]?.transitions_in_last_minute ?? 0) > 0 && (
+                      <span
+                        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-900/30 text-orange-400 border border-orange-800/50 shrink-0"
+                        title={`${reconcileTicks[proc.id].transitions_in_last_minute} state transition${reconcileTicks[proc.id].transitions_in_last_minute === 1 ? "" : "s"} in the last minute — process may be flapping`}
+                      >
+                        ↻ {reconcileTicks[proc.id].transitions_in_last_minute}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-3 mt-1 ml-5 text-xs text-zinc-500">
                     {proc.pid && <span>PID: {proc.pid}</span>}

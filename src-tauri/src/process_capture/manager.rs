@@ -1,8 +1,8 @@
 //! ProcessCaptureManager: orchestrator for managed processes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -969,12 +969,22 @@ impl ProcessCaptureManager {
         app_handle: tauri::AppHandle,
     ) {
         const POLL_INTERVAL: Duration = Duration::from_secs(3);
+        /// Emit a reconcile-tick heartbeat every N ticks (~15s at 3s/tick).
+        /// Also emitted immediately on every confirmed transition.
+        const HEARTBEAT_EVERY_N_TICKS: u32 = 5;
+        /// Keep only transitions in the last 60 seconds for the flap counter.
+        const TRANSITION_WINDOW: Duration = Duration::from_secs(60);
 
         // Two-tick confirm state: remember what we proposed last tick.
         let mut last_proposed: Option<ProcessState> = None;
+        // Tick counter for heartbeat cadence.
+        let mut tick_count: u32 = 0;
+        // Ring of recent confirmed-transition timestamps (pruned to the last 60s).
+        let mut transition_times: VecDeque<Instant> = VecDeque::new();
 
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
+            tick_count = tick_count.wrapping_add(1);
 
             // ── Snapshot current state + service PID under read lock ──────────
             let (current_state, service_pid, tracked_pid) = {
@@ -1043,6 +1053,31 @@ impl ProcessCaptureManager {
             last_proposed = proposed;
 
             let Some(next_state) = confirmed else {
+                // No confirmed transition this tick. Still emit a heartbeat
+                // every HEARTBEAT_EVERY_N_TICKS ticks so the frontend gets
+                // periodic telemetry even when the process is stable.
+                if tick_count.is_multiple_of(HEARTBEAT_EVERY_N_TICKS) {
+                    // Prune stale transition timestamps before counting.
+                    let now = Instant::now();
+                    while transition_times
+                        .front()
+                        .map(|t| now.duration_since(*t) > TRANSITION_WINDOW)
+                        .unwrap_or(false)
+                    {
+                        transition_times.pop_front();
+                    }
+                    let transitions_in_last_minute = transition_times.len() as u32;
+                    // Ad-hoc telemetry payload (mirrors the untyped `process-state-changed`
+                    // event); not routed through schema_export, so no schemas binding.
+                    let tick_payload = serde_json::json!({
+                        "process_id": process_id.clone(),
+                        "state": current_state.as_str(),
+                        "observed_port_owned": port_in_use,
+                        "observed_pid_alive": pid_alive,
+                        "transitions_in_last_minute": transitions_in_last_minute,
+                    });
+                    let _ = tauri::Emitter::emit(&app_handle, "reconcile-tick", &tick_payload);
+                }
                 continue;
             };
 
@@ -1115,6 +1150,29 @@ impl ProcessCaptureManager {
 
             if let Some(status) = emit_status {
                 let _ = tauri::Emitter::emit(&app_handle, "process-state-changed", &status);
+
+                // Record this transition in the ring and emit an immediate
+                // reconcile-tick so the frontend learns about the flap
+                // without waiting for the next heartbeat window.
+                let now = Instant::now();
+                transition_times.push_back(now);
+                // Prune transitions older than 60 seconds.
+                while transition_times
+                    .front()
+                    .map(|t| now.duration_since(*t) > TRANSITION_WINDOW)
+                    .unwrap_or(false)
+                {
+                    transition_times.pop_front();
+                }
+                let transitions_in_last_minute = transition_times.len() as u32;
+                let tick_payload = serde_json::json!({
+                    "process_id": process_id.clone(),
+                    "state": next_state.as_str(),
+                    "observed_port_owned": port_in_use,
+                    "observed_pid_alive": pid_alive,
+                    "transitions_in_last_minute": transitions_in_last_minute,
+                });
+                let _ = tauri::Emitter::emit(&app_handle, "reconcile-tick", &tick_payload);
             }
         }
 
