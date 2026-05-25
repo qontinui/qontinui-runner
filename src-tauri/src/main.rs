@@ -2243,6 +2243,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Start heartbeat background task for fleet registration
             heartbeat::start_heartbeat(heartbeat_app_state);
 
+            // Headless/back-end auto-login for supervisor-spawned test runners.
+            // The webview-driven path (AuthProvider → get_test_auto_login) only
+            // fires once React mounts; a headless temp runner would otherwise
+            // never authenticate (runner_token_empty=true → no device-JWT, 401s).
+            // No-op unless QONTINUI_TEST_AUTO_LOGIN_* is set and tokens are absent.
+            commands::auth::spawn_headless_auto_login(
+                app.state::<launch_env::SharedLaunchEnv>().inner().clone(),
+            );
+
             // Phase 3 — web-backend integration is now driven entirely by
             // the unified WebSocket relay (`crate::mcp::backend_relay`).
             // The relay is launched from `mcp_api::start_server` once

@@ -169,10 +169,31 @@ fn coord_http_base() -> Option<String> {
     Some(with_http)
 }
 
-/// Resolve the coord WS URL: prefer the active profile's `coord_url`
-/// (which is the WS endpoint per the runner contract); otherwise None.
+/// Resolve the coord WS URL from the active profile's `coord_url`,
+/// normalizing the scheme to `ws://` / `wss://`.
+///
+/// The profile's `coord_url` is frequently configured as an HTTP(S) base
+/// (e.g. `https://coord.staging.qontinui.io`, mirrored from the API base)
+/// rather than a WS endpoint. Passing an `https://` URL straight to
+/// `tokio_tungstenite::connect_async` fails with `URL scheme not supported`
+/// (the agent_runtime WS-pump error seen on staging). Convert
+/// `https://`→`wss://` and `http://`→`ws://`; leave an already-WS scheme as-is.
+/// Mirrors the converter in `session::handoff::coord_ws_url`.
 fn coord_ws_url() -> Option<String> {
-    qontinui_runner_lib::profiles::load_strict().ok()?.coord_url
+    let coord_url = qontinui_runner_lib::profiles::load_strict()
+        .ok()?
+        .coord_url?;
+    let trimmed = coord_url.trim();
+    let ws = trimmed
+        .strip_prefix("https://")
+        .map(|rest| format!("wss://{rest}"))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("http://")
+                .map(|rest| format!("ws://{rest}"))
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    Some(ws)
 }
 
 /// Read `~/.qontinui/machine.json` → device_id. Falls back to None.
