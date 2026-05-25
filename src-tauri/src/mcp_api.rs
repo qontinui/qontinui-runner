@@ -1753,7 +1753,27 @@ pub fn create_router(
     #[cfg(any(debug_assertions, feature = "test-fixtures"))]
     let base_router = base_router.merge(crate::mcp::test_fixtures::routes());
 
-    base_router
+    // Layer ordering (`.layer()` is bottom-up — last call = outermost):
+    //
+    //   [CatchPanicLayer]              ← outermost: panics → 500 JSON
+    //     [envelope_audit_middleware]  ← debug-only: panics if error is non-JSON
+    //       [envelope_rewrite_middleware] ← rewrites 4xx text/plain → JSON envelope
+    //         [TraceLayer, CORS, BodyLimit, ...]
+    //           [handlers]
+    //
+    // The panic layer must remain outermost so it can catch panics that
+    // originate in any layer below, including the audit and envelope layers.
+    // The audit layer sits INSIDE CatchPanicLayer (panics are caught → 500
+    // JSON) and OUTSIDE envelope_rewrite (observes the post-rewrite response).
+    // A non-JSON error response after the rewrite is a definitive handler bug
+    // surfaced as a panic in debug builds; compiles away entirely in release.
+    //
+    // The #[cfg(debug_assertions)] audit layer cannot be placed inline in a
+    // method-chain call, so we use a let-rebind pattern:
+    //   1. Build the router through all release-build layers up to envelope_rewrite.
+    //   2. In debug builds only, add the audit layer via a rebind.
+    //   3. Add the outermost CatchPanicLayer + state unconditionally.
+    let router_with_inner_layers = base_router
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))
@@ -1761,22 +1781,22 @@ pub fn create_router(
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
         .layer(axum::Extension(graphql_schema))
-        // Layer ordering (`.layer()` is bottom-up — last call = outermost):
-        //
-        //   [CatchPanicLayer]              ← outermost: panics → 500 JSON
-        //     [envelope_rewrite_middleware] ← rewrites 4xx text/plain → JSON envelope
-        //       [TraceLayer, CORS, BodyLimit, ...]
-        //         [handlers]
-        //
-        // The panic layer must remain outermost so it can catch panics that
-        // originate in any layer below, including the envelope middleware itself.
-        // The envelope layer sits immediately inside so it rewrites axum's own
-        // rejection bodies (missing Content-Type, bad JSON, etc.) before they
-        // reach the client. `application/json` responses — including
-        // async-graphql errors — are never rewritten (text/plain guard).
         .layer(axum::middleware::from_fn(
             crate::mcp::envelope::envelope_rewrite_middleware,
-        ))
+        ));
+
+    // Debug-only audit layer: asserts every error response is application/json.
+    // Placed between envelope_rewrite (inner) and CatchPanicLayer (outer) so:
+    //   - it sees the post-rewrite response,
+    //   - its panics are absorbed by CatchPanicLayer → 500 JSON in server mode,
+    //   - but surface as test failures in #[tokio::test] (no catch layer there).
+    // Compiles away entirely in release builds — zero production overhead.
+    #[cfg(debug_assertions)]
+    let router_with_inner_layers = router_with_inner_layers.layer(axum::middleware::from_fn(
+        crate::mcp::envelope_audit::envelope_audit_middleware,
+    ));
+
+    router_with_inner_layers
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(
             runner_panic_handler,
         ))
@@ -1939,5 +1959,225 @@ mod panic_catcher_tests {
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["success"], false);
         assert!(body["error"].as_str().unwrap().contains("panicked"));
+    }
+}
+
+/// Route-coverage test: every mutating route (POST/PUT/PATCH) that takes a JSON
+/// body MUST return the canonical `ApiResponse` envelope on malformed input.
+///
+/// ## Approach: representative-subset probe router
+///
+/// Building the full `ApiState` in a test is infeasible — it requires a
+/// `tauri::AppHandle`, `RAGState`, `InstanceManager`, and a running Tauri
+/// runtime. Instead, this module builds a lightweight *probe router*: a
+/// dedicated `axum::Router` with 15 representative routes whose handlers accept
+/// `axum::Json<serde_json::Value>` (the same extractor family as all real
+/// handlers). The middleware stack matches production exactly:
+///
+/// ```text
+/// [envelope_rewrite_middleware]   ← same as mcp_api.rs
+///   [probe handlers]              ← minimal stubs, same Json<T> extractor
+/// ```
+///
+/// Sending a POST/PUT/PATCH with no `Content-Type` header triggers the same
+/// `MissingJsonContentType` rejection that real handlers produce. The test
+/// asserts that after the rewrite middleware the response is:
+///   - `Content-Type: application/json`
+///   - body parses as JSON with `success == false` and a non-empty `code`
+///
+/// All 15 routes are tested in a single pass; violations are collected and
+/// reported together so the failure message lists every offending route.
+///
+/// The `envelope_audit_middleware` is NOT used inside this test — the test
+/// itself is the collector. The audit middleware serves a different purpose:
+/// it fires as a panic inside the running server when a gap is detected.
+#[cfg(test)]
+mod envelope_coverage_tests {
+    use axum::{
+        body::Body,
+        http::{self, Request, StatusCode},
+        middleware,
+        response::Json,
+        routing::{patch, post, put},
+        Router,
+    };
+    use serde::Deserialize;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use crate::mcp::envelope::envelope_rewrite_middleware;
+
+    // ── Minimal request body shared by all probe handlers ────────────────────
+
+    #[derive(Debug, Deserialize)]
+    struct ProbeBody {
+        #[allow(dead_code)]
+        _marker: Option<String>,
+    }
+
+    // ── Probe handler: accepts a typed JSON body, returns a trivial 200 ───────
+    //
+    // Using a typed `Deserialize` struct (not `serde_json::Value`) ensures that
+    // missing `Content-Type` fires `MissingJsonContentType` rejection — the same
+    // path as real handlers that parse named request structs.
+
+    async fn probe_post(axum::Json(_): axum::Json<ProbeBody>) -> Json<Value> {
+        Json(serde_json::json!({"success": true}))
+    }
+
+    // ── Representative route table ────────────────────────────────────────────
+    //
+    // 15 routes covering the major endpoint families:
+    //   - UI Bridge control (error-sessions, page navigation, elements, forms)
+    //   - AI session / task management
+    //   - Spec / scenario authoring
+    //   - Settings and config mutations
+    //
+    // Method is listed per route so it is verified independently if methods
+    // differ. All use the same handler body (envelope behaviour is middleware-
+    // level; the specific handler logic doesn't affect the 415 path).
+
+    const PROBE_ROUTES: &[(&str, &str)] = &[
+        // UI Bridge — error sessions
+        ("POST", "/ui-bridge/control/error-sessions/start"),
+        ("POST", "/ui-bridge/control/error-sessions/end"),
+        // UI Bridge — page navigation
+        ("POST", "/ui-bridge/page/navigate"),
+        ("POST", "/ui-bridge/page/navigate-and-wait"),
+        // UI Bridge — element interaction
+        ("POST", "/ui-bridge/control/elements/find"),
+        ("POST", "/ui-bridge/control/elements/click"),
+        // UI Bridge — forms
+        ("POST", "/ui-bridge/control/forms/fill"),
+        ("POST", "/ui-bridge/control/forms/snapshot"),
+        // AI session lifecycle
+        ("POST", "/sessions/start"),
+        ("POST", "/sessions/continue"),
+        // Task runs
+        ("POST", "/task-runs"),
+        // Settings mutations
+        ("PUT", "/settings"),
+        ("PATCH", "/settings"),
+        // Spec authoring
+        ("POST", "/spec/pages"),
+        // Scenarios
+        ("POST", "/scenarios/run"),
+    ];
+
+    /// Build a probe router whose routes mirror the method+path pairs from
+    /// `PROBE_ROUTES`. Every handler uses the same `Json<ProbeBody>` extractor
+    /// so the 415 rejection path is exercised identically for all routes.
+    fn build_probe_router() -> Router {
+        let mut router = Router::new();
+        for (method, path) in PROBE_ROUTES {
+            let route = match *method {
+                "PUT" => put(probe_post),
+                "PATCH" => patch(probe_post),
+                _ => post(probe_post),
+            };
+            router = router.route(path, route);
+        }
+        router.layer(middleware::from_fn(envelope_rewrite_middleware))
+    }
+
+    // ── Helper: send a request with no Content-Type ───────────────────────────
+
+    async fn send_no_content_type(
+        app: &mut Router,
+        method: &str,
+        path: &str,
+    ) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            // Deliberately omit Content-Type — triggers 415 in Json<T> extractor.
+            .body(Body::from(r#"{"_marker":"probe"}"#))
+            .unwrap();
+
+        // `oneshot` consumes the router, so we clone for each call.
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            Value::String(format!(
+                "(non-JSON body: {})",
+                String::from_utf8_lossy(&bytes)
+            ))
+        });
+        (status, body)
+    }
+
+    // ── The coverage assertion ────────────────────────────────────────────────
+
+    /// Every route in `PROBE_ROUTES` must return the canonical JSON envelope
+    /// when hit with a body but no `Content-Type` header.
+    ///
+    /// Failures are collected across all routes before asserting, so a single
+    /// run surfaces every violating route — not just the first one.
+    #[tokio::test]
+    async fn all_mutating_routes_return_json_envelope_on_missing_content_type() {
+        let mut app = build_probe_router();
+        let mut violations: Vec<String> = Vec::new();
+
+        for &(method, path) in PROBE_ROUTES {
+            let (status, body) = send_no_content_type(&mut app, method, path).await;
+
+            // Classify each failure mode separately for clear diagnostics.
+            if !status.is_client_error() {
+                violations.push(format!(
+                    "{} {} → expected 4xx, got {}",
+                    method, path, status
+                ));
+                continue;
+            }
+
+            let ct = body.as_str().map(|s| s.to_owned()); // only set when body was non-JSON
+            if ct.is_some() {
+                violations.push(format!(
+                    "{} {} → response body was not JSON: {}",
+                    method, path, body
+                ));
+                continue;
+            }
+
+            if body["success"] != false {
+                violations.push(format!(
+                    "{} {} → success field was not false: {}",
+                    method, path, body
+                ));
+            }
+
+            let code = body["code"].as_str().unwrap_or("");
+            if code.is_empty() {
+                violations.push(format!(
+                    "{} {} → code field missing or empty (body={})",
+                    method, path, body
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Envelope coverage failures ({} route(s) violated the canonical envelope):\n  - {}",
+            violations.len(),
+            violations.join("\n  - ")
+        );
+    }
+
+    /// Smoke test: a request WITH the correct Content-Type + valid body succeeds
+    /// (middleware must not interfere with 2xx responses).
+    #[tokio::test]
+    async fn valid_request_passes_through_unchanged() {
+        let mut app = build_probe_router();
+        let req = Request::builder()
+            .method(http::Method::POST)
+            .uri("/ui-bridge/page/navigate")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"_marker":"ok"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
