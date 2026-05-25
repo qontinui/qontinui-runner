@@ -638,10 +638,11 @@ pub fn pair_via_browser(
         '?'
     };
     let connect_url = format!(
-        "{}{}device_id={}",
+        "{}{}device_id={}&device_name={}",
         pair_start_resp.redirect_url,
         separator,
         urlencoding::encode(&device_id),
+        urlencoding::encode(&hostname_now),
     );
 
     let received: Arc<Mutex<Option<CallbackCapture>>> = Arc::new(Mutex::new(None));
@@ -754,8 +755,8 @@ pub fn pair_via_browser(
     // `capture.token_id` = device_id forwarded by the web redirect.
     // `user_id` is decoded from the JWT payload (best-effort; persist
     //  path re-validates).
-    let user_id = tenant_id_from_jwt_claim(&capture.token, "sub")
-        .or_else(|| tenant_id_from_jwt_claim(&capture.token, "user_id"))
+    let user_id = tenant_id_from_jwt_claim(&capture.token, "user_id")
+        .or_else(|| tenant_id_from_jwt_claim(&capture.token, "sub"))
         .unwrap_or_default();
     let resp_device_id = capture
         .token_id
