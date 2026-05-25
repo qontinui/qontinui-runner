@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { useUIComponent } from "@qontinui/ui-bridge";
+import { useUIComponent, useUIElement } from "@qontinui/ui-bridge";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -113,6 +113,25 @@ export function ProcessManagerTab() {
    * `reconcile-tick` Tauri event. Used to derive the flap-count badge.
    */
   const [reconcileTicks, setReconcileTicks] = useState<Record<string, ReconcileTickPayload>>({});
+
+  // Stable UI Bridge anchors for spec-check (IrPageSpec authoring). These give
+  // the process-manager page id-addressable structure that survives copy edits
+  // and live-data drift, independent of the per-process tile content.
+  const { ref: panelRef } = useUIElement({
+    id: "process-manager-panel",
+    type: "generic",
+    label: "Process Manager panel",
+  });
+  const { ref: headingRef } = useUIElement({
+    id: "process-manager-heading",
+    type: "generic",
+    label: "Process Manager heading",
+  });
+  const { ref: processListRef } = useUIElement({
+    id: "process-list",
+    type: "generic",
+    label: "Process list",
+  });
 
   // AI Fix session state
   const [aiFixActive, setAiFixActive] = useState(false);
@@ -597,12 +616,14 @@ Be concise and actionable.`;
   const selected = selectedId ? processes.find((p) => p.id === selectedId) : null;
 
   return (
-    <div className="flex flex-col h-full">
+    <div ref={panelRef} className="flex flex-col h-full">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
         <div className="flex items-center gap-2">
           <Cpu className="w-4 h-4 text-cyan-400" />
-          <h2 className="text-sm font-medium text-zinc-200">Process Manager</h2>
+          <h2 ref={headingRef} className="text-sm font-medium text-zinc-200">
+            Process Manager
+          </h2>
           <span className="text-xs text-zinc-500">
             {processes.filter((p) => isRunning(p.state)).length}/{processes.length} running
           </span>
@@ -654,7 +675,7 @@ Be concise and actionable.`;
       {/* Main content */}
       <div className="flex flex-1 min-h-0">
         {/* Process list */}
-        <div className="w-[400px] border-r border-white/10 overflow-y-auto">
+        <div ref={processListRef} className="w-[400px] border-r border-white/10 overflow-y-auto">
           {loading ? (
             <div className="flex items-center justify-center h-32 text-zinc-500 text-sm">
               Loading...
@@ -671,6 +692,11 @@ Be concise and actionable.`;
             processes.map((proc) => (
               <div
                 key={proc.id}
+                data-testid={`process-tile-${proc.name
+                  .toLowerCase()
+                  .replace(/[^a-z0-9]+/g, "-")
+                  .replace(/(^-|-$)/g, "")}`}
+                data-state={proc.state}
                 onClick={(e) => {
                   // Ignore clicks on child buttons (start, stop, edit, etc.)
                   if ((e.target as HTMLElement).closest("button")) return;
