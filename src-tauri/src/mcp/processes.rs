@@ -17,6 +17,45 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::process_capture::primary_proxy;
 use crate::process_capture::types::{OutputLine, ProcessStatus};
 
+/// Map a process-manager error string into a canonical envelope.
+///
+/// The manager's lifecycle methods return `Result<_, String>`. The Phase-B2
+/// `ExternallyOwned` guards embed a `[CODE]` prefix (e.g.
+/// `"[ACTION_NOT_SUPPORTED] Process ... "`) so this HTTP boundary can surface a
+/// structured `code` field on the canonical envelope instead of burying the
+/// code in free text. Errors without a recognised `[CODE]` prefix fall back to
+/// a plain `api_error` under `default_status`.
+fn manager_error_to_envelope(
+    err: &str,
+    default_status: StatusCode,
+    fallback_prefix: &str,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    if let Some(rest) = err.strip_prefix('[') {
+        if let Some((code, message)) = rest.split_once(']') {
+            let code = code.trim();
+            let message = message.trim();
+            if !code.is_empty() {
+                let status = match code {
+                    "INVALID_STATE" | "ACTION_NOT_SUPPORTED" => StatusCode::BAD_REQUEST,
+                    "EXTERNAL_PORT_OWNED" => StatusCode::CONFLICT,
+                    _ => default_status,
+                };
+                return (
+                    status,
+                    Json(ApiResponse::error_with_code(
+                        message.to_string(),
+                        code.to_string(),
+                    )),
+                );
+            }
+        }
+    }
+    (
+        default_status,
+        Json(api_error(format!("{}: {}", fallback_prefix, err))),
+    )
+}
+
 /// List all managed processes with their status.
 pub async fn list_processes(
     State(state): State<Arc<ApiState>>,
@@ -98,9 +137,10 @@ pub async fn start_process(
         .await
         .unwrap_or_else(|| id.clone());
     manager.start_process(&resolved).await.map_err(|e| {
-        (
+        manager_error_to_envelope(
+            &e,
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to start process: {}", e))),
+            "Failed to start process",
         )
     })?;
 
@@ -135,10 +175,7 @@ pub async fn stop_process(
         .await
         .unwrap_or_else(|| id.clone());
     manager.stop_process(&resolved).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(api_error(format!("Failed to stop process: {}", e))),
-        )
+        manager_error_to_envelope(&e, StatusCode::BAD_REQUEST, "Failed to stop process")
     })?;
 
     Ok(Json(ApiResponse::success("stopped".to_string())))
