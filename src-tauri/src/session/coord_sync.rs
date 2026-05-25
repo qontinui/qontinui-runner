@@ -665,6 +665,14 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
             body["parent_session_id"] = p;
         }
     }
+    // Forward the ambient Claude Code session id (the `Session-Id` git-trailer
+    // id) as a first-class field so coord can join session rows to commit
+    // history. Omitted when absent/null — coord tolerates its absence.
+    if let Some(ccsid) = rec.payload.get("claude_code_session_id") {
+        if !ccsid.is_null() {
+            body["claude_code_session_id"] = ccsid.clone();
+        }
+    }
     body
 }
 
@@ -1403,6 +1411,44 @@ mod tests {
         assert_eq!(body["session_kind"], "terminal_claude");
         assert_eq!(body["intent"]["purpose"], "p");
         assert_eq!(body["tenant_id"], "11111111-1111-1111-1111-111111111111");
+    }
+
+    /// rebuild_create_body forwards the ambient Claude Code session id as a
+    /// first-class field when present, and omits it entirely when absent —
+    /// so coord can join session rows to commit `Session-Id` trailers.
+    #[test]
+    fn rebuild_create_body_forwards_claude_code_session_id() {
+        let with = OutboxRecord {
+            machine_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            seq: 1,
+            event_kind: "started".into(),
+            payload: json!({
+                "id": Uuid::nil(),
+                "kind": "terminal_claude",
+                "intent": { "kind": "terminal_claude", "purpose": "p" },
+                "claude_code_session_id": "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b4"
+            }),
+            recorded_at: Utc::now(),
+            acked_at: None,
+        };
+        let body = rebuild_create_body(&with);
+        assert_eq!(
+            body["claude_code_session_id"],
+            "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b4"
+        );
+
+        // Absent (manual launch / CI) → key omitted, not null.
+        let without = OutboxRecord {
+            payload: json!({
+                "id": Uuid::nil(),
+                "kind": "terminal_shell",
+                "intent": { "kind": "terminal_shell", "purpose": "p" }
+            }),
+            ..with
+        };
+        let body = rebuild_create_body(&without);
+        assert!(body.get("claude_code_session_id").is_none());
     }
 
     /// state_change_body forwards only the known coord fields and
