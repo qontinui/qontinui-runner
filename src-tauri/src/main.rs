@@ -2982,9 +2982,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             });
 
-                            // Release ADB forwards installed by the USB scanner
-                            // so they don't linger in `adb forward --list`
-                            // across runner restarts. Graceful path only — the
+                            // Release ADB forwards and reverses installed by the
+                            // USB scanner so they don't linger in
+                            // `adb forward --list` / `adb reverse --list` across
+                            // runner restarts. Graceful path only — the
                             // supervisor force-kills via taskkill /F and this
                             // code never runs for temp runners. See plan
                             // adb-forwarder-port.md §1.6a.
@@ -2992,7 +2993,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(usb) =
                                     app_state_clone.usb_transport.get()
                                 {
-                                    info!("Releasing ADB forwards on shutdown");
+                                    info!("Releasing ADB forwards and reverses on shutdown");
                                     usb.release_all().await;
                                 }
                             });
