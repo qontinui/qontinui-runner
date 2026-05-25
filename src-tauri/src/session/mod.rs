@@ -219,6 +219,11 @@ pub struct SessionDescription {
     pub last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     pub closed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub parent_session_id: Option<Uuid>,
+    /// Ambient Claude Code session id (`CLAUDE_CODE_SESSION_ID`) captured at
+    /// start — the same id the `prepare-commit-msg` hook stamps as the
+    /// `Session-Id` git trailer. Lets attribution be a join, not a hunt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_session_id: Option<String>,
     pub transport_handle_kind: &'static str,
 }
 
@@ -234,6 +239,9 @@ struct SessionRecord {
     last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     closed_at: Option<chrono::DateTime<chrono::Utc>>,
     parent_session_id: Option<Uuid>,
+    /// Ambient `CLAUDE_CODE_SESSION_ID` at session start (the id that also
+    /// lands in commit `Session-Id` trailers). `None` outside Claude Code.
+    claude_code_session_id: Option<String>,
     transport: DynTransport,
     transport_handle: TransportHandle,
     /// Phase 8 (plan §D10) — the opt-in output-streaming pipe task, present
@@ -254,6 +262,7 @@ impl SessionRecord {
             last_heartbeat_at: self.last_heartbeat_at,
             closed_at: self.closed_at,
             parent_session_id: self.parent_session_id,
+            claude_code_session_id: self.claude_code_session_id.clone(),
             transport_handle_kind: match &self.transport_handle {
                 TransportHandle::Pty { .. } => "pty",
                 TransportHandle::ClaudeCli { .. } => "claude_cli",
@@ -291,6 +300,27 @@ impl SessionTransports {
             }
         }
     }
+}
+
+/// Capture the ambient Claude Code session id (`CLAUDE_CODE_SESSION_ID`) —
+/// the same id the `prepare-commit-msg` hook stamps as the `Session-Id` git
+/// trailer on commits. Recording it on the session row lets coord *join* its
+/// session records to commit history (and to the conversation that produced
+/// them) instead of forcing a forensic hunt when a worktree is later found in
+/// an unexpected state. Returns `None` outside Claude Code (manual launches,
+/// CI) — those stay untagged, which is the correct default.
+///
+/// NB: this reads the runner *process* environment, so it reflects the
+/// session the runner was launched under. Per-subprocess capture (the spawned
+/// `claude` CLI's own id for `TerminalClaude`/`Agentic` sessions) is a
+/// follow-up to be calibrated against real runner usage; this seed is the
+/// un-backfillable part — start recording it now so early coordinated history
+/// is joinable.
+fn ambient_claude_code_session_id() -> Option<String> {
+    std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 impl SessionRegistry {
@@ -341,6 +371,7 @@ impl SessionRegistry {
 
         let id = uuid_v7();
         let now = chrono::Utc::now();
+        let claude_code_session_id = ambient_claude_code_session_id();
 
         // Phase 8 (plan §D10/§D11) — opt-in PTY output streaming. Only when
         // the session declared `share_output`: tap the transport's output
@@ -378,6 +409,7 @@ impl SessionRegistry {
             last_heartbeat_at: Some(now),
             closed_at: None,
             parent_session_id,
+            claude_code_session_id: claude_code_session_id.clone(),
             transport: transport.clone(),
             transport_handle,
             output_pipe,
@@ -395,6 +427,7 @@ impl SessionRegistry {
             "state": SessionState::Active.as_str(),
             "started_at": now,
             "parent_session_id": parent_session_id,
+            "claude_code_session_id": claude_code_session_id,
         });
         self.coord_sync
             .outbox()
@@ -449,6 +482,7 @@ impl SessionRegistry {
 
         let id = uuid_v7();
         let now = chrono::Utc::now();
+        let claude_code_session_id = ambient_claude_code_session_id();
         let transport: DynTransport = Arc::new(transport::ExternalTransport);
 
         let record = SessionRecord {
@@ -460,6 +494,7 @@ impl SessionRegistry {
             last_heartbeat_at: Some(now),
             closed_at: None,
             parent_session_id: None,
+            claude_code_session_id: claude_code_session_id.clone(),
             transport,
             transport_handle: TransportHandle::External,
             // Externally-owned mirror — the real PTY belongs to the legacy
@@ -475,6 +510,7 @@ impl SessionRegistry {
             "intent": intent,
             "state": SessionState::Active.as_str(),
             "started_at": now,
+            "claude_code_session_id": claude_code_session_id,
         });
         self.coord_sync
             .outbox()
