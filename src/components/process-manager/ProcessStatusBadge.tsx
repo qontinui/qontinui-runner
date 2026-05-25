@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   Circle,
   Hammer,
+  Link,
   Loader2,
   Square,
   XCircle,
@@ -17,7 +18,8 @@ export type ProcessState =
   | "running"
   | "healthy"
   | "stopping"
-  | "failed";
+  | "failed"
+  | "externally_owned";
 
 interface ProcessStatusBadgeProps {
   state: ProcessState;
@@ -98,6 +100,11 @@ const stateConfig: Record<ProcessState, { icon: React.ReactNode; label: string; 
       icon: <XCircle className="w-3 h-3" />,
       label: "Failed",
       classes: "bg-red-900/30 text-red-400 border-red-800",
+    },
+    externally_owned: {
+      icon: <Link className="w-3 h-3" />,
+      label: "External",
+      classes: "bg-violet-900/30 text-violet-400 border-violet-800",
     },
   };
 
