@@ -307,31 +307,6 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
     None
 }
 
-#[cfg(test)]
-mod port_owner_tests {
-    use super::*;
-
-    /// `port_owner_pid` must return `None` for a port that nothing is
-    /// listening on.  We pick a high-numbered port that is almost certainly
-    /// free; if by chance it is bound the test passes vacuously (we get
-    /// `Some(_)` instead of `None`, which is also valid behaviour).
-    ///
-    /// A positive "live port" test would require spawning a real server and
-    /// is left to the integration test in `manager.rs` where the full
-    /// reconcile loop is exercised end-to-end.
-    #[test]
-    fn free_port_returns_none_or_valid_pid() {
-        // Port 49999 is in the ephemeral range and almost never bound.
-        // We accept either None (expected) or Some(pid > 0) (port happened
-        // to be in use on this machine at test time).
-        let result = port_owner_pid(49999);
-        if let Some(pid) = result {
-            assert!(pid > 0, "pid must be positive if returned");
-        }
-        // Either outcome is acceptable — the function must not panic.
-    }
-}
-
 /// Kill the process using a specific port (Windows-specific).
 /// Returns true if at least one kill was attempted.
 ///
@@ -451,4 +426,29 @@ pub async fn kill_port_process(port: u16) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod port_owner_tests {
+    use super::*;
+
+    /// `port_owner_pid` must return `None` for a port that nothing is
+    /// listening on.  We pick a high-numbered port that is almost certainly
+    /// free; if by chance it is bound the test passes vacuously (we get
+    /// `Some(_)` instead of `None`, which is also valid behaviour).
+    ///
+    /// A positive "live port" test would require spawning a real server and
+    /// is left to the integration test in `manager.rs` where the full
+    /// reconcile loop is exercised end-to-end.
+    #[test]
+    fn free_port_returns_none_or_valid_pid() {
+        // Port 49999 is in the ephemeral range and almost never bound.
+        // We accept either None (expected) or Some(pid > 0) (port happened
+        // to be in use on this machine at test time).
+        let result = port_owner_pid(49999);
+        if let Some(pid) = result {
+            assert!(pid > 0, "pid must be positive if returned");
+        }
+        // Either outcome is acceptable — the function must not panic.
+    }
 }

@@ -98,6 +98,7 @@ fn make_ir() -> IrPageSpec {
         ],
         synthesized_groups: None,
         initial_state: None,
+        api_assertions: None,
     }
 }
 
@@ -223,6 +224,7 @@ fn project_scenarios_handles_empty_ir() {
         transitions: vec![],
         synthesized_groups: None,
         initial_state: None,
+        api_assertions: None,
     };
     let proj = project_scenarios(&ir);
     assert!(proj.states.is_empty());

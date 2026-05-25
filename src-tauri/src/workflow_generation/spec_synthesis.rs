@@ -1522,6 +1522,7 @@ mod tests {
                 Some(synthesized_groups)
             },
             initial_state: None,
+            api_assertions: None,
         };
 
         crate::spec_api::storage::write_ir_and_regenerate(

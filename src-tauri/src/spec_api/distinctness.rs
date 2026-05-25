@@ -368,6 +368,7 @@ mod tests {
             transitions: vec![],
             synthesized_groups: None,
             initial_state: None,
+            api_assertions: None,
         }
     }
 
