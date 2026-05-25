@@ -80,12 +80,29 @@ interface UnifiedRun {
   taskType?: string;
 }
 
+/**
+ * Mode selector for the unified runs/history view.
+ *
+ *  - `"history"` (default): completed/failed/cancelled runs — terminal states.
+ *    Status-filter respects the user's stored "all|success|failed" preference.
+ *  - `"active"`: in-progress runs only (status === "running"). Acts as a live
+ *    list of what's currently executing on this runner. The "passed/failed"
+ *    status filter is hidden because by definition nothing in this view has
+ *    a terminal status yet.
+ *
+ * Wired so the sidebar's `runs` tab renders `mode="active"` and `history` tab
+ * renders `mode="history"`. Without this, both tabs rendered identical
+ * "Run > History" content byte-for-byte (page-health iter-1 finding 2026-05-24).
+ */
+export type HistoryTabMode = "history" | "active";
+
 interface HistoryTabProps {
   onNavigateToRun: () => void;
   onNavigateToAi: (runId: string) => void;
+  mode?: HistoryTabMode;
 }
 
-export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps) {
+export function HistoryTab({ onNavigateToRun, onNavigateToAi, mode = "history" }: HistoryTabProps) {
   // Filter state
   const [filterType, setFilterType] = useState<FilterType>(() => {
     const parsed = instanceStorage.getJSON<{ type?: FilterType; status?: FilterStatus } | null>(
@@ -213,16 +230,25 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
   // Apply filters
   const filteredRuns = useMemo(() => {
     return unifiedRuns.filter((run) => {
+      // Mode filter — partitions runs by terminal-vs-active. A run with
+      // `success === undefined && status !== "running"` (rare interim state)
+      // is treated as terminal so it doesn't disappear from both views.
+      const isActive = run.status === "running" || run.status === "paused";
+      if (mode === "active" && !isActive) return false;
+      if (mode === "history" && isActive) return false;
+
       // Type filter
       if (filterType !== "all" && run.type !== filterType) {
         return false;
       }
 
-      // Status filter
-      if (filterStatus === "success" && run.success !== true) {
+      // Status filter — only meaningful in history mode (active runs have no
+      // terminal pass/fail yet). When mode=active, the UI hides the status
+      // filter and we ignore its value here.
+      if (mode === "history" && filterStatus === "success" && run.success !== true) {
         return false;
       }
-      if (filterStatus === "failed" && run.success !== false) {
+      if (mode === "history" && filterStatus === "failed" && run.success !== false) {
         return false;
       }
 
@@ -238,7 +264,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
 
       return true;
     });
-  }, [unifiedRuns, filterType, filterStatus, searchQuery]);
+  }, [unifiedRuns, filterType, filterStatus, searchQuery, mode]);
 
   // Format helpers
   const formatDuration = (ms: number | undefined) => {
@@ -325,7 +351,9 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <History className="w-5 h-5 text-primary" />
-          <h1 className="text-xl font-semibold">Run History</h1>
+          <h1 className="text-xl font-semibold">
+            {mode === "active" ? "Active Runs" : "Run History"}
+          </h1>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -379,7 +407,9 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
           </div>
         </div>
 
-        {/* Status filter */}
+        {/* Status filter — only meaningful for terminal-state history view.
+            Active runs have no pass/fail yet, so we hide it in active mode. */}
+        {mode === "history" && (
         <div className="flex rounded-lg border border-border overflow-hidden">
           {(["all", "success", "failed"] as FilterStatus[]).map((status) => (
             <button
@@ -403,6 +433,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
             </button>
           ))}
         </div>
+        )}
 
         {/* Search */}
         <div className="flex-1 max-w-xs">
@@ -464,11 +495,13 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
         ) : filteredRuns.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground">
             <History className="w-12 h-12 mx-auto mb-4 opacity-50" />
-            <p>No runs found</p>
+            <p>{mode === "active" ? "No active runs" : "No runs found"}</p>
             <p className="text-sm mt-2">
               {filterType !== "all" || filterStatus !== "all" || searchQuery
                 ? "Try adjusting your filters"
-                : "Start an automation to see history"}
+                : mode === "active"
+                  ? "Runs currently in progress will appear here"
+                  : "Start an automation to see history"}
             </p>
           </div>
         ) : filteredRuns.length > VIRTUAL_SCROLL_THRESHOLD ? (

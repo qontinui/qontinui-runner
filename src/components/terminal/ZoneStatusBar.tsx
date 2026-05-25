@@ -771,11 +771,18 @@ function AnalyzeDropdown({
       >
         Summary · Architecture · Progress
       </span>
-      {/* Analysis status indicator — always rendered so 'Analyzing' label is reliably discoverable */}
+      {/* Analysis status indicator — always rendered so 'Analyzing' label is reliably discoverable.
+          NOTE: previously used `role="status"`, which page-health auto-classifies
+          as a transient toast (caused the "Analyzing: idle" line to appear as a
+          permanent toast in the page-health audit). Switched to a plain
+          `aria-live="polite"` span with `data-page-element="status-indicator"`
+          so the spec snapshot treats this as a persistent status-bar widget
+          rather than a toast. */}
       <span
         className={`flex items-center gap-1 text-[10px] ${isAnalyzing ? "text-[#e0af68]" : "text-[#414868]"}`}
-        role="status"
         aria-live="polite"
+        data-page-element="status-indicator"
+        data-indicator="analysis-engine"
         title={isAnalyzing ? "Analysis in progress" : "Analyzing engine: idle"}
       >
         {isAnalyzing && (

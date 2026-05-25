@@ -346,10 +346,24 @@ export function TabContent({
       );
 
     case "runs":
-    case "history":
       return (
         <div data-page-id="runs" className="h-full overflow-hidden">
           <HistoryTab
+            mode="active"
+            onNavigateToRun={() => setActiveTab("gui-automation")}
+            onNavigateToAi={(runId) => {
+              instanceStorage.setJSON("qontinui-selected-task-run-id", runId);
+              setActiveTab("run-recap");
+            }}
+          />
+        </div>
+      );
+
+    case "history":
+      return (
+        <div data-page-id="history" className="h-full overflow-hidden">
+          <HistoryTab
+            mode="history"
             onNavigateToRun={() => setActiveTab("gui-automation")}
             onNavigateToAi={(runId) => {
               instanceStorage.setJSON("qontinui-selected-task-run-id", runId);

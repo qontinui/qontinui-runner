@@ -1656,7 +1656,9 @@ mod tab_activate_tests {
     /// rejects it as `unknown_tab`. (Surfaced 2026-05-02 for `"wrappers"`.)
     #[test]
     fn recently_added_tabs_are_accepted() {
-        for id in &["wrappers", "productivity"] {
+        // `settings-account` added 2026-05-23 — was advertised by `availableTabs`
+        // but rejected by `tab/activate` because the Rust mirror was missing it.
+        for id in &["wrappers", "productivity", "settings-account"] {
             validate_tab_id(id).unwrap_or_else(|_| {
                 panic!(
                     "tab '{id}' missing from VALID_TAB_IDS — sync with src/components/app/tab-types.ts",

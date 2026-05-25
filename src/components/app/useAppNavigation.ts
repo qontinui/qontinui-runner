@@ -140,7 +140,14 @@ export function useAppNavigation(): UseAppNavigationReturn {
   >[0]);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
-    return instanceStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
+    // Honor a persisted explicit choice first. Otherwise default-collapse on
+    // narrow viewports (<1280px) so the content area gets enough horizontal
+    // room — addresses page-health `spatial_coverage` WARNING where the
+    // sidebar occupied ~23% of the left half and content shrank to 9-20%.
+    const stored = instanceStorage.getItem(SIDEBAR_COLLAPSED_KEY);
+    if (stored !== null) return stored === "true";
+    if (typeof window !== "undefined" && window.innerWidth < 1280) return true;
+    return false;
   });
 
   const [terminalSessionCount, setTerminalSessionCount] = useState(0);
@@ -391,6 +398,33 @@ export function useAppNavigation(): UseAppNavigationReturn {
       setSidebarCollapsed(false);
     }
   }, [activeTab, terminalSessionCount, sidebarCollapsed]);
+
+  // Viewport-driven auto-collapse: when the window narrows below 1280px,
+  // collapse the sidebar so the content area gets the horizontal room it
+  // needs (page-health `spatial_coverage` improvement). When the window
+  // widens past the threshold, re-expand IF the previous collapse was
+  // automatic (autoCollapsedRef set) so we don't undo an explicit operator
+  // toggle.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const NARROW_BREAKPOINT_PX = 1280;
+    const onResize = () => {
+      const narrow = window.innerWidth < NARROW_BREAKPOINT_PX;
+      setSidebarCollapsed((current) => {
+        if (narrow && !current) {
+          autoCollapsedRef.current = true;
+          return true;
+        }
+        if (!narrow && current && autoCollapsedRef.current) {
+          autoCollapsedRef.current = false;
+          return false;
+        }
+        return current;
+      });
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   // Backstop persistence: every event-handler that calls `setActiveTab`
   // already persists synchronously via `setActiveTabAndPersist`, but this

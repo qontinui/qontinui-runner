@@ -17,6 +17,7 @@ import { Monitor, Plus, Trash2, Play, Square, ChevronDown, ChevronRight } from "
 import { SectionHeader } from "./SectionHeader";
 import { getApiPort } from "@/lib/runner-api";
 import type { LogFunction } from "./types";
+import { HandoffPanel } from "@/components/session/HandoffPanel";
 
 // ---------------------------------------------------------------------------
 // Types mirroring the Rust shapes from `commands::instances` /
@@ -1152,6 +1153,12 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
           Add Instance
         </button>
       )}
+
+      {/* Phase 7 cross-machine session handoff — PR #258. Lives here because
+          "transfer a session to another runner" is naturally adjacent to the
+          "manage runner instances" affordance, and HandoffPanel needs the
+          SessionProvider that already wraps this settings tree. */}
+      <HandoffPanel onLog={(msg) => onLog("info", msg)} />
     </div>
   );
 }
