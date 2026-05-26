@@ -31,6 +31,7 @@ import { ContainerSettings } from "./ContainerSettings";
 import { LockYieldPolicySettings } from "./LockYieldPolicySettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { AccountSettings } from "./AccountSettings";
+import { CiRunnerSettings } from "./CiRunnerSettings";
 
 interface SettingsProps {
   /** Default tab to open. If provided, overrides instanceStorage persistence. */
@@ -60,6 +61,7 @@ type SettingsTab =
   | "otel"
   | "containers"
   | "security"
+  | "ci-runner"
   | "lock-yield"
   | "advanced"
   | "updates";
@@ -94,6 +96,7 @@ const SETTINGS_TABS = [
   { id: "instances", label: "Runner Instances" },
   { id: "otel", label: "OpenTelemetry" },
   { id: "containers", label: "Container Isolation" },
+  { id: "ci-runner", label: "CI Runner" },
   { id: "security", label: "Security" },
   { id: "lock-yield", label: "Lock-yield Policy" },
   { id: "advanced", label: "Debug" },
@@ -132,6 +135,7 @@ const SUB_TAB_TO_MAIN_TAB: Record<SettingsTab, string> = {
   instances: "settings-instances",
   otel: "settings-otel",
   containers: "settings-containers",
+  "ci-runner": "settings-ci-runner",
   security: "settings-security",
   "lock-yield": "settings-lock-yield",
   // SETTINGS_TABS id is "advanced" (label "Debug"); MainTabId is "settings-debug"
@@ -291,6 +295,8 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         return <OtelSettings onLog={onLog} />;
       case "containers":
         return <ContainerSettings onLog={onLog} />;
+      case "ci-runner":
+        return <CiRunnerSettings onLog={onLog} />;
       case "security":
         return <SecuritySettings onLog={onLog} />;
       case "lock-yield":
