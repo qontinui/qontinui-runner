@@ -746,7 +746,11 @@ pub fn spawn_headless_auto_login(launch_env: crate::launch_env::SharedLaunchEnv)
 
         let auth_manager = AuthManager::new();
         let already_paired = dirs::data_local_dir()
-            .map(|d| d.join("com.qontinui.runner").join("paired_user.json").exists())
+            .map(|d| {
+                d.join("com.qontinui.runner")
+                    .join("paired_user.json")
+                    .exists()
+            })
             .unwrap_or(false);
 
         // Phase 1: Login (skip if tokens already exist from a prior run,
@@ -816,13 +820,7 @@ pub fn spawn_headless_auto_login(launch_env: crate::launch_env::SharedLaunchEnv)
         let device_c = device_id.clone();
         let user_c = user_id.clone();
         let pair_result = match tokio::task::spawn_blocking(move || {
-            pair_with_auth_token_with_ids(
-                &base_c,
-                &token_c,
-                &device_c,
-                &user_c,
-                uuid::Uuid::nil(),
-            )
+            pair_with_auth_token_with_ids(&base_c, &token_c, &device_c, &user_c, uuid::Uuid::nil())
         })
         .await
         {
@@ -861,10 +859,7 @@ pub fn spawn_headless_auto_login(launch_env: crate::launch_env::SharedLaunchEnv)
             return;
         }
 
-        let resp_device_id = pair_resp
-            .device_id
-            .as_deref()
-            .unwrap_or(device_id.as_str());
+        let resp_device_id = pair_resp.device_id.as_deref().unwrap_or(device_id.as_str());
         info!(
             user = %user_id,
             device = %resp_device_id,
