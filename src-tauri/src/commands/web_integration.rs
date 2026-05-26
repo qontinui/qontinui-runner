@@ -366,7 +366,25 @@ pub async fn test_web_integration_connection(
     runner_token: String,
 ) -> Result<TestConnectionResponse, String> {
     let trimmed_backend = trim_backend_url(&backend_url);
-    let trimmed_token = runner_token.trim().to_string();
+    // Fall back to the persisted token when the caller passes an empty
+    // string. The Settings UI clears its in-memory token field after a
+    // successful Save (so it never holds the secret longer than needed),
+    // which previously made a follow-up "Test connection" send an empty
+    // token and 422 with "runner_token is required". Resolving against the
+    // persisted value here means Save-then-Test works as the operator
+    // expects without re-typing the token.
+    let trimmed_token = {
+        let from_arg = runner_token.trim().to_string();
+        if from_arg.is_empty() {
+            settings::load_settings()
+                .web_integration
+                .runner_token
+                .trim()
+                .to_string()
+        } else {
+            from_arg
+        }
+    };
     if trimmed_backend.is_empty() {
         return Err("backend_url is required".to_string());
     }
@@ -671,7 +689,10 @@ pub struct RedeemPairCodeResponse {
 ///   the device IS paired server-side but the runner cannot use the
 ///   credential — operator should retry).
 #[tauri::command]
-pub async fn redeem_pair_code(code: String) -> Result<RedeemPairCodeResponse, String> {
+pub async fn redeem_pair_code(
+    code: String,
+    backend_url: Option<String>,
+) -> Result<RedeemPairCodeResponse, String> {
     use qontinui_runner_lib::pair::{
         coord_http_base, derive_web_base_from_coord, pair_with_pair_code, persist_pairing,
         read_device_id_from_disk,
@@ -689,13 +710,26 @@ pub async fn redeem_pair_code(code: String) -> Result<RedeemPairCodeResponse, St
         read_device_id_from_disk().map_err(|e| format!("could not read device identity: {}", e))?;
 
     // Resolve the web base. Pair-code endpoints live on qontinui-web,
-    // not coord. Derive via the same recipe used by the browser flow;
-    // operator can override via QONTINUI_WEB_BASE if web + coord are
-    // split across hosts.
-    let coord_base = coord_http_base().map_err(|e| format!("active profile: {}", e))?;
-    let web_base = std::env::var("QONTINUI_WEB_BASE")
-        .ok()
-        .unwrap_or_else(|| derive_web_base_from_coord(&coord_base));
+    // not coord. Precedence:
+    //   1. An explicit `backend_url` passed from the Settings form. The
+    //      operator may have typed a new backend without hitting Save yet;
+    //      honoring the form value means "redeem against the URL I see in
+    //      the field" rather than a stale persisted one.
+    //   2. `QONTINUI_WEB_BASE` env override (split web/coord hosts).
+    //   3. Derived from the active profile's coord_url.
+    let web_base = match backend_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(form_url) => trim_backend_url(form_url),
+        None => {
+            let coord_base = coord_http_base().map_err(|e| format!("active profile: {}", e))?;
+            std::env::var("QONTINUI_WEB_BASE")
+                .ok()
+                .unwrap_or_else(|| derive_web_base_from_coord(&coord_base))
+        }
+    };
 
     // Run the blocking HTTP call on a tokio blocking thread so we don't
     // tie up the async runtime. `pair_with_pair_code` uses a 30-second
@@ -723,6 +757,28 @@ pub async fn redeem_pair_code(code: String) -> Result<RedeemPairCodeResponse, St
         .map_err(|e| format!("server returned malformed tenant_id: {e}"))?;
 
     persist_pairing(&resp, tenant_id).map_err(|e| format!("persist pairing: {}", e))?;
+
+    // Promote to Tier 2 (qontinui_account) now that a device JWT is in
+    // hand. Redeeming a pair code IS a cloud-account bind, so the runner
+    // must leave Tier Local for the WS relay to come online. Defensive:
+    // the Settings UI also promotes after redeem, but a headless / UI-Bridge
+    // caller that doesn't run the FE path still ends up online. Idempotent —
+    // a no-op when already at Tier 2. Kicks the relay + JWT refresher as a
+    // side effect of `set_runner_tier`.
+    {
+        let mut s = settings::load_settings();
+        if s.tier != settings::RunnerTier::QontinuiAccount {
+            s.tier = settings::RunnerTier::QontinuiAccount;
+            s.tier_initialized = true;
+            if let Err(e) = settings::save_settings(&s) {
+                warn!("redeem_pair_code: tier promotion persist failed (continuing): {e}");
+            } else {
+                crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+                info!("redeem_pair_code: promoted runner to Tier QontinuiAccount + kicked relay");
+            }
+        }
+    }
 
     let response_device_id = resp.device_id.clone().unwrap_or_else(|| device_id.clone());
 

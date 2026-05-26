@@ -320,8 +320,40 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         runnerToken: tokenEdited ? formToken : "",
       });
       onLog("success", "Web integration settings saved");
-      // Re-seed the form so isDirty goes false; also clear the raw token.
+
+      // Promote the runner to Tier 2 (qontinui_account) once a usable
+      // integration config exists. Persisting a runner token alone leaves
+      // the runner in Tier Local, where the cloud WS relay stays idle and
+      // never connects (the relay only runs at tier == qontinui_account with
+      // a device JWT). Promoting here — and kicking the relay via
+      // set_runner_tier's side effect — is what actually brings the runner
+      // online after a token Save. Gated on a complete config so toggling
+      // the integration off doesn't spuriously promote.
+      //
+      // We use the post-save status (which reflects the just-persisted
+      // token) to decide whether the config is complete.
       const next = await refreshStatus();
+      const hasToken =
+        (tokenEdited && formToken.trim().length > 0) ||
+        Boolean(next?.runnerTokenMasked && next.runnerTokenMasked.length > 0);
+      const configComplete =
+        formEnabled && formBackendUrl.trim().length > 0 && hasToken;
+
+      if (configComplete) {
+        try {
+          await invoke<void>("set_runner_tier", { tier: "qontinui_account" });
+          // Notify tier consumers (AuthProvider et al.) without waiting for
+          // their poll cycle.
+          window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+          onLog("success", "Runner promoted to Qontinui account tier — connecting…");
+          // Re-read so the status banner picks up the (re)connecting relay.
+          await refreshStatus();
+        } catch (tierErr) {
+          onLog("error", `Saved, but tier promotion failed: ${tierErr}`);
+        }
+      }
+
+      // Re-seed the form so isDirty goes false; also clear the raw token.
       if (next) applyStatusToForm(next);
     } catch (err) {
       onLog("error", `Failed to save web integration settings: ${err}`);
@@ -376,19 +408,48 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       setPairCodeState({ state: "error", message: "Enter a pair code first." });
       return;
     }
+    // Validate the backend URL the same way Save does, and pass the form
+    // value through so the redeem hits the URL the operator currently sees
+    // in the field — not a stale persisted/derived one. The Rust command
+    // treats an empty/absent backendUrl as "fall back to the active
+    // profile", preserving the prior behavior when the field is blank.
+    const formUrl = formBackendUrl.trim();
+    if (formUrl) {
+      const urlValidation = validateBackendUrl(formUrl);
+      if (urlValidation) {
+        setPairCodeState({ state: "error", message: urlValidation });
+        return;
+      }
+    }
     setPairCodeState({ state: "redeeming" });
     try {
       const result = await invoke<{
         userId: string;
         tenantId: string;
         deviceId: string;
-      }>("redeem_pair_code", { code: trimmed });
+      }>("redeem_pair_code", {
+        code: trimmed,
+        backendUrl: formUrl || undefined,
+      });
       setPairCodeInput("");
       setPairCodeState({
         state: "success",
         message: `Paired (device ${result.deviceId.slice(0, 8)}…).`,
       });
       onLog("info", `Paired via one-time code (user=${result.userId})`);
+
+      // A successful pair-code redeem persists a device JWT but, like Save,
+      // leaves the runner in Tier Local — so the WS relay stays idle. Promote
+      // to Tier 2 so the relay comes online. (The Rust redeem command also
+      // promotes defensively; doing it here keeps the UI responsive without
+      // waiting for the next status poll.)
+      try {
+        await invoke<void>("set_runner_tier", { tier: "qontinui_account" });
+        window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+      } catch (tierErr) {
+        onLog("error", `Paired, but tier promotion failed: ${tierErr}`);
+      }
+
       // Refresh status so the UI picks up the new auth + ws state.
       void refreshStatus();
     } catch (err) {
@@ -396,7 +457,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       setPairCodeState({ state: "error", message: msg });
       onLog("error", `Pair-code redeem failed: ${msg}`);
     }
-  }, [pairCodeInput, onLog, refreshStatus]);
+  }, [pairCodeInput, formBackendUrl, onLog, refreshStatus]);
 
   const handleStartWebTokenFlow = useCallback(async () => {
     try {

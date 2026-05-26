@@ -35,12 +35,20 @@ interface AccountSettingsProps {
 
 type FlowState = "idle" | "opening" | "awaiting-browser" | "error";
 
+const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
+
 export function AccountSettings({ onLog }: AccountSettingsProps) {
   const { tier, loading: tierLoading, refresh: refreshTier } = useRunnerTier();
   const { authStatus, logout: clearAuthState } = useAuth();
   const [flowState, setFlowState] = useState<FlowState>("idle");
   const [flowError, setFlowError] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
+
+  // --- In-app (headless / UI-Bridge-drivable) credentials pairing ----------
+  const [credEmail, setCredEmail] = useState("");
+  const [credPassword, setCredPassword] = useState("");
+  const [credBackendUrl, setCredBackendUrl] = useState(DEFAULT_BACKEND_URL);
+  const [credState, setCredState] = useState<"idle" | "pairing">("idle");
 
   const isTier2 = tier === "qontinui_account";
 
@@ -75,6 +83,36 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       onLog("error", `Sign-in failed to start: ${msg}`);
     }
   }, [onLog]);
+
+  const handleCredentialsPair = useCallback(async () => {
+    const email = credEmail.trim();
+    const password = credPassword;
+    const backendUrl = credBackendUrl.trim();
+    if (!email || !password || !backendUrl) {
+      setFlowError("Email, password, and backend URL are all required.");
+      return;
+    }
+    setCredState("pairing");
+    setFlowError(null);
+    try {
+      const result = await invoke<{ userId: string; tenantId: string; deviceId: string }>(
+        "pair_with_credentials",
+        { email, password, backendUrl },
+      );
+      setCredPassword("");
+      // The Rust command already promoted the runner to Tier 2; nudge the
+      // tier consumers so the panel flips to the signed-in view immediately.
+      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+      await refreshTier();
+      onLog("success", `Paired with Qontinui account (user=${result.userId}) — Tier 2 active`);
+    } catch (err) {
+      const msg = typeof err === "string" ? err : String(err);
+      setFlowError(msg);
+      onLog("error", `Credentials pairing failed: ${msg}`);
+    } finally {
+      setCredState("idle");
+    }
+  }, [credEmail, credPassword, credBackendUrl, onLog, refreshTier]);
 
   const handleSignOut = useCallback(async () => {
     setSigningOut(true);
@@ -147,7 +185,18 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
           onSignOut={handleSignOut}
         />
       ) : (
-        <SignedOutPanel flowState={flowState} onSignIn={handleSignIn} />
+        <SignedOutPanel
+          flowState={flowState}
+          onSignIn={handleSignIn}
+          credEmail={credEmail}
+          credPassword={credPassword}
+          credBackendUrl={credBackendUrl}
+          credPairing={credState === "pairing"}
+          onCredEmailChange={setCredEmail}
+          onCredPasswordChange={setCredPassword}
+          onCredBackendUrlChange={setCredBackendUrl}
+          onCredentialsPair={handleCredentialsPair}
+        />
       )}
     </div>
   );
@@ -211,32 +260,134 @@ function SignedInPanel({ email, userId, name, signingOut, onSignOut }: SignedInP
 interface SignedOutPanelProps {
   flowState: FlowState;
   onSignIn: () => void;
+  credEmail: string;
+  credPassword: string;
+  credBackendUrl: string;
+  credPairing: boolean;
+  onCredEmailChange: (v: string) => void;
+  onCredPasswordChange: (v: string) => void;
+  onCredBackendUrlChange: (v: string) => void;
+  onCredentialsPair: () => void;
 }
 
-function SignedOutPanel({ flowState, onSignIn }: SignedOutPanelProps) {
+function SignedOutPanel({
+  flowState,
+  onSignIn,
+  credEmail,
+  credPassword,
+  credBackendUrl,
+  credPairing,
+  onCredEmailChange,
+  onCredPasswordChange,
+  onCredBackendUrlChange,
+  onCredentialsPair,
+}: SignedOutPanelProps) {
   const inFlight = flowState === "opening" || flowState === "awaiting-browser";
+  const credDisabled =
+    credPairing ||
+    credEmail.trim().length === 0 ||
+    credPassword.length === 0 ||
+    credBackendUrl.trim().length === 0;
 
   return (
-    <div className="space-y-3">
-      <button
-        type="button"
-        onClick={onSignIn}
-        disabled={inFlight}
-        className="inline-flex items-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-      >
-        {inFlight ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogIn className="w-4 h-4" />}
-        Sign in to Qontinui
-      </button>
+    <div className="space-y-5">
+      {/* In-app email/password pairing — headless, no browser, UI-Bridge
+          drivable. This is the primary path for automated / remote pairing. */}
+      <div className="space-y-3 rounded-lg border border-border bg-card/50 p-4">
+        <div>
+          <div className="text-sm font-medium">Sign in with email & password</div>
+          <div className="text-xs text-muted-foreground">
+            Pairs this runner directly — no browser needed. Promotes the runner to Tier 2.
+          </div>
+        </div>
 
-      {flowState === "awaiting-browser" && (
-        <p className="text-xs text-muted-foreground">
-          Complete the sign-in in your browser. This panel will update automatically when the
-          runner is paired.
-        </p>
-      )}
-      {flowState === "opening" && (
-        <p className="text-xs text-muted-foreground">Opening browser…</p>
-      )}
+        <div className="space-y-1.5">
+          <label htmlFor="account-cred-backend" className="text-xs font-medium">
+            Backend URL
+          </label>
+          <input
+            id="account-cred-backend"
+            type="url"
+            autoComplete="off"
+            spellCheck={false}
+            value={credBackendUrl}
+            onChange={(e) => onCredBackendUrlChange(e.target.value)}
+            placeholder="https://api.qontinui.io"
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
+          />
+        </div>
+
+        <div className="space-y-1.5">
+          <label htmlFor="account-cred-email" className="text-xs font-medium">
+            Email
+          </label>
+          <input
+            id="account-cred-email"
+            type="email"
+            autoComplete="off"
+            spellCheck={false}
+            value={credEmail}
+            onChange={(e) => onCredEmailChange(e.target.value)}
+            placeholder="you@example.com"
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
+          />
+        </div>
+
+        <div className="space-y-1.5">
+          <label htmlFor="account-cred-password" className="text-xs font-medium">
+            Password
+          </label>
+          <input
+            id="account-cred-password"
+            type="password"
+            autoComplete="new-password"
+            data-lpignore="true"
+            data-1p-ignore="true"
+            value={credPassword}
+            onChange={(e) => onCredPasswordChange(e.target.value)}
+            placeholder="••••••••"
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
+          />
+        </div>
+
+        <button
+          type="button"
+          onClick={onCredentialsPair}
+          disabled={credDisabled}
+          className="inline-flex items-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {credPairing ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <LogIn className="w-4 h-4" />
+          )}
+          {credPairing ? "Pairing…" : "Pair with credentials"}
+        </button>
+      </div>
+
+      {/* Browser SSO fallback. */}
+      <div className="space-y-3">
+        <div className="text-xs font-medium text-muted-foreground">Or use browser sign-in</div>
+        <button
+          type="button"
+          onClick={onSignIn}
+          disabled={inFlight}
+          className="inline-flex items-center gap-2 rounded bg-muted px-4 py-2 text-sm font-medium hover:bg-muted/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {inFlight ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogIn className="w-4 h-4" />}
+          Sign in to Qontinui
+        </button>
+
+        {flowState === "awaiting-browser" && (
+          <p className="text-xs text-muted-foreground">
+            Complete the sign-in in your browser. This panel will update automatically when the
+            runner is paired.
+          </p>
+        )}
+        {flowState === "opening" && (
+          <p className="text-xs text-muted-foreground">Opening browser…</p>
+        )}
+      </div>
     </div>
   );
 }

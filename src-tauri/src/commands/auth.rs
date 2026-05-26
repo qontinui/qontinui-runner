@@ -148,6 +148,19 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
 
 async fn login_impl(email: String, password: String) -> Result<LoginResponse, AppError> {
     require_tier_2()?;
+    login_impl_inner(email, password).await
+}
+
+/// Shared login body — performs the OAuth2 form login + `/users/me` fetch +
+/// token storage against [`get_api_base_url`].
+///
+/// Tier-gating is applied by the public `login` command (via `login_impl`).
+/// The bootstrap credentials-pairing path ([`pair_with_credentials`]) does
+/// NOT route through here — it logs in against an explicit `backend_url`
+/// (so a debug build can target prod) and is tier-ungated by design, closing
+/// the chicken-and-egg where `login` requires Tier 2 but reaching Tier 2
+/// requires logging in first.
+async fn login_impl_inner(email: String, password: String) -> Result<LoginResponse, AppError> {
     info!("Login attempt for email: {}", email);
 
     let auth_manager = AuthManager::new();
@@ -773,7 +786,15 @@ pub fn set_runner_tier(tier: String) -> Result<(), String> {
     // demotion out of it should let the refresher idle). The refresher's
     // `next_action` predicate already handles the tier branching; we
     // just need to wake it.
-    tokio::spawn(async {
+    //
+    // Use `tauri::async_runtime::spawn`, NOT `tokio::spawn`: this command is
+    // a *synchronous* `#[tauri::command]`, which Tauri invokes on a worker
+    // thread that does NOT carry an entered Tokio runtime context. A bare
+    // `tokio::spawn` there panics with "there is no reactor running" (a
+    // non-unwinding panic that aborts the whole process). The Tauri async
+    // runtime handle is always available and routes to the same Tokio
+    // runtime the relay/refresher live on.
+    tauri::async_runtime::spawn(async {
         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
         crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
     });
@@ -809,6 +830,186 @@ pub async fn start_qontinui_sign_in<R: Runtime>(
     // re-uses whatever is already persisted (or errors if nothing is).
     crate::commands::web_integration::start_web_token_flow(integration, health, app_handle, None)
         .await
+}
+
+/// Wire response for [`pair_with_credentials`]. Mirrors the redeem/pair
+/// confirmation shape so the FE can show a uniform "paired!" panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairWithCredentialsResponse {
+    pub user_id: String,
+    pub tenant_id: String,
+    pub device_id: String,
+}
+
+/// Headless, in-app email/password pairing — the non-browser, UI-Bridge-
+/// drivable cloud-pair path.
+///
+/// The only other cloud-pair entry points are the external-browser SSO
+/// (`start_qontinui_sign_in`) and a dashboard-minted pair code
+/// (`redeem_pair_code`). Neither is fully self-service from inside the app:
+/// SSO needs a human to click Confirm in a browser; the pair code needs a
+/// human to mint it on the dashboard first. This command closes that gap —
+/// given an email, password, and backend URL it logs in, mints a device
+/// JWT, persists it, and promotes the runner to Tier 2, all without leaving
+/// the app.
+///
+/// Flow:
+///   1. OAuth2 form login against `{backend_url}/api/v1/auth/jwt/login`
+///      (tier-ungated bootstrap — see [`login_bootstrap_impl`]).
+///   2. `GET /api/v1/auth/users/me` for the `user_id`.
+///   3. Resolve `tenant_id` from the login JWT's `tenant_id` claim.
+///   4. Device-pair via the existing `pair_with_auth_token_with_ids`
+///      (`POST {backend_url}/api/v1/devices/pair-cli`), which returns a
+///      coord-minted device JWT.
+///   5. Persist the device JWT + paired-user file, then promote the runner
+///      to Tier QontinuiAccount and kick the relay.
+///
+/// `backend_url` is required and explicit (NOT `get_api_base_url()`) so the
+/// caller can target prod from a debug build, where the default resolves to
+/// `http://127.0.0.1:8000`.
+#[tauri::command]
+pub async fn pair_with_credentials(
+    email: String,
+    password: String,
+    backend_url: String,
+) -> Result<PairWithCredentialsResponse, String> {
+    pair_with_credentials_impl(email, password, backend_url)
+        .await
+        .map_err(String::from)
+}
+
+async fn pair_with_credentials_impl(
+    email: String,
+    password: String,
+    backend_url: String,
+) -> Result<PairWithCredentialsResponse, AppError> {
+    use qontinui_runner_lib::pair::{
+        pair_with_auth_token_with_ids, persist_pairing, read_device_id_from_disk,
+        tenant_id_from_oauth_claim,
+    };
+
+    let base = backend_url.trim().trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return Err(AppError::Raw("backend_url is required".to_string()));
+    }
+    info!(
+        "pair_with_credentials: logging in {} against {}",
+        email, base
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| AppError::Raw(format!("Failed to create HTTP client: {e}")))?;
+
+    // 1. OAuth2 form login.
+    let form_data = [
+        ("username", email.as_str()),
+        ("password", password.as_str()),
+    ];
+    let login_resp = client
+        .post(format!("{base}/api/v1/auth/jwt/login"))
+        .form(&form_data)
+        .send()
+        .await?;
+    if !login_resp.status().is_success() {
+        let status = login_resp.status();
+        let body = login_resp.text().await.unwrap_or_default();
+        let msg = match status.as_u16() {
+            401 => "Invalid email or password".to_string(),
+            _ => format!(
+                "login failed ({status}): {}",
+                body.chars().take(200).collect::<String>()
+            ),
+        };
+        return Err(AppError::Raw(msg));
+    }
+    let api_login: ApiLoginResponse = login_resp.json().await?;
+    let access_token = api_login.access_token.clone();
+
+    // 2. Fetch user info for the user_id.
+    let me_resp = client
+        .get(format!("{base}/api/v1/auth/users/me"))
+        .bearer_auth(&access_token)
+        .send()
+        .await?;
+    if !me_resp.status().is_success() {
+        let status = me_resp.status();
+        return Err(AppError::Raw(format!("fetch user info failed: {status}")));
+    }
+    let user_info: ApiUserInfo = me_resp.json().await?;
+    let user_id = user_info.id.clone();
+
+    // Store the user tokens so subsequent tier-2 commands (refresh, ws
+    // token) can use them.
+    let auth_manager = AuthManager::new();
+    auth_manager.store_tokens(&access_token, &api_login.refresh_token)?;
+
+    // 3. Resolve tenant_id from the login JWT's claim. The pair-cli proxy
+    //    requires it in the body. If the backend's user JWT doesn't carry a
+    //    `tenant_id` claim, there's no runner-side way to recover it without
+    //    a prior browser pair — surface a clear, actionable error.
+    let tenant_id_str = tenant_id_from_oauth_claim(&access_token).ok_or_else(|| {
+        AppError::Raw(
+            "login succeeded but the user token carries no tenant_id claim — \
+             cannot device-pair via credentials. Use the browser sign-in or a \
+             dashboard pair code for the first pair."
+                .to_string(),
+        )
+    })?;
+    let tenant_id = uuid::Uuid::parse_str(tenant_id_str.trim())
+        .map_err(|e| AppError::Raw(format!("malformed tenant_id claim: {e}")))?;
+
+    // 4. Device identity from disk.
+    let device_id = read_device_id_from_disk()
+        .map_err(|e| AppError::Raw(format!("could not read device identity: {e}")))?;
+
+    // 5. Device-pair (blocking HTTP on a worker thread).
+    let base_b = base.clone();
+    let token_b = access_token.clone();
+    let device_b = device_id.clone();
+    let user_b = user_id.clone();
+    let pair_resp = tokio::task::spawn_blocking(move || {
+        pair_with_auth_token_with_ids(&base_b, &token_b, &device_b, &user_b, tenant_id)
+    })
+    .await
+    .map_err(|e| AppError::Raw(format!("device-pair task panicked: {e}")))?
+    .map_err(AppError::Raw)?;
+
+    // 6. Persist the device JWT + paired-user file.
+    persist_pairing(&pair_resp, tenant_id)
+        .map_err(|e| AppError::Raw(format!("persist pairing: {e}")))?;
+
+    // 7. Promote to Tier 2 + kick the relay (idempotent).
+    {
+        let mut s = settings::load_settings();
+        // Stage the backend so the relay + later Save see the right host.
+        if s.web_integration.backend_url.trim() != base {
+            s.web_integration.backend_url = base.clone();
+        }
+        s.web_integration.enabled = true;
+        s.qontinui_user_id = Some(user_id.clone());
+        s.tier = settings::RunnerTier::QontinuiAccount;
+        s.tier_initialized = true;
+        settings::save_settings(&s)
+            .map_err(|e| AppError::Raw(format!("persist tier promotion: {e}")))?;
+    }
+    tokio::spawn(async {
+        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+        crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+    });
+
+    let resp_device_id = pair_resp.device_id.clone().unwrap_or(device_id);
+    info!(
+        "pair_with_credentials: paired (user_id={user_id}, tenant_id={tenant_id_str}, device_id={resp_device_id}) — promoted to Tier 2"
+    );
+
+    Ok(PairWithCredentialsResponse {
+        user_id,
+        tenant_id: tenant_id_str,
+        device_id: resp_device_id,
+    })
 }
 
 /// Clears the runner token, drops the runner back to Tier 0/1, and kicks
@@ -896,6 +1097,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             get_runner_tier,
             set_runner_tier,
             start_qontinui_sign_in,
+            pair_with_credentials,
             qontinui_sign_out,
             device_jwt_present,
             kick_device_jwt_refresher_cmd,
