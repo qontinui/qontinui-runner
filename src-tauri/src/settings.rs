@@ -1220,6 +1220,22 @@ mod tier_tests {
         apply_tier_env_overlay(&mut s, "nope");
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);
     }
+
+    /// Only the primary runner (no instance name) may persist settings; every
+    /// non-primary runner shares the primary's settings.json and must not write
+    /// it — guards against the temp-runner tier-demotion footgun.
+    #[test]
+    fn only_primary_persists_settings() {
+        assert!(settings_persist_allowed(None), "primary must persist");
+        assert!(
+            !settings_persist_allowed(Some("test-19e6389622c-10")),
+            "temp/test runner must not persist to the shared file"
+        );
+        assert!(
+            !settings_persist_allowed(Some("named-9879-abc")),
+            "named secondary must not persist to the shared file"
+        );
+    }
 }
 
 // ============================================================================
@@ -1939,7 +1955,40 @@ pub(crate) fn migrate_tier_in_place(settings: &mut Settings) -> bool {
 }
 
 /// Save settings to file (atomic write to prevent corruption on crash)
+/// Whether THIS runner may persist to the shared `settings.json`.
+///
+/// Only the **primary** runner may write. Non-primary runners (temp/test and
+/// named secondaries) share the primary's settings file — `get_settings_path`
+/// resolves `dirs::config_dir()/com.qontinui.runner/settings.json` for every
+/// runner — so a non-primary write clobbers the primary's persisted state.
+/// The acute failure: a token-less temp runner's startup tier-migration
+/// (`migrate_tier_in_place`) infers `tier=local` and, if persisted, silently
+/// **demotes the primary runner to Tier 1** (observed 2026-05-26 — a
+/// `/manual-test-coord` temp runner persisted `tier=local` to the shared file).
+///
+/// Primary runners run without `QONTINUI_INSTANCE_NAME` (→ `instance_name ==
+/// None`); the supervisor sets it for every non-primary runner. Pure (takes the
+/// instance name) so it is unit-testable without mutating the process env.
+pub(crate) fn settings_persist_allowed(instance_name: Option<&str>) -> bool {
+    instance_name.is_none()
+}
+
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
+    // Guard the single persist choke point: a non-primary runner reads the
+    // shared settings.json (config inheritance) but must NEVER write it, or it
+    // corrupts the primary's state (see `settings_persist_allowed`). Session-
+    // only for non-primary; reads are unaffected. Returns Ok so callers (incl.
+    // the startup migrate-persist) treat it as a successful no-op.
+    if !settings_persist_allowed(crate::instance::instance_name().as_deref()) {
+        tracing::info!(
+            target: "settings",
+            "save_settings: non-primary runner — skipping write to shared settings.json \
+             (session-only; prevents clobbering the primary runner's persisted state, \
+             e.g. a tier-migration demotion)"
+        );
+        return Ok(());
+    }
+
     let path = get_settings_path()?;
     let contents = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
