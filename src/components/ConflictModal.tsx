@@ -10,7 +10,7 @@
  *
  *  - The runner only **notifies** that a conflict occurred (this file).
  *  - The **resolution UX** (two-sided ConflictRow + StealModal) lives
- *    on the dashboard at `demo.staging.qontinui.io/sessions/<id>`.
+ *    on the dashboard at `qontinui.io/sessions/<id>`.
  *
  * Why: the dashboard has cross-machine context (the other operator's
  * intent, started_at, file claims) that the runner does not. Keeping
@@ -75,7 +75,7 @@ interface ConflictEvent {
  * setting for dashboard-base-URL (Phase 7+ tenant/SSO work) the const
  * will become a setting read.
  */
-const DASHBOARD_BASE_URL = "https://demo.staging.qontinui.io";
+const DASHBOARD_BASE_URL = "https://qontinui.io";
 
 function dashboardUrlFor(conflict: ConflictEvent): string {
   // If we know the session id, open the session-detail panel directly;
