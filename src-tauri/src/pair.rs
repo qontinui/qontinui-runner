@@ -152,7 +152,12 @@ fn read_device_id() -> Result<String, String> {
 /// `auth_tokens.enc`) so the CLI bin and the GUI runner read the same
 /// file.
 pub(crate) fn paired_user_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("com.qontinui.runner").join("paired_user.json"))
+    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
+    Some(base.join("paired_user.json"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

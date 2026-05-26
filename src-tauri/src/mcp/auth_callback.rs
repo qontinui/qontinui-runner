@@ -344,7 +344,9 @@ fn promote_to_tier_2(token: &str) {
     }
 
     if mutated {
-        if let Err(e) = crate::settings::save_settings(&s) {
+        if crate::instance::is_secondary() {
+            warn!("promote_to_tier_2: secondary runner — applying in-memory only, skipping save_settings");
+        } else if let Err(e) = crate::settings::save_settings(&s) {
             warn!(
                 "runner_token_callback: failed to persist tier/setup_completed: {}",
                 e

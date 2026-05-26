@@ -1757,9 +1757,12 @@ fn default_app_mode() -> String {
 
 /// Get the settings file path in the app data directory
 fn get_settings_path() -> Result<PathBuf, String> {
-    let app_data_dir = dirs::config_dir()
-        .ok_or("Failed to get config directory")?
-        .join("com.qontinui.runner");
+    let app_data_dir = std::env::var("QONTINUI_CONFIG_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::config_dir().map(|d| d.join("com.qontinui.runner")))
+        .ok_or("Failed to get config directory")?;
 
     // Create directory if it doesn't exist
     if !app_data_dir.exists() {

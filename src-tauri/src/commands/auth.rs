@@ -903,7 +903,13 @@ pub fn set_runner_tier(tier: String) -> Result<(), String> {
     let mut s = settings::load_settings();
     s.tier = parsed;
     s.tier_initialized = true;
-    settings::save_settings(&s).map_err(|e| e.to_string())?;
+    if crate::instance::is_secondary() {
+        warn!(
+            "set_runner_tier: secondary runner — applying in-memory only, skipping save_settings"
+        );
+    } else {
+        settings::save_settings(&s).map_err(|e| e.to_string())?;
+    }
     // Kick both the relay (so it picks up the new tier without a runner
     // restart) and the device-JWT refresher (Phase 2 of unified-devices
     // — promotion into Tier 2 should trigger a JWT refresh check, and
@@ -1116,8 +1122,12 @@ async fn pair_with_credentials_impl(
         s.qontinui_user_id = Some(user_id.clone());
         s.tier = settings::RunnerTier::QontinuiAccount;
         s.tier_initialized = true;
-        settings::save_settings(&s)
-            .map_err(|e| AppError::Raw(format!("persist tier promotion: {e}")))?;
+        if crate::instance::is_secondary() {
+            warn!("pair_with_credentials: secondary runner — applying in-memory only, skipping save_settings");
+        } else {
+            settings::save_settings(&s)
+                .map_err(|e| AppError::Raw(format!("persist tier promotion: {e}")))?;
+        }
     }
     tokio::spawn(async {
         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
@@ -1165,11 +1175,17 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
     s.qontinui_user_id = None;
     s.tier = settings::RunnerTier::Local;
     s.tier_initialized = true;
-    settings::save_settings(&s).map_err(|e| {
-        let msg = format!("failed to persist sign-out: {}", e);
-        error!("qontinui_sign_out: {}", msg);
-        msg
-    })?;
+    if crate::instance::is_secondary() {
+        warn!(
+            "qontinui_sign_out: secondary runner — applying in-memory only, skipping save_settings"
+        );
+    } else {
+        settings::save_settings(&s).map_err(|e| {
+            let msg = format!("failed to persist sign-out: {}", e);
+            error!("qontinui_sign_out: {}", msg);
+            msg
+        })?;
+    }
 
     // Kick the relay — now that tier != QontinuiAccount, the cloud relay
     // task enters its idle-await-kick state and drops the WS.
