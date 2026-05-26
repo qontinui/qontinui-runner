@@ -733,22 +733,146 @@ pub fn spawn_headless_auto_login(launch_env: crate::launch_env::SharedLaunchEnv)
             return;
         }
 
-        // Already authenticated (webview path won the race, or a prior run)?
+        use qontinui_runner_lib::pair::{
+            pair_with_auth_token_with_ids, persist_pairing, read_device_id_from_disk,
+            tenant_id_from_oauth_claim,
+        };
+
+        // When the backend URL is explicitly overridden (e.g. a staging temp
+        // runner via extra_env), stored tokens from the shared settings.json
+        // likely target a different backend (the primary's localhost default).
+        // Force a fresh login+pair against the intended target.
+        let backend_override = std::env::var("QONTINUI_WEB_BACKEND_URL").is_ok();
+
         let auth_manager = AuthManager::new();
-        if auth_manager.has_tokens() {
-            info!("headless_auto_login: tokens already present — skipping");
+        let already_paired = dirs::data_local_dir()
+            .map(|d| {
+                d.join("com.qontinui.runner")
+                    .join("paired_user.json")
+                    .exists()
+            })
+            .unwrap_or(false);
+
+        // Phase 1: Login (skip if tokens already exist from a prior run,
+        // unless the backend was explicitly overridden).
+        let access_token;
+        let user_id;
+        if !backend_override && auth_manager.has_tokens() {
+            if already_paired {
+                info!("headless_auto_login: tokens + paired_user present — fully skipping");
+                return;
+            }
+            info!("headless_auto_login: tokens present but not paired — skipping login, will pair");
+            access_token = match auth_manager.get_access_token() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "headless_auto_login: could not retrieve stored token");
+                    return;
+                }
+            };
+            user_id = String::new();
+        } else {
+            let (email, password) = creds;
+            if backend_override {
+                info!(
+                    email = %email,
+                    "headless_auto_login: QONTINUI_WEB_BACKEND_URL set — forcing fresh login (stale tokens ignored)"
+                );
+            }
+            info!(email = %email, "headless_auto_login: attempting backend login");
+            let resp = match login_impl(email, password).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %String::from(e), "headless_auto_login: login failed");
+                    return;
+                }
+            };
+            info!(
+                user = %resp.user.id,
+                "headless_auto_login: login succeeded — attempting device pairing"
+            );
+            access_token = resp.access_token.clone();
+            user_id = resp.user.id.clone();
+        }
+
+        // Phase 2: Auto-pair — mint a device-JWT so the backend relay
+        // can register. The web backend's POST /api/v1/devices/pair-cli
+        // resolves tenant_id SERVER-SIDE; the runner only sends
+        // (device_id, hostname, name) + Bearer auth.
+
+        let device_id = match read_device_id_from_disk() {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "headless_auto_login: could not read device identity — skipping pairing"
+                );
+                return;
+            }
+        };
+
+        // POST pair-cli. tenant_id in the body is ignored by the web
+        // backend (PairCliRequest only has device_id/hostname/name);
+        // pass nil as a placeholder.
+        let base = get_api_base_url();
+        let base_c = base.clone();
+        let token_c = access_token.clone();
+        let device_c = device_id.clone();
+        let user_c = user_id.clone();
+        let pair_result = match tokio::task::spawn_blocking(move || {
+            pair_with_auth_token_with_ids(&base_c, &token_c, &device_c, &user_c, uuid::Uuid::nil())
+        })
+        .await
+        {
+            Ok(inner) => inner,
+            Err(join_err) => {
+                warn!(
+                    error = %join_err,
+                    "headless_auto_login: pair task join failed — skipping pairing"
+                );
+                return;
+            }
+        };
+
+        let pair_resp = match pair_result {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "headless_auto_login: device-pair POST failed — skipping pairing"
+                );
+                return;
+            }
+        };
+
+        // Extract the real tenant_id from the coord-minted device-JWT
+        // (the response token carries it, unlike the user OAuth token).
+        let tenant_id = tenant_id_from_oauth_claim(&pair_resp.token)
+            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+            .unwrap_or(uuid::Uuid::nil());
+
+        if let Err(e) = persist_pairing(&pair_resp, tenant_id) {
+            warn!(
+                error = %e,
+                "headless_auto_login: persist pairing failed — device-JWT not stored"
+            );
             return;
         }
 
-        let (email, password) = creds;
-        info!(email = %email, "headless_auto_login: attempting backend login");
-        match login_impl(email, password).await {
-            Ok(resp) => info!(
-                user = %resp.user.id,
-                "headless_auto_login: login succeeded — device-JWT mint + heartbeat can proceed"
-            ),
-            Err(e) => warn!(error = %String::from(e), "headless_auto_login: login failed"),
-        }
+        let resp_device_id = pair_resp.device_id.as_deref().unwrap_or(device_id.as_str());
+        info!(
+            user = %user_id,
+            device = %resp_device_id,
+            tenant = %tenant_id,
+            "headless_auto_login: device paired + JWT persisted"
+        );
+
+        // Kick the relay + JWT refresher so they pick up the fresh
+        // device-JWT without waiting for the next poll cycle.
+        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+        crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+
+        info!("headless_auto_login: relay + refresher kicked — auto-pair complete");
     });
 }
 
