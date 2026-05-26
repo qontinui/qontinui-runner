@@ -1805,6 +1805,14 @@ pub fn create_router(
     #[cfg(any(debug_assertions, feature = "test-fixtures"))]
     let base_router = base_router.merge(crate::mcp::test_fixtures::routes());
 
+    // Canonical JSON 404 for unmatched routes. axum's default fallback returns
+    // an empty body with no Content-Type, which both breaks the canonical
+    // envelope contract and trips the debug envelope_audit layer (it sees a
+    // non-application/json 4xx and panics). Returning the envelope here keeps
+    // the error shape universal — route-not-found included — and is the JSON
+    // the audit expects.
+    let base_router = base_router.fallback(not_found_handler);
+
     // Layer ordering (`.layer()` is bottom-up — last call = outermost):
     //
     //   [CatchPanicLayer]              ← outermost: panics → 500 JSON
@@ -1862,6 +1870,22 @@ pub fn create_router(
 /// The panic payload is `Box<dyn Any + Send>`; downcast to the two common
 /// concrete types (`&'static str` from `panic!("literal")` and `String` from
 /// `panic!("{}", x)`) and fall back to a generic message otherwise.
+/// Canonical JSON 404 handler for unmatched routes. See the `.fallback(...)`
+/// call in `build_router` for why this exists (envelope universality + the
+/// debug envelope_audit layer).
+async fn not_found_handler(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let body = crate::mcp::types::ApiResponse::<()>::error_with_code(
+        format!("No route for {} {}", method, uri.path()),
+        "NOT_FOUND",
+    );
+    (axum::http::StatusCode::NOT_FOUND, axum::Json(body)).into_response()
+}
+
 fn runner_panic_handler(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
     use axum::response::IntoResponse;
 
