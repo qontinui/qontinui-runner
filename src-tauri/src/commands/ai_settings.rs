@@ -1122,7 +1122,16 @@ pub async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
     // error rather than a swallowed "couldn't refresh."
     let creds_path = std::path::PathBuf::from(&config_dir).join(".credentials.json");
     if is_oauth_token_expired(&creds_path) {
-        let _ = crate::ai_provider::oauth_refresh::try_refresh_credentials(&creds_path);
+        // try_refresh_credentials uses reqwest::blocking::Client internally.
+        // Calling it directly from async context panics ("Cannot drop a runtime
+        // in a context where blocking is not allowed"), so offload to a blocking
+        // thread. Refresh failure is non-fatal — we still probe with whatever
+        // token we have.
+        let creds_for_refresh = creds_path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::ai_provider::oauth_refresh::try_refresh_credentials(&creds_for_refresh)
+        })
+        .await;
     }
 
     let token = match read_oauth_token(&config_dir) {
