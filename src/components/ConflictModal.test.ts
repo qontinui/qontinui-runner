@@ -31,11 +31,11 @@ describe("ConflictModal toast contract (Phase 6 tripwires)", () => {
     // Phase 6 §D9: the runner's conflict notification is a toast that
     // opens the dashboard for resolution. The URL is staging until
     // tenant/SSO work lands a per-tenant dashboard-base setting.
-    const base = "https://demo.staging.qontinui.io";
+    const base = "https://qontinui.io";
     const sessionId = "11111111-1111-1111-1111-111111111111";
     const expected = `${base}/sessions/${sessionId}`;
     expect(expected).toBe(
-      "https://demo.staging.qontinui.io/sessions/" +
+      "https://qontinui.io/sessions/" +
         "11111111-1111-1111-1111-111111111111"
     );
   });

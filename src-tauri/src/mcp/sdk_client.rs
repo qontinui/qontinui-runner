@@ -1049,7 +1049,7 @@ async fn handle_element(
 ///
 /// - `task_run_id` - persistence correlation for the audit event.
 /// - `tab_id` / `target_tab_id` - per-tab routing (UI Bridge Item #4). When a
-///   single relay (e.g. qontinui-web's dashboard at demo.staging.qontinui.io)
+///   single relay (e.g. qontinui-web's dashboard at qontinui.io)
 ///   has more than one browser tab connected - two operator machines each
 ///   driving a headless tab - the relay's default dispatch routes to
 ///   `primaryTabId`, which flips to whichever tab registered most recently.

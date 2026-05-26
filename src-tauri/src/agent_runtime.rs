@@ -173,7 +173,7 @@ fn coord_http_base() -> Option<String> {
 /// normalizing the scheme to `ws://` / `wss://`.
 ///
 /// The profile's `coord_url` is frequently configured as an HTTP(S) base
-/// (e.g. `https://coord.staging.qontinui.io`, mirrored from the API base)
+/// (e.g. `https://coord.qontinui.io`, mirrored from the API base)
 /// rather than a WS endpoint. Passing an `https://` URL straight to
 /// `tokio_tungstenite::connect_async` fails with `URL scheme not supported`
 /// (the agent_runtime WS-pump error seen on staging). Convert

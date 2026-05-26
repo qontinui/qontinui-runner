@@ -831,8 +831,8 @@ mod tests {
             "ws://localhost:9870/ws?pattern=qontinui.sessions.%2A"
         );
         assert_eq!(
-            coord_ws_url("https://coord.staging.qontinui.io/"),
-            "wss://coord.staging.qontinui.io/ws?pattern=qontinui.sessions.%2A"
+            coord_ws_url("https://coord.qontinui.io/"),
+            "wss://coord.qontinui.io/ws?pattern=qontinui.sessions.%2A"
         );
     }
 
