@@ -1220,6 +1220,28 @@ mod tier_tests {
         apply_tier_env_overlay(&mut s, "nope");
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);
     }
+
+    /// FOOTGUN GUARD: a supervisor-spawned temp/named runner (secondary) must
+    /// NEVER persist a tier/local_user_id migration to the shared
+    /// settings.json — doing so would infer `tier=Local` (no runner_token) and
+    /// clobber the primary's persisted Tier 2 state. Only the primary may
+    /// persist. `should_persist_migration` encodes that decision.
+    #[test]
+    fn secondary_runner_must_not_persist_migration() {
+        // Secondary with a pending migration: persist is suppressed.
+        assert!(
+            !should_persist_migration(true, /* is_secondary = */ true),
+            "a secondary runner must never persist a migration to the shared settings.json"
+        );
+        // Primary with a pending migration: persist proceeds.
+        assert!(
+            should_persist_migration(true, /* is_secondary = */ false),
+            "the primary runner must persist its tier/local_user_id migration"
+        );
+        // Nothing to persist: never persist, regardless of runner kind.
+        assert!(!should_persist_migration(false, false));
+        assert!(!should_persist_migration(false, true));
+    }
 }
 
 // ============================================================================
@@ -1839,6 +1861,20 @@ pub fn load_settings() -> Settings {
     // Both branches may mutate the in-memory `settings` and request a
     // persist. The persist is best-effort (logged on failure) — an in-memory
     // value is still correct for the rest of this process's lifetime.
+    //
+    // FOOTGUN GUARD: the persist below writes the SHARED settings.json
+    // (`dirs::config_dir()/com.qontinui.runner/settings.json` — the same file
+    // for primary + temp + named runners; `get_settings_path` is NOT
+    // instance-scoped). A supervisor-spawned temp/named runner has no
+    // `runner_token`, so `migrate_tier_in_place` infers `tier=Local` for it.
+    // If that secondary persisted, it would silently overwrite the primary's
+    // persisted Tier 2 (`qontinui_account`) state on disk, demoting the primary
+    // the next time it loads from `local`. Therefore: ONLY the primary runner
+    // may persist a tier/local_user_id migration. Secondaries (temp + named,
+    // i.e. any runner the supervisor launched with `QONTINUI_INSTANCE_NAME`)
+    // keep the migration in-memory only — correct for this process's lifetime,
+    // never written to the shared file. This mirrors the in-memory-only
+    // `QONTINUI_RUNNER_TIER` overlay just below.
     let mut needs_persist = false;
     if migrate_tier_in_place(&mut settings) {
         needs_persist = true;
@@ -1847,7 +1883,17 @@ pub fn load_settings() -> Settings {
         settings.local_user_id = uuid::Uuid::new_v4().to_string();
         needs_persist = true;
     }
-    if needs_persist {
+    let is_secondary = crate::instance::is_secondary();
+    if needs_persist && is_secondary {
+        info!(
+            "Skipping tier/local_user_id migration persist for secondary runner \
+             (instance={:?}) — would clobber the primary's shared settings.json; \
+             keeping the migration in-memory only (tier={:?})",
+            crate::instance::instance_name(),
+            settings.tier
+        );
+    }
+    if should_persist_migration(needs_persist, is_secondary) {
         if let Err(e) = save_settings(&settings) {
             error!("Failed to persist tier/local_user_id migration: {}", e);
         } else {
@@ -1936,6 +1982,23 @@ pub(crate) fn migrate_tier_in_place(settings: &mut Settings) -> bool {
     }
     settings.tier_initialized = true;
     true
+}
+
+/// Decide whether a pending tier/local_user_id migration may be persisted to
+/// the SHARED settings.json.
+///
+/// Returns `true` only when there is something to persist (`needs_persist`)
+/// AND the runner is the primary (`!is_secondary`). A secondary (temp or
+/// named — any supervisor-launched runner with `QONTINUI_INSTANCE_NAME`) must
+/// never write the shared file, because `migrate_tier_in_place` infers
+/// `tier=Local` for it (no `runner_token`), which would silently demote the
+/// primary's persisted Tier 2 state on disk. See the FOOTGUN GUARD comment in
+/// `load_settings`.
+///
+/// Pure helper (no env / no IO) so the guard can be unit-tested without
+/// mutating process env or touching the real settings file.
+pub(crate) fn should_persist_migration(needs_persist: bool, is_secondary: bool) -> bool {
+    needs_persist && !is_secondary
 }
 
 /// Save settings to file (atomic write to prevent corruption on crash)
