@@ -7,8 +7,9 @@
 //!    per spec, all sharing the same `snapshot_id`. This test runs in-process
 //!    (no PG, no HTTP) and is NOT gated — `cargo test` runs it by default.
 //!
-//! 2. **Event broadcast.** Construct and round-trip `SpecApiEvent::SpecCheckInvoked`
-//!    + `SpecCheckCompleted` through an in-process `std::sync::mpsc` channel,
+//! 2. **Event broadcast.** Construct and round-trip
+//!    `SpecApiEvent::SpecCheckInvoked` and `SpecCheckCompleted` through an
+//!    in-process `std::sync::mpsc` channel,
 //!    verifying both the enum shape and the `snapshot_id` join key. The real
 //!    `spec_api::events::subscribe()` path lives in the runner binary
 //!    (`src-tauri/src/spec_api/events.rs`) and the matching `POST /spec-check`

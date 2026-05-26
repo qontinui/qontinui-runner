@@ -191,6 +191,7 @@ pub fn arbitrary_spec() -> impl Strategy<Value = IrPageSpec> {
         transitions: Vec::new(),
         synthesized_groups: None,
         initial_state: None,
+        api_assertions: None,
     })
 }
 
