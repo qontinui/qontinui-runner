@@ -770,7 +770,12 @@ pub async fn redeem_pair_code(
         if s.tier != settings::RunnerTier::QontinuiAccount {
             s.tier = settings::RunnerTier::QontinuiAccount;
             s.tier_initialized = true;
-            if let Err(e) = settings::save_settings(&s) {
+            if crate::instance::is_secondary() {
+                warn!("redeem_pair_code: secondary runner — applying in-memory only, skipping save_settings");
+                crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+                crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+                info!("redeem_pair_code: promoted runner to Tier QontinuiAccount + kicked relay");
+            } else if let Err(e) = settings::save_settings(&s) {
                 warn!("redeem_pair_code: tier promotion persist failed (continuing): {e}");
             } else {
                 crate::mcp::backend_relay::commands::kick_cloud_relay().await;
