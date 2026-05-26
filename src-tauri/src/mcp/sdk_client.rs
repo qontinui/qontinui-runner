@@ -2247,7 +2247,7 @@ async fn handle_windows(
 async fn handle_tabs(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Json<ApiResponse<serde_json::Value>> {
     let truthy = |v: &String| {
         let s = v.trim();
         s == "1" || s.eq_ignore_ascii_case("true")
@@ -2264,9 +2264,13 @@ async fn handle_tabs(
     } else {
         format!("/tabs?{}", parts.join("&"))
     };
+    // Wrap in the canonical `ApiResponse` envelope like every sibling
+    // `/ui-bridge/sdk/*` handler (e.g. `handle_windows`) so the
+    // `envelope_audit` layer doesn't trip on a bare value, and callers see a
+    // uniform `{ success, data | error }` shape.
     match sdk_request(&state, Method::GET, &path, None).await {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Ok(data) => Json(ApiResponse::success(data)),
+        Err(e) => Json(ApiResponse::error(e)),
     }
 }
 

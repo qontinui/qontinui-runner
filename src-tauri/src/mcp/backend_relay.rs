@@ -185,13 +185,38 @@ async fn web_integration_status_handler(
     axum::response::Json(web_integration_status(&state).await)
 }
 
-/// Router exposing the relay's web-integration diagnostic endpoint. Merged
-/// into the base router in `mcp_api::start_server`.
+/// `POST /web-integration/relay/kick` — force the WS relay to interrupt any
+/// in-progress backoff sleep and immediately retry a connect with
+/// freshly-read settings + tokens.
+///
+/// The relay reconnects on its own exponential backoff (2s → 120s), so after
+/// a fresh pair (which DOES kick internally via `redeem_pair_code`) or any
+/// out-of-band credential change there's otherwise no way to force an
+/// immediate reconnect without a UI action or a runner restart. This endpoint
+/// pokes the same kick channel the in-process callers use
+/// ([`commands::kick_cloud_relay`]). It's a no-op (still returns ack) when no
+/// relay task is running. Local-only + unauthenticated, consistent with the
+/// rest of the runner's localhost-bound API surface.
+async fn relay_kick_handler() -> axum::response::Json<Value> {
+    commands::kick_cloud_relay().await;
+    axum::response::Json(serde_json::json!({
+        "ok": true,
+        "kicked": true,
+    }))
+}
+
+/// Router exposing the relay's web-integration diagnostic + control
+/// endpoints. Merged into the base router in `mcp_api::start_server`.
 pub fn routes() -> axum::Router<Arc<ApiState>> {
-    axum::Router::new().route(
-        "/web-integration/status",
-        axum::routing::get(web_integration_status_handler),
-    )
+    axum::Router::new()
+        .route(
+            "/web-integration/status",
+            axum::routing::get(web_integration_status_handler),
+        )
+        .route(
+            "/web-integration/relay/kick",
+            axum::routing::post(relay_kick_handler),
+        )
 }
 
 /// Return true iff `e` is a tungstenite handshake error with HTTP 401
