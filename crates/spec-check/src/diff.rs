@@ -685,6 +685,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn elem(
         id: &str,
         selector: &str,

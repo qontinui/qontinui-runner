@@ -204,6 +204,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn el(
         element_type: &str,
         tag: Option<&str>,

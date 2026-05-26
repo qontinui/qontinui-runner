@@ -325,6 +325,53 @@ fn max_f32(a: f32, b: f32) -> f32 {
     }
 }
 
+// ===========================================================================
+// Misc utilities (private to crate, but `pub(crate)` so evaluator can reuse)
+// ===========================================================================
+
+/// Intersect two slice-views of `ElementIdx`, returning the elements that
+/// appear in both. Linear in `|a| + |b|` after a copy + sort of `b`
+/// (typically `b` is the role hit list — small constant factors).
+pub(crate) fn intersect_sorted_unique(a: &[ElementIdx], b: &[ElementIdx]) -> Vec<ElementIdx> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    // Both posting lists are produced in insertion-order (the natural
+    // element index order) by `IndexedSnapshot::new`, so they're already
+    // sorted ascending — verify defensively before two-pointer merge.
+    let sorted_a = is_sorted(a);
+    let sorted_b = is_sorted(b);
+
+    if sorted_a && sorted_b {
+        let mut out = Vec::with_capacity(a.len().min(b.len()));
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Equal => {
+                    if out.last() != Some(&a[i]) {
+                        out.push(a[i]);
+                    }
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+        out
+    } else {
+        let set: std::collections::HashSet<ElementIdx> = a.iter().copied().collect();
+        let mut out: Vec<ElementIdx> = b.iter().copied().filter(|x| set.contains(x)).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+fn is_sorted(v: &[ElementIdx]) -> bool {
+    v.windows(2).all(|w| w[0] <= w[1])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,51 +1030,4 @@ mod tests {
             prop_assert_eq!(score_text(&text, &el.text), 1.0);
         }
     }
-}
-
-// ===========================================================================
-// Misc utilities (private to crate, but `pub(crate)` so evaluator can reuse)
-// ===========================================================================
-
-/// Intersect two slice-views of `ElementIdx`, returning the elements that
-/// appear in both. Linear in `|a| + |b|` after a copy + sort of `b`
-/// (typically `b` is the role hit list — small constant factors).
-pub(crate) fn intersect_sorted_unique(a: &[ElementIdx], b: &[ElementIdx]) -> Vec<ElementIdx> {
-    if a.is_empty() || b.is_empty() {
-        return Vec::new();
-    }
-    // Both posting lists are produced in insertion-order (the natural
-    // element index order) by `IndexedSnapshot::new`, so they're already
-    // sorted ascending — verify defensively before two-pointer merge.
-    let sorted_a = is_sorted(a);
-    let sorted_b = is_sorted(b);
-
-    if sorted_a && sorted_b {
-        let mut out = Vec::with_capacity(a.len().min(b.len()));
-        let (mut i, mut j) = (0, 0);
-        while i < a.len() && j < b.len() {
-            match a[i].cmp(&b[j]) {
-                std::cmp::Ordering::Equal => {
-                    if out.last() != Some(&a[i]) {
-                        out.push(a[i]);
-                    }
-                    i += 1;
-                    j += 1;
-                }
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
-            }
-        }
-        out
-    } else {
-        let set: std::collections::HashSet<ElementIdx> = a.iter().copied().collect();
-        let mut out: Vec<ElementIdx> = b.iter().copied().filter(|x| set.contains(x)).collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-}
-
-fn is_sorted(v: &[ElementIdx]) -> bool {
-    v.windows(2).all(|w| w[0] <= w[1])
 }

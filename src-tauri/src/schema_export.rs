@@ -84,6 +84,22 @@ pub fn export_all_schemas() -> Value {
     // delete-only diff against the checked-in TS files.
     add!("UiBridgeRequestEnvelope", qae::UiBridgeRequestEnvelope);
     add!("UiBridgeResponseEnvelope", qae::UiBridgeResponseEnvelope);
+    // HTTP UI-Bridge surface envelopes (qontinui-web Next.js `/api/ui-bridge/*`
+    // proxy). Distinct from the WS/relay `UiBridgeResponseEnvelope` above —
+    // these lack `requestId`/`type`/`timestamp` and model the proxy's
+    // structured 503 error body + the SDK's `/health` success body. They are
+    // the source-of-truth for the Spec-CI `conforms_to` C1 checks on
+    // qontinui-web's `ui-bridge-states` page spec. The nested `*HealthData` /
+    // `*HealthAppInfo` structs are registered as top-level types so they get
+    // their own per-type TS / Python files (same pattern as `CanvasPanel`).
+    // See the doc comments in `qontinui-schemas/rust/src/app_events.rs`.
+    add!("UiBridgeHttpErrorEnvelope", qae::UiBridgeHttpErrorEnvelope);
+    add!(
+        "UiBridgeHttpHealthEnvelope",
+        qae::UiBridgeHttpHealthEnvelope
+    );
+    add!("UiBridgeHttpHealthData", qae::UiBridgeHttpHealthData);
+    add!("UiBridgeHttpHealthAppInfo", qae::UiBridgeHttpHealthAppInfo);
 
     // ── qontinui-types: ai_workflows ──
     add!("ExecutionStep", qaw::ExecutionStep);
@@ -785,7 +801,7 @@ mod tests {
             obj.contains_key("SpecApiEvent"),
             "Missing SpecApiEvent schema (Plan 06)"
         );
-        assert_eq!(obj.len(), 495, "Expected 495 schema entries");
+        assert_eq!(obj.len(), 499, "Expected 499 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
