@@ -509,6 +509,14 @@ async fn relay_loop(
                 let state_outbound = api_state.clone();
                 let state_heartbeat = api_state.clone();
                 let mut shutdown_clone = shutdown_rx.clone();
+                // Clone the kick receiver so an established connection can be
+                // torn down on a kick (settings change / tier demotion /
+                // sign-out). Without this arm the connected select only ends
+                // when the connection dies on its own, so a `kick_cloud_relay()`
+                // from `set_runner_tier(local)` would NOT idle a live relay —
+                // `ws_connected` would stay true long after tier dropped to
+                // Local. Re-looping re-evaluates `should_relay_idle`.
+                let mut kick_clone = kick_rx.clone();
 
                 // Shared "last inbound frame at" epoch-ms, updated by the
                 // inbound handler on every received frame (Text, Ping, Pong,
@@ -536,6 +544,16 @@ async fn relay_loop(
                         info!("Backend relay received shutdown signal");
                         mark_disconnected(&api_state).await;
                         return;
+                    }
+                    _ = kick_clone.changed() => {
+                        info!(
+                            "Backend relay kicked while connected — tearing down \
+                             connection to re-evaluate idle gate (tier/enabled/JWT)"
+                        );
+                        mark_disconnected(&api_state).await;
+                        backoff_ms = 2000;
+                        consecutive_quick_disconnects = 0;
+                        continue;
                     }
                 }
 
