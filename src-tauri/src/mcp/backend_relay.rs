@@ -642,7 +642,9 @@ where
 {
     let port = api_state.app_state.api_port.load(Ordering::Relaxed);
     let instance_name = crate::instance::instance_name();
-    let hostname = crate::fleet::canonical_hostname();
+    let hostname = hostname::get()
+        .ok()
+        .map(|h| h.to_string_lossy().to_string());
 
     // Capabilities are static for now; the runner does GUI automation +
     // accessibility + Restate-style durable execution. Future work can

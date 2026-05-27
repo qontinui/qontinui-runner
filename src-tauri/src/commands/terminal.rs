@@ -25,6 +25,9 @@ pub fn terminal_create(
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> Result<CommandResponse, String> {
+    let repo_detect_handle = app_handle.clone();
+    let repo_detect_dir = working_dir.clone();
+    let cred_helper_dir = working_dir.clone();
     let info = terminal_manager.create(
         title.clone(),
         working_dir.clone(),
@@ -34,13 +37,11 @@ pub fn terminal_create(
         app_handle,
     )?;
 
-    // Plan §Phase 10 dual-write (DORMANT by default). When the tenant's
-    // `session_coordination_enabled` flag is flipped on, also register a
-    // coord-native mirror of this PTY so the dashboard renders it from
-    // `coord.sessions`. With the flag OFF — the default — this is a
-    // no-op: `mirror_legacy_session` returns immediately without touching
-    // the registry, the outbox, or coord, so the legacy terminal path
-    // behaves exactly as it does today (zero prod behavior change).
+    // Unconditional coord registration — every terminal session is
+    // mirrored into the coordinator's session plane so the dashboard
+    // renders it from `coord.sessions`. This is NOT gated by dual-write;
+    // registration is always-on. Errors are logged and swallowed so a
+    // coord hiccup never blocks the operator's terminal.
     let purpose = title
         .filter(|t| t.trim().len() >= 3)
         .unwrap_or_else(|| "Terminal shell session".to_string());
@@ -53,13 +54,48 @@ pub fn terminal_create(
             .map(std::path::PathBuf::from)
             .into_iter()
             .collect(),
-        share_output: false,
+        share_output: true,
         redact_secrets: None,
     };
-    let _mirror_id = session_registry
-        .inner()
-        .coord_sync()
-        .mirror_legacy_session(session_registry.inner(), intent);
+    let mut coord_session_id: Option<uuid::Uuid> = None;
+    match session_registry.inner().register_external(intent) {
+        Ok(coord_id) => {
+            coord_session_id = Some(coord_id);
+            // Store the coord session id on the terminal so close can clean up.
+            if let Some(session) = terminal_manager.get(&info.id) {
+                session.set_coord_session_id(coord_id);
+                // Attach the output pipe so PTY output streams to coord.
+                let rx = session.subscribe_output();
+                session_registry
+                    .inner()
+                    .attach_output_pipe(coord_id, rx, true);
+            }
+            info!(
+                terminal_id = %info.id,
+                coord_session = %coord_id,
+                "terminal_create: registered coord session"
+            );
+        }
+        Err(e) => {
+            warn!(
+                terminal_id = %info.id,
+                error = %e,
+                "terminal_create: coord session registration failed — terminal unaffected"
+            );
+        }
+    }
+
+    tokio::spawn(async move {
+        crate::repo_detection::check_and_emit_unregistered(repo_detect_handle, repo_detect_dir)
+            .await;
+    });
+
+    if let (Some(dir), Some(sid)) = (cred_helper_dir, coord_session_id) {
+        let session_id_str = sid.to_string();
+        tokio::spawn(async move {
+            crate::credential_helper::setup_credential_helper(&dir, &session_id_str).await;
+        });
+    }
 
     Ok(CommandResponse {
         success: true,
@@ -161,13 +197,31 @@ pub fn terminal_resize(
 #[tauri::command]
 pub async fn terminal_close(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    session_registry: tauri::State<'_, Arc<SessionRegistry>>,
     terminal_id: String,
 ) -> Result<CommandResponse, String> {
+    // Capture the coord session id BEFORE close destroys the terminal.
+    let coord_id = terminal_manager
+        .get(&terminal_id)
+        .and_then(|s| s.coord_session_id());
+
     let manager = terminal_manager.inner().clone();
     let id = terminal_id.clone();
     tokio::task::spawn_blocking(move || manager.close(&id))
         .await
         .map_err(|e| String::from(AppError::ProcessError(format!("Join error: {}", e))))??;
+
+    // Close the coord mirror — fire-and-forget on error.
+    if let Some(coord_id) = coord_id {
+        if let Err(e) = session_registry.inner().close_by_id(coord_id) {
+            warn!(
+                terminal_id = %terminal_id,
+                coord_session = %coord_id,
+                error = %e,
+                "terminal_close: coord session close failed"
+            );
+        }
+    }
 
     Ok(CommandResponse {
         success: true,

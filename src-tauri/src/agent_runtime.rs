@@ -170,29 +170,30 @@ fn coord_http_base() -> Option<String> {
 }
 
 /// Resolve the coord WS URL from the active profile's `coord_url`,
-/// normalizing the scheme to `ws://` / `wss://` and appending the
-/// `/ws` path with an `events.agent.*` pattern filter.
+/// normalizing the scheme to `ws://` / `wss://`.
 ///
-/// Mirrors `session::handoff::coord_ws_url` which appends
-/// `/ws?pattern=qontinui.sessions.*`. The coord `/ws` endpoint is a
-/// Redis pub/sub bridge at the `/ws` path (not the root); connecting to
-/// the root returns 401 from the ALB.
-fn coord_ws_url(device_id: uuid::Uuid) -> Option<String> {
+/// The profile's `coord_url` is frequently configured as an HTTP(S) base
+/// (e.g. `https://coord.qontinui.io`, mirrored from the API base)
+/// rather than a WS endpoint. Passing an `https://` URL straight to
+/// `tokio_tungstenite::connect_async` fails with `URL scheme not supported`
+/// (the agent_runtime WS-pump error seen on staging). Convert
+/// `https://`→`wss://` and `http://`→`ws://`; leave an already-WS scheme as-is.
+/// Mirrors the converter in `session::handoff::coord_ws_url`.
+fn coord_ws_url() -> Option<String> {
     let coord_url = qontinui_runner_lib::profiles::load_strict()
         .ok()?
         .coord_url?;
-    let base = coord_url.trim().trim_end_matches('/');
-    let ws_base = base
+    let trimmed = coord_url.trim();
+    let ws = trimmed
         .strip_prefix("https://")
         .map(|rest| format!("wss://{rest}"))
         .or_else(|| {
-            base.strip_prefix("http://")
+            trimmed
+                .strip_prefix("http://")
                 .map(|rest| format!("ws://{rest}"))
         })
-        .unwrap_or_else(|| base.to_string());
-    Some(format!(
-        "{ws_base}/ws?pattern=events.agent.spawn_requested.{device_id}"
-    ))
+        .unwrap_or_else(|| trimmed.to_string());
+    Some(ws)
 }
 
 /// Read `~/.qontinui/machine.json` → device_id. Falls back to None.
@@ -257,7 +258,7 @@ pub fn spawn_runtime() {
 /// `run_agent_subprocess` in its own task. Reconnects with capped
 /// exponential backoff.
 async fn subscribe_to_spawn_requests(device_id: uuid::Uuid) -> anyhow::Result<()> {
-    let ws_url = match coord_ws_url(device_id) {
+    let ws_url = match coord_ws_url() {
         Some(u) => u,
         None => {
             warn!("agent_runtime: no coord_url; subscriber loop exiting");
@@ -286,15 +287,28 @@ async fn subscribe_to_spawn_requests(device_id: uuid::Uuid) -> anyhow::Result<()
 /// Single connect-and-pump iteration: opens the WS, listens for events,
 /// dispatches spawn-requests. Returns on disconnect.
 ///
-/// Coord's `/ws` endpoint is a Redis pub/sub bridge; the pattern filter
-/// is set via the `?pattern=` query param at upgrade time (client-sent
-/// Text frames are silently ignored). The URL already carries the
-/// device-scoped pattern from [`coord_ws_url`].
+/// The coord WS surface broadcasts every Redis channel that matches a
+/// subscriber's filter; we use the simple "send subject filter on
+/// connect" protocol that coord's `ws::upgrade` accepts.
 async fn connect_and_pump(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url).await?;
-    info!("agent_runtime: WS connected for device_id={device_id}");
+
+    // Subscribe to this device's spawn-request channel + lifecycle
+    // channel. Coord's WS upgrade accepts a JSON subscribe frame; the
+    // implementation may also support automatic-fanout-by-prefix.
+    let sub = serde_json::json!({
+        "type": "subscribe",
+        "channels": [
+            format!("events.agent.spawn_requested.{device_id}"),
+        ],
+    });
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        sub.to_string().into(),
+    ))
+    .await?;
+    info!("agent_runtime: WS subscribed for device_id={device_id}");
 
     while let Some(msg) = ws.next().await {
         let msg = match msg {
