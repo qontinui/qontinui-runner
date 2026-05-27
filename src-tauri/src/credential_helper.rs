@@ -117,7 +117,12 @@ async fn fetch_registered_repos(coord_base: &str) -> Result<Vec<String>, String>
 
 fn is_git_repo(working_dir: &Path) -> bool {
     std::process::Command::new("git")
-        .args(["-C", &working_dir.to_string_lossy(), "rev-parse", "--git-dir"])
+        .args([
+            "-C",
+            &working_dir.to_string_lossy(),
+            "rev-parse",
+            "--git-dir",
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -125,7 +130,11 @@ fn is_git_repo(working_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn set_git_credential_helper(working_dir: &Path, binary_path: &Path, config_path: &Path) -> Result<(), String> {
+fn set_git_credential_helper(
+    working_dir: &Path,
+    binary_path: &Path,
+    config_path: &Path,
+) -> Result<(), String> {
     let binary_str = binary_path.to_string_lossy().replace('\\', "/");
     let config_str = config_path.to_string_lossy().replace('\\', "/");
     let helper_value = format!("{binary_str} --config {config_str}");
@@ -144,16 +153,15 @@ fn set_git_credential_helper(working_dir: &Path, binary_path: &Path, config_path
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git config --local credential.helper failed: {stderr}"));
+        return Err(format!(
+            "git config --local credential.helper failed: {stderr}"
+        ));
     }
 
     Ok(())
 }
 
-pub async fn setup_credential_helper(
-    working_dir: &str,
-    session_id: &str,
-) {
+pub async fn setup_credential_helper(working_dir: &str, session_id: &str) {
     let working_path = Path::new(working_dir);
     if !is_git_repo(working_path) {
         debug!("credential_helper: {working_dir} is not a git repo, skipping");
@@ -223,10 +231,7 @@ pub async fn setup_credential_helper(
     }
 }
 
-pub async fn setup_credential_helper_for_worktree(
-    worktree_path: &Path,
-    session_id: &str,
-) {
+pub async fn setup_credential_helper_for_worktree(worktree_path: &Path, session_id: &str) {
     let dir_str = worktree_path.to_string_lossy().to_string();
     setup_credential_helper(&dir_str, session_id).await;
 }

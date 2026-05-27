@@ -10,20 +10,22 @@ struct Config {
 }
 
 fn load_config(path: &str) -> Result<Config, String> {
-    let data = std::fs::read_to_string(path)
-        .map_err(|e| format!("read config {path}: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&data)
-        .map_err(|e| format!("parse config {path}: {e}"))?;
+    let data = std::fs::read_to_string(path).map_err(|e| format!("read config {path}: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("parse config {path}: {e}"))?;
     Ok(Config {
-        coord_url: v.get("coord_url")
+        coord_url: v
+            .get("coord_url")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        push_token: v.get("push_token")
+        push_token: v
+            .get("push_token")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        repos: v.get("repos")
+        repos: v
+            .get("repos")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()

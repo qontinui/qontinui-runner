@@ -7,7 +7,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 static REGISTERED_REPOS_CACHE: once_cell::sync::Lazy<RwLock<(Instant, HashSet<String>)>> =
-    once_cell::sync::Lazy::new(|| RwLock::new((Instant::now() - Duration::from_secs(120), HashSet::new())));
+    once_cell::sync::Lazy::new(|| {
+        RwLock::new((Instant::now() - Duration::from_secs(120), HashSet::new()))
+    });
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
@@ -43,7 +45,10 @@ fn parse_repo_slug(url: &str) -> Option<String> {
     // HTTPS: https://github.com/owner/name.git (or http)
     if url.starts_with("https://") || url.starts_with("http://") {
         if let Ok(parsed) = url::Url::parse(url) {
-            let path = parsed.path().trim_start_matches('/').trim_end_matches(".git");
+            let path = parsed
+                .path()
+                .trim_start_matches('/')
+                .trim_end_matches(".git");
             let parts: Vec<&str> = path.splitn(3, '/').collect();
             if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
                 return Some(format!("{}/{}", parts[0], parts[1]));
