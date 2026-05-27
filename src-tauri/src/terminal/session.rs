@@ -911,6 +911,7 @@ mod tests {
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             first_osc_title_tx: Arc::new(Mutex::new(Some(osc_title_tx))),
             first_osc_title_rx: Arc::new(Mutex::new(Some(osc_title_rx))),
+            coord_session_id: Arc::new(Mutex::new(None)),
         }
     }
 
