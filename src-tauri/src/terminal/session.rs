@@ -136,6 +136,10 @@ pub struct TerminalSession {
     /// (the OSC may have fired before they could subscribe, in which case
     /// the sender already consumed the slot above).
     first_osc_title_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    /// Coord-native session id, set after `register_external()` wires this
+    /// terminal into the coordinator's session plane. `None` until wired;
+    /// read by `terminal_close` so it can close the coord mirror.
+    coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
 }
 
 impl TerminalSession {
@@ -470,6 +474,7 @@ impl TerminalSession {
             grid,
             first_osc_title_tx,
             first_osc_title_rx,
+            coord_session_id: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -710,6 +715,19 @@ impl TerminalSession {
     /// Returns a receiver that yields base64-encoded output chunks.
     pub fn subscribe_output(&self) -> broadcast::Receiver<String> {
         self.output_tx.subscribe()
+    }
+
+    /// Set the coord-native session id after `register_external()` wires
+    /// this terminal into the coordinator's session plane.
+    pub fn set_coord_session_id(&self, id: uuid::Uuid) {
+        if let Ok(mut slot) = self.coord_session_id.lock() {
+            *slot = Some(id);
+        }
+    }
+
+    /// Read the coord-native session id, if one has been wired.
+    pub fn coord_session_id(&self) -> Option<uuid::Uuid> {
+        self.coord_session_id.lock().ok().and_then(|g| *g)
     }
 
     /// Clone the per-session grid handle so callers can snapshot or read text.

@@ -1072,6 +1072,10 @@ pub async fn spawn_worker_session(
         app_handle.clone(),
     )?;
 
+    // Save the title for coord registration before it is moved into
+    // WorkerSession::new.
+    let coord_purpose = title.clone();
+
     let worker = crate::claude_session::WorkerSession::new(
         task_run_id.clone(),
         info.id.clone(),
@@ -1103,6 +1107,47 @@ pub async fn spawn_worker_session(
         });
         if let Err(e) = app_handle.emit("worker-registered", &payload) {
             warn!("spawn_worker_session: emit worker-registered failed: {}", e);
+        }
+    }
+
+    // Unconditional coord registration — mirror the worker session into
+    // the coordinator's session plane so the dashboard renders it. Errors
+    // are logged and swallowed so a coord hiccup never blocks the worker.
+    {
+        let session_registry = app_handle
+            .try_state::<Arc<crate::session::SessionRegistry>>()
+            .map(|s| s.inner().clone());
+        if let Some(registry) = session_registry {
+            let intent = crate::session::Intent {
+                kind: crate::session::SessionKind::TerminalClaude,
+                purpose: coord_purpose.clone(),
+                repo: None,
+                branch: None,
+                declared_paths: vec![],
+                share_output: true,
+                redact_secrets: None,
+            };
+            match registry.register_external(intent) {
+                Ok(coord_id) => {
+                    if let Some(session) = terminal_manager.get(&info.id) {
+                        session.set_coord_session_id(coord_id);
+                        let rx = session.subscribe_output();
+                        registry.attach_output_pipe(coord_id, rx, true);
+                    }
+                    tracing::info!(
+                        terminal_id = %info.id,
+                        coord_session = %coord_id,
+                        "spawn_worker_session: registered coord session"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        terminal_id = %info.id,
+                        error = %e,
+                        "spawn_worker_session: coord session registration failed — worker unaffected"
+                    );
+                }
+            }
         }
     }
 
