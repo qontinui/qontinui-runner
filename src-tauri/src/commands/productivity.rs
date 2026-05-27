@@ -1062,6 +1062,8 @@ pub async fn spawn_worker_session(
     // resizes the PTY). Falls back to (120, 30) when no other terminals
     // exist — same as `terminal_manager.create(None, None)` historically.
     let (dom_cols, dom_rows) = terminal_manager.dominant_zone_dims();
+    let repo_path_for_detect = repo_path.clone();
+    let cred_helper_repo_path = repo_path.clone();
 
     let info = terminal_manager.create(
         Some(title.clone()),
@@ -1071,6 +1073,10 @@ pub async fn spawn_worker_session(
         Some(dom_rows),
         app_handle.clone(),
     )?;
+
+    // Save the title for coord registration before it is moved into
+    // WorkerSession::new.
+    let coord_purpose = title.clone();
 
     let worker = crate::claude_session::WorkerSession::new(
         task_run_id.clone(),
@@ -1103,6 +1109,49 @@ pub async fn spawn_worker_session(
         });
         if let Err(e) = app_handle.emit("worker-registered", &payload) {
             warn!("spawn_worker_session: emit worker-registered failed: {}", e);
+        }
+    }
+
+    // Unconditional coord registration — mirror the worker session into
+    // the coordinator's session plane so the dashboard renders it. Errors
+    // are logged and swallowed so a coord hiccup never blocks the worker.
+    let mut coord_session_id: Option<uuid::Uuid> = None;
+    {
+        let session_registry = app_handle
+            .try_state::<Arc<crate::session::SessionRegistry>>()
+            .map(|s| s.inner().clone());
+        if let Some(registry) = session_registry {
+            let intent = crate::session::Intent {
+                kind: crate::session::SessionKind::TerminalClaude,
+                purpose: coord_purpose.clone(),
+                repo: None,
+                branch: None,
+                declared_paths: vec![],
+                share_output: true,
+                redact_secrets: None,
+            };
+            match registry.register_external(intent) {
+                Ok(coord_id) => {
+                    coord_session_id = Some(coord_id);
+                    if let Some(session) = terminal_manager.get(&info.id) {
+                        session.set_coord_session_id(coord_id);
+                        let rx = session.subscribe_output();
+                        registry.attach_output_pipe(coord_id, rx, true);
+                    }
+                    tracing::info!(
+                        terminal_id = %info.id,
+                        coord_session = %coord_id,
+                        "spawn_worker_session: registered coord session"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        terminal_id = %info.id,
+                        error = %e,
+                        "spawn_worker_session: coord session registration failed — worker unaffected"
+                    );
+                }
+            }
         }
     }
 
@@ -1176,6 +1225,28 @@ pub async fn spawn_worker_session(
         );
         observer_worker.set_state(crate::claude_session::state::SessionState::Ready);
     });
+
+    {
+        let detect_handle = app_handle.clone();
+        tokio::spawn(async move {
+            crate::repo_detection::check_and_emit_unregistered(
+                detect_handle,
+                Some(repo_path_for_detect),
+            )
+            .await;
+        });
+    }
+
+    if let Some(sid) = coord_session_id {
+        let session_id_str = sid.to_string();
+        tokio::spawn(async move {
+            crate::credential_helper::setup_credential_helper(
+                &cred_helper_repo_path,
+                &session_id_str,
+            )
+            .await;
+        });
+    }
 
     schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
 

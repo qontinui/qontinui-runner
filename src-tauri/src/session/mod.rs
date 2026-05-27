@@ -643,6 +643,36 @@ impl SessionRegistry {
         Ok(())
     }
 
+    /// Attach an output pipe to an existing externally-owned session so
+    /// its PTY output streams to coord. Used by `terminal_create` and
+    /// `spawn_worker_session` after they register an external session and
+    /// have a broadcast receiver from the real PTY.
+    ///
+    /// The spawned pipe task is stored on the session record so it lives
+    /// for the session's lifetime and is aborted on close (same lifecycle
+    /// as pipes spawned inside `start_inner`).
+    pub fn attach_output_pipe(
+        &self,
+        id: Uuid,
+        rx: tokio::sync::broadcast::Receiver<String>,
+        redact: bool,
+    ) {
+        let handle = output_pipe::spawn(self.coord_sync.clone(), id, rx, redact);
+        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+        if let Some(rec) = sessions.get_mut(&id) {
+            // If there was already a pipe (shouldn't happen for external
+            // sessions, but be safe), abort it before replacing.
+            if let Some(old) = rec.output_pipe.take() {
+                old.abort();
+            }
+            rec.output_pipe = Some(handle);
+        } else {
+            // Session was already closed/removed before we could attach —
+            // abort the just-spawned pipe so it doesn't leak.
+            handle.abort();
+        }
+    }
+
     /// Borrow the coord-sync facade. Phase 3 will use this to drive the
     /// drain loop from main.rs.
     pub fn coord_sync(&self) -> &coord_sync::CoordSync {
