@@ -15,7 +15,7 @@ use crate::terminal::{strip_ansi, TerminalManager};
 
 /// Create a new terminal session.
 #[tauri::command]
-pub fn terminal_create(
+pub async fn terminal_create(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     session_registry: tauri::State<'_, Arc<SessionRegistry>>,
     app_handle: tauri::AppHandle,
