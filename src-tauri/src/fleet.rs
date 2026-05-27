@@ -150,13 +150,11 @@ fn load_device_file() -> Option<DeviceFile> {
 /// a stale or mismatched hostname for temp runners that share the
 /// primary's `settings.json`.
 pub fn canonical_hostname() -> Option<String> {
-    load_device_file()
-        .map(|d| d.hostname)
-        .or_else(|| {
-            hostname::get()
-                .ok()
-                .map(|h| h.to_string_lossy().to_string())
-        })
+    load_device_file().map(|d| d.hostname).or_else(|| {
+        hostname::get()
+            .ok()
+            .map(|h| h.to_string_lossy().to_string())
+    })
 }
 
 /// Resolve the device's `tenant_id` for coord-side requests
