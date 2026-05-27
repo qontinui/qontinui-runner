@@ -25,6 +25,9 @@ pub fn terminal_create(
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> Result<CommandResponse, String> {
+    let repo_detect_handle = app_handle.clone();
+    let repo_detect_dir = working_dir.clone();
+    let cred_helper_dir = working_dir.clone();
     let info = terminal_manager.create(
         title.clone(),
         working_dir.clone(),
@@ -54,8 +57,10 @@ pub fn terminal_create(
         share_output: true,
         redact_secrets: None,
     };
+    let mut coord_session_id: Option<uuid::Uuid> = None;
     match session_registry.inner().register_external(intent) {
         Ok(coord_id) => {
+            coord_session_id = Some(coord_id);
             // Store the coord session id on the terminal so close can clean up.
             if let Some(session) = terminal_manager.get(&info.id) {
                 session.set_coord_session_id(coord_id);
@@ -78,6 +83,18 @@ pub fn terminal_create(
                 "terminal_create: coord session registration failed — terminal unaffected"
             );
         }
+    }
+
+    tokio::spawn(async move {
+        crate::repo_detection::check_and_emit_unregistered(repo_detect_handle, repo_detect_dir)
+            .await;
+    });
+
+    if let (Some(dir), Some(sid)) = (cred_helper_dir, coord_session_id) {
+        let session_id_str = sid.to_string();
+        tokio::spawn(async move {
+            crate::credential_helper::setup_credential_helper(&dir, &session_id_str).await;
+        });
     }
 
     Ok(CommandResponse {

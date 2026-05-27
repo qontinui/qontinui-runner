@@ -47,6 +47,7 @@ mod context;
 mod coord_questions;
 mod coordinator;
 mod cost_management;
+mod credential_helper;
 mod crash_dumps;
 mod database;
 mod debug_lifecycle;
@@ -123,6 +124,7 @@ mod rag;
 mod recording;
 mod reflection;
 mod regression_api;
+mod repo_detection;
 mod restate;
 mod rework;
 mod routing;
@@ -1409,6 +1411,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::regression::record_regression_diagnosis,
             commands::regression::record_regression_run,
             commands::regression::save_regression_suite,
+            repo_detection::register_repo_with_coord,
             commands::saved_projects::add_saved_project,
             commands::saved_projects::list_saved_projects,
             commands::saved_projects::remove_saved_project,
