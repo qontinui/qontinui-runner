@@ -854,6 +854,18 @@ pub async fn allocate_and_materialize_with_claim(
         }
     }
 
+    // Install the git credential helper in each materialized worktree so
+    // that direct `git push` from within the worktree routes through coord.
+    // Best-effort: failure to install degrades to direct GitHub push (the
+    // agent pusher daemon still pushes through coord regardless).
+    for w in &materialized {
+        let sid = coord_resp.agent_id.clone();
+        let wt_path = w.worktree_path.clone();
+        tokio::spawn(async move {
+            crate::credential_helper::setup_credential_helper_for_worktree(&wt_path, &sid).await;
+        });
+    }
+
     Ok(AllocateResult {
         agent_id: coord_resp.agent_id,
         worktrees: materialized,
