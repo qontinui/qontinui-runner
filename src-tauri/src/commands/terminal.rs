@@ -61,7 +61,9 @@ pub fn terminal_create(
                 session.set_coord_session_id(coord_id);
                 // Attach the output pipe so PTY output streams to coord.
                 let rx = session.subscribe_output();
-                session_registry.inner().attach_output_pipe(coord_id, rx, true);
+                session_registry
+                    .inner()
+                    .attach_output_pipe(coord_id, rx, true);
             }
             info!(
                 terminal_id = %info.id,
