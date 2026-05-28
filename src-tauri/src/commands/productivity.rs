@@ -1016,8 +1016,43 @@ pub async fn spawn_worker_session(
 ) -> Result<LaunchResult, String> {
     let app_state = require_app_state(&app_handle)?;
 
-    let repo_path = resolve_runner_repo_path()
+    let primary_repo_path = resolve_runner_repo_path()
         .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
+
+    // Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
+    // Worker sessions always intend to edit qontinui-runner (the
+    // Coordinator's `assign-task` dispatch targets runner code). When
+    // worktree mode is on, allocate an isolated worktree and route the
+    // PTY there instead of the primary checkout; on failure or
+    // flag-off, fall back to the primary path. The context is parked
+    // on the TerminalSession after spawn.
+    let intent_repo = "qontinui-runner".to_string();
+    let repos = vec![intent_repo.clone()];
+    let isolated_ctx = match crate::agent_worktree::isolated_edit::acquire(
+        crate::agent_worktree::isolated_edit::AcquireRequest {
+            repos: &repos,
+            intent: Some("Worker session"),
+            declared_overlap_paths: None,
+            plan_id: None,
+            phase: None,
+        },
+    )
+    .await
+    {
+        Ok(Some(ctx)) => Some(ctx),
+        Ok(None) => None, // flag off
+        Err(e) => {
+            warn!(
+                error = %e,
+                "spawn_worker_session: isolated worktree allocate failed — using primary checkout"
+            );
+            None
+        }
+    };
+    let repo_path = match isolated_ctx.as_ref().and_then(|c| c.worktrees.first()) {
+        Some(w) => w.worktree_path.to_string_lossy().to_string(),
+        None => primary_repo_path,
+    };
 
     let terminal_manager = app_handle
         .try_state::<Arc<TerminalManager>>()
@@ -1074,6 +1109,15 @@ pub async fn spawn_worker_session(
         app_handle.clone(),
     )?;
 
+    // Phase 2 — park the isolated edit context on the TerminalSession
+    // so the heartbeat + claim live as long as the worker PTY. Cleared
+    // in `TerminalSession::close()`.
+    if let Some(ctx) = isolated_ctx {
+        if let Some(session) = terminal_manager.get(&info.id) {
+            session.set_isolated_edit_ctx(ctx);
+        }
+    }
+
     // Save the title for coord registration before it is moved into
     // WorkerSession::new.
     let coord_purpose = title.clone();
@@ -1124,7 +1168,11 @@ pub async fn spawn_worker_session(
             let intent = crate::session::Intent {
                 kind: crate::session::SessionKind::TerminalClaude,
                 purpose: coord_purpose.clone(),
-                repo: None,
+                // Phase 2 — worker sessions edit qontinui-runner.
+                // Declaring the repo on the Intent makes coord.sessions
+                // reflect the edit-intent that drove the worktree
+                // allocation above.
+                repo: Some(intent_repo.clone()),
                 branch: None,
                 declared_paths: vec![],
                 share_output: true,

@@ -140,6 +140,15 @@ pub struct TerminalSession {
     /// terminal into the coordinator's session plane. `None` until wired;
     /// read by `terminal_close` so it can close the coord mirror.
     coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
+    /// When the session declared edit intent on a registered repo and
+    /// `worktree_mode_enabled()` was true at spawn time, this carries
+    /// the allocated `IsolatedEditContext`. The context's `Drop` impl
+    /// stops the heartbeat task and fires a best-effort claim release;
+    /// `close()` clears the slot first so release fires before PTY
+    /// teardown.
+    isolated_edit_ctx:
+        Arc<Mutex<Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>>>,
 }
 
 impl TerminalSession {
@@ -475,6 +484,7 @@ impl TerminalSession {
             first_osc_title_tx,
             first_osc_title_rx,
             coord_session_id: Arc::new(Mutex::new(None)),
+            isolated_edit_ctx: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -730,6 +740,21 @@ impl TerminalSession {
         self.coord_session_id.lock().ok().and_then(|g| *g)
     }
 
+    /// Phase 2 of the worktree-isolation plan — park the
+    /// `IsolatedEditContext` returned by
+    /// `agent_worktree::isolated_edit::acquire` so its heartbeat task
+    /// + claim live as long as the terminal session. The slot is
+    /// cleared in `close()`, which drops the context and fires
+    /// best-effort claim release.
+    pub fn set_isolated_edit_ctx(
+        &self,
+        ctx: crate::agent_worktree::isolated_edit::IsolatedEditContext,
+    ) {
+        if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
+            *slot = Some(ctx);
+        }
+    }
+
     /// Clone the per-session grid handle so callers can snapshot or read text.
     pub fn grid(&self) -> Arc<Mutex<Grid>> {
         self.grid.clone()
@@ -744,6 +769,14 @@ impl TerminalSession {
     pub fn close(&self) {
         info!(terminal_id = %self.id, "Closing terminal session");
         self.is_alive.store(false, Ordering::Relaxed);
+
+        // Phase 2 — drop the isolated edit context first so the
+        // claim-release fire-and-forget posts ahead of the PTY teardown
+        // (release uses tokio::spawn; running it before we drain threads
+        // makes ordering observable in coord audit logs).
+        if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
+            slot.take();
+        }
 
         // Kill the child process via PID if still alive
         if let Some(pid) = self.child_pid {
@@ -912,6 +945,7 @@ mod tests {
             first_osc_title_tx: Arc::new(Mutex::new(Some(osc_title_tx))),
             first_osc_title_rx: Arc::new(Mutex::new(Some(osc_title_rx))),
             coord_session_id: Arc::new(Mutex::new(None)),
+            isolated_edit_ctx: Arc::new(Mutex::new(None)),
         }
     }
 
