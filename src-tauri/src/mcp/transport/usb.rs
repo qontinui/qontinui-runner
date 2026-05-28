@@ -1,13 +1,11 @@
 //! USB/ADB transport for physical Android device connections.
 //!
-//! Plan 1A refactor: device listing, shell commands, and `establish_forward`
-//! now use the pure-Rust `adb_client` crate via `mcp::adb_helper`. The one
-//! remaining subprocess call is `release_forward`, which still shells out to
-//! `adb forward --remove tcp:<port>` because `adb_client` 3.x exposes only
-//! `forward_remove_all` (nuclear) and not per-forward `killforward`.
+//! Plan 1A refactor: every ADB operation this transport performs (device
+//! listing, shell, screenshot, logcat, forward/reverse establish, forward/
+//! reverse per-rule removal) goes through the pure-Rust `adb_client` crate
+//! via `mcp::adb_helper`. No subprocess fallback remains.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -21,33 +19,27 @@ use crate::mcp::adb_helper;
 
 /// Manages ADB port forwards for connected Android devices.
 ///
-/// `adb_path` is still used by `release_forward` because `adb_client` 3.x has
-/// no per-forward `killforward` API (only `forward_remove_all`, which would
-/// stomp every forward on the machine). Everything else (device listing,
-/// shell, screenshot, logcat, `establish_forward`) goes through `adb_helper`.
+/// All ADB I/O goes through `adb_helper` (the pure-Rust `adb_client` crate);
+/// no subprocess fallback is needed.
 ///
-/// `Clone` is cheap: `active_forwards` is an `Arc<Mutex<_>>` shared across
-/// clones, and `adb_path` is a small `PathBuf`. We rely on cloning so the
-/// shutdown handler in `main.rs` can call `release_all` on the same forward
-/// registry the USB scanner task owns.
+/// `Clone` is cheap — both registries are `Arc<Mutex<_>>` shared across clones.
+/// We rely on cloning so the shutdown handler in `main.rs` can call
+/// `release_all` on the same forward/reverse registries the USB scanner task
+/// owns.
 #[derive(Clone)]
 pub struct UsbTransport {
-    /// Path to the `adb` (or `adb.exe`) binary. Still needed for
-    /// `release_forward` — see struct-level doc above.
-    pub adb_path: PathBuf,
     /// Maps ADB serial number → locally forwarded TCP port.
     pub active_forwards: Arc<Mutex<HashMap<String, u16>>>,
     /// Maps ADB serial number → device-side port currently reversed back to the
     /// runner HTTP API (`adb reverse tcp:<port> tcp:<port>`). Tracked so the
-    /// shutdown / disconnect paths can `adb reverse --remove` exactly the rules
-    /// this process installed, rather than nuking every reverse on the machine.
+    /// shutdown / disconnect paths can remove exactly the rules this process
+    /// installed, rather than nuking every reverse on the machine.
     pub active_reverses: Arc<Mutex<HashMap<String, u16>>>,
 }
 
 impl UsbTransport {
-    pub fn new(adb_path: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
-            adb_path,
             active_forwards: Arc::new(Mutex::new(HashMap::new())),
             active_reverses: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -104,23 +96,11 @@ impl UsbTransport {
             }
         };
 
-        let output = crate::process_helpers::tokio_no_window(&self.adb_path)
-            .args([
-                "-s",
-                adb_serial,
-                "forward",
-                "--remove",
-                &format!("tcp:{}", port),
-            ])
-            .output()
-            .await
-            .map_err(|e| TransportError::AdbCommandFailed(e.to_string()))?;
-
-        if !output.status.success() {
+        if let Err(e) = adb_helper::forward_remove(adb_serial.to_string(), port).await {
             warn!(
                 serial = %adb_serial,
                 port,
-                stderr = %String::from_utf8_lossy(&output.stderr),
+                error = %e,
                 "Failed to remove ADB forward (device may be disconnected)"
             );
         }
@@ -173,13 +153,6 @@ impl UsbTransport {
     }
 
     /// Remove the ADB reverse for the given device and clean up the map entry.
-    ///
-    /// `adb_client` 3.x exposes only `reverse_remove_all` (which would stomp
-    /// every reverse on the machine), so per-rule removal shells out to
-    /// `adb -s <serial> reverse --remove tcp:<port>`, mirroring
-    /// [`release_forward`].
-    ///
-    /// [`release_forward`]: UsbTransport::release_forward
     pub async fn release_reverse(&self, adb_serial: &str) -> Result<(), TransportError> {
         let port = {
             let reverses = self.active_reverses.lock().await;
@@ -192,23 +165,11 @@ impl UsbTransport {
             }
         };
 
-        let output = crate::process_helpers::tokio_no_window(&self.adb_path)
-            .args([
-                "-s",
-                adb_serial,
-                "reverse",
-                "--remove",
-                &format!("tcp:{}", port),
-            ])
-            .output()
-            .await
-            .map_err(|e| TransportError::AdbCommandFailed(e.to_string()))?;
-
-        if !output.status.success() {
+        if let Err(e) = adb_helper::reverse_remove(adb_serial.to_string(), port).await {
             warn!(
                 serial = %adb_serial,
                 port,
-                stderr = %String::from_utf8_lossy(&output.stderr),
+                error = %e,
                 "Failed to remove ADB reverse (device may be disconnected)"
             );
         }
