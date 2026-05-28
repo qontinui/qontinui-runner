@@ -16,8 +16,15 @@
 //!
 //! ## Scope (Phase 1)
 //!
-//! - Call coord `/agents/allocate` with `{ machine_id, repos: [{repo,
-//!   parent_sha}], intent? }`.
+//! - Call coord `/agents/allocate` with `{ device_id, repos: [{repo,
+//!   parent_sha}], intent? }`. The body's `device_id` key matches
+//!   coord's `AllocateRequest.device_id` field
+//!   (`qontinui-coord/src/agent_worktrees.rs:77`) after the
+//!   `coord.machines → coord.devices` rename. The runner's local
+//!   variable is still `machine_id` because the rest of the runner
+//!   (claims acquire/heartbeat/release, JWT issuance) hasn't been
+//!   renamed; only the on-the-wire JSON body to `/agents/allocate`
+//!   needs the new key.
 //! - `git worktree add <suggested-path> -b <branch> <parent_sha>` for
 //!   each returned worktree row.
 //! - Return materialized rows.
@@ -49,6 +56,8 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::worktree::run_git_command;
+
+pub mod isolated_edit;
 
 /// Env var that turns the new spawn path on. Default off — `feature
 /// flag agent_worktree_mode` per plan §5 Phase 1.
@@ -718,8 +727,14 @@ pub async fn allocate_and_materialize_with_claim(
     // Phase 1B: declared_overlap_paths is optional; when present, coord
     // skips its LLM-based derivation step and uses our paths directly.
     // When absent, coord derives from `intent` (or falls back to empty).
+    //
+    // Body key is `device_id` to match coord's `AllocateRequest.device_id`
+    // (`qontinui-coord/src/agent_worktrees.rs:77`) after the
+    // `coord.machines → coord.devices` rename. The runner-side variable
+    // stays `machine_id` for symmetry with claims acquire/heartbeat/release,
+    // which coord's `claims.rs` still expects as `machine_id`.
     let body = serde_json::json!({
-        "machine_id": machine_id.to_string(),
+        "device_id": machine_id.to_string(),
         "repos": repos.iter().map(|r| serde_json::json!({
             "repo": r.repo,
             "parent_sha": r.parent_sha,

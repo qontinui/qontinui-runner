@@ -14,6 +14,16 @@ use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::{strip_ansi, TerminalManager};
 
 /// Create a new terminal session.
+///
+/// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`:
+/// callers that intend to *edit* a coord-registered repo can pass
+/// `intent_repo: Some("<repo-slug>")`. When
+/// `QONTINUI_AGENT_WORKTREE_MODE` is enabled, the runner allocates an
+/// isolated git worktree for that repo via
+/// `agent_worktree::isolated_edit::acquire` and uses the materialized
+/// worktree path as the session's cwd, instead of the operator's primary
+/// checkout. Observation/read-only callers leave `intent_repo: None` and
+/// keep the legacy shared-cwd behavior — that path is unchanged.
 #[tauri::command]
 pub async fn terminal_create(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
@@ -24,7 +34,48 @@ pub async fn terminal_create(
     page_id: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    intent_repo: Option<String>,
 ) -> Result<CommandResponse, String> {
+    // Phase 2 — try to allocate an isolated worktree when the caller
+    // declared edit intent on a registered repo AND worktree mode is on.
+    // On failure or flag-off, fall through to legacy shared-cwd behavior.
+    let isolated_ctx = if let Some(ref repo) = intent_repo {
+        let repos = vec![repo.clone()];
+        let purpose = title.as_deref().unwrap_or("Terminal edit session");
+        match crate::agent_worktree::isolated_edit::acquire(
+            crate::agent_worktree::isolated_edit::AcquireRequest {
+                repos: &repos,
+                intent: Some(purpose),
+                declared_overlap_paths: None,
+                plan_id: None,
+                phase: None,
+            },
+        )
+        .await
+        {
+            Ok(Some(ctx)) => Some(ctx),
+            Ok(None) => None, // flag off — legacy path
+            Err(e) => {
+                warn!(
+                    intent_repo = %repo,
+                    error = %e,
+                    "terminal_create: isolated worktree allocate failed — falling back to shared cwd"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // If we allocated a worktree, route the PTY there instead of the
+    // operator's primary checkout. The Intent built below uses the same
+    // resolved cwd so `coord.sessions` reflects what actually happened.
+    let working_dir = match isolated_ctx.as_ref().and_then(|c| c.worktrees.first()) {
+        Some(w) => Some(w.worktree_path.to_string_lossy().to_string()),
+        None => working_dir,
+    };
+
     let repo_detect_handle = app_handle.clone();
     let repo_detect_dir = working_dir.clone();
     let cred_helper_dir = working_dir.clone();
@@ -37,6 +88,14 @@ pub async fn terminal_create(
         app_handle,
     )?;
 
+    // Park the isolated edit context on the terminal session so its
+    // heartbeat + claim live as long as the PTY. Cleared in `close()`.
+    if let Some(ctx) = isolated_ctx {
+        if let Some(session) = terminal_manager.get(&info.id) {
+            session.set_isolated_edit_ctx(ctx);
+        }
+    }
+
     // Unconditional coord registration — every terminal session is
     // mirrored into the coordinator's session plane so the dashboard
     // renders it from `coord.sessions`. This is NOT gated by dual-write;
@@ -48,7 +107,7 @@ pub async fn terminal_create(
     let intent = Intent {
         kind: SessionKind::TerminalShell,
         purpose,
-        repo: None,
+        repo: intent_repo,
         branch: None,
         declared_paths: working_dir
             .map(std::path::PathBuf::from)
