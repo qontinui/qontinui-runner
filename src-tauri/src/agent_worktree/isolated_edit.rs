@@ -126,9 +126,9 @@ pub async fn acquire(
 
     let mut repo_reqs: Vec<RepoRequest> = Vec::with_capacity(req.repos.len());
     for repo in req.repos {
-        let canonical = canonical_paths.get(repo).ok_or_else(|| {
-            AllocateError::Other(format!("no canonical path for repo '{repo}'"))
-        })?;
+        let canonical = canonical_paths
+            .get(repo)
+            .ok_or_else(|| AllocateError::Other(format!("no canonical path for repo '{repo}'")))?;
         let parent_sha = resolve_head_sha(canonical)
             .map_err(|e| AllocateError::Other(format!("git rev-parse HEAD on {repo}: {e}")))?;
         repo_reqs.push(RepoRequest {

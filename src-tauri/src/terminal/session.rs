@@ -147,9 +147,8 @@ pub struct TerminalSession {
     /// stops the heartbeat task and fires a best-effort claim release;
     /// `close()` clears the slot first so release fires before PTY
     /// teardown.
-    isolated_edit_ctx: Arc<
-        Mutex<Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>>,
-    >,
+    isolated_edit_ctx:
+        Arc<Mutex<Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>>>,
 }
 
 impl TerminalSession {
