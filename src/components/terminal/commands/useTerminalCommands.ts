@@ -185,6 +185,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     zoneLayout,
     workflowGen,
     findingsActions,
+    analysis,
   } = session;
   const transitionEffects = useTransitionEffects();
   const { dispatch: uiDispatch, toggleFocusMode } = useUIStateCx();
@@ -857,6 +858,125 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     patterns: [/^tag-clear$/i, /^tags?-clear$/i, /^clear-tags?$/i],
     handler: async (): Promise<CommandResult> => {
       labelsAndTags.setActiveTagFilters(new Set());
+      return ok();
+    },
+  });
+
+  // ── Phase 9e — workflow + analysis + plan-build actions ─────────────
+  // Five actions covering the ZSB workflow-generation, Analyze dropdown,
+  // and plan-build button cluster. All wrap existing onClick closures —
+  // no semantic change, just registry surface.
+
+  // 28. /generate — generate workflow from latest Claude Code session
+  useCommandAction({
+    id: "terminal.generate-workflow",
+    slash: "/generate",
+    aliases: ["/generate-workflow"],
+    label: "Generate workflow",
+    description:
+      "Generate a workflow from the latest Claude Code session in the active " +
+      "terminal. Same as the Generate button in ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^generate(?:\s+workflow)?$/i],
+    handler: async (): Promise<CommandResult> => {
+      await workflowGen.handleGenerateFromLatestSession();
+      return ok();
+    },
+  });
+
+  // 29. /save-workflow — save the most recently generated workflow
+  useCommandAction({
+    id: "terminal.save-workflow",
+    slash: "/save-workflow",
+    aliases: ["/save"],
+    label: "Save generated workflow",
+    description:
+      "Save the most recently generated workflow to the library. Requires " +
+      "a workflow to have been generated first (via /generate). Same as the " +
+      "Save button in ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^save(?:\s+workflow)?$/i],
+    handler: async (): Promise<CommandResult> => {
+      if (!workflowGen.generatedWorkflow) {
+        return fail("no-workflow", "generate a workflow first via /generate");
+      }
+      await workflowGen.handleSaveWorkflow();
+      return ok();
+    },
+  });
+
+  // 30. /analyze <type> — run a Claude analysis on terminal output
+  useCommandAction({
+    id: "terminal.analyze",
+    slash: "/analyze",
+    label: "Analyze terminal output",
+    description:
+      "Run a Claude analysis: session-summary, architecture, change-impact, " +
+      "progress, cross-tab, page-architecture. Same as picking an option in " +
+      "ZoneStatusBar's Analyze dropdown.",
+    paramSchema: {
+      type: 'string — one of "session-summary", "architecture", "change-impact", "progress", "cross-tab", "page-architecture"',
+    },
+    patterns: [
+      /^analyze\s+(?<type>session-summary|architecture|change-impact|progress|cross-tab|page-architecture)$/i,
+    ],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+      const raw = typeof args.type === "string" ? args.type.toLowerCase() : "";
+      const valid = [
+        "session-summary",
+        "architecture",
+        "change-impact",
+        "progress",
+        "cross-tab",
+        "page-architecture",
+      ] as const;
+      if (!(valid as readonly string[]).includes(raw)) {
+        return fail("invalid-args", `type must be one of: ${valid.join(", ")}`);
+      }
+      analysis.handleAnalyze(raw as (typeof valid)[number]);
+      return ok();
+    },
+  });
+
+  // 31. /plan-implement — build the plan-implementation workflow
+  useCommandAction({
+    id: "terminal.plan-implement",
+    slash: "/plan-implement",
+    aliases: ["/implement"],
+    label: "Build plan implementation workflow",
+    description:
+      "Build a plan-implementation workflow from the loaded plan file " +
+      "(implement + review + next-steps per phase). Requires a PLAN*.md / " +
+      "TODO*.md file in the workspace. Same as the Implement button in " +
+      "ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^plan-implement$/i, /^implement$/i],
+    handler: async (): Promise<CommandResult> => {
+      if (!workflowGen.planFileName) {
+        return fail("no-plan", "no PLAN*.md / TODO*.md file detected in workspace");
+      }
+      await workflowGen.handleBuildPlanImplementationFromFile();
+      return ok();
+    },
+  });
+
+  // 32. /plan-verify — build the plan-verification workflow
+  useCommandAction({
+    id: "terminal.plan-verify",
+    slash: "/plan-verify",
+    aliases: ["/verify"],
+    label: "Build plan verification workflow",
+    description:
+      "Build a plan workflow with the verification-only loop (lighter, no " +
+      "review/next-steps). Requires a PLAN*.md / TODO*.md file in the " +
+      "workspace. Same as the Verify button in ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^plan-verify$/i, /^verify$/i],
+    handler: async (): Promise<CommandResult> => {
+      if (!workflowGen.planFileName) {
+        return fail("no-plan", "no PLAN*.md / TODO*.md file detected in workspace");
+      }
+      await workflowGen.handleBuildPlanFromFile();
       return ok();
     },
   });
