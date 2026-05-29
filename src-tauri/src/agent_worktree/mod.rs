@@ -57,6 +57,7 @@ use tracing::{debug, info, warn};
 
 use crate::worktree::run_git_command;
 
+pub mod canonical_paths;
 pub mod isolated_edit;
 
 /// Env var that turns the new spawn path on. Default off — `feature
