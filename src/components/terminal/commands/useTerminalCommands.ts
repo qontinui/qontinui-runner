@@ -36,7 +36,7 @@
 
 import { instanceStorage } from "@/lib/instance-storage";
 
-import { useTerminalSession, useTransitionEffects, useUIStateCx } from "../contexts";
+import { useTerminalSession, useTransitionEffects, useUIStateCx, useZoneMetadata } from "../contexts";
 import type { AccountUsageInfo } from "../useSessionManager";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
@@ -188,6 +188,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   } = session;
   const transitionEffects = useTransitionEffects();
   const { dispatch: uiDispatch, toggleFocusMode } = useUIStateCx();
+  const { labelsAndTags } = useZoneMetadata();
 
   /**
    * Helper that converts 1-based zone arg to 0-based, defaulting to
@@ -777,6 +778,86 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         return ok({ patterns: next });
       }
       return fail("invalid-args", `unknown action "${action}"`);
+    },
+  });
+
+  // ── Phase 9f — ZSB middle-group control migration ───────────────────
+  // Three actions covering the state-count buttons and tag-filter pills.
+  // (Next Action button = already covered by /focus needs-input.)
+
+  // 25. /select-by-state <state> — select all zones in a given session state
+  useCommandAction({
+    id: "terminal.select-by-state",
+    slash: "/select-by-state",
+    aliases: ["/select-state"],
+    label: "Select zones by state",
+    description:
+      "Select all zones whose session is in the given state " +
+      "(idle, working, needs-input, completed, error). Same as clicking " +
+      "a state-count pill in ZoneStatusBar.",
+    paramSchema: {
+      state: 'string — one of "idle", "working", "needs-input", "completed", "error"',
+    },
+    patterns: [
+      /^select(?:-by-state)?\s+(?<state>idle|working|needs[-_ ]?input|completed|error)$/i,
+    ],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+      const raw = typeof args.state === "string" ? args.state.toLowerCase() : "";
+      const state = /^needs[-_ ]?input$/.test(raw) ? "needs-input" : raw;
+      const valid = ["idle", "working", "needs-input", "completed", "error"];
+      if (!valid.includes(state)) {
+        return fail("invalid-args", `state must be one of: ${valid.join(", ")}`);
+      }
+      const zones = new Set<number>();
+      for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
+        if ((sessionStates[tabId] ?? "idle") === state) {
+          zones.add(Number(zoneStr));
+        }
+      }
+      uiDispatch({ type: "SET_SELECTED_ZONES", payload: zones });
+      return ok({ count: zones.size });
+    },
+  });
+
+  // 26. /tag <name> — toggle a tag filter on/off
+  useCommandAction({
+    id: "terminal.tag-toggle",
+    slash: "/tag",
+    aliases: ["/tag-toggle", "/filter-tag"],
+    label: "Toggle tag filter",
+    description:
+      "Toggle a tag in the active tag-filter set. Same as clicking a tag " +
+      "pill in ZoneStatusBar — narrows the visible zones to those matching " +
+      "the selected tags.",
+    paramSchema: { tag: "string (tag name; case-sensitive match against zone labels)" },
+    patterns: [/^tag\s+(?<tag>\S+)$/i, /^filter-tag\s+(?<tag>\S+)$/i],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+      const tag = typeof args.tag === "string" ? args.tag.trim() : "";
+      if (!tag) return fail("invalid-args", "tag required");
+      labelsAndTags.setActiveTagFilters((prev) => {
+        const next = new Set(prev);
+        if (next.has(tag)) next.delete(tag);
+        else next.add(tag);
+        return next;
+      });
+      return ok();
+    },
+  });
+
+  // 27. /tag-clear — clear all tag filters
+  useCommandAction({
+    id: "terminal.tag-clear",
+    slash: "/tag-clear",
+    aliases: ["/tags-clear", "/clear-tags"],
+    label: "Clear tag filters",
+    description:
+      "Clear all active tag filters. Same as clicking the 'All' pill in " +
+      "ZoneStatusBar when one or more tag filters are active.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^tag-clear$/i, /^tags?-clear$/i, /^clear-tags?$/i],
+    handler: async (): Promise<CommandResult> => {
+      labelsAndTags.setActiveTagFilters(new Set());
+      return ok();
     },
   });
 
