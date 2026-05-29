@@ -183,6 +183,8 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     terminalRefs,
     sessionStates,
     zoneLayout,
+    workflowGen,
+    findingsActions,
   } = session;
   const transitionEffects = useTransitionEffects();
   const { dispatch: uiDispatch, toggleFocusMode } = useUIStateCx();
@@ -613,6 +615,168 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     handler: async (): Promise<CommandResult> => {
       uiDispatch({ type: "SET_SHOW_SHORTCUTS", payload: true });
       return ok();
+    },
+  });
+
+  // ── Phase 9d — ZoneStatusBar migration slice 2 ──────────────────────
+  // 7 more actions for the simplest workflow-toggle / preference-toggle
+  // controls. Same pattern as Phase 9b: each handler calls the same
+  // closure the existing ZSB button does, so both surfaces stay in
+  // lockstep until the buttons come out (in the same commit /
+  // subsequent commit). Pairs with the ZSB button deletions below.
+
+  // 18. /sessions — toggle the Claude Code sessions sidebar
+  useCommandAction({
+    id: "terminal.toggle-sessions-sidebar",
+    slash: "/sessions",
+    aliases: ["/toggle-sessions"],
+    label: "Toggle sessions sidebar",
+    description:
+      "Open/close the SessionManagerPanel — browses Claude Code sessions for resume / inspection.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^sessions$/i, /^toggle\s+sessions$/i],
+    handler: async (): Promise<CommandResult> => {
+      workflowGen.setShowSidebar((v: boolean) => !v);
+      return ok();
+    },
+  });
+
+  // 19. /resume — open sessions sidebar (always opens, never closes)
+  // Mirrors ZSB's Resume button: opens the sidebar so operator can pick
+  // a session to resume. Force-open semantics so the operator never
+  // closes the sidebar by accident when intending to resume.
+  useCommandAction({
+    id: "terminal.resume",
+    slash: "/resume",
+    label: "Resume a previous Claude Code session",
+    description: "Open the sessions sidebar (always opens, never closes).",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^resume$/i],
+    handler: async (): Promise<CommandResult> => {
+      workflowGen.setShowSidebar(true);
+      return ok();
+    },
+  });
+
+  // 20. /findings — toggle findings decisions panel
+  useCommandAction({
+    id: "terminal.toggle-findings",
+    slash: "/findings",
+    aliases: ["/toggle-findings"],
+    label: "Toggle findings panel",
+    description:
+      "Show/hide the findings decisions panel in the right sidebar (drift / quality / regression findings from the active session).",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^findings$/i, /^toggle\s+findings$/i],
+    handler: async (): Promise<CommandResult> => {
+      findingsActions.handleToggleFindings();
+      return ok();
+    },
+  });
+
+  // 21. /file-ownership — toggle file-ownership heatmap panel
+  useCommandAction({
+    id: "terminal.toggle-file-ownership",
+    slash: "/file-ownership",
+    aliases: ["/files", "/toggle-file-ownership"],
+    label: "Toggle file-ownership heatmap",
+    description:
+      "Show/hide the file-ownership heatmap (recent session-touched files) in the right sidebar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^file[- ]ownership$/i, /^files$/i],
+    handler: async (): Promise<CommandResult> => {
+      workflowGen.setRightPanelMode((prev) =>
+        prev === "file-ownership" ? null : "file-ownership",
+      );
+      return ok();
+    },
+  });
+
+  // 22. /desktop-notify — toggle native desktop notifications
+  // Mirrors ZSB's onToggleDesktopNotify: flips the boolean AND persists
+  // to instanceStorage so the choice survives reload (same key the
+  // existing button uses).
+  useCommandAction({
+    id: "terminal.toggle-desktop-notify",
+    slash: "/desktop-notify",
+    aliases: ["/notifications", "/toggle-notifications"],
+    label: "Toggle desktop notifications",
+    description:
+      "Show/hide native desktop notifications when sessions enter needs-input or error states.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^desktop[- ]notify$/i, /^notifications$/i],
+    handler: async (): Promise<CommandResult> => {
+      transitionEffects.setDesktopNotify((prev: boolean) => {
+        const next = !prev;
+        instanceStorage.setItem("zone-desktop-notify", String(next));
+        return next;
+      });
+      return ok();
+    },
+  });
+
+  // 23. /plan-refresh — reload the workspace's plan file from disk
+  useCommandAction({
+    id: "terminal.plan-refresh",
+    slash: "/plan-refresh",
+    aliases: ["/refresh-plan"],
+    label: "Refresh plan file",
+    description:
+      "Reload the workspace's PLAN*.md / TODO*.md file from disk. Useful after editing the plan in another editor while the runner is open.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^plan[- ]refresh$/i, /^refresh\s+plan$/i],
+    handler: async (): Promise<CommandResult> => {
+      await workflowGen.loadPlanContent();
+      return ok();
+    },
+  });
+
+  // 24. /auto-approve — manage the auto-approve regex pattern list
+  // Patterns are regex-matched against the last output of a session
+  // entering needs-input; matching patterns auto-send "y\r" without
+  // requiring operator confirmation. Useful for headless polling
+  // workflows where "Do you want to proceed?" prompts are routine.
+  // Subcommands: add <pattern>, list, clear, remove <pattern>.
+  useCommandAction({
+    id: "terminal.auto-approve",
+    slash: "/auto-approve",
+    label: "Manage auto-approve patterns",
+    description:
+      "Sub-commands: /auto-approve add <regex>, /auto-approve list, " +
+      "/auto-approve clear, /auto-approve remove <regex>. Patterns are " +
+      "regex-matched against last-output on needs-input; matches auto-send 'y'.",
+    paramSchema: {
+      action: 'string — "add" | "list" | "clear" | "remove"',
+      pattern: "string (regex; required for add and remove)",
+    },
+    patterns: [
+      /^auto-approve\s+(?<action>add|remove)\s+(?<pattern>.+)$/i,
+      /^auto-approve\s+(?<action>list|clear)$/i,
+    ],
+    handler: async (
+      args: Record<string, unknown>,
+    ): Promise<CommandResult<{ patterns: string[] }>> => {
+      const action = typeof args.action === "string" ? args.action.toLowerCase() : "";
+      const pattern = typeof args.pattern === "string" ? args.pattern : "";
+      const current = transitionEffects.autoApprovePatterns ?? [];
+      if (action === "list") return ok({ patterns: current });
+      if (action === "clear") {
+        transitionEffects.setAutoApprovePatterns([]);
+        return ok({ patterns: [] });
+      }
+      if (action === "add") {
+        if (!pattern) return fail("invalid-args", "pattern required for add");
+        const next = current.includes(pattern) ? current : [...current, pattern];
+        transitionEffects.setAutoApprovePatterns(next);
+        return ok({ patterns: next });
+      }
+      if (action === "remove") {
+        if (!pattern) return fail("invalid-args", "pattern required for remove");
+        const next = current.filter((p) => p !== pattern);
+        transitionEffects.setAutoApprovePatterns(next);
+        return ok({ patterns: next });
+      }
+      return fail("invalid-args", `unknown action "${action}"`);
     },
   });
 
