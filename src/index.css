@@ -1064,6 +1064,22 @@
       box-shadow: none;
     }
   }
+
+  /* Phase 4 suggestion-chip fade-in. Matches the plan's "fade-in 200ms"
+     specification for SuggestionChip overlays on zone cells. */
+  .suggestion-chip-fade-in {
+    animation: suggestion-chip-fade-in 200ms ease-out;
+  }
+  @keyframes suggestion-chip-fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
 }
 
 /* Scrollbar utilities (must be top-level, not nested in @layer) */

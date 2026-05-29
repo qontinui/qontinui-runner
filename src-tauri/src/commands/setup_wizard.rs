@@ -17,9 +17,31 @@ use uuid::Uuid;
 // Setup Status
 // ============================================================================
 
-/// Check if the first-launch setup wizard has been completed
+/// Check if the first-launch setup wizard has been completed.
+///
+/// Auto-bypass for test runners: when the supervisor forwards
+/// `QONTINUI_TEST_AUTO_LOGIN_EMAIL` (the same env var that drives the
+/// existing test auto-login), report setup as complete regardless of
+/// the persisted settings value. Temp runners always start with a
+/// fresh profile (setup_completed=false) which previously blocked any
+/// route-scoped UI Bridge testing behind the 7-step wizard. Reusing
+/// the supervisor's existing auto-login env var means zero new
+/// configuration on the spawn side — the same plumbing that auto-logs
+/// also auto-skips.
+///
+/// Operators running the runner directly never set this env var, so
+/// their wizard behaviour is unchanged. Manual dismissal is also
+/// available via the `setup-wizard` UI Bridge component's `complete`
+/// action (registered in `SetupWizard.tsx`).
 #[tauri::command]
 pub fn check_setup_completed() -> Result<bool, String> {
+    if std::env::var("QONTINUI_TEST_AUTO_LOGIN_EMAIL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return Ok(true);
+    }
     Ok(settings::get_setup_completed())
 }
 

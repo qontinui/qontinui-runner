@@ -1,61 +1,15 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { Search } from "lucide-react";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { TerminalTab } from "./useTerminalManager";
-
-/* ── Fuzzy match scoring ─────────────────────────────────────────────── */
-
-function fuzzyScore(text: string, query: string): { score: number; indices: number[] } | null {
-  const lower = text.toLowerCase();
-  const q = query.toLowerCase();
-
-  // Exact prefix match — highest score
-  if (lower.startsWith(q)) {
-    return {
-      score: 100 + q.length,
-      indices: Array.from({ length: q.length }, (_, i) => i),
-    };
-  }
-
-  // Word boundary match
-  const words = lower.split(/[\s\-_:]/);
-  let wordStart = 0;
-  const wordBoundaryIndices: number[] = [];
-  let qi = 0;
-  for (const word of words) {
-    if (qi < q.length && word.startsWith(q[qi])) {
-      for (let wi = 0; wi < word.length && qi < q.length; wi++) {
-        if (word[wi] === q[qi]) {
-          wordBoundaryIndices.push(wordStart + wi);
-          qi++;
-        }
-      }
-    }
-    wordStart += word.length + 1;
-  }
-  if (qi === q.length) {
-    return { score: 70 + q.length, indices: wordBoundaryIndices };
-  }
-
-  // Sequential character match (fuzzy)
-  const indices: number[] = [];
-  let si = 0;
-  for (let i = 0; i < lower.length && si < q.length; i++) {
-    if (lower[i] === q[si]) {
-      indices.push(i);
-      si++;
-    }
-  }
-  if (si === q.length) {
-    const spread = indices[indices.length - 1] - indices[0];
-    const compactness = Math.max(0, 50 - spread);
-    return { score: 30 + compactness, indices };
-  }
-
-  return null;
-}
+import { fuzzyScore } from "./commands/fuzzy";
+import {
+  getAll as getRegistrySnapshot,
+  getRegistryPaletteActions,
+  subscribe as subscribeToRegistry,
+} from "./commands";
 
 function renderHighlightedLabel(label: string, indices: number[]): ReactNode {
   if (indices.length === 0) return label;
@@ -150,9 +104,30 @@ export function CommandPalette({
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
+  // Phase 7 — subscribe to the command registry so a new
+  // `useCommandAction` registration appears in the palette without a
+  // re-mount. Snapshot identity is stable between mutations, so this is
+  // cheap re-key for the useMemo below.
+  const registrySnapshot = useSyncExternalStore(
+    subscribeToRegistry,
+    getRegistrySnapshot,
+  );
+
   // Build action list
   const actions = useMemo(() => {
     const list: PaletteAction[] = [];
+
+    // Phase 7 — prepend every registry action as a discoverability row.
+    // Categorised under "Commands" so the palette's existing
+    // category-tinted grouping treats them as a distinct block at the
+    // top of the list. Their `priority: 0` lands them just below the
+    // (deduped) `approve-all` and above the per-zone enumerations.
+    for (const row of getRegistryPaletteActions()) {
+      list.push(row as PaletteAction);
+    }
+    // Capture which registry slashes we've already projected so the
+    // hard-coded equivalents (`approve-all`, etc.) below can dedupe.
+    const projectedSlashes = new Set(registrySnapshot.map((a) => a.slash));
 
     // Per-zone actions
     for (let z = 0; z < zoneCount; z++) {
@@ -247,7 +222,13 @@ export function CommandPalette({
 
     // Global actions
     const needsInputCount = Object.values(sessionStates).filter((s) => s === "needs-input").length;
-    if (needsInputCount > 0) {
+    // Phase 7 dedupe — only render the hard-coded `approve-all` row
+    // when the registry hasn't already projected its equivalent. This
+    // is the one "delete the duplicated construction" beat from the
+    // plan that actually applies; the per-zone focus / restart loops
+    // below stay because they carry per-tab titles the registry's
+    // abstract `/focus N` row can't reproduce.
+    if (needsInputCount > 0 && !projectedSlashes.has("/approve-all")) {
       list.push({
         id: "approve-all",
         label: `Approve all (${needsInputCount} waiting)`,
@@ -367,6 +348,7 @@ export function CommandPalette({
 
     return list.sort((a, b) => a.priority - b.priority);
   }, [
+    registrySnapshot, // Phase 7 — re-run projection when actions register/unregister
     tabs,
     assignments,
     sessionStates,

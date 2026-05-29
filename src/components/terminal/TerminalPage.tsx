@@ -26,8 +26,12 @@ import { ZoneControlPanel } from "./ZoneControlPanel";
 import { OutputSearchBar } from "./OutputSearchBar";
 import { TerminalRightPanel } from "./TerminalRightPanel";
 import { TerminalOverlays } from "./TerminalOverlays";
+import { CommandBar } from "./CommandBar";
+import { SuggestionsProvider } from "./suggestions";
+import { StatusStrip } from "./StatusStrip";
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
+import { callRegistry, useTerminalCommands } from "./commands";
 import { useTerminalInitialization } from "./useTerminalInitialization";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
@@ -62,7 +66,9 @@ export function TerminalPage(props: TerminalPageProps) {
       <ZoneMetadataProvider>
         <TransitionEffectsProvider>
           <UIStateProvider>
-            <TerminalPageInner {...props} />
+            <SuggestionsProvider>
+              <TerminalPageInner {...props} />
+            </SuggestionsProvider>
           </UIStateProvider>
         </TransitionEffectsProvider>
       </ZoneMetadataProvider>
@@ -126,6 +132,161 @@ function TerminalPageInner({
             title: t.title,
             isAlive: Boolean(t.isAlive),
           })),
+      },
+    ],
+  });
+
+  // Phase 9a — hoist the `terminal-launch-menu` UI Bridge registration
+  // out of `TerminalTabBar` so external agents keep getting `create-plain`
+  // / `create-ai-session` / `create-best-account` / `create-with-command`
+  // when the tab bar is eventually removed. Handlers close over the
+  // later-declared `handleQuickLaunch` / `handleLaunchAiSession` — fine
+  // because they only execute at action-invocation time (after the
+  // function body has run through the const declarations).
+  //
+  // The `open` / `close` actions that used to live here are dropped — they
+  // were UI-popover toggles for the LaunchMenu component, not wire
+  // contract. External automation calls the spawn actions directly without
+  // needing the popover open. If a caller surfaces dependence on them,
+  // restore by lifting `showQuickLaunch` state to `TerminalPage` and
+  // threading it down to `TerminalTabBar` as props.
+  useUIComponent({
+    id: "terminal-launch-menu",
+    name: "Terminal Launch Menu",
+    description:
+      "Creates plain terminals and AI sessions. Use create-plain, create-ai-session, " +
+      "create-best-account, or create-with-command to launch terminals programmatically.",
+    actions: [
+      {
+        id: "create-plain",
+        label: "Create Plain Terminal",
+        description: "Spawn N blank terminals using the user's default shell.",
+        paramSchema: { count: "number (>= 1, defaults to 1)" },
+        handler: async (params?: unknown) => {
+          const { count = 1 } = (params ?? {}) as { count?: number };
+          if (typeof count !== "number" || count < 1) {
+            throw new Error("create-plain requires { count: number } where count >= 1");
+          }
+          const tabIds = await callRegistry<string[]>("terminal.spawn", { count });
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: [] as Array<string | null>,
+          };
+        },
+      },
+      {
+        id: "create-ai-session",
+        label: "Create AI Session",
+        description:
+          "Spawn N terminals pre-configured to launch `claude` under the given CLAUDE_CONFIG_DIR, optionally pre-typing a context prompt.",
+        paramSchema: {
+          count: "number (>= 1, defaults to 1)",
+          configDir: "string (absolute path to a Claude Code config dir, required)",
+          context: "string (optional initial prompt auto-typed after claude starts)",
+        },
+        handler: async (params?: unknown) => {
+          const {
+            count = 1,
+            configDir,
+            context,
+          } = (params ?? {}) as {
+            count?: number;
+            configDir?: string;
+            context?: string;
+          };
+          if (!configDir)
+            throw new Error(
+              "create-ai-session requires { count?: number, configDir: string, context?: string }",
+            );
+          if (typeof count !== "number" || count < 1) {
+            throw new Error("create-ai-session: count must be a positive number");
+          }
+          // configDir + the operator's `account` label are different
+          // abstractions; the UI Bridge contract takes raw configDir for
+          // historical reasons. Call the local closure directly rather
+          // than the registry's account-shaped `terminal.spawn-ai`.
+          const tabIds = ((await handleLaunchAiSession(count, configDir, context)) ??
+            []) as string[];
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: tabIds.map(() => null) as Array<string | null>,
+          };
+        },
+      },
+      {
+        id: "create-best-account",
+        label: "Create AI Session with Best Account",
+        description:
+          "Like create-ai-session, but picks the AI account with the lowest current utilization. Fails if no accounts are configured.",
+        paramSchema: {
+          count: "number (>= 1, defaults to 1)",
+          context: "string (optional initial prompt auto-typed after claude starts)",
+        },
+        handler: async (params?: unknown) => {
+          const { count = 1, context } = (params ?? {}) as {
+            count?: number;
+            context?: string;
+          };
+          if (typeof count !== "number" || count < 1) {
+            throw new Error("create-best-account: count must be a positive number");
+          }
+          // Delegate to registry `terminal.spawn-ai` with the literal
+          // `account: "best"`. The registry handler does the lowest-
+          // utilization lookup; we rethrow `no-account` as the original
+          // "No AI accounts available" wording so existing automation
+          // regexes keep matching.
+          let tabIds: string[];
+          try {
+            tabIds = await callRegistry<string[]>("terminal.spawn-ai", {
+              count,
+              account: "best",
+              context,
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes("no-account") || msg.toLowerCase().includes("no matching")) {
+              throw new Error("No AI accounts available", { cause: err });
+            }
+            throw err;
+          }
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: tabIds.map(() => null) as Array<string | null>,
+          };
+        },
+      },
+      {
+        id: "create-with-command",
+        label: "Create Terminal with Command",
+        description:
+          "Spawn N terminals and auto-type the given shell command into each after the prompt renders.",
+        paramSchema: {
+          count: "number (>= 1, defaults to 1)",
+          command: "string (the shell command to type + Enter, required)",
+        },
+        handler: async (params?: unknown) => {
+          const { count = 1, command } = (params ?? {}) as {
+            count?: number;
+            command?: string;
+          };
+          if (!command)
+            throw new Error("create-with-command requires { count?: number, command: string }");
+          if (typeof count !== "number" || count < 1) {
+            throw new Error("create-with-command: count must be a positive number");
+          }
+          const tabIds = await callRegistry<string[]>("terminal.spawn-with", {
+            count,
+            command,
+          });
+          return {
+            success: true,
+            tab_ids: tabIds,
+            task_run_ids: [] as Array<string | null>,
+          };
+        },
       },
     ],
   });
@@ -413,6 +574,85 @@ function TerminalPageInner({
       onTimeout: (id) => console.warn(`[LaunchAI] terminal ref for ${id} never became ready`),
     });
 
+  // Hoisted out of the JSX so the command registry (`useTerminalCommands`
+  // below) can share the exact same spawn closures with `TerminalTabBar`'s
+  // `onQuickLaunch` / `onLaunchAiSession` props. Behavior identical to the
+  // prior inline definitions; no useCallback wrap since the originals
+  // weren't memoized either and downstream consumers don't depend on
+  // stable identity.
+  const handleQuickLaunch = async (count: number, autoCommand?: string): Promise<string[]> => {
+    const totalTabs = tabs.length + count;
+    const layoutId = pickLayout(totalTabs);
+    zoneLayout.setLayoutId(layoutId);
+    const title = autoCommand ? autoCommand.slice(0, 20) : undefined;
+    const createdTabIds: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const tabId = await createAndAssignTerminal(title);
+      if (tabId) createdTabIds.push(tabId);
+    }
+    if (autoCommand && createdTabIds.length > 0) {
+      for (const tabId of createdTabIds) {
+        writeWhenReady(tabId, `${autoCommand}\r`);
+      }
+    }
+    return createdTabIds;
+  };
+
+  const handleLaunchAiSession = async (
+    count: number,
+    configDir: string,
+    context?: string,
+  ): Promise<string[]> => {
+    const totalTabs = tabs.length + count;
+    const layoutId = pickLayout(totalTabs);
+    zoneLayout.setLayoutId(layoutId);
+
+    const isWindows = navigator.platform.startsWith("Win");
+    const customCmd = sessionManager.launchCommands?.[configDir];
+    const cmd = customCmd
+      ? customCmd
+      : isWindows
+        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude`
+        : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
+    const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
+    const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
+    const createdTabIds: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const tabId = await createAndAssignTerminal(label);
+      if (tabId) createdTabIds.push(tabId);
+    }
+    if (createdTabIds.length > 0) {
+      const spawnAt = Date.now();
+      for (const tabId of createdTabIds) {
+        writeWhenReady(tabId, `${cmd}\r`);
+        const tab = tabs.find((t) => t.id === tabId);
+        startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
+      }
+      if (context) {
+        const safeContext = context.replace(/\n/g, " ");
+        setTimeout(() => {
+          for (const tabId of createdTabIds) {
+            writeWhenReady(tabId, `${safeContext}\r`);
+          }
+        }, 8000);
+      }
+    }
+    return createdTabIds;
+  };
+
+  // Phase 1b — register the Terminal-page command set. Sources the spawn
+  // closures above; reads everything else (tabs, zoneLayout, sessionStates,
+  // closeTerminal, transitionEffects.handleRestartInZone, terminalRefs)
+  // directly from contexts. No visible UI change today — the registry is
+  // populated for future CommandBar / palette / AI-tier consumers.
+  useTerminalCommands({
+    spawnPlain: handleQuickLaunch,
+    spawnAi: handleLaunchAiSession,
+    accounts: sessionManager.accountUsage,
+    sortZones: handleSortZones,
+    exportAll: handleExportOutput,
+  });
+
   if (!initialized) {
     return (
       <div className="h-full flex items-center justify-center bg-[#1a1b26]">
@@ -427,6 +667,11 @@ function TerminalPageInner({
   return (
     <UIBridgeComponentScope componentId="terminal-page">
       <div className="h-full flex flex-col bg-[#1a1b26]">
+        {/* Phase 6 — top status strip. Renders nothing when no signal
+            requires attention, keeping the top of viewport clean by
+            default. Sits above TerminalTabBar during the transition;
+            Phase 9 demolition will collapse the chrome further. */}
+        <StatusStrip />
         <TerminalTabBar
           tabs={tabs}
           activeId={activeId}
@@ -536,77 +781,8 @@ function TerminalPageInner({
           staleTabs={stateTracking.staleTabs}
           zoneLabels={labelsAndTags.zoneLabels}
           labelColorMap={labelsAndTags.labelColorMap}
-          onQuickLaunch={async (count, autoCommand) => {
-            const totalTabs = tabs.length + count;
-            const layoutId = pickLayout(totalTabs);
-            zoneLayout.setLayoutId(layoutId);
-            const title = autoCommand ? autoCommand.slice(0, 20) : undefined;
-            const createdTabIds: string[] = [];
-            for (let i = 0; i < count; i++) {
-              const tabId = await createAndAssignTerminal(title);
-              if (tabId) createdTabIds.push(tabId);
-            }
-            if (autoCommand && createdTabIds.length > 0) {
-              for (const tabId of createdTabIds) {
-                writeWhenReady(tabId, `${autoCommand}\r`);
-              }
-            }
-            // Returned ids surface in the UI Bridge action response so
-            // automation can immediately poll
-            // `/control/terminal-sessions/{id}` without screen-scraping.
-            return createdTabIds;
-          }}
-          onLaunchAiSession={async (count, configDir, context) => {
-            const totalTabs = tabs.length + count;
-            const layoutId = pickLayout(totalTabs);
-            zoneLayout.setLayoutId(layoutId);
-
-            const isWindows = navigator.platform.startsWith("Win");
-            const customCmd = sessionManager.launchCommands?.[configDir];
-            const cmd = customCmd
-              ? customCmd
-              : isWindows
-                ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude`
-                : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
-            // Smart tab naming: use custom command or account label
-            const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
-            const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
-            const createdTabIds: string[] = [];
-            for (let i = 0; i < count; i++) {
-              const tabId = await createAndAssignTerminal(label);
-              if (tabId) createdTabIds.push(tabId);
-            }
-            if (createdTabIds.length > 0) {
-              const spawnAt = Date.now();
-              // Type the launch command once the terminal ref is mounted
-              for (const tabId of createdTabIds) {
-                writeWhenReady(tabId, `${cmd}\r`);
-                // Plan §1.5 — start polling transcript_get_latest so
-                // tab.claudeSessionId fills in once Claude CLI writes
-                // its first JSONL record. Pass `configDir` so the probe
-                // scopes to the account this tab launched into; without
-                // it, a concurrent session in another account writing
-                // to the same project_path can win the freshest-mtime
-                // race and the wrong session_id gets bound (P0 silent
-                // fail for multi-account users).
-                const tab = tabs.find((t) => t.id === tabId);
-                startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDir);
-              }
-              // Type the initial instructions after Claude starts
-              if (context) {
-                const safeContext = context.replace(/\n/g, " ");
-                setTimeout(() => {
-                  for (const tabId of createdTabIds) {
-                    writeWhenReady(tabId, `${safeContext}\r`);
-                  }
-                }, 8000);
-              }
-            }
-            // Returned ids surface in the UI Bridge action response so
-            // automation can immediately poll
-            // `/control/terminal-sessions/{id}` without screen-scraping.
-            return createdTabIds;
-          }}
+          onQuickLaunch={handleQuickLaunch}
+          onLaunchAiSession={handleLaunchAiSession}
           onLaunchMultiAiSessions={async (configDirs, context) => {
             const count = configDirs.length;
             const totalTabs = tabs.length + count;
@@ -861,6 +1037,11 @@ function TerminalPageInner({
         </div>
 
         <TerminalOverlays onSortZones={handleSortZones} onExport={handleExportOutput} />
+
+        {/* Phase 2 — slash-command bar pinned to the bottom of the
+            page chrome. Reads from the command registry populated by
+            `useTerminalCommands` above; Ctrl+/ focuses from anywhere. */}
+        <CommandBar />
       </div>
     </UIBridgeComponentScope>
   );
