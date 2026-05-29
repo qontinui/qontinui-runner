@@ -1,6 +1,5 @@
 import { useEffect, useCallback, useMemo, useState } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
-import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
@@ -92,7 +91,6 @@ function TerminalPageInner({
     setInitialized,
     createTerminal,
     closeTerminal,
-    renameTab,
     updateTab,
     reconnectToExistingSessions,
     createPlanTab,
@@ -404,13 +402,19 @@ function TerminalPageInner({
     return holderTab?.claudeSessionId;
   }, [showWaitingBanner, activeLockState?.counterpartyName, tabs]);
 
-  // Per-tab commit-readiness state (Plan §3). Sibling to fileLockStates;
-  // both are passed through to TerminalTabBar for rendering.
-  const commitStates = useCommitState(tabs);
+  // Per-tab commit-readiness state (Plan §3) — drives the
+  // CommitTrafficLight badge that previously rendered inside the
+  // TerminalTabBar tab strip. Phase 9c removed that consumer; the hook
+  // still runs because its file-system polling side effects (PG
+  // recent-editors snapshot) are load-bearing for other consumers.
+  useCommitState(tabs);
   // Per-tab registry-awareness counts (pty-launched-ai-tabs-warning-plan
-  // Phase 2). Sibling to fileLockStates; polled from
-  // `/file-registry/probe-conflicts` every 2s per eligible tab.
-  const registryAwareness = useRegistryAwareness(tabs);
+  // Phase 2). Same situation as commitStates above — the hook's side
+  // effect (HTTP polling of /file-registry/probe-conflicts) feeds the
+  // global registry; the per-tab badge consumer in TerminalTabBar is
+  // gone, but other surfaces (HoldingLockBanner / SuggestionChip) read
+  // the live registry instead of needing this return value.
+  useRegistryAwareness(tabs);
   // Mid-session probe (Phase 3 of pty-launched-ai-tabs-warning-plan).
   // Fires `/file-registry/probe-conflicts` 500ms after the user types a
   // new turn into an active Claude CLI tab and surfaces predicted
@@ -478,8 +482,10 @@ function TerminalPageInner({
     state: uiState,
     dispatch,
     toggleFocusMode: _toggleFocusMode,
-    toggleAutoLayout,
-    cycleViewMode,
+    // toggleAutoLayout + cycleViewMode were prop-passed into TerminalTabBar's
+    // layoutPicker slot; after Phase 9c demolition they're unused. Keyboard
+    // shortcuts (Ctrl+Shift+M for view-mode cycle) still drive these via
+    // useKeyboardShortcuts.
   } = useUIStateCx();
 
   useTerminalInitialization({
@@ -669,176 +675,10 @@ function TerminalPageInner({
       <div className="h-full flex flex-col bg-[#1a1b26]">
         {/* Phase 6 — top status strip. Renders nothing when no signal
             requires attention, keeping the top of viewport clean by
-            default. Sits above TerminalTabBar during the transition;
-            Phase 9 demolition will collapse the chrome further. */}
+            default. Phase 9c demolition removed `TerminalTabBar` (was
+            mounted directly below this); the registry + CommandBar +
+            ZoneHoverActions + StatusStrip now cover its surface. */}
         <StatusStrip />
-        <TerminalTabBar
-          tabs={tabs}
-          activeId={activeId}
-          onSelect={(id) => {
-            setActiveId(id);
-            const zoneIdx = Object.entries(zoneLayout.assignments).find(
-              ([, tabId]) => tabId === id,
-            );
-            if (zoneIdx) {
-              zoneLayout.setFocusedZone(Number(zoneIdx[0]));
-            }
-          }}
-          onClose={closeTerminal}
-          onCreate={() => createAndAssignTerminal()}
-          onRename={renameTab}
-          sessionStates={stateTracking.sessionStates}
-          layoutPicker={
-            <div className="flex items-center gap-1">
-              <ZoneLayoutPicker
-                currentLayoutId={zoneLayout.layoutId}
-                onSelectLayout={zoneLayout.setLayoutId}
-                tabCount={tabs.length}
-              />
-              {zoneLayout.isMultiZone && (
-                <>
-                  <button
-                    onClick={cycleViewMode}
-                    className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors"
-                    title={`View mode: ${uiState.viewMode} (Ctrl+Shift+M to cycle)`}
-                  >
-                    <span className="font-mono uppercase tracking-wider">{uiState.viewMode}</span>
-                    <span className="text-[#565f89]/50">{zoneLayout.layout.zones.length}z</span>
-                  </button>
-                  <button
-                    onClick={() => dispatch({ type: "RESET_RATIOS" })}
-                    className="px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors"
-                    title="Reset zone sizes to equal"
-                  >
-                    Reset
-                  </button>
-                </>
-              )}
-              <button
-                onClick={toggleAutoLayout}
-                className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-                  uiState.autoLayout
-                    ? "text-[#9ece6a] bg-[#9ece6a]/10"
-                    : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-                }`}
-                title={`Auto-layout: ${uiState.autoLayout ? "ON" : "OFF"} — automatically switch layout based on terminal count`}
-              >
-                Auto
-              </button>
-              <ZoneProfilePicker
-                currentLayoutId={zoneLayout.layoutId}
-                zoneLabels={labelsAndTags.zoneLabels}
-                zoneNotes={labelsAndTags.zoneNotes}
-                pinnedZones={labelsAndTags.pinnedZones}
-                autoApprovePatterns={transitionEffects.autoApprovePatterns}
-                pageId={pageId}
-                zoneAssignments={zoneLayout.assignments}
-                tabs={tabs}
-                initialized={initialized}
-                onLoadProfile={async (profile) => {
-                  zoneLayout.setLayoutId(profile.layoutId);
-                  labelsAndTags.setZoneLabels(profile.labels);
-                  labelsAndTags.setZoneNotes(profile.notes);
-                  labelsAndTags.setPinnedZones(new Set(profile.pins));
-                  transitionEffects.setAutoApprovePatterns(profile.autoApprovePatterns);
-                  // Create terminals for profile sessions that need them.
-                  // Stash sessions BEFORE creating terminals so the assignments-watching
-                  // effect sees them as soon as the first assignment lands.
-                  if (profile.sessions && profile.sessions.length > 0) {
-                    pendingProfileSessionsRef.current = profile.sessions;
-                    const existingTabCount = tabs.length;
-                    const neededCount = profile.sessions.length;
-                    const toCreate = Math.max(0, neededCount - existingTabCount);
-                    for (let i = 0; i < toCreate; i++) {
-                      await createAndAssignTerminal();
-                    }
-                    // Edge case: if existing tabs already satisfy the count, no new
-                    // terminals (and no zone-assignment changes) will be triggered, so
-                    // the effect watching zoneLayout.assignments in TerminalCoreContext
-                    // would never re-fire to consume pendingProfileSessionsRef. Bind
-                    // each profile session's zoneIndex to one of the existing tabs;
-                    // assignTabToZone always returns a new assignments object, so the
-                    // effect re-runs and processes the pending sessions.
-                    if (toCreate === 0) {
-                      const assignedTabs = new Set<string>();
-                      for (const s of profile.sessions) {
-                        const candidate = tabs.find((t) => !assignedTabs.has(t.id));
-                        if (!candidate) break;
-                        assignedTabs.add(candidate.id);
-                        zoneLayout.assignTabToZone(s.zoneIndex, candidate.id);
-                      }
-                    }
-                  }
-                }}
-              />
-            </div>
-          }
-          assignments={zoneLayout.isMultiZone ? zoneLayout.assignments : undefined}
-          activityData={stateTracking.activityData}
-          stateDurations={stateTracking.stateDurations}
-          lastOutputLines={stateTracking.lastOutputLines}
-          unreadTabs={transitionEffects.unseenNeedsInput}
-          staleTabs={stateTracking.staleTabs}
-          zoneLabels={labelsAndTags.zoneLabels}
-          labelColorMap={labelsAndTags.labelColorMap}
-          onQuickLaunch={handleQuickLaunch}
-          onLaunchAiSession={handleLaunchAiSession}
-          onLaunchMultiAiSessions={async (configDirs, context) => {
-            const count = configDirs.length;
-            const totalTabs = tabs.length + count;
-            const layoutId = pickLayout(totalTabs);
-            zoneLayout.setLayoutId(layoutId);
-
-            const isWindows = navigator.platform.startsWith("Win");
-            const cmds = sessionManager.launchCommands ?? {};
-            const createdTabIds: string[] = [];
-            const spawnAt = Date.now();
-            for (let i = 0; i < count; i++) {
-              const customCmd = cmds[configDirs[i]];
-              const dirName =
-                configDirs[i].replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
-              const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
-              const tabId = await createAndAssignTerminal(label);
-              if (tabId) {
-                createdTabIds.push(tabId);
-                const cmd = customCmd
-                  ? customCmd
-                  : isWindows
-                    ? `$env:CLAUDE_CONFIG_DIR="${configDirs[i]}"; claude`
-                    : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
-                // Stagger launch commands across accounts
-                setTimeout(() => writeWhenReady(tabId, `${cmd}\r`), i * 300);
-                // Plan §1.5 — kick off transcript-id polling per tab.
-                // Pass each tab's own `configDirs[i]` so the probe scopes
-                // to the account this tab is in; otherwise a faster-
-                // writing concurrent account would shadow the right
-                // session_id and silently break the commit traffic light.
-                const tab = tabs.find((t) => t.id === tabId);
-                startSessionIdCapture(tabId, tab?.workingDir ?? "", spawnAt, configDirs[i]);
-              }
-            }
-            // Type initial instructions after Claude starts (stagger per session)
-            if (context && createdTabIds.length > 0) {
-              const safeContext = context.replace(/\n/g, " ");
-              for (let j = 0; j < createdTabIds.length; j++) {
-                const tabId = createdTabIds[j];
-                setTimeout(() => writeWhenReady(tabId, `${safeContext}\r`), j * 300 + 8000);
-              }
-            }
-            // Returned ids surface in the UI Bridge action response so
-            // automation can immediately poll
-            // `/control/terminal-sessions/{id}` without screen-scraping.
-            return createdTabIds;
-          }}
-          accountUsage={sessionManager.accountUsage}
-          launchCommands={sessionManager.launchCommands}
-          fileLocks={sessionManager.fileLocks}
-          fileLockStates={fileLockStates}
-          registryAwareness={registryAwareness}
-          activeTabCwd={tabs.find((t) => t.id === activeId)?.workingDir}
-          commitStates={commitStates}
-          terminalRefs={terminalRefs.current}
-        />
         <ZoneStatusBar
           onExport={handleExportOutput}
           onSortZones={handleSortZones}
@@ -1042,6 +882,62 @@ function TerminalPageInner({
             page chrome. Reads from the command registry populated by
             `useTerminalCommands` above; Ctrl+/ focuses from anywhere. */}
         <CommandBar />
+
+        {/* Phase 9c — TerminalTabBar demolished. ZoneLayoutPicker and
+            ZoneProfilePicker carry their own `useUIComponent`
+            registrations (`zone-layout-picker` and `zone-profile-picker`),
+            so external agents discover layout / profile actions through
+            those component ids. To preserve those wire contracts WITHOUT
+            re-introducing the visual chrome they used to provide, the
+            two pickers mount here inside an `aria-hidden` container with
+            `display: none` — they self-register on mount, no UI surface.
+            Operators reach the same surfaces via slash commands
+            (`/layout <preset>`, `/profile-load <name>`, etc.) or via
+            external automation calling the UI Bridge action endpoints
+            directly. */}
+        <div style={{ display: "none" }} aria-hidden>
+          <ZoneLayoutPicker
+            currentLayoutId={zoneLayout.layoutId}
+            onSelectLayout={zoneLayout.setLayoutId}
+            tabCount={tabs.length}
+          />
+          <ZoneProfilePicker
+            currentLayoutId={zoneLayout.layoutId}
+            zoneLabels={labelsAndTags.zoneLabels}
+            zoneNotes={labelsAndTags.zoneNotes}
+            pinnedZones={labelsAndTags.pinnedZones}
+            autoApprovePatterns={transitionEffects.autoApprovePatterns}
+            pageId={pageId}
+            zoneAssignments={zoneLayout.assignments}
+            tabs={tabs}
+            initialized={initialized}
+            onLoadProfile={async (profile) => {
+              zoneLayout.setLayoutId(profile.layoutId);
+              labelsAndTags.setZoneLabels(profile.labels);
+              labelsAndTags.setZoneNotes(profile.notes);
+              labelsAndTags.setPinnedZones(new Set(profile.pins));
+              transitionEffects.setAutoApprovePatterns(profile.autoApprovePatterns);
+              if (profile.sessions && profile.sessions.length > 0) {
+                pendingProfileSessionsRef.current = profile.sessions;
+                const existingTabCount = tabs.length;
+                const neededCount = profile.sessions.length;
+                const toCreate = Math.max(0, neededCount - existingTabCount);
+                for (let i = 0; i < toCreate; i++) {
+                  await createAndAssignTerminal();
+                }
+                if (toCreate === 0) {
+                  const assignedTabs = new Set<string>();
+                  for (const s of profile.sessions) {
+                    const candidate = tabs.find((t) => !assignedTabs.has(t.id));
+                    if (!candidate) break;
+                    assignedTabs.add(candidate.id);
+                    zoneLayout.assignTabToZone(s.zoneIndex, candidate.id);
+                  }
+                }
+              }
+            }}
+          />
+        </div>
       </div>
     </UIBridgeComponentScope>
   );

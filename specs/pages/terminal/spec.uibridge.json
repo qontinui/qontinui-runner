@@ -1236,16 +1236,6 @@
         "description": "Users work with multiple concurrent terminal sessions organized as tabs. Each tab is an independent PTY session with its own shell, working directory, command history, and scrollback buffer. Users can create new tabs (Ctrl+Shift+T), close tabs (Ctrl+Shift+W), cycle between tabs (Ctrl+Tab), and rename tabs for better organization. Tabs auto-rename from the first command entered. On mount, the terminal attempts to reconnect to existing Rust PTY sessions from previous page visits, preserving shell state across navigation. When all tabs are closed, a helpful empty state guides users on how to create a new terminal.",
         "elements": [
           {
-            "role": "tablist"
-          },
-          {
-            "role": "button",
-            "textContent": "+"
-          },
-          {
-            "textContent": "No terminals open"
-          },
-          {
             "textContent": "Ctrl+Shift+T"
           }
         ],
