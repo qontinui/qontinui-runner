@@ -205,7 +205,8 @@ export async function interpretCommand(
   } catch (err) {
     // Log to console; Tier-3 failure is silent at the UX level so the
     // CommandBar's fuzzy fallback isn't paved over by an error toast.
-    // eslint-disable-next-line no-console
+    // `console.warn` is allowed by the no-console rule (only `log` is
+    // disallowed), so no eslint-disable is needed here.
     console.warn("[Tier-3] command_interpret failed:", err);
     return null;
   }

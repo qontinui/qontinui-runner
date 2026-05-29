@@ -101,7 +101,7 @@ function toPaletteRow(action: CommandAction): PaletteActionLike {
       // the palette's existing action contract.
       callRegistry(action.id, {}).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
-        // eslint-disable-next-line no-console
+        // `console.warn` is allowed by the no-console rule; no disable needed.
         console.warn(
           `[CommandPalette] ${action.slash} failed: ${msg} — use Ctrl+/ to supply arguments.`,
         );

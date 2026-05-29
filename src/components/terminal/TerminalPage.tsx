@@ -247,7 +247,7 @@ function TerminalPageInner({
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             if (msg.includes("no-account") || msg.toLowerCase().includes("no matching")) {
-              throw new Error("No AI accounts available");
+              throw new Error("No AI accounts available", { cause: err });
             }
             throw err;
           }

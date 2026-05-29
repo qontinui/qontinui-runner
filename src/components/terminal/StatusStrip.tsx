@@ -167,7 +167,6 @@ export function StatusStrip() {
     };
     // The tick covers cadence-driven re-eval for the maxStuckMs reading;
     // tabs / sessionStates / fileLockStates cover state-driven re-eval.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs, sessionStates, fileLockStates]);
 
   const wrapperCount = wrapperTools.length;
