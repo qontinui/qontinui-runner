@@ -334,50 +334,6 @@ async fn desktop_ports_merged() -> Vec<u16> {
 // ADB Utilities (minimal, for discovery only)
 // ============================================================================
 
-/// Find ADB path
-fn find_adb() -> Option<std::path::PathBuf> {
-    // Check ANDROID_HOME
-    if let Ok(android_home) = std::env::var("ANDROID_HOME") {
-        let p = std::path::PathBuf::from(&android_home)
-            .join("platform-tools")
-            .join(if cfg!(windows) { "adb.exe" } else { "adb" });
-        if p.exists() {
-            return Some(p);
-        }
-    }
-
-    // Check ANDROID_SDK_ROOT
-    if let Ok(sdk_root) = std::env::var("ANDROID_SDK_ROOT") {
-        let p = std::path::PathBuf::from(&sdk_root)
-            .join("platform-tools")
-            .join(if cfg!(windows) { "adb.exe" } else { "adb" });
-        if p.exists() {
-            return Some(p);
-        }
-    }
-
-    // Common Windows paths
-    if cfg!(windows) {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let p = std::path::PathBuf::from(local_app_data)
-                .join("Android")
-                .join("Sdk")
-                .join("platform-tools")
-                .join("adb.exe");
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-
-    // Fallback to PATH
-    Some(std::path::PathBuf::from(if cfg!(windows) {
-        "adb.exe"
-    } else {
-        "adb"
-    }))
-}
-
 /// List connected ADB devices via the pure-Rust `adb_client` crate.
 async fn list_adb_devices() -> Vec<MobileDevice> {
     crate::mcp::adb_helper::list_devices()
@@ -410,46 +366,28 @@ async fn list_adb_devices() -> Vec<MobileDevice> {
         .collect()
 }
 
-/// Check if a mobile device has UI Bridge by port forwarding
+/// Check if a mobile device has UI Bridge by port forwarding.
+///
+/// Uses the host-side pre-allocated-port convention (see
+/// `adb_helper::forward_tcp` docs) instead of asking adb to pick the port.
+/// TOCTOU between `pick_free_local_port` releasing the bind and adb claiming
+/// the port is brief and matches what `UsbTransport::establish_forward` does.
 async fn check_device_ui_bridge(device_id: &str) -> Option<DiscoveredApp> {
-    let adb_path = find_adb()?;
     let client = build_scan_client()?;
 
-    // Forward a local port to the device's UI Bridge port
-    // Use tcp:0 to let the OS pick a free local port
-    let output = crate::process_helpers::tokio_no_window(&adb_path)
-        .args(["-s", device_id, "forward", "tcp:0", "tcp:9876"])
-        .output()
+    let local_port = crate::mcp::adb_helper::pick_free_local_port().await.ok()?;
+    crate::mcp::adb_helper::forward_tcp(device_id.to_string(), local_port, 9876)
         .await
         .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    // Parse the local port from output
-    let local_port_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let local_port: u16 = local_port_str.parse().ok()?;
 
     debug!(
         "Port forwarded device {} to local port {}",
         device_id, local_port
     );
 
-    // Check the forwarded port
     let result = check_port(&client, local_port).await;
 
-    // Remove the port forward
-    let _ = crate::process_helpers::tokio_no_window(&adb_path)
-        .args([
-            "-s",
-            device_id,
-            "forward",
-            "--remove",
-            &format!("tcp:{}", local_port),
-        ])
-        .output()
-        .await;
+    let _ = crate::mcp::adb_helper::forward_remove(device_id.to_string(), local_port).await;
 
     result
 }
@@ -616,54 +554,26 @@ async fn forward_device(
     State(_state): State<Arc<ApiState>>,
     Json(req): Json<ForwardDeviceRequest>,
 ) -> Result<Json<ApiResponse<ForwardDeviceResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let adb_path = find_adb().ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error(
-                "ADB not found. Install Android SDK platform-tools.",
-            )),
-        )
-    })?;
-
-    // Use tcp:0 to let the OS pick a free local port
-    let output = crate::process_helpers::tokio_no_window(&adb_path)
-        .args([
-            "-s",
-            &req.device_id,
-            "forward",
-            "tcp:0",
-            &format!("tcp:{}", req.remote_port),
-        ])
-        .output()
+    let local_port = crate::mcp::adb_helper::pick_free_local_port()
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error(format!("Failed to run adb: {}", e))),
+                Json(ApiResponse::error(format!(
+                    "Failed to pick local port: {}",
+                    e
+                ))),
             )
         })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error(format!(
-                "ADB forward failed: {}",
-                stderr.trim()
-            ))),
-        ));
-    }
-
-    let local_port_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let local_port: u16 = local_port_str.parse().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error(format!(
-                "Failed to parse local port from ADB output: '{}'",
-                local_port_str
-            ))),
-        )
-    })?;
+    crate::mcp::adb_helper::forward_tcp(req.device_id.clone(), local_port, req.remote_port)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(format!("ADB forward failed: {}", e))),
+            )
+        })?;
 
     debug!(
         "Persistent port forward: device {} remote {} -> local {}",
