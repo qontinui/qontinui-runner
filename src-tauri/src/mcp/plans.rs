@@ -621,11 +621,11 @@ mod tests {
 
         let pg = PgDb::new_blocking_for_test();
 
-        // Self-heal so the test passes even if the alembic migration
-        // hasn't landed in this DB yet.
-        pg.ensure_tasks_identity_hash_column()
+        // Provision the test fixture column so the test passes even if the
+        // alembic migration hasn't landed in this throwaway DB yet.
+        pg.create_tasks_identity_hash_for_test()
             .await
-            .expect("ensure identity_hash column");
+            .expect("create identity_hash column for test");
 
         let conn = pg.pool().get().await.expect("conn");
 

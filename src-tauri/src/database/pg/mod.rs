@@ -5,7 +5,6 @@
 
 pub mod activity_timeline;
 pub mod adaptive_learning;
-pub mod agent_sessions;
 pub mod agent_worktrees;
 pub mod agentic_metrics;
 pub mod ai_sessions;
@@ -47,7 +46,6 @@ pub mod learned_patterns_ops;
 pub mod learning;
 pub mod log_sources;
 pub mod memory_query_cache;
-pub mod merge_proposals;
 pub mod meta_optimizer;
 pub mod misc_crud;
 pub mod observations;
@@ -467,6 +465,31 @@ impl PgDb {
                 })
             })
             .collect())
+    }
+
+    /// Assert that a PG table exists, hard-failing if it doesn't.
+    ///
+    /// alembic (qontinui-web) is the sole author of the `coord.*` schema the
+    /// runner connects to. The runner no longer self-heals those tables; it
+    /// requires them to be present and fails fast with an actionable message
+    /// if the alembic migrations haven't been applied.
+    pub async fn require_table(&self, schema: &str, table: &str) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
+        let row = conn
+            .query_one(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_schema = $1 AND table_name = $2",
+                &[&schema, &table],
+            )
+            .await
+            .map_err(|e| format!("check {schema}.{table}: {e}"))?;
+        let n: i64 = row.get(0);
+        if n == 0 {
+            return Err(format!(
+                "missing PG table {schema}.{table} — run alembic migrations before starting"
+            ));
+        }
+        Ok(())
     }
 
     /// Get a reference to the connection pool.

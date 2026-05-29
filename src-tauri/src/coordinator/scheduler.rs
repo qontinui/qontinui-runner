@@ -113,96 +113,36 @@ pub fn start_coordinator_scheduler(
 
         let instance_id = format!("rust-{}", Uuid::new_v4());
 
-        // Self-heal the shadow-decisions table on PG instances where the
-        // alembic migration hasn't been applied. Idempotent. Logs but
-        // doesn't fail the scheduler — when shadow mode IS enabled and
-        // the table is missing, individual inserts will surface the
-        // error via the warn! line in `log_shadow_decision`.
+        // alembic (qontinui-web) is the sole author of the `coord.*` schema.
+        // The runner no longer self-heals these tables — it requires them to
+        // be present and aborts the scheduler with an actionable error if the
+        // migrations haven't been applied. The set mirrors the tables the
+        // scheduler + its downstream paths read/write:
+        //   - coord.coordinator_shadow_decisions (shadow-mode inserts only)
+        //   - coord.tasks (task state machine, identity_hash, emergent rows)
+        //   - coord.session_touched_files (deconflicter lookup)
+        //   - coord.agent_worktrees (branch-per-agent allocation)
+        //   - coord.merge_proposals + coord.merge_proposal_repos (merge API)
+        //   - coord.agent_sessions (Claude Code session lineage)
+        let mut required: Vec<&str> = vec![
+            "tasks",
+            "session_touched_files",
+            "agent_worktrees",
+            "merge_proposals",
+            "merge_proposal_repos",
+            "agent_sessions",
+        ];
         if shadow_mode_enabled {
-            if let Err(e) = state.app_state.pg_db.ensure_shadow_decisions_table().await {
-                warn!(
-                    "Coordinator scheduler: ensure_shadow_decisions_table failed: {} — shadow inserts may fail until alembic upgrade",
+            required.push("coordinator_shadow_decisions");
+        }
+        for table in required {
+            if let Err(e) = state.app_state.pg_db.require_table("coord", table).await {
+                error!(
+                    "Coordinator scheduler: required PG table check failed: {} — not starting (apply alembic migrations and restart)",
                     e
                 );
+                return;
             }
-        }
-
-        // Self-heal the coord.tasks.identity_hash column + partial unique
-        // index for re-decompose idempotency (Phase 1 of
-        // coord-task-status-hygiene plan). Idempotent. Logs but doesn't
-        // fail the scheduler — when the column is missing, the
-        // /plans/decompose endpoint's 3-way-merge path will surface a
-        // clear error.
-        if let Err(e) = state
-            .app_state
-            .pg_db
-            .ensure_tasks_identity_hash_column()
-            .await
-        {
-            warn!(
-                "Coordinator scheduler: ensure_tasks_identity_hash_column failed: {} — re-decompose may fail until alembic upgrade",
-                e
-            );
-        }
-
-        // Self-heal the coord.tasks schema additions required by the
-        // "Coord as Deconflicter, not Dispatcher" Phase 1 plan
-        // (§4.2 of plans/2026-05-13-coord-as-deconflicter-plan.md):
-        // origin column + NOT NULL relaxations + new indexes used by the
-        // deconflicter's "who else recently touched this file" lookup.
-        // Idempotent. Logs but doesn't fail the scheduler — when the
-        // columns are missing, emergent-task creation degrades gracefully
-        // (the INSERT errors, callers log and continue).
-        if let Err(e) = state
-            .app_state
-            .pg_db
-            .ensure_coord_tasks_emergent_columns()
-            .await
-        {
-            warn!(
-                "Coordinator scheduler: ensure_coord_tasks_emergent_columns failed: {} — emergent task creation may fail until alembic upgrade",
-                e
-            );
-        }
-
-        // Coordination Phase 1 (branch-per-agent): self-heal
-        // coord.agent_worktrees. Idempotent. Logs but doesn't fail —
-        // when the table is missing, /agents/allocate-local will
-        // surface the error from coord rather than from the runner.
-        if let Err(e) = state.app_state.pg_db.ensure_agent_worktrees_table().await {
-            warn!(
-                "Coordinator scheduler: ensure_agent_worktrees_table failed: {} — agent worktree allocation may fail until alembic upgrade",
-                e
-            );
-        }
-
-        // Coordination Phase 3 (merge proposal API): self-heal
-        // coord.merge_proposals + coord.merge_proposal_repos. Idempotent.
-        // Logs but doesn't fail — runner doesn't write these tables
-        // directly today, but the local-coord harness does, and a
-        // fresh dev DB whose alembic chain hasn't reached Phase 3 yet
-        // benefits from the self-heal.
-        if let Err(e) = state.app_state.pg_db.ensure_merge_proposals_tables().await {
-            warn!(
-                "Coordinator scheduler: ensure_merge_proposals_tables failed: {} — /merge/* endpoints may fail until alembic upgrade",
-                e
-            );
-        }
-
-        // Plan `coord-agent-session-id-tracking.md` Phase 2 (Side B):
-        // self-heal coord.agent_sessions (the Claude Code session
-        // lookup table). Idempotent. Logs but doesn't fail — coord's
-        // upsert_agent_session helper degrades gracefully when the
-        // table is missing, so a self-heal failure is non-blocking.
-        // Same posture as the merge-proposals helper above: runner
-        // doesn't write this table directly today; the self-heal
-        // exists so local-coord harnesses + fresh dev DBs have a
-        // path to bootstrap without waiting for alembic.
-        if let Err(e) = state.app_state.pg_db.ensure_agent_sessions_table().await {
-            warn!(
-                "Coordinator scheduler: ensure_agent_sessions_table failed: {} — agent-session lineage may be sparse until alembic upgrade",
-                e
-            );
         }
 
         info!(
