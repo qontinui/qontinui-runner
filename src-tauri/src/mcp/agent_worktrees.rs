@@ -117,7 +117,14 @@ pub async fn post_allocate_local(
         )
     })?;
 
-    let canonical_paths = build_canonical_paths(&req.repos, &req.repo_canonical_paths);
+    let canonical_paths =
+        build_canonical_paths(&req.repos, &req.repo_canonical_paths).map_err(|e| {
+            warn!("/agents/allocate-local: invalid repo slug: {e}");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("invalid repo slug: {e}"))),
+            )
+        })?;
     let repo_reqs: Vec<RepoRequest> = req
         .repos
         .iter()
@@ -240,31 +247,28 @@ pub(crate) fn coord_http_base() -> Result<String, String> {
     Ok("http://localhost:9870".to_string())
 }
 
+/// Resolve a canonical-checkout path per repo. Per-repo
+/// `repo_canonical_paths` overrides win for non-standard checkouts; the
+/// rest fall back to the unified
+/// [`crate::agent_worktree::canonical_paths::default_canonical_path`]
+/// resolver, which normalizes `owner/name` coord slugs into the runner's
+/// flat `<root>/<name>/` layout. A malformed slug (empty / trailing-slash)
+/// is surfaced as `Err` so the HTTP handler returns a 400 instead of
+/// attempting `git worktree add` on `<root>/`.
 fn build_canonical_paths(
     repos: &[AllocateLocalRepo],
     override_map: &HashMap<String, String>,
-) -> HashMap<String, PathBuf> {
+) -> Result<HashMap<String, PathBuf>, String> {
     let mut out: HashMap<String, PathBuf> = HashMap::new();
     for r in repos {
         let path = if let Some(p) = override_map.get(&r.repo) {
             PathBuf::from(p)
         } else {
-            default_canonical_path(&r.repo)
+            crate::agent_worktree::canonical_paths::default_canonical_path(&r.repo)?
         };
         out.insert(r.repo.clone(), path);
     }
-    out
-}
-
-#[cfg(target_os = "windows")]
-fn default_canonical_path(repo: &str) -> PathBuf {
-    PathBuf::from(format!("D:/qontinui-root/{}", repo))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn default_canonical_path(repo: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(format!("{}/qontinui-root/{}", home, repo))
+    Ok(out)
 }
 
 pub fn routes() -> axum::Router<Arc<ApiState>> {

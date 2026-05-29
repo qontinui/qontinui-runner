@@ -204,8 +204,10 @@ fn origin_url_basename(config_path: &Path) -> Option<String> {
 }
 
 /// `git@github.com:org/repo.git` / `https://github.com/org/repo.git`
-/// → `repo`.
-fn repo_basename_from_url(url: &str) -> String {
+/// → `repo`. Also reduces a bare `owner/name` coord slug to `name`.
+/// Reused by the bin crate's `agent_worktree::canonical_paths::canonical_segment`
+/// (hence fully `pub` — it crosses the lib↔bin crate boundary).
+pub fn repo_basename_from_url(url: &str) -> String {
     let url = url.trim().trim_end_matches('/');
     let last = url.rsplit(['/', ':']).next().unwrap_or(url);
     last.strip_suffix(".git").unwrap_or(last).to_string()
