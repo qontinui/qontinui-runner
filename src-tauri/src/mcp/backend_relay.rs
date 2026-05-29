@@ -1127,7 +1127,7 @@ async fn handle_relay_command(
         // Mobile terminal session relay
         // --------------------------------------------------------------
         "terminal_list" => handle_terminal_list(api_state, data),
-        "terminal_create" => handle_terminal_create(api_state, data),
+        "terminal_create" => handle_terminal_create(api_state, data).await,
         "terminal_input" => handle_terminal_input(api_state, data),
         "terminal_resize" => handle_terminal_resize(api_state, data),
         "terminal_close" => handle_terminal_close(api_state, data).await,
@@ -2029,7 +2029,7 @@ fn handle_terminal_list(api_state: &Arc<ApiState>, data: &Value) -> Option<Value
     }
 }
 
-fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
         .app_handle
         .try_state::<Arc<crate::terminal::TerminalManager>>()
@@ -2049,6 +2049,23 @@ fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
             .get("rows")
             .and_then(|v| v.as_u64())
             .map(|v| v.min(u16::MAX as u64) as u16);
+        // Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
+        // Accept the same `intent_repo` opt-in the Tauri command + HTTP-SDK
+        // proxy accept so backend-relay callers can declare edit intent on
+        // a registered repo. Allocation happens via the shared helper; the
+        // context (if any) is parked on the resulting TerminalSession.
+        let intent_repo = data
+            .get("intent_repo")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let (working_dir, isolated_ctx) =
+            crate::agent_worktree::isolated_edit::acquire_for_terminal(
+                intent_repo.as_deref(),
+                title.as_deref().unwrap_or("Terminal edit session"),
+                working_dir,
+            )
+            .await;
 
         match tm.create(
             title,
@@ -2058,11 +2075,18 @@ fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
             rows,
             api_state.app_handle.clone(),
         ) {
-            Ok(info) => Some(serde_json::json!({
-                "type": "terminal_created",
-                "terminal": info,
-                "request_id": data.get("request_id"),
-            })),
+            Ok(info) => {
+                if let Some(ctx) = isolated_ctx {
+                    if let Some(session) = tm.get(&info.id) {
+                        session.set_isolated_edit_ctx(ctx);
+                    }
+                }
+                Some(serde_json::json!({
+                    "type": "terminal_created",
+                    "terminal": info,
+                    "request_id": data.get("request_id"),
+                }))
+            }
             Err(e) => Some(serde_json::json!({
                 "type": "error",
                 "message": format!("Failed to create terminal: {}", e),

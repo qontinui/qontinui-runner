@@ -36,45 +36,17 @@ pub async fn terminal_create(
     rows: Option<u16>,
     intent_repo: Option<String>,
 ) -> Result<CommandResponse, String> {
-    // Phase 2 — try to allocate an isolated worktree when the caller
-    // declared edit intent on a registered repo AND worktree mode is on.
-    // On failure or flag-off, fall through to legacy shared-cwd behavior.
-    let isolated_ctx = if let Some(ref repo) = intent_repo {
-        let repos = vec![repo.clone()];
-        let purpose = title.as_deref().unwrap_or("Terminal edit session");
-        match crate::agent_worktree::isolated_edit::acquire(
-            crate::agent_worktree::isolated_edit::AcquireRequest {
-                repos: &repos,
-                intent: Some(purpose),
-                declared_overlap_paths: None,
-                plan_id: None,
-                phase: None,
-            },
-        )
-        .await
-        {
-            Ok(Some(ctx)) => Some(ctx),
-            Ok(None) => None, // flag off — legacy path
-            Err(e) => {
-                warn!(
-                    intent_repo = %repo,
-                    error = %e,
-                    "terminal_create: isolated worktree allocate failed — falling back to shared cwd"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // If we allocated a worktree, route the PTY there instead of the
-    // operator's primary checkout. The Intent built below uses the same
-    // resolved cwd so `coord.sessions` reflects what actually happened.
-    let working_dir = match isolated_ctx.as_ref().and_then(|c| c.worktrees.first()) {
-        Some(w) => Some(w.worktree_path.to_string_lossy().to_string()),
-        None => working_dir,
-    };
+    // Phase 2 — route through the shared `acquire_for_terminal` helper
+    // so this entry point + the HTTP-proxy / backend-relay siblings stay
+    // in lockstep. When `intent_repo` is `None`, the helper is a no-op;
+    // when it's `Some(_)` but worktree mode is off or allocation fails,
+    // the helper returns the original `working_dir` and logs.
+    let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
+        intent_repo.as_deref(),
+        title.as_deref().unwrap_or("Terminal edit session"),
+        working_dir,
+    )
+    .await;
 
     let repo_detect_handle = app_handle.clone();
     let repo_detect_dir = working_dir.clone();
