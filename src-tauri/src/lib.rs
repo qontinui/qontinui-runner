@@ -21,6 +21,11 @@ pub mod secure_storage;
 // share one code path. See `pair.rs` for the canonical wire shapes.
 pub mod pair;
 
+// Cognito Hosted-UI sign-in (RFC 8252 PKCE). Phase 5 of the
+// unified-Cognito-identity plan. Tauri-free (loopback + system browser); the
+// `cognito_sign_in` Tauri command in `commands::auth` drives it.
+pub mod cognito;
+
 // ============================================================================
 // Main window label abstraction
 // ============================================================================
