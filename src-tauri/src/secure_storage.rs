@@ -38,11 +38,36 @@ const SERVICE_NAME: &str = "com.qontinui.runner";
 const STORAGE_FILE: &str = "auth_tokens.enc";
 
 /// Stored token data structure
+///
+/// ## Token slots (Phase 5 unified-Cognito-identity)
+///
+/// - `access_token` / `refresh_token`: the **coord device-token JWT** slot.
+///   `access_token` holds the coord-minted device JWT (read by the WS relay
+///   via `AuthManager::get_access_token`); `refresh_token` is unused for the
+///   device-JWT flow (coord owns its lifecycle).
+/// - `oauth_access_token` / `oauth_id_token` / `oauth_refresh_token`: the
+///   **Cognito user-token** slots, written by the RFC-8252 PKCE sign-in
+///   (`cognito::store_cognito_tokens`). These are kept distinct from the
+///   device-JWT slot so the relay keeps using the device JWT while
+///   user-facing calls (and the device→user re-bind) use the Cognito token.
+///   `oauth_expires_at` is the absolute unix-seconds expiry of the Cognito
+///   access token, used by the refresher to decide staleness.
+///
+/// All new fields carry `#[serde(default)]` so a pre-Phase-5 `auth_tokens.enc`
+/// (only the first three keys) still deserializes.
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct StoredTokens {
     access_token: Option<String>,
     refresh_token: Option<String>,
     device_id: Option<String>,
+    #[serde(default)]
+    oauth_access_token: Option<String>,
+    #[serde(default)]
+    oauth_id_token: Option<String>,
+    #[serde(default)]
+    oauth_refresh_token: Option<String>,
+    #[serde(default)]
+    oauth_expires_at: Option<i64>,
 }
 
 /// Secure file-based storage manager.
@@ -217,11 +242,17 @@ impl SecureStorage {
             .ok_or_else(|| anyhow::anyhow!("Refresh token not found in storage"))
     }
 
-    /// Clears all tokens from storage.
+    /// Clears all tokens from storage (device-JWT slot AND the Cognito
+    /// user-token slots). `device_id` is preserved — it is a stable local
+    /// identifier, not a credential.
     pub fn clear_tokens(&self) -> Result<()> {
         let mut tokens = self.load_tokens().unwrap_or_default();
         tokens.access_token = None;
         tokens.refresh_token = None;
+        tokens.oauth_access_token = None;
+        tokens.oauth_id_token = None;
+        tokens.oauth_refresh_token = None;
+        tokens.oauth_expires_at = None;
         self.save_tokens(&tokens)?;
         info!("Tokens cleared from secure file storage");
         Ok(())
@@ -250,6 +281,71 @@ impl SecureStorage {
             Ok(tokens) => tokens.access_token.is_some() && tokens.refresh_token.is_some(),
             Err(_) => false,
         }
+    }
+
+    /// Stores the Cognito user tokens (Phase 5 unified-Cognito-identity).
+    ///
+    /// Writes the `oauth_access_token` / `oauth_id_token` /
+    /// `oauth_refresh_token` / `oauth_expires_at` slots, leaving the coord
+    /// device-JWT (`access_token`) slot untouched.
+    pub fn store_oauth_tokens(
+        &self,
+        access_token: &str,
+        id_token: &str,
+        refresh_token: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens.oauth_access_token = Some(access_token.to_string());
+        tokens.oauth_id_token = Some(id_token.to_string());
+        tokens.oauth_refresh_token = Some(refresh_token.to_string());
+        tokens.oauth_expires_at = Some(expires_at);
+        self.save_tokens(&tokens)?;
+        info!("Cognito (oauth) tokens stored in secure file storage");
+        Ok(())
+    }
+
+    /// Retrieves the Cognito access token.
+    pub fn get_oauth_access_token(&self) -> Result<String> {
+        let tokens = self.load_tokens()?;
+        tokens
+            .oauth_access_token
+            .ok_or_else(|| anyhow::anyhow!("Cognito access token not found in storage"))
+    }
+
+    /// Retrieves the Cognito id token.
+    pub fn get_oauth_id_token(&self) -> Result<String> {
+        let tokens = self.load_tokens()?;
+        tokens
+            .oauth_id_token
+            .ok_or_else(|| anyhow::anyhow!("Cognito id token not found in storage"))
+    }
+
+    /// Retrieves the Cognito refresh token.
+    pub fn get_oauth_refresh_token(&self) -> Result<String> {
+        let tokens = self.load_tokens()?;
+        tokens
+            .oauth_refresh_token
+            .ok_or_else(|| anyhow::anyhow!("Cognito refresh token not found in storage"))
+    }
+
+    /// Retrieves the Cognito access-token expiry (absolute unix seconds),
+    /// if present.
+    pub fn get_oauth_expires_at(&self) -> Option<i64> {
+        self.load_tokens().ok().and_then(|t| t.oauth_expires_at)
+    }
+
+    /// Clears only the Cognito (oauth) token slots, leaving the device-JWT
+    /// slot intact. Used on Cognito sign-out.
+    pub fn clear_oauth_tokens(&self) -> Result<()> {
+        let mut tokens = self.load_tokens().unwrap_or_default();
+        tokens.oauth_access_token = None;
+        tokens.oauth_id_token = None;
+        tokens.oauth_refresh_token = None;
+        tokens.oauth_expires_at = None;
+        self.save_tokens(&tokens)?;
+        info!("Cognito (oauth) tokens cleared from secure file storage");
+        Ok(())
     }
 
     /// Deletes the storage file entirely.
@@ -310,6 +406,41 @@ mod tests {
         storage.clear_tokens().unwrap();
         assert!(storage.get_access_token().is_err());
         assert!(storage.get_refresh_token().is_err());
+    }
+
+    #[test]
+    fn test_oauth_tokens_round_trip_and_isolation() {
+        let storage = create_test_storage("test_oauth_tokens_round_trip");
+
+        // Device-JWT slot.
+        storage.store_tokens("device.jwt.here", "").unwrap();
+        // Cognito user-token slots.
+        storage
+            .store_oauth_tokens("cog.access", "cog.id", "cog.refresh", 1_700_000_000)
+            .unwrap();
+
+        // Both slots coexist — Cognito write must not clobber the device JWT.
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt.here");
+        assert_eq!(storage.get_oauth_access_token().unwrap(), "cog.access");
+        assert_eq!(storage.get_oauth_id_token().unwrap(), "cog.id");
+        assert_eq!(storage.get_oauth_refresh_token().unwrap(), "cog.refresh");
+        assert_eq!(storage.get_oauth_expires_at(), Some(1_700_000_000));
+
+        // Clearing only the oauth slots leaves the device JWT intact.
+        storage.clear_oauth_tokens().unwrap();
+        assert!(storage.get_oauth_access_token().is_err());
+        assert_eq!(storage.get_access_token().unwrap(), "device.jwt.here");
+    }
+
+    /// A pre-Phase-5 `StoredTokens` JSON (only the original three keys) must
+    /// still deserialize — the new oauth_* fields carry `#[serde(default)]`.
+    #[test]
+    fn test_legacy_stored_tokens_without_oauth_fields_deserializes() {
+        let raw = r#"{"access_token":"a","refresh_token":"r","device_id":"d"}"#;
+        let parsed: StoredTokens = serde_json::from_str(raw).expect("legacy shape must decode");
+        assert_eq!(parsed.access_token.as_deref(), Some("a"));
+        assert!(parsed.oauth_access_token.is_none());
+        assert!(parsed.oauth_expires_at.is_none());
     }
 
     #[test]

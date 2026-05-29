@@ -243,6 +243,66 @@ pub(crate) async fn try_refresh_once(
     }
 }
 
+/// Ensure the Cognito (oauth) access token is fresh before it's used as the
+/// pair-cli bearer. If a Cognito refresh token is stored and the access token
+/// is within the refresh threshold (or already expired), POST the
+/// `refresh_token` grant to Cognito and persist the new access/id tokens.
+///
+/// Best-effort: a refresh failure is logged and we fall through with whatever
+/// is stored — `try_refresh_once` will surface a 401 from the web backend and
+/// keep the existing device JWT (the REPLACE-not-REVOKE invariant).
+///
+/// Returns the bearer the device pair should present: the (possibly
+/// refreshed) Cognito access token when a Cognito session exists, else `None`
+/// (the caller falls back to the legacy device-JWT-slot bearer for installs
+/// paired via local-login).
+async fn ensure_fresh_cognito_bearer(auth_manager: &crate::auth::AuthManager) -> Option<String> {
+    // No Cognito session → legacy/local-login install; let the caller use its
+    // existing bearer source.
+    let refresh_token = match auth_manager.get_oauth_refresh_token() {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => return None,
+    };
+
+    if auth_manager.cognito_token_needs_refresh() {
+        info!("device_jwt_refresher: Cognito access token stale — refreshing first");
+        let rt = refresh_token.clone();
+        let refreshed =
+            tokio::task::spawn_blocking(move || qontinui_runner_lib::cognito::refresh_tokens(&rt))
+                .await;
+        match refreshed {
+            Ok(Ok(resp)) => {
+                let expires_at = chrono::Utc::now().timestamp() + resp.expires_in;
+                // Cognito omits refresh_token on the refresh grant — keep the
+                // existing one.
+                let new_refresh = resp.refresh_token.unwrap_or(refresh_token);
+                if let Err(e) = auth_manager.store_oauth_tokens(
+                    &resp.access_token,
+                    &resp.id_token,
+                    &new_refresh,
+                    expires_at,
+                ) {
+                    warn!("device_jwt_refresher: persist refreshed Cognito tokens failed: {e}");
+                } else {
+                    info!("device_jwt_refresher: Cognito access token refreshed");
+                }
+                return Some(resp.access_token);
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "device_jwt_refresher: Cognito token refresh failed: {e} — using stored token"
+                );
+            }
+            Err(join_err) => {
+                warn!("device_jwt_refresher: Cognito refresh task join failed: {join_err}");
+            }
+        }
+    }
+
+    // Fresh enough (or refresh failed) — use whatever access token is stored.
+    auth_manager.get_oauth_access_token().ok()
+}
+
 async fn refresher_loop(
     _api_state: Arc<ApiState>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -315,29 +375,35 @@ async fn refresher_loop(
                 continue;
             }
             Decision::Pair => {
-                // Post-2026-05-22: pair-cli now goes through the web
-                // backend (`/api/v1/devices/pair-cli`), not coord directly,
-                // so the backend can resolve `tenant_id` from the
-                // authenticated user. The backend gates on the FastAPI
-                // user-JWT (`Authorization: Bearer <access_token>`) — not
-                // the legacy `runner_token`, which only coord ever
-                // accepted. Pull the user JWT that the runner stashed at
-                // sign-in time (`commands::auth::login` →
-                // `AuthManager::store_tokens`).
-                let bearer_token = match auth_manager.get_access_token() {
-                    Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-                    _ => {
-                        warn!(
-                            "device_jwt_refresher: access_token slot empty — user must \
-                             sign in to Qontinui before the refresher can pair"
-                        );
-                        if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
+                // The web backend's pair-cli endpoint gates on the user
+                // bearer (`Authorization: Bearer <user-token>`). Phase 5
+                // (unified-Cognito-identity): when the runner was signed in
+                // via Cognito, the bearer is the Cognito **access token** —
+                // refreshed first if it's stale (so the re-bind presents a
+                // valid user token). For legacy/local-login installs there's
+                // no Cognito session, so we fall back to the device-JWT slot
+                // bearer (the historical Phase-2 source).
+                let bearer_token = match ensure_fresh_cognito_bearer(&auth_manager).await {
+                    Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    _ => match auth_manager.get_access_token() {
+                        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+                        _ => {
+                            warn!(
+                                "device_jwt_refresher: no Cognito session and access_token slot \
+                                 empty — user must sign in to Qontinui before the refresher can pair"
+                            );
+                            if wait_with_signals(
+                                REFRESH_CHECK_INTERVAL,
+                                &mut shutdown_rx,
+                                &mut kick_rx,
+                            )
                             .await
-                        {
-                            return;
+                            {
+                                return;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
+                    },
                 };
                 let pair_base = settings_snapshot
                     .web_integration

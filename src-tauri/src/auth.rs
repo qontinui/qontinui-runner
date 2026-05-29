@@ -406,6 +406,67 @@ impl AuthManager {
         let now = chrono::Utc::now().timestamp();
         Ok(now + REFRESH_BEFORE_EXPIRY_SECS >= claim.exp)
     }
+
+    // ========================================================================
+    // Cognito (oauth) user-token slots — Phase 5 unified-Cognito-identity.
+    //
+    // These are stored in slots DISTINCT from the coord device-JWT
+    // (`access_token`) slot so the WS relay keeps using the device JWT while
+    // user-facing calls (and the device→user re-bind) use the Cognito token.
+    // Keychain backup is intentionally NOT mirrored here: the keychain path
+    // proved unreliable on Windows (see module docs) and the encrypted file
+    // is the source of truth.
+    // ========================================================================
+
+    /// Store the Cognito user tokens. `expires_at` is the absolute
+    /// unix-seconds expiry of the Cognito access token (now + expires_in).
+    pub fn store_oauth_tokens(
+        &self,
+        access_token: &str,
+        id_token: &str,
+        refresh_token: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        self.secure_storage
+            .store_oauth_tokens(access_token, id_token, refresh_token, expires_at)
+            .context("Failed to store Cognito tokens in secure storage")?;
+        info!("Cognito tokens stored successfully in secure storage");
+        Ok(())
+    }
+
+    /// Retrieve the Cognito access token.
+    pub fn get_oauth_access_token(&self) -> Result<String> {
+        self.secure_storage.get_oauth_access_token()
+    }
+
+    /// Retrieve the Cognito id token.
+    pub fn get_oauth_id_token(&self) -> Result<String> {
+        self.secure_storage.get_oauth_id_token()
+    }
+
+    /// Retrieve the Cognito refresh token.
+    pub fn get_oauth_refresh_token(&self) -> Result<String> {
+        self.secure_storage.get_oauth_refresh_token()
+    }
+
+    /// Absolute unix-seconds expiry of the Cognito access token, if stored.
+    pub fn get_oauth_expires_at(&self) -> Option<i64> {
+        self.secure_storage.get_oauth_expires_at()
+    }
+
+    /// `true` iff the Cognito access token is missing OR within
+    /// [`REFRESH_BEFORE_EXPIRY_SECS`] of expiry. Used by the device-JWT
+    /// refresher to refresh the Cognito token *first* when it's stale (so the
+    /// subsequent device re-bind presents a fresh user bearer).
+    pub fn cognito_token_needs_refresh(&self) -> bool {
+        match self.secure_storage.get_oauth_expires_at() {
+            Some(exp) => chrono::Utc::now().timestamp() + REFRESH_BEFORE_EXPIRY_SECS >= exp,
+            // No stored expiry → either never signed in via Cognito, or a
+            // partial write. Treat as "needs refresh" only if we actually
+            // hold a refresh token; otherwise there's nothing to refresh.
+            None => self.secure_storage.get_oauth_refresh_token().is_ok(),
+        }
+    }
 }
 
 impl Default for AuthManager {

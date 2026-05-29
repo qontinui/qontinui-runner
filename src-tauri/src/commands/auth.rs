@@ -1146,6 +1146,165 @@ async fn pair_with_credentials_impl(
     })
 }
 
+/// Wire response for [`cognito_sign_in`]. Mirrors the credentials/pair-code
+/// confirmation shape so the FE shows a uniform "signed in" panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CognitoSignInResponse {
+    /// Cognito `sub` (the user id used to bind the device).
+    pub user_id: String,
+    /// `email` claim from the Cognito id token, if present.
+    pub email: Option<String>,
+    /// Tenant the coord device JWT was minted under (decoded from the minted
+    /// device JWT — coord stamps it; the Cognito token does not carry it).
+    pub tenant_id: Option<String>,
+    /// The paired device id.
+    pub device_id: String,
+}
+
+/// Sign in to the runner with a **Cognito** account via RFC 8252 (system
+/// browser + PKCE + loopback redirect), then bind the coord device-token JWT
+/// to that user.
+///
+/// Phase 5 of the unified-Cognito-identity plan. Flow:
+///   1. RFC-8252 PKCE login against the Cognito Hosted UI
+///      (`cognito::pkce_login` — system browser + fixed-port loopback). Yields
+///      `{access_token, id_token, refresh_token, expires_at, sub, email}`.
+///   2. Persist the Cognito tokens in the distinct oauth slots
+///      (`AuthManager::store_oauth_tokens`) — kept separate from the coord
+///      device-JWT slot so the WS relay keeps using the device JWT while
+///      user-facing calls use the Cognito token.
+///   3. Bind device→user: reuse the EXISTING web-backend `pair-cli` flow
+///      (`pair::pair_with_auth_token_with_ids`) with the Cognito **access
+///      token** as the user bearer and the Cognito `sub` as
+///      `X-Qontinui-User-Id`, so the minted device JWT is user-bound. (Swaps
+///      the token *source* — Cognito instead of local-login JWT — not the
+///      endpoint.) The web backend resolves `tenant_id` server-side.
+///   4. Persist the device JWT, promote to Tier 2, kick the relay + refresher.
+///
+/// `backend_url` is the web-backend base (e.g. `https://api.qontinui.io`). It
+/// is required and explicit (NOT `get_api_base_url()`) so a debug build can
+/// target prod — symmetric with [`pair_with_credentials`].
+#[tauri::command]
+pub async fn cognito_sign_in(backend_url: String) -> Result<CognitoSignInResponse, String> {
+    cognito_sign_in_impl(backend_url)
+        .await
+        .map_err(String::from)
+}
+
+async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInResponse, AppError> {
+    use qontinui_runner_lib::pair::{
+        pair_with_auth_token_with_ids, persist_pairing, read_device_id_from_disk,
+        tenant_id_from_oauth_claim,
+    };
+
+    let base = backend_url.trim().trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return Err(AppError::Raw("backend_url is required".to_string()));
+    }
+
+    // 1. RFC-8252 PKCE login (blocking — browser + loopback). Run on a
+    //    worker thread so it doesn't block the tokio runtime.
+    info!("cognito_sign_in: starting RFC-8252 PKCE login");
+    let login = tokio::task::spawn_blocking(qontinui_runner_lib::cognito::pkce_login)
+        .await
+        .map_err(|e| AppError::Raw(format!("PKCE login task panicked: {e}")))?
+        .map_err(AppError::Raw)?;
+
+    info!(
+        "cognito_sign_in: PKCE login succeeded (sub={}) — binding device",
+        login.sub
+    );
+
+    // 2. Persist the Cognito user tokens in the distinct oauth slots.
+    let auth_manager = AuthManager::new();
+    auth_manager
+        .store_oauth_tokens(
+            &login.access_token,
+            &login.id_token,
+            &login.refresh_token,
+            login.expires_at,
+        )
+        .map_err(|e| AppError::Raw(format!("persist Cognito tokens: {e}")))?;
+
+    // 3. Device identity from disk.
+    let device_id = read_device_id_from_disk()
+        .map_err(|e| AppError::Raw(format!("could not read device identity: {e}")))?;
+
+    // 4. Bind device→user via the existing pair-cli flow. The web backend
+    //    resolves tenant_id server-side from the authenticated user, so the
+    //    body tenant_id is a placeholder (nil) — same as the headless path.
+    //    The user bearer is the Cognito ACCESS token; the user id is the
+    //    Cognito `sub`.
+    let base_b = base.clone();
+    let cognito_access = login.access_token.clone();
+    let device_b = device_id.clone();
+    let sub_b = login.sub.clone();
+    let pair_resp = tokio::task::spawn_blocking(move || {
+        pair_with_auth_token_with_ids(
+            &base_b,
+            &cognito_access,
+            &device_b,
+            &sub_b,
+            uuid::Uuid::nil(),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Raw(format!("device-pair task panicked: {e}")))?
+    .map_err(AppError::Raw)?;
+
+    // Coord stamps the real tenant_id on the minted device JWT; decode it for
+    // persistence + display (the Cognito token does not carry tenant_id).
+    let tenant_id = tenant_id_from_oauth_claim(&pair_resp.token)
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+        .unwrap_or(uuid::Uuid::nil());
+
+    // 5. Persist the device JWT + paired-user file.
+    persist_pairing(&pair_resp, tenant_id)
+        .map_err(|e| AppError::Raw(format!("persist pairing: {e}")))?;
+
+    let tenant_id_str = if tenant_id.is_nil() {
+        None
+    } else {
+        Some(tenant_id.to_string())
+    };
+
+    // 6. Promote to Tier 2 + stage backend, then kick the relay/refresher.
+    {
+        let mut s = settings::load_settings();
+        if s.web_integration.backend_url.trim() != base {
+            s.web_integration.backend_url = base.clone();
+        }
+        s.web_integration.enabled = true;
+        s.qontinui_user_id = Some(login.sub.clone());
+        s.tier = settings::RunnerTier::QontinuiAccount;
+        s.tier_initialized = true;
+        if crate::instance::is_secondary() {
+            warn!("cognito_sign_in: secondary runner — applying in-memory only, skipping save_settings");
+        } else {
+            settings::save_settings(&s)
+                .map_err(|e| AppError::Raw(format!("persist tier promotion: {e}")))?;
+        }
+    }
+    tokio::spawn(async {
+        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+        crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+    });
+
+    let resp_device_id = pair_resp.device_id.clone().unwrap_or(device_id);
+    info!(
+        "cognito_sign_in: signed in + device bound (sub={}, device={resp_device_id}) — Tier 2 active",
+        login.sub
+    );
+
+    Ok(CognitoSignInResponse {
+        user_id: login.sub,
+        email: login.email,
+        tenant_id: tenant_id_str,
+        device_id: resp_device_id,
+    })
+}
+
 /// Clears the runner token, drops the runner back to Tier 0/1, and kicks
 /// the relay so the WS connection closes cleanly.
 ///
@@ -1238,6 +1397,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             set_runner_tier,
             start_qontinui_sign_in,
             pair_with_credentials,
+            cognito_sign_in,
             qontinui_sign_out,
             device_jwt_present,
             kick_device_jwt_refresher_cmd,
