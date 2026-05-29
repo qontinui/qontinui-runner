@@ -161,8 +161,8 @@ pub async fn command_interpret(
         ));
     }
 
-    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("envelope JSON parse: {e}"))?;
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("envelope JSON parse: {e}"))?;
 
     if envelope
         .get("is_error")
