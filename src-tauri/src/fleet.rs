@@ -201,6 +201,34 @@ fn warn_tenant_id_unresolvable_once() {
     }
 }
 
+/// Dedupe the "coord rejected our tenant_id as unknown" heartbeat warning.
+/// coord returns HTTP 400 `{"error":"unknown_tenant", ...}` when our
+/// tenant_id is not present in `coord.tenants`; the heartbeat ticks every 30s
+/// so a stale `paired_user.json` would otherwise flood the journal forever.
+/// Fires exactly once per process lifetime.
+static UNKNOWN_TENANT_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Atomic gate behind [`warn_unknown_tenant_once`]: returns `true` exactly
+/// once per process (the first caller), `false` thereafter. Factored out so
+/// the once-per-process semantics are unit-testable without asserting on the
+/// `warn!` side effect.
+fn should_warn_unknown_tenant() -> bool {
+    !UNKNOWN_TENANT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn warn_unknown_tenant_once() {
+    if should_warn_unknown_tenant() {
+        warn!(
+            "fleet::heartbeat: coord rejected this device's tenant_id as unknown \
+             (not present in coord.tenants); heartbeats will keep being rejected \
+             until paired_user.json carries a valid tenant_id. Re-run \
+             `qontinui_profile device pair --tenant-id <uuid>` to recover. \
+             Logging once per process."
+        );
+    }
+}
+
 /// Cache file for the last successful budget payload. Inspectable when
 /// coord is unreachable; lets operators verify "what was advertised" from
 /// the runner side without coord access. Path: `~/.qontinui/last_budget.json`.
@@ -587,6 +615,27 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();
+        // Phase 2 of the unknown-tenant plan: coord returns HTTP 400
+        // `{"error":"unknown_tenant","tenant_id":"<uuid>", ...}` when our
+        // tenant_id is not present in coord.tenants. A stale paired_user.json
+        // would 400 here forever (30s cadence) — warn once, then keep
+        // returning Err so the caller logs+swallows (same posture as the
+        // tenant_id-unresolvable skip; we never exit the runner).
+        if status.as_u16() == 400 {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                if json.get("error").and_then(|v| v.as_str()) == Some("unknown_tenant") {
+                    warn_unknown_tenant_once();
+                    let body_tenant = json
+                        .get("tenant_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<unknown>");
+                    return Err(format!(
+                        "coord rejected heartbeat: unknown_tenant (tenant_id={body_tenant}); \
+                         see warn-once log"
+                    ));
+                }
+            }
+        }
         let excerpt: String = body.chars().take(200).collect();
         Err(format!("coord returned {status} for POST {url}: {excerpt}"))
     }
@@ -1166,6 +1215,28 @@ pub fn spawn_tree_publisher() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 2 unknown-tenant warn-once dedupe: across N successive
+    /// invocations the gate must return `true` exactly once (the first
+    /// caller) and `false` thereafter. We assert on the atomic gate rather
+    /// than the `warn!` side effect for determinism. Reset the flag first so
+    /// the test is independent of any earlier in-process call.
+    #[test]
+    fn unknown_tenant_warn_fires_exactly_once() {
+        UNKNOWN_TENANT_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut fired = 0usize;
+        for _ in 0..5 {
+            if should_warn_unknown_tenant() {
+                fired += 1;
+            }
+        }
+        assert_eq!(
+            fired, 1,
+            "expected the warn gate to open exactly once across 5 calls"
+        );
+        // Reset so we don't leak state into other tests sharing the process.
+        UNKNOWN_TENANT_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 
     #[test]
     fn derive_max_agents_examples() {
