@@ -118,11 +118,12 @@ pub async fn acquire(
     let device_id = read_device_id()
         .map_err(|e| AllocateError::Other(format!("device_id not available: {e}")))?;
 
-    let canonical_paths: HashMap<String, PathBuf> = req
-        .repos
-        .iter()
-        .map(|repo| (repo.clone(), default_canonical_path(repo)))
-        .collect();
+    let mut canonical_paths: HashMap<String, PathBuf> = HashMap::with_capacity(req.repos.len());
+    for repo in req.repos {
+        let path = super::canonical_paths::default_canonical_path(repo)
+            .map_err(|e| AllocateError::Other(format!("canonical path for repo {repo:?}: {e}")))?;
+        canonical_paths.insert(repo.clone(), path);
+    }
 
     let mut repo_reqs: Vec<RepoRequest> = Vec::with_capacity(req.repos.len());
     for repo in req.repos {
@@ -198,17 +199,6 @@ fn read_device_id() -> Result<uuid::Uuid, String> {
         .and_then(|s| s.as_str())
         .ok_or_else(|| format!("{}: missing device_id (or machine_id)", path.display()))?;
     uuid::Uuid::parse_str(id_str).map_err(|e| format!("invalid UUID: {e}"))
-}
-
-#[cfg(target_os = "windows")]
-fn default_canonical_path(repo: &str) -> PathBuf {
-    PathBuf::from(format!("D:/qontinui-root/{}", repo))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn default_canonical_path(repo: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(format!("{}/qontinui-root/{}", home, repo))
 }
 
 fn resolve_head_sha(canonical: &Path) -> Result<String, String> {
