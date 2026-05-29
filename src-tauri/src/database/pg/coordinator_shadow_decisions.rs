@@ -134,24 +134,6 @@ impl PgDb {
         Ok(row_to_shadow(&row))
     }
 
-    /// Previously self-healed `coord.coordinator_shadow_decisions` on PG
-    /// instances where the alembic migration hadn't applied yet. The
-    /// table is now Atlas-managed out of
-    /// `qontinui-runner/atlas/schema.hcl` (Row 3 schema-half pilot,
-    /// Wave 1.4); Atlas is invoked out-of-process at deploy time.
-    ///
-    /// Kept as a no-op stub so existing callers in the scheduler boot
-    /// path don't need to change shape during the migration. Remove the
-    /// callsites and this stub once the pilot is declared stable
-    /// (follow-up tracked in Row 3 schema-half tracker row).
-    ///
-    /// The companion ALTER on `coord.coordinator_decisions`
-    /// (`observation_hash` column) is left alembic-managed — it's an
-    /// additive evolution on a table the runner doesn't own.
-    pub async fn ensure_shadow_decisions_table(&self) -> Result<(), String> {
-        Ok(())
-    }
-
     /// List recent shadow rows, newest-first. Used by the soak dashboard.
     pub async fn list_recent_shadow_decisions(
         &self,

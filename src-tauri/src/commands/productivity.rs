@@ -1186,9 +1186,8 @@ pub async fn spawn_worker_session(
     // emergent `coord.tasks` row keyed by this worker's task_run_id so
     // the deconflicter and in-session advisory banner have something to
     // attach to. Best-effort — never block worker spawn on this. The
-    // partial unique index `idx_tasks_emergent_per_session` (added by
-    // `ensure_coord_tasks_emergent_columns`) makes the INSERT idempotent
-    // on re-registration.
+    // partial unique index `idx_tasks_emergent_per_session` (alembic-owned)
+    // makes the INSERT idempotent on re-registration.
     if let Err(e) = app_state
         .pg_db
         .create_emergent_task(&task_run_id, "in_progress", "session_emergent", None)

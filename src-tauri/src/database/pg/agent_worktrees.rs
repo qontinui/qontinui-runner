@@ -4,10 +4,8 @@
 //! Plan reference:
 //! `D:/qontinui-root/plans/2026-05-14-branch-per-agent-coordination-plan.md`
 //! §4.1 + §4.2. The schema is defined authoritatively in alembic revision
-//! `coord_phase_1_01_agent_worktrees`; this module mirrors it via the
-//! self-heal pattern documented in memory
-//! [[proj_pg_dual_schema_runner_public]] — the runner can write rows
-//! without waiting for qontinui-web's alembic upgrade to run.
+//! `coord_phase_1_01_agent_worktrees` (qontinui-web), which is the sole
+//! author of the `coord.*` schema; the runner only reads/writes rows.
 //!
 //! Column shapes match §4.2 exactly. Downstream phases (merge proposals,
 //! merge scheduler, observability heatmap) read this table, so the names
@@ -88,84 +86,6 @@ fn row_to_aw(r: &tokio_postgres::Row) -> AgentWorktreeRow {
 }
 
 impl PgDb {
-    /// Self-heal `coord.agent_worktrees` on PG instances where the
-    /// alembic migration hasn't been applied yet. Idempotent — uses
-    /// `CREATE TABLE IF NOT EXISTS` plus a DO-block that conditionally
-    /// adds the CHECK constraint. Mirrors the
-    /// `ensure_shadow_decisions_table` / `ensure_coord_tasks_emergent_columns`
-    /// self-heal helpers already in this crate.
-    ///
-    /// Schema must stay byte-equivalent to the alembic migration
-    /// `coord_phase_1_01_agent_worktrees`. Both shapes are the §4.2
-    /// contract; downstream phases will fail in interesting ways if
-    /// the two drift.
-    pub async fn ensure_agent_worktrees_table(&self) -> Result<(), String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        conn.batch_execute(
-            r#"
-            CREATE SCHEMA IF NOT EXISTS coord;
-
-            CREATE TABLE IF NOT EXISTS coord.agent_worktrees (
-                agent_id       UUID NOT NULL,
-                machine_id     UUID REFERENCES coord.machines(machine_id)
-                                   ON DELETE SET NULL,
-                repo           TEXT NOT NULL,
-                branch         TEXT NOT NULL,
-                parent_sha     TEXT NOT NULL,
-                worktree_path  TEXT NOT NULL,
-                status         TEXT NOT NULL DEFAULT 'allocated',
-                intent         TEXT,
-                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (agent_id, repo),
-                CONSTRAINT agent_worktrees_repo_branch_uq UNIQUE (repo, branch)
-            );
-
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = 'agent_worktrees_status_chk'
-                ) THEN
-                    ALTER TABLE coord.agent_worktrees
-                        ADD CONSTRAINT agent_worktrees_status_chk
-                        CHECK (status IN ('allocated','active','merging','merged','abandoned'));
-                END IF;
-            END$$;
-
-            CREATE INDEX IF NOT EXISTS idx_agent_worktrees_status
-                ON coord.agent_worktrees (status, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_agent_worktrees_machine_status
-                ON coord.agent_worktrees (machine_id, status)
-                WHERE machine_id IS NOT NULL;
-
-            ALTER TABLE coord.agent_worktrees
-                ADD COLUMN IF NOT EXISTS declared_overlap_paths TEXT[];
-
-            CREATE INDEX IF NOT EXISTS idx_agent_worktrees_overlap_paths_gin
-                ON coord.agent_worktrees USING gin (declared_overlap_paths);
-
-            -- Plan `coord-agent-session-id-tracking.md` Phase 2 (Side B):
-            -- agent_session_id lineage column. Mirrors the alembic
-            -- migration shape. NULL until Phase 6 tightens to required
-            -- after Side C2 (Claude Code env-var surface) lands.
-            ALTER TABLE coord.agent_worktrees
-                ADD COLUMN IF NOT EXISTS agent_session_id UUID;
-
-            CREATE INDEX IF NOT EXISTS idx_agent_worktrees_agent_session
-                ON coord.agent_worktrees (agent_session_id)
-                WHERE agent_session_id IS NOT NULL;
-            "#,
-        )
-        .await
-        .map_err(|e| format!("Failed to ensure coord.agent_worktrees: {}", e))
-    }
-
     /// Fetch all worktree rows for a given agent. Ordered by repo for
     /// deterministic iteration when the spawn path materializes the
     /// worktrees one-by-one.
