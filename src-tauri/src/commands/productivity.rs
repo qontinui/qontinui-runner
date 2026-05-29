@@ -946,7 +946,7 @@ pub async fn launch_coordinator_session(
 
     // mode == "claude_skill": legacy pty-spawn path.
     let runner_port = crate::mcp::types::runner_api_port(&app_state);
-    let repo_path = resolve_runner_repo_path()
+    let primary_repo_path = resolve_runner_repo_path()
         .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
     let initial_command = build_coordinator_initial_command(runner_port, plan_path.as_deref())?;
     let title = title_hint.unwrap_or_else(|| "Coordinator".to_string());
@@ -957,6 +957,19 @@ pub async fn launch_coordinator_session(
         .inner()
         .clone();
 
+    // Phase 2 round 2 — Coordinator sessions always edit qontinui-runner
+    // (same class as `spawn_worker_session`). Route through the shared
+    // facade so flag-on lands in a worktree, flag-off keeps the primary
+    // checkout.
+    let (effective_repo_path, isolated_ctx) =
+        crate::agent_worktree::isolated_edit::acquire_for_terminal(
+            Some("qontinui-runner"),
+            "Coordinator session",
+            Some(primary_repo_path.clone()),
+        )
+        .await;
+    let repo_path = effective_repo_path.unwrap_or(primary_repo_path);
+
     let info = terminal_manager.create(
         Some(title),
         Some(repo_path),
@@ -965,6 +978,12 @@ pub async fn launch_coordinator_session(
         None,
         app_handle.clone(),
     )?;
+
+    if let Some(ctx) = isolated_ctx {
+        if let Some(session) = terminal_manager.get(&info.id) {
+            session.set_isolated_edit_ctx(ctx);
+        }
+    }
 
     schedule_initial_command(terminal_manager, info.id.clone(), initial_command);
 

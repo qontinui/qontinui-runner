@@ -43,6 +43,13 @@ pub struct CreateTerminalRequest {
     /// Optional command to execute immediately after shell initialization.
     #[serde(default)]
     pub initial_command: Option<String>,
+    /// Phase 2 round 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
+    /// When `Some(repo_slug)` AND `QONTINUI_AGENT_WORKTREE_MODE` is on,
+    /// allocate an isolated worktree for that repo and use it as the
+    /// PTY cwd instead of `working_dir`. Mirrors the `intent_repo`
+    /// argument on the `terminal_create` Tauri command + HTTP-SDK proxy.
+    #[serde(default)]
+    pub intent_repo: Option<String>,
 }
 
 /// Request body for writing data to a terminal.
@@ -129,19 +136,38 @@ pub async fn create_terminal_handler(
     let app_handle = state.app_handle.clone();
 
     info!(
-        "HTTP: Creating terminal session (title={:?}, working_dir={:?})",
-        request.title, request.working_dir
+        "HTTP: Creating terminal session (title={:?}, working_dir={:?}, intent_repo={:?})",
+        request.title, request.working_dir, request.intent_repo
     );
+
+    // Phase 2 round 2 — route through the shared `acquire_for_terminal`
+    // helper so this entry point matches the other five
+    // terminal_manager.create call sites. `intent_repo == None` is a
+    // no-op (helper returns the original working_dir, no allocation).
+    let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
+        request.intent_repo.as_deref(),
+        request
+            .title
+            .as_deref()
+            .unwrap_or("HTTP terminal edit session"),
+        request.working_dir,
+    )
+    .await;
 
     match terminal_manager.create(
         request.title,
-        request.working_dir,
+        working_dir,
         request.page_id,
         request.cols,
         request.rows,
         app_handle,
     ) {
         Ok(info) => {
+            if let Some(ctx) = isolated_ctx {
+                if let Some(session) = terminal_manager.get(&info.id) {
+                    session.set_isolated_edit_ctx(ctx);
+                }
+            }
             info!("HTTP: Created terminal session: {}", info.id);
 
             // Send initial command after a short delay for shell initialization
