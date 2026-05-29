@@ -1,7 +1,6 @@
 export { TerminalPage } from "./TerminalPage";
 export { TerminalInstance } from "./TerminalInstance";
 export type { TerminalInstanceHandle } from "./TerminalInstance";
-export { TerminalTabBar } from "./TerminalTabBar";
 
 export { TerminalNotification } from "./TerminalNotification";
 export { SessionManagerPanel } from "./SessionManagerPanel";
