@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { LayoutGrid } from "lucide-react";
 import { LAYOUT_PRESETS, type LayoutPreset } from "./useZoneLayout";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
+import { callRegistry } from "./commands";
 
 interface ZoneLayoutPickerProps {
   currentLayoutId: string;
@@ -99,16 +100,26 @@ export function ZoneLayoutPicker({
         label: "Select Layout",
         description: "Switch the terminal grid to a named layout preset.",
         paramSchema: { layoutId: "string (use list-layouts to enumerate valid IDs)" },
-        handler: (params?: unknown) => {
+        handler: async (params?: unknown) => {
           const { layoutId } = (params ?? {}) as { layoutId?: string };
           if (!layoutId) throw new Error("select-layout requires { layoutId: string }");
+          // Validate up-front so the existing "Valid options: …" error
+          // message stays intact for automation parsers. The registry
+          // would otherwise return `invalid-preset` with a thinner
+          // message.
           const preset = LAYOUT_PRESETS.find((l) => l.id === layoutId);
           if (!preset) {
             throw new Error(
               `Unknown layoutId: "${layoutId}". Valid options: ${LAYOUT_PRESETS.map((l) => l.id).join(", ")}`,
             );
           }
-          onSelectLayout(layoutId);
+          // Phase 1c — delegates to registry `terminal.layout`. The
+          // registry handler calls the same `zoneLayout.setLayoutId`
+          // closure that `onSelectLayout` does (both source from
+          // TerminalPage's session context), so behavior is identical
+          // — but a future change to layout semantics now has one
+          // landing point instead of two.
+          await callRegistry("terminal.layout", { preset: layoutId });
           setOpen(false);
         },
       },

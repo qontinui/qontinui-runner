@@ -1,11 +1,11 @@
-import { useState, useRef, useEffect, useMemo, useCallback, type ReactNode } from "react";
-import { Terminal, X, Plus, List, ChevronDown, FileText, Lock } from "lucide-react";
+import { useState, useEffect, useMemo, useCallback, type ReactNode } from "react";
+import { Plus, ChevronDown } from "lucide-react";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { AccountUsageInfo } from "./useSessionManager";
 import { LaunchMenu } from "./LaunchMenu";
-import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
-import { WrapperToolsBadge } from "@/components/wrappers/WrapperToolsBadge";
+import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
+import { callRegistry } from "./commands";
 import { ReviewBadge } from "./ReviewBadge";
 import { CommitTrafficLight } from "./CommitTrafficLight";
 import type { CommitState } from "./useCommitState";
@@ -96,16 +96,6 @@ const STATE_BAR_COLORS: Record<SessionState, string> = {
   completed: "#9ece6a",
   error: "#f7768e",
 };
-
-function formatTime(value?: string | number): string {
-  if (value === undefined || value === null) return "";
-  try {
-    const d = new Date(value);
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  } catch {
-    return "";
-  }
-}
 
 /**
  * Format a "since" epoch-ms as a short relative-age string ("5s",
@@ -248,9 +238,7 @@ export function TerminalTabBar({
 }: TerminalTabBarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
-  const [showDropdown, setShowDropdown] = useState(false);
   const [showQuickLaunch, setShowQuickLaunch] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
 
   // Phase 2 (stuck-session heartbeat) — subscribe to the shared 1Hz
   // broadcast so the lock tooltip's "since 5m" text refreshes on next-
@@ -291,18 +279,6 @@ export function TerminalTabBar({
     setEditingId(null);
   };
 
-  // Close dropdowns when clicking outside
-  useEffect(() => {
-    if (!showDropdown) return;
-    const handleClick = (e: MouseEvent) => {
-      if (showDropdown && dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setShowDropdown(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, [showDropdown]);
-
   // ── Helpers for per-tab enrichments ──────────────────────────────────────
 
   function getTabZoneIndex(tabId: string): number | undefined {
@@ -319,163 +295,29 @@ export function TerminalTabBar({
     return tabId in tabIdToZone;
   }
 
-  // ── UI Bridge: terminal-launch-menu registration ─────────────────────────
-  // LaunchMenu only mounts while showQuickLaunch=true, so we register from
-  // TerminalTabBar (always mounted) to ensure agents can invoke actions at
-  // any time.
-
-  const sortedAccountsForBridge = useMemo(
-    () => [...(accountUsage ?? [])].sort((a, b) => (a.utilization ?? 0) - (b.utilization ?? 0)),
-    [accountUsage],
-  );
-
-  const openLaunchMenu = useCallback(() => setShowQuickLaunch(true), []);
+  // ── UI Bridge: terminal-launch-menu registration HOISTED ─────────────────
+  // Phase 9a moved this registration to `TerminalPage.tsx` (next to the
+  // `terminal-page` block) so external agents keep getting `create-plain` /
+  // `create-ai-session` / `create-best-account` / `create-with-command`
+  // even after `TerminalTabBar.tsx` is eventually retired. The local
+  // LaunchMenu popover is still rendered here (operator-facing UI); the
+  // wire-contract registration is just no longer co-located with it.
+  //
+  // The hoisted version dropped the `open` / `close` actions — they were
+  // popover-toggle UI affordances, not wire contract. If external
+  // automation surfaces dependence on them, restore by lifting
+  // `showQuickLaunch` state to `TerminalPage` and threading down via props.
+  //
+  // The local launch-menu popover (chevron + LaunchMenu JSX below) still
+  // uses `closeLaunchMenu` for its own onClose handler, so we keep that
+  // callback here. `openLaunchMenu` / `sortedAccountsForBridge` were
+  // only used by the deleted registration and are removed.
   const closeLaunchMenu = useCallback(() => setShowQuickLaunch(false), []);
 
-  useUIComponent({
-    id: "terminal-launch-menu",
-    name: "Terminal Launch Menu",
-    description:
-      "Creates plain terminals and AI sessions. Use create-plain, create-ai-session, " +
-      "create-best-account, or create-with-command to launch terminals programmatically.",
-    actions: [
-      {
-        id: "open",
-        label: "Open launch menu",
-        handler: openLaunchMenu,
-      },
-      {
-        id: "close",
-        label: "Close launch menu",
-        handler: closeLaunchMenu,
-      },
-      {
-        id: "create-plain",
-        label: "Create Plain Terminal",
-        description: "Spawn N blank terminals using the user's default shell.",
-        paramSchema: { count: "number (>= 1, defaults to 1)" },
-        handler: async (params?: unknown) => {
-          const { count = 1 } = (params ?? {}) as { count?: number };
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-plain requires { count: number } where count >= 1");
-          }
-          // PTY-only tabs never own a Claude task_run_id, so the parallel
-          // task_run_ids array is empty — callers polling
-          // `/control/terminal-sessions/{id}` for the readiness signal
-          // (`state` / `is_alive`) is the right pattern for these.
-          const tabIds = ((await onQuickLaunch?.(count)) ?? []) as string[];
-          closeLaunchMenu();
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: [] as Array<string | null>,
-          };
-        },
-      },
-      {
-        id: "create-ai-session",
-        label: "Create AI Session",
-        description:
-          "Spawn N terminals pre-configured to launch `claude` under the given CLAUDE_CONFIG_DIR, optionally pre-typing a context prompt.",
-        paramSchema: {
-          count: "number (>= 1, defaults to 1)",
-          configDir: "string (absolute path to a Claude Code config dir, required)",
-          context: "string (optional initial prompt auto-typed after claude starts)",
-        },
-        handler: async (params?: unknown) => {
-          const {
-            count = 1,
-            configDir,
-            context,
-          } = (params ?? {}) as {
-            count?: number;
-            configDir?: string;
-            context?: string;
-          };
-          if (!configDir)
-            throw new Error(
-              "create-ai-session requires { count?: number, configDir: string, context?: string }",
-            );
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-ai-session: count must be a positive number");
-          }
-          // `task_run_id` (= Claude session_id) is captured asynchronously
-          // by `useTabSessionIdCapture` once Claude CLI writes its first
-          // JSONL record. At handler-return time the value is `null` for
-          // every fresh tab — callers correlate via
-          // `GET /control/terminal-sessions/{tab_id}` and watch for
-          // `task_run_id` to flip non-null.
-          const tabIds = ((await onLaunchAiSession?.(count, configDir, context)) ?? []) as string[];
-          closeLaunchMenu();
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: tabIds.map(() => null) as Array<string | null>,
-          };
-        },
-      },
-      {
-        id: "create-best-account",
-        label: "Create AI Session with Best Account",
-        description:
-          "Like create-ai-session, but picks the AI account with the lowest current utilization. Fails if no accounts are configured.",
-        paramSchema: {
-          count: "number (>= 1, defaults to 1)",
-          context: "string (optional initial prompt auto-typed after claude starts)",
-        },
-        handler: async (params?: unknown) => {
-          const { count = 1, context } = (params ?? {}) as {
-            count?: number;
-            context?: string;
-          };
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-best-account: count must be a positive number");
-          }
-          const best = sortedAccountsForBridge[0];
-          if (!best) throw new Error("No AI accounts available");
-          const tabIds = ((await onLaunchAiSession?.(count, best.config_dir, context)) ??
-            []) as string[];
-          closeLaunchMenu();
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: tabIds.map(() => null) as Array<string | null>,
-          };
-        },
-      },
-      {
-        id: "create-with-command",
-        label: "Create Terminal with Command",
-        description:
-          "Spawn N terminals and auto-type the given shell command into each after the prompt renders.",
-        paramSchema: {
-          count: "number (>= 1, defaults to 1)",
-          command: "string (the shell command to type + Enter, required)",
-        },
-        handler: async (params?: unknown) => {
-          const { count = 1, command } = (params ?? {}) as {
-            count?: number;
-            command?: string;
-          };
-          if (!command)
-            throw new Error("create-with-command requires { count?: number, command: string }");
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-with-command: count must be a positive number");
-          }
-          // `create-with-command` reuses the plain-PTY path (no Claude
-          // CLI), so `task_run_ids` is empty by definition. Callers can
-          // still observe the spawned tabs via `terminal-sessions`.
-          const tabIds = ((await onQuickLaunch?.(count, command)) ?? []) as string[];
-          closeLaunchMenu();
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: [] as Array<string | null>,
-          };
-        },
-      },
-    ],
-  });
+  // The original `useUIComponent({id: "terminal-launch-menu", ...})` call
+  // and its ~165-line `actions` array previously lived here and have been
+  // moved verbatim to TerminalPage.tsx; this comment marks the hoist site
+  // for git-blame readability.
 
   // ── Render ───────────────────────────────────────────────────────────────
 
@@ -576,381 +418,14 @@ export function TerminalTabBar({
         )}
       </div>
 
-      {/* Scrollable tab area.
-          Phase 3: `items-end` (was `items-center`) anchors every tab to
-          the bottom edge of the strip where the active tab's `-mb-px`
-          overlap happens, so the taller active tab grows UPWARD without
-          dragging the inactive tabs along (active renders extra rows for
-          tags + working-dir; inactives don't). Pair with `min-h-[37px]`
-          on each tab below to give inactives a baseline matching the
-          observed active-tab height. */}
-      <div className="flex items-end gap-0.5 px-1 overflow-x-auto scrollbar-none flex-1 min-w-0 h-full">
-        {tabs.map((tab) => {
-          const isActive = tab.id === activeId;
-          const isDead = !tab.isAlive;
-          const isEditing = editingId === tab.id;
-          const state = sessionStates?.[tab.id] ?? "idle";
-          const hasUnread = unreadTabs?.has(tab.id) ?? false;
-          const isStale = staleTabs?.has(tab.id) ?? false;
-          const tabActivity = activityData?.[tab.id];
-          const tabDuration = stateDurations?.[tab.id];
-          const tabLabels = getTabLabels(tab.id);
-          const showSparkline =
-            isMultiZone && isTabAssigned(tab.id) && tabActivity && tabActivity.length > 0;
-          const lockState = fileLockStates?.[tab.id];
-          const commitState = commitStates?.[tab.id];
-          const overlapCount = registryAwareness[tab.id] ?? 0;
+      <div className="flex-1" />
 
-          return (
-            <button
-              key={tab.id}
-              onClick={() => onSelect(tab.id)}
-              onDoubleClick={() => startEditing(tab)}
-              onAuxClick={(e) => {
-                if (e.button === 1) {
-                  e.preventDefault();
-                  onClose(tab.id);
-                }
-              }}
-              draggable
-              onDragStart={(e) => {
-                e.dataTransfer.setData("text/tab-id", tab.id);
-                e.dataTransfer.effectAllowed = "move";
-              }}
-              className={`
-              flex items-center gap-1.5 px-3 py-1 rounded-t text-xs font-medium min-h-[37px]
-              transition-colors whitespace-nowrap min-w-0 max-w-[260px] overflow-hidden group cursor-grab active:cursor-grabbing
-              ${
-                isActive
-                  ? "bg-[#1a1b26] text-[#c0caf5] border-t border-x border-[#2a2d3d] -mb-px"
-                  : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
-              }
-              ${isDead ? "opacity-60" : ""}
-              ${isStale ? "border-dashed border-[#565f89]/40" : ""}
-            `}
-            >
-              {/* Session state dot / plan icon */}
-              {tab.type === "plan" ? (
-                <FileText className="w-3 h-3 shrink-0 text-[#7dcfff]" />
-              ) : sessionStates ? (
-                <div
-                  className={`w-2 h-2 rounded-full shrink-0 ${STATE_DOT_COLORS[state]} ${
-                    state === "needs-input" ? "animate-pulse" : ""
-                  }`}
-                />
-              ) : (
-                <Terminal className="w-3 h-3 shrink-0" />
-              )}
-
-              {/* File lock indicator. Wrapped in a span so the native
-                  `title` tooltip reaches the user — Lucide icons render
-                  as <svg> and don't accept the React title attribute
-                  directly. */}
-              {lockState?.kind === "waiting" && (
-                <span
-                  data-testid="tab-lock-waiting"
-                  className="shrink-0 inline-flex"
-                  aria-label="waiting on file lock"
-                  title={`waiting on ${lockState.counterpartyName ?? "another session"}'s ${
-                    lockState.filePath ?? "edit"
-                  }${lockState.sinceMs ? ` since ${formatSince(lockState.sinceMs, nowMs)}` : ""}`}
-                >
-                  <Lock className="w-2.5 h-2.5 text-[#e0af68] animate-pulse" />
-                </span>
-              )}
-              {lockState?.kind === "holding" && (
-                <span
-                  data-testid="tab-lock-holding"
-                  className="shrink-0 inline-flex"
-                  aria-label="holding file lock"
-                  title={`holding ${lockState.filePath ?? "file"} — ${lockState.waiterCount ?? 0} session${
-                    lockState.waiterCount === 1 ? "" : "s"
-                  } waiting`}
-                >
-                  <Lock className="w-2.5 h-2.5 text-[#7aa2f7] opacity-60" />
-                </span>
-              )}
-
-              {/* Registry-awareness badge — count of files held by OTHER
-                  sessions that overlap with this tab's cwd. Driven by
-                  `useRegistryAwareness` polling `/file-registry/probe-conflicts`
-                  (Phase 2 of pty-launched-ai-tabs-warning-plan). Silent
-                  tabs stay visually quiet — badge renders only when N > 0. */}
-              {overlapCount > 0 && (
-                <span
-                  data-testid="tab-registry-overlap"
-                  className="shrink-0 px-1 rounded text-[10px] leading-[14px] font-medium bg-[#e0af68]/20 text-[#e0af68]"
-                  title={`${overlapCount} file(s) held by other sessions overlap with this tab's cwd.`}
-                >
-                  {overlapCount}
-                </span>
-              )}
-
-              {/*
-                Commit-readiness traffic light. Renders nothing visible when
-                state.status is "unknown" but always slots in the GitCommit
-                button (disabled) so the tab layout stays stable.
-
-                isPtyTab decision: every tab that reaches `TerminalTabBar`
-                today is a PTY-launched terminal. SDK chat sessions live in
-                a separate component path (`useAiSession.ts` →
-                `MessagesPanel`-style surfaces) and never render here. We
-                pass `isPtyTab={true}` unconditionally; if a future SDK-chat
-                surface starts routing through this component the toggle
-                can flip per-tab. Tracked at plan §0 caveat.
-              */}
-              {tab.type !== "plan" && (
-                <span onClick={(e) => e.stopPropagation()}>
-                  <CommitTrafficLight
-                    state={commitState}
-                    sessionId={tab.claudeSessionId}
-                    isPtyTab={true}
-                    onWriteToTerminal={(text) => {
-                      const ref = terminalRefs?.get(tab.id);
-                      ref?.current?.writeToTerminal(text);
-                    }}
-                  />
-                </span>
-              )}
-
-              <span className="flex flex-col items-start min-w-0">
-                {/* Title row */}
-                <span className="flex items-center gap-1 min-w-0">
-                  {isEditing ? (
-                    <input
-                      autoFocus
-                      value={editValue}
-                      onChange={(e) => setEditValue(e.target.value)}
-                      onBlur={commitEdit}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") commitEdit();
-                        if (e.key === "Escape") setEditingId(null);
-                        e.stopPropagation();
-                      }}
-                      onClick={(e) => e.stopPropagation()}
-                      className="bg-transparent border-b border-[#565f89] text-[#c0caf5] text-xs w-20 outline-hidden"
-                    />
-                  ) : (
-                    <span className="truncate">{tab.title}</span>
-                  )}
-
-                  {/* Inline sparkline + duration (active tab only) */}
-                  {isActive && showSparkline && (
-                    <ActivitySparkline data={tabActivity!} color={STATE_BAR_COLORS[state]} />
-                  )}
-                  {isActive && tabDuration && (
-                    <DurationBadge duration={tabDuration} state={state} />
-                  )}
-                </span>
-
-                {/* Tags row (active tab only, multi-zone) */}
-                {isActive && tabLabels && isMultiZone && (
-                  <TagBadges labels={tabLabels} colorMap={labelColorMap} />
-                )}
-
-                {/* Working dir (active tab only) */}
-                {isActive && tab.workingDir && (
-                  <span className="text-[9px] text-[#565f89] truncate max-w-[140px]">
-                    {tab.workingDir.split(/[/\\]/).slice(-2).join("/")}
-                  </span>
-                )}
-              </span>
-
-              {/* Stale indicator (inactive tabs) */}
-              {!isActive && isStale && (
-                <span className="text-[8px] text-[#565f89] italic shrink-0">stalled?</span>
-              )}
-
-              {/* Duration badge on inactive tabs for attention states */}
-              {!isActive && tabDuration && <DurationBadge duration={tabDuration} state={state} />}
-
-              {/* Exit code badge */}
-              {isDead && tab.exitCode !== null && (
-                <span
-                  className={`text-[10px] px-1 rounded ${
-                    tab.exitCode === 0
-                      ? "bg-green-900/30 text-green-400"
-                      : "bg-red-900/30 text-red-400"
-                  }`}
-                >
-                  {tab.exitCode}
-                </span>
-              )}
-
-              {/* Unread indicator */}
-              {hasUnread && <span className="w-1.5 h-1.5 rounded-full bg-[#f7768e] shrink-0" />}
-
-              {/* Phase 3 review verdict badge — next to the existing per-tab
-                  controls cluster. Renders nothing when no review row
-                  exists for the session. */}
-              <span
-                className="shrink-0"
-                data-testid="terminal-tab-controls"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <ReviewBadge sessionId={tab.id} />
-              </span>
-
-              {/* Close button */}
-              <span
-                role="button"
-                tabIndex={0}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClose(tab.id);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.stopPropagation();
-                    onClose(tab.id);
-                  }
-                }}
-                className="ml-1 p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-[#2a2d3d] transition-opacity"
-              >
-                <X className="w-3 h-3" />
-              </span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Pinned right: wrapper tools badge + session list dropdown */}
-      <div className="flex items-center gap-0.5 px-1 shrink-0">
-        {/* Wrapper tools available to AI agents (Phase 4 visibility) */}
-        <WrapperToolsBadge />
-        {/* Session dropdown */}
-        {tabs.length > 0 && (
-          <div className="relative ml-auto shrink-0" ref={dropdownRef}>
-            <button
-              onClick={() => setShowDropdown(!showDropdown)}
-              className={`flex items-center justify-center w-6 h-6 rounded transition-colors ${
-                showDropdown
-                  ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-                  : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
-              }`}
-              title="All sessions"
-            >
-              <List className="w-3.5 h-3.5" />
-            </button>
-
-            {showDropdown && (
-              <div className="absolute right-0 top-full mt-1 w-80 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden">
-                <div className="px-3 py-2 text-[10px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d]">
-                  Sessions ({tabs.length})
-                </div>
-                <div className="max-h-64 overflow-y-auto scrollbar-dark">
-                  {tabs.map((tab) => {
-                    const isActive = tab.id === activeId;
-                    const isDead = !tab.isAlive;
-                    const state = sessionStates?.[tab.id] ?? "idle";
-                    const tabActivity = activityData?.[tab.id];
-                    const tabDuration = stateDurations?.[tab.id];
-                    const tabLabels = getTabLabels(tab.id);
-                    const hasSparkline =
-                      isMultiZone && isTabAssigned(tab.id) && tabActivity && tabActivity.length > 0;
-
-                    return (
-                      <div
-                        key={tab.id}
-                        role="button"
-                        tabIndex={0}
-                        onClick={() => {
-                          onSelect(tab.id);
-                          setShowDropdown(false);
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" || e.key === " ") {
-                            onSelect(tab.id);
-                            setShowDropdown(false);
-                          }
-                        }}
-                        className={`flex items-start gap-2 px-3 py-2 cursor-pointer transition-colors ${
-                          isActive ? "bg-[#7aa2f7]/10" : "hover:bg-[#2a2d3d]/50"
-                        }`}
-                      >
-                        {/* Status dot */}
-                        <div className="mt-1 shrink-0">
-                          <div
-                            className={`w-2 h-2 rounded-full ${
-                              sessionStates
-                                ? `${STATE_DOT_COLORS[state]} ${state === "needs-input" ? "animate-pulse" : ""}`
-                                : isDead
-                                  ? "bg-[#565f89]"
-                                  : "bg-[#9ece6a]"
-                            }`}
-                          />
-                        </div>
-
-                        {/* Info */}
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <span
-                              className={`text-xs font-medium truncate ${
-                                isActive ? "text-[#7aa2f7]" : "text-[#c0caf5]"
-                              }`}
-                            >
-                              {tab.title}
-                            </span>
-                            {isDead && tab.exitCode !== null && (
-                              <span
-                                className={`text-[10px] px-1 rounded ${
-                                  tab.exitCode === 0
-                                    ? "bg-green-900/30 text-green-400"
-                                    : "bg-red-900/30 text-red-400"
-                                }`}
-                              >
-                                exit {tab.exitCode}
-                              </span>
-                            )}
-                            {/* Sparkline in dropdown */}
-                            {hasSparkline && (
-                              <ActivitySparkline
-                                data={tabActivity!}
-                                color={STATE_BAR_COLORS[state]}
-                              />
-                            )}
-                            {/* Duration in dropdown */}
-                            {tabDuration && <DurationBadge duration={tabDuration} state={state} />}
-                            {/* Phase 3 review verdict badge — same data
-                                surface as the per-tab header. */}
-                            <ReviewBadge sessionId={tab.id} />
-                          </div>
-                          <div className="flex items-center gap-2 text-[10px] text-[#565f89] mt-0.5">
-                            {tab.pid && <span>PID {tab.pid}</span>}
-                            {tab.workingDir && (
-                              <span className="truncate" title={tab.workingDir}>
-                                {tab.workingDir.split(/[/\\]/).pop()}
-                              </span>
-                            )}
-                            {tab.createdAt && <span>{formatTime(tab.createdAt)}</span>}
-                          </div>
-                          {/* Tag badges in dropdown */}
-                          {tabLabels && isMultiZone && (
-                            <div className="mt-0.5">
-                              <TagBadges labels={tabLabels} colorMap={labelColorMap} max={3} />
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Close button */}
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onClose(tab.id);
-                          }}
-                          className="mt-0.5 p-0.5 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors shrink-0"
-                        >
-                          <X className="w-3 h-3" />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+      {/* Phase 9a — `WrapperToolsBadge` was previously pinned to the
+          right of the tab bar; its popover + tool list moved into
+          `StatusStrip`'s wrapper-tools pill so there's a single
+          surface for wrapper-tools info. The badge component file is
+          left in place pending operator decision on whether other
+          surfaces should still mount it. */}
     </div>
   );
 }

@@ -28,7 +28,17 @@ export function ZoneMinimap() {
   const layout = zoneLayout.layout;
   const assignments = zoneLayout.assignments;
   const focusedZone = zoneLayout.focusedZone;
+  const maximizedZone = zoneLayout.maximizedZone;
   const onFocusZone = zoneLayout.setFocusedZone;
+  const onMaximizeZone = zoneLayout.setMaximizedZone;
+  const selectZone = (idx: number) => {
+    onFocusZone(idx);
+    // When a zone is maximized the grid renders only that zone, so the
+    // minimap is the only switcher available — swap the maximized view
+    // to the clicked tile instead of leaving the user stuck on the
+    // previous one.
+    if (maximizedZone !== null) onMaximizeZone(idx);
+  };
   const sessionStates = session.sessionStates;
   const { labelsAndTags } = useZoneMetadata();
   const zoneTags = labelsAndTags.zoneTags;
@@ -36,7 +46,7 @@ export function ZoneMinimap() {
 
   const [dismissed, setDismissed] = useState(false);
 
-  if (dismissed || layout.zones.length < 6) return null;
+  if (dismissed || !zoneLayout.isMultiZone) return null;
 
   const { columns, rows } = layout;
   const mapW = 120;
@@ -102,7 +112,7 @@ export function ZoneMinimap() {
             const h = rowSpan * cellH;
 
             return (
-              <g key={`zone-${idx}`} onClick={() => onFocusZone(idx)} className="cursor-pointer">
+              <g key={`zone-${idx}`} onClick={() => selectZone(idx)} className="cursor-pointer">
                 <rect
                   x={x + 1}
                   y={y + 1}

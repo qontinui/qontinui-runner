@@ -168,6 +168,7 @@ pub mod checks; // Code quality checks (linting, formatting, type checking)
 pub mod chunk_labels; // Per-config user-chosen chunk label overrides for chunked state-machine graph view
 pub mod claims; // Plan 2026-05-18-agent-spawn-coordination Phase 3 — Tauri wrappers around coord's /claims/* API
 pub mod clipboard; // Clipboard sync: share text to mobile via backend relay
+pub mod command_interpreter; // Phase 8 — Tier-3 free-text → registry action via local `claude` CLI
 pub mod comparison; // Side-by-side architecture comparison runs
 pub mod compartments; // Workstream C: scoped wrappers around Arc<AppState> for gradual migration
 pub mod config;

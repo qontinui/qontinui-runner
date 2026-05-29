@@ -971,6 +971,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::claims::claims_steal,
             commands::clipboard::share_file_to_mobile,
             commands::clipboard::share_to_mobile,
+            commands::command_interpreter::command_interpret,
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,
             commands::comparison::start_comparison,

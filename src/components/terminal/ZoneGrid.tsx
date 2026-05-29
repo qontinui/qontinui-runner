@@ -11,6 +11,8 @@ import {
   type ShellIntegrationEvent,
 } from "./TerminalInstance";
 import { PlanViewer } from "./PlanViewer";
+import { SuggestionChip } from "./suggestions";
+import { ZoneHoverActions } from "./ZoneHoverActions";
 import type { LayoutPreset } from "./useZoneLayout";
 import {
   STATE_BORDER_COLORS,
@@ -799,7 +801,7 @@ function ZoneCell({
 
   return (
     <div
-      className={`relative overflow-hidden ${isFlashing ? "zone-flash" : ""} ${
+      className={`group relative overflow-hidden ${isFlashing ? "zone-flash" : ""} ${
         outputSearchQuery && !searchMatch ? "opacity-40" : ""
       }`}
       style={{
@@ -1111,6 +1113,16 @@ function ZoneCell({
           </div>
         </div>
       )}
+
+      {/* Phase 4 — per-zone suggestion chip overlay. Renders nothing
+          when the engine has no chip for this zone, keeping cell
+          chrome quiet by default. */}
+      <SuggestionChip zoneIdx={zoneIdx} />
+
+      {/* Phase 5 — per-zone hover-revealed action cluster (maximize /
+          restart / label / export / close). Fades in on cell hover
+          via group-hover from the cell's outer div. */}
+      <ZoneHoverActions zoneIdx={zoneIdx} onExportZone={onExportZone} />
     </div>
   );
 }
