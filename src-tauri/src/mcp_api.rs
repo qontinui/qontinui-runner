@@ -1163,44 +1163,7 @@ pub fn create_router(
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
             let mobile_settings = crate::settings::get_mobile_settings();
-
-            // Resolve ADB path: prefer custom setting, then fall back to auto-detection
-            let adb_path = if let Some(custom) = &mobile_settings.adb_path {
-                std::path::PathBuf::from(custom)
-            } else {
-                // Mirror the find_adb() logic from app_discovery.rs
-                let adb_name = if cfg!(windows) { "adb.exe" } else { "adb" };
-                let mut resolved = std::path::PathBuf::from(adb_name);
-                if let Ok(android_home) = std::env::var("ANDROID_HOME") {
-                    let p = std::path::PathBuf::from(android_home)
-                        .join("platform-tools")
-                        .join(adb_name);
-                    if p.exists() {
-                        resolved = p;
-                    }
-                } else if let Ok(sdk_root) = std::env::var("ANDROID_SDK_ROOT") {
-                    let p = std::path::PathBuf::from(sdk_root)
-                        .join("platform-tools")
-                        .join(adb_name);
-                    if p.exists() {
-                        resolved = p;
-                    }
-                } else if cfg!(windows) {
-                    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-                        let p = std::path::PathBuf::from(local_app_data)
-                            .join("Android")
-                            .join("Sdk")
-                            .join("platform-tools")
-                            .join(adb_name);
-                        if p.exists() {
-                            resolved = p;
-                        }
-                    }
-                }
-                resolved
-            };
-
-            let usb_transport = crate::mcp::transport::usb::UsbTransport::new(adb_path);
+            let usb_transport = crate::mcp::transport::usb::UsbTransport::new();
 
             // Publish for the CloseRequested shutdown handler in main.rs, which
             // calls release_all so this process's `adb forward` entries don't

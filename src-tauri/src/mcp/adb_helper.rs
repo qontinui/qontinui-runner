@@ -4,12 +4,12 @@
 //! library. Every operation runs on `tokio::task::spawn_blocking` because the
 //! underlying `adb_client` API is synchronous.
 //!
-//! Port forwarding: `establish_forward` now uses `adb_client`'s `forward()` API
+//! Port forwarding: `establish_forward` uses `adb_client`'s `forward()` API
 //! (sends `host:forward:<local>;<remote>`). Because the library's `forward()`
 //! discards the response body, callers must pre-allocate the local port via
-//! `pick_free_local_port` rather than passing `tcp:0`. Per-forward removal
-//! (`host:killforward:tcp:<port>`) is not exposed, so teardown callers still
-//! shell out; only `forward_remove_all` (kills every forward) is available here.
+//! `pick_free_local_port` rather than passing `tcp:0`. Per-forward and
+//! per-reverse teardown use `forward_remove` / `reverse_remove` (added
+//! upstream in adb_client 3.2.1 — cocool97/adb_client#192 and #195).
 
 use std::io::Cursor;
 use std::net::SocketAddrV4;
@@ -259,6 +259,21 @@ pub async fn forward_tcp(serial: String, local_port: u16, remote_port: u16) -> R
     .map_err(|e| format!("task join failed: {e}"))?
 }
 
+/// Remove a single adb reverse by its device-side ("remote") endpoint
+/// (`reverse:killforward:tcp:<device_port>`).
+///
+/// Available since `adb_client` 3.2.1 (cocool97/adb_client#195).
+pub async fn reverse_remove(serial: String, device_port: u16) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
+        device
+            .reverse_remove(format!("tcp:{device_port}"))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task join failed: {e}"))?
+}
+
 /// Establish an `adb reverse tcp:<device_port> tcp:<host_port>` on the device.
 ///
 /// This is the mirror of [`forward_tcp`]: it makes the *device* listen on
@@ -305,12 +320,25 @@ pub async fn pick_free_local_port() -> Result<u16, String> {
     .map_err(|e| format!("task join failed: {e}"))?
 }
 
+/// Remove a single adb forward by its local endpoint
+/// (`host-serial:<serial>:killforward:tcp:<local_port>`).
+///
+/// Available since `adb_client` 3.2.1 (cocool97/adb_client#192).
+pub async fn forward_remove(serial: String, local_port: u16) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
+        device
+            .forward_remove(format!("tcp:{local_port}"))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task join failed: {e}"))?
+}
+
 /// Remove **all** adb forwards (`host:killforward-all`).
 ///
-/// Currently unused by callers but exposed for future teardown paths. Because
-/// there is no per-forward `killforward` API in `adb_client` 3.x, this is the
-/// only library-level removal available; individual forward cleanup still
-/// shells out to `adb forward --remove tcp:<port>`.
+/// Nuclear option — wipes every forward on the local adb server, not just this
+/// process's. Unused by current callers; prefer [`forward_remove`] for cleanup.
 #[allow(dead_code)]
 pub async fn forward_remove_all() -> Result<(), String> {
     tokio::task::spawn_blocking(|| -> Result<(), String> {
