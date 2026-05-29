@@ -3,8 +3,6 @@ import {
   ArrowRight,
   ArrowUpDown,
   BarChart3,
-  Bell,
-  BellRing,
   ChevronDown,
   Clock,
   Download,
@@ -13,20 +11,14 @@ import {
   Focus,
   Keyboard,
   ListChecks,
-  MessageSquare,
-  Network,
   Rocket,
-  PanelLeft,
   RefreshCw,
   Save,
-  Shield,
   Tag,
-  TerminalSquare,
   Volume2,
   VolumeOff,
   Wand2,
 } from "lucide-react";
-import { useUIElement } from "@qontinui/ui-bridge";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
 import { DocFinderModal } from "./DocFinderModal";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
@@ -93,7 +85,6 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
     stateDurations,
     lastOutputLines,
     stateTimeAccum: stateTimeAccumRef,
-    activeFindings,
   } = session;
   const { labelsAndTags, eventHistory, metrics: metricsRef } = useZoneMetadata();
   const zoneLabels = labelsAndTags.zoneLabels;
@@ -110,14 +101,10 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
   const onToggleAutoFocus = transitionEffects.toggleAutoFocus;
   const soundEnabled = transitionEffects.soundEnabled;
   const onToggleSound = transitionEffects.toggleSound;
-  const desktopNotify = transitionEffects.desktopNotify;
-  const autoApprovePatterns = transitionEffects.autoApprovePatterns;
-  const onSetAutoApprovePatterns = transitionEffects.setAutoApprovePatterns;
   const autoApproveCount = transitionEffects.autoApproveCount;
   const autoRestart = transitionEffects.autoRestart;
   const autoRestartCount = transitionEffects.autoRestartCount;
-  const { workflowGen, analysis, findingsActions, sessionManager } = session;
-  const showSidebar = workflowGen.showSidebar;
+  const { workflowGen, analysis, sessionManager } = session;
   const isGenerating = workflowGen.isGenerating;
   const isAnalyzing = analysis.isAnalyzing;
   const onAnalyze = analysis.handleAnalyze;
@@ -126,29 +113,17 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
   const generatedWorkflow = workflowGen.generatedWorkflow;
   const planFileName = workflowGen.planFileName;
   const isPlanLoading = workflowGen.isPlanLoading;
-  const onRefreshPlan = workflowGen.loadPlanContent;
   const onBuildPlanFromFile = workflowGen.handleBuildPlanFromFile;
   const onBuildPlanImplementationFromFile = workflowGen.handleBuildPlanImplementationFromFile;
-  const onToggleFindings = findingsActions.handleToggleFindings;
-  const findingsActive = workflowGen.rightPanelMode === "findings";
-  const fileOwnershipActive = workflowGen.rightPanelMode === "file-ownership";
-  const onToggleFileOwnership = () =>
-    workflowGen.setRightPanelMode((prev) => (prev === "file-ownership" ? null : "file-ownership"));
-  const findingsCount = activeFindings.length;
-  const frozenSessionCount = sessionManager.frozenCount;
+  // Phase 9d note: `findingsCount` and `frozenSessionCount` are no
+  // longer surfaced as ZSB badges. Phase 9f will resurrect them as
+  // StatusStrip pills (e.g. `N findings`, `N frozen sessions`).
+  void sessionManager;
   const { state: uiState, dispatch, toggleFocusMode } = useUIStateCx();
   const focusMode = uiState.focusMode;
   const onToggleFocusMode = toggleFocusMode;
-  const onToggleSidebar = () => workflowGen.setShowSidebar((v: boolean) => !v);
   const onJumpToNeedsInput = () => zoneLayout.focusNextNeedsInput(sessionStates);
   const onShowShortcuts = () => dispatch({ type: "SET_SHOW_SHORTCUTS", payload: true });
-  const onToggleDesktopNotify = () => {
-    transitionEffects.setDesktopNotify((prev: boolean) => {
-      const next = !prev;
-      instanceStorage.setItem("zone-desktop-notify", String(next));
-      return next;
-    });
-  };
   const onSelectByState = (state: SessionState) => {
     const zones = new Set<number>();
     for (const [zoneStr, tabId] of Object.entries(assignments)) {
@@ -228,17 +203,6 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
   const isMultiZone = tabs.length > 1;
   const busy = isAnalyzing || isGenerating;
 
-  // UI Bridge: register the Sessions sidebar toggle so external clients can
-  // discover "what control unhides session-card-* / promote-to-worktree-* /
-  // commit-progress-*" via `GET /control/elements?revealsAny=session-card-*`
-  // without grepping source. See ui-bridge plan 2026-05-03 Phase 3.2.
-  const { ref: sessionsToggleRef } = useUIElement({
-    id: "button-browse-claude-code-sessions",
-    type: "button",
-    label: showSidebar ? "Hide session browser" : "Browse Claude Code sessions",
-    reveals: ["session-card-*", "promote-to-worktree-*", "commit-progress-*"],
-  });
-
   return (
     <div className="flex items-center gap-2 px-3 h-8 bg-[#13141f] border-b border-[#2a2d3d] shrink-0">
       {/* ── Left group (always visible) ─────────────────────────────── */}
@@ -248,40 +212,13 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
         Transcript
       </h5>
 
-      {/* Sessions sidebar toggle */}
-      <button
-        ref={sessionsToggleRef}
-        onClick={onToggleSidebar}
-        className={`
-          flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors shrink-0
-          ${
-            showSidebar
-              ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-              : "text-[#9ece6a] hover:bg-[#9ece6a]/10 hover:text-[#a6da7a]"
-          }
-        `}
-        title={showSidebar ? "Hide session browser" : "Browse Claude Code sessions"}
-      >
-        {showSidebar ? <PanelLeft className="w-3 h-3" /> : <FileText className="w-3 h-3" />}
-        {showSidebar ? "Hide" : "Sessions"}
-        {!showSidebar && frozenSessionCount != null && frozenSessionCount > 0 && (
-          <span className="ml-0.5 px-1 py-0 rounded-full text-[9px] font-bold bg-[#f7768e] text-[#13141f] leading-tight">
-            {frozenSessionCount}
-          </span>
-        )}
-      </button>
-
-      {/* Resume latest session — opens the sidebar to pick a session to resume */}
-      <button
-        onClick={() => {
-          if (!showSidebar) workflowGen.setShowSidebar(true);
-        }}
-        title="Resume a previous Claude Code session from the sidebar"
-        className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors text-[#9ece6a] hover:bg-[#9ece6a]/10 hover:text-[#a6da7a] shrink-0"
-      >
-        <TerminalSquare className="w-3 h-3" />
-        Resume
-      </button>
+      {/* Phase 9d — Sessions toggle, Resume, and Doc-finder buttons
+          replaced by /sessions, /resume, and (TBD: /doc-finder) registry
+          actions. The Sessions toggle's `useUIElement reveals`
+          declaration is lost in the migration; external agents that
+          previously walked `/control/elements?revealsAny=session-card-*`
+          to find the toggle now invoke the action directly via UI Bridge
+          components. */}
 
       {onOpenDocFile && (
         <button
@@ -340,46 +277,10 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
         </div>
       )}
 
-      {/* Findings button */}
-      <button
-        onClick={onToggleFindings}
-        title="Toggle findings decisions panel"
-        className={`
-          flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors relative shrink-0
-          ${
-            findingsActive
-              ? "text-[#bb9af7] bg-[#bb9af7]/10"
-              : findingsCount > 0
-                ? "text-[#bb9af7] hover:bg-[#bb9af7]/10 hover:text-[#c8abff]"
-                : "text-[#565f89] hover:bg-[#2a2d3d] hover:text-[#a9b1d6]"
-          }
-        `}
-      >
-        <MessageSquare className="w-3 h-3" />
-        Findings
-        {findingsCount > 0 && (
-          <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold leading-none bg-[#bb9af7]/20 text-[#bb9af7]">
-            {findingsCount}
-          </span>
-        )}
-      </button>
-
-      {/* File-Ownership button (Phase 3 of conflict-tooling-pauses-aligned-plan) */}
-      <button
-        onClick={onToggleFileOwnership}
-        title="Toggle file-ownership heatmap (recent session_touched_files)"
-        className={`
-          flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors shrink-0
-          ${
-            fileOwnershipActive
-              ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-              : "text-[#565f89] hover:bg-[#2a2d3d] hover:text-[#a9b1d6]"
-          }
-        `}
-      >
-        <Network className="w-3 h-3" />
-        Files
-      </button>
+      {/* Phase 9d — Findings + File-Ownership buttons replaced by
+          /findings and /file-ownership registry actions. The count
+          badges (findingsCount, frozenSessionCount) lost their visible
+          home in this slice; a Phase 9f StatusStrip pill picks them up. */}
 
       <div className="w-px h-4 bg-[#2a2d3d]" />
 
@@ -524,23 +425,8 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
             )}
 
             {/* Desktop notification toggle */}
-            {onToggleDesktopNotify && (
-              <button
-                onClick={onToggleDesktopNotify}
-                className={`p-1 rounded transition-colors shrink-0 ${
-                  desktopNotify
-                    ? "text-[#e0af68] bg-[#e0af68]/10"
-                    : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-                }`}
-                title={`Desktop notifications: ${desktopNotify ? "ON" : "OFF"}`}
-              >
-                {desktopNotify ? (
-                  <BellRing className="w-3.5 h-3.5" />
-                ) : (
-                  <Bell className="w-3.5 h-3.5" />
-                )}
-              </button>
-            )}
+            {/* Phase 9d — Desktop-notify toggle replaced by
+                /desktop-notify registry action. */}
 
             {/* Focus mode toggle */}
             {onToggleFocusMode && (
@@ -575,14 +461,8 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
               </button>
             )}
 
-            {/* Auto-approve config popover */}
-            {onSetAutoApprovePatterns && (
-              <AutoApprovePopover
-                patterns={autoApprovePatterns ?? []}
-                onSetPatterns={onSetAutoApprovePatterns}
-                approveCount={autoApproveCount ?? 0}
-              />
-            )}
+            {/* Phase 9d — AutoApprovePopover replaced by /auto-approve
+                slash family (add/list/clear/remove subcommands). */}
 
             {/* Event history popover */}
             {eventHistory && eventHistory.length > 0 && <HistoryPopover entries={eventHistory} />}
@@ -699,14 +579,8 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
             Verify
           </button>
         )}
-        <button
-          onClick={onRefreshPlan}
-          disabled={isPlanLoading}
-          title="Reload plan file from disk"
-          className="p-0.5 rounded text-[#414868] hover:text-[#7dcfff] transition-colors disabled:opacity-40"
-        >
-          <RefreshCw className="w-3 h-3" />
-        </button>
+        {/* Phase 9d — plan-refresh icon button replaced by
+            /plan-refresh registry action. */}
       </div>
 
       {showDocFinder && onOpenDocFile && (
@@ -1147,90 +1021,10 @@ function MetricsPopover({
   );
 }
 
-function AutoApprovePopover({
-  patterns,
-  onSetPatterns,
-  approveCount,
-}: {
-  patterns: string[];
-  onSetPatterns: (patterns: string[]) => void;
-  approveCount: number;
-}) {
-  const [open, setOpen] = useState(false);
-  const [text, setText] = useState(() => patterns.join("\n"));
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        // Save on close
-        const newPatterns = text
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean);
-        onSetPatterns(newPatterns);
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [open, text, onSetPatterns]);
-
-  // Sync text when patterns change externally
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- sync from external prop
-    if (!open) setText(patterns.join("\n"));
-  }, [patterns, open]);
-
-  const hasPatterns = patterns.length > 0;
-
-  return (
-    <div className="relative shrink-0" ref={ref}>
-      <button
-        onClick={() => setOpen(!open)}
-        className={`flex items-center gap-1 p-1 rounded transition-colors ${
-          open
-            ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-            : hasPatterns
-              ? "text-[#9ece6a] bg-[#9ece6a]/10"
-              : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-        }`}
-        title={`Auto-approve rules: ${hasPatterns ? `${patterns.length} pattern(s), ${approveCount} auto-approved` : "none configured"}`}
-      >
-        <Shield className="w-3.5 h-3.5" />
-        {hasPatterns && <span className="text-[9px] font-mono">{approveCount}</span>}
-      </button>
-      {open && (
-        <div className="absolute right-0 bottom-full mb-2 w-72 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden">
-          <div className="px-3 py-2 text-[10px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d]">
-            Auto-Approve Rules
-          </div>
-          <div className="p-3 space-y-2">
-            <p className="text-[10px] text-[#565f89]">
-              Regex patterns (one per line). When a session enters &quot;needs-input&quot; and its
-              last output matches a pattern, &quot;y&quot; is sent automatically.
-            </p>
-            <textarea
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              onKeyDown={(e) => e.stopPropagation()}
-              placeholder={"Do you want to proceed\\?\nApply changes\\?\nContinue\\?"}
-              rows={5}
-              className="w-full bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1.5 text-[11px] font-mono text-[#c0caf5] placeholder-[#565f89]/50 outline-hidden focus:border-[#7aa2f7] transition-colors resize-none"
-            />
-            <div className="flex items-center justify-between text-[10px]">
-              <span className="text-[#565f89]">
-                {patterns.length} pattern{patterns.length !== 1 ? "s" : ""}
-              </span>
-              <span className="text-[#9ece6a]">{approveCount} auto-approved</span>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
+// Phase 9d — AutoApprovePopover function definition deleted alongside
+// its mount above. Pattern management is now via the /auto-approve
+// slash family (add/list/clear/remove subcommands) in
+// useTerminalCommands.ts.
 
 function HistoryPopover({
   entries,

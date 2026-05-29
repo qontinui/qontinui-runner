@@ -36,7 +36,7 @@
 
 import { instanceStorage } from "@/lib/instance-storage";
 
-import { useTerminalSession, useTransitionEffects, useUIStateCx } from "../contexts";
+import { useTerminalSession, useTransitionEffects, useUIStateCx, useZoneMetadata } from "../contexts";
 import type { AccountUsageInfo } from "../useSessionManager";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
@@ -183,9 +183,13 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     terminalRefs,
     sessionStates,
     zoneLayout,
+    workflowGen,
+    findingsActions,
+    analysis,
   } = session;
   const transitionEffects = useTransitionEffects();
   const { dispatch: uiDispatch, toggleFocusMode } = useUIStateCx();
+  const { labelsAndTags } = useZoneMetadata();
 
   /**
    * Helper that converts 1-based zone arg to 0-based, defaulting to
@@ -612,6 +616,367 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     patterns: [/^shortcuts$/i, /^keys$/i, /^help$/i],
     handler: async (): Promise<CommandResult> => {
       uiDispatch({ type: "SET_SHOW_SHORTCUTS", payload: true });
+      return ok();
+    },
+  });
+
+  // ── Phase 9d — ZoneStatusBar migration slice 2 ──────────────────────
+  // 7 more actions for the simplest workflow-toggle / preference-toggle
+  // controls. Same pattern as Phase 9b: each handler calls the same
+  // closure the existing ZSB button does, so both surfaces stay in
+  // lockstep until the buttons come out (in the same commit /
+  // subsequent commit). Pairs with the ZSB button deletions below.
+
+  // 18. /sessions — toggle the Claude Code sessions sidebar
+  useCommandAction({
+    id: "terminal.toggle-sessions-sidebar",
+    slash: "/sessions",
+    aliases: ["/toggle-sessions"],
+    label: "Toggle sessions sidebar",
+    description:
+      "Open/close the SessionManagerPanel — browses Claude Code sessions for resume / inspection.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^sessions$/i, /^toggle\s+sessions$/i],
+    handler: async (): Promise<CommandResult> => {
+      workflowGen.setShowSidebar((v: boolean) => !v);
+      return ok();
+    },
+  });
+
+  // 19. /resume — open sessions sidebar (always opens, never closes)
+  // Mirrors ZSB's Resume button: opens the sidebar so operator can pick
+  // a session to resume. Force-open semantics so the operator never
+  // closes the sidebar by accident when intending to resume.
+  useCommandAction({
+    id: "terminal.resume",
+    slash: "/resume",
+    label: "Resume a previous Claude Code session",
+    description: "Open the sessions sidebar (always opens, never closes).",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^resume$/i],
+    handler: async (): Promise<CommandResult> => {
+      workflowGen.setShowSidebar(true);
+      return ok();
+    },
+  });
+
+  // 20. /findings — toggle findings decisions panel
+  useCommandAction({
+    id: "terminal.toggle-findings",
+    slash: "/findings",
+    aliases: ["/toggle-findings"],
+    label: "Toggle findings panel",
+    description:
+      "Show/hide the findings decisions panel in the right sidebar (drift / quality / regression findings from the active session).",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^findings$/i, /^toggle\s+findings$/i],
+    handler: async (): Promise<CommandResult> => {
+      findingsActions.handleToggleFindings();
+      return ok();
+    },
+  });
+
+  // 21. /file-ownership — toggle file-ownership heatmap panel
+  useCommandAction({
+    id: "terminal.toggle-file-ownership",
+    slash: "/file-ownership",
+    aliases: ["/files", "/toggle-file-ownership"],
+    label: "Toggle file-ownership heatmap",
+    description:
+      "Show/hide the file-ownership heatmap (recent session-touched files) in the right sidebar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^file[- ]ownership$/i, /^files$/i],
+    handler: async (): Promise<CommandResult> => {
+      workflowGen.setRightPanelMode((prev) =>
+        prev === "file-ownership" ? null : "file-ownership",
+      );
+      return ok();
+    },
+  });
+
+  // 22. /desktop-notify — toggle native desktop notifications
+  // Mirrors ZSB's onToggleDesktopNotify: flips the boolean AND persists
+  // to instanceStorage so the choice survives reload (same key the
+  // existing button uses).
+  useCommandAction({
+    id: "terminal.toggle-desktop-notify",
+    slash: "/desktop-notify",
+    aliases: ["/notifications", "/toggle-notifications"],
+    label: "Toggle desktop notifications",
+    description:
+      "Show/hide native desktop notifications when sessions enter needs-input or error states.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^desktop[- ]notify$/i, /^notifications$/i],
+    handler: async (): Promise<CommandResult> => {
+      transitionEffects.setDesktopNotify((prev: boolean) => {
+        const next = !prev;
+        instanceStorage.setItem("zone-desktop-notify", String(next));
+        return next;
+      });
+      return ok();
+    },
+  });
+
+  // 23. /plan-refresh — reload the workspace's plan file from disk
+  useCommandAction({
+    id: "terminal.plan-refresh",
+    slash: "/plan-refresh",
+    aliases: ["/refresh-plan"],
+    label: "Refresh plan file",
+    description:
+      "Reload the workspace's PLAN*.md / TODO*.md file from disk. Useful after editing the plan in another editor while the runner is open.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^plan[- ]refresh$/i, /^refresh\s+plan$/i],
+    handler: async (): Promise<CommandResult> => {
+      await workflowGen.loadPlanContent();
+      return ok();
+    },
+  });
+
+  // 24. /auto-approve — manage the auto-approve regex pattern list
+  // Patterns are regex-matched against the last output of a session
+  // entering needs-input; matching patterns auto-send "y\r" without
+  // requiring operator confirmation. Useful for headless polling
+  // workflows where "Do you want to proceed?" prompts are routine.
+  // Subcommands: add <pattern>, list, clear, remove <pattern>.
+  useCommandAction({
+    id: "terminal.auto-approve",
+    slash: "/auto-approve",
+    label: "Manage auto-approve patterns",
+    description:
+      "Sub-commands: /auto-approve add <regex>, /auto-approve list, " +
+      "/auto-approve clear, /auto-approve remove <regex>. Patterns are " +
+      "regex-matched against last-output on needs-input; matches auto-send 'y'.",
+    paramSchema: {
+      action: 'string — "add" | "list" | "clear" | "remove"',
+      pattern: "string (regex; required for add and remove)",
+    },
+    patterns: [
+      /^auto-approve\s+(?<action>add|remove)\s+(?<pattern>.+)$/i,
+      /^auto-approve\s+(?<action>list|clear)$/i,
+    ],
+    handler: async (
+      args: Record<string, unknown>,
+    ): Promise<CommandResult<{ patterns: string[] }>> => {
+      const action = typeof args.action === "string" ? args.action.toLowerCase() : "";
+      const pattern = typeof args.pattern === "string" ? args.pattern : "";
+      const current = transitionEffects.autoApprovePatterns ?? [];
+      if (action === "list") return ok({ patterns: current });
+      if (action === "clear") {
+        transitionEffects.setAutoApprovePatterns([]);
+        return ok({ patterns: [] });
+      }
+      if (action === "add") {
+        if (!pattern) return fail("invalid-args", "pattern required for add");
+        const next = current.includes(pattern) ? current : [...current, pattern];
+        transitionEffects.setAutoApprovePatterns(next);
+        return ok({ patterns: next });
+      }
+      if (action === "remove") {
+        if (!pattern) return fail("invalid-args", "pattern required for remove");
+        const next = current.filter((p) => p !== pattern);
+        transitionEffects.setAutoApprovePatterns(next);
+        return ok({ patterns: next });
+      }
+      return fail("invalid-args", `unknown action "${action}"`);
+    },
+  });
+
+  // ── Phase 9f — ZSB middle-group control migration ───────────────────
+  // Three actions covering the state-count buttons and tag-filter pills.
+  // (Next Action button = already covered by /focus needs-input.)
+
+  // 25. /select-by-state <state> — select all zones in a given session state
+  useCommandAction({
+    id: "terminal.select-by-state",
+    slash: "/select-by-state",
+    aliases: ["/select-state"],
+    label: "Select zones by state",
+    description:
+      "Select all zones whose session is in the given state " +
+      "(idle, working, needs-input, completed, error). Same as clicking " +
+      "a state-count pill in ZoneStatusBar.",
+    paramSchema: {
+      state: 'string — one of "idle", "working", "needs-input", "completed", "error"',
+    },
+    patterns: [
+      /^select(?:-by-state)?\s+(?<state>idle|working|needs[-_ ]?input|completed|error)$/i,
+    ],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+      const raw = typeof args.state === "string" ? args.state.toLowerCase() : "";
+      const state = /^needs[-_ ]?input$/.test(raw) ? "needs-input" : raw;
+      const valid = ["idle", "working", "needs-input", "completed", "error"];
+      if (!valid.includes(state)) {
+        return fail("invalid-args", `state must be one of: ${valid.join(", ")}`);
+      }
+      const zones = new Set<number>();
+      for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
+        if ((sessionStates[tabId] ?? "idle") === state) {
+          zones.add(Number(zoneStr));
+        }
+      }
+      uiDispatch({ type: "SET_SELECTED_ZONES", payload: zones });
+      return ok({ count: zones.size });
+    },
+  });
+
+  // 26. /tag <name> — toggle a tag filter on/off
+  useCommandAction({
+    id: "terminal.tag-toggle",
+    slash: "/tag",
+    aliases: ["/tag-toggle", "/filter-tag"],
+    label: "Toggle tag filter",
+    description:
+      "Toggle a tag in the active tag-filter set. Same as clicking a tag " +
+      "pill in ZoneStatusBar — narrows the visible zones to those matching " +
+      "the selected tags.",
+    paramSchema: { tag: "string (tag name; case-sensitive match against zone labels)" },
+    patterns: [/^tag\s+(?<tag>\S+)$/i, /^filter-tag\s+(?<tag>\S+)$/i],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+      const tag = typeof args.tag === "string" ? args.tag.trim() : "";
+      if (!tag) return fail("invalid-args", "tag required");
+      labelsAndTags.setActiveTagFilters((prev) => {
+        const next = new Set(prev);
+        if (next.has(tag)) next.delete(tag);
+        else next.add(tag);
+        return next;
+      });
+      return ok();
+    },
+  });
+
+  // 27. /tag-clear — clear all tag filters
+  useCommandAction({
+    id: "terminal.tag-clear",
+    slash: "/tag-clear",
+    aliases: ["/tags-clear", "/clear-tags"],
+    label: "Clear tag filters",
+    description:
+      "Clear all active tag filters. Same as clicking the 'All' pill in " +
+      "ZoneStatusBar when one or more tag filters are active.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^tag-clear$/i, /^tags?-clear$/i, /^clear-tags?$/i],
+    handler: async (): Promise<CommandResult> => {
+      labelsAndTags.setActiveTagFilters(new Set());
+      return ok();
+    },
+  });
+
+  // ── Phase 9e — workflow + analysis + plan-build actions ─────────────
+  // Five actions covering the ZSB workflow-generation, Analyze dropdown,
+  // and plan-build button cluster. All wrap existing onClick closures —
+  // no semantic change, just registry surface.
+
+  // 28. /generate — generate workflow from latest Claude Code session
+  useCommandAction({
+    id: "terminal.generate-workflow",
+    slash: "/generate",
+    aliases: ["/generate-workflow"],
+    label: "Generate workflow",
+    description:
+      "Generate a workflow from the latest Claude Code session in the active " +
+      "terminal. Same as the Generate button in ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^generate(?:\s+workflow)?$/i],
+    handler: async (): Promise<CommandResult> => {
+      await workflowGen.handleGenerateFromLatestSession();
+      return ok();
+    },
+  });
+
+  // 29. /save-workflow — save the most recently generated workflow
+  useCommandAction({
+    id: "terminal.save-workflow",
+    slash: "/save-workflow",
+    aliases: ["/save"],
+    label: "Save generated workflow",
+    description:
+      "Save the most recently generated workflow to the library. Requires " +
+      "a workflow to have been generated first (via /generate). Same as the " +
+      "Save button in ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^save(?:\s+workflow)?$/i],
+    handler: async (): Promise<CommandResult> => {
+      if (!workflowGen.generatedWorkflow) {
+        return fail("no-workflow", "generate a workflow first via /generate");
+      }
+      await workflowGen.handleSaveWorkflow();
+      return ok();
+    },
+  });
+
+  // 30. /analyze <type> — run a Claude analysis on terminal output
+  useCommandAction({
+    id: "terminal.analyze",
+    slash: "/analyze",
+    label: "Analyze terminal output",
+    description:
+      "Run a Claude analysis: session-summary, architecture, change-impact, " +
+      "progress, cross-tab, page-architecture. Same as picking an option in " +
+      "ZoneStatusBar's Analyze dropdown.",
+    paramSchema: {
+      type: 'string — one of "session-summary", "architecture", "change-impact", "progress", "cross-tab", "page-architecture"',
+    },
+    patterns: [
+      /^analyze\s+(?<type>session-summary|architecture|change-impact|progress|cross-tab|page-architecture)$/i,
+    ],
+    handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
+      const raw = typeof args.type === "string" ? args.type.toLowerCase() : "";
+      const valid = [
+        "session-summary",
+        "architecture",
+        "change-impact",
+        "progress",
+        "cross-tab",
+        "page-architecture",
+      ] as const;
+      if (!(valid as readonly string[]).includes(raw)) {
+        return fail("invalid-args", `type must be one of: ${valid.join(", ")}`);
+      }
+      analysis.handleAnalyze(raw as (typeof valid)[number]);
+      return ok();
+    },
+  });
+
+  // 31. /plan-implement — build the plan-implementation workflow
+  useCommandAction({
+    id: "terminal.plan-implement",
+    slash: "/plan-implement",
+    aliases: ["/implement"],
+    label: "Build plan implementation workflow",
+    description:
+      "Build a plan-implementation workflow from the loaded plan file " +
+      "(implement + review + next-steps per phase). Requires a PLAN*.md / " +
+      "TODO*.md file in the workspace. Same as the Implement button in " +
+      "ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^plan-implement$/i, /^implement$/i],
+    handler: async (): Promise<CommandResult> => {
+      if (!workflowGen.planFileName) {
+        return fail("no-plan", "no PLAN*.md / TODO*.md file detected in workspace");
+      }
+      await workflowGen.handleBuildPlanImplementationFromFile();
+      return ok();
+    },
+  });
+
+  // 32. /plan-verify — build the plan-verification workflow
+  useCommandAction({
+    id: "terminal.plan-verify",
+    slash: "/plan-verify",
+    aliases: ["/verify"],
+    label: "Build plan verification workflow",
+    description:
+      "Build a plan workflow with the verification-only loop (lighter, no " +
+      "review/next-steps). Requires a PLAN*.md / TODO*.md file in the " +
+      "workspace. Same as the Verify button in ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^plan-verify$/i, /^verify$/i],
+    handler: async (): Promise<CommandResult> => {
+      if (!workflowGen.planFileName) {
+        return fail("no-plan", "no PLAN*.md / TODO*.md file detected in workspace");
+      }
+      await workflowGen.handleBuildPlanFromFile();
       return ok();
     },
   });
