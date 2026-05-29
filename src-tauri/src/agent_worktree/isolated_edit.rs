@@ -182,6 +182,63 @@ pub async fn acquire(
     }))
 }
 
+/// Convenience helper for the three runner terminal-spawn entry points
+/// (`commands/terminal.rs::terminal_create`, `commands/productivity.rs::
+/// spawn_worker_session`, `mcp/tauri_proxy.rs::"terminal_create"`,
+/// `mcp/backend_relay.rs::handle_terminal_create`). Given the caller's
+/// `intent_repo` + `purpose` + original `working_dir`, returns the
+/// effective working dir for the PTY plus an `IsolatedEditContext` to
+/// park on the resulting `TerminalSession`.
+///
+/// Behavior:
+/// - `intent_repo == None` → returns `(working_dir, None)`. Observation
+///   session; legacy shared-checkout path.
+/// - `intent_repo == Some(_)` but `worktree_mode_enabled()` is false →
+///   returns `(working_dir, None)`. Caller's existing behavior preserved.
+/// - `intent_repo == Some(_)` and worktree mode is on, allocate succeeds
+///   → returns `(Some(worktree_path), Some(ctx))`.
+/// - `intent_repo == Some(_)` and worktree mode is on, allocate fails →
+///   returns `(working_dir, None)`. Failure is logged as a warning;
+///   the spawn flow falls back to the primary checkout (this matches
+///   the in-place Phase 2 wireup of `terminal_create` and
+///   `spawn_worker_session`).
+pub async fn acquire_for_terminal(
+    intent_repo: Option<&str>,
+    purpose: &str,
+    working_dir: Option<String>,
+) -> (Option<String>, Option<IsolatedEditContext>) {
+    let Some(repo) = intent_repo else {
+        return (working_dir, None);
+    };
+    let repos = vec![repo.to_string()];
+    match acquire(AcquireRequest {
+        repos: &repos,
+        intent: Some(purpose),
+        declared_overlap_paths: None,
+        plan_id: None,
+        phase: None,
+    })
+    .await
+    {
+        Ok(Some(ctx)) => {
+            let wt_path = ctx
+                .worktrees
+                .first()
+                .map(|w| w.worktree_path.to_string_lossy().to_string());
+            (wt_path.or(working_dir), Some(ctx))
+        }
+        Ok(None) => (working_dir, None),
+        Err(e) => {
+            warn!(
+                intent_repo = %repo,
+                error = %e,
+                "acquire_for_terminal: isolated worktree allocate failed — falling back to shared cwd"
+            );
+            (working_dir, None)
+        }
+    }
+}
+
 /// Read the device UUID from `~/.qontinui/machine.json`. Accepts the
 /// canonical `"device_id"` field (post-unified-devices) and falls back
 /// to legacy `"machine_id"`.

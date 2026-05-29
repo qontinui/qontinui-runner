@@ -171,6 +171,12 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 page_id: Option<String>,
                 cols: Option<u16>,
                 rows: Option<u16>,
+                /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
+                /// When `Some(repo_slug)` AND `QONTINUI_AGENT_WORKTREE_MODE` is on,
+                /// allocate an isolated worktree for that repo and use it as the
+                /// PTY cwd instead of `working_dir`. Mirrors the `intent_repo`
+                /// argument on the `terminal_create` Tauri command.
+                intent_repo: Option<String>,
             }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
@@ -181,15 +187,29 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 .state::<Arc<TerminalManager>>()
                 .inner()
                 .clone();
+
+            let (working_dir, isolated_ctx) =
+                crate::agent_worktree::isolated_edit::acquire_for_terminal(
+                    a.intent_repo.as_deref(),
+                    a.title.as_deref().unwrap_or("Terminal edit session"),
+                    a.working_dir,
+                )
+                .await;
+
             match tm.create(
                 a.title,
-                a.working_dir,
+                working_dir,
                 a.page_id,
                 a.cols,
                 a.rows,
                 state.app_handle.clone(),
             ) {
                 Ok(info) => {
+                    if let Some(ctx) = isolated_ctx {
+                        if let Some(session) = tm.get(&info.id) {
+                            session.set_isolated_edit_ctx(ctx);
+                        }
+                    }
                     TauriInvokeResponse::ok(serde_json::to_value(&info).unwrap_or(Value::Null))
                 }
                 Err(e) => TauriInvokeResponse::err(e),

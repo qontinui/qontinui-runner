@@ -1019,40 +1019,19 @@ pub async fn spawn_worker_session(
     let primary_repo_path = resolve_runner_repo_path()
         .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
 
-    // Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
-    // Worker sessions always intend to edit qontinui-runner (the
-    // Coordinator's `assign-task` dispatch targets runner code). When
-    // worktree mode is on, allocate an isolated worktree and route the
-    // PTY there instead of the primary checkout; on failure or
-    // flag-off, fall back to the primary path. The context is parked
-    // on the TerminalSession after spawn.
+    // Phase 2 — worker sessions always intend to edit qontinui-runner
+    // (the Coordinator's `assign-task` dispatch targets runner code).
+    // Route through `acquire_for_terminal` so this path stays in
+    // lockstep with the other three terminal-spawn entry points.
     let intent_repo = "qontinui-runner".to_string();
-    let repos = vec![intent_repo.clone()];
-    let isolated_ctx = match crate::agent_worktree::isolated_edit::acquire(
-        crate::agent_worktree::isolated_edit::AcquireRequest {
-            repos: &repos,
-            intent: Some("Worker session"),
-            declared_overlap_paths: None,
-            plan_id: None,
-            phase: None,
-        },
-    )
-    .await
-    {
-        Ok(Some(ctx)) => Some(ctx),
-        Ok(None) => None, // flag off
-        Err(e) => {
-            warn!(
-                error = %e,
-                "spawn_worker_session: isolated worktree allocate failed — using primary checkout"
-            );
-            None
-        }
-    };
-    let repo_path = match isolated_ctx.as_ref().and_then(|c| c.worktrees.first()) {
-        Some(w) => w.worktree_path.to_string_lossy().to_string(),
-        None => primary_repo_path,
-    };
+    let (effective_repo_path, isolated_ctx) =
+        crate::agent_worktree::isolated_edit::acquire_for_terminal(
+            Some(&intent_repo),
+            "Worker session",
+            Some(primary_repo_path.clone()),
+        )
+        .await;
+    let repo_path = effective_repo_path.unwrap_or(primary_repo_path);
 
     let terminal_manager = app_handle
         .try_state::<Arc<TerminalManager>>()
