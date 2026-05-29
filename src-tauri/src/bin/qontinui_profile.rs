@@ -991,6 +991,28 @@ fn register_with_coord(
     let body_text = resp
         .text()
         .unwrap_or_else(|_| "<unable to read response body>".to_string());
+    // Phase 2 of the unknown-tenant plan: coord now returns HTTP 400 with
+    // `{"error":"unknown_tenant","tenant_id":"<uuid>", ...}` when the supplied
+    // tenant_id is not present in coord.tenants. Surface an actionable recovery
+    // hint instead of the raw body. Any other 400 / non-2xx keeps the generic
+    // error below.
+    if status.as_u16() == 400 {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
+            if json.get("error").and_then(|v| v.as_str()) == Some("unknown_tenant") {
+                let body_tenant = json
+                    .get("tenant_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(tenant_id);
+                return Err(format!(
+                    "coord rejected device registration — tenant_id {body_tenant} is not registered. \
+                     Common cause: paired_user.json carries a stale tenant_id from a re-paired session. \
+                     Re-pair the device (`qontinui_profile device pair --tenant-id {body_tenant}`) or \
+                     update the runner's paired_user.json to the current tenant_id (look up via web UI \
+                     Settings → Account)."
+                ));
+            }
+        }
+    }
     Err(format!(
         "POST {} returned HTTP {}: {}",
         url, status, body_text
