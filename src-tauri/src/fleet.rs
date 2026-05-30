@@ -864,6 +864,17 @@ struct TreeStatePayload {
     /// tracked and not gitignored. The orphan-untracked-file signal.
     #[serde(skip_serializing_if = "Option::is_none")]
     untracked_count: Option<i32>,
+    /// Commits the LOCAL default branch (`main`) is ahead of
+    /// `origin/<default>` — unpushed local commits on default
+    /// (`git rev-list --count origin/<default>..<default>`). Computed
+    /// regardless of which branch is currently checked out (it's a
+    /// property of the local default ref, not HEAD). The coord-side
+    /// `repo_pull` verdict keys on this: a clean default-branch tree
+    /// with `local_ahead > 0` is DIVERGED and must escalate rather than
+    /// auto-ff. `None` when `origin/<default>` or the local `<default>`
+    /// ref doesn't resolve (coord persists the column's `DEFAULT 0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_ahead: Option<i32>,
 }
 
 /// Maximum number of dirty paths included per row (the column is unbounded
@@ -1061,6 +1072,58 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             }
         });
 
+    // local_ahead: commits the LOCAL default branch is ahead of
+    // `origin/<default>` — unpushed local commits on default. Computed
+    // against the default ref regardless of which branch is checked out
+    // (the coord `repo_pull` verdict needs the default's divergence even
+    // when the operator is sitting on a feature branch). Resolve the
+    // default branch from `origin/HEAD` (e.g. `origin/main` -> `main`),
+    // falling back to `main`. No network fetch — uses last-fetched refs,
+    // same posture as `behind_count` above.
+    let default_branch = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str()?,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                // `origin/main` -> `main`
+                s.strip_prefix("origin/").map(|b| b.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "main".to_string());
+    let local_ahead: Option<i32> = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str()?,
+            "rev-list",
+            "--count",
+            &format!("origin/{default_branch}..{default_branch}"),
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+            } else {
+                // Either ref unresolved (fresh clone, no local default
+                // ref, detached genesis) — report nothing; coord keeps
+                // the column's DEFAULT 0.
+                None
+            }
+        });
+
     // device_id is filled in by the caller (it's identity-side, not
     // per-repo). Punch in a placeholder; the publisher overwrites it.
     Some(TreeStatePayload {
@@ -1078,7 +1141,494 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         behind_count,
         head_detached,
         untracked_count,
+        local_ahead,
     })
+}
+
+// =============================================================================
+// repo_pull executor (Coordination-Layer Pull Decision plan §5)
+//
+// After publishing a repo's tree state, for repos that are behind origin this
+// requests coord's `repo_pull` verdict (POST /coord/trees/pull-decision,
+// device-scoped) and applies the SAFE action with a re-check at apply time:
+//   - Pull (timing=Now): `git pull --ff-only origin <default>` — only after
+//     re-verifying the tree is still on the default branch AND clean (multi-
+//     agent paranoia, /pull-scoped rule 5). ff failure → record, never force.
+//   - DefaultRefSync: `git fetch origin <default>:<default>` — a pure local-ref
+//     fast-forward (git refuses a non-ff ref update, so an unpushed local
+//     default is never clobbered); the working tree is untouched.
+//   - Pull (timing=Defer) / Hold / UpToDate: no-op this tick.
+//   - Escalate (Diverged / malformed): no-op; coord put it in the operator inbox.
+//
+// The executor NEVER auto-stashes, `reset --hard`, `--force`, rebases, or
+// touches a feature branch's working tree — the /pull-scoped hard rules are
+// invariants enforced here even if a (buggy/spoofed) Decision asked otherwise.
+//
+// GATED OFF by default: set `COORD_PULL_EXECUTOR_ENABLED=1` to opt in. The
+// decision REQUEST is harmless, but the apply mutates the working tree, so an
+// existing runner stays inert until the operator flips the flag (the standing
+// autonomous-pull authorization is per-operator — no-surprise default).
+// =============================================================================
+
+/// Is the auto-pull executor opted in? Off unless `COORD_PULL_EXECUTOR_ENABLED`
+/// is a truthy value (`1`/`true`/`yes`, case-insensitive).
+fn pull_executor_enabled() -> bool {
+    std::env::var("COORD_PULL_EXECUTOR_ENABLED")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Resolve a repo's default branch from `origin/HEAD` (`origin/main` -> `main`),
+/// falling back to `main`. No network — uses the last-fetched symbolic ref.
+fn resolve_default_branch(repo_path: &std::path::Path) -> String {
+    use std::process::Command;
+    Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str().unwrap_or("."),
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                s.strip_prefix("origin/").map(|b| b.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "main".to_string())
+}
+
+/// The outcome the executor reports back to coord's flywheel + logs.
+struct PullOutcome {
+    chosen_option: String,
+    reasoning: String,
+    /// `Some` git op to also append to the fleet feed (`git_ops.record`).
+    git_op: Option<(String, Option<String>)>, // (op_kind, message)
+}
+
+/// Apply one safe verdict to one repo's working tree. Blocking git via the
+/// caller's `spawn_blocking`. Returns the outcome to record. NEVER performs an
+/// unsafe op regardless of the verdict (defense in depth, plan §5).
+fn apply_pull_verdict_blocking(
+    repo_path: &std::path::Path,
+    verdict_kind: &str,
+    timing_now: bool,
+    hold_reason: Option<&str>,
+) -> PullOutcome {
+    use std::process::Command;
+    let default_branch = resolve_default_branch(repo_path);
+    let repo_str = repo_path.to_str().unwrap_or(".");
+
+    match verdict_kind {
+        "up_to_date" => PullOutcome {
+            chosen_option: "up_to_date".to_string(),
+            reasoning: "coord verdict UpToDate — nothing to pull".to_string(),
+            git_op: None,
+        },
+        "hold" => PullOutcome {
+            chosen_option: format!("held_{}", hold_reason.unwrap_or("unknown")),
+            reasoning: format!(
+                "coord verdict Hold ({}) — not safe to act, surfaced not applied",
+                hold_reason.unwrap_or("unknown")
+            ),
+            git_op: None,
+        },
+        "default_ref_sync" => {
+            // Pure local-default ref fast-forward; never touches the checked-out
+            // tree. git refuses a non-ff ref update, so an unpushed local
+            // default is safe.
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    repo_str,
+                    "fetch",
+                    "origin",
+                    &format!("{default_branch}:{default_branch}"),
+                ])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => PullOutcome {
+                    chosen_option: "default_ref_sync".to_string(),
+                    reasoning: format!("fast-forwarded local {default_branch} ref to origin"),
+                    git_op: Some((
+                        "fetch".to_string(),
+                        Some(format!("ref-sync {default_branch}")),
+                    )),
+                },
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    let excerpt: String = err.trim().chars().take(200).collect();
+                    PullOutcome {
+                        chosen_option: "ref_sync_failed".to_string(),
+                        reasoning: format!(
+                            "git fetch origin {default_branch}:{default_branch} failed (likely \
+                             local default diverged — not forced): {excerpt}"
+                        ),
+                        git_op: None,
+                    }
+                }
+                Err(e) => PullOutcome {
+                    chosen_option: "ref_sync_failed".to_string(),
+                    reasoning: format!("git fetch invocation failed: {e}"),
+                    git_op: None,
+                },
+            }
+        }
+        "pull" => {
+            if !timing_now {
+                return PullOutcome {
+                    chosen_option: "deferred".to_string(),
+                    reasoning: "coord verdict Pull but timing=Defer — re-evaluate next tick"
+                        .to_string(),
+                    git_op: None,
+                };
+            }
+            // §5 apply-time safety re-check: branch + clean-tree can change
+            // between the decision and now. Re-verify we are STILL on the
+            // default branch and the tree is STILL clean before pulling.
+            let cur_branch = Command::new("git")
+                .args(["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            let on_default = cur_branch.as_deref() == Some(default_branch.as_str());
+            let clean = Command::new("git")
+                .args(["-C", repo_str, "status", "--porcelain=v1"])
+                .output()
+                .ok()
+                .map(|o| o.status.success() && o.stdout.is_empty())
+                .unwrap_or(false);
+            if !on_default || !clean {
+                return PullOutcome {
+                    chosen_option: "skipped_recheck".to_string(),
+                    reasoning: format!(
+                        "apply-time re-check failed (on_default={on_default}, clean={clean}) — \
+                         tree changed since the verdict; not pulling"
+                    ),
+                    git_op: None,
+                };
+            }
+            // ff-only pull — the ONLY tree-mutating op the executor performs.
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    repo_str,
+                    "pull",
+                    "--ff-only",
+                    "origin",
+                    &default_branch,
+                ])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    let new_sha = Command::new("git")
+                        .args(["-C", repo_str, "rev-parse", "HEAD"])
+                        .output()
+                        .ok()
+                        .filter(|x| x.status.success())
+                        .map(|x| String::from_utf8_lossy(&x.stdout).trim().to_string());
+                    let sha_suffix = new_sha
+                        .as_ref()
+                        .map(|s| format!(" (HEAD={})", &s[..s.len().min(12)]))
+                        .unwrap_or_default();
+                    PullOutcome {
+                        chosen_option: "pulled".to_string(),
+                        reasoning: format!(
+                            "ff-only pull of origin/{default_branch} succeeded{sha_suffix}"
+                        ),
+                        git_op: Some((
+                            "pull".to_string(),
+                            Some(format!("ff-only origin/{default_branch}")),
+                        )),
+                    }
+                }
+                Ok(o) => {
+                    // ff failed — someone pushed a local commit since the verdict
+                    // (now diverged). Record Diverged; NEVER force.
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    let excerpt: String = err.trim().chars().take(200).collect();
+                    PullOutcome {
+                        chosen_option: "ff_failed".to_string(),
+                        reasoning: format!(
+                            "git pull --ff-only failed (default diverged since verdict — not \
+                             forced): {excerpt}"
+                        ),
+                        git_op: None,
+                    }
+                }
+                Err(e) => PullOutcome {
+                    chosen_option: "ff_failed".to_string(),
+                    reasoning: format!("git pull invocation failed: {e}"),
+                    git_op: None,
+                },
+            }
+        }
+        other => PullOutcome {
+            chosen_option: "unknown_verdict".to_string(),
+            reasoning: format!("unrecognized verdict kind `{other}` — no action"),
+            git_op: None,
+        },
+    }
+}
+
+/// Request coord's `repo_pull` verdict for one behind repo and apply the safe
+/// action. Best-effort: any error logs `warn!`/`debug!` and returns — the next
+/// publish tick retries. `payload` is the just-published tree state.
+async fn request_and_apply_pull(
+    client: &reqwest::Client,
+    base: &str,
+    device_id: uuid::Uuid,
+    repo_path: std::path::PathBuf,
+    payload: &TreeStatePayload,
+) {
+    // 1. Request the decision (device-scoped — coord resolves tenant from
+    //    device_id; the executor's fresh git state rides in `context` so the
+    //    verdict can fall back to it if coord's row lags).
+    let context = serde_json::json!({
+        "repo": payload.repo,
+        "branch": payload.branch,
+        "behind": payload.behind_count,
+        "dirty": payload.dirty,
+        "untracked": payload.untracked_count,
+        "detached": payload.head_detached,
+        "local_ahead": payload.local_ahead,
+    });
+    let body = serde_json::json!({
+        "device_id": device_id,
+        "repo": payload.repo,
+        "surface": "infra",
+        "context": context,
+    });
+    let url = format!("{base}/coord/trees/pull-decision");
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            let status = r.status();
+            let txt = r.text().await.unwrap_or_default();
+            let excerpt: String = txt.chars().take(200).collect();
+            warn!(
+                "fleet::pull_executor: decision HTTP {status} for {}: {excerpt}",
+                payload.repo
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "fleet::pull_executor: decision request for {} failed: {e}",
+                payload.repo
+            );
+            return;
+        }
+    };
+    let json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "fleet::pull_executor: decision body parse for {} failed: {e}",
+                payload.repo
+            );
+            return;
+        }
+    };
+
+    let resolution_id = json
+        .get("resolution_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let kind = json.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+
+    if kind == "escalate" {
+        let reason = json
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no reason)");
+        info!(
+            "fleet::pull_executor: {} escalated to operator (not auto-pulled): {reason}",
+            payload.repo
+        );
+        return;
+    }
+    if kind != "decision" {
+        debug!(
+            "fleet::pull_executor: {} resolution kind `{kind}` — no action",
+            payload.repo
+        );
+        return;
+    }
+
+    // 2. Parse the verdict payload the Decision carries in action.log_message.
+    let log_message = json
+        .get("action")
+        .and_then(|a| a.get("log_message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let verdict_payload: serde_json::Value = match serde_json::from_str(log_message) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "fleet::pull_executor: {} verdict payload parse failed: {e}",
+                payload.repo
+            );
+            return;
+        }
+    };
+    let autonomy = verdict_payload
+        .get("autonomy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto_decide");
+    let verdict = verdict_payload
+        .get("verdict")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let verdict_kind = verdict
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let timing_now = verdict
+        .get("timing")
+        .and_then(|t| t.get("when"))
+        .and_then(|v| v.as_str())
+        .map(|w| w == "now")
+        .unwrap_or(true); // non-Pull verdicts carry no timing → treat as "now"
+    let hold_reason = verdict
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // 3. Honor the autonomy dial: guidance_only surfaces the recommendation
+    //    without mutating the tree.
+    if autonomy != "auto_decide" {
+        info!(
+            "fleet::pull_executor: {} recommendation `{verdict_kind}` (autonomy={autonomy}) — \
+             surfacing, not applying",
+            payload.repo
+        );
+        record_pull_outcome(
+            client,
+            base,
+            device_id,
+            resolution_id,
+            "surfaced",
+            &format!("guidance_only: recommended {verdict_kind}, not applied"),
+        )
+        .await;
+        return;
+    }
+
+    // 4. Apply the safe verdict (blocking git on a worker thread).
+    let rp = repo_path.clone();
+    let vk = verdict_kind.clone();
+    let hr = hold_reason.clone();
+    let outcome = match tokio::task::spawn_blocking(move || {
+        apply_pull_verdict_blocking(&rp, &vk, timing_now, hr.as_deref())
+    })
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(
+                "fleet::pull_executor: {} apply task panicked: {e}",
+                payload.repo
+            );
+            return;
+        }
+    };
+
+    if outcome.chosen_option == "pulled" || outcome.chosen_option == "default_ref_sync" {
+        info!(
+            "fleet::pull_executor: {} -> {} ({})",
+            payload.repo, outcome.chosen_option, outcome.reasoning
+        );
+    } else {
+        debug!(
+            "fleet::pull_executor: {} -> {} ({})",
+            payload.repo, outcome.chosen_option, outcome.reasoning
+        );
+    }
+
+    // 5. Close the flywheel + (best-effort) append the actual op to the fleet feed.
+    record_pull_outcome(
+        client,
+        base,
+        device_id,
+        resolution_id,
+        &outcome.chosen_option,
+        &outcome.reasoning,
+    )
+    .await;
+    if let Some((op_kind, message)) = outcome.git_op {
+        record_git_op_fleet_feed(&payload.repo, &payload.branch, &op_kind, message).await;
+    }
+}
+
+/// POST /coord/trees/pull-decision/record — close the Mode-C flywheel.
+async fn record_pull_outcome(
+    client: &reqwest::Client,
+    base: &str,
+    device_id: uuid::Uuid,
+    resolution_id: Option<String>,
+    chosen_option: &str,
+    reasoning: &str,
+) {
+    let Some(resolution_id) = resolution_id else {
+        debug!("fleet::pull_executor: no resolution_id to record against");
+        return;
+    };
+    let body = serde_json::json!({
+        "device_id": device_id,
+        "resolution_id": resolution_id,
+        "chosen_option": chosen_option,
+        "reasoning": reasoning,
+    });
+    let url = format!("{base}/coord/trees/pull-decision/record");
+    if let Err(e) = client.post(&url).json(&body).send().await {
+        debug!("fleet::pull_executor: record outcome failed: {e}");
+    }
+}
+
+/// Append the actual git op to the fleet feed (`git_ops.record`) — observability
+/// distinct from the decision audit. Best-effort; resolves tenant locally.
+async fn record_git_op_fleet_feed(
+    repo: &str,
+    branch: &str,
+    op_kind: &str,
+    message: Option<String>,
+) {
+    let Some(tenant_id) = resolve_tenant_id() else {
+        debug!("fleet::pull_executor: no tenant_id — skipping git_ops fleet-feed record");
+        return;
+    };
+    let Some(base) = qontinui_runner_lib::observable_bridge::git_ops_client::coord_http_base()
+    else {
+        return;
+    };
+    let client = match qontinui_runner_lib::observable_bridge::git_ops_client::build_client() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let req = qontinui_types::git_ops::RecordGitOpRequest {
+        repo: repo.to_string(),
+        branch: Some(branch.to_string()),
+        op_kind: op_kind.to_string(),
+        sha: None,
+        message,
+        metadata: Some(serde_json::json!({"source": "repo_pull_executor"})),
+    };
+    if let Err(e) = qontinui_runner_lib::observable_bridge::git_ops_client::record(
+        &client, &base, "", tenant_id, &req,
+    )
+    .await
+    {
+        debug!("fleet::pull_executor: git_ops fleet-feed record failed: {e}");
+    }
 }
 
 /// One publish pass: discover qontinui-* dirs under `QONTINUI_ROOT`,
@@ -1184,9 +1734,10 @@ pub async fn publish_tree_state() -> Result<(), String> {
         total += 1;
         payload.device_id = device_id;
 
-        match client.post(&url).json(&payload).send().await {
+        let upsert_ok = match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 posted += 1;
+                true
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -1196,13 +1747,23 @@ pub async fn publish_tree_state() -> Result<(), String> {
                     "fleet::tree_publisher: coord returned {status} for {repo}: {excerpt}",
                     repo = payload.repo
                 );
+                false
             }
             Err(e) => {
                 warn!(
                     "fleet::tree_publisher: POST {url} for {repo} failed: {e}",
                     repo = payload.repo
                 );
+                false
             }
+        };
+
+        // repo_pull executor (plan §5): once the fresh tree state has landed in
+        // coord, for a repo that is behind origin, request the pull verdict and
+        // apply the safe action. Gated OFF by default (opt-in via
+        // COORD_PULL_EXECUTOR_ENABLED) — the apply mutates the working tree.
+        if upsert_ok && pull_executor_enabled() && payload.behind_count.unwrap_or(0) > 0 {
+            request_and_apply_pull(&client, &base, device_id, path.clone(), &payload).await;
         }
     }
 
