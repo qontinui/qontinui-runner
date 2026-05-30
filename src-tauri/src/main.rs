@@ -1848,6 +1848,34 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     coord_sync_facade.clone(),
                 );
                 coord_sync_facade.attach_registry(&registry);
+
+                // R2 (session-lifecycle-cleanup) — pane → coord-session-id
+                // store, so a restored terminal pane RESUMES its prior coord
+                // session instead of orphaning the row + minting a duplicate.
+                // Co-located with the session outbox under `.qontinui/runner`.
+                let pane_store_path = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".qontinui")
+                    .join("runner")
+                    .join("pane-sessions.json");
+                let pane_store = std::sync::Arc::new(
+                    match session::pane_store::PaneSessionStore::open(&pane_store_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %pane_store_path.display(),
+                                "session: pane store open failed — using ephemeral fallback"
+                            );
+                            let fallback = std::env::temp_dir()
+                                .join("qontinui-runner-pane-sessions.json");
+                            session::pane_store::PaneSessionStore::open(&fallback)
+                                .expect("session: ephemeral pane store open failed")
+                        }
+                    },
+                );
+                app.manage(pane_store);
+
                 // Plan §Phase 3/7/10 — start the coord-sync background loops
                 // (drain, heartbeat, Phase 7 handoff receiver, Phase 10
                 // cutover-flag poll). `.setup()` runs synchronously with no

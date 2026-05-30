@@ -350,6 +350,54 @@ impl CoordSync {
         self.inner.dual_write.enabled()
     }
 
+    /// R2 (session-lifecycle-cleanup) — probe coord to decide whether a
+    /// persisted session id can be RESUMED (PATCH) or must be re-registered
+    /// fresh (POST). Issues `PATCH /sessions/:id` with
+    /// `{state:"active", heartbeat:true}` — the same body the drain loop's
+    /// `state_change` push sends, so a successful probe also re-activates +
+    /// heartbeats the row (the resume is effectively done coord-side on a
+    /// 2xx). Coord already supports `state` + `heartbeat` on
+    /// `UpdateSessionRequest`, so **no coord-side change is required**.
+    ///
+    /// Maps the response to a coarse [`ResumeProbe`]:
+    /// - 2xx → [`ResumeProbe::Found`] (row exists, now re-activated)
+    /// - 404 / 410 → [`ResumeProbe::NotFound`] (GC'd or never existed)
+    /// - everything else (network, timeout, 5xx, other 4xx) →
+    ///   [`ResumeProbe::Unreachable`] (treat as transient; caller resumes
+    ///   optimistically and the drain loop retries).
+    ///
+    /// Called by [`SessionRegistry::resume_external`].
+    pub async fn probe_resume(&self, session_id: Uuid) -> ResumeProbe {
+        let base = self.inner.coord_url.trim_end_matches('/');
+        let url = format!("{base}/sessions/{session_id}");
+        let body = json!({ "state": SessionState::Active.as_str(), "heartbeat": true });
+        match self.inner.http.patch(&url).json(&body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    ResumeProbe::Found
+                } else if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+                    ResumeProbe::NotFound
+                } else {
+                    tracing::debug!(
+                        session = %session_id,
+                        %status,
+                        "coord_sync: resume probe got non-2xx/non-404 — treating as unreachable"
+                    );
+                    ResumeProbe::Unreachable
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    session = %session_id,
+                    error = %e,
+                    "coord_sync: resume probe transport error — treating as unreachable"
+                );
+                ResumeProbe::Unreachable
+            }
+        }
+    }
+
     /// Test-only: force the cutover gate to a given value, simulating
     /// what the poll loop does when a tenant flips the flag.
     #[cfg(test)]
@@ -424,6 +472,26 @@ impl CoordSync {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Resume probe outcome (R2)
+// ---------------------------------------------------------------------------
+
+/// Coarse outcome of [`CoordSync::probe_resume`], driving
+/// [`super::SessionRegistry::resume_external`]'s PATCH-vs-fresh-POST
+/// decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeProbe {
+    /// The coord row exists and was re-activated by the probe PATCH.
+    Found,
+    /// Coord returned 404/410 — the row was GC'd or never existed. The
+    /// caller registers a fresh session.
+    NotFound,
+    /// Coord was unreachable / returned a transient error. The caller
+    /// resumes optimistically under the persisted id; the drain loop
+    /// retries.
+    Unreachable,
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,6 +1070,9 @@ mod tests {
         next_post_conflict: bool,
         /// When >0, the next N POSTs return 500.
         next_post_5xx: usize,
+        /// When true, every PATCH returns 404 (simulates a GC'd / missing
+        /// coord row — drives the R2 resume 404-fallback path).
+        patch_returns_404: bool,
     }
 
     impl CoordRecorder {
@@ -1054,7 +1125,15 @@ mod tests {
                     |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
                      AxumPath(id): AxumPath<Uuid>,
                      Json(body): Json<JsonValue>| async move {
-                        state.lock().await.patches.push((id, body.clone()));
+                        let mut g = state.lock().await;
+                        g.patches.push((id, body.clone()));
+                        if g.patch_returns_404 {
+                            return (
+                                AxumStatus::NOT_FOUND,
+                                Json(json!({"error": "session not found"})),
+                            )
+                                .into_response();
+                        }
                         (AxumStatus::OK, Json(json!({"id": id}))).into_response()
                     },
                 )
@@ -1495,5 +1574,200 @@ mod tests {
         std::env::set_var(var, "not-a-number");
         assert_eq!(env_u64(var, 42), 42);
         std::env::remove_var(var);
+    }
+
+    // -----------------------------------------------------------------
+    // R2 — probe_resume + resume_external (PATCH-vs-POST + 404 fallback)
+    // -----------------------------------------------------------------
+
+    /// `probe_resume` against an existing row returns `Found` and the
+    /// probe itself issues the re-activating PATCH (state=active +
+    /// heartbeat).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_resume_found_emits_activating_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let id = Uuid::new_v4();
+        let probe = coord.probe_resume(id).await;
+        assert_eq!(probe, ResumeProbe::Found);
+        let g = rec.lock().await;
+        assert_eq!(g.patches.len(), 1, "probe issues exactly one PATCH");
+        let (patched_id, body) = &g.patches[0];
+        assert_eq!(*patched_id, id);
+        assert_eq!(body["state"], "active");
+        assert_eq!(body["heartbeat"], true);
+    }
+
+    /// `probe_resume` maps a 404 to `NotFound` (drives the fresh-register
+    /// fallback).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_resume_404_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_returns_404 = true;
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let probe = coord.probe_resume(Uuid::new_v4()).await;
+        assert_eq!(probe, ResumeProbe::NotFound);
+    }
+
+    /// `probe_resume` maps an unreachable coord (connection refused) to
+    /// `Unreachable` (drives the optimistic-resume path).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_resume_transport_error_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        // Port 1 is reserved/unbindable — connection refused.
+        let coord = CoordSync::new_for_test(
+            outbox,
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let probe = coord.probe_resume(Uuid::new_v4()).await;
+        assert_eq!(probe, ResumeProbe::Unreachable);
+    }
+
+    /// `resume_external` on an existing row REUSES the persisted id (no new
+    /// id, no `Started` POST) and emits a `state_change` outbox row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_reuses_id_when_row_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, _rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let registry = build_registry(coord.clone());
+
+        let persisted = Uuid::new_v4();
+        let resumed = registry
+            .resume_external(persisted, make_test_intent())
+            .await
+            .unwrap();
+        assert_eq!(resumed, persisted, "resume must reuse the persisted id");
+
+        // The in-memory mirror exists under the persisted id.
+        let desc = registry.describe_by_id(persisted).unwrap();
+        assert_eq!(desc.state, SessionState::Active);
+        assert_eq!(desc.transport_handle_kind, "external");
+
+        // A state_change (NOT started) row is queued for the drain loop.
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].event_kind,
+            SessionEventKind::StateChange.as_str()
+        );
+        assert_eq!(pending[0].session_id, persisted);
+    }
+
+    /// `resume_external` on a GC'd row (PATCH 404) falls back to a fresh
+    /// `register_external`: a NEW id + a `Started` POST row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_falls_back_to_fresh_on_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_returns_404 = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let registry = build_registry(coord.clone());
+
+        let persisted = Uuid::new_v4();
+        let fresh = registry
+            .resume_external(persisted, make_test_intent())
+            .await
+            .unwrap();
+        assert_ne!(fresh, persisted, "404 fallback mints a NEW id");
+
+        // The fresh id has a mirror; the stale persisted id does not.
+        assert!(registry.describe_by_id(fresh).is_ok());
+        assert!(registry.describe_by_id(persisted).is_err());
+
+        // A `started` row (fresh register), keyed by the new id.
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_kind, SessionEventKind::Started.as_str());
+        assert_eq!(pending[0].session_id, fresh);
+    }
+
+    /// `resume_external` against an unreachable coord resumes optimistically
+    /// under the persisted id (idempotent reconnect; a fresh POST would
+    /// fail identically while coord is down).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_optimistic_when_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let registry = build_registry(coord.clone());
+
+        let persisted = Uuid::new_v4();
+        let resumed = registry
+            .resume_external(persisted, make_test_intent())
+            .await
+            .unwrap();
+        assert_eq!(resumed, persisted);
+        assert!(registry.describe_by_id(persisted).is_ok());
+        // Still emits a state_change for the drain loop to retry.
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].event_kind,
+            SessionEventKind::StateChange.as_str()
+        );
+    }
+
+    /// `resume_external` rejects an invalid intent up front (before any
+    /// network probe).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_rejects_invalid_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox,
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
+        let registry = build_registry(coord.clone());
+        let mut intent = make_test_intent();
+        intent.purpose = "x".into();
+        let err = registry
+            .resume_external(Uuid::new_v4(), intent)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::session::SessionError::Intent(_)));
     }
 }

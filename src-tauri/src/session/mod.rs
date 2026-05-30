@@ -62,6 +62,7 @@ pub mod handoff;
 pub mod intent;
 pub mod local_store;
 pub mod output_pipe;
+pub mod pane_store;
 pub mod transport;
 
 use std::collections::HashMap;
@@ -73,6 +74,7 @@ use serde_json::{json, Value as JsonValue};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use coord_sync::ResumeProbe;
 pub use intent::{Intent, IntentError};
 pub use transport::{DynTransport, ExternalTransport, Transport, TransportError, TransportHandle};
 
@@ -521,6 +523,135 @@ impl SessionRegistry {
         sessions.insert(id, record);
 
         Ok(id)
+    }
+
+    /// R2 (session-lifecycle-cleanup) — RESUME a previously-registered
+    /// external session by its persisted coord id instead of minting a
+    /// fresh one. Used on runner restart when a restored terminal pane has
+    /// a coord session id persisted in
+    /// [`crate::session::pane_store::PaneSessionStore`].
+    ///
+    /// ## Why this exists
+    ///
+    /// [`Self::register_external`] always allocates a new `uuid_v7`, so a
+    /// pane that re-launches across restarts orphans its old `coord.sessions`
+    /// row and accumulates duplicates. Resuming re-activates the EXISTING
+    /// row via a PATCH (`state=active` + `heartbeat`) — coord already
+    /// supports both on `UpdateSessionRequest`, so **no coord-side change
+    /// is required**.
+    ///
+    /// ## PATCH-vs-fresh decision + 404 fallback
+    ///
+    /// We probe coord synchronously with `PATCH /sessions/:id`
+    /// `{state:"active", heartbeat:true}`:
+    ///
+    /// - **2xx** → the row exists; re-insert the in-memory [`SessionRecord`]
+    ///   under `persisted_id`, emit a `StateChange` outbox row (so the drain
+    ///   loop keeps coord fresh and the local state is consistent), and
+    ///   return `persisted_id`. The session id is unchanged across the
+    ///   restart — no duplicate.
+    /// - **404 / 410** → the row was GC'd (or never existed). Fall back to a
+    ///   fresh [`Self::register_external`] (new id, `Started` POST) so the
+    ///   pane is never left without a coord session, and return the NEW id.
+    ///   The caller persists the new id over the stale one.
+    /// - **transport error / 5xx** (coord temporarily unreachable) → resume
+    ///   OPTIMISTICALLY: re-insert under `persisted_id` and emit a
+    ///   `StateChange` row. The drain loop retries the PATCH on reconnect;
+    ///   if the row turns out to be gone, the next heartbeat PATCH 404s and
+    ///   the row is treated as permanently-failed locally (the dashboard
+    ///   simply won't show it until the operator re-launches). A fresh POST
+    ///   here would fail identically while coord is down, so re-using the
+    ///   persisted id is the strictly-better choice (idempotent reconnect).
+    ///
+    /// Returns the coord session id the pane should now persist (either the
+    /// resumed `persisted_id` or the fresh fallback id).
+    pub async fn resume_external(
+        self: &Arc<Self>,
+        persisted_id: Uuid,
+        intent: Intent,
+    ) -> Result<Uuid, SessionError> {
+        intent.validate()?;
+
+        let probe = self.coord_sync.probe_resume(persisted_id).await;
+
+        match probe {
+            ResumeProbe::Found => {
+                self.insert_resumed_record(persisted_id, intent);
+                tracing::info!(
+                    session = %persisted_id,
+                    "session: resumed existing coord session (PATCH 2xx)"
+                );
+                Ok(persisted_id)
+            }
+            ResumeProbe::NotFound => {
+                tracing::info!(
+                    session = %persisted_id,
+                    "session: persisted coord session gone (404) — registering fresh"
+                );
+                self.register_external(intent)
+            }
+            ResumeProbe::Unreachable => {
+                // Optimistic resume — coord is down, not the row. Re-use the
+                // persisted id so reconnect is idempotent.
+                self.insert_resumed_record(persisted_id, intent);
+                tracing::warn!(
+                    session = %persisted_id,
+                    "session: coord unreachable during resume — resuming optimistically, drain loop will retry"
+                );
+                Ok(persisted_id)
+            }
+        }
+    }
+
+    /// Re-insert the in-memory mirror record for a resumed session under the
+    /// persisted id, and emit a `StateChange` (→ PATCH `state=active`) so
+    /// the drain loop reconciles coord. Mirrors [`Self::register_external`]'s
+    /// record shape but reuses `persisted_id` and emits `StateChange`
+    /// instead of `Started`.
+    fn insert_resumed_record(self: &Arc<Self>, persisted_id: Uuid, intent: Intent) {
+        let now = chrono::Utc::now();
+        let claude_code_session_id = ambient_claude_code_session_id();
+        let transport: DynTransport = Arc::new(transport::ExternalTransport);
+
+        let record = SessionRecord {
+            id: persisted_id,
+            kind: intent.kind,
+            state: SessionState::Active,
+            intent: intent.clone(),
+            started_at: now,
+            last_heartbeat_at: Some(now),
+            closed_at: None,
+            parent_session_id: None,
+            claude_code_session_id,
+            transport,
+            transport_handle: TransportHandle::External,
+            output_pipe: None,
+        };
+
+        // Emit a state_change → PATCH so the drain loop re-activates the row
+        // (state=active + heartbeat). state_change_body always stamps
+        // heartbeat:true, refreshing last_heartbeat_at coord-side.
+        let payload = json!({
+            "id": persisted_id,
+            "state": SessionState::Active.as_str(),
+            "repo": intent.repo,
+            "branch": intent.branch,
+        });
+        if let Err(e) = self.coord_sync.outbox().record(
+            self.machine_id,
+            persisted_id,
+            SessionEventKind::StateChange,
+            payload,
+        ) {
+            tracing::warn!(
+                session = %persisted_id,
+                error = %e,
+                "session: resume state_change outbox write failed"
+            );
+        }
+
+        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+        sessions.insert(persisted_id, record);
     }
 
     fn with_record<R>(
