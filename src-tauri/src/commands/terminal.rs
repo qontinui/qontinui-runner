@@ -37,6 +37,8 @@ pub async fn terminal_create(
     cols: Option<u16>,
     rows: Option<u16>,
     intent_repo: Option<String>,
+    plan_slug: Option<String>,
+    correlation_topic: Option<String>,
 ) -> Result<CommandResponse, String> {
     // R2 (session-lifecycle-cleanup) — derive the STABLE pane identity from
     // the create-time triple the frontend round-trips on restore
@@ -97,6 +99,8 @@ pub async fn terminal_create(
         purpose,
         repo: intent_repo,
         branch: None,
+        plan_slug,
+        correlation_topic,
         declared_paths: working_dir
             .map(std::path::PathBuf::from)
             .into_iter()
@@ -132,11 +136,12 @@ pub async fn terminal_create(
 
                 // R1 — install the on-exit hook so the PTY waiter thread
                 // closes the coord session mirror the instant the process
-                // exits, instead of leaving a ~3-minute ghost until the
-                // coord_sync 180s autoclose. Shares the idempotent
-                // `close_by_id` path with the frontend `terminal_close`
-                // command, so a double-close (exit + explicit close) is a
-                // no-op.
+                // exits, instead of leaving a ghost until coord's own
+                // stale→closed watcher reaps it (the runner no longer
+                // self-closes abandoned sessions; see coord_sync plan A3).
+                // Shares the idempotent `close_by_id` path with the frontend
+                // `terminal_close` command, so a double-close (exit +
+                // explicit close) is a no-op.
                 let close_registry = registry.clone();
                 session.set_on_exit(Box::new(move |coord_id| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {

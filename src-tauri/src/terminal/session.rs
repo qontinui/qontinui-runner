@@ -141,12 +141,13 @@ pub struct TerminalSession {
     /// read by `terminal_close` so it can close the coord mirror.
     coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
     /// R1 (session-lifecycle-cleanup) — best-effort hook invoked by the
-    /// waiter thread the instant the backing PTY process exits, BEFORE the
-    /// 180s coord_sync autoclose would otherwise fire. Wired by
+    /// waiter thread the instant the backing PTY process exits. Wired by
     /// `terminal_create` alongside [`Self::set_coord_session_id`]: it
     /// closes the coord session mirror for `coord_session_id` so a process
     /// that dies (operator types `exit`, shell crashes, etc.) doesn't leave
-    /// a ~3-minute ghost `active` row on the dashboard. Held in a shared
+    /// a ghost `active` row on the dashboard until coord's own stale→closed
+    /// watcher reaps it (the runner no longer self-closes abandoned
+    /// sessions; see coord_sync plan A3). Held in a shared
     /// slot so the already-spawned waiter thread can read it once the
     /// registration completes; cloned into the waiter at spawn time.
     /// Idempotent against the frontend `terminal_close` path because
@@ -404,8 +405,9 @@ impl TerminalSession {
             .map_err(|e| format!("Failed to spawn reader thread: {}", e))?;
 
         // R1 — shared slots the waiter thread reads on PTY exit so it can
-        // close the coord session mirror immediately (vs. waiting out the
-        // 180s coord_sync autoclose). Both are populated AFTER spawn by
+        // close the coord session mirror immediately (vs. leaving it for
+        // coord's stale→closed watcher; see coord_sync plan A3). Both are
+        // populated AFTER spawn by
         // `terminal_create` once `register_external` returns the coord id,
         // so the waiter reads them at exit time rather than capturing a
         // value that isn't known yet at spawn.
@@ -481,8 +483,9 @@ impl TerminalSession {
 
                 // R1 — close the coord session mirror the instant the PTY
                 // process exits, instead of letting it linger `active`
-                // until the coord_sync heartbeat loop's 180s autoclose
-                // fires (~3-minute ghost session). Read the coord id + hook
+                // until coord's own stale→closed watcher reaps it (the
+                // runner no longer self-closes abandoned sessions; see
+                // coord_sync plan A3). Read the coord id + hook
                 // populated by `terminal_create` after registration; if the
                 // terminal was never wired into coord (registration failed,
                 // or close raced ahead via the frontend `terminal_close`
@@ -796,7 +799,8 @@ impl TerminalSession {
     /// R1 — install the on-exit hook the waiter thread fires the instant
     /// the PTY process exits. `terminal_create` wires this (alongside
     /// [`Self::set_coord_session_id`]) to close the coord session mirror
-    /// immediately rather than waiting out the 180s coord_sync autoclose.
+    /// immediately rather than leaving it for coord's stale→closed watcher
+    /// (the runner no longer self-closes abandoned sessions; coord_sync A3).
     /// The callback receives the coord session id and must be idempotent
     /// (it shares the close path with the frontend `terminal_close`
     /// command — `SessionRegistry::close_by_id` is already idempotent).

@@ -856,14 +856,14 @@ impl SessionRegistry {
     }
 
     /// Test-only: rewind a session's `last_heartbeat_at` so the
-    /// heartbeat-loop's elapsed-time check trips deterministically
-    /// without sleeping for the real autoclose interval.
+    /// heartbeat-loop's elapsed-time check (the local stale flip) trips
+    /// deterministically without sleeping for the real stale interval.
     #[cfg(test)]
     pub fn force_heartbeat_to_for_test(&self, id: Uuid, when: chrono::DateTime<chrono::Utc>) {
         let mut sessions = self.sessions.lock().expect("session registry poisoned");
         if let Some(rec) = sessions.get_mut(&id) {
             rec.last_heartbeat_at = Some(when);
-            // The autoclose path uses `last_heartbeat_at.unwrap_or(started_at)`,
+            // The sweep uses `last_heartbeat_at.unwrap_or(started_at)`,
             // so also rewind started_at to match — otherwise a brand-new
             // session with `started_at = now` would clamp elapsed to ~0.
             rec.started_at = when;
@@ -1046,6 +1046,8 @@ mod tests {
             purpose: "smoke test".into(),
             repo: None,
             branch: None,
+            plan_slug: None,
+            correlation_topic: None,
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
