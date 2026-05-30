@@ -140,6 +140,18 @@ pub struct TerminalSession {
     /// terminal into the coordinator's session plane. `None` until wired;
     /// read by `terminal_close` so it can close the coord mirror.
     coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    /// R1 (session-lifecycle-cleanup) — best-effort hook invoked by the
+    /// waiter thread the instant the backing PTY process exits, BEFORE the
+    /// 180s coord_sync autoclose would otherwise fire. Wired by
+    /// `terminal_create` alongside [`Self::set_coord_session_id`]: it
+    /// closes the coord session mirror for `coord_session_id` so a process
+    /// that dies (operator types `exit`, shell crashes, etc.) doesn't leave
+    /// a ~3-minute ghost `active` row on the dashboard. Held in a shared
+    /// slot so the already-spawned waiter thread can read it once the
+    /// registration completes; cloned into the waiter at spawn time.
+    /// Idempotent against the frontend `terminal_close` path because
+    /// `SessionRegistry::close` is itself idempotent.
+    on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid) + Send + Sync>>>>,
     /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
     /// When the session declared edit intent on a registered repo and
     /// `worktree_mode_enabled()` was true at spawn time, this carries
@@ -391,12 +403,24 @@ impl TerminalSession {
             })
             .map_err(|e| format!("Failed to spawn reader thread: {}", e))?;
 
+        // R1 — shared slots the waiter thread reads on PTY exit so it can
+        // close the coord session mirror immediately (vs. waiting out the
+        // 180s coord_sync autoclose). Both are populated AFTER spawn by
+        // `terminal_create` once `register_external` returns the coord id,
+        // so the waiter reads them at exit time rather than capturing a
+        // value that isn't known yet at spawn.
+        let coord_session_id: Arc<Mutex<Option<uuid::Uuid>>> = Arc::new(Mutex::new(None));
+        let on_exit: Arc<Mutex<Option<Box<dyn Fn(uuid::Uuid) + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
+
         // Spawn waiter thread: detects process exit
         let waiter_id = id.clone();
         let waiter_title = title.clone();
         let waiter_alive = is_alive.clone();
         let waiter_exit = exit_code.clone();
         let waiter_app = app_handle;
+        let waiter_coord_session_id = coord_session_id.clone();
+        let waiter_on_exit = on_exit.clone();
         let waiter_handle = thread::Builder::new()
             .name(format!("terminal-waiter-{}", &id))
             .spawn(move || {
@@ -454,6 +478,34 @@ impl TerminalSession {
                     &waiter_title,
                     code,
                 );
+
+                // R1 — close the coord session mirror the instant the PTY
+                // process exits, instead of letting it linger `active`
+                // until the coord_sync heartbeat loop's 180s autoclose
+                // fires (~3-minute ghost session). Read the coord id + hook
+                // populated by `terminal_create` after registration; if the
+                // terminal was never wired into coord (registration failed,
+                // or close raced ahead via the frontend `terminal_close`
+                // path which clears nothing here but is idempotent on the
+                // registry side), there's simply nothing to do. The hook
+                // calls `SessionRegistry::close_by_id`, which is idempotent
+                // — a no-op when the session is already Closed.
+                let coord_id = waiter_coord_session_id
+                    .lock()
+                    .ok()
+                    .and_then(|slot| *slot);
+                if let Some(coord_id) = coord_id {
+                    if let Ok(slot) = waiter_on_exit.lock() {
+                        if let Some(cb) = slot.as_ref() {
+                            debug!(
+                                terminal_id = %waiter_id,
+                                coord_session = %coord_id,
+                                "terminal exit — closing coord session mirror"
+                            );
+                            cb(coord_id);
+                        }
+                    }
+                }
             })
             .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
 
@@ -483,7 +535,8 @@ impl TerminalSession {
             grid,
             first_osc_title_tx,
             first_osc_title_rx,
-            coord_session_id: Arc::new(Mutex::new(None)),
+            coord_session_id,
+            on_exit,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
         })
     }
@@ -740,6 +793,19 @@ impl TerminalSession {
         self.coord_session_id.lock().ok().and_then(|g| *g)
     }
 
+    /// R1 — install the on-exit hook the waiter thread fires the instant
+    /// the PTY process exits. `terminal_create` wires this (alongside
+    /// [`Self::set_coord_session_id`]) to close the coord session mirror
+    /// immediately rather than waiting out the 180s coord_sync autoclose.
+    /// The callback receives the coord session id and must be idempotent
+    /// (it shares the close path with the frontend `terminal_close`
+    /// command — `SessionRegistry::close_by_id` is already idempotent).
+    pub fn set_on_exit(&self, hook: Box<dyn Fn(uuid::Uuid) + Send + Sync>) {
+        if let Ok(mut slot) = self.on_exit.lock() {
+            *slot = Some(hook);
+        }
+    }
+
     /// Phase 2 of the worktree-isolation plan — park the
     /// `IsolatedEditContext` returned by
     /// `agent_worktree::isolated_edit::acquire` so its heartbeat task
@@ -945,6 +1011,7 @@ mod tests {
             first_osc_title_tx: Arc::new(Mutex::new(Some(osc_title_tx))),
             first_osc_title_rx: Arc::new(Mutex::new(Some(osc_title_rx))),
             coord_session_id: Arc::new(Mutex::new(None)),
+            on_exit: Arc::new(Mutex::new(None)),
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
         }
     }

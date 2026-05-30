@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use crate::claude_session::SessionManager;
 use crate::commands::CommandResponse;
 use crate::error::AppError;
+use crate::session::pane_store::{PaneKey, PaneSessionStore};
 use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::{strip_ansi, TerminalManager};
 
@@ -28,6 +29,7 @@ use crate::terminal::{strip_ansi, TerminalManager};
 pub async fn terminal_create(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     session_registry: tauri::State<'_, Arc<SessionRegistry>>,
+    pane_store: tauri::State<'_, Arc<PaneSessionStore>>,
     app_handle: tauri::AppHandle,
     title: Option<String>,
     working_dir: Option<String>,
@@ -36,6 +38,20 @@ pub async fn terminal_create(
     rows: Option<u16>,
     intent_repo: Option<String>,
 ) -> Result<CommandResponse, String> {
+    // R2 (session-lifecycle-cleanup) — derive the STABLE pane identity from
+    // the create-time triple the frontend round-trips on restore
+    // (`page_id`, `title`, original `working_dir`). Computed BEFORE
+    // `acquire_for_terminal` reassigns `working_dir` to a freshly-allocated
+    // isolated worktree path (which is NOT stable across restarts) and
+    // before `page_id` is moved into `terminal_manager.create`. Used to
+    // look up / persist this pane's coord session id so a restart RESUMES
+    // the prior coord row instead of orphaning it.
+    let pane_key = PaneKey::from_create(
+        page_id.as_deref().unwrap_or("default"),
+        title.as_deref().unwrap_or(""),
+        working_dir.as_deref().unwrap_or(""),
+    );
+
     // Phase 2 — route through the shared `acquire_for_terminal` helper
     // so this entry point + the HTTP-proxy / backend-relay siblings stay
     // in lockstep. When `intent_repo` is `None`, the helper is a no-op;
@@ -88,23 +104,59 @@ pub async fn terminal_create(
         share_output: true,
         redact_secrets: None,
     };
+    // R2 — RESUME the pane's prior coord session if one is persisted,
+    // otherwise register fresh. Resuming PATCHes the EXISTING coord row
+    // (state=active + heartbeat) so a runner restart no longer orphans the
+    // old row + mints a duplicate. On a persisted-but-GC'd row the resume
+    // falls back to a fresh register (new id), which we persist over the
+    // stale one. Either way the pane ends with a live coord session id.
+    let registry = session_registry.inner().clone();
+    let persisted = pane_store.get(&pane_key);
+    let registration: Result<uuid::Uuid, crate::session::SessionError> = match persisted {
+        Some(prior_id) => registry.resume_external(prior_id, intent).await,
+        None => registry.register_external(intent),
+    };
+
     let mut coord_session_id: Option<uuid::Uuid> = None;
-    match session_registry.inner().register_external(intent) {
+    match registration {
         Ok(coord_id) => {
             coord_session_id = Some(coord_id);
+            // Persist (or refresh) the pane → coord-id mapping so the NEXT
+            // restart resumes this same row. On the fallback path `coord_id`
+            // is a fresh id replacing the stale GC'd one.
+            pane_store.put(&pane_key, coord_id);
+
             // Store the coord session id on the terminal so close can clean up.
             if let Some(session) = terminal_manager.get(&info.id) {
                 session.set_coord_session_id(coord_id);
+
+                // R1 — install the on-exit hook so the PTY waiter thread
+                // closes the coord session mirror the instant the process
+                // exits, instead of leaving a ~3-minute ghost until the
+                // coord_sync 180s autoclose. Shares the idempotent
+                // `close_by_id` path with the frontend `terminal_close`
+                // command, so a double-close (exit + explicit close) is a
+                // no-op.
+                let close_registry = registry.clone();
+                session.set_on_exit(Box::new(move |coord_id| {
+                    if let Err(e) = close_registry.close_by_id(coord_id) {
+                        warn!(
+                            coord_session = %coord_id,
+                            error = %e,
+                            "terminal exit hook: coord session close failed"
+                        );
+                    }
+                }));
+
                 // Attach the output pipe so PTY output streams to coord.
                 let rx = session.subscribe_output();
-                session_registry
-                    .inner()
-                    .attach_output_pipe(coord_id, rx, true);
+                registry.attach_output_pipe(coord_id, rx, true);
             }
             info!(
                 terminal_id = %info.id,
                 coord_session = %coord_id,
-                "terminal_create: registered coord session"
+                resumed = persisted.is_some(),
+                "terminal_create: coord session ready"
             );
         }
         Err(e) => {
