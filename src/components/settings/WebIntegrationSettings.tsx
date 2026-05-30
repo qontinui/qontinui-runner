@@ -100,6 +100,36 @@ function truncate(text: string, max: number): string {
   return text.slice(0, Math.max(0, max - 1)) + "…";
 }
 
+/**
+ * Derive the user-facing web-frontend origin from an API backend URL.
+ *
+ * Production is a split deployment: the API host carries an `api.` label
+ * (`https://api.qontinui.io`, which serves NO login page) while the web
+ * frontend drops it (`https://qontinui.io`). When the backend host starts with
+ * `api.` we strip that single label (preserving scheme + port); otherwise
+ * (localhost dev, a bare IP, or a unified origin) we return the backend
+ * unchanged. Mirrors the Rust `api_config::derive_web_base_url` used by the
+ * one-click web-login flow so both code paths land on the same origin.
+ *
+ * Returns null if `backendUrl` is empty/unparseable, so callers can fall back
+ * to plain text rather than rendering a broken link.
+ */
+function deriveWebAppUrl(backendUrl: string): string | null {
+  const trimmed = backendUrl.trim();
+  if (!trimmed) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  const host = parsed.hostname.startsWith("api.")
+    ? parsed.hostname.slice("api.".length)
+    : parsed.hostname;
+  const portPart = parsed.port ? `:${parsed.port}` : "";
+  return `${parsed.protocol}//${host}${portPart}`;
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -256,6 +286,11 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   })();
 
   const canSave = isDirty && !saving && !urlError;
+
+  // Web-frontend origin for the "log into qontinui-web" help link. Derived from
+  // the backend URL (api.qontinui.io → qontinui.io); null when the backend
+  // field is empty/invalid, in which case the help text renders without a link.
+  const webAppUrl = deriveWebAppUrl(formBackendUrl);
 
   // --- Handlers -------------------------------------------------------------
   const handleBackendUrlChange = (value: string) => {
@@ -810,9 +845,9 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           <div className="text-xs text-muted-foreground pl-5 space-y-1">
             <p>
               1. Log into{" "}
-              {formBackendUrl.trim() ? (
+              {webAppUrl ? (
                 <a
-                  href={formBackendUrl.trim()}
+                  href={`${webAppUrl}/login`}
                   target="_blank"
                   rel="noreferrer"
                   className="text-primary hover:underline inline-flex items-center gap-1"

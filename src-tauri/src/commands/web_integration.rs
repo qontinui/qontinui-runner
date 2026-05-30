@@ -611,11 +611,13 @@ pub async fn start_web_token_flow<R: Runtime>(
 
     let runner_name = get_hostname_for_browser();
 
-    // `/connect-runner` is a Next.js page, not an API endpoint. In unified
-    // production deployments `backend_url` serves both, but in split local
-    // dev (FastAPI on :8000, Next.js on :3001) they're different hosts.
-    // Honor an explicit `web_base_url` override when set, else fall back
-    // to `backend_url` — preserving the old behavior for production.
+    // `/connect-runner` is a Next.js page, not an API endpoint. In production
+    // the API and the web frontend are split hosts (`api.qontinui.io` vs
+    // `qontinui.io`); in split local dev they differ by port. Honor an explicit
+    // `web_base_url` override when set, else derive the frontend origin from the
+    // backend by stripping a leading `api.` label (a no-op for localhost / a
+    // unified origin), so the browser never lands on the API host — which has
+    // no `/connect-runner` page.
     let web_origin = settings::load_settings()
         .web_integration
         .web_base_url
@@ -623,7 +625,7 @@ pub async fn start_web_token_flow<R: Runtime>(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(trim_backend_url)
-        .unwrap_or_else(|| effective_backend.clone());
+        .unwrap_or_else(|| crate::api_config::derive_web_base_url(&effective_backend));
 
     let web_url = format!(
         "{}/connect-runner?state={}&callback={}&runner_name={}",
