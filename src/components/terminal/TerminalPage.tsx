@@ -5,7 +5,6 @@ import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
 import { ZoneGrid } from "./ZoneGrid";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
-import { ZoneStatusBar } from "./ZoneStatusBar";
 import { DocFinderModal } from "./DocFinderModal";
 import { BatchOperationsBar } from "./BatchOperationsBar";
 import { ZoneMinimap } from "./ZoneMinimap";
@@ -690,10 +689,6 @@ function TerminalPageInner({
             mounted directly below this); the registry + CommandBar +
             ZoneHoverActions + StatusStrip now cover its surface. */}
         <StatusStrip />
-        <ZoneStatusBar
-          onExport={handleExportOutput}
-          onSortZones={handleSortZones}
-        />
         {showDocFinder && (
           <DocFinderModal
             onSelect={(filePath) => {
