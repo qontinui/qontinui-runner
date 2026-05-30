@@ -1,16 +1,21 @@
-<!-- BEGIN License & CLA preamble — added 2026-04-29 during AGPL rollout -->
-## License & CLA
+<!-- BEGIN License & DCO preamble — updated 2026-05-30 (CLA→DCO per open/closed license alignment) -->
+
+## License & contributions
 
 This project is licensed under the **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`). See [`LICENSE`](LICENSE) for the full text. Contributors should be aware:
 
-- AGPL is a strong copyleft license. Anyone who runs a modified version of this project as a network service must publish their modifications under AGPL too.
+- AGPL is a strong copyleft license. Anyone who runs a modified version of this project as a network service must offer its users the Corresponding Source under AGPL too.
 - For typical self-hosting, internal use, forking, or contributing back, AGPL behaves like GPL.
 
-All non-trivial contributions require signing the qontinui Contributor License Agreement (CLA). The CLA is administered via [cla-assistant.io](https://cla-assistant.io/) — when you open a pull request, the CLA bot will comment with a one-click sign link, and signing applies across all qontinui repositories. The CLA text lives in [`CLA.md`](CLA.md). It grants Joshua Spinak the right to relicense your contribution under any future license; you retain copyright in your contributions.
+Contributions are accepted under the **Developer Certificate of Origin (DCO) 1.1** — *not* a CLA. The DCO text lives in [`DCO.txt`](DCO.txt). Certify that you wrote (or otherwise have the right to submit) your contribution by adding a `Signed-off-by` trailer to every commit:
+
+    git commit -s -m "your message"
+
+which appends `Signed-off-by: Your Name <your@email>` from your `git config user.name` / `user.email`. Your contributions are licensed inbound under the same `AGPL-3.0-or-later` as the project (inbound = outbound); you retain copyright in your contributions. No relicensing rights are granted — this repository is one of the apps where Qontinui does not need the dual-/commercial-license lever (that lever is retained only on the embeddable `ui-bridge` library via its CLA).
 
 The remainder of this document covers contribution mechanics specific to this repository.
 
-<!-- END License & CLA preamble -->
+<!-- END License & DCO preamble -->
 
 # Contributing to Qontinui Runner
 
