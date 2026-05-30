@@ -29,6 +29,7 @@ import { TerminalOverlays } from "./TerminalOverlays";
 import { CommandBar } from "./CommandBar";
 import { SuggestionsProvider } from "./suggestions";
 import { StatusStrip } from "./StatusStrip";
+import { ResultCardProvider, ResultCardMount } from "./result-card";
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { callRegistry, useTerminalCommands } from "./commands";
@@ -67,7 +68,9 @@ export function TerminalPage(props: TerminalPageProps) {
         <TransitionEffectsProvider>
           <UIStateProvider>
             <SuggestionsProvider>
-              <TerminalPageInner {...props} />
+              <ResultCardProvider>
+                <TerminalPageInner {...props} />
+              </ResultCardProvider>
             </SuggestionsProvider>
           </UIStateProvider>
         </TransitionEffectsProvider>
@@ -893,6 +896,7 @@ function TerminalPageInner({
             page chrome. Reads from the command registry populated by
             `useTerminalCommands` above; Ctrl+/ focuses from anywhere. */}
         <CommandBar />
+        <ResultCardMount />
 
         {/* Phase 9c — TerminalTabBar demolished. ZoneLayoutPicker and
             ZoneProfilePicker carry their own `useUIComponent`
