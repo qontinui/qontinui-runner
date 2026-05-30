@@ -7,7 +7,6 @@ import {
   Clock,
   Download,
   Eye,
-  FileText,
   Focus,
   Keyboard,
   ListChecks,
@@ -20,7 +19,6 @@ import {
   Wand2,
 } from "lucide-react";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
-import { DocFinderModal } from "./DocFinderModal";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { TerminalTab } from "./useTerminalManager";
 import { instanceStorage } from "@/lib/instance-storage";
@@ -56,7 +54,6 @@ interface ZoneStatusBarProps {
   /** Callbacks from useZoneActions — kept as props until that hook moves to context */
   onExport?: () => void;
   onSortZones?: () => void;
-  onOpenDocFile?: (filePath: string) => void;
 }
 
 const STATE_COLORS: Record<SessionState, string> = {
@@ -75,7 +72,7 @@ const STATE_LABELS: Record<SessionState, string> = {
   error: "error",
 };
 
-export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStatusBarProps) {
+export function ZoneStatusBar({ onExport, onSortZones }: ZoneStatusBarProps) {
   // Read all data from contexts instead of props
   const session = useTerminalSession();
   const { tabs, zoneLayout } = session;
@@ -140,7 +137,6 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
       return next;
     });
   };
-  const [showDocFinder, setShowDocFinder] = useState(false);
   const stateCounts = useMemo(() => {
     const counts: Record<SessionState, number> = {
       idle: 0,
@@ -220,16 +216,9 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
           to find the toggle now invoke the action directly via UI Bridge
           components. */}
 
-      {onOpenDocFile && (
-        <button
-          onClick={() => setShowDocFinder(true)}
-          className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors text-[#7dcfff] hover:bg-[#7dcfff]/10 hover:text-[#89d4ff] shrink-0"
-          title="Open a document file in a zone"
-        >
-          <FileText className="w-3 h-3" />
-          Doc
-        </button>
-      )}
+      {/* Phase 9f — Doc button migrated to /doc-finder registry action.
+          DocFinderModal mount + showDocFinder state lifted to TerminalPage
+          so the registry action and modal share a single source of truth. */}
 
       <div className="w-px h-4 bg-[#2a2d3d]" />
 
@@ -582,16 +571,6 @@ export function ZoneStatusBar({ onExport, onSortZones, onOpenDocFile }: ZoneStat
         {/* Phase 9d — plan-refresh icon button replaced by
             /plan-refresh registry action. */}
       </div>
-
-      {showDocFinder && onOpenDocFile && (
-        <DocFinderModal
-          onSelect={(filePath) => {
-            onOpenDocFile(filePath);
-            setShowDocFinder(false);
-          }}
-          onClose={() => setShowDocFinder(false)}
-        />
-      )}
     </div>
   );
 }
