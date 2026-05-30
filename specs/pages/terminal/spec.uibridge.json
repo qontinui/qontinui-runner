@@ -6,67 +6,15 @@
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Required element 0 for state Multi-Tab Terminal Sessions",
-          "enabled": true,
-          "id": "term-multi-tab-elem-0",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {
-              "role": "tablist"
-            },
-            "label": "Required element for Multi-Tab Terminal Sessions",
-            "type": "search"
-          }
-        },
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
-          "description": "Required element 1 for state Multi-Tab Terminal Sessions",
-          "enabled": true,
-          "id": "term-multi-tab-elem-1",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {
-              "role": "button",
-              "textContent": "+"
-            },
-            "label": "Required element for Multi-Tab Terminal Sessions",
-            "type": "search"
-          }
-        },
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
-          "description": "Required element 2 for state Multi-Tab Terminal Sessions",
-          "enabled": true,
-          "id": "term-multi-tab-elem-2",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {
-              "textContent": "No terminals open"
-            },
-            "label": "Required element for Multi-Tab Terminal Sessions",
-            "type": "search"
-          }
-        },
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
           "description": "Required element 3 for state Multi-Tab Terminal Sessions",
           "enabled": true,
           "id": "term-multi-tab-elem-3",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
-              "textContent": "Ctrl+Shift+T"
+              "text": "Ctrl+Shift+T"
             },
             "label": "Required element for Multi-Tab Terminal Sessions",
             "type": "search"
@@ -89,10 +37,10 @@
           "id": "term-workflow-preview-elem-0",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
-              "textContent": "Workflow"
+              "text": "Workflow"
             },
             "label": "Required element for Workflow Generation and Preview",
             "type": "search"
@@ -106,11 +54,11 @@
           "id": "term-workflow-preview-elem-1",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Execute"
+              "text": "Execute"
             },
             "label": "Required element for Workflow Generation and Preview",
             "type": "search"
@@ -124,11 +72,11 @@
           "id": "term-workflow-preview-elem-2",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Save"
+              "text": "Save"
             },
             "label": "Required element for Workflow Generation and Preview",
             "type": "search"
@@ -142,11 +90,11 @@
           "id": "term-workflow-preview-elem-3",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Edit"
+              "text": "Edit"
             },
             "label": "Required element for Workflow Generation and Preview",
             "type": "search"
@@ -169,10 +117,10 @@
           "id": "term-findings-tracking-elem-0",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
-              "textContent": "Findings"
+              "text": "Findings"
             },
             "label": "Required element for Real-Time Findings Detection",
             "type": "search"
@@ -186,11 +134,11 @@
           "id": "term-findings-tracking-elem-1",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Fix"
+              "text": "Fix"
             },
             "label": "Required element for Real-Time Findings Detection",
             "type": "search"
@@ -204,11 +152,11 @@
           "id": "term-findings-tracking-elem-2",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Generate Workflow"
+              "text": "Generate Workflow"
             },
             "label": "Required element for Real-Time Findings Detection",
             "type": "search"
@@ -222,11 +170,11 @@
           "id": "term-findings-tracking-elem-3",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Respond"
+              "text": "Respond"
             },
             "label": "Required element for Real-Time Findings Detection",
             "type": "search"
@@ -249,10 +197,10 @@
           "id": "term-analysis-elem-0",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
-              "textContent": "Architecture"
+              "text": "Architecture"
             },
             "label": "Required element for AI-Powered Terminal Analysis",
             "type": "search"
@@ -266,10 +214,10 @@
           "id": "term-analysis-elem-1",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
-              "textContent": "Summary"
+              "text": "Summary"
             },
             "label": "Required element for AI-Powered Terminal Analysis",
             "type": "search"
@@ -283,10 +231,10 @@
           "id": "term-analysis-elem-2",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
-              "textContent": "Analyzing"
+              "text": "Analyzing"
             },
             "label": "Required element for AI-Powered Terminal Analysis",
             "type": "search"
@@ -307,10 +255,9 @@
           "description": "Required element 0 for state File Conflict Detection Banner",
           "enabled": true,
           "id": "term-file-conflict-banner-elem-0",
-          "precondition": "No files are registered by multiple sessions in the file registry (GET /file-registry/info returns entries with unique holder_task_run_id per file_path)",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "under concurrent"
@@ -325,10 +272,9 @@
           "description": "Required element 1 for state File Conflict Detection Banner",
           "enabled": true,
           "id": "term-file-conflict-banner-elem-1",
-          "precondition": "No files are registered by multiple sessions in the file registry (GET /file-registry/info returns entries with unique holder_task_run_id per file_path)",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "under concurrent development"
@@ -343,10 +289,9 @@
           "description": "Required element 2 for state File Conflict Detection Banner",
           "enabled": true,
           "id": "term-file-conflict-banner-elem-2",
-          "precondition": "No files are registered by multiple sessions in the file registry (GET /file-registry/info returns entries with unique holder_task_run_id per file_path)",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "under concurrent development"
@@ -361,10 +306,9 @@
           "description": "Required element 3 for state File Conflict Detection Banner",
           "enabled": true,
           "id": "term-file-conflict-banner-elem-3",
-          "precondition": "No files are registered by multiple sessions in the file registry (GET /file-registry/info returns entries with unique holder_task_run_id per file_path)",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "Conflict:"
@@ -379,10 +323,9 @@
           "description": "Required element 4 for state File Conflict Detection Banner",
           "enabled": true,
           "id": "term-file-conflict-banner-elem-4",
-          "precondition": "No files are registered by multiple sessions in the file registry (GET /file-registry/info returns entries with unique holder_task_run_id per file_path)",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "under concurrent"
@@ -406,10 +349,9 @@
           "description": "Required element 0 for state Per-Session File Conflict Indicators",
           "enabled": true,
           "id": "term-session-conflict-indicator-elem-0",
-          "precondition": "At least one session has files overlapping with another session in the file registry",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "shared with other sessions"
@@ -424,10 +366,9 @@
           "description": "Required element 1 for state Per-Session File Conflict Indicators",
           "enabled": true,
           "id": "term-session-conflict-indicator-elem-1",
-          "precondition": "At least one session has files overlapping with another session in the file registry",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "shared with other sessions"
@@ -442,10 +383,9 @@
           "description": "Required element 2 for state Per-Session File Conflict Indicators",
           "enabled": true,
           "id": "term-session-conflict-indicator-elem-2",
-          "precondition": "At least one session has files overlapping with another session in the file registry",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "shared with other sessions"
@@ -460,10 +400,9 @@
           "description": "Required element 3 for state Per-Session File Conflict Indicators",
           "enabled": true,
           "id": "term-session-conflict-indicator-elem-3",
-          "precondition": "At least one session has files overlapping with another session in the file registry",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "shared with other sessions"
@@ -487,10 +426,9 @@
           "description": "Required element 0 for state Multiple Terminal Pages",
           "enabled": true,
           "id": "term-multi-page-elem-0",
-          "precondition": "At least two pages exist with different numbers of terminals",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "tab"
@@ -505,10 +443,9 @@
           "description": "Required element 1 for state Multiple Terminal Pages",
           "enabled": true,
           "id": "term-multi-page-elem-1",
-          "precondition": "At least two pages exist with different numbers of terminals",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "accessibleName": "Add terminal page",
@@ -524,10 +461,9 @@
           "description": "Required element 2 for state Multiple Terminal Pages",
           "enabled": true,
           "id": "term-multi-page-elem-2",
-          "precondition": "At least two pages exist with different numbers of terminals",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "tab"
@@ -542,10 +478,9 @@
           "description": "Required element 3 for state Multiple Terminal Pages",
           "enabled": true,
           "id": "term-multi-page-elem-3",
-          "precondition": "At least two pages exist with different numbers of terminals",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "tab"
@@ -560,10 +495,9 @@
           "description": "Required element 4 for state Multiple Terminal Pages",
           "enabled": true,
           "id": "term-multi-page-elem-4",
-          "precondition": "At least two pages exist with different numbers of terminals",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "accessibleName": "Close page"
@@ -578,10 +512,9 @@
           "description": "Required element 5 for state Multiple Terminal Pages",
           "enabled": true,
           "id": "term-multi-page-elem-5",
-          "precondition": "At least two pages exist with different numbers of terminals",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "tab"
@@ -596,10 +529,9 @@
           "description": "Required element 6 for state Multiple Terminal Pages",
           "enabled": true,
           "id": "term-multi-page-elem-6",
-          "precondition": "At least two pages exist with different numbers of terminals",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "Loading terminals"
@@ -623,10 +555,9 @@
           "description": "Required element 0 for state Session Persistence & Auto-Resume",
           "enabled": true,
           "id": "term-session-persistence-elem-0",
-          "precondition": "Runner was restarted after Claude sessions were running in terminal zones",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "textbox"
@@ -641,10 +572,9 @@
           "description": "Required element 1 for state Session Persistence & Auto-Resume",
           "enabled": true,
           "id": "term-session-persistence-elem-1",
-          "precondition": "Runner was restarted after Claude sessions were running in terminal zones",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "Zone"
@@ -659,30 +589,13 @@
           "description": "Required element 2 for state Session Persistence & Auto-Resume",
           "enabled": true,
           "id": "term-session-persistence-elem-2",
-          "precondition": "Runner was restarted after Claude sessions were running in terminal zones",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "accessibleName": "Zone profiles"
             },
-            "label": "Required element for Session Persistence & Auto-Resume",
-            "type": "search"
-          }
-        },
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
-          "description": "Required element 3 for state Session Persistence & Auto-Resume",
-          "enabled": true,
-          "id": "term-session-persistence-elem-3",
-          "precondition": "Runner was restarted after Claude sessions were running in terminal zones",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {},
             "label": "Required element for Session Persistence & Auto-Resume",
             "type": "search"
           }
@@ -702,10 +615,9 @@
           "description": "Required element 0 for state Per-Page Storage Isolation",
           "enabled": true,
           "id": "term-page-storage-isolation-elem-0",
-          "precondition": "Multiple pages exist, at least one has saved profiles",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "accessibleName": "Zone profiles"
@@ -720,10 +632,9 @@
           "description": "Required element 1 for state Per-Page Storage Isolation",
           "enabled": true,
           "id": "term-page-storage-isolation-elem-1",
-          "precondition": "Multiple pages exist, at least one has saved profiles",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "tab"
@@ -738,10 +649,9 @@
           "description": "Required element 2 for state Per-Page Storage Isolation",
           "enabled": true,
           "id": "term-page-storage-isolation-elem-2",
-          "precondition": "Multiple pages exist, at least one has saved profiles",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "tab"
@@ -765,14 +675,13 @@
           "description": "Required element 0 for state Plan Implementation Workflow",
           "enabled": true,
           "id": "term-plan-implementation-elem-0",
-          "precondition": "Transcript panel is open with messages selected",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Implement"
+              "text": "Implement"
             },
             "label": "Required element for Plan Implementation Workflow",
             "type": "search"
@@ -784,14 +693,13 @@
           "description": "Required element 1 for state Plan Implementation Workflow",
           "enabled": true,
           "id": "term-plan-implementation-elem-1",
-          "precondition": "Transcript panel is open with messages selected",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Verify"
+              "text": "Verify"
             },
             "label": "Required element for Plan Implementation Workflow",
             "type": "search"
@@ -803,14 +711,13 @@
           "description": "Required element 2 for state Plan Implementation Workflow",
           "enabled": true,
           "id": "term-plan-implementation-elem-2",
-          "precondition": "Transcript panel is open with messages selected",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Implement"
+              "text": "Implement"
             },
             "label": "Required element for Plan Implementation Workflow",
             "type": "search"
@@ -822,14 +729,13 @@
           "description": "Required element 3 for state Plan Implementation Workflow",
           "enabled": true,
           "id": "term-plan-implementation-elem-3",
-          "precondition": "Transcript panel is open with messages selected",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "role": "button",
-              "textContent": "Verify"
+              "text": "Verify"
             },
             "label": "Required element for Plan Implementation Workflow",
             "type": "search"
@@ -841,10 +747,9 @@
           "description": "Required element 4 for state Plan Implementation Workflow",
           "enabled": true,
           "id": "term-plan-implementation-elem-4",
-          "precondition": "Transcript panel is open with messages selected",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "Plan Implementation"
@@ -859,10 +764,9 @@
           "description": "Required element 5 for state Plan Implementation Workflow",
           "enabled": true,
           "id": "term-plan-implementation-elem-5",
-          "precondition": "Transcript panel is open with messages selected",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "accessibleName": "Reload plan file from disk"
@@ -888,7 +792,7 @@
           "id": "term-plan-cli-script-elem-0",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "Parsed"
@@ -905,7 +809,7 @@
           "id": "term-plan-cli-script-elem-1",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "execute-inline"
@@ -922,7 +826,7 @@
           "id": "term-plan-cli-script-elem-2",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "textContains": "follow"
@@ -946,10 +850,9 @@
           "description": "Required element 0 for state Per-Tab Commit Traffic Light",
           "enabled": true,
           "id": "term-commit-traffic-light-elem-0",
-          "precondition": "At least one terminal tab has an active Claude Code AI session (tab.claudeSessionId is populated, either from a resumed session or the post-spawn transcript_get_latest polling)",
           "reviewed": false,
           "severity": "critical",
-          "source": "ai-generated",
+          "source": "migrated",
           "target": {
             "criteria": {
               "accessibleName": "Commit progress",
@@ -971,24 +874,23 @@
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Required element 0 for state Lock-Yield Protocol Banners",
+          "description": "WaitingLockBanner UI Bridge component renders when a tab is waiting on a contended file lock.",
           "enabled": true,
           "id": "term-lock-yield-banners-elem-0",
-          "precondition": "At least two active AI sessions contend on the same file: one holds an exclusive lock via FileLockManager, another is blocked on `acquire()`. Verifiable via GET /file-locks/info returning at least one entry whose holder_task_run_id corresponds to a live tab, while another tab's lockState.kind === 'waiting' on the same file_path.",
           "reviewed": false,
           "severity": "critical",
           "source": "ai-generated",
           "target": {
             "criteria": {
-              "dataUiBridgeId": "terminal.waiting-lock-banner"
+              "id": "terminal.waiting-lock-banner"
             },
-            "label": "Required element for Lock-Yield Protocol Banners",
+            "label": "WaitingLockBanner component",
             "type": "search"
           }
         }
       ],
       "category": "element-presence",
-      "description": "When two AI sessions contend on the same file, the holder and the waiter each see an in-tab banner driven by `<HoldingLockBanner>` (qontinui-runner/src/components/terminal/HoldingLockBanner.tsx) and `<WaitingLockBanner>` (qontinui-runner/src/components/terminal/WaitingLockBanner.tsx). The banners share placement: absolutely-positioned `top-2 right-2 z-30 w-[340px]` overlays inside the active tab's pane. They are gated to active AI tabs only (per `proj_holding_banner_pty_gate.md` — PTY tabs without `claudeSessionId` never render either banner). Banner mounting is driven by `useFileLockTracking` (qontinui-runner/src/components/terminal/useFileLockTracking.ts) exposing `lockStates: Record<tabId, LockState>` and `pendingYieldRequests: Record<holderTabId, IncomingYieldRequest[]>`. HoldingLockBanner shows above the active tab's pane when `lockState.kind === 'holding'` AND (`waiterCount > 0` OR pending yield requests exist for this tab). Its three buttons are `terminal.holding-lock-banner-yield` (calls POST `/file-locks/yield` to release this lock without ending the session), `terminal.holding-lock-banner-hold` (dismisses the banner locally until the next waiter event), and `terminal.holding-lock-banner-signal-long-wait` (Stuck-Session Heartbeat surface — see `term-heartbeat-idle-status`). WaitingLockBanner shows above the active tab's pane when `lockState.kind === 'waiting'` and exposes one primary action `terminal.waiting-lock-banner-request-yield` (POST `/file-locks/yield-request`). After click, the button enters a 30-second cooldown matching `REQUEST_YIELD_COOLDOWN_MS` (re-exported from `@/lib/lock-yield` for consumer tripwires) — local state, not server-tracked, reload resets it. Disabled state: when `blockerTaskRunId` is undefined the parent couldn't resolve the holder session by name, so there's nothing to route the request to and the button is disabled with a guidance tooltip. Backend wiring lives in `qontinui-runner/src-tauri/src/mcp/file_registry.rs::yield_lock` and `::request_yield` (registered in `routes()` at `/file-locks/yield` and `/file-locks/yield-request` POST). Both emit via the dual-emit pattern: `state.app_handle.emit(name, &payload)` for the Tauri webview AND `state.app_state.event_broadcast.send(payload)` for SSE/headless consumers, matching the dispatcher's wait emit at `claude_session/dispatcher.rs:436-441`. The yield endpoint emits `file-lock-released` (same shape used by session.rs, ai_session.rs, graphql/mutation.rs, task_runs.rs). The yield-request endpoint emits `file-lock-yield-requested` `{type, file_path, requester_task_run_id, requester_name, holder_task_run_id, requested_at}` which `useFileLockTracking`'s third listener routes to the holder's tab by matching `tab.claudeSessionId === payload.holder_task_run_id` (via `findTabByTaskRunId`). The pending-yield list is deduped by `(requesterTaskRunId, filePath)` so a holder doesn't see N entries from spam clicks. Entries clear automatically on `file-lock-released` for the matching `(holder_task_run_id, file_path)` pair. Banner-side 1Hz seconds-tick uses `useNow1Hz` (see `term-heartbeat-idle-status`).",
+      "description": "When two AI sessions contend on the same file, the holder and the waiter each see an in-tab banner (`HoldingLockBanner` / `WaitingLockBanner`, terminal/HoldingLockBanner.tsx + terminal/WaitingLockBanner.tsx). Mounted only on active AI tabs with an active lock conflict. Exposes the lock-yield/request-yield/signal-long-wait actions via `terminal.holding-lock-banner-*` and `terminal.waiting-lock-banner-*` UI Bridge components.",
       "id": "term-lock-yield-banners",
       "name": "Lock-Yield Protocol Banners",
       "source": "ai-generated"
@@ -998,51 +900,23 @@
         {
           "assertionType": "exists",
           "category": "element-presence",
-          "description": "Required element 0 for state Deconflict Advisory Banner",
-          "enabled": true,
-          "id": "term-deconflict-advisory-banner-elem-0",
-          "precondition": "At least one unresolved `coord.coordinator_decisions` row exists where `rule = 'deconflict'`, `target_id` equals the active tab's `claudeSessionId`, and `resolved = false`. Verifiable via GET `/coordinator/decisions?rule=deconflict` returning a row whose `targetId` matches the active tab.",
-          "reviewed": false,
-          "severity": "critical",
-          "source": "ai-generated",
-          "target": {
-            "criteria": {
-              "dataUiBridgeId": "terminal.deconflict-advisory-banner"
-            },
-            "label": "Required element for Deconflict Advisory Banner",
-            "type": "search"
-          }
-        }
-      ],
-      "category": "element-presence",
-      "description": "When the Rust deconflicter loop (qontinui-runner/src-tauri/src/coordinator/deconflicter.rs, started from `main.rs::setup` via `tauri::async_runtime::spawn`) detects that another live AI session has recently touched the same file the active session is editing, it inserts a `coord.coordinator_decisions` row `{session_id: 'deconflicter-rust', rule: 'deconflict', action: 'advise-with-text', target_id: <touching session's task_run_id>, reasoning: <one-line advisory text>}` and emits a `coordinator-decision-created` Tauri event with the same payload. The active tab subscribes via `<DeconflictAdvisoryBanner>` (qontinui-runner/src/components/terminal/DeconflictAdvisoryBanner.tsx), mounted in TerminalPage.tsx as a sibling of `<HoldingLockBanner>`/`<WaitingLockBanner>` inside the existing `claudeSessionId`-gated section. The banner gates on `props.taskRunId === active tab's claudeSessionId` AND `decision.target_id === taskRunId` AND `decision.session_id.startsWith('deconflicter-')` AND `decision.resolved === false`. PTY-only tabs without `claudeSessionId` never render the banner. Banner placement matches the lock-yield surface (absolutely-positioned overlay inside the active tab's pane); each unresolved deconflict advisory renders one row carrying `data-ui-bridge-id=\"terminal.deconflict-advisory-banner\"` and `data-advisory-decision-id=<decision.id>`. The Dismiss action invokes the pre-existing `resolve_escalation` Tauri command (commands/productivity.rs:294) with `{decisionId, resolution: 'dismissed'}`, which flips `resolved=true, resolution='dismissed'` on the row via `PgDb::resolve_coordinator_decision`. Emergent-task rows underpin the cross-session conflict signal: every AI session gets a `coord.tasks` row with `origin='session_emergent'` so the deconflicter's SQL (`JOIN coord.tasks t ON t.assigned_session_id = stf.task_run_id WHERE stf.recorded_at > now() - interval '15 minutes' AND t.status IN ('in_progress','assigned','running')`) can find the other live session. Worker-spawn writes emergent rows at `commands/productivity.rs:1084`; user-launched AI sessions write them at `commands/ai_session.rs:368` (create_ai_session) and the resume-from-log loop at `:1309`. Touch events flow `auto_register_file` (dispatcher.rs) → `broadcast::Sender<TouchEvent>` in `AppState.touch_events_tx` → the deconflicter loop's receiver. The loop deduplicates `(session, path)` pairs for 5 minutes to keep noise low and is restricted by `must_advise_only` (coordinator/act.rs:61-72) to `AdviseWithText` actions only: any other action attempted with a `session_id` starting `deconflicter-` is rejected at `/coordinator/act` with HTTP 403 \"deconflicter restricted to advisory actions.\"",
-      "id": "term-deconflict-advisory-banner",
-      "name": "Deconflict Advisory Banner",
-      "source": "ai-generated"
-    },
-    {
-      "assertions": [
-        {
-          "assertionType": "exists",
-          "category": "element-presence",
-          "description": "Required element 0 for state Stuck-Session Heartbeat",
+          "description": "Waiter-side holder-idle marker renders when waiting on a contended lock with idle-status telemetry.",
           "enabled": true,
           "id": "term-heartbeat-idle-status-elem-0",
-          "precondition": "At least two active AI sessions contend on the same file: one holds an exclusive lock via FileLockManager, another is blocked on `acquire()`. Verifiable via GET /file-locks/info returning at least one entry whose holder_task_run_id corresponds to a live tab, while another tab's lockState.kind === 'waiting' on the same file_path.",
           "reviewed": false,
           "severity": "critical",
           "source": "ai-generated",
           "target": {
             "criteria": {
-              "dataUiBridgeId": "terminal.waiting-lock-banner-holder-idle"
+              "id": "terminal.waiting-lock-banner-holder-idle"
             },
-            "label": "Required element for Stuck-Session Heartbeat",
+            "label": "WaitingLockBanner holder-idle marker",
             "type": "search"
           }
         }
       ],
       "category": "element-presence",
-      "description": "On top of the Lock-Yield Protocol surface, the terminal page exposes live idle telemetry so a waiter can tell whether the holder is busy or sitting in Ready, and the holder can broadcast 'I'll be a while' to current waiters. Backend: `GET /sessions/idle-status` (registered in `qontinui-runner/src-tauri/src/mcp/ai_session.rs::routes()` as `/sessions/idle-status`) returns `[{task_run_id, holder_name, last_activity_ms, idle_ms}]` for every registered Claude Code session. The handler iterates `SessionManager::snapshot()` (returns `Vec<(task_run_id, holder_name, Arc<AtomicU64>)>` triples without holding the manager lock during reads), reads each session's `last_activity_tracker().load(Ordering::Relaxed)` atomic (epoch seconds, written by `last_activity_stdout.store(now, Ordering::Relaxed)` on every stdout line in `claude_session/session.rs`), converts to ms at the response boundary, and computes `idle_ms = now_ms.saturating_sub(last_activity_ms)` (saturating to 0 on future-skew). `holder_name` is cached on `ClaudeSession` at spawn from the same source as the file-lock dispatcher (`session_ctx.session_name` for workflow sessions, `session_id` as the terminal fallback) so the response joins by-name with `file-lock-*` events. POST `/file-locks/signal-long-wait` (registered alongside the yield routes in `mcp/file_registry.rs::routes()`) accepts `{file_path, holder_task_run_id, holder_name, estimated_remaining_ms?: number}` and returns `{signaled: true}`. It dual-emits `file-lock-long-wait-signaled` `{type, file_path, holder_task_run_id, holder_name, estimated_remaining_ms, signaled_at}` to the Tauri webview AND the broadcast channel, mirroring the yield-request shape. Frontend: `<Now1HzProvider>` (qontinui-runner/src/components/terminal/useNow1Hz.tsx) mounts at the runner-app root inside `<PromptExecutionProvider>` in `AppWithTutorials` and broadcasts `Date.now()` once per second via React context. Every consumer of `useNow1Hz()` subscribes to the shared interval; a private per-component fallback fires only when no provider is in the tree (test isolation). Pre-existing component-local 1Hz tickers in `HoldingLockBanner`, `WaitingLockBanner`, and `productivity/FileActivityPanel` were collapsed onto the singleton. Tab-icon tooltips use the native HTML `title` attribute — the next hover sees fresh text but the OS-rendered popup does NOT refresh its visible text while open; the banner-side seconds-tick (real JSX) ticks fully live. `formatSince(sinceMs, nowMs)` (helper in `TerminalTabBar.tsx`) takes both arguments explicitly — promoted from a single-arg `Date.now()`-internal variant to match the established `formatBannerSeconds` pattern. `useFileLockTracking`'s 10s `/file-locks/info` poll now runs in parallel with `/sessions/idle-status` via `Promise.allSettled`; the join indexes idle entries by `holder_name` (waiters know the holder's friendly name from `file-lock-waiting`'s `blocked_by`, not its task_run_id) and attaches `holderIdleMs: number | undefined` to each waiting `LockState`. Idle-fetch failure is silent — `holderIdleMs` stays undefined; the lock-info loop is unaffected. WaitingLockBanner renders an inline `(holder idle Xm)` suffix (subdued via `text-[#a9b1d6]/70`, `data-ui-bridge-id=\"terminal.waiting-lock-banner-holder-idle\"`) inside the headline when `holderIdleMs > HOLDER_IDLE_DISPLAY_THRESHOLD_MS` (60_000 — exported for tripwire tests). `file-lock-long-wait-signaled` is consumed by `useFileLockTracking`'s fourth listener: it routes the signal to every waiter tab whose `lockState.kind === 'waiting' && lockState.filePath === payload.file_path`, deduping per `(holder_task_run_id, file_path)` and clearing on `file-lock-released` (for the file) or `file-lock-acquired` (for that waiter tab). Waiting tabs whose `pendingLongWaitSignals[tab.id]` has entries render an advisory `\"<strong>B</strong> says they'll be a while.\"` line below the main headline, plus `(~Xm)` when the holder included an estimate. The HoldingLockBanner's `terminal.holding-lock-banner-signal-long-wait` button (previously disabled) is enabled and POSTs to the new endpoint on click; the button enters a 30s cooldown using `SIGNAL_LONG_WAIT_COOLDOWN_MS` (exported constant) with the same UX as the waiter's yield-request cooldown.",
+      "description": "On top of the Lock-Yield Protocol surface, the terminal page exposes live idle telemetry so waiters can tell whether the holder is busy or sitting at Ready. Backend: `GET /sessions/idle-status`. Frontend: `Now1HzProvider` + a `terminal.waiting-lock-banner-holder-idle` UI Bridge marker on the waiter side showing the holder's last_activity_ms / idle_ms.",
       "id": "term-heartbeat-idle-status",
       "name": "Stuck-Session Heartbeat",
       "source": "ai-generated"
@@ -1237,8 +1111,7 @@
           },
           {
             "accessibleName": "Zone profiles"
-          },
-          {}
+          }
         ],
         "id": "term-session-persistence",
         "isInitial": false,
@@ -1326,10 +1199,10 @@
         "transitions": []
       },
       {
-        "description": "When two AI sessions contend on the same file, the holder and the waiter each see an in-tab banner driven by `<HoldingLockBanner>` (qontinui-runner/src/components/terminal/HoldingLockBanner.tsx) and `<WaitingLockBanner>` (qontinui-runner/src/components/terminal/WaitingLockBanner.tsx). The banners share placement: absolutely-positioned `top-2 right-2 z-30 w-[340px]` overlays inside the active tab's pane. They are gated to active AI tabs only (per `proj_holding_banner_pty_gate.md` — PTY tabs without `claudeSessionId` never render either banner). Banner mounting is driven by `useFileLockTracking` (qontinui-runner/src/components/terminal/useFileLockTracking.ts) exposing `lockStates: Record<tabId, LockState>` and `pendingYieldRequests: Record<holderTabId, IncomingYieldRequest[]>`. HoldingLockBanner shows above the active tab's pane when `lockState.kind === 'holding'` AND (`waiterCount > 0` OR pending yield requests exist for this tab). Its three buttons are `terminal.holding-lock-banner-yield` (calls POST `/file-locks/yield` to release this lock without ending the session), `terminal.holding-lock-banner-hold` (dismisses the banner locally until the next waiter event), and `terminal.holding-lock-banner-signal-long-wait` (Stuck-Session Heartbeat surface — see `term-heartbeat-idle-status`). WaitingLockBanner shows above the active tab's pane when `lockState.kind === 'waiting'` and exposes one primary action `terminal.waiting-lock-banner-request-yield` (POST `/file-locks/yield-request`). After click, the button enters a 30-second cooldown matching `REQUEST_YIELD_COOLDOWN_MS` (re-exported from `@/lib/lock-yield` for consumer tripwires) — local state, not server-tracked, reload resets it. Disabled state: when `blockerTaskRunId` is undefined the parent couldn't resolve the holder session by name, so there's nothing to route the request to and the button is disabled with a guidance tooltip. Backend wiring lives in `qontinui-runner/src-tauri/src/mcp/file_registry.rs::yield_lock` and `::request_yield` (registered in `routes()` at `/file-locks/yield` and `/file-locks/yield-request` POST). Both emit via the dual-emit pattern: `state.app_handle.emit(name, &payload)` for the Tauri webview AND `state.app_state.event_broadcast.send(payload)` for SSE/headless consumers, matching the dispatcher's wait emit at `claude_session/dispatcher.rs:436-441`. The yield endpoint emits `file-lock-released` (same shape used by session.rs, ai_session.rs, graphql/mutation.rs, task_runs.rs). The yield-request endpoint emits `file-lock-yield-requested` `{type, file_path, requester_task_run_id, requester_name, holder_task_run_id, requested_at}` which `useFileLockTracking`'s third listener routes to the holder's tab by matching `tab.claudeSessionId === payload.holder_task_run_id` (via `findTabByTaskRunId`). The pending-yield list is deduped by `(requesterTaskRunId, filePath)` so a holder doesn't see N entries from spam clicks. Entries clear automatically on `file-lock-released` for the matching `(holder_task_run_id, file_path)` pair. Banner-side 1Hz seconds-tick uses `useNow1Hz` (see `term-heartbeat-idle-status`).",
+        "description": "When two AI sessions contend on the same file, the holder and the waiter each see an in-tab banner (`HoldingLockBanner` / `WaitingLockBanner`, terminal/HoldingLockBanner.tsx + terminal/WaitingLockBanner.tsx). Mounted only on active AI tabs with an active lock conflict. Exposes the lock-yield/request-yield/signal-long-wait actions via `terminal.holding-lock-banner-*` and `terminal.waiting-lock-banner-*` UI Bridge components.",
         "elements": [
           {
-            "dataUiBridgeId": "terminal.waiting-lock-banner"
+            "id": "terminal.waiting-lock-banner"
           }
         ],
         "id": "term-lock-yield-banners",
@@ -1338,10 +1211,10 @@
         "transitions": []
       },
       {
-        "description": "On top of the Lock-Yield Protocol surface, the terminal page exposes live idle telemetry so a waiter can tell whether the holder is busy or sitting in Ready, and the holder can broadcast 'I'll be a while' to current waiters. Backend: `GET /sessions/idle-status` (registered in `qontinui-runner/src-tauri/src/mcp/ai_session.rs::routes()` as `/sessions/idle-status`) returns `[{task_run_id, holder_name, last_activity_ms, idle_ms}]` for every registered Claude Code session. The handler iterates `SessionManager::snapshot()` (returns `Vec<(task_run_id, holder_name, Arc<AtomicU64>)>` triples without holding the manager lock during reads), reads each session's `last_activity_tracker().load(Ordering::Relaxed)` atomic (epoch seconds, written by `last_activity_stdout.store(now, Ordering::Relaxed)` on every stdout line in `claude_session/session.rs`), converts to ms at the response boundary, and computes `idle_ms = now_ms.saturating_sub(last_activity_ms)` (saturating to 0 on future-skew). `holder_name` is cached on `ClaudeSession` at spawn from the same source as the file-lock dispatcher (`session_ctx.session_name` for workflow sessions, `session_id` as the terminal fallback) so the response joins by-name with `file-lock-*` events. POST `/file-locks/signal-long-wait` (registered alongside the yield routes in `mcp/file_registry.rs::routes()`) accepts `{file_path, holder_task_run_id, holder_name, estimated_remaining_ms?: number}` and returns `{signaled: true}`. It dual-emits `file-lock-long-wait-signaled` `{type, file_path, holder_task_run_id, holder_name, estimated_remaining_ms, signaled_at}` to the Tauri webview AND the broadcast channel, mirroring the yield-request shape. Frontend: `<Now1HzProvider>` (qontinui-runner/src/components/terminal/useNow1Hz.tsx) mounts at the runner-app root inside `<PromptExecutionProvider>` in `AppWithTutorials` and broadcasts `Date.now()` once per second via React context. Every consumer of `useNow1Hz()` subscribes to the shared interval; a private per-component fallback fires only when no provider is in the tree (test isolation). Pre-existing component-local 1Hz tickers in `HoldingLockBanner`, `WaitingLockBanner`, and `productivity/FileActivityPanel` were collapsed onto the singleton. Tab-icon tooltips use the native HTML `title` attribute — the next hover sees fresh text but the OS-rendered popup does NOT refresh its visible text while open; the banner-side seconds-tick (real JSX) ticks fully live. `formatSince(sinceMs, nowMs)` (helper in `TerminalTabBar.tsx`) takes both arguments explicitly — promoted from a single-arg `Date.now()`-internal variant to match the established `formatBannerSeconds` pattern. `useFileLockTracking`'s 10s `/file-locks/info` poll now runs in parallel with `/sessions/idle-status` via `Promise.allSettled`; the join indexes idle entries by `holder_name` (waiters know the holder's friendly name from `file-lock-waiting`'s `blocked_by`, not its task_run_id) and attaches `holderIdleMs: number | undefined` to each waiting `LockState`. Idle-fetch failure is silent — `holderIdleMs` stays undefined; the lock-info loop is unaffected. WaitingLockBanner renders an inline `(holder idle Xm)` suffix (subdued via `text-[#a9b1d6]/70`, `data-ui-bridge-id=\"terminal.waiting-lock-banner-holder-idle\"`) inside the headline when `holderIdleMs > HOLDER_IDLE_DISPLAY_THRESHOLD_MS` (60_000 — exported for tripwire tests). `file-lock-long-wait-signaled` is consumed by `useFileLockTracking`'s fourth listener: it routes the signal to every waiter tab whose `lockState.kind === 'waiting' && lockState.filePath === payload.file_path`, deduping per `(holder_task_run_id, file_path)` and clearing on `file-lock-released` (for the file) or `file-lock-acquired` (for that waiter tab). Waiting tabs whose `pendingLongWaitSignals[tab.id]` has entries render an advisory `\"<strong>B</strong> says they'll be a while.\"` line below the main headline, plus `(~Xm)` when the holder included an estimate. The HoldingLockBanner's `terminal.holding-lock-banner-signal-long-wait` button (previously disabled) is enabled and POSTs to the new endpoint on click; the button enters a 30s cooldown using `SIGNAL_LONG_WAIT_COOLDOWN_MS` (exported constant) with the same UX as the waiter's yield-request cooldown.",
+        "description": "On top of the Lock-Yield Protocol surface, the terminal page exposes live idle telemetry so waiters can tell whether the holder is busy or sitting at Ready. Backend: `GET /sessions/idle-status`. Frontend: `Now1HzProvider` + a `terminal.waiting-lock-banner-holder-idle` UI Bridge marker on the waiter side showing the holder's last_activity_ms / idle_ms.",
         "elements": [
           {
-            "dataUiBridgeId": "terminal.waiting-lock-banner-holder-idle"
+            "id": "terminal.waiting-lock-banner-holder-idle"
           }
         ],
         "id": "term-heartbeat-idle-status",

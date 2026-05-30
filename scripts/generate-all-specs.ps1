@@ -5,11 +5,12 @@
 # Usage: powershell -File scripts/generate-all-specs.ps1 [-MaxMinutes 40]
 
 param(
-    [int]$MaxMinutes = 40
+    [int]$MaxMinutes = 40,
+    [int]$Port = 9876
 )
 
-$BASE = "http://localhost:9876/ui-bridge"
-$RUNNER_API = "http://localhost:9876"
+$BASE = "http://localhost:$Port/ui-bridge"
+$RUNNER_API = "http://localhost:$Port"
 $SPEC_DIR = "$env:APPDATA\com.qontinui.runner\user-specs"
 $logFile = "$PSScriptRoot\spec-gen.log"
 $UTF8_NO_BOM = New-Object System.Text.UTF8Encoding $false  # WriteAllText default adds BOM; Rust serde_json rejects BOM
