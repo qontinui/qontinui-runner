@@ -16,13 +16,6 @@ export interface DeviceInfo {
   platform: "windows" | "darwin" | "linux";
 }
 
-export interface LoginResponse {
-  access_token: string;
-  refresh_token: string;
-  user: User;
-  device_info: DeviceInfo;
-}
-
 export interface AuthStatus {
   authenticated: boolean;
   user: User | null;
@@ -41,17 +34,21 @@ export interface AuthContextValue {
   authStatus: AuthStatus | null;
   loading: boolean;
   error: string | null;
-  /** True in dev mode until auto-login completes or is skipped */
+  /**
+   * Always `false` under Cognito-only auth — the legacy dev email/password
+   * auto-login was removed. Retained on the interface (and as a constant) so
+   * existing consumers that gate on it keep compiling and behaving.
+   */
   devAutoLoginPending: boolean;
   /**
    * Current runner tier. Surfaced so consumers can gate UI without calling
-   * `useRunnerTier()` redundantly. Only "qontinui_account" requires a
-   * qontinui-account JWT; "local" and "local_provider" run with a
-   * synthesized local-guest auth.
+   * `useRunnerTier()` redundantly. Only "qontinui_account" requires a Qontinui
+   * (Cognito) sign-in; "local" and "local_provider" run with a synthesized
+   * local-guest auth.
    */
   tier: RunnerTier;
-  login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
+  /** Re-validate the current auth status (no token-refresh side effect). */
   refreshAuth: () => Promise<void>;
 }
 

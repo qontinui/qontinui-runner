@@ -890,16 +890,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::get_access_token_for_websocket,
             commands::auth::get_api_port,
             commands::auth::get_device_info,
-            commands::auth::get_test_auto_login,
             commands::auth::get_user_projects,
             commands::auth::is_api_ready,
             commands::auth::get_runner_tier,
             commands::auth::kick_device_jwt_refresher_cmd,
-            commands::auth::login,
             commands::auth::logout,
-            commands::auth::pair_with_credentials,
             commands::auth::qontinui_sign_out,
-            commands::auth::refresh_token,
             commands::auth::set_runner_tier,
             commands::auth::start_qontinui_sign_in,
             commands::autostart::get_autostart_enabled,
@@ -2249,14 +2245,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Start heartbeat background task for fleet registration
             heartbeat::start_heartbeat(heartbeat_app_state);
 
-            // Headless/back-end auto-login for supervisor-spawned test runners.
-            // The webview-driven path (AuthProvider → get_test_auto_login) only
-            // fires once React mounts; a headless temp runner would otherwise
-            // never authenticate (runner_token_empty=true → no device-JWT, 401s).
-            // No-op unless QONTINUI_TEST_AUTO_LOGIN_* is set and tokens are absent.
-            commands::auth::spawn_headless_auto_login(
-                app.state::<launch_env::SharedLaunchEnv>().inner().clone(),
-            );
+            // Legacy headless/back-end email/password auto-login REMOVED
+            // (Cognito-legacy-auth teardown). The web backend is Cognito-only;
+            // there is no `/jwt/login` for a headless temp runner to call, and
+            // Cognito PKCE inherently requires a browser. Supervisor-spawned
+            // runners now reach Tier 2 via the browser/SSO Cognito sign-in
+            // (`commands::auth::cognito_sign_in`) like any other runner; once a
+            // device-JWT is persisted, the device-JWT refresher keeps it fresh.
 
             // Phase 3 — web-backend integration is now driven entirely by
             // the unified WebSocket relay (`crate::mcp::backend_relay`).
