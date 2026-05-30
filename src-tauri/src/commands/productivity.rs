@@ -1172,6 +1172,8 @@ pub async fn spawn_worker_session(
                 // allocation above.
                 repo: Some(intent_repo.clone()),
                 branch: None,
+                plan_slug: None,
+                correlation_topic: None,
                 declared_paths: vec![],
                 share_output: true,
                 redact_secrets: None,
@@ -1184,8 +1186,10 @@ pub async fn spawn_worker_session(
 
                         // R1 (session-lifecycle-cleanup) — close the coord
                         // session mirror immediately when the worker PTY
-                        // exits, instead of waiting out the coord_sync 180s
-                        // autoclose. Idempotent with any explicit close.
+                        // exits, instead of leaving it for coord's stale→closed
+                        // watcher (the runner no longer self-closes abandoned
+                        // sessions; see coord_sync plan A3). Idempotent with any
+                        // explicit close.
                         let close_registry = registry.clone();
                         session.set_on_exit(Box::new(move |coord_id| {
                             if let Err(e) = close_registry.close_by_id(coord_id) {

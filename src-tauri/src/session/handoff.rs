@@ -620,12 +620,22 @@ fn build_child_intent(state: &HandoffState) -> Result<Intent, HandoffError> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let redact_secrets = src.get("redact_secrets").and_then(|v| v.as_bool());
+    let plan_slug = src
+        .get("plan_slug")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let correlation_topic = src
+        .get("correlation_topic")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     Ok(Intent {
         kind,
         purpose,
         repo: state.repo.clone(),
         branch: state.branch.clone(),
+        plan_slug,
+        correlation_topic,
         declared_paths,
         share_output,
         redact_secrets,

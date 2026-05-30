@@ -29,6 +29,10 @@ pub struct StartSessionArgs {
     #[serde(default)]
     pub branch: Option<String>,
     #[serde(default)]
+    pub plan_slug: Option<String>,
+    #[serde(default)]
+    pub correlation_topic: Option<String>,
+    #[serde(default)]
     pub declared_paths: Vec<PathBuf>,
     #[serde(default)]
     pub share_output: bool,
@@ -43,6 +47,8 @@ impl From<StartSessionArgs> for Intent {
             purpose: a.purpose,
             repo: a.repo,
             branch: a.branch,
+            plan_slug: a.plan_slug,
+            correlation_topic: a.correlation_topic,
             declared_paths: a.declared_paths,
             share_output: a.share_output,
             redact_secrets: a.redact_secrets,

@@ -87,8 +87,6 @@ use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
 const DEFAULT_HEARTBEAT_SECS: u64 = 15;
 /// Default stale threshold — 3 missed heartbeats.
 const DEFAULT_STALE_SECS: u64 = 45;
-/// Default auto-close threshold — 12 missed heartbeats.
-const DEFAULT_AUTOCLOSE_SECS: u64 = 180;
 /// Fallback coord URL when neither `COORD_HTTP_URL` env nor profile is set.
 const DEFAULT_COORD_URL: &str = "http://localhost:9870";
 
@@ -151,7 +149,6 @@ struct CoordSyncInner {
     http: reqwest::Client,
     heartbeat: Duration,
     stale: Duration,
-    autoclose: Duration,
     /// Set the first time we successfully reach coord. Used to decide
     /// whether to log a noisy "reconnected" line on the next success.
     has_been_online: AtomicBool,
@@ -179,7 +176,6 @@ impl std::fmt::Debug for CoordSync {
             .field("coord_url", &self.inner.coord_url)
             .field("heartbeat", &self.inner.heartbeat)
             .field("stale", &self.inner.stale)
-            .field("autoclose", &self.inner.autoclose)
             .finish()
     }
 }
@@ -194,10 +190,6 @@ impl CoordSync {
             DEFAULT_HEARTBEAT_SECS,
         ));
         let stale = Duration::from_secs(env_u64("QONTINUI_SESSION_STALE_SECS", DEFAULT_STALE_SECS));
-        let autoclose = Duration::from_secs(env_u64(
-            "QONTINUI_SESSION_AUTOCLOSE_SECS",
-            DEFAULT_AUTOCLOSE_SECS,
-        ));
 
         let http = reqwest::Client::builder()
             // Per-request timeout — slow enough to ride out a hiccup,
@@ -217,7 +209,6 @@ impl CoordSync {
                 http,
                 heartbeat,
                 stale,
-                autoclose,
                 has_been_online: AtomicBool::new(false),
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
@@ -235,7 +226,6 @@ impl CoordSync {
         coord_url: String,
         heartbeat: Duration,
         stale: Duration,
-        autoclose: Duration,
     ) -> Self {
         Self {
             inner: Arc::new(CoordSyncInner {
@@ -247,7 +237,6 @@ impl CoordSync {
                     .unwrap(),
                 heartbeat,
                 stale,
-                autoclose,
                 has_been_online: AtomicBool::new(false),
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
@@ -285,12 +274,6 @@ impl CoordSync {
     #[allow(dead_code)]
     pub fn stale_threshold(&self) -> Duration {
         self.inner.stale
-    }
-
-    /// Auto-close threshold (12 missed heartbeats).
-    #[allow(dead_code)]
-    pub fn autoclose_threshold(&self) -> Duration {
-        self.inner.autoclose
     }
 
     /// Attach the Tauri AppHandle so the drain loop can emit
@@ -844,7 +827,6 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
     tracing::info!(
         ?interval,
         stale_after = ?inner.stale,
-        autoclose_after = ?inner.autoclose,
         "coord_sync: heartbeat loop starting"
     );
 
@@ -866,7 +848,6 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
         let snapshot = reg.snapshot();
         let machine_id = reg.machine_id();
 
-        let mut to_close: Vec<Uuid> = Vec::new();
         let mut to_stale: Vec<Uuid> = Vec::new();
         let mut to_heartbeat: HashMap<Uuid, ()> = HashMap::new();
 
@@ -880,10 +861,13 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
                 .to_std()
                 .unwrap_or_else(|_| Duration::from_secs(0));
 
-            if elapsed >= inner.autoclose {
-                to_close.push(desc.id);
-                continue;
-            }
+            // NOTE (plan A3): the runner deliberately does NOT auto-close /
+            // DELETE an abandoned session here. When heartbeats cease (runner
+            // stopped/crashed/slept), coord's own watcher ages the row
+            // (Active→Stale at 600s, →Closed at 1800s). Self-closing at a
+            // shorter local threshold would race coord and prematurely DELETE
+            // a session coord still considers live. The local Stale flip below
+            // is a UI affordance only — it never emits a DELETE.
             if elapsed >= inner.stale && !matches!(desc.state, SessionState::Stale) {
                 to_stale.push(desc.id);
             }
@@ -921,23 +905,6 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
                     session = %id,
                     error = %e,
                     "coord_sync: heartbeat outbox write failed"
-                );
-            }
-        }
-
-        // Auto-close the truly-gone sessions. `close_by_id` records the
-        // `closed` event in the outbox, which the drain loop folds into
-        // a DELETE on its next tick.
-        for id in to_close {
-            tracing::info!(
-                session = %id,
-                "coord_sync: auto-closing session past autoclose threshold"
-            );
-            if let Err(e) = reg.close_by_id(id) {
-                tracing::warn!(
-                    session = %id,
-                    error = %e,
-                    "coord_sync: auto-close failed"
                 );
             }
         }
@@ -1052,6 +1019,8 @@ mod tests {
             purpose: "coord-sync test".into(),
             repo: Some("qontinui-runner".into()),
             branch: Some("feat/coord-sync".into()),
+            plan_slug: None,
+            correlation_topic: None,
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
@@ -1206,7 +1175,6 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
 
@@ -1233,7 +1201,6 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
 
@@ -1261,7 +1228,6 @@ mod tests {
             base,
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
         // Establish the session (writes the `started` row) BEFORE starting
@@ -1306,7 +1272,6 @@ mod tests {
             base,
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
         // See drain_pushes: start the session before the drain loop so its
@@ -1344,7 +1309,6 @@ mod tests {
             base,
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
         // See drain_pushes: session before the drain loop to avoid the
@@ -1373,7 +1337,6 @@ mod tests {
             base,
             Duration::from_millis(100),
             Duration::from_secs(60),
-            Duration::from_secs(600),
         );
         let registry = build_registry(coord.clone());
         // Session before the heartbeat loop, consistent with the drain
@@ -1405,7 +1368,6 @@ mod tests {
             base,
             Duration::from_millis(100),
             Duration::from_secs(60),
-            Duration::from_secs(600),
         );
         let registry = build_registry(coord.clone());
         // Session before the loops (see drain_pushes).
@@ -1422,31 +1384,28 @@ mod tests {
         .await;
     }
 
+    /// Plan A3 — an ABANDONED session (heartbeats ceased) must NOT
+    /// self-delete. The runner leaves it for coord's own watcher to age;
+    /// the sweep only flips local state to Stale (a UI affordance) and keeps
+    /// emitting heartbeats. It must never emit a `closed`→DELETE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn autoclose_fires_delete_after_threshold() {
+    async fn abandoned_session_goes_stale_but_never_self_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
-        // Heartbeat every 50ms; stale at 60ms; autoclose at 120ms so
-        // the natural elapsed time after a session start crosses the
-        // threshold within ~half a second of wall-clock.
+        // Heartbeat every 50ms; stale at 60ms. There is no autoclose
+        // threshold any longer — abandonment is coord's job to reap.
         let coord = CoordSync::new_for_test(
             outbox.clone(),
             base,
             Duration::from_millis(50),
             Duration::from_millis(60),
-            Duration::from_millis(120),
         );
         let registry = build_registry(coord.clone());
 
-        // Start the session and force its last_heartbeat far into the past
-        // BEFORE spawning the heartbeat/drain loops. On a multi_thread
-        // runtime the loops run concurrently: if they were started first,
-        // the heartbeat sweep could race ahead of the force, see the
-        // session as still "active", and emit a fresh heartbeat row — so
-        // the autoclose never fires and the DELETE never lands (observed
-        // ~65% flake). Forcing it stale first makes the very first sweep
-        // autoclose it deterministically.
+        // Start the session and shove its last_heartbeat 10s into the past —
+        // well beyond the OLD 180s/120ms autoclose window — so we prove that
+        // even a long-abandoned session is never self-DELETEd.
         let handle = registry.start(make_test_intent()).unwrap();
         let id = handle.id();
         registry.force_heartbeat_to_for_test(id, Utc::now() - chrono::Duration::seconds(10));
@@ -1454,14 +1413,29 @@ mod tests {
         let _drain = coord.start_drain_task();
         let _hb = coord.start_heartbeat_task();
 
+        // The sweep should flip the session to Stale locally.
         wait_until(Duration::from_secs(5), || {
-            let r = rec.try_lock();
-            r.map(|g| g.deletes.contains(&id)).unwrap_or(false)
+            registry
+                .describe_by_id(id)
+                .map(|d| d.state == SessionState::Stale)
+                .unwrap_or(false)
         })
         .await;
 
+        // Give the loops several more ticks to (NOT) self-delete.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let g = rec.lock().await;
+        assert!(
+            !g.deletes.contains(&id),
+            "abandoned session must NOT be self-DELETEd by the runner — coord reaps it"
+        );
+        drop(g);
+
+        // Local state stays Stale (never Closed) — only an explicit close
+        // would flip it to Closed + emit a DELETE.
         let desc = registry.describe_by_id(id).unwrap();
-        assert_eq!(desc.state, SessionState::Closed);
+        assert_eq!(desc.state, SessionState::Stale);
     }
 
     /// Smoke test: rebuild_create_body honors the payload's intent +
@@ -1593,7 +1567,6 @@ mod tests {
             base,
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let id = Uuid::new_v4();
         let probe = coord.probe_resume(id).await;
@@ -1619,7 +1592,6 @@ mod tests {
             base,
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let probe = coord.probe_resume(Uuid::new_v4()).await;
         assert_eq!(probe, ResumeProbe::NotFound);
@@ -1637,7 +1609,6 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let probe = coord.probe_resume(Uuid::new_v4()).await;
         assert_eq!(probe, ResumeProbe::Unreachable);
@@ -1655,7 +1626,6 @@ mod tests {
             base,
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
 
@@ -1694,7 +1664,6 @@ mod tests {
             base,
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
 
@@ -1728,7 +1697,6 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
 
@@ -1759,7 +1727,6 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             Duration::from_millis(50),
             Duration::from_secs(10),
-            Duration::from_secs(60),
         );
         let registry = build_registry(coord.clone());
         let mut intent = make_test_intent();

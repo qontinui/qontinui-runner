@@ -45,6 +45,15 @@ pub struct Intent {
     /// Optional branch name. See [`Intent::repo`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Optional plan slug this session is working on. Forwarded into
+    /// `coord.sessions.intent` so coord can group sessions by plan and
+    /// drive plan-scoped multi-repo dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_slug: Option<String>,
+    /// Optional correlation topic for cross-machine peer discovery /
+    /// rendezvous. Forwarded into `coord.sessions.intent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_topic: Option<String>,
     /// Paths the session intends to touch. The plan calls this out as the
     /// hook for fine-grained claim narrowing in later phases; for now the
     /// list is persisted verbatim in the intent JSON.
@@ -124,6 +133,8 @@ mod tests {
             purpose: "fix the thing".into(),
             repo: None,
             branch: None,
+            plan_slug: None,
+            correlation_topic: None,
             declared_paths: vec![],
             share_output: false,
             redact_secrets: None,
@@ -200,6 +211,8 @@ mod tests {
             purpose: "drive the agentic loop".into(),
             repo: Some("qontinui-web".into()),
             branch: Some("main".into()),
+            plan_slug: Some("2026-05-22-coord-native-session-coordination".into()),
+            correlation_topic: Some("by-correlation-topic/demo".into()),
             declared_paths: vec![PathBuf::from("/repo/path")],
             share_output: true,
             redact_secrets: Some(false),

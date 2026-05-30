@@ -1832,7 +1832,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Phase 3 — wire the coord-sync drain + heartbeat loops.
                 // `attach_app_handle` enables the conflict-event emit;
                 // `attach_registry` gives the heartbeat loop a way to
-                // enumerate active sessions for stale/autoclose sweeps.
+                // enumerate active sessions for the stale sweep.
                 coord_sync_facade.attach_app_handle(app_handle.clone());
                 let registry = session::SessionRegistry::new(
                     machine_id,
