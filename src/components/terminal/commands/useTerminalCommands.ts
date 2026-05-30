@@ -87,6 +87,13 @@ export interface TerminalCommandsContext {
    * "Export" button used.
    */
   exportAll: () => void;
+  /**
+   * Open the DocFinder modal. Mirrors the closure ZoneStatusBar's
+   * "Doc" button used (now lifted into `TerminalPage` so the modal
+   * mount and the `/doc-finder` registry action share a single
+   * `showDocFinder` state).
+   */
+  openDocFinder: () => void;
 }
 
 /**
@@ -977,6 +984,23 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
         return fail("no-plan", "no PLAN*.md / TODO*.md file detected in workspace");
       }
       await workflowGen.handleBuildPlanFromFile();
+      return ok();
+    },
+  });
+
+  // 33. /doc-finder — open the doc-picker modal
+  useCommandAction({
+    id: "terminal.doc-finder",
+    slash: "/doc-finder",
+    aliases: ["/doc", "/docs"],
+    label: "Open doc-finder",
+    description:
+      "Open the doc-picker modal to load a documentation file into a zone. " +
+      "Same as the Doc button in ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^docs?$/i, /^doc-finder$/i],
+    handler: async (): Promise<CommandResult> => {
+      ctx.openDocFinder();
       return ok();
     },
   });

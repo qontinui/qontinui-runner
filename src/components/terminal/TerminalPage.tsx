@@ -6,6 +6,7 @@ import { SessionManagerPanel } from "./SessionManagerPanel";
 import { ZoneGrid } from "./ZoneGrid";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { ZoneStatusBar } from "./ZoneStatusBar";
+import { DocFinderModal } from "./DocFinderModal";
 import { BatchOperationsBar } from "./BatchOperationsBar";
 import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
@@ -335,6 +336,7 @@ function TerminalPageInner({
   // plan flagged this ambiguity; the cleaner placement is here next to
   // the contention toast, matching its visual language.
   const [dismissedBanners, setDismissedBanners] = useState<Set<string>>(new Set());
+  const [showDocFinder, setShowDocFinder] = useState(false);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional sync: drop stale dismissals whenever fileLockStates changes so the banner re-shows on a fresh waiter wave (count 0 → 1 after a "Hold" click). The same React-rules exception pattern is used at lib/runner-api.ts:61 / :79 for the port-listener sync.
     setDismissedBanners((prev) => {
@@ -657,6 +659,7 @@ function TerminalPageInner({
     accounts: sessionManager.accountUsage,
     sortZones: handleSortZones,
     exportAll: handleExportOutput,
+    openDocFinder: () => setShowDocFinder(true),
   });
 
   if (!initialized) {
@@ -682,8 +685,16 @@ function TerminalPageInner({
         <ZoneStatusBar
           onExport={handleExportOutput}
           onSortZones={handleSortZones}
-          onOpenDocFile={handleOpenDocFile}
         />
+        {showDocFinder && (
+          <DocFinderModal
+            onSelect={(filePath) => {
+              handleOpenDocFile(filePath);
+              setShowDocFinder(false);
+            }}
+            onClose={() => setShowDocFinder(false)}
+          />
+        )}
         <TerminalNotification
           message={workflowGen.notification?.message ?? null}
           type={workflowGen.notification?.type ?? "success"}

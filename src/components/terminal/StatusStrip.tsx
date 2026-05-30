@@ -43,7 +43,17 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertOctagon, Lock, Package, RefreshCw, Sparkles } from "lucide-react";
+import {
+  AlertOctagon,
+  ClipboardList,
+  Lock,
+  Package,
+  RefreshCw,
+  Sparkles,
+  TerminalSquare,
+} from "lucide-react";
+
+import type { SessionState } from "./useZoneLayout";
 
 import { useTerminalSession } from "./contexts";
 import { useWrapperTools } from "@/hooks/useWrapperTools";
@@ -92,9 +102,21 @@ function Pill({ icon, text, color, onClick, title }: PillProps) {
   );
 }
 
+/** Color codes mirror the per-state palette in ZoneStatusBar so the
+ *  visual identity stays consistent across the lifted-out pills. */
+const STATE_COLORS: Record<SessionState, string> = {
+  idle: "#565f89",
+  working: "#7aa2f7",
+  "needs-input": "#e0af68",
+  completed: "#9ece6a",
+  error: "#f7768e",
+};
+
 export function StatusStrip() {
   const session = useTerminalSession();
-  const { tabs, sessionStates, fileLockStates, zoneLayout } = session;
+  const { tabs, sessionStates, fileLockStates, zoneLayout, workflowGen } = session;
+  const planFileName = workflowGen.planFileName;
+  const isPlanLoading = workflowGen.isPlanLoading;
   const {
     tools: wrapperTools,
     routes: wrapperRoutes,
@@ -133,14 +155,31 @@ export function StatusStrip() {
   }, []);
 
   // Counts + derived signals. Reused across the pill list AND the
-  // outer auto-hide gate.
-  const { needsInputCount, errorCount, stuckLocks, maxStuckMs, longestStuckTabId } = useMemo(() => {
+  // outer auto-hide gate. Working/completed/idle feed the Phase-9f
+  // state-breakdown pill (sibling to the existing needs-input / error
+  // pills, which keep their own callsites because they're clickable).
+  const {
+    needsInputCount,
+    errorCount,
+    workingCount,
+    completedCount,
+    idleCount,
+    stuckLocks,
+    maxStuckMs,
+    longestStuckTabId,
+  } = useMemo(() => {
     let needsInput = 0;
     let errors = 0;
+    let working = 0;
+    let completed = 0;
+    let idle = 0;
     for (const tab of tabs) {
-      const state = sessionStates[tab.id];
+      const state = sessionStates[tab.id] ?? "idle";
       if (state === "needs-input") needsInput++;
       else if (state === "error") errors++;
+      else if (state === "working") working++;
+      else if (state === "completed") completed++;
+      else if (state === "idle") idle++;
     }
     let stuck = 0;
     let maxMs = 0;
@@ -161,6 +200,9 @@ export function StatusStrip() {
     return {
       needsInputCount: needsInput,
       errorCount: errors,
+      workingCount: working,
+      completedCount: completed,
+      idleCount: idle,
       stuckLocks: stuck,
       maxStuckMs: maxMs,
       longestStuckTabId: longestTabId,
@@ -169,12 +211,30 @@ export function StatusStrip() {
     // tabs / sessionStates / fileLockStates cover state-driven re-eval.
   }, [tabs, sessionStates, fileLockStates]);
 
+  const sessionCount = tabs.length;
+  const isMultiZone = sessionCount > 1;
+
   const wrapperCount = wrapperTools.length;
 
-  // Auto-hide gate — when nothing requires attention, the strip
-  // disappears entirely so the top of viewport is fully clean.
+  // Phase 9f — visual indicators lifted from ZoneStatusBar. These
+  // surface ambient session-shape info (count, non-attention state
+  // breakdown, loaded plan file) so the strip carries the operator
+  // context ZSB used to. The attention-pills above keep their bright
+  // colors; these new pills render in muted shades so they don't
+  // compete visually with "needs attention" signals.
+  const hasBreakdown = workingCount > 0 || completedCount > 0 || idleCount > 0;
+
+  // Auto-hide gate — when nothing requires attention AND nothing
+  // informational is worth showing either, the strip disappears
+  // entirely so the top of viewport is fully clean.
   const hasContent =
-    needsInputCount > 0 || errorCount > 0 || stuckLocks > 0 || wrapperCount > 0;
+    needsInputCount > 0 ||
+    errorCount > 0 ||
+    stuckLocks > 0 ||
+    wrapperCount > 0 ||
+    isMultiZone ||
+    planFileName !== null ||
+    isPlanLoading;
 
   const focusNextError = useCallback(() => {
     // Inline mirror of `useZoneLayout.focusNextNeedsInput`'s walk,
@@ -324,6 +384,87 @@ export function StatusStrip() {
           )}
         </div>
       )}
+      {/* Phase 9f — session count pill. Multi-zone only; informational. */}
+      {isMultiZone && (
+        <Pill
+          icon={<TerminalSquare className="w-2.5 h-2.5" />}
+          text={`${sessionCount} sessions`}
+          color="#565f89"
+          title={`${sessionCount} terminal sessions open in this page`}
+        />
+      )}
+
+      {/* Phase 9f — state-breakdown pill. Single combined pill listing
+          the non-attention states (working / completed / idle); the
+          attention-grabbing needs-input / error counts already have
+          dedicated pills above. Renders dot-then-count per state in
+          its native color so the dense layout stays legible. */}
+      {isMultiZone && hasBreakdown && (
+        <span
+          className="flex items-center gap-2 px-1.5 py-0.5 text-[10px] leading-none whitespace-nowrap text-[#565f89]"
+          title="Session state breakdown"
+        >
+          {workingCount > 0 && (
+            <span className="flex items-center gap-1" style={{ color: STATE_COLORS.working }}>
+              <span
+                className="w-1.5 h-1.5 rounded-full"
+                style={{ backgroundColor: STATE_COLORS.working }}
+                aria-hidden
+              />
+              {workingCount} working
+            </span>
+          )}
+          {completedCount > 0 && (
+            <span className="flex items-center gap-1" style={{ color: STATE_COLORS.completed }}>
+              <span
+                className="w-1.5 h-1.5 rounded-full"
+                style={{ backgroundColor: STATE_COLORS.completed }}
+                aria-hidden
+              />
+              {completedCount} done
+            </span>
+          )}
+          {idleCount > 0 && (
+            <span className="flex items-center gap-1" style={{ color: STATE_COLORS.idle }}>
+              <span
+                className="w-1.5 h-1.5 rounded-full"
+                style={{ backgroundColor: STATE_COLORS.idle }}
+                aria-hidden
+              />
+              {idleCount} idle
+            </span>
+          )}
+        </span>
+      )}
+
+      {/* Phase 9f — plan-file pill. Mirrors ZSB's plan-file indicator:
+          loaded chip when a PLAN*.md / TODO*.md was found, a muted
+          spinner while scanning, and a "no plan" hint otherwise. */}
+      {isPlanLoading ? (
+        <Pill
+          icon={
+            <span className="w-2.5 h-2.5 border border-[#565f89] border-t-transparent rounded-full animate-spin" />
+          }
+          text="scanning plan…"
+          color="#565f89"
+          title="Looking for PLAN*.md / TODO*.md in the workspace"
+        />
+      ) : planFileName ? (
+        <Pill
+          icon={<ClipboardList className="w-2.5 h-2.5" />}
+          text={planFileName}
+          color="#9ece6a"
+          title={`Plan loaded: ${planFileName} — used by /plan-implement, /plan-verify, Architecture, and Plan Progress analyses`}
+        />
+      ) : (
+        <Pill
+          icon={<ClipboardList className="w-2.5 h-2.5" />}
+          text="no plan"
+          color="#414868"
+          title="No PLAN*.md / TODO*.md file found in workspace"
+        />
+      )}
+
       {/* Trailing decorative spark so the strip's "something present"
           state is visually distinct from a stray border-bottom on a
           blank row, while staying subtle. Aria-hidden — it's purely
