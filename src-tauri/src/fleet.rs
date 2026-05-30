@@ -184,6 +184,21 @@ fn resolve_tenant_id() -> Option<uuid::Uuid> {
     Some(parsed)
 }
 
+/// Parse the authoritative `tenant_id` out of a successful
+/// `POST /coord/devices/register` response body (the serialized
+/// `DeviceStateRow`). Returns `None` when the body isn't JSON, has no
+/// `tenant_id`, or it isn't a valid UUID — all of which the caller
+/// treats as "nothing to heal this tick". Pure (no IO) so the heal's
+/// extraction is unit-testable without an HTTP mock.
+fn response_tenant_id(body: &str) -> Option<uuid::Uuid> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|j| j.get("tenant_id"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+}
+
 /// Dedupe the "tenant_id unresolvable" startup warning — the heartbeat
 /// ticks every 30s so logging on every miss would flood the journal.
 /// Fires exactly once per process lifetime; subsequent skips are silent
@@ -612,6 +627,21 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
             "fleet::heartbeat: ok device_id={device_id} hostname={} status={}",
             device.hostname, status
         );
+        // Soft-heal write-back. Coord's response carries the authoritative
+        // (possibly soft-healed) `tenant_id` for this device — if our cached
+        // value was a stale orphan, coord rescued the call using its stored
+        // tenant and returned THAT here. Persist it to paired_user.json so
+        // the next tick's `resolve_tenant_id` branch 1 sends the corrected
+        // value and the loop converges (coord stops soft-healing). The
+        // helper is idempotent (`pair::backfill_paired_tenant_id` no-ops
+        // when unchanged), so steady state is one write then silence.
+        // Best-effort: a parse/IO miss just retries the heal next tick.
+        let body = resp.text().await.unwrap_or_default();
+        if let Some(resp_tenant) = response_tenant_id(&body) {
+            if let Err(e) = qontinui_runner_lib::pair::backfill_paired_tenant_id(&resp_tenant) {
+                tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
+            }
+        }
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();
@@ -1362,6 +1392,40 @@ mod tests {
             body.get("claude_code_available").and_then(|v| v.as_bool()),
             Some(true),
             "claude_code_available must remain on the heartbeat wire (PR #216 shape)"
+        );
+    }
+
+    /// The soft-heal write-back depends on extracting the authoritative
+    /// `tenant_id` from coord's `DeviceStateRow` response. Verify the pure
+    /// parse: a real response shape yields the UUID; junk / missing /
+    /// non-UUID values yield `None` (caller treats as "nothing to heal").
+    #[test]
+    fn response_tenant_id_extracts_from_device_state_row() {
+        // Minimal DeviceStateRow-shaped body (coord serializes more fields,
+        // but the heal only reads tenant_id).
+        let body = r#"{
+            "device_id": "00000000-0000-0000-0000-000000000001",
+            "hostname": "spaceship",
+            "state": "healthy",
+            "last_seen_at": "2026-05-30T00:00:00Z",
+            "tenant_id": "c231d9da-1111-2222-3333-444455556666"
+        }"#;
+        assert_eq!(
+            response_tenant_id(body),
+            uuid::Uuid::parse_str("c231d9da-1111-2222-3333-444455556666").ok(),
+            "valid response tenant_id must parse"
+        );
+
+        assert_eq!(response_tenant_id("not json"), None, "non-JSON → None");
+        assert_eq!(
+            response_tenant_id(r#"{"hostname":"x"}"#),
+            None,
+            "missing tenant_id → None"
+        );
+        assert_eq!(
+            response_tenant_id(r#"{"tenant_id":"not-a-uuid"}"#),
+            None,
+            "non-UUID tenant_id → None"
         );
     }
 }
