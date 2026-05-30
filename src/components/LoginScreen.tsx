@@ -1,40 +1,49 @@
 /**
  * LoginScreen.tsx
  *
- * Beautiful login form for authenticating users
- * Matches qontinui-runner's dark gaming theme with neon accents
+ * Tier-2 sign-in gate. The web backend authenticates via Cognito only — there
+ * is no local email/password login anymore — so this screen drives the runner's
+ * Cognito Hosted-UI sign-in (RFC 8252 PKCE, system browser) via the
+ * `cognito_sign_in` Tauri command. On success the runner is promoted to Tier 2
+ * (server-side, inside the command) and emits `runner-tier-changed`, which
+ * AuthProvider observes to re-check auth and leave this screen.
+ *
+ * Matches qontinui-runner's dark gaming theme with neon accents.
  */
 
-import { useState, FormEvent } from "react";
-import { Lock, Mail, AlertCircle, Loader2 } from "lucide-react";
+import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { LogIn, AlertCircle, Loader2 } from "lucide-react";
 import { createLogger } from "@/lib/logger";
 
 const log = createLogger("LoginScreen");
 
-interface LoginScreenProps {
-  onLogin: (email: string, password: string) => Promise<void>;
-}
+/** Web backend the Cognito-bound device JWT is minted against. */
+const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
-export function LoginScreen({ onLogin }: LoginScreenProps) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+export function LoginScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const handleLogin = async (e: FormEvent) => {
-    e.preventDefault();
-    log.debug("handleLogin() called");
+  const handleSignIn = async () => {
+    log.debug("handleSignIn() called — starting Cognito PKCE sign-in");
     setLoading(true);
     setError("");
 
     try {
-      log.debug("Calling onLogin...");
-      await onLogin(email, password);
-      log.debug("Login completed successfully");
-      // AuthProvider.login() handles setting the auth state, no callback needed
+      await invoke<{
+        userId: string;
+        email: string | null;
+        tenantId: string | null;
+        deviceId: string;
+      }>("cognito_sign_in", { backendUrl: DEFAULT_BACKEND_URL });
+      log.debug("Cognito sign-in completed — runner promoted to Tier 2");
+      // The command already promoted the runner to Tier 2; nudge tier consumers
+      // (notably AuthProvider) so the gate re-evaluates without a poll cycle.
+      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
     } catch (err) {
-      log.error("Login failed:", err);
-      setError(err as string);
+      log.error("Cognito sign-in failed:", err);
+      setError(typeof err === "string" ? err : String(err));
     } finally {
       setLoading(false);
     }
@@ -54,85 +63,47 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
           </p>
         </div>
 
-        {/* Login Card */}
+        {/* Sign-in Card */}
         <div className="card p-8 space-y-6 glow-cyan">
-          <form onSubmit={handleLogin} className="space-y-5">
-            {/* Email Input */}
-            <div className="space-y-2">
-              <label htmlFor="email" className="block text-sm font-medium text-foreground">
-                Email Address
-              </label>
-              <div className="relative">
-                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
-                <input
-                  id="email"
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="w-full pl-11 pr-4 py-3 bg-input border border-border/50 rounded-lg
-                           text-foreground placeholder:text-muted-foreground
-                           focus:outline-hidden focus:ring-2 focus:ring-primary focus:border-transparent
-                           transition-all duration-200"
-                  placeholder="you@example.com"
-                  required
-                  disabled={loading}
-                />
-              </div>
-            </div>
+          <p className="text-sm text-muted-foreground text-center">
+            Sign in with your Qontinui account. A secure browser window opens to
+            complete authentication, then returns you here.
+          </p>
 
-            {/* Password Input */}
-            <div className="space-y-2">
-              <label htmlFor="password" className="block text-sm font-medium text-foreground">
-                Password
-              </label>
-              <div className="relative">
-                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
-                <input
-                  id="password"
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="w-full pl-11 pr-4 py-3 bg-input border border-border/50 rounded-lg
-                           text-foreground placeholder:text-muted-foreground
-                           focus:outline-hidden focus:ring-2 focus:ring-primary focus:border-transparent
-                           transition-all duration-200"
-                  placeholder="Enter your password"
-                  required
-                  disabled={loading}
-                />
-              </div>
-            </div>
-
-            {/* Error Message */}
-            {error && (
-              <div
-                id="login-error"
-                data-testid="login-error"
-                role="alert"
-                aria-live="assertive"
-                className="flex items-start gap-2 p-3 bg-destructive/10 border border-destructive/50 rounded-lg animate-slideDown"
-              >
-                <AlertCircle className="w-5 h-5 text-destructive shrink-0 mt-0.5" />
-                <p className="text-sm text-destructive">{error}</p>
-              </div>
-            )}
-
-            {/* Submit Button */}
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full btn-primary py-3 text-base font-semibold flex items-center justify-center gap-2"
+          {/* Error Message */}
+          {error && (
+            <div
+              id="login-error"
+              data-testid="login-error"
+              role="alert"
+              aria-live="assertive"
+              className="flex items-start gap-2 p-3 bg-destructive/10 border border-destructive/50 rounded-lg animate-slideDown"
             >
-              {loading ? (
-                <>
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                  <span>Signing in...</span>
-                </>
-              ) : (
-                <span>Sign In</span>
-              )}
-            </button>
-          </form>
+              <AlertCircle className="w-5 h-5 text-destructive shrink-0 mt-0.5" />
+              <p className="text-sm text-destructive">{error}</p>
+            </div>
+          )}
+
+          {/* Sign-in Button */}
+          <button
+            type="button"
+            onClick={handleSignIn}
+            disabled={loading}
+            data-testid="cognito-sign-in"
+            className="w-full btn-primary py-3 text-base font-semibold flex items-center justify-center gap-2"
+          >
+            {loading ? (
+              <>
+                <Loader2 className="w-5 h-5 animate-spin" />
+                <span>Opening browser…</span>
+              </>
+            ) : (
+              <>
+                <LogIn className="w-5 h-5" />
+                <span>Sign in with Qontinui</span>
+              </>
+            )}
+          </button>
 
           {/* Help Text */}
           <div className="text-center pt-4 border-t border-border/50">
@@ -153,7 +124,7 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
         {/* Footer */}
         <div className="text-center text-xs text-muted-foreground">
           <p>Qontinui Runner v0.1.0</p>
-          <p className="mt-1">Secure authentication via OS keychain</p>
+          <p className="mt-1">Secure authentication via Cognito + OS keychain</p>
         </div>
       </div>
     </div>

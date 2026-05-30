@@ -256,7 +256,15 @@ pub(crate) async fn try_refresh_once(
 /// refreshed) Cognito access token when a Cognito session exists, else `None`
 /// (the caller falls back to the legacy device-JWT-slot bearer for installs
 /// paired via local-login).
-async fn ensure_fresh_cognito_bearer(auth_manager: &crate::auth::AuthManager) -> Option<String> {
+///
+/// Exposed at `pub(crate)` so the web-backend-authenticated Tauri commands in
+/// `commands::auth` (`check_auth_status`, `get_user_projects`) reuse the exact
+/// same "refresh-first, then read" Cognito-bearer derivation the refresher uses
+/// before a device re-bind. Single source of truth for "what user bearer do we
+/// present to the web backend?".
+pub(crate) async fn ensure_fresh_cognito_bearer(
+    auth_manager: &crate::auth::AuthManager,
+) -> Option<String> {
     // No Cognito session → legacy/local-login install; let the caller use its
     // existing bearer source.
     let refresh_token = match auth_manager.get_oauth_refresh_token() {

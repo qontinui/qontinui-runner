@@ -44,13 +44,11 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
   const [flowError, setFlowError] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
 
-  // --- In-app (headless / UI-Bridge-drivable) credentials pairing ----------
-  const [credEmail, setCredEmail] = useState("");
-  const [credPassword, setCredPassword] = useState("");
-  const [credBackendUrl, setCredBackendUrl] = useState(DEFAULT_BACKEND_URL);
-  const [credState, setCredState] = useState<"idle" | "pairing">("idle");
-
   // --- Cognito Hosted-UI sign-in (RFC 8252 PKCE) ----------------------------
+  // Backend URL the Cognito-bound device JWT is minted against. The legacy
+  // email/password pairing was removed (web backend is Cognito-only); Cognito
+  // sign-in (and browser SSO) are the only sign-in paths.
+  const [credBackendUrl, setCredBackendUrl] = useState(DEFAULT_BACKEND_URL);
   const [cognitoState, setCognitoState] = useState<"idle" | "signing-in">("idle");
 
   const isTier2 = tier === "qontinui_account";
@@ -86,36 +84,6 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       onLog("error", `Sign-in failed to start: ${msg}`);
     }
   }, [onLog]);
-
-  const handleCredentialsPair = useCallback(async () => {
-    const email = credEmail.trim();
-    const password = credPassword;
-    const backendUrl = credBackendUrl.trim();
-    if (!email || !password || !backendUrl) {
-      setFlowError("Email, password, and backend URL are all required.");
-      return;
-    }
-    setCredState("pairing");
-    setFlowError(null);
-    try {
-      const result = await invoke<{ userId: string; tenantId: string; deviceId: string }>(
-        "pair_with_credentials",
-        { email, password, backendUrl },
-      );
-      setCredPassword("");
-      // The Rust command already promoted the runner to Tier 2; nudge the
-      // tier consumers so the panel flips to the signed-in view immediately.
-      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
-      await refreshTier();
-      onLog("success", `Paired with Qontinui account (user=${result.userId}) — Tier 2 active`);
-    } catch (err) {
-      const msg = typeof err === "string" ? err : String(err);
-      setFlowError(msg);
-      onLog("error", `Credentials pairing failed: ${msg}`);
-    } finally {
-      setCredState("idle");
-    }
-  }, [credEmail, credPassword, credBackendUrl, onLog, refreshTier]);
 
   const handleCognitoSignIn = useCallback(async () => {
     const backendUrl = credBackendUrl.trim();
@@ -226,14 +194,8 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
           onSignIn={handleSignIn}
           cognitoSigningIn={cognitoState === "signing-in"}
           onCognitoSignIn={handleCognitoSignIn}
-          credEmail={credEmail}
-          credPassword={credPassword}
           credBackendUrl={credBackendUrl}
-          credPairing={credState === "pairing"}
-          onCredEmailChange={setCredEmail}
-          onCredPasswordChange={setCredPassword}
           onCredBackendUrlChange={setCredBackendUrl}
-          onCredentialsPair={handleCredentialsPair}
         />
       )}
     </div>
@@ -300,14 +262,8 @@ interface SignedOutPanelProps {
   onSignIn: () => void;
   cognitoSigningIn: boolean;
   onCognitoSignIn: () => void;
-  credEmail: string;
-  credPassword: string;
   credBackendUrl: string;
-  credPairing: boolean;
-  onCredEmailChange: (v: string) => void;
-  onCredPasswordChange: (v: string) => void;
   onCredBackendUrlChange: (v: string) => void;
-  onCredentialsPair: () => void;
 }
 
 function SignedOutPanel({
@@ -315,65 +271,25 @@ function SignedOutPanel({
   onSignIn,
   cognitoSigningIn,
   onCognitoSignIn,
-  credEmail,
-  credPassword,
   credBackendUrl,
-  credPairing,
-  onCredEmailChange,
-  onCredPasswordChange,
   onCredBackendUrlChange,
-  onCredentialsPair,
 }: SignedOutPanelProps) {
   const inFlight = flowState === "opening" || flowState === "awaiting-browser";
-  const credDisabled =
-    credPairing ||
-    credEmail.trim().length === 0 ||
-    credPassword.length === 0 ||
-    credBackendUrl.trim().length === 0;
 
   const cognitoDisabled = cognitoSigningIn || credBackendUrl.trim().length === 0;
 
   return (
     <div className="space-y-5">
-      {/* Cognito Hosted-UI sign-in (RFC 8252 PKCE). The recommended path for
-          a human at the machine: opens the system browser, signs in with the
-          Qontinui (Cognito) account, and binds this device to that user. */}
+      {/* Cognito Hosted-UI sign-in (RFC 8252 PKCE). The web backend is
+          Cognito-only — this is the runner's primary sign-in: opens the system
+          browser, signs in with the Qontinui (Cognito) account, and binds this
+          device to that user. */}
       <div className="space-y-3 rounded-lg border border-primary/40 bg-card/50 p-4">
         <div>
           <div className="text-sm font-medium">Sign in with Qontinui</div>
           <div className="text-xs text-muted-foreground">
             Opens your browser to sign in with your Qontinui account, then binds this runner to
             you. Promotes the runner to Tier 2.
-          </div>
-        </div>
-        <button
-          type="button"
-          onClick={onCognitoSignIn}
-          disabled={cognitoDisabled}
-          className="inline-flex items-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-        >
-          {cognitoSigningIn ? (
-            <Loader2 className="w-4 h-4 animate-spin" />
-          ) : (
-            <LogIn className="w-4 h-4" />
-          )}
-          {cognitoSigningIn ? "Waiting for browser…" : "Sign in with Qontinui"}
-        </button>
-        {cognitoSigningIn && (
-          <p className="text-xs text-muted-foreground">
-            Complete the sign-in in your browser. This panel will update automatically when the
-            runner is bound.
-          </p>
-        )}
-      </div>
-
-      {/* In-app email/password pairing — headless, no browser, UI-Bridge
-          drivable. This is the primary path for automated / remote pairing. */}
-      <div className="space-y-3 rounded-lg border border-border bg-card/50 p-4">
-        <div>
-          <div className="text-sm font-medium">Sign in with email & password</div>
-          <div className="text-xs text-muted-foreground">
-            Pairs this runner directly — no browser needed. Promotes the runner to Tier 2.
           </div>
         </div>
 
@@ -393,52 +309,25 @@ function SignedOutPanel({
           />
         </div>
 
-        <div className="space-y-1.5">
-          <label htmlFor="account-cred-email" className="text-xs font-medium">
-            Email
-          </label>
-          <input
-            id="account-cred-email"
-            type="email"
-            autoComplete="off"
-            spellCheck={false}
-            value={credEmail}
-            onChange={(e) => onCredEmailChange(e.target.value)}
-            placeholder="you@example.com"
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
-          />
-        </div>
-
-        <div className="space-y-1.5">
-          <label htmlFor="account-cred-password" className="text-xs font-medium">
-            Password
-          </label>
-          <input
-            id="account-cred-password"
-            type="password"
-            autoComplete="new-password"
-            data-lpignore="true"
-            data-1p-ignore="true"
-            value={credPassword}
-            onChange={(e) => onCredPasswordChange(e.target.value)}
-            placeholder="••••••••"
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
-          />
-        </div>
-
         <button
           type="button"
-          onClick={onCredentialsPair}
-          disabled={credDisabled}
+          onClick={onCognitoSignIn}
+          disabled={cognitoDisabled}
           className="inline-flex items-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
-          {credPairing ? (
+          {cognitoSigningIn ? (
             <Loader2 className="w-4 h-4 animate-spin" />
           ) : (
             <LogIn className="w-4 h-4" />
           )}
-          {credPairing ? "Pairing…" : "Pair with credentials"}
+          {cognitoSigningIn ? "Waiting for browser…" : "Sign in with Qontinui"}
         </button>
+        {cognitoSigningIn && (
+          <p className="text-xs text-muted-foreground">
+            Complete the sign-in in your browser. This panel will update automatically when the
+            runner is bound.
+          </p>
+        )}
       </div>
 
       {/* Browser SSO fallback. */}

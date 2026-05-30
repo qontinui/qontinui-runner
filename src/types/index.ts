@@ -64,7 +64,7 @@ export {
 export type { ActionLogViewData, ActionLogEntry, CommandResponse } from "./displayProfile";
 
 // Authentication types
-export type { User, DeviceInfo, LoginResponse, AuthStatus, AuthContextValue } from "./auth";
+export type { User, DeviceInfo, AuthStatus, AuthContextValue } from "./auth";
 
 // Web extraction types
 export type {
