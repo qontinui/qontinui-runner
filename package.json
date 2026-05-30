@@ -92,6 +92,7 @@
   "name": "qontinui-runner",
   "packageManager": "pnpm@10.33.2",
   "private": true,
+  "license": "AGPL-3.0-or-later",
   "scripts": {
     "build": "tsc && vite build",
     "build-ir": "ui-bridge-build-ir --document-id=runner-root --document-name=\"Qontinui Runner\" --include=\"src/**/*.tsx\" --out=\"specs/pages/runner-root/state-machine.derived.json\"",
