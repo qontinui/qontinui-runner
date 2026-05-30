@@ -89,7 +89,12 @@ export function ResultCardMount() {
               )}
               {section.rows.map((row, ri) => (
                 <div key={ri} className="flex justify-between gap-3">
-                  <span className="text-[#a9b1d6] truncate">{row.label}</span>
+                  <span
+                    className={row.labelColor ? "truncate" : "text-[#a9b1d6] truncate"}
+                    style={row.labelColor ? { color: row.labelColor } : undefined}
+                  >
+                    {row.label}
+                  </span>
                   <span
                     className="font-mono text-right break-all"
                     style={row.valueColor ? { color: row.valueColor } : { color: "#c0caf5" }}

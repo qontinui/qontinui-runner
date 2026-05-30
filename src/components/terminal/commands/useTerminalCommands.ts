@@ -38,6 +38,8 @@ import { instanceStorage } from "@/lib/instance-storage";
 
 import { useTerminalSession, useTransitionEffects, useUIStateCx, useZoneMetadata } from "../contexts";
 import type { AccountUsageInfo } from "../useSessionManager";
+import type { ResultCardSpec } from "../result-card";
+import { buildMetricsCardSpec, buildHistoryCardSpec } from "../result-card";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { useCommandAction } from "./useCommandAction";
 
@@ -94,6 +96,12 @@ export interface TerminalCommandsContext {
    * `showDocFinder` state).
    */
   openDocFinder: () => void;
+  /**
+   * Pop a result card. Threaded in from `TerminalPageInner` (which holds
+   * the `ResultCardProvider`'s `showCard`). Used by `/metrics` and
+   * `/history` to present the ZoneStatusBar popover bodies as a card.
+   */
+  showCard: (spec: ResultCardSpec) => void;
 }
 
 /**
@@ -189,6 +197,9 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     closeTerminal,
     terminalRefs,
     sessionStates,
+    stateDurations,
+    lastOutputLines,
+    stateTimeAccum: stateTimeAccumRef,
     zoneLayout,
     workflowGen,
     findingsActions,
@@ -196,7 +207,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
   } = session;
   const transitionEffects = useTransitionEffects();
   const { dispatch: uiDispatch, toggleFocusMode } = useUIStateCx();
-  const { labelsAndTags } = useZoneMetadata();
+  const { labelsAndTags, metrics: metricsRef, eventHistory } = useZoneMetadata();
 
   /**
    * Helper that converts 1-based zone arg to 0-based, defaulting to
@@ -1001,6 +1012,55 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     patterns: [/^docs?$/i, /^doc-finder$/i],
     handler: async (): Promise<CommandResult> => {
       ctx.openDocFinder();
+      return ok();
+    },
+  });
+
+  // 34. /metrics — pop the session-metrics result card (same data the
+  // ZoneStatusBar chart-icon MetricsPopover shows).
+  useCommandAction({
+    id: "terminal.metrics",
+    slash: "/metrics",
+    aliases: ["/stats"],
+    label: "Show session metrics",
+    description:
+      "Show session metrics (approvals, rejections, broadcasts, state breakdown, " +
+      "time-in-state, top keywords). Same as the chart icon in ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^(?:metrics|stats)$/i],
+    handler: async (): Promise<CommandResult> => {
+      ctx.showCard(
+        buildMetricsCardSpec({
+          metrics: metricsRef.current,
+          sessionStates,
+          tabs,
+          autoApproveCount: transitionEffects.autoApproveCount ?? 0,
+          autoRestartCount: transitionEffects.autoRestartCount ?? 0,
+          stateTimeAccum: stateTimeAccumRef.current,
+          lastOutputLines,
+          assignments: zoneLayout.assignments,
+          zoneLabels: labelsAndTags.zoneLabels,
+          stateDurations,
+        }),
+      );
+      return ok();
+    },
+  });
+
+  // 35. /history — pop the event-history result card (same data the
+  // ZoneStatusBar clock-icon HistoryPopover shows).
+  useCommandAction({
+    id: "terminal.history",
+    slash: "/history",
+    aliases: ["/events"],
+    label: "Show event history",
+    description:
+      "Show recent event history (state transitions, etc.). " +
+      "Same as the clock icon in ZoneStatusBar.",
+    paramSchema: SCHEMA.empty,
+    patterns: [/^(?:history|events)$/i],
+    handler: async (): Promise<CommandResult> => {
+      ctx.showCard(buildHistoryCardSpec(eventHistory ?? []));
       return ok();
     },
   });
