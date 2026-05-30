@@ -26,7 +26,7 @@ import {
 
 export interface ResultCardSection {
   heading?: string;
-  rows: { label: string; value: string; valueColor?: string }[];
+  rows: { label: string; value: string; valueColor?: string; labelColor?: string }[];
 }
 
 export interface ResultCardSpec {

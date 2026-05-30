@@ -29,7 +29,7 @@ import { TerminalOverlays } from "./TerminalOverlays";
 import { CommandBar } from "./CommandBar";
 import { SuggestionsProvider } from "./suggestions";
 import { StatusStrip } from "./StatusStrip";
-import { ResultCardProvider, ResultCardMount } from "./result-card";
+import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { callRegistry, useTerminalCommands } from "./commands";
@@ -103,6 +103,10 @@ function TerminalPageInner({
     terminalRefs,
     pendingProfileSessionsRef,
   } = session;
+
+  // Result-card surface — the ResultCardProvider wraps TerminalPageInner
+  // (see line ~71). `/metrics` + `/history` slash actions pop a card here.
+  const { showCard } = useResultCard();
 
   // Register page-level UI Bridge actions so AI agents can discover
   // and invoke terminal operations without knowing element IDs.
@@ -663,6 +667,7 @@ function TerminalPageInner({
     sortZones: handleSortZones,
     exportAll: handleExportOutput,
     openDocFinder: () => setShowDocFinder(true),
+    showCard,
   });
 
   if (!initialized) {

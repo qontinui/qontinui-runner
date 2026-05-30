@@ -15,3 +15,5 @@ export type {
   ResultCardAction,
 } from "./ResultCardContext";
 export { ResultCardMount } from "./ResultCardMount";
+export { buildMetricsCardSpec, buildHistoryCardSpec } from "./builders";
+export type { BuildMetricsCardInput, HistoryCardEntry } from "./builders";
