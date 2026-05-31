@@ -187,6 +187,38 @@ pub async fn check_auth_status() -> Result<AuthStatus, String> {
     check_auth_status_impl().await.map_err(String::from)
 }
 
+/// `true` iff the runner holds a valid *local* signed-in session: a paired
+/// coord device-token JWT (the credential the WS relay presents) and/or a
+/// stored Cognito session. This is the authoritative "is the runner signed
+/// in?" signal — it is what a successful [`cognito_sign_in`] produces
+/// (`store_oauth_tokens` + `persist_pairing` → device JWT in the access_token
+/// slot) and what survives a process restart on disk.
+///
+/// Why this is the source of truth (and NOT a `/api/v1/auth/users/me`
+/// round-trip): the web backend's `users/me` endpoint can return 401/403 for a
+/// federated Cognito identity even though the runner is fully signed in and
+/// device-paired (the pair-cli bind returned 201 with the SAME access token).
+/// Gating "authenticated" on that call made a completed sign-in render the
+/// LoginScreen forever. The runner is signed in when it has local credentials,
+/// regardless of whether `users/me` happens to accept the Cognito access token.
+fn has_local_signed_in_session(auth_manager: &AuthManager) -> bool {
+    // A paired device has a (non-expired) coord device-token JWT in the
+    // access_token slot — written by `persist_pairing` after a successful
+    // pair-cli bind. `device_jwt_needs_refresh() == Ok(false)` means a real,
+    // unexpired JWT is present.
+    let has_valid_device_jwt = matches!(auth_manager.device_jwt_needs_refresh(), Ok(false));
+
+    // A stored Cognito session (refresh token present) also means the user
+    // signed in — even if the device JWT is momentarily stale and awaiting the
+    // refresher's next pair cycle.
+    let has_cognito_session = auth_manager
+        .get_oauth_refresh_token()
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false);
+
+    has_valid_device_jwt || has_cognito_session
+}
+
 async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     info!("Checking authentication status");
 
@@ -202,94 +234,72 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     }
 
     let auth_manager = AuthManager::new();
-
-    // Resolve the Cognito user bearer (refresh-first). Absence of a Cognito
-    // session means the runner hasn't signed in — the web backend is
-    // Cognito-only, so there is no other credential to validate.
-    let access_token = match web_backend_user_bearer(&auth_manager).await {
-        Ok(t) => t,
-        Err(_) => {
-            info!("No Cognito session — user not authenticated");
-            return Ok(AuthStatus {
-                authenticated: false,
-                user: None,
-                device_id: None,
-            });
-        }
-    };
-
-    // Validate token by calling /users/me endpoint — reqwest::Error From impl
-    // wraps build failures into AppError::NetworkError, but we keep the
-    // historical wire string via AppError::Raw to preserve frontend parsing.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| AppError::Raw(format!("Failed to create HTTP client: {}", e)))?;
-    let response = match client
-        .get(format!("{}/api/v1/auth/users/me", get_api_base_url()))
-        .bearer_auth(&access_token)
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            // Backend unreachable — tokens exist, assume authenticated.
-            // The runner should work offline; token validity will be checked
-            // when the backend becomes available again.
-            warn!(
-                "Backend unreachable during auth check ({}), assuming authenticated with stored tokens",
-                e
-            );
-            let device_id = auth_manager.get_device_id().ok();
-            return Ok(AuthStatus {
-                authenticated: true,
-                user: None,
-                device_id,
-            });
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        warn!("Token validation failed: {}", status);
-
-        // On a definitive auth failure (401/403) the Cognito access token is
-        // invalid/expired — report unauthenticated so the frontend prompts a
-        // re-sign-in. We deliberately do NOT clear any token slot here: the
-        // coord device-JWT (access_token slot, used by the WS relay) is a
-        // SEPARATE credential and must survive a Cognito-token expiry. The
-        // Cognito tokens are refreshed by the device-JWT refresher's
-        // `ensure_fresh_cognito_bearer` path on the next cycle.
-        // For transient errors (5xx, timeouts, etc.), return Err so the
-        // frontend catch block fires without changing auth state.
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Ok(AuthStatus {
-                authenticated: false,
-                user: None,
-                device_id: None,
-            });
-        } else {
-            return Err(AppError::Raw(format!(
-                "Auth status check failed with transient error: {}",
-                status
-            )));
-        }
-    }
-
-    let user_info: ApiUserInfo = response.json().await?;
-
     let device_id = auth_manager.get_device_id().ok();
 
-    info!("User authenticated: {}", user_info.id);
+    // Authoritative signal: does the runner hold a valid local signed-in
+    // session? This is true immediately after a successful `cognito_sign_in`
+    // (device paired + Cognito tokens stored) AND on a fresh boot that restored
+    // those credentials from disk. If there's no local session, the runner has
+    // genuinely never signed in (or was logged out) — report unauthenticated so
+    // the frontend shows LoginScreen.
+    if !has_local_signed_in_session(&auth_manager) {
+        info!("No local signed-in session — user not authenticated");
+        return Ok(AuthStatus {
+            authenticated: false,
+            user: None,
+            device_id: None,
+        });
+    }
+
+    // We ARE signed in. Best-effort: enrich the status with the user's
+    // profile via `/api/v1/auth/users/me`. A failure here (network error, or
+    // even a 401/403 — the federated-identity `users/me` gap) does NOT
+    // downgrade `authenticated`: a valid local device pairing is proof the
+    // runner is signed in. We only use the response to populate `user`.
+    let user = match web_backend_user_bearer(&auth_manager).await {
+        Ok(access_token) => fetch_user_info(&access_token).await,
+        Err(_) => None,
+    };
+
+    info!(
+        "Runner authenticated via local session (user enrichment: {})",
+        if user.is_some() { "ok" } else { "unavailable" }
+    );
 
     Ok(AuthStatus {
         authenticated: true,
-        user: Some(UserInfo {
-            id: user_info.id,
-            email: user_info.email,
-            name: user_info.full_name,
-        }),
+        user,
         device_id,
+    })
+}
+
+/// Best-effort fetch of the signed-in user's profile from the web backend.
+/// Returns `None` on any failure (network error, 4xx/5xx, malformed body) —
+/// callers treat a missing profile as "authenticated but unenriched", never as
+/// a sign-out signal.
+async fn fetch_user_info(access_token: &str) -> Option<UserInfo> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("{}/api/v1/auth/users/me", get_api_base_url()))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        warn!(
+            "users/me returned {} — keeping local-session authentication, skipping user enrichment",
+            response.status()
+        );
+        return None;
+    }
+    let user_info: ApiUserInfo = response.json().await.ok()?;
+    Some(UserInfo {
+        id: user_info.id,
+        email: user_info.email,
+        name: user_info.full_name,
     })
 }
 
