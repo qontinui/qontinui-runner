@@ -21,9 +21,20 @@ const log = createLogger("LoginScreen");
 /** Web backend the Cognito-bound device JWT is minted against. */
 const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
+type CognitoSignInResponse = {
+  userId: string;
+  email: string | null;
+  tenantId: string | null;
+  deviceId: string;
+};
+
 export function LoginScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  // Inline email/password (direct Cognito InitiateAuth — no browser).
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [pwLoading, setPwLoading] = useState(false);
 
   const handleSignIn = async () => {
     log.debug("handleSignIn() called — starting Cognito PKCE sign-in");
@@ -31,12 +42,9 @@ export function LoginScreen() {
     setError("");
 
     try {
-      await invoke<{
-        userId: string;
-        email: string | null;
-        tenantId: string | null;
-        deviceId: string;
-      }>("cognito_sign_in", { backendUrl: DEFAULT_BACKEND_URL });
+      await invoke<CognitoSignInResponse>("cognito_sign_in", {
+        backendUrl: DEFAULT_BACKEND_URL,
+      });
       log.debug("Cognito sign-in completed — runner promoted to Tier 2");
       // The command already promoted the runner to Tier 2; nudge tier consumers
       // (notably AuthProvider) so the gate re-evaluates without a poll cycle.
@@ -46,6 +54,29 @@ export function LoginScreen() {
       setError(typeof err === "string" ? err : String(err));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handlePasswordSignIn = async () => {
+    log.debug("handlePasswordSignIn() called — direct Cognito USER_PASSWORD_AUTH");
+    setPwLoading(true);
+    setError("");
+
+    try {
+      await invoke<CognitoSignInResponse>("cognito_sign_in_password", {
+        email,
+        password,
+        backendUrl: DEFAULT_BACKEND_URL,
+      });
+      log.debug("Password sign-in completed — runner promoted to Tier 2");
+      // Same as the hosted-UI path: the command already promoted to Tier 2,
+      // nudge tier consumers so the gate re-evaluates immediately.
+      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+    } catch (err) {
+      log.error("Password sign-in failed:", err);
+      setError(typeof err === "string" ? err : String(err));
+    } finally {
+      setPwLoading(false);
     }
   };
 
@@ -88,7 +119,7 @@ export function LoginScreen() {
           <button
             type="button"
             onClick={handleSignIn}
-            disabled={loading}
+            disabled={loading || pwLoading}
             data-testid="cognito-sign-in"
             className="w-full btn-primary py-3 text-base font-semibold flex items-center justify-center gap-2"
           >
@@ -104,6 +135,82 @@ export function LoginScreen() {
               </>
             )}
           </button>
+
+          {/* Divider: "or sign in with email" */}
+          <div className="flex items-center gap-3" aria-hidden="true">
+            <span className="flex-1 h-px bg-border/50" />
+            <span className="text-xs uppercase tracking-wide text-muted-foreground">
+              or sign in with email
+            </span>
+            <span className="flex-1 h-px bg-border/50" />
+          </div>
+
+          {/* Inline credential sign-in (direct Cognito, no browser) */}
+          <form
+            className="space-y-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!pwLoading && !loading) void handlePasswordSignIn();
+            }}
+          >
+            <div className="space-y-1">
+              <label
+                htmlFor="email"
+                className="block text-sm font-medium text-foreground"
+              >
+                Email
+              </label>
+              <input
+                id="email"
+                name="email"
+                type="email"
+                autoComplete="username"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={pwLoading}
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border/60 text-foreground focus:outline-none focus:border-primary"
+                placeholder="you@example.com"
+              />
+            </div>
+            <div className="space-y-1">
+              <label
+                htmlFor="password"
+                className="block text-sm font-medium text-foreground"
+              >
+                Password
+              </label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={pwLoading}
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border/60 text-foreground focus:outline-none focus:border-primary"
+                placeholder="••••••••"
+              />
+            </div>
+            <button
+              id="button-sign-in-password"
+              type="submit"
+              disabled={pwLoading || loading}
+              data-testid="cognito-sign-in-password"
+              className="w-full btn-secondary py-3 text-base font-semibold flex items-center justify-center gap-2"
+            >
+              {pwLoading ? (
+                <>
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  <span>Signing in…</span>
+                </>
+              ) : (
+                <>
+                  <LogIn className="w-5 h-5" />
+                  <span>Sign In</span>
+                </>
+              )}
+            </button>
+          </form>
 
           {/* Help Text */}
           <div className="text-center pt-4 border-t border-border/50">

@@ -576,11 +576,6 @@ pub async fn cognito_sign_in(backend_url: String) -> Result<CognitoSignInRespons
 }
 
 async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInResponse, AppError> {
-    use qontinui_runner_lib::pair::{
-        pair_with_auth_token_with_ids, persist_pairing, read_device_id_from_disk,
-        tenant_id_from_oauth_claim,
-    };
-
     let base = backend_url.trim().trim_end_matches('/').to_string();
     if base.is_empty() {
         return Err(AppError::Raw("backend_url is required".to_string()));
@@ -607,6 +602,35 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
         login.sub
     );
 
+    // Run the shared post-auth chain (store tokens → pair → persist → promote).
+    finalize_signed_in(login, base).await
+}
+
+/// Shared post-authentication chain used by BOTH the Hosted-UI PKCE sign-in
+/// ([`cognito_sign_in`]) and the direct credential sign-in
+/// ([`cognito_sign_in_password`]). Given a freshly obtained
+/// [`CognitoLoginResult`] (from either flow), this:
+///
+///   2. Persists the Cognito user tokens in the distinct oauth slots.
+///   3. Reads the device identity from disk.
+///   4. Binds device→user via the existing web-backend `pair-cli` flow,
+///      presenting the Cognito access token + `sub`.
+///   5. Persists the minted coord device JWT + paired-user file.
+///   6. Promotes the runner to Tier 2, stages the backend URL, and kicks the
+///      cloud relay + device-JWT refresher.
+///
+/// Factored out so the two sign-in entry points cannot diverge. The
+/// `runner-tier-changed` window event is dispatched by the FRONTEND on success
+/// (both call sites do this) — identical to the prior single-callsite behavior.
+async fn finalize_signed_in(
+    login: qontinui_runner_lib::cognito::CognitoLoginResult,
+    base: String,
+) -> Result<CognitoSignInResponse, AppError> {
+    use qontinui_runner_lib::pair::{
+        pair_with_auth_token_with_ids, persist_pairing, read_device_id_from_disk,
+        tenant_id_from_oauth_claim,
+    };
+
     // 2. Persist the Cognito user tokens in the distinct oauth slots.
     let auth_manager = AuthManager::new();
     auth_manager
@@ -617,13 +641,13 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
             login.expires_at,
         )
         .map_err(|e| {
-            error!("cognito_sign_in: step 2 (store_oauth_tokens) failed: {e}");
+            error!("finalize_signed_in: step 2 (store_oauth_tokens) failed: {e}");
             AppError::Raw(format!("persist Cognito tokens: {e}"))
         })?;
 
     // 3. Device identity from disk.
     let device_id = read_device_id_from_disk().map_err(|e| {
-        error!("cognito_sign_in: step 3 (read_device_id_from_disk) failed: {e}");
+        error!("finalize_signed_in: step 3 (read_device_id_from_disk) failed: {e}");
         AppError::Raw(format!("could not read device identity: {e}"))
     })?;
 
@@ -647,11 +671,11 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
     })
     .await
     .map_err(|e| {
-        error!("cognito_sign_in: device-pair task panicked: {e}");
+        error!("finalize_signed_in: device-pair task panicked: {e}");
         AppError::Raw(format!("device-pair task panicked: {e}"))
     })?
     .map_err(|e| {
-        error!("cognito_sign_in: step 4 (pair_with_auth_token_with_ids) failed: {e}");
+        error!("finalize_signed_in: step 4 (pair_with_auth_token_with_ids) failed: {e}");
         AppError::Raw(e)
     })?;
 
@@ -663,7 +687,7 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
 
     // 5. Persist the device JWT + paired-user file.
     persist_pairing(&pair_resp, tenant_id).map_err(|e| {
-        error!("cognito_sign_in: step 5 (persist_pairing) failed AFTER a successful pair: {e}");
+        error!("finalize_signed_in: step 5 (persist_pairing) failed AFTER a successful pair: {e}");
         AppError::Raw(format!("persist pairing: {e}"))
     })?;
 
@@ -684,10 +708,10 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
         s.tier = settings::RunnerTier::QontinuiAccount;
         s.tier_initialized = true;
         if crate::instance::is_secondary() {
-            warn!("cognito_sign_in: secondary runner — applying in-memory only, skipping save_settings");
+            warn!("finalize_signed_in: secondary runner — applying in-memory only, skipping save_settings");
         } else {
             settings::save_settings(&s).map_err(|e| {
-                error!("cognito_sign_in: step 6 (save_settings tier promotion) failed AFTER a successful pair: {e}");
+                error!("finalize_signed_in: step 6 (save_settings tier promotion) failed AFTER a successful pair: {e}");
                 AppError::Raw(format!("persist tier promotion: {e}"))
             })?;
         }
@@ -699,7 +723,7 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
 
     let resp_device_id = pair_resp.device_id.clone().unwrap_or(device_id);
     info!(
-        "cognito_sign_in: signed in + device bound (sub={}, device={resp_device_id}) — Tier 2 active",
+        "finalize_signed_in: signed in + device bound (sub={}, device={resp_device_id}) — Tier 2 active",
         login.sub
     );
 
@@ -709,6 +733,80 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
         tenant_id: tenant_id_str,
         device_id: resp_device_id,
     })
+}
+
+/// Sign in to the runner with an email + password **directly** via Cognito
+/// `InitiateAuth` USER_PASSWORD_AUTH — **no system browser**. This is the
+/// fully-headless / UI-Bridge-driveable counterpart to [`cognito_sign_in`]
+/// (Hosted-UI PKCE): the operator can complete the entire sign-in through the
+/// runner's own UI without a browser hop.
+///
+/// Additive — the Hosted-UI "Sign in with Qontinui" button
+/// ([`cognito_sign_in`]) is unchanged. Both flows converge on the SAME
+/// post-auth chain ([`finalize_signed_in`]): store Cognito tokens → bind the
+/// coord device JWT via `pair-cli` → persist → promote to Tier 2 → kick the
+/// relay/refresher. On a Cognito error (bad credentials, unconfirmed user,
+/// etc.) a clean `Err(message)` is returned.
+///
+/// The password is NEVER logged. Requires the runner Cognito app-client to
+/// have `ALLOW_USER_PASSWORD_AUTH` enabled.
+///
+/// `backend_url` is the web-backend base (e.g. `https://api.qontinui.io`),
+/// explicit + required — symmetric with [`cognito_sign_in`].
+#[tauri::command]
+pub async fn cognito_sign_in_password(
+    email: String,
+    password: String,
+    backend_url: String,
+) -> Result<CognitoSignInResponse, String> {
+    cognito_sign_in_password_impl(email, password, backend_url)
+        .await
+        .map_err(String::from)
+}
+
+async fn cognito_sign_in_password_impl(
+    email: String,
+    password: String,
+    backend_url: String,
+) -> Result<CognitoSignInResponse, AppError> {
+    let base = backend_url.trim().trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return Err(AppError::Raw("backend_url is required".to_string()));
+    }
+    let email = email.trim().to_string();
+    if email.is_empty() {
+        return Err(AppError::Raw("email is required".to_string()));
+    }
+    if password.is_empty() {
+        return Err(AppError::Raw("password is required".to_string()));
+    }
+
+    // NOTE: never log `password`.
+    info!("cognito_sign_in_password: starting InitiateAuth USER_PASSWORD_AUTH");
+
+    // Blocking reqwest call — run on a worker thread off the tokio runtime.
+    // `password` is moved into the closure and dropped there; it is never logged.
+    let login = tokio::task::spawn_blocking(move || {
+        qontinui_runner_lib::cognito::password_login(&email, &password)
+    })
+    .await
+    .map_err(|e| {
+        error!("cognito_sign_in_password: login task panicked: {e}");
+        AppError::Raw(format!("password login task panicked: {e}"))
+    })?
+    .map_err(|e| {
+        // `e` is already a humanized Cognito message (no secrets).
+        error!("cognito_sign_in_password: InitiateAuth failed: {e}");
+        AppError::Raw(e)
+    })?;
+
+    info!(
+        "cognito_sign_in_password: InitiateAuth succeeded (sub={}) — binding device",
+        login.sub
+    );
+
+    // Shared post-auth chain — identical to the Hosted-UI path.
+    finalize_signed_in(login, base).await
 }
 
 /// Clears the runner token, drops the runner back to Tier 0/1, and kicks
@@ -800,6 +898,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             set_runner_tier,
             start_qontinui_sign_in,
             cognito_sign_in,
+            cognito_sign_in_password,
             qontinui_sign_out,
             device_jwt_present,
             kick_device_jwt_refresher_cmd,

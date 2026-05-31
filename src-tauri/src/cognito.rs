@@ -48,6 +48,10 @@ pub const COGNITO_CALLBACK_PORT: u16 = 53682;
 pub const COGNITO_REDIRECT_URI: &str = "http://localhost:53682/auth/callback";
 /// OAuth scopes requested.
 pub const COGNITO_SCOPE: &str = "openid email profile";
+/// Region-scoped Cognito IDP endpoint used for the direct `InitiateAuth`
+/// (USER_PASSWORD_AUTH) flow — the no-browser, credential-driven sign-in.
+/// Distinct from the Hosted-UI token endpoint (`COGNITO_TOKEN_URL`).
+pub const COGNITO_IDP_URL: &str = "https://cognito-idp.us-east-1.amazonaws.com/";
 
 // ============================================================================
 // Wire types.
@@ -403,6 +407,170 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
     })
 }
 
+// ============================================================================
+// Direct credential login (`InitiateAuth` USER_PASSWORD_AUTH) — no browser.
+// ============================================================================
+
+/// `AuthenticationResult` block from a Cognito `InitiateAuth` /
+/// `RespondToAuthChallenge` success response. Field names are Cognito's
+/// PascalCase (the IDP JSON protocol), distinct from the Hosted-UI
+/// `/oauth2/token` snake_case shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CognitoAuthenticationResult {
+    pub access_token: String,
+    pub id_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    pub expires_in: i64,
+}
+
+/// Top-level `InitiateAuth` success envelope.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InitiateAuthResponse {
+    #[serde(default)]
+    authentication_result: Option<CognitoAuthenticationResult>,
+}
+
+/// Sign in directly with email + password via Cognito `InitiateAuth`
+/// USER_PASSWORD_AUTH — no system browser, no loopback redirect. Yields the
+/// same `CognitoLoginResult` bundle as [`pkce_login`] so the post-auth chain is
+/// identical.
+///
+/// The password is NEVER logged. On a Cognito error (e.g.
+/// `NotAuthorizedException`, `UserNotConfirmedException`,
+/// `PasswordResetRequiredException`) a clean human-readable `Err(message)` is
+/// returned. Blocking; call via `tokio::task::spawn_blocking`.
+///
+/// Requires the runner client (`COGNITO_CLIENT_ID`) to have
+/// `ALLOW_USER_PASSWORD_AUTH` enabled in its Cognito app-client config.
+pub fn password_login(email: &str, password: &str) -> Result<CognitoLoginResult, String> {
+    let result = initiate_auth_user_password(email, password)?;
+
+    let expires_at = chrono::Utc::now().timestamp() + result.expires_in;
+    let refresh_token = result.refresh_token.ok_or_else(|| {
+        "Cognito InitiateAuth response omitted RefreshToken — the runner client must be \
+         configured to issue refresh tokens"
+            .to_string()
+    })?;
+    let sub = jwt_claim(&result.id_token, "sub")
+        .ok_or_else(|| "id token has no `sub` claim — cannot identify the user".to_string())?;
+    let claim_email = jwt_claim(&result.id_token, "email");
+
+    Ok(CognitoLoginResult {
+        access_token: result.access_token,
+        id_token: result.id_token,
+        refresh_token,
+        expires_at,
+        sub,
+        email: claim_email,
+    })
+}
+
+/// POST the raw `InitiateAuth` USER_PASSWORD_AUTH request to the region IDP
+/// endpoint and surface Cognito error codes as clean messages. Blocking.
+fn initiate_auth_user_password(
+    email: &str,
+    password: &str,
+) -> Result<CognitoAuthenticationResult, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest client build failed: {e}"))?;
+
+    let body = serde_json::json!({
+        "AuthFlow": "USER_PASSWORD_AUTH",
+        "ClientId": COGNITO_CLIENT_ID,
+        "AuthParameters": {
+            "USERNAME": email,
+            "PASSWORD": password,
+        }
+    });
+
+    let resp = client
+        .post(COGNITO_IDP_URL)
+        .header("X-Amz-Target", "AWSCognitoIdentityProviderService.InitiateAuth")
+        .header("Content-Type", "application/x-amz-json-1.1")
+        .body(serde_json::to_vec(&body).map_err(|e| format!("serialize InitiateAuth: {e}"))?)
+        .send()
+        .map_err(|e| format!("POST InitiateAuth failed: {e}"))?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .map_err(|e| format!("read InitiateAuth response: {e}"))?;
+
+    if !status.is_success() {
+        return Err(humanize_cognito_error(&text, status.as_u16()));
+    }
+
+    let parsed: InitiateAuthResponse = serde_json::from_str(&text)
+        .map_err(|e| format!("decode InitiateAuth response failed: {e}"))?;
+
+    parsed.authentication_result.ok_or_else(|| {
+        // A 200 without AuthenticationResult means Cognito returned a challenge
+        // (e.g. NEW_PASSWORD_REQUIRED / MFA) which this direct flow can't drive.
+        "Cognito requires an additional sign-in step (a challenge such as a new password \
+         or MFA) that this credential sign-in cannot complete. Use the browser sign-in instead."
+            .to_string()
+    })
+}
+
+/// Turn a Cognito IDP JSON error body into a clean user-facing message. The
+/// IDP returns `{"__type":"NotAuthorizedException","message":"..."}`.
+fn humanize_cognito_error(body: &str, http_status: u16) -> String {
+    let json: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return format!(
+                "Cognito sign-in failed (HTTP {http_status}): {}",
+                body.chars().take(200).collect::<String>()
+            )
+        }
+    };
+    // `__type` is like "NotAuthorizedException" or
+    // "com.amazon.coral...#NotAuthorizedException".
+    let code = json
+        .get("__type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.rsplit('#').next().unwrap_or(s))
+        .unwrap_or("UnknownError");
+    let msg = json
+        .get("message")
+        .or_else(|| json.get("Message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match code {
+        "NotAuthorizedException" => "Incorrect email or password.".to_string(),
+        "UserNotFoundException" => "No account found for that email.".to_string(),
+        "UserNotConfirmedException" => {
+            "Your account is not confirmed yet. Check your email for a verification link."
+                .to_string()
+        }
+        "PasswordResetRequiredException" => {
+            "A password reset is required. Reset your password, then sign in again.".to_string()
+        }
+        "InvalidParameterException" => {
+            if msg.is_empty() {
+                "Invalid sign-in parameters.".to_string()
+            } else {
+                format!("Invalid sign-in: {msg}")
+            }
+        }
+        "TooManyRequestsException" | "LimitExceededException" => {
+            "Too many sign-in attempts. Wait a moment and try again.".to_string()
+        }
+        other => {
+            if msg.is_empty() {
+                format!("Cognito sign-in failed ({other}).")
+            } else {
+                format!("Cognito sign-in failed ({other}): {msg}")
+            }
+        }
+    }
+}
+
 /// POST the authorization_code grant to `/oauth2/token`. Blocking.
 fn exchange_code(code: &str, code_verifier: &str) -> Result<CognitoTokenResponse, String> {
     let form = [
@@ -534,5 +702,53 @@ mod tests {
         )
         .unwrap();
         assert!(without.refresh_token.is_none());
+    }
+
+    #[test]
+    fn initiate_auth_response_decodes_pascalcase() {
+        let resp: InitiateAuthResponse = serde_json::from_str(
+            r#"{"AuthenticationResult":{"AccessToken":"at","IdToken":"it","RefreshToken":"rt","ExpiresIn":3600,"TokenType":"Bearer"}}"#,
+        )
+        .unwrap();
+        let ar = resp.authentication_result.expect("has result");
+        assert_eq!(ar.access_token, "at");
+        assert_eq!(ar.id_token, "it");
+        assert_eq!(ar.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(ar.expires_in, 3600);
+    }
+
+    #[test]
+    fn initiate_auth_response_handles_challenge_without_result() {
+        // A challenge (e.g. NEW_PASSWORD_REQUIRED) carries no AuthenticationResult.
+        let resp: InitiateAuthResponse = serde_json::from_str(
+            r#"{"ChallengeName":"NEW_PASSWORD_REQUIRED","Session":"abc"}"#,
+        )
+        .unwrap();
+        assert!(resp.authentication_result.is_none());
+    }
+
+    #[test]
+    fn humanize_cognito_error_maps_known_codes() {
+        assert_eq!(
+            humanize_cognito_error(r#"{"__type":"NotAuthorizedException","message":"x"}"#, 400),
+            "Incorrect email or password."
+        );
+        // Namespaced __type still resolves to the bare code.
+        assert_eq!(
+            humanize_cognito_error(
+                r#"{"__type":"com.amazon.coral.service#UserNotFoundException","message":"x"}"#,
+                400
+            ),
+            "No account found for that email."
+        );
+        assert!(
+            humanize_cognito_error(r#"{"__type":"UserNotConfirmedException"}"#, 400)
+                .contains("not confirmed")
+        );
+        // Unknown code falls back to a generic message including the code.
+        assert!(humanize_cognito_error(r#"{"__type":"SomethingElse"}"#, 400)
+            .contains("SomethingElse"));
+        // Non-JSON body doesn't panic.
+        assert!(humanize_cognito_error("not json", 500).contains("500"));
     }
 }
