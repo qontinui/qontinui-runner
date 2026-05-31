@@ -490,7 +490,10 @@ fn initiate_auth_user_password(
 
     let resp = client
         .post(COGNITO_IDP_URL)
-        .header("X-Amz-Target", "AWSCognitoIdentityProviderService.InitiateAuth")
+        .header(
+            "X-Amz-Target",
+            "AWSCognitoIdentityProviderService.InitiateAuth",
+        )
         .header("Content-Type", "application/x-amz-json-1.1")
         .body(serde_json::to_vec(&body).map_err(|e| format!("serialize InitiateAuth: {e}"))?)
         .send()
@@ -720,10 +723,9 @@ mod tests {
     #[test]
     fn initiate_auth_response_handles_challenge_without_result() {
         // A challenge (e.g. NEW_PASSWORD_REQUIRED) carries no AuthenticationResult.
-        let resp: InitiateAuthResponse = serde_json::from_str(
-            r#"{"ChallengeName":"NEW_PASSWORD_REQUIRED","Session":"abc"}"#,
-        )
-        .unwrap();
+        let resp: InitiateAuthResponse =
+            serde_json::from_str(r#"{"ChallengeName":"NEW_PASSWORD_REQUIRED","Session":"abc"}"#)
+                .unwrap();
         assert!(resp.authentication_result.is_none());
     }
 
@@ -746,8 +748,9 @@ mod tests {
                 .contains("not confirmed")
         );
         // Unknown code falls back to a generic message including the code.
-        assert!(humanize_cognito_error(r#"{"__type":"SomethingElse"}"#, 400)
-            .contains("SomethingElse"));
+        assert!(
+            humanize_cognito_error(r#"{"__type":"SomethingElse"}"#, 400).contains("SomethingElse")
+        );
         // Non-JSON body doesn't panic.
         assert!(humanize_cognito_error("not json", 500).contains("500"));
     }
