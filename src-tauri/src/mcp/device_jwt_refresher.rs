@@ -83,25 +83,31 @@ pub(crate) enum Decision {
     /// Tier is not `QontinuiAccount` — refresher has nothing to do.
     /// Wait for a tier-change kick before re-checking.
     IdleWrongTier,
-    /// JWT needs refresh but no `runner_token` is available to present
-    /// to coord. Wait for a settings-change kick before re-checking.
-    IdleNoToken,
-    /// JWT needs refresh and a bearer token is available — call
-    /// `pair_with_auth_token`.
+    /// JWT needs refresh — resolve a bearer in the `Pair` arm (Cognito
+    /// access token, falling back to the device-JWT slot) and re-mint.
+    /// The arm self-idles (with periodic re-check) if no bearer exists yet,
+    /// so we no longer gate this decision on a `runner_token` being present
+    /// (Cognito- and pair-code-paired runners have an empty `runner_token`
+    /// but a valid Cognito/device bearer — gating on `runner_token` here
+    /// stranded them and let their device JWT expire).
     Pair,
 }
 
-/// Pure decision predicate: given the current tier + bearer token +
-/// "does the JWT need refresh?" answer, what should the loop do?
-pub(crate) fn next_action(tier: RunnerTier, runner_token: &str, needs_refresh: bool) -> Decision {
+/// Pure decision predicate: given the current tier + "does the JWT need
+/// refresh?" answer, what should the loop do?
+///
+/// Deliberately does NOT consult `web_integration.runner_token`. Post-Cognito
+/// unification the bearer is the Cognito access token (or the device-JWT slot)
+/// — neither populates `runner_token`, so gating on it here left every
+/// Cognito-/pair-code-paired runner in a permanent "idle, no token" state and
+/// let its device JWT silently expire. The `Pair` arm resolves the real bearer
+/// and idles gracefully (with periodic re-check) when none is available yet.
+pub(crate) fn next_action(tier: RunnerTier, needs_refresh: bool) -> Decision {
     if tier != RunnerTier::QontinuiAccount {
         return Decision::IdleWrongTier;
     }
     if !needs_refresh {
         return Decision::Idle;
-    }
-    if runner_token.trim().is_empty() {
-        return Decision::IdleNoToken;
     }
     Decision::Pair
 }
@@ -340,11 +346,7 @@ async fn refresher_loop(
             }
         };
 
-        let decision = next_action(
-            settings_snapshot.tier,
-            settings_snapshot.web_integration.runner_token.trim(),
-            needs_refresh,
-        );
+        let decision = next_action(settings_snapshot.tier, needs_refresh);
 
         match decision {
             Decision::IdleWrongTier => {
@@ -353,23 +355,6 @@ async fn refresher_loop(
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         info!("Device-JWT refresher shutting down (was idle on non-Tier2)");
-                        return;
-                    }
-                    _ = kick_rx.changed() => continue,
-                }
-            }
-            Decision::IdleNoToken => {
-                // Need to refresh but have no bearer to present. This is
-                // the "first-pair" state — the user must complete a
-                // browser pair before we can refresh. Block on
-                // shutdown/kick to avoid a hot-loop.
-                tracing::debug!(
-                    "device_jwt_refresher: needs refresh but runner_token is empty — \
-                     awaiting first browser-pair (kick on settings save)"
-                );
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        info!("Device-JWT refresher shutting down (was idle on no-token)");
                         return;
                     }
                     _ = kick_rx.changed() => continue,
@@ -450,12 +435,13 @@ async fn refresher_loop(
                 let user_id = match qontinui_runner_lib::pair::read_paired_user_id_from_disk() {
                     Some(u) => u,
                     None => {
-                        // Should not happen — `Decision::IdleNoToken`
-                        // arm already gates on runner_token presence,
-                        // and a paired install always has both. Log + back off.
+                        // No paired-user record yet — this runner hasn't
+                        // completed a pairing (Cognito sign-in or pair-code),
+                        // so there's nothing to re-mint. Log + back off; the
+                        // next pairing writes the file and a kick wakes us.
                         warn!(
                             "device_jwt_refresher: paired_user.json missing — \
-                             needs first browser-pair (refresher idling until kick)"
+                             runner not paired yet (refresher idling until kick)"
                         );
                         if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
                             .await
@@ -576,36 +562,40 @@ mod tests {
 
     #[test]
     fn decides_no_refresh_when_jwt_fresh() {
-        // Tier 2 + token present + needs_refresh=false → Idle (no work).
-        let d = next_action(RunnerTier::QontinuiAccount, "some-runner-token", false);
+        // Tier 2 + needs_refresh=false → Idle (no work).
+        let d = next_action(RunnerTier::QontinuiAccount, false);
         assert_eq!(d, Decision::Idle);
     }
 
     #[test]
-    fn decides_pair_when_jwt_stale_and_token_present() {
-        let d = next_action(RunnerTier::QontinuiAccount, "some-runner-token", true);
+    fn decides_pair_when_jwt_stale() {
+        let d = next_action(RunnerTier::QontinuiAccount, true);
         assert_eq!(d, Decision::Pair);
     }
 
     #[test]
-    fn decides_idle_when_runner_token_empty() {
-        let d = next_action(RunnerTier::QontinuiAccount, "", true);
-        assert_eq!(d, Decision::IdleNoToken);
-        // Whitespace-only should still count as empty.
-        let d2 = next_action(RunnerTier::QontinuiAccount, "   ", true);
-        assert_eq!(d2, Decision::IdleNoToken);
+    fn decides_pair_for_cognito_runner_with_empty_runner_token() {
+        // Regression: a Cognito-/pair-code-paired runner has an EMPTY
+        // `web_integration.runner_token` but a valid Cognito/device bearer.
+        // The refresher must still attempt to re-mint (Pair) — it must NOT
+        // idle on the missing runner_token (which let the device JWT expire
+        // and silently dropped the runner off the cloud after ~one TTL).
+        // `next_action` no longer consults runner_token at all; the `Pair`
+        // arm resolves the real bearer and idles only if none exists.
+        let d = next_action(RunnerTier::QontinuiAccount, true);
+        assert_eq!(d, Decision::Pair);
     }
 
     #[test]
     fn decides_idle_when_tier_not_qontinui_account() {
         // LocalProvider: not Tier 2 — refresher idles regardless of
-        // whether the JWT is stale or a token is present.
-        let d = next_action(RunnerTier::LocalProvider, "some-runner-token", true);
+        // whether the JWT is stale.
+        let d = next_action(RunnerTier::LocalProvider, true);
         assert_eq!(d, Decision::IdleWrongTier);
-        let d2 = next_action(RunnerTier::Local, "some-runner-token", true);
+        let d2 = next_action(RunnerTier::Local, true);
         assert_eq!(d2, Decision::IdleWrongTier);
         // Even with no needs-refresh signal, wrong-tier still wins.
-        let d3 = next_action(RunnerTier::LocalProvider, "", false);
+        let d3 = next_action(RunnerTier::LocalProvider, false);
         assert_eq!(d3, Decision::IdleWrongTier);
     }
 

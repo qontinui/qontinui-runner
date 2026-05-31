@@ -44,29 +44,41 @@ pub struct ServerModeConfig {
     /// Base URL of the qontinui-web API, e.g. `"https://api.qontinui.io"`.
     /// No trailing slash — callers append `/api/v1/...`.
     pub web_backend_url: String,
-    /// Plaintext runner bearer token (`qontinui_runner_<64hex>`).
-    /// Never logged.
+    /// Legacy plaintext runner bearer token (`qontinui_runner_<64hex>`), or
+    /// empty for a Cognito-/pair-code-paired runner. Never logged.
+    ///
+    /// No longer consulted by the WS relay (it authenticates with the device
+    /// JWT from `AuthManager`) — retained only so legacy installs that still
+    /// carry one round-trip it unchanged.
     pub runner_token: String,
 }
 
 impl ServerModeConfig {
     /// Build from the persisted [`WebIntegrationSettings`].
     ///
-    /// Returns `None` unless `enabled=true` AND `backend_url` is non-empty
-    /// AND `runner_token` is non-empty. Trims a trailing slash from
-    /// `backend_url` so callers can safely append `/api/v1/...` paths.
+    /// Returns `None` unless `enabled=true` AND `backend_url` is non-empty.
+    /// Trims a trailing slash from `backend_url` so callers can safely append
+    /// `/api/v1/...` paths.
+    ///
+    /// Deliberately does NOT require `runner_token`. Post-Cognito unification
+    /// the relay authenticates with the device JWT, and Cognito-/pair-code-
+    /// paired runners have an empty `runner_token`. Requiring it here left
+    /// `ServerModeState` uninstalled for those runners, so the relay had
+    /// nowhere to publish its connection state and `get_web_integration_status`
+    /// reported `ws_connected=false` even while the runner was connected and
+    /// heartbeating. Gating only on `enabled` + `backend_url` installs the
+    /// state for every connectable runner.
     pub fn from_settings(settings: &WebIntegrationSettings) -> Option<Self> {
         if !settings.enabled {
             return None;
         }
         let backend_url = settings.backend_url.trim();
-        let runner_token = settings.runner_token.trim();
-        if backend_url.is_empty() || runner_token.is_empty() {
+        if backend_url.is_empty() {
             return None;
         }
         Some(Self {
             web_backend_url: backend_url.trim_end_matches('/').to_string(),
-            runner_token: runner_token.to_string(),
+            runner_token: settings.runner_token.trim().to_string(),
         })
     }
 }
@@ -270,5 +282,52 @@ mod tests {
         let c = s.clone();
         s.incr_terminal_subscribers();
         assert_eq!(c.terminal_subscriber_count(), 1);
+    }
+
+    fn web_settings(
+        enabled: bool,
+        backend_url: &str,
+        runner_token: &str,
+    ) -> WebIntegrationSettings {
+        WebIntegrationSettings {
+            enabled,
+            backend_url: backend_url.to_string(),
+            runner_token: runner_token.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn from_settings_builds_with_empty_runner_token() {
+        // Regression: a Cognito-/pair-code-paired runner has an empty
+        // runner_token but must still get a ServerModeState installed so the
+        // relay can publish connection status. Previously this returned None.
+        let cfg =
+            ServerModeConfig::from_settings(&web_settings(true, "https://api.qontinui.io/", ""))
+                .expect("should build a config without a runner_token");
+        assert_eq!(cfg.web_backend_url, "https://api.qontinui.io");
+        assert_eq!(cfg.runner_token, "");
+    }
+
+    #[test]
+    fn from_settings_still_carries_a_legacy_runner_token() {
+        let cfg = ServerModeConfig::from_settings(&web_settings(
+            true,
+            "https://api.qontinui.io",
+            "qontinui_runner_abc",
+        ))
+        .expect("should build");
+        assert_eq!(cfg.runner_token, "qontinui_runner_abc");
+    }
+
+    #[test]
+    fn from_settings_none_when_disabled_or_no_backend_url() {
+        assert!(ServerModeConfig::from_settings(&web_settings(
+            false,
+            "https://api.qontinui.io",
+            ""
+        ))
+        .is_none());
+        assert!(ServerModeConfig::from_settings(&web_settings(true, "   ", "tok")).is_none());
     }
 }

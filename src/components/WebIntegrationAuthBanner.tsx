@@ -246,10 +246,13 @@ export function WebIntegrationAuthBanner() {
   }, []);
 
   const handleDismiss = useCallback(() => {
-    const sig = statusSignature(status);
+    // `deviceJwtPresent !== false` treats the not-yet-loaded (null) state as
+    // paired so a paired runner never flashes the banner while the
+    // device_jwt_present probe is in flight.
+    const sig = statusSignature(status, deviceJwtPresent !== false);
     writeDismissedSignature(sig);
     setDismissedSignature(sig);
-  }, [status]);
+  }, [status, deviceJwtPresent]);
 
   if (tier !== "qontinui_account") return null;
 
@@ -333,7 +336,7 @@ export function WebIntegrationAuthBanner() {
     );
   }
 
-  const visible = shouldShowAuthBanner(status, dismissedSignature);
+  const visible = shouldShowAuthBanner(status, deviceJwtPresent !== false, dismissedSignature);
   if (!visible) return null;
 
   return (

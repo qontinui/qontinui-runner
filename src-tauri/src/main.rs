@@ -591,15 +591,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             );
             crate::server_mode::ServerModeState::new(cfg)
         });
-    if initial_server_mode_state.is_none()
-        && (!web_integration_settings.backend_url.is_empty()
-            || !web_integration_settings.runner_token.is_empty())
-    {
+    if initial_server_mode_state.is_none() && !web_integration_settings.backend_url.is_empty() {
         warn!(
-            "Web-integration partially configured (enabled={}, backend_url_empty={}, runner_token_empty={}) — phase events and heartbeats will NOT be reported until all three are set",
+            "Web-integration not active (enabled={}, backend_url_empty={}) — phase events and heartbeats will NOT be reported until it is enabled with a backend URL. (A runner_token is no longer required; the relay authenticates with the device JWT.)",
             web_integration_settings.enabled,
             web_integration_settings.backend_url.is_empty(),
-            web_integration_settings.runner_token.is_empty(),
         );
     }
     let server_mode_state: Arc<tokio::sync::RwLock<Option<crate::server_mode::ServerModeState>>> =

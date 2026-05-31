@@ -26,55 +26,47 @@ const baseFreshInstall: AuthBannerStatus = {
 
 describe("shouldShowAuthBanner", () => {
   it("hides when status has not loaded yet", () => {
-    expect(shouldShowAuthBanner(null, null)).toBe(false);
+    expect(shouldShowAuthBanner(null, false, null)).toBe(false);
   });
 
-  it("shows on a fresh install (enabled, no token, never dismissed)", () => {
-    expect(shouldShowAuthBanner(baseFreshInstall, null)).toBe(true);
+  it("shows on a fresh install (enabled, not paired, never dismissed)", () => {
+    expect(shouldShowAuthBanner(baseFreshInstall, false, null)).toBe(true);
   });
 
   it("hides when the user has opted out (enabled === false)", () => {
     // Respect explicit opt-out — never bug them again until they re-enable.
-    expect(shouldShowAuthBanner({ ...baseFreshInstall, enabled: false }, null)).toBe(false);
+    expect(shouldShowAuthBanner({ ...baseFreshInstall, enabled: false }, false, null)).toBe(false);
   });
 
-  it("hides when the runner token is set", () => {
-    expect(
-      shouldShowAuthBanner(
-        { ...baseFreshInstall, runnerTokenMasked: "qontinui_runner_aaaa…bbbb" },
-        null,
-      ),
-    ).toBe(false);
+  it("hides when the runner is paired (device JWT present), even with an empty runner_token", () => {
+    // Regression: post-Cognito a paired runner has an EMPTY runner_token but a
+    // valid device JWT. The banner must NOT show — it previously keyed off
+    // runner_token and so nagged every Cognito-/pair-code-paired runner.
+    expect(shouldShowAuthBanner(baseFreshInstall, true, null)).toBe(false);
   });
 
   it("hides when the user dismissed for the current status signature", () => {
-    const sig = statusSignature(baseFreshInstall);
-    expect(shouldShowAuthBanner(baseFreshInstall, sig)).toBe(false);
+    const sig = statusSignature(baseFreshInstall, false);
+    expect(shouldShowAuthBanner(baseFreshInstall, false, sig)).toBe(false);
   });
 
   it("re-shows when status changes after a dismissal (e.g. new auth error)", () => {
-    // User dismissed a clean "needs token" banner. A subsequent registration
-    // error must resurface the banner — they need to know the runner is now
-    // actively failing to authenticate, not just unconfigured.
-    const dismissedSig = statusSignature(baseFreshInstall);
+    // User dismissed a clean "needs authorization" banner. A subsequent
+    // registration error must resurface it — they need to know the runner is
+    // now actively failing to authenticate, not just unpaired.
+    const dismissedSig = statusSignature(baseFreshInstall, false);
     const withError: AuthBannerStatus = {
       ...baseFreshInstall,
       registrationError: "401 Unauthorized",
     };
-    expect(shouldShowAuthBanner(withError, dismissedSig)).toBe(true);
+    expect(shouldShowAuthBanner(withError, false, dismissedSig)).toBe(true);
   });
 
-  it("re-shows after token gets cleared (token-revoked path)", () => {
-    // Banner was dismissed when the token was set (so `shouldShowAuthBanner`
-    // would have returned false anyway). Now the token has been cleared —
-    // the new status' signature differs, so the banner reappears.
-    const withToken: AuthBannerStatus = {
-      ...baseFreshInstall,
-      runnerTokenMasked: "qontinui_runner_xxxx…yyyy",
-    };
-    const dismissedWhenTokenSet = statusSignature(withToken);
-    // Token is now empty again:
-    expect(shouldShowAuthBanner(baseFreshInstall, dismissedWhenTokenSet)).toBe(true);
+  it("re-shows after the device un-pairs (device JWT cleared)", () => {
+    // Banner was dismissed while paired (device JWT present, so it was hidden
+    // anyway). The JWT is now gone — the signature differs, so it reappears.
+    const dismissedWhilePaired = statusSignature(baseFreshInstall, true);
+    expect(shouldShowAuthBanner(baseFreshInstall, false, dismissedWhilePaired)).toBe(true);
   });
 });
 
@@ -168,22 +160,24 @@ describe("shouldShowRePairCta (post-upgrade migration)", () => {
 
 describe("statusSignature", () => {
   it("returns an empty string for null status", () => {
-    expect(statusSignature(null)).toBe("");
+    expect(statusSignature(null, false)).toBe("");
   });
 
-  it("differentiates token-set from token-empty even at the same enabled flag", () => {
-    const a = statusSignature(baseFreshInstall);
-    const b = statusSignature({ ...baseFreshInstall, runnerTokenMasked: "qontinui_x…y" });
+  it("differentiates paired from unpaired even at the same enabled flag", () => {
+    const a = statusSignature(baseFreshInstall, false);
+    const b = statusSignature(baseFreshInstall, true);
     expect(a).not.toBe(b);
   });
 
   it("differentiates registration errors from a clean state", () => {
-    const a = statusSignature(baseFreshInstall);
-    const b = statusSignature({ ...baseFreshInstall, registrationError: "401" });
+    const a = statusSignature(baseFreshInstall, false);
+    const b = statusSignature({ ...baseFreshInstall, registrationError: "401" }, false);
     expect(a).not.toBe(b);
   });
 
   it("is stable across calls with identical input", () => {
-    expect(statusSignature(baseFreshInstall)).toBe(statusSignature({ ...baseFreshInstall }));
+    expect(statusSignature(baseFreshInstall, false)).toBe(
+      statusSignature({ ...baseFreshInstall }, false),
+    );
   });
 });
