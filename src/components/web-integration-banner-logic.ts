@@ -17,15 +17,20 @@ export interface AuthBannerStatus {
  * Stable signature used to decide "did the status change since the user
  * dismissed?". Any change to the bits the banner cares about resurfaces it.
  *
- * Including `registrationError` means a 401 transition (auth failure after
- * the token was revoked / rotated server-side) re-shows the banner even
- * mid-session — the user explicitly needs to know.
+ * `deviceJwtPresent` is the real "is this runner paired?" signal post-Cognito
+ * unification (Cognito sign-in / pair-code mint a device JWT; neither sets
+ * `runner_token`). Including `registrationError` means a 401 transition (auth
+ * failure after the credential was revoked / rotated server-side) re-shows the
+ * banner even mid-session — the user explicitly needs to know.
  */
-export function statusSignature(status: AuthBannerStatus | null): string {
+export function statusSignature(
+  status: AuthBannerStatus | null,
+  deviceJwtPresent: boolean,
+): string {
   if (!status) return "";
   return [
     status.enabled ? "1" : "0",
-    status.runnerTokenMasked.length > 0 ? "T" : "_",
+    deviceJwtPresent ? "P" : "_",
     status.registrationError ?? "",
   ].join("|");
 }
@@ -36,19 +41,29 @@ export function statusSignature(status: AuthBannerStatus | null): string {
  * Visibility rule:
  *   - Hide when status hasn't loaded yet (avoid flashing on every render).
  *   - Hide when `enabled === false` — user opted out, respect it.
- *   - Hide when `runnerTokenMasked` is non-empty — token is set, no action needed.
+ *   - Hide when `deviceJwtPresent` — the runner IS paired (has a device JWT
+ *     from Cognito sign-in or a pair-code), so no authorization action is
+ *     needed. NOTE: this used to key off `runnerTokenMasked`, which broke
+ *     post-Cognito: Cognito-/pair-code-paired runners have an empty
+ *     `runner_token`, so a fully-paired runner showed a perpetual "needs
+ *     authorization" banner. Callers should pass `deviceJwtPresent !== false`
+ *     so the not-yet-loaded state (null) is treated as paired (no flash).
  *   - Hide when the user dismissed it for the session AND status hasn't changed
- *     since dismissal (re-shows on reload, on token clear, or on a new
+ *     since dismissal (re-shows on reload, on un-pair, or on a new
  *     registration error).
  */
 export function shouldShowAuthBanner(
   status: AuthBannerStatus | null,
+  deviceJwtPresent: boolean,
   dismissedSignature: string | null,
 ): boolean {
   if (!status) return false;
   if (!status.enabled) return false;
-  if (status.runnerTokenMasked.length > 0) return false;
-  if (dismissedSignature !== null && dismissedSignature === statusSignature(status)) {
+  if (deviceJwtPresent) return false;
+  if (
+    dismissedSignature !== null &&
+    dismissedSignature === statusSignature(status, deviceJwtPresent)
+  ) {
     return false;
   }
   return true;

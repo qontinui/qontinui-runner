@@ -219,10 +219,9 @@ pub async fn apply_web_integration_settings<R: Runtime>(
     } else {
         info!(
             "Web-integration hot-reload: new settings do not form a valid config \
-             (enabled={}, backend_url_empty={}, runner_token_empty={}) — integration is now disabled",
+             (enabled={}, backend_url_empty={}) — integration is now disabled",
             normalized.enabled,
             normalized.backend_url.is_empty(),
-            normalized.runner_token.is_empty(),
         );
     }
 
