@@ -581,8 +581,16 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
     info!("cognito_sign_in: starting RFC-8252 PKCE login");
     let login = tokio::task::spawn_blocking(qontinui_runner_lib::cognito::pkce_login)
         .await
-        .map_err(|e| AppError::Raw(format!("PKCE login task panicked: {e}")))?
-        .map_err(AppError::Raw)?;
+        .map_err(|e| {
+            error!("cognito_sign_in: PKCE login task panicked: {e}");
+            AppError::Raw(format!("PKCE login task panicked: {e}"))
+        })?
+        .map_err(|e| {
+            // Most common cause: a prior sign-in leaked the fixed loopback port
+            // (BUG 1, now fixed) so the bind fails with os error 10048.
+            error!("cognito_sign_in: PKCE login failed at step 1 (pkce_login): {e}");
+            AppError::Raw(e)
+        })?;
 
     info!(
         "cognito_sign_in: PKCE login succeeded (sub={}) — binding device",
@@ -598,11 +606,16 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
             &login.refresh_token,
             login.expires_at,
         )
-        .map_err(|e| AppError::Raw(format!("persist Cognito tokens: {e}")))?;
+        .map_err(|e| {
+            error!("cognito_sign_in: step 2 (store_oauth_tokens) failed: {e}");
+            AppError::Raw(format!("persist Cognito tokens: {e}"))
+        })?;
 
     // 3. Device identity from disk.
-    let device_id = read_device_id_from_disk()
-        .map_err(|e| AppError::Raw(format!("could not read device identity: {e}")))?;
+    let device_id = read_device_id_from_disk().map_err(|e| {
+        error!("cognito_sign_in: step 3 (read_device_id_from_disk) failed: {e}");
+        AppError::Raw(format!("could not read device identity: {e}"))
+    })?;
 
     // 4. Bind device→user via the existing pair-cli flow. The web backend
     //    resolves tenant_id server-side from the authenticated user, so the
@@ -623,8 +636,14 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
         )
     })
     .await
-    .map_err(|e| AppError::Raw(format!("device-pair task panicked: {e}")))?
-    .map_err(AppError::Raw)?;
+    .map_err(|e| {
+        error!("cognito_sign_in: device-pair task panicked: {e}");
+        AppError::Raw(format!("device-pair task panicked: {e}"))
+    })?
+    .map_err(|e| {
+        error!("cognito_sign_in: step 4 (pair_with_auth_token_with_ids) failed: {e}");
+        AppError::Raw(e)
+    })?;
 
     // Coord stamps the real tenant_id on the minted device JWT; decode it for
     // persistence + display (the Cognito token does not carry tenant_id).
@@ -633,8 +652,10 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
         .unwrap_or(uuid::Uuid::nil());
 
     // 5. Persist the device JWT + paired-user file.
-    persist_pairing(&pair_resp, tenant_id)
-        .map_err(|e| AppError::Raw(format!("persist pairing: {e}")))?;
+    persist_pairing(&pair_resp, tenant_id).map_err(|e| {
+        error!("cognito_sign_in: step 5 (persist_pairing) failed AFTER a successful pair: {e}");
+        AppError::Raw(format!("persist pairing: {e}"))
+    })?;
 
     let tenant_id_str = if tenant_id.is_nil() {
         None
@@ -655,8 +676,10 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
         if crate::instance::is_secondary() {
             warn!("cognito_sign_in: secondary runner — applying in-memory only, skipping save_settings");
         } else {
-            settings::save_settings(&s)
-                .map_err(|e| AppError::Raw(format!("persist tier promotion: {e}")))?;
+            settings::save_settings(&s).map_err(|e| {
+                error!("cognito_sign_in: step 6 (save_settings tier promotion) failed AFTER a successful pair: {e}");
+                AppError::Raw(format!("persist tier promotion: {e}"))
+            })?;
         }
     }
     tokio::spawn(async {

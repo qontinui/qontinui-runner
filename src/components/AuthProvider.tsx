@@ -184,6 +184,30 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [checkAuthStatus, isTier2, tierLoading]);
 
   /**
+   * Re-check auth status when the runner tier changes underneath us.
+   *
+   * `useRunnerTier` already re-reads the tier on the `runner-tier-changed`
+   * window event, but when the tier is ALREADY "qontinui_account" (e.g. a
+   * prior sign-in promoted it, but the auth status was still unauthenticated
+   * so `LoginScreen` was showing), a fresh sign-in does NOT change the `tier`
+   * value — so the mount effect above (keyed on `isTier2`) never re-runs and
+   * `authStatus.authenticated` stays stale-false. The App gate
+   * (`isTier2 && !authenticated → LoginScreen`) then keeps showing the
+   * sign-in screen until a process restart.
+   *
+   * Listening for the same event here and re-running `checkAuthStatus` flips
+   * `authenticated` live so the view leaves `LoginScreen` without a restart.
+   */
+  useEffect(() => {
+    const onTierChanged = () => {
+      log.debug("runner-tier-changed observed - re-checking auth status");
+      void checkAuthStatus();
+    };
+    window.addEventListener("runner-tier-changed", onTierChanged);
+    return () => window.removeEventListener("runner-tier-changed", onTierChanged);
+  }, [checkAuthStatus]);
+
+  /**
    * Synthesize a local-guest authStatus for Tier 0/1.
    */
   useEffect(() => {

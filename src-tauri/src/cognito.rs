@@ -173,6 +173,21 @@ pub(crate) struct CognitoCallbackQuery {
 // PKCE login (browser + loopback) — blocking.
 // ============================================================================
 
+/// Bind the loopback callback port with `SO_REUSEADDR` so a lingering
+/// `TIME_WAIT` socket from a just-completed sign-in never blocks a fresh
+/// rebind on Windows (`os error 10048`). Mirrors `mcp_api::try_bind_port`.
+fn bind_loopback_reuseaddr(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
 /// Run the full RFC-8252 PKCE login: open the system browser, capture the
 /// loopback redirect, validate `state`, and exchange the code at the token
 /// endpoint. Blocking (mirrors `pair::pair_via_browser`); call via
@@ -188,14 +203,18 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
     // Bind the FIXED loopback port. Cognito exact-matches redirect_uri, so we
     // cannot use an OS-assigned port here. If the port is busy, surface a
     // clear, actionable error rather than silently falling back.
-    let std_listener =
-        std::net::TcpListener::bind(("127.0.0.1", COGNITO_CALLBACK_PORT)).map_err(|e| {
-            format!(
-                "could not bind loopback callback on 127.0.0.1:{COGNITO_CALLBACK_PORT} ({e}). \
-                 Another sign-in may be in progress, or another app is holding the port. \
-                 Close it and try again."
-            )
-        })?;
+    //
+    // Bind via socket2 with SO_REUSEADDR so a lingering TIME_WAIT socket from a
+    // just-completed sign-in (the previous flow's loopback server tears down on
+    // success, but the OS may hold the 4-tuple in TIME_WAIT briefly) never
+    // blocks a fresh rebind with `os error 10048`.
+    let std_listener = bind_loopback_reuseaddr(COGNITO_CALLBACK_PORT).map_err(|e| {
+        format!(
+            "could not bind loopback callback on 127.0.0.1:{COGNITO_CALLBACK_PORT} ({e}). \
+             Another sign-in may be in progress, or another app is holding the port. \
+             Close it and try again."
+        )
+    })?;
     std_listener
         .set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking failed: {e}"))?;
@@ -203,6 +222,21 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
     let received: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
     let received_clone = received.clone();
     let state_expected = state.clone();
+
+    // Graceful-shutdown signal: the route handler fires this the instant it has
+    // written a result (code OR error) to `received`, so `axum::serve` returns
+    // and the listener — hence port 53682 — is fully torn down before
+    // `pkce_login` returns. Without this the server would keep LISTENing after
+    // the code was captured, leaking the fixed port and making the NEXT sign-in
+    // fail to bind with `os error 10048` (BUG 1).
+    //
+    // A oneshot can only be sent once and `Sender::send` consumes it, so it
+    // lives in a shared `Mutex<Option<_>>` the (potentially re-entrant) handler
+    // takes-and-sends exactly once.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
+        Arc::new(Mutex::new(Some(shutdown_tx)));
+    let shutdown_tx_route = shutdown_tx.clone();
 
     let (server_done_tx, server_done_rx) = std::sync::mpsc::channel::<()>();
     let _server_handle = std::thread::spawn(move || -> Result<(), String> {
@@ -214,17 +248,28 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
             use axum::{extract::Query, response::Html, routing::get, Router};
             let state_for_route = state_expected.clone();
             let received_for_route = received_clone.clone();
+            // Fire the graceful-shutdown signal exactly once (idempotent across
+            // duplicate callback hits).
+            let signal_shutdown =
+                move |tx: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>| {
+                    if let Some(tx) = tx.lock().expect("mutex").take() {
+                        let _ = tx.send(());
+                    }
+                };
             let app = Router::new().route(
                 "/auth/callback",
                 get(move |Query(q): Query<CognitoCallbackQuery>| {
                     let state_for_route = state_for_route.clone();
                     let received_for_route = received_for_route.clone();
+                    let shutdown_tx_route = shutdown_tx_route.clone();
+                    let signal_shutdown = signal_shutdown.clone();
                     async move {
                         // Error path: Cognito reported a problem.
                         if let Some(err) = q.error {
                             let desc = q.error_description.unwrap_or_default();
                             *received_for_route.lock().expect("mutex") =
                                 Some(Err(format!("Cognito returned error `{err}`: {desc}")));
+                            signal_shutdown(&shutdown_tx_route);
                             return Html(
                                 "<h1>Sign-in failed</h1><p>You can close this tab and try \
                                  again.</p>"
@@ -236,6 +281,7 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
                             *received_for_route.lock().expect("mutex") = Some(Err(
                                 "callback state did not match the pending sign-in".to_string(),
                             ));
+                            signal_shutdown(&shutdown_tx_route);
                             return Html(
                                 "<h1>State mismatch</h1><p>The sign-in could not be verified. \
                                  Close this tab and try again.</p>"
@@ -245,6 +291,7 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
                         match q.code {
                             Some(code) if !code.is_empty() => {
                                 *received_for_route.lock().expect("mutex") = Some(Ok(code));
+                                signal_shutdown(&shutdown_tx_route);
                                 Html(
                                     "<h1>&#10003; Signed in to Qontinui</h1>\
                                      <p>You can close this tab and return to the runner.</p>\
@@ -255,6 +302,7 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
                             _ => {
                                 *received_for_route.lock().expect("mutex") =
                                     Some(Err("callback carried no authorization code".to_string()));
+                                signal_shutdown(&shutdown_tx_route);
                                 Html(
                                     "<h1>Sign-in failed</h1><p>No authorization code was \
                                      returned. Close this tab and try again.</p>"
@@ -267,16 +315,20 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
             );
             let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
                 .map_err(|e| format!("tokio listener wrap failed: {e}"))?;
-            let serve = axum::serve(tokio_listener, app);
-            let timeout = tokio::time::sleep(Duration::from_secs(300));
-            tokio::pin!(timeout);
-            tokio::select! {
-                res = serve => { res.map_err(|e| format!("axum serve failed: {e}"))?; }
-                _ = &mut timeout => {
-                    return Err("sign-in timed out after 5 minutes waiting for the browser \
-                                callback".to_string());
+            // Serve until EITHER the handler signals shutdown (code/error
+            // captured) OR the 5-minute timeout elapses. `with_graceful_shutdown`
+            // stops accepting + drains in-flight responses (so the "Signed in"
+            // page is fully delivered to the browser) and THEN drops the
+            // listener, releasing port 53682.
+            let serve = axum::serve(tokio_listener, app).with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = shutdown_rx => {}
+                    _ = tokio::time::sleep(Duration::from_secs(300)) => {}
                 }
-            }
+            });
+            serve.await.map_err(|e| format!("axum serve failed: {e}"))?;
+            // The listener is now dropped (port released). Wake the polling
+            // main thread so it stops waiting the moment the port is free.
             let _ = server_done_tx.send(());
             Ok(())
         })
@@ -290,25 +342,44 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
         );
     }
 
-    // Poll the slot up to 5 minutes.
+    // Poll the slot up to 5 minutes. On capture we DON'T return immediately —
+    // we first wait for the server thread to finish its graceful shutdown (it
+    // sends on `server_done_rx` only AFTER the listener is dropped) so port
+    // 53682 is provably free before `pkce_login` returns. This holds on BOTH
+    // the success and the error path, so an immediate retry can always rebind.
     let deadline = Instant::now() + Duration::from_secs(300);
-    let code = loop {
+    let captured: Result<String, String> = loop {
         if let Some(result) = received.lock().expect("mutex").take() {
-            break result?;
+            break result;
+        }
+        if server_done_rx.try_recv().is_ok() {
+            // Server stopped without a captured result — only happens on the
+            // internal 300s graceful-shutdown timeout (no browser callback).
+            break match received.lock().expect("mutex").take() {
+                Some(result) => result,
+                None => Err(
+                    "sign-in timed out after 5 minutes waiting for the browser callback"
+                        .to_string(),
+                ),
+            };
         }
         if Instant::now() >= deadline {
-            return Err(
+            break Err(
                 "sign-in timed out after 5 minutes waiting for the browser callback".to_string(),
             );
         }
         std::thread::sleep(Duration::from_millis(200));
-        if server_done_rx.try_recv().is_ok() {
-            if let Some(result) = received.lock().expect("mutex").take() {
-                break result?;
-            }
-            return Err("sign-in callback server stopped before capturing a code".to_string());
-        }
     };
+
+    // Wait (bounded) for the loopback server to fully tear down so the port is
+    // released regardless of success/error — the handler fires graceful
+    // shutdown the instant it writes `received`, so this is near-instant.
+    let teardown_deadline = Instant::now() + Duration::from_secs(5);
+    while server_done_rx.try_recv().is_err() && Instant::now() < teardown_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let code = captured?;
 
     // Exchange the authorization code for tokens.
     let token_resp = exchange_code(&code, &code_verifier)?;
