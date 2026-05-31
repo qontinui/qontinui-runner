@@ -479,6 +479,25 @@ impl AppState {
     pub async fn current_server_mode(&self) -> Option<crate::server_mode::ServerModeState> {
         self.server_mode.read().await.clone()
     }
+
+    /// Install a `ServerModeState` from current settings if none is present,
+    /// returning the live state (existing or freshly installed), or `None`
+    /// when current settings don't form a valid config.
+    ///
+    /// Closes the "integration disabled at boot" gap — see
+    /// [`crate::server_mode::install_if_absent`]. The relay calls this on a
+    /// successful connect so it always has somewhere to publish connection
+    /// state, even when boot left the slot empty and a later sign-in enabled
+    /// integration without routing through `apply_web_integration_settings`.
+    pub async fn install_server_mode_if_absent(
+        &self,
+    ) -> Option<crate::server_mode::ServerModeState> {
+        crate::server_mode::install_if_absent(
+            &self.server_mode,
+            &crate::settings::load_settings().web_integration,
+        )
+        .await
+    }
 }
 
 /// Standard response structure for command handlers.

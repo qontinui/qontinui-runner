@@ -767,11 +767,29 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
     let sm_state = match api_state.app_state.current_server_mode().await {
         Some(s) => s,
         None => {
-            warn!(
-                "Received `connected` message but no ServerModeState is installed; \
-                 the relay will continue but state queries will return empty"
-            );
-            return;
+            // No ServerModeState was installed at boot — e.g. web integration
+            // was disabled then, and a later Cognito/pair-code sign-in enabled
+            // it via save_settings + a relay kick without routing through
+            // apply_web_integration_settings. We're demonstrably connected, so
+            // self-install from current settings; otherwise status queries
+            // would report this runner disconnected until the next restart.
+            match api_state.app_state.install_server_mode_if_absent().await {
+                Some(s) => {
+                    info!(
+                        "Backend relay: self-installed ServerModeState on connect \
+                         (none was present at boot)"
+                    );
+                    s
+                }
+                None => {
+                    warn!(
+                        "Received `connected` message but no ServerModeState is installed \
+                         and current settings don't form a valid config; the relay will \
+                         continue but state queries will return empty"
+                    );
+                    return;
+                }
+            }
         }
     };
 
