@@ -19,7 +19,7 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
 export interface DiscoveredApp {
   appId: string;
   appName: string;
-  appType: "web" | "desktop" | "mobile" | "other" | string;
+  appType: "web" | "desktop" | "mobile" | "other" | "injected" | string;
   framework?: string;
   url: string;
   port: number;
