@@ -39,6 +39,7 @@ pub mod bridges;
 pub mod canvas;
 pub mod cascade;
 pub mod checks;
+pub mod code_semantics;
 pub mod command_relay;
 pub mod comparison_api;
 pub mod completion_reports;
