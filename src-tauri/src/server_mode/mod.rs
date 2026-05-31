@@ -83,6 +83,37 @@ impl ServerModeConfig {
     }
 }
 
+/// Install a [`ServerModeState`] built from `settings` into `slot` if the slot
+/// is currently empty; return the live state (existing or freshly installed),
+/// or `None` if `settings` don't form a valid config (see
+/// [`ServerModeConfig::from_settings`]).
+///
+/// A single write-lock makes the check-then-install atomic (no TOCTOU with a
+/// concurrent installer such as `apply_web_integration_settings`). An existing
+/// state is never clobbered.
+///
+/// Closes the "integration disabled at boot" gap: boot installs a
+/// `ServerModeState` only when `from_settings` is `Some`. A later Cognito /
+/// pair-code sign-in enables integration via `save_settings` + a relay kick
+/// WITHOUT routing through `apply_web_integration_settings`, so the slot can
+/// still be empty when the relay connects. The relay calls this on a
+/// successful connect so it always has somewhere to publish `ws_connected` /
+/// `runner_id` / heartbeat — otherwise `get_web_integration_status` would
+/// report the runner disconnected until the next process restart.
+pub async fn install_if_absent(
+    slot: &RwLock<Option<ServerModeState>>,
+    settings: &WebIntegrationSettings,
+) -> Option<ServerModeState> {
+    let mut guard = slot.write().await;
+    if let Some(existing) = guard.as_ref() {
+        return Some(existing.clone());
+    }
+    let cfg = ServerModeConfig::from_settings(settings)?;
+    let state = ServerModeState::new(cfg);
+    *guard = Some(state.clone());
+    Some(state)
+}
+
 /// Shared runtime state for the runner ↔ web-backend WebSocket relay.
 ///
 /// Populated and refreshed by [`crate::mcp::backend_relay`] as the WS
@@ -329,5 +360,49 @@ mod tests {
         ))
         .is_none());
         assert!(ServerModeConfig::from_settings(&web_settings(true, "   ", "tok")).is_none());
+    }
+
+    #[tokio::test]
+    async fn install_if_absent_installs_into_empty_slot() {
+        // The enabled=false-at-boot edge: boot left the slot empty; a later
+        // sign-in enabled integration. On connect the relay self-installs.
+        let slot = RwLock::new(None);
+        let s = install_if_absent(&slot, &web_settings(true, "https://api.qontinui.io", ""))
+            .await
+            .expect("valid settings should install");
+        assert_eq!(s.config.web_backend_url, "https://api.qontinui.io");
+        assert!(
+            slot.read().await.is_some(),
+            "slot should now hold the state"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_if_absent_does_not_clobber_existing() {
+        let slot = RwLock::new(Some(ServerModeState::new(ServerModeConfig {
+            web_backend_url: "https://original.test".to_string(),
+            runner_token: String::new(),
+        })));
+        // Different settings must NOT replace the already-installed state.
+        let s = install_if_absent(&slot, &web_settings(true, "https://different.test", ""))
+            .await
+            .expect("existing state should be returned");
+        assert_eq!(s.config.web_backend_url, "https://original.test");
+        assert_eq!(
+            slot.read().await.as_ref().unwrap().config.web_backend_url,
+            "https://original.test"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_if_absent_returns_none_for_invalid_settings() {
+        let slot = RwLock::new(None);
+        // Integration disabled → no valid config → nothing installed.
+        assert!(
+            install_if_absent(&slot, &web_settings(false, "https://api.qontinui.io", ""))
+                .await
+                .is_none()
+        );
+        assert!(slot.read().await.is_none(), "slot must stay empty");
     }
 }
