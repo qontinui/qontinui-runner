@@ -755,6 +755,16 @@ function RegisteredAppCard({
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground">
             {app.appType}
           </span>
+          {app.appType === "injected" && (
+            <span
+              data-ui-bridge-test-id="injected-apptype-badge"
+              title="Injected apps run the UI Bridge SDK via an injected relay client; their actions are dispatched over the relay transport rather than a host-bundled SDK."
+              className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 font-medium"
+            >
+              <Plug className="w-3 h-3" aria-hidden="true" />
+              injected
+            </span>
+          )}
           {app.transport === "websocket" && (
             <span
               data-ui-bridge-test-id="wrapper-transport-badge"
