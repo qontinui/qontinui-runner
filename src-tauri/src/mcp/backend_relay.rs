@@ -42,7 +42,7 @@
 //! migration); it is owned by the refresher's outbound HTTP to coord's
 //! pair-cli endpoint.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -479,7 +479,19 @@ async fn relay_loop(
             Ok((ws_stream, _response)) => {
                 info!("Connected to runner WS at {}", ws_url);
                 let connected_at = std::time::Instant::now();
-                clear_connection_error(&api_state).await;
+                // NOTE: the connection error is intentionally NOT cleared
+                // here. A successful TCP/WS *handshake* only means the
+                // server accepted the socket — it may still close/reject us
+                // before the `connected` application-ack (e.g. the
+                // device-bridge register path fails because Redis pairing is
+                // down). Clearing here left a misleading `ws_connected=false`
+                // + `last_error=null` state that cost real time to diagnose
+                // (Redis-disabled pairing outage). The error is now cleared
+                // inside `handle_connected_message`, i.e. only once the
+                // backend's `connected` ack actually arrives. The shared
+                // `connected_ack` flag lets the inbound handler record an
+                // actionable close reason if the socket dies before the ack.
+                let connected_ack = Arc::new(AtomicBool::new(false));
 
                 let (write, read) = ws_stream.split();
                 let write = Arc::new(Mutex::new(write));
@@ -526,9 +538,10 @@ async fn relay_loop(
                 let last_inbound_ms = Arc::new(AtomicU64::new(now_epoch_ms()));
                 let last_inbound_inbound = last_inbound_ms.clone();
                 let last_inbound_keepalive = last_inbound_ms.clone();
+                let connected_ack_inbound = connected_ack.clone();
 
                 tokio::select! {
-                    _ = handle_inbound(read, state_inbound, write_inbound, last_inbound_inbound) => {
+                    _ = handle_inbound(read, state_inbound, write_inbound, last_inbound_inbound, connected_ack_inbound) => {
                         warn!("Backend relay inbound handler ended");
                     }
                     _ = handle_outbound(&mut event_rx, write_outbound, state_outbound) => {
@@ -687,6 +700,12 @@ async fn handle_inbound<S>(
         Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
     >,
     last_inbound_ms: Arc<AtomicU64>,
+    // Set to `true` once the backend's `connected` application-ack has been
+    // processed. If the socket closes/errors while this is still `false`, the
+    // server accepted the TCP/WS handshake but rejected us before completing
+    // registration — record the close reason as an actionable `last_error`
+    // instead of leaving `ws_connected=false` + `last_error=null`.
+    connected_ack: Arc<AtomicBool>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -709,6 +728,10 @@ async fn handle_inbound<S>(
                     // capture runner_id on the shared state.
                     if msg_type == "connected" {
                         handle_connected_message(&api_state, &data).await;
+                        // The registration ack arrived: the relay is fully
+                        // up. Mark the ack so a later close isn't
+                        // misclassified as close-before-ack.
+                        connected_ack.store(true, Ordering::Relaxed);
                         continue;
                     }
 
@@ -739,10 +762,37 @@ async fn handle_inbound<S>(
                 } else {
                     info!("Backend relay WS closed (no close frame)");
                 }
+                // If the server closed us before the `connected` ack, this
+                // is a registration rejection (e.g. device-bridge register
+                // failed because Redis pairing is down). Surface it as a
+                // non-null `last_error` so status queries show an actionable
+                // reason instead of a silent `ws_connected=false` /
+                // `last_error=null`.
+                if !connected_ack.load(Ordering::Relaxed) {
+                    let detail = match frame {
+                        Some(f) if !f.reason.is_empty() => {
+                            format!("code={}, reason={}", f.code, f.reason)
+                        }
+                        Some(f) => format!("code={}", f.code),
+                        None => "no close frame".to_string(),
+                    };
+                    record_connection_error(&api_state, close_before_ack_error(&detail)).await;
+                }
                 return;
             }
             Err(e) => {
                 warn!("Backend relay read error: {}", e);
+                if !connected_ack.load(Ordering::Relaxed) {
+                    record_connection_error(
+                        &api_state,
+                        format!(
+                            "Backend relay read error before the `connected` ack \
+                             (registration rejected): {}",
+                            e
+                        ),
+                    )
+                    .await;
+                }
                 return;
             }
             _ => {}
@@ -794,6 +844,11 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
     };
 
     sm_state.set_ws_connected(true);
+    // Clear any prior connection error ONLY now that the backend has
+    // acknowledged our registration. Clearing on the bare handshake (the
+    // old behavior) masked register-path rejections that close the socket
+    // after accept but before this ack.
+    clear_connection_error(api_state).await;
 
     let id_str = data
         .get("device_id")
@@ -1034,6 +1089,19 @@ async fn handle_outbound<S>(
             }
         }
     }
+}
+
+/// Build the `last_error` text for a socket that closed *before* the
+/// backend's `connected` application-ack. The server accepted the TCP/WS
+/// handshake but rejected us during registration (e.g. the device-bridge
+/// register path failed because Redis pairing is down). Surfacing this as a
+/// non-null, actionable error avoids the misleading `ws_connected=false` /
+/// `last_error=null` state that previously stymied diagnosis.
+fn close_before_ack_error(detail: &str) -> String {
+    format!(
+        "Backend closed the WS before the `connected` ack (registration rejected): {}",
+        detail
+    )
 }
 
 async fn record_connection_error(api_state: &Arc<ApiState>, msg: String) {
@@ -2406,6 +2474,45 @@ mod tests {
         assert!(
             !is_unauthorized(&err),
             "ConnectionClosed MUST NOT trigger a refresher kick"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // close-before-ack diagnosability.
+    //
+    // The relay now defers `clear_connection_error` until the backend's
+    // `connected` ack arrives (see `handle_connected_message`), and on a
+    // close/error *before* that ack it records an actionable `last_error`
+    // via `close_before_ack_error`. These pin the message shape so a
+    // future refactor can't silently regress back to `last_error=null`
+    // (the ambiguous state that cost real time during the Redis-disabled
+    // pairing outage).
+
+    #[test]
+    fn close_before_ack_error_includes_code_and_reason() {
+        let msg = close_before_ack_error("code=1011, reason=register failed");
+        assert!(
+            msg.contains("before the `connected` ack"),
+            "must name the close-before-ack condition: {msg}"
+        );
+        assert!(
+            msg.contains("registration rejected"),
+            "must flag this as a registration rejection: {msg}"
+        );
+        assert!(
+            msg.contains("code=1011") && msg.contains("register failed"),
+            "must carry the actionable close code/reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn close_before_ack_error_is_non_empty_without_close_frame() {
+        // A close with no frame still yields a non-null, descriptive error
+        // rather than the old silent `ws_connected=false` / `last_error=null`.
+        let msg = close_before_ack_error("no close frame");
+        assert!(
+            !msg.is_empty() && msg.contains("no close frame"),
+            "must remain actionable even with no close frame: {msg}"
         );
     }
 
