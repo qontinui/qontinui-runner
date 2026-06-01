@@ -592,15 +592,24 @@ fn qontinui_root_dir() -> Option<PathBuf> {
 /// from the validated JWT claims, so no `AGENT_NAME`/`AGENT_LANE`/`TOPIC`/
 /// `DEVICE_ID` env vars are needed in the config.
 ///
-/// DEPLOY GATING — DO NOT MERGE/DEPLOY THIS RUNNER CHANGE BEFORE the
-/// coord-native `/mcp` endpoint (coord branch `feat/coord-native-coordination-mcp`)
-/// is live on the target coord deployment (staging). If this config points at
-/// a coord that has no `/mcp` route, agents get an unreachable MCP server:
-/// Claude Code degrades gracefully and runs *without* coord tools, which is a
-/// silent coordination regression. Sequence the coord deploy first.
+/// The coord-native `/mcp` endpoint is live (coord PR #277 Phase-2 cutover),
+/// so this no longer carries the prior "do not deploy" gate. If a target coord
+/// ever lacks the `/mcp` route, agents get an unreachable MCP server: Claude
+/// Code degrades gracefully and runs *without* coord tools (a silent
+/// coordination regression) — so always sequence a coord `/mcp` deploy ahead
+/// of pointing runners at a new coord.
+///
+/// Coord base resolution: `COORD_HTTP_URL` env → active profile's `coord_url`
+/// → localhost fallback. Previously this read ONLY the env var, so a
+/// profile-configured runner (production → `coord.qontinui.io`) wrote a
+/// `localhost` MCP url into the agent's `.mcp.json`, silently pointing spawned
+/// agents at the wrong coord.
 fn write_coord_mcp_config(primary_wt: &str, payload: &LaunchPayload) {
-    let coord_url =
-        std::env::var("COORD_HTTP_URL").unwrap_or_else(|_| "http://localhost:9870".to_string());
+    let coord_url = std::env::var("COORD_HTTP_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(coord_http_base)
+        .unwrap_or_else(|| "http://localhost:9870".to_string());
     let mcp_url = format!("{}/mcp", coord_url.trim_end_matches('/'));
 
     let mcp_config = serde_json::json!({

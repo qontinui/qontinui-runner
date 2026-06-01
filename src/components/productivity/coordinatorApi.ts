@@ -387,13 +387,13 @@ export async function listOverlappingIntents(
 // operators an in-runner affordance so they don't have to flip to the
 // browser console to spawn agents during readiness rollouts.
 //
-// The runner reaches coord directly at `coordHttpBase()` (same fallback
-// pattern as ConflictModal.tsx); coord is LAN-trusted in the runner's
-// dev posture. A future deployment-config milestone will harden this
-// path (mTLS / signed JWT) before the runner ships to non-trusted
-// networks — at which point this helper becomes a Tauri-command proxy
-// like `getFleetHealth`. For now it's a plain `fetch` to keep the
-// surface small and reviewable.
+// The coord base is now resolved by the runner backend
+// (`get_coord_http_base`: env → profile `coord_url` → localhost), so the
+// in-app button reaches the SAME coord as backend session-sync rather than
+// a hardcoded localhost. The POST itself is still a plain `fetch` and coord
+// is LAN-trusted in the current pilot posture; the auth hardening (device
+// JWT on this call + coord-side gating, tracked in the Bar-2 / Phase-7
+// fleet-auth plan) lands separately before serving non-trusted networks.
 // ---------------------------------------------------------------------------
 
 /** Wire shape returned by coord's POST /agents/spawn. Extra fields are
@@ -407,10 +407,18 @@ export interface SpawnAgentResult {
   [k: string]: unknown;
 }
 
-/** Default coord HTTP base — same fallback as ConflictModal.tsx; a
- *  future Tauri command (`get_coord_http_base`) will replace this
- *  when production deployments need a non-default base. */
-function defaultCoordHttpBase(): string {
+/** Resolve coord's HTTP base from the runner backend (env `COORD_HTTP_URL`
+ *  → active profile `coord_url` → localhost), so in-app spawn reaches the
+ *  SAME coord the backend session-sync uses — not a hardcoded localhost.
+ *  Falls back to localhost only if the command is unavailable (e.g. unit
+ *  tests, which pass `coordBase` explicitly and never hit this path). */
+async function resolveCoordHttpBase(): Promise<string> {
+  try {
+    const base = await invoke<string>("get_coord_http_base");
+    if (base && base.trim()) return base.trim();
+  } catch {
+    // command unavailable — fall through to localhost default
+  }
   return "http://localhost:9870";
 }
 
@@ -437,7 +445,7 @@ export async function spawnFromPlan(
   declaredOverlapPaths?: string[],
   coordBase?: string,
 ): Promise<SpawnAgentResult> {
-  const base = coordBase ?? defaultCoordHttpBase();
+  const base = coordBase ?? (await resolveCoordHttpBase());
   const url = new URL("/agents/spawn", base);
   const body = {
     plan_slug: planSlug,

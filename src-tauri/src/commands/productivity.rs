@@ -1804,6 +1804,15 @@ fn coord_http_base_for_fleet() -> String {
     "http://localhost:9870".to_string()
 }
 
+/// `get_coord_http_base` — expose the runner's resolved coord HTTP base
+/// to the frontend so in-app surfaces (e.g. Spawn-from-Plan) reach the
+/// SAME coord the backend session-sync uses, instead of a hardcoded
+/// `localhost:9870`. Mirrors the `get_fleet_health` proxy pattern.
+#[tauri::command]
+pub fn get_coord_http_base() -> String {
+    coord_http_base_for_fleet()
+}
+
 /// `get_fleet_health` — fetch coord's fleet-health rollup + active
 /// alerts in one call for the dashboard panel. Returns the merged JSON
 /// `{ health: <coord /fleet/health>, alerts: [...], coordBase }`.
