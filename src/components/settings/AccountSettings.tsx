@@ -12,7 +12,10 @@
  *     listens for indirectly via `runner-tier-changed`.
  *
  *   - Tier 2: shows the signed-in account (when available) and a "Sign
- *     out" button that drops the runner back to Tier Local.
+ *     out" button. Signing out clears the runner token but KEEPS the
+ *     runner at Tier 2 (unauthenticated), so the app returns to the
+ *     LoginScreen to sign in again / switch accounts — it does NOT drop
+ *     to local-guest (that is a separate first-run SetupWizard choice).
  *
  * The component is intentionally lean — token/runner_id/heartbeat
  * diagnostics live in the existing `WebIntegrationSettings` panel. This
@@ -123,19 +126,21 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
     setFlowError(null);
     try {
       await invoke("qontinui_sign_out");
-      // FE re-fires the tier-change event so AuthProvider re-syncs to the
-      // synthesized local-guest auth without waiting for a poll cycle.
+      // The runner stays Tier 2 but unauthenticated (token cleared), so
+      // re-fire the tier-change event: AuthProvider re-runs
+      // `check_auth_status` (now `authenticated: false`) and the App gate
+      // `isTier2 && !authenticated` renders the LoginScreen.
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
       await refreshTier();
-      // Drop the JWT-flow auth state locally as well so the LoginScreen
-      // doesn't briefly show on the next render.
+      // Clear the local JWT-flow auth state immediately so the gate flips
+      // to the LoginScreen without waiting for the re-check round-trip.
       try {
         await clearAuthState();
       } catch {
-        // clearAuthState invokes the Tier-2 `logout` command which now
-        // errors with "Tier 0/1 — no auth"; that's expected and harmless.
+        // clearAuthState invokes the `logout` command, which may error now
+        // that the token is already cleared; that's expected and harmless.
       }
-      onLog("info", "Signed out — runner returned to Tier Local");
+      onLog("info", "Signed out — sign in again on the login screen");
     } catch (err) {
       const msg = typeof err === "string" ? err : String(err);
       setFlowError(msg);
@@ -250,8 +255,8 @@ function SignedInPanel({ email, userId, name, signingOut, onSignOut }: SignedInP
         Sign out
       </button>
       <p className="text-xs text-muted-foreground">
-        Signing out clears the runner token and drops the runner to Tier Local. Local automation and
-        captures continue to work; cloud features become unavailable until you sign in again.
+        Signing out clears the runner token and returns you to the sign-in screen, where you can sign
+        in again or switch accounts.
       </p>
     </div>
   );
