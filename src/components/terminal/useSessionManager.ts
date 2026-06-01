@@ -284,6 +284,13 @@ export interface UseSessionManagerReturn {
 
   // Derived
   allAccounts: string[];
+  /**
+   * The operator-CONFIGURED Claude account config dirs (from
+   * `claude_config_dirs` settings) — distinct from `accountUsage`, which
+   * also probes transcript-derived dirs (e.g. the default `~/.claude`).
+   * New AI sessions must only spawn into a configured account.
+   */
+  savedConfigDirs: string[];
 
   // Stats
   frozenCount: number;
@@ -960,6 +967,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     sessionLabels,
     setSessionLabel,
     allAccounts,
+    savedConfigDirs,
     frozenCount,
     needsInputCount,
     activeCount,
