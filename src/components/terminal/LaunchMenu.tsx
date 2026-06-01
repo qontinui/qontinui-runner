@@ -11,6 +11,7 @@ import type {
   FileRegistryInfoEntry,
   PredictedCollision,
 } from "./useSessionManager";
+import { compareByUsageHeadroom } from "../settings/types";
 
 interface LaunchMenuProps {
   onCreatePlain: (count: number) => void;
@@ -521,7 +522,7 @@ export function LaunchMenu({
   }, [runProbe]);
 
   const sortedAccounts = useMemo(
-    () => [...accountUsage].sort((a, b) => (a.utilization ?? 0) - (b.utilization ?? 0)),
+    () => [...accountUsage].sort(compareByUsageHeadroom),
     [accountUsage],
   );
 

@@ -54,6 +54,13 @@ export interface AccountUsageInfo {
   resets_at: number | null;
   status: string | null;
   error: string | null;
+  /**
+   * Actual minus expected utilization (negative = under projected usage).
+   * Supplied by the `check_accounts_usage` backend; used to pick the
+   * account with the most headroom relative to its projection. Optional
+   * because older probe results / error rows may omit it.
+   */
+  usage_delta?: number | null;
 }
 
 export interface FileLockInfo {

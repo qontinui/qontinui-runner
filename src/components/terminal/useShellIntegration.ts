@@ -145,13 +145,16 @@ export function useShellIntegration({
       // Windows terminals use PowerShell ($env:VAR), others use bash (VAR=val cmd).
       const configDir = session.config_dir;
       const isWindows = navigator.platform.startsWith("Win");
+      // Resume autonomously (`--permission-mode bypassPermissions`) to match
+      // the operator's clg/clh/clp wrappers — a resumed session shouldn't
+      // stall on a permission prompt either.
       let resumeCmd: string;
       if (configDir) {
         resumeCmd = isWindows
-          ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude --resume ${session.session_id}`
-          : `CLAUDE_CONFIG_DIR="${configDir}" claude --resume ${session.session_id}`;
+          ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude --permission-mode bypassPermissions --resume ${session.session_id}`
+          : `CLAUDE_CONFIG_DIR="${configDir}" claude --permission-mode bypassPermissions --resume ${session.session_id}`;
       } else {
-        resumeCmd = `claude --resume ${session.session_id}`;
+        resumeCmd = `claude --permission-mode bypassPermissions --resume ${session.session_id}`;
       }
       pendingResumeRef.current = { tabId, resumeCmd };
 

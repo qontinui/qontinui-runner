@@ -24,6 +24,7 @@ import type {
 } from "./types";
 import { EXECUTION_MODE_OPTIONS } from "./types";
 import type { CliExecutionMode } from "../types";
+import { compareByUsageHeadroom } from "../types";
 
 interface ClaudeCliSectionProps {
   settings: AiSettings;
@@ -219,7 +220,7 @@ export function ClaudeCliSection({
         setAccountUsages(result.data);
         const best = result.data
           .filter((a) => !a.error)
-          .sort((a, b) => a.utilization - b.utilization)[0];
+          .sort(compareByUsageHeadroom)[0];
         if (best) {
           onLog(
             "success",
@@ -395,7 +396,7 @@ export function ClaudeCliSection({
                   accountUsages.length > 0 &&
                   accountUsages
                     .filter((a) => !a.error)
-                    .sort((a, b) => a.utilization - b.utilization)[0]?.config_dir === dir;
+                    .sort(compareByUsageHeadroom)[0]?.config_dir === dir;
 
                 return (
                   <div
