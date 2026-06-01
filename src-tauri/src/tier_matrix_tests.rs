@@ -285,7 +285,7 @@ fn tier_promotion_local_to_qontinui_sets_user_id() {
 }
 
 #[test]
-fn tier_downgrade_qontinui_to_local_clears_state() {
+fn sign_out_stays_tier2_unauthenticated_clears_token() {
     // Starting state: signed-in Tier 2 install.
     let mut s = settings_with(RunnerTier::QontinuiAccount, "qontinui_runner_signed_in");
     s.qontinui_user_id = Some("u456".to_string());
@@ -293,32 +293,41 @@ fn tier_downgrade_qontinui_to_local_clears_state() {
     s.tier_initialized = true;
 
     // Apply the sign-out path (mirrors commands::auth::qontinui_sign_out):
+    // clear the token + user id but KEEP Tier 2 so the App gate
+    // `isTier2 && !authenticated → LoginScreen` renders the login screen
+    // rather than silently dropping to the local-guest app shell. Local
+    // guest is a separate, deliberate SetupWizard tier choice — not a
+    // side effect of signing out of an account.
     s.web_integration.runner_token = String::new();
     s.qontinui_user_id = None;
-    s.tier = RunnerTier::Local;
+    s.tier = RunnerTier::QontinuiAccount;
 
-    assert_eq!(s.tier, RunnerTier::Local);
+    assert_eq!(
+        s.tier,
+        RunnerTier::QontinuiAccount,
+        "sign-out must stay Tier 2 (unauthenticated) so the LoginScreen shows"
+    );
     assert!(s.qontinui_user_id.is_none());
     assert!(s.web_integration.runner_token.is_empty());
     assert_eq!(
         s.local_user_id, "local-uuid-keeps",
-        "local_user_id must survive downgrade — local DB rows are keyed on it \
+        "local_user_id must survive sign-out — local DB rows are keyed on it \
          per Phase 1 of the tier-decoupling plan"
     );
-    // Post-downgrade: tier wins, regardless of whether the JWT slot was
-    // cleared. Exercise both has_jwt arms to nail down the tier-precedence.
+    // Post-sign-out the device-JWT slot is cleared, so the relay idles
+    // because there is no JWT to authenticate the WS — even though tier is
+    // still Tier 2.
     assert!(
         should_relay_idle_with(s.tier, s.web_integration.enabled, false),
-        "post-downgrade (tier=Local) with cleared JWT must idle the relay"
+        "post-sign-out (tier=Tier2 but cleared JWT) must idle the relay"
     );
+    // The tier gate alone now passes (still Tier 2); actual cloud auth
+    // fails downstream on the empty token / missing JWT, which surfaces as
+    // `check_auth_status` → authenticated:false → LoginScreen.
     assert!(
-        should_relay_idle_with(s.tier, s.web_integration.enabled, true),
-        "post-downgrade (tier=Local) must idle even if a JWT lingers — \
-         tier gate is strict"
-    );
-    assert!(
-        require_tier_2_for(s.tier).is_err(),
-        "post-downgrade tier must block cloud auth commands"
+        require_tier_2_for(s.tier).is_ok(),
+        "sign-out keeps Tier 2, so the tier gate itself stays open; \
+         authentication fails on the cleared token, not the tier"
     );
 }
 

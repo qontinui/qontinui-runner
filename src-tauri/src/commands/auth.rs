@@ -809,13 +809,28 @@ async fn cognito_sign_in_password_impl(
     finalize_signed_in(login, base).await
 }
 
-/// Clears the runner token, drops the runner back to Tier 0/1, and kicks
-/// the relay so the WS connection closes cleanly.
+/// Clears the runner token but KEEPS the runner at Tier 2
+/// (`QontinuiAccount`) in an *unauthenticated* state, and kicks the relay
+/// so the WS connection closes cleanly.
 ///
-/// Used by `AccountSettings.tsx`'s "Sign out" button. The FE is expected
-/// to dispatch a `runner-tier-changed` window event after this call
-/// returns Ok so `useRunnerTier` consumers (notably `AuthProvider`)
-/// re-read and switch back to the synthesized local-guest auth.
+/// Used by `AccountSettings.tsx`'s "Sign out" button. An explicit "Sign
+/// out" is a deliberate "I want to sign in again / switch accounts"
+/// action, so the runner must land on the `LoginScreen` rather than
+/// silently continue as a local guest. The App gate
+/// (`isTier2 && !authStatus.authenticated → LoginScreen`) renders the
+/// login screen precisely for this Tier-2-unauthenticated state, so we
+/// clear the token (→ `check_auth_status` reports `authenticated: false`)
+/// while leaving `tier = QontinuiAccount`.
+///
+/// This intentionally does NOT drop to `RunnerTier::Local`: the
+/// local-guest tier is a *separate, deliberate* entry point chosen at
+/// first-run via the SetupWizard's tier selector, not a side effect of
+/// signing out of an account.
+///
+/// The FE is expected to dispatch a `runner-tier-changed` window event
+/// after this call returns Ok so `useRunnerTier` consumers (notably
+/// `AuthProvider`) re-read the tier and re-run `check_auth_status`, which
+/// now returns unauthenticated → the gate shows `LoginScreen`.
 ///
 /// # Errors
 ///
@@ -824,10 +839,10 @@ async fn cognito_sign_in_password_impl(
 /// surfaced to the caller.
 #[tauri::command]
 pub async fn qontinui_sign_out() -> Result<(), String> {
-    info!("qontinui_sign_out: clearing token + dropping to Tier Local");
+    info!("qontinui_sign_out: clearing token + staying Tier 2 (unauthenticated) so the LoginScreen shows");
 
     // Best-effort: a stale keychain entry is annoying but not fatal —
-    // the gating checks all run off the `tier` field below.
+    // the gating checks all run off the `tier` field + cleared token below.
     let auth_manager = AuthManager::new();
     if let Err(e) = auth_manager.clear_tokens() {
         warn!("qontinui_sign_out: clear_tokens failed (continuing): {}", e);
@@ -836,7 +851,10 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
     let mut s = settings::load_settings();
     s.web_integration.runner_token = String::new();
     s.qontinui_user_id = None;
-    s.tier = settings::RunnerTier::Local;
+    // Keep tier == QontinuiAccount so the App gate renders LoginScreen for
+    // this Tier-2-unauthenticated state instead of falling through to the
+    // synthesized local-guest app shell.
+    s.tier = settings::RunnerTier::QontinuiAccount;
     s.tier_initialized = true;
     if crate::instance::is_secondary() {
         warn!(
