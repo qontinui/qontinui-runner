@@ -125,6 +125,26 @@ export interface AccountUsageInfo {
   period_remaining_days: number | null;
 }
 
+/**
+ * Comparator for "best account" selection. Prefers the account furthest
+ * UNDER its projected usage — i.e. the most-negative `usage_delta`
+ * (actual minus expected), which is "least usage relative to its
+ * projected usage". Falls back to raw `utilization` when `usage_delta`
+ * is unavailable (e.g. `expected_utilization` is null). Ascending: the
+ * best (most headroom) account sorts first.
+ *
+ * Structurally typed so both `AccountUsageInfo` shapes (settings + the
+ * terminal subset in `useSessionManager`) can use the one comparator.
+ */
+export function compareByUsageHeadroom(
+  a: { utilization: number; usage_delta?: number | null },
+  b: { utilization: number; usage_delta?: number | null },
+): number {
+  const ka = a.usage_delta ?? a.utilization ?? 0;
+  const kb = b.usage_delta ?? b.utilization ?? 0;
+  return ka - kb;
+}
+
 export interface ClaudeApiSettings {
   model: string;
   max_tokens: number;

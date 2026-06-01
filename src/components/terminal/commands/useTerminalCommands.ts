@@ -38,6 +38,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 
 import { useTerminalSession, useTransitionEffects, useUIStateCx, useZoneMetadata } from "../contexts";
 import type { AccountUsageInfo } from "../useSessionManager";
+import { compareByUsageHeadroom } from "../../settings/types";
 import type { ResultCardSpec } from "../result-card";
 import { buildMetricsCardSpec, buildHistoryCardSpec } from "../result-card";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
@@ -166,9 +167,10 @@ function readZoneArg(
 
 /**
  * Look up a `configDir` from an `account` arg. `"best"` (or empty
- * string) resolves to the lowest-utilization account. Returns `null`
- * when no matching account exists — handlers surface that as
- * `code: "no-account"`.
+ * string) resolves to the account with the most headroom relative to its
+ * projected usage (most-negative `usage_delta`; see
+ * `compareByUsageHeadroom`). Returns `null` when no matching account
+ * exists — handlers surface that as `code: "no-account"`.
  */
 function resolveAccountConfigDir(
   account: unknown,
@@ -177,9 +179,7 @@ function resolveAccountConfigDir(
   if (accounts.length === 0) return null;
   const raw = typeof account === "string" ? account.trim().toLowerCase() : "";
   if (raw === "" || raw === "best" || raw === "@best") {
-    const sorted = [...accounts].sort(
-      (a, b) => (a.utilization ?? 0) - (b.utilization ?? 0),
-    );
+    const sorted = [...accounts].sort(compareByUsageHeadroom);
     return sorted[0]?.config_dir ?? null;
   }
   const match = accounts.find(

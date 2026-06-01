@@ -623,11 +623,16 @@ function TerminalPageInner({
 
     const isWindows = navigator.platform.startsWith("Win");
     const customCmd = sessionManager.launchCommands?.[configDir];
+    // Default to autonomous mode (`--permission-mode bypassPermissions`),
+    // matching the operator's `clg`/`clh`/`clp` wrappers — runner-spawned
+    // AI sessions are for autonomous development and must not stall on a
+    // permission prompt. An explicit per-account launch command (if
+    // configured in settings) still overrides.
     const cmd = customCmd
       ? customCmd
       : isWindows
-        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude`
-        : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
+        ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude --permission-mode bypassPermissions`
+        : `CLAUDE_CONFIG_DIR="${configDir}" claude --permission-mode bypassPermissions`;
     const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
     const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
     const createdTabIds: string[] = [];

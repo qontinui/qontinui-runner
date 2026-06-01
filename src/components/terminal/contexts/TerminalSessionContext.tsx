@@ -234,7 +234,9 @@ export function TerminalSessionProvider({
 
     const isWindows = navigator.platform.startsWith("Win");
     const buildResumeCmd = (sessionId: string, configDir: string | undefined) => {
-      const base = `claude --resume ${sessionId}`;
+      // Autonomous resume (matches clg/clh/clp) so a re-attached session
+      // doesn't stall on a permission prompt.
+      const base = `claude --permission-mode bypassPermissions --resume ${sessionId}`;
       if (!configDir) return `${base}\r`;
       return isWindows
         ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; ${base}\r`
