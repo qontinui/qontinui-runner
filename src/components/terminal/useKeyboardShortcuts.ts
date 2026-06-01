@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { LAYOUT_PRESETS, type SessionState } from "./useZoneLayout";
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
+import { getById } from "./commands";
 
 interface UseKeyboardShortcutsParams {
   activeId: string | null;
@@ -242,6 +243,17 @@ export function useKeyboardShortcuts({
       if (e.ctrlKey && e.shiftKey && e.key === "?") {
         e.preventDefault();
         dispatch({ type: "TOGGLE_SHORTCUTS" });
+        return;
+      }
+      // Ctrl+Shift+H → pop the event-history result card. Fires the
+      // `terminal.history` registry action (single source of truth) so
+      // this binding can't drift from the /history slash command — that
+      // handler closes over the page's `showCard`. The hook has no
+      // `showCard` of its own, so reaching the registry by id is the
+      // clean path (no prop-drilling a card callback through every page).
+      if (e.ctrlKey && e.shiftKey && e.key === "H") {
+        e.preventDefault();
+        void getById("terminal.history")?.handler({}, { source: "hotkey" });
         return;
       }
       if (e.ctrlKey && e.shiftKey && e.key === "ArrowLeft") {

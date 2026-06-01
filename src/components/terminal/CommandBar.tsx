@@ -415,10 +415,21 @@ export function CommandBar() {
     setFocused(true);
   }, []);
 
-  const dropdownVisible = focused && matches.length >= 0;
+  // Surface matches when the input is focused OR when there's query
+  // content. Gating solely on `focused` meant an external driver (UI
+  // Bridge `type`/`setValue`, which sets the value + fires `input` but
+  // not `focus`) could never open the dropdown — and any environment
+  // that drops the focus event saw the same dead resolver. Keying off
+  // query content makes match-surfacing correct regardless of how input
+  // arrives, and removes the `dispatchEvent(FocusEvent('focus'))`
+  // workaround from on-page slash tests.
+  const dropdownVisible = (focused || query.trim().length > 0) && matches.length >= 0;
 
   return (
-    <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-40 w-[420px] pointer-events-none">
+    <div
+      data-page-element="command-bar"
+      className="absolute bottom-2 left-1/2 -translate-x-1/2 z-40 w-[420px] pointer-events-none"
+    >
       {/* Status line — sits above the input, visible briefly after execute. */}
       {status && !focused && (
         <div className="mb-1 px-2 py-1 text-[10px] rounded bg-[#1a1b26]/90 border border-[#2a2d3d]/60 backdrop-blur-sm pointer-events-auto">

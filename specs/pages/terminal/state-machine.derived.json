@@ -827,67 +827,6 @@
       }
     },
     {
-      "id": "term-plan-cli-script",
-      "name": "Plan Implementation CLI Script",
-      "description": "A standalone CLI script (scripts/run-plan-implementation.ts) allows launching plan implementation workflows from any Claude Code session without the runner UI. The script parses markdown plan files, builds the same multi-stage workflow as the UI Implement button, and POSTs it to the runner execute-inline endpoint. It supports --dry-run for inspection and --follow for streaming progress.",
-      "assertions": [
-        {
-          "id": "term-plan-cli-script-elem-0",
-          "description": "Required element 0 for state Plan Implementation CLI Script",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "Parsed"
-            },
-            "label": "Required element for Plan Implementation CLI Script"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "term-plan-cli-script-elem-1",
-          "description": "Required element 1 for state Plan Implementation CLI Script",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "execute-inline"
-            },
-            "label": "Required element for Plan Implementation CLI Script"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        },
-        {
-          "id": "term-plan-cli-script-elem-2",
-          "description": "Required element 2 for state Plan Implementation CLI Script",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContains": "follow"
-            },
-            "label": "Required element for Plan Implementation CLI Script"
-          },
-          "source": "migrated",
-          "reviewed": false,
-          "enabled": true
-        }
-      ],
-      "provenance": {
-        "source": "migrated"
-      }
-    },
-    {
       "id": "term-commit-traffic-light",
       "name": "Per-Tab Commit Traffic Light",
       "description": "Each terminal tab that hosts an active Claude Code AI session displays a per-tab git \"commit traffic light\" + commit-progress button beside the existing file-lock icon (TerminalTabBar.tsx:~493). The traffic light is a small colored dot rendered by `<CommitTrafficLight>` (qontinui-runner/src/components/terminal/CommitTrafficLight.tsx) reflecting the session's git working-tree state restricted to the files THAT session has touched. Five states: `empty` (gray, default — tracker has no rows yet), `clean` (green — every touched file matches HEAD), `dirty` (yellow — at least one touched file differs from HEAD), `merging` (red — at least one touched repo has MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase-merge/rebase-apply), and `unknown` (no dot rendered — backend probe failed or generated_at_ms is older than 5 minutes). Beside the dot, a GitCommit-icon button labeled \"Commit progress\" (button-commit-progress) is enabled only when status is `dirty`; on click, PTY tabs receive a multi-line `COMMIT_PROMPT_TEMPLATE` typed via `writeToTerminal` that asks the AI to verify-and-commit only its own writes (cross-references its tool-call transcript, runs `git status --porcelain` / `git diff --stat` against the touched paths only, refuses to commit during in-progress merges, omits the Co-Authored-By trailer per the runner pre-commit hook). SDK chat sessions take the equivalent `send_user_message` Tauri invoke path. State source: the Tauri command `get_session_commit_state(taskRunId)` returns `{status, touched_count, dirty_count, repo_roots[], merging_repos[], generated_at_ms}` with lowercase status enum and snake_case fields. The `useCommitState` hook (qontinui-runner/src/components/terminal/useCommitState.ts) listens for `commit-state-changed` Tauri events `{type, task_run_id, state}` keyed by tab.claudeSessionId and additionally polls every 30 seconds. Events are emitted from three sites with a 500 ms per-session debounce: dispatcher.rs after every Edit/Write the SDK reports, mcp/ai_session.rs::commit_session_progress_inner success/no-op branches, and terminal/transcript_watcher.rs after the JSONL watcher records a new TouchedFile via pg.record_file_touched. The watcher backend (terminal/transcript_watcher.rs + extended terminal/transcript.rs parser) populates `coord.session_touched_files` for PTY-launched tabs, since `auto_register_file` in dispatcher.rs only fires for SDK-driven sessions; the watcher tails ~/.claude/projects/<encoded>/<session_id>.jsonl and parses Edit/Write/MultiEdit `tool_use` blocks. Workflow-spawned bypassPermissions sessions are filtered out via `is_workflow_session` so they never pollute the tracker. The `useTabSessionIdCapture` hook (qontinui-runner/src/components/terminal/useTabSessionIdCapture.ts) populates `tab.claudeSessionId` post-spawn by polling the existing `transcript_get_latest` Tauri command for ~15 s after `writeWhenReady` fires (PTY launches don't carry a session-id OSC — verified at `useShellIntegration.ts:67-118` and `TerminalInstance.tsx:699-704`; resumed sessions already have it set via `useShellIntegration.ts:135`). Without `claudeSessionId`, the traffic light wrapper still mounts but the state is treated as `unknown` and the button stays disabled.",
