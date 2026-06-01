@@ -664,10 +664,23 @@ function TerminalPageInner({
   // closeTerminal, transitionEffects.handleRestartInZone, terminalRefs)
   // directly from contexts. No visible UI change today — the registry is
   // populated for future CommandBar / palette / AI-tier consumers.
+  // New AI sessions must only target operator-CONFIGURED accounts. The
+  // `accountUsage` list also probes transcript-derived dirs (the default
+  // `~/.claude` from prior sessions), which previously let `/spawn-ai best`
+  // resolve to an unauthenticated default account. Restrict spawn
+  // candidates to `claude_config_dirs`; fall back to the full list only
+  // when nothing is configured yet.
+  const spawnAccounts =
+    sessionManager.savedConfigDirs.length > 0
+      ? sessionManager.accountUsage.filter((a) =>
+          sessionManager.savedConfigDirs.includes(a.config_dir),
+        )
+      : sessionManager.accountUsage;
+
   useTerminalCommands({
     spawnPlain: handleQuickLaunch,
     spawnAi: handleLaunchAiSession,
-    accounts: sessionManager.accountUsage,
+    accounts: spawnAccounts,
     sortZones: handleSortZones,
     exportAll: handleExportOutput,
     openDocFinder: () => setShowDocFinder(true),
