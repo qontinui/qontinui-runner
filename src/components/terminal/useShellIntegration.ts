@@ -3,6 +3,7 @@ import type { ShellIntegrationEvent } from "./TerminalInstance";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
+import { rememberSessionId } from "./lastKnownSessionIds";
 
 export interface CommandHistoryEntry {
   command: string;
@@ -32,7 +33,9 @@ interface UseShellIntegrationParams {
   setSessionStates: React.Dispatch<React.SetStateAction<Record<string, SessionState>>>;
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
   setRightPanelMode: React.Dispatch<
-    React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
+    React.SetStateAction<
+      "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null
+    >
   >;
   setSelectedTranscriptSessionId: React.Dispatch<React.SetStateAction<string | null>>;
 }
@@ -135,6 +138,9 @@ export function useShellIntegration({
         claudeSessionId: session.session_id,
         claudeConfigDir: session.config_dir,
       });
+      // Persist durably so the tab stays resumable across a close→reopen even
+      // if the live tab object later loses the id.
+      rememberSessionId(tabId, session.session_id, session.config_dir);
 
       // Close the transcript panel so the terminal is visible
       setRightPanelMode(null);

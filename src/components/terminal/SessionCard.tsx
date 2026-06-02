@@ -139,7 +139,14 @@ export function SessionCard({
   onSetLabel,
   onAfterPromote,
 }: SessionCardProps) {
-  const statusInfo = STATUS_DOT[session.liveStatus];
+  const baseStatusInfo = STATUS_DOT[session.liveStatus];
+  // An orphaned "frozen" session has no live PTY in this window — it's simply
+  // not running here, so relabel the chip away from the alarming "Frozen" to a
+  // neutral, resumable read (color stays muted to match).
+  const statusInfo =
+    session.liveStatus === "frozen" && session.isOrphaned
+      ? { color: "#565f89", pulse: false, label: "Not running" }
+      : baseStatusInfo;
   const accountBadge = ACCOUNT_BADGE_COLORS[session.accountLabel];
   const durationLabel = formatDuration(session.durationMs);
 
@@ -396,13 +403,23 @@ export function SessionCard({
             </div>
           )}
 
-        {/* Frozen warning badge */}
-        {session.liveStatus === "frozen" && (
-          <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#f7768e]/80">
-            <AlertTriangle className="w-3 h-3" />
-            <span>Session appears frozen — may need resume</span>
-          </div>
-        )}
+        {/* Frozen / orphaned badge.
+            - Orphaned (no live PTY in this window): the transcript just isn't
+              open anywhere — it's resumable, not failed. Neutral copy + color.
+            - Genuinely stuck live session (a stale in-zone tab): keep the
+              warning treatment. */}
+        {session.liveStatus === "frozen" &&
+          (session.isOrphaned ? (
+            <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#565f89]">
+              <TerminalSquare className="w-3 h-3" />
+              <span>Not open in a window — click Resume to continue</span>
+            </div>
+          ) : (
+            <div className="mt-1 ml-3.5 flex items-center gap-1 text-[10px] text-[#f7768e]/80">
+              <AlertTriangle className="w-3 h-3" />
+              <span>Session appears stuck — may need resume</span>
+            </div>
+          ))}
 
         {/* File-lock waiting subtitle — sourced from useFileLockTracking
             via `sessionLockStates`. Same orange color convention as the

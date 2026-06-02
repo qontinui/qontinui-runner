@@ -41,6 +41,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { CommandResponse } from "./types";
 import type { TerminalTab } from "./useTerminalManager";
 import { createLogger } from "@/lib/logger";
+import { rememberSessionId } from "./lastKnownSessionIds";
 
 const logger = createLogger("TabSessionIdCapture");
 
@@ -52,13 +53,21 @@ interface TranscriptSessionPayload {
 }
 
 const POLL_INTERVAL_MS = 500;
-const POLL_TIMEOUT_MS = 15_000;
+// Widened from 15s → 45s. Claude CLI can take a while to write its first
+// transcript line under load (cold model spin-up, slow disk, busy runner), and
+// a miss here makes the tab unresumable at the next save. The poll is cheap
+// (one `transcript_get_latest` IPC per tick) and self-cancels the moment the id
+// is bound, so a longer ceiling costs nothing in the common (fast) case.
+const POLL_TIMEOUT_MS = 45_000;
 
 interface CaptureParams {
   updateTab: (
     id: string,
     updates: Partial<
-      Pick<TerminalTab, "isAlive" | "exitCode" | "workingDir" | "claudeSessionId" | "claudeConfigDir">
+      Pick<
+        TerminalTab,
+        "isAlive" | "exitCode" | "workingDir" | "claudeSessionId" | "claudeConfigDir"
+      >
     >,
   ) => void;
   /** Used to skip capture for tabs that already have a session id
@@ -141,8 +150,7 @@ export function useTabSessionIdCapture({
       // arbitrary points still get the latest value. Production cost
       // is a single getItem per debug call site.
       const debug = (): boolean =>
-        typeof localStorage !== "undefined" &&
-        localStorage.getItem("debug:tabSidCapture") === "1";
+        typeof localStorage !== "undefined" && localStorage.getItem("debug:tabSidCapture") === "1";
 
       if (debug()) {
         logger.debug("[tabSidCapture] start", { tabId, workingDir, configDir, spawnTimestamp });
@@ -221,6 +229,9 @@ export function useTabSessionIdCapture({
               claudeSessionId: data.session_id,
               claudeConfigDir: data.config_dir,
             });
+            // Persist durably so a later state churn / remount that drops the
+            // live id off the tab object can still be recovered at save time.
+            rememberSessionId(tabId, data.session_id, data.config_dir);
             handle.cancelled = true;
             inFlight.current.delete(tabId);
             return;
