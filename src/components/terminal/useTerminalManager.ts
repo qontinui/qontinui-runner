@@ -319,7 +319,12 @@ export function useTerminalManager(pageId: string = "default") {
       updates: Partial<
         Pick<
           TerminalTab,
-          "isAlive" | "exitCode" | "workingDir" | "claudeSessionId" | "claudeConfigDir"
+          | "isAlive"
+          | "exitCode"
+          | "workingDir"
+          | "claudeSessionId"
+          | "claudeConfigDir"
+          | "isReconnecting"
         >
       >,
     ) => {

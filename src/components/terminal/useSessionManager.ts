@@ -224,6 +224,14 @@ export interface UnifiedSession {
   lastMessagePreview: string;
   workSummaryHint: string;
   likelyFrozen: boolean;
+  /**
+   * True when this session has NO live PTY in the current window (it isn't
+   * open in any zone) — i.e. it's an orphaned transcript that can simply be
+   * resumed, as opposed to a genuinely stuck *live* session. Drives the
+   * "click to resume" copy instead of a "looks stuck" warning. Only
+   * meaningful when `liveStatus === "frozen"`.
+   */
+  isOrphaned: boolean;
 
   // Original transcript session (for resume)
   _transcript: TranscriptSession;
@@ -674,6 +682,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
             lastMessagePreview: "",
             workSummaryHint: "",
             likelyFrozen: liveStatus === "frozen",
+            // Injected fakes carry no real PTY tab — treat a frozen inject as
+            // orphaned so the resume affordance shows in debug demos.
+            isOrphaned: liveStatus === "frozen",
             _transcript: s,
           };
         }
@@ -744,6 +755,11 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           lastMessagePreview: digest?.last_message_preview ?? "",
           workSummaryHint: digest?.work_summary_hint ?? "",
           likelyFrozen: digest?.likely_frozen ?? false,
+          // "frozen" reached without a live PTY tab in this window means the
+          // transcript is merely orphaned (resumable), not a stuck live run.
+          // The `if (tab)` branch above is the only one that sets `frozen`
+          // *with* a live tab (a genuinely stale/stuck session).
+          isOrphaned: liveStatus === "frozen" && !tab,
           _transcript: s,
         };
       });

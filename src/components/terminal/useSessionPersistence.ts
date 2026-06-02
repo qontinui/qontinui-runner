@@ -1,7 +1,35 @@
 import { useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
+import { createLogger } from "@/lib/logger";
+import { recallSessionId } from "./lastKnownSessionIds";
 import type { CommandResponse } from "./types";
+
+const logger = createLogger("SessionPersistence");
+
+/**
+ * Resolve the effective Claude session id/config-dir for a tab at save time,
+ * preferring the live tab object but falling back to the durable last-known
+ * store when the live id was dropped (state churn / capture lag). This is what
+ * keeps a tab resumable across a close→reopen even if its in-memory id was lost.
+ */
+function resolveSessionId(tab: {
+  id: string;
+  claudeSessionId?: string;
+  claudeConfigDir?: string;
+}): { claudeSessionId?: string; claudeConfigDir?: string } {
+  if (tab.claudeSessionId) {
+    return { claudeSessionId: tab.claudeSessionId, claudeConfigDir: tab.claudeConfigDir };
+  }
+  const recalled = recallSessionId(tab.id);
+  if (recalled) {
+    return {
+      claudeSessionId: recalled.claudeSessionId,
+      claudeConfigDir: tab.claudeConfigDir ?? recalled.claudeConfigDir,
+    };
+  }
+  return { claudeSessionId: undefined, claudeConfigDir: tab.claudeConfigDir };
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,6 +85,41 @@ const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 function storageKey(pageId: string): string {
   return pageId === "default" ? BASE_STORAGE_KEY : `page:${pageId}:${BASE_STORAGE_KEY}`;
+}
+
+/**
+ * Anti-degradation predicate (defense-in-depth for the session-restore race).
+ *
+ * Returns true when an incoming save would DEGRADE the stored layout and must
+ * be skipped. The degenerate case the restore path produces: plain shells are
+ * recreated and `claudeSessionId` is re-attached only asynchronously, so a save
+ * that races that window persists a layout that has LOST the resumable Claude
+ * sessions — leaving nothing to resume on the next reopen.
+ *
+ * We skip iff:
+ *   - the stored layout is non-stale, AND
+ *   - it had at least one resumable Claude session, AND
+ *   - the incoming layout has strictly fewer resumable Claude sessions, AND
+ *   - the total tab count did NOT drop (same/more tabs, but they lost ids).
+ *
+ * A genuine "user closed a Claude tab" lowers the total count too and is
+ * allowed through (returns false).
+ *
+ * Exported for unit testing without booting React / the debounce timer.
+ */
+export function isDegradingSave(
+  incoming: Pick<SavedSessionLayout, "sessions">,
+  existing: SavedSessionLayout | null,
+  now: number,
+): boolean {
+  if (!existing) return false;
+  if (now - existing.savedAt >= STALE_THRESHOLD_MS) return false;
+  const existingClaude = existing.sessions.filter((s) => !!s.claudeSessionId).length;
+  if (existingClaude === 0) return false;
+  const incomingClaude = incoming.sessions.filter((s) => !!s.claudeSessionId).length;
+  if (incomingClaude >= existingClaude) return false;
+  const totalDropped = incoming.sessions.length < existing.sessions.length;
+  return !totalDropped;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +179,7 @@ export function useSessionPersistence(pageId: string = "default") {
           if (!tab) continue;
 
           assignedTabIds.add(tabId);
+          const sid = resolveSessionId(tab);
           sessions.push({
             title: tab.title,
             workingDir: tab.workingDir,
@@ -124,9 +188,9 @@ export function useSessionPersistence(pageId: string = "default") {
             notes: zoneNotes[zoneIndex] || undefined,
             pinned: pinnedZones.has(zoneIndex) || undefined,
             savedAt: now,
-            isClaudeSession: !!tab.claudeSessionId,
-            claudeSessionId: tab.claudeSessionId,
-            claudeConfigDir: tab.claudeConfigDir,
+            isClaudeSession: !!sid.claudeSessionId,
+            claudeSessionId: sid.claudeSessionId,
+            claudeConfigDir: sid.claudeConfigDir,
             type: tab.type,
             planFilePath: tab.planFilePath,
           });
@@ -135,14 +199,15 @@ export function useSessionPersistence(pageId: string = "default") {
         // Include unassigned tabs at the end with zoneIndex: -1
         for (const tab of tabs) {
           if (assignedTabIds.has(tab.id)) continue;
+          const sid = resolveSessionId(tab);
           sessions.push({
             title: tab.title,
             workingDir: tab.workingDir,
             zoneIndex: -1,
             savedAt: now,
-            isClaudeSession: !!tab.claudeSessionId,
-            claudeSessionId: tab.claudeSessionId,
-            claudeConfigDir: tab.claudeConfigDir,
+            isClaudeSession: !!sid.claudeSessionId,
+            claudeSessionId: sid.claudeSessionId,
+            claudeConfigDir: sid.claudeConfigDir,
             type: tab.type,
             planFilePath: tab.planFilePath,
           });
@@ -154,6 +219,25 @@ export function useSessionPersistence(pageId: string = "default") {
           savedAt: now,
           focusedZone,
         };
+
+        // Anti-degradation guard (defense-in-depth for the restore race) — see
+        // `isDegradingSave` for the predicate rationale.
+        try {
+          const existing = instanceStorage.getJSON<SavedSessionLayout | null>(key, null);
+          if (isDegradingSave(layout, existing, now)) {
+            const existingClaude = existing!.sessions.filter((s) => !!s.claudeSessionId).length;
+            const incomingClaude = sessions.filter((s) => !!s.claudeSessionId).length;
+            logger.debug(
+              `Skipping degraded save: incoming has ${incomingClaude} resumable Claude ` +
+                `session(s) vs stored ${existingClaude}, and tab count did not drop ` +
+                `(${sessions.length} >= ${existing!.sessions.length}) — likely a ` +
+                `restore-window race.`,
+            );
+            return;
+          }
+        } catch {
+          // If the guard read fails, fall through to the normal write.
+        }
 
         try {
           instanceStorage.setJSON(key, layout);
