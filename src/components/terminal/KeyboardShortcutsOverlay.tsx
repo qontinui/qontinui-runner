@@ -57,6 +57,7 @@ const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
       { keys: "Ctrl+Shift+K", description: "Open command palette" },
       { keys: "Ctrl+Shift+G", description: "Cycle tag filter" },
       { keys: "Ctrl+Shift+I", description: "Toggle zone timeline" },
+      { keys: "Ctrl+Shift+H", description: "Show event history card" },
       { keys: "Ctrl+Shift+?", description: "Toggle this help overlay" },
     ],
   },

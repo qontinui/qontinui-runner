@@ -26,3 +26,7 @@ End-to-end smoke at `scripts/test-grid-endpoints.sh`.
 The assertions in `spec.uibridge.json` below cover the runner UI
 shell. Cell content lives on the HTTP side because the spec runner's
 DOM-search primitive can't reach it.
+
+## Spec maintenance
+
+- Removed spec state `term-plan-cli-script` (2026-06-02): it asserted on plan-CLI *script output*, not page elements — a category error for a UI-Bridge page spec. The behavior it nominally covered is exercised by the Rust integration test `src-tauri/src/flywheel_e2e_tests.rs`.
