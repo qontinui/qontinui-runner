@@ -173,7 +173,11 @@ fn coord_http_base() -> Option<String> {
     let with_http = trimmed
         .strip_prefix("wss://")
         .map(|rest| format!("https://{rest}"))
-        .or_else(|| trimmed.strip_prefix("ws://").map(|rest| format!("http://{rest}")))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("ws://")
+                .map(|rest| format!("http://{rest}"))
+        })
         .unwrap_or_else(|| trimmed.to_string());
     Some(with_http.trim_end_matches('/').to_string())
 }
@@ -468,7 +472,8 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
 
 /// Build the census row for a single worktree dir.
 fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
-    let branch = git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty());
+    let branch =
+        git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty());
     let head_sha = git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty());
 
     let head_age_secs = git_capture(worktree, &["log", "-1", "--format=%ct"])

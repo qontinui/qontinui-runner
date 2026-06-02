@@ -643,7 +643,11 @@ mod tests {
 
     #[test]
     fn rejunction_creates_junctions_to_canonical() {
-        let i = instr(ReclaimAction::Rejunction, &["target", "node_modules"], false);
+        let i = instr(
+            ReclaimAction::Rejunction,
+            &["target", "node_modules"],
+            false,
+        );
         let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
         let steps = plan_reclaim(&i, false, Some(&canonical));
         assert_eq!(
@@ -671,7 +675,11 @@ mod tests {
 
     #[test]
     fn unknown_action_is_a_skip_not_a_destructive_step() {
-        let i = instr(ReclaimAction::Unknown("nuke".to_string()), &["target"], false);
+        let i = instr(
+            ReclaimAction::Unknown("nuke".to_string()),
+            &["target"],
+            false,
+        );
         let steps = plan_reclaim(&i, false, None);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
