@@ -57,9 +57,54 @@ pub const PAGE_DISCLOSURES: &[PageDisclosure] = &[PageDisclosure {
     summary: "Reveals per-stage controls (analyze, install SDK, discover pages, generate registrations/specs/tutorials/videos)",
 }];
 
+/// A disclosure row that can be rendered into the prompt's registry table.
+///
+/// Both the static [`PageDisclosure`] (runner fallback) and the caller-supplied
+/// owned [`DisclosureDef`] (e.g. the web co-pilot's web pages) implement this so
+/// [`render_disclosure_section`] can render either source uniformly.
+trait DisclosureRow {
+    fn page_canonical(&self) -> &str;
+    fn element_id(&self) -> &str;
+    fn registered_label(&self) -> &str;
+    fn summary(&self) -> &str;
+}
+
+impl DisclosureRow for PageDisclosure {
+    fn page_canonical(&self) -> &str {
+        self.page_canonical
+    }
+    fn element_id(&self) -> &str {
+        self.element_id
+    }
+    fn registered_label(&self) -> &str {
+        self.registered_label
+    }
+    fn summary(&self) -> &str {
+        self.summary
+    }
+}
+
+impl DisclosureRow for DisclosureDef {
+    fn page_canonical(&self) -> &str {
+        &self.page_canonical
+    }
+    fn element_id(&self) -> &str {
+        &self.element_id
+    }
+    fn registered_label(&self) -> &str {
+        &self.registered_label
+    }
+    fn summary(&self) -> &str {
+        &self.summary
+    }
+}
+
 /// Render the disclosure registry as a Markdown section to embed into the
 /// system prompt. Designed for crisp, low-token consumption by the AI.
-fn render_disclosure_section(disclosures: &[PageDisclosure]) -> String {
+///
+/// Generic over [`DisclosureRow`] so it renders either the static runner
+/// [`PAGE_DISCLOSURES`] (fallback) or a caller-supplied [`DisclosureDef`] list.
+fn render_disclosure_section<D: DisclosureRow>(disclosures: &[D]) -> String {
     if disclosures.is_empty() {
         return String::new();
     }
@@ -81,7 +126,10 @@ fn render_disclosure_section(disclosures: &[PageDisclosure]) -> String {
         let _ = writeln!(
             out,
             "| {} | `{}` | {} | {} |",
-            d.page_canonical, d.element_id, d.registered_label, d.summary
+            d.page_canonical(),
+            d.element_id(),
+            d.registered_label(),
+            d.summary()
         );
     }
     out.push('\n');
@@ -102,10 +150,18 @@ fn render_disclosure_section(disclosures: &[PageDisclosure]) -> String {
     out
 }
 
-const SYSTEM_PROMPT_BASE: &str = r#"You are the Qontinui Runner's intent planner. Given a user's request, plan a sequence of UI actions to accomplish it.
+/// Role line + page-list header. Always emitted first. Caller-supplied pages or
+/// the runner fallback page list are appended after this.
+const SYSTEM_PROMPT_PREFIX: &str = r#"You are the Qontinui Runner's intent planner. Given a user's request, plan a sequence of UI actions to accomplish it.
 
 The runner has these pages (state machine states):
-- page-prompt-home: Home — natural-language prompt entry point
+"#;
+
+/// Runner's own hardcoded page list. Used ONLY as the fallback when a caller
+/// does not supply its own `pages`. The leading `- page-prompt-home` and the
+/// trailing "Each page has interactive elements…" sentence are part of this
+/// block so the fallback concatenation is byte-stable with the original prompt.
+const SYSTEM_PROMPT_RUNNER_PAGES: &str = r#"- page-prompt-home: Home — natural-language prompt entry point
 - page-gui-automation: Workflows — select and run automation workflows
 - page-active: Active Dashboard — monitor running executions
 - page-workflow-queue: Workflow Queue — scheduled workflow runs
@@ -161,9 +217,18 @@ The runner has these pages (state machine states):
 - page-skills: Skills — skill management and approval
 - page-accessibility-explorer: Accessibility Explorer — WCAG/a11y audit
 - page-help: Help — documentation and tutorials
+"#;
 
+/// Shared footer appended after the page list (runner or caller). Generic — not
+/// runner-specific — so it is emitted in both paths.
+const SYSTEM_PROMPT_PAGES_FOOTER: &str = r#"
 Each page has interactive elements (buttons, inputs, dropdowns) that can be targeted with natural language instructions.
+"#;
 
+/// Runner-specific integration walkthrough. Emitted ONLY in the fallback path
+/// (when the caller supplied no `pages`); it references runner-only element ids
+/// and would mislead a non-runner planner.
+const SYSTEM_PROMPT_RUNNER_INTEGRATION: &str = r#"
 === Integration workflow on page-config-ui-bridge ===
 To integrate a project with UI Bridge and/or generate documentation/tutorials for it, always navigate to page-config-ui-bridge. The Advanced disclosure reveals a project-path input, an Analyze button, and a generation-options checklist with these toggles (registered ids in backticks — use them verbatim with the `element <id>` form so NLActionExecutor routes directly via `/control/element/<id>/action`):
   - `ui-bridge-generate-registrations-checkbox` — useUIElement() calls for every interactive element
@@ -188,7 +253,11 @@ Typical action sequence when the user wants to integrate a project:
   5. action: "click element ui-bridge-generate-button"
 
 Pick only the checkboxes the user asked for — do not toggle options they didn't request.
+"#;
 
+/// The "Respond with valid JSON only…" instruction + Rules block. Always
+/// emitted last (before suffix/disclosure/catalog). Generic — caller-agnostic.
+const SYSTEM_PROMPT_RULES: &str = r#"
 Respond with valid JSON only, no markdown fences:
 {
   "summary": "Brief description of what you'll do",
@@ -232,6 +301,33 @@ const BRIEF_SUFFIX: &str = r#"
 Keep explanations concise (one sentence each).
 "#;
 
+/// A caller-supplied page (state machine state) to enumerate in the planner's
+/// system prompt. When a caller (e.g. the web co-pilot) supplies its own pages,
+/// they replace the runner's hardcoded fallback list so the planner emits the
+/// caller's `page-…`/route ids and plans the caller's UI.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PageDef {
+    /// A `page-…`/route id (e.g. `page-dashboard`).
+    pub id: String,
+    /// Short human-readable description of the page.
+    pub description: String,
+}
+
+/// Caller-supplied owned-`String` mirror of [`PageDisclosure`]. When supplied,
+/// these replace the runner's static [`PAGE_DISCLOSURES`] in the rendered
+/// disclosure section.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DisclosureDef {
+    /// Canonical `page-…` state id (must match an id in the caller's page list).
+    pub page_canonical: String,
+    /// Registered element id — used by NLActionExecutor for direct routing.
+    pub element_id: String,
+    /// Verbatim registered `label` from the `useUIElement` call.
+    pub registered_label: String,
+    /// Short human-readable hint describing what the disclosure reveals.
+    pub summary: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PlanIntentRequest {
     pub prompt: String,
@@ -242,6 +338,16 @@ pub struct PlanIntentRequest {
     /// uses actual button names instead of hallucinating generic ones.
     #[serde(default, rename = "pageCatalog")]
     pub page_catalog: Option<String>,
+    /// Caller-supplied page list. When present and non-empty, the planner
+    /// enumerates THESE pages (and omits the runner-only integration workflow)
+    /// instead of the runner's hardcoded fallback list. Wire name: `pages`.
+    #[serde(default)]
+    pub pages: Option<Vec<PageDef>>,
+    /// Caller-supplied disclosure registry. When present, the planner renders
+    /// the disclosure section from these instead of the static runner
+    /// [`PAGE_DISCLOSURES`]. Wire name: `disclosures`.
+    #[serde(default)]
+    pub disclosures: Option<Vec<DisclosureDef>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -259,6 +365,69 @@ pub struct PlanStep {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
     pub explanation: String,
+}
+
+/// Assemble the full planner system prompt.
+///
+/// Pure (no I/O) so it is unit-testable without HTTP or `run_prompt_sync`.
+///
+/// - `explain`: chooses the educational vs. brief suffix.
+/// - `pages`: caller-supplied page list. When `Some` and non-empty, these pages
+///   are enumerated and the runner-only integration-workflow section is OMITTED.
+///   When `None`/empty, the runner's hardcoded fallback page list + integration
+///   workflow are used (byte-stable with the original prompt).
+/// - `disclosures`: caller-supplied disclosure registry. When `Some`, rendered
+///   in place of the static [`PAGE_DISCLOSURES`].
+/// - `catalog`: optional pre-trimmed page element catalog text.
+fn build_system_prompt(
+    explain: bool,
+    pages: Option<&[PageDef]>,
+    disclosures: Option<&[DisclosureDef]>,
+    catalog: Option<&str>,
+) -> String {
+    let suffix = if explain {
+        EXPLAIN_SUFFIX
+    } else {
+        BRIEF_SUFFIX
+    };
+
+    let catalog_section = catalog
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("{}{}\n", CATALOG_HEADER, c))
+        .unwrap_or_default();
+
+    let disclosure_section = match disclosures {
+        Some(d) => render_disclosure_section(d),
+        None => render_disclosure_section(PAGE_DISCLOSURES),
+    };
+
+    let mut out = String::with_capacity(8192);
+    out.push_str(SYSTEM_PROMPT_PREFIX);
+
+    match pages.filter(|p| !p.is_empty()) {
+        // Caller supplied pages: enumerate THEM, omit the runner-only
+        // integration-workflow section (it references runner element ids and
+        // would mislead a non-runner planner).
+        Some(p) => {
+            for page in p {
+                let _ = writeln!(out, "- {}: {}", page.id, page.description);
+            }
+            out.push_str(SYSTEM_PROMPT_PAGES_FOOTER);
+        }
+        // Fallback: runner's hardcoded page list + integration workflow.
+        None => {
+            out.push_str(SYSTEM_PROMPT_RUNNER_PAGES);
+            out.push_str(SYSTEM_PROMPT_PAGES_FOOTER);
+            out.push_str(SYSTEM_PROMPT_RUNNER_INTEGRATION);
+        }
+    }
+
+    out.push_str(SYSTEM_PROMPT_RULES);
+    out.push_str(suffix);
+    out.push_str(&disclosure_section);
+    out.push_str(&catalog_section);
+    out
 }
 
 pub async fn plan_intent_handler(
@@ -290,23 +459,14 @@ pub async fn plan_intent_handler(
         ));
     }
 
-    // Build combined prompt with system instructions + user request
-    let suffix = if request.explain {
-        EXPLAIN_SUFFIX
-    } else {
-        BRIEF_SUFFIX
-    };
-    let catalog_section = request
-        .page_catalog
-        .as_deref()
-        .map(|c| c.trim())
-        .filter(|c| !c.is_empty())
-        .map(|c| format!("{}{}\n", CATALOG_HEADER, c))
-        .unwrap_or_default();
-    let disclosure_section = render_disclosure_section(PAGE_DISCLOSURES);
-    let system_prompt = format!(
-        "{}{}{}{}",
-        SYSTEM_PROMPT_BASE, suffix, disclosure_section, catalog_section
+    // Build combined prompt with system instructions + user request. The
+    // caller may supply its own `pages` + `disclosures` (e.g. the web co-pilot
+    // passing web pages); otherwise the runner's hardcoded fallback is used.
+    let system_prompt = build_system_prompt(
+        request.explain,
+        request.pages.as_deref(),
+        request.disclosures.as_deref(),
+        request.page_catalog.as_deref(),
     );
     let full_prompt = format!("{}\n\nUser request: {}", system_prompt, request.prompt);
 
@@ -380,15 +540,22 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
 mod tests {
     use super::*;
 
+    /// The assembled fallback system prompt (no caller pages/disclosures).
+    /// Helper so tests don't re-thread the argument list everywhere.
+    fn fallback_prompt() -> String {
+        build_system_prompt(false, None, None, None)
+    }
+
     /// Every disclosure entry must reference a `page-…` id present in the
-    /// page list embedded in `SYSTEM_PROMPT_BASE`. If this fails, either the
-    /// registry has a typo or the page list lost an entry — fix whichever
+    /// page list embedded in the fallback system prompt. If this fails, either
+    /// the registry has a typo or the page list lost an entry — fix whichever
     /// drifted.
     #[test]
     fn disclosure_pages_exist_in_system_prompt() {
+        let prompt = fallback_prompt();
         for d in PAGE_DISCLOSURES {
             assert!(
-                SYSTEM_PROMPT_BASE.contains(d.page_canonical),
+                prompt.contains(d.page_canonical),
                 "PAGE_DISCLOSURES entry {} references unknown page {}",
                 d.element_id,
                 d.page_canonical
@@ -413,8 +580,9 @@ mod tests {
     }
 
     /// The seed entry must be present — this is the disclosure that originally
-    /// motivated the registry. If it's removed, the integration workflow in
-    /// `SYSTEM_PROMPT_BASE` must also be updated, hence the assertion.
+    /// motivated the registry. If it's removed, the runner integration workflow
+    /// in `SYSTEM_PROMPT_RUNNER_INTEGRATION` must also be updated, hence the
+    /// assertion.
     #[test]
     fn seed_disclosure_present() {
         let seed = PAGE_DISCLOSURES
@@ -447,7 +615,7 @@ mod tests {
     /// emit a ghost section header into the prompt).
     #[test]
     fn empty_registry_renders_empty_string() {
-        let section = render_disclosure_section(&[]);
+        let section = render_disclosure_section::<PageDisclosure>(&[]);
         assert!(section.is_empty());
     }
 
@@ -457,8 +625,9 @@ mod tests {
     /// drifts from real tabs" memory entry's failure mode.
     #[test]
     fn integration_workflow_uses_registered_id() {
+        let prompt = fallback_prompt();
         assert!(
-            SYSTEM_PROMPT_BASE.contains("click element ui-bridge-advanced-disclosure"),
+            prompt.contains("click element ui-bridge-advanced-disclosure"),
             "integration workflow lost the direct-id routing instruction"
         );
         // The exact failing instruction from the bug report must not appear
@@ -466,7 +635,7 @@ mod tests {
         // example in the Rules section (because we want the planner to
         // recognise that phrasing and translate it). Distinguish by checking
         // the integration-workflow paragraph specifically.
-        let workflow_section = SYSTEM_PROMPT_BASE
+        let workflow_section = prompt
             .split("=== Integration workflow on page-config-ui-bridge ===")
             .nth(1)
             .and_then(|s| s.split("Pick only the checkboxes").next())
@@ -483,8 +652,102 @@ mod tests {
     #[test]
     fn rules_mention_generic_disclosure_handling() {
         assert!(
-            SYSTEM_PROMPT_BASE.contains("Disclosure widgets registry"),
+            fallback_prompt().contains("Disclosure widgets registry"),
             "generic disclosure rule missing from Rules block"
         );
+    }
+
+    /// When the caller supplies its own pages, the assembled prompt enumerates
+    /// THOSE ids, drops the runner-only page ids, and omits the runner-specific
+    /// integration-workflow section (which references runner element ids).
+    #[test]
+    fn caller_pages_replace_runner_pages_and_omit_integration() {
+        let pages = vec![
+            PageDef {
+                id: "page-dashboard".to_string(),
+                description: "Dashboard — overview of activity".to_string(),
+            },
+            PageDef {
+                id: "page-runs".to_string(),
+                description: "Runs — past executions".to_string(),
+            },
+        ];
+        let prompt = build_system_prompt(false, Some(&pages), None, None);
+
+        // Caller's pages + descriptions are enumerated.
+        assert!(prompt.contains("page-dashboard"));
+        assert!(prompt.contains("Dashboard — overview of activity"));
+        assert!(prompt.contains("page-runs"));
+
+        // Runner-only page ids must be gone.
+        assert!(
+            !prompt.contains("page-gui-automation"),
+            "caller-pages prompt leaked a runner-only page id"
+        );
+
+        // Runner-only integration workflow must be omitted.
+        assert!(
+            !prompt.contains("=== Integration workflow on page-config-ui-bridge ==="),
+            "caller-pages prompt leaked the runner-only integration workflow"
+        );
+
+        // Generic scaffolding (role line, pages footer, rules) must remain.
+        assert!(prompt.contains("intent planner"));
+        assert!(prompt.contains("Each page has interactive elements"));
+        assert!(prompt.contains("Respond with valid JSON only"));
+    }
+
+    /// When no pages are supplied, the fallback prompt is unchanged: it contains
+    /// the runner ids and the integration-workflow header.
+    #[test]
+    fn no_pages_keeps_runner_fallback() {
+        let prompt = fallback_prompt();
+        assert!(prompt.contains("page-gui-automation"));
+        assert!(prompt.contains("page-prompt-home"));
+        assert!(prompt.contains("=== Integration workflow on page-config-ui-bridge ==="));
+    }
+
+    /// An empty (but `Some`) page list falls back to the runner list (treated
+    /// the same as `None`).
+    #[test]
+    fn empty_caller_pages_falls_back_to_runner() {
+        let prompt = build_system_prompt(false, Some(&[]), None, None);
+        assert!(prompt.contains("page-gui-automation"));
+        assert!(prompt.contains("=== Integration workflow on page-config-ui-bridge ==="));
+    }
+
+    /// Caller-supplied disclosures are rendered in place of the static registry.
+    #[test]
+    fn caller_disclosures_render_in_section() {
+        let pages = vec![PageDef {
+            id: "page-dashboard".to_string(),
+            description: "Dashboard".to_string(),
+        }];
+        let disclosures = vec![DisclosureDef {
+            page_canonical: "page-dashboard".to_string(),
+            element_id: "web-advanced-filters-disclosure".to_string(),
+            registered_label: "Advanced filters — narrow results by date and status".to_string(),
+            summary: "Reveals date/status filter controls".to_string(),
+        }];
+        let prompt = build_system_prompt(false, Some(&pages), Some(&disclosures), None);
+        assert!(prompt.contains("web-advanced-filters-disclosure"));
+        assert!(prompt.contains("Advanced filters — narrow results"));
+        // The static runner registry ROW data (its registered label) must not
+        // be rendered — only the caller's rows. (Note: the disclosure-section
+        // scaffolding prose hardcodes `ui-bridge-advanced-disclosure` as a
+        // Strategy-B example regardless of the rows, so we assert on the row
+        // payload — the registered label — not that example id.)
+        assert!(
+            !prompt.contains("Advanced: per-stage controls"),
+            "caller-disclosure prompt leaked the static runner registry row"
+        );
+    }
+
+    /// The catalog section is appended when a non-empty catalog is supplied.
+    #[test]
+    fn catalog_section_appended_when_present() {
+        let prompt = build_system_prompt(false, None, None, Some("page-runs: Run, Cancel"));
+        assert!(prompt.contains("=== Page Element Catalog ==="));
+        assert!(prompt.contains("page-runs: Run, Cancel"));
     }
 }
