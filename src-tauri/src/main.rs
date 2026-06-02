@@ -492,6 +492,29 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // pay for a second long-lived thread; the publisher's
                 // 60s cadence is way below the heartbeat's 30s scale.
                 fleet::spawn_tree_publisher();
+                // Ξ_Worktree census (Phase 1) — periodic disk-footprint
+                // + junction-status + volume-free-space census of every
+                // on-disk git worktree, POSTed to
+                // `/agents/<device_id>/worktree-census`. coord can't see
+                // the operator's Windows disk; the runner is the only
+                // vantage point. Default 300s cadence (env override
+                // QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS) — an order of
+                // magnitude slower than the heartbeat/tree-publisher
+                // because each tick stats real files under
+                // node_modules/target (junctions are skipped, so a
+                // junctioned 165GB target costs ~0).
+                agent_worktree::census::spawn_census();
+                // Ξ_Worktree reclaim (Phase 4) — periodically pull
+                // coord's pending per-device reclaim instructions and
+                // execute the INV-W4 safe path (unlink junctions FIRST,
+                // then remove the worktree; or recreate a drifted
+                // junction). coord ships dry_run=true by default (the
+                // poller only LOGS what it would do); the operator arms
+                // execution server-side via COORD_WORKTREE_RECLAIM_ENABLED.
+                // Default 300s cadence (env
+                // QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS). Same machine-
+                // wide, anonymous, device-keyed posture as the census.
+                agent_worktree::reclaim::spawn_reclaim();
                 // Phase 4 — coord-driven Claude Code subprocess runtime.
                 // Subscribes to `events.agent.spawn_requested.<device_id>`
                 // on coord WS and supervises the resulting `claude` CLI

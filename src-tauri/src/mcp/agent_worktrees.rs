@@ -30,7 +30,7 @@ use tracing::{info, warn};
 
 use crate::agent_worktree::{
     allocate_and_materialize_with_claim, coord_ws_to_http, worktree_mode_enabled, AllocateError,
-    RepoRequest,
+    MaterializeOutcome, RepoRequest,
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -146,7 +146,7 @@ pub async fn post_allocate_local(
     )
     .await
     {
-        Ok(result) => {
+        Ok(MaterializeOutcome::Worktrees(result)) => {
             info!(
                 "/agents/allocate-local ok: agent_id={} repos={}",
                 result.agent_id,
@@ -175,6 +175,7 @@ pub async fn post_allocate_local(
             // correctness.
             crate::agent_daemons::spawn_for_agent(&result, coord_http_base.clone(), machine_id);
             Ok(Json(ApiResponse::success(json!({
+                "isolation": "worktree",
                 "agent_id": result.agent_id,
                 "worktrees": result.worktrees.iter().map(|w| json!({
                     "repo": w.repo,
@@ -183,6 +184,51 @@ pub async fn post_allocate_local(
                     "worktree_path": w.worktree_path.to_string_lossy(),
                 })).collect::<Vec<_>>(),
                 "active_claim": result.active_claim,
+            }))))
+        }
+        // Phase 3 — coord chose a shared feature branch in the canonical
+        // checkout (no worktree). Register the claim heartbeat the same
+        // way; surface the per-repo branches + their checkout path.
+        Ok(MaterializeOutcome::SharedBranch(sb)) => {
+            info!(
+                "/agents/allocate-local ok (shared_branch): agent_id={} repos={}",
+                sb.agent_id,
+                sb.branches.len()
+            );
+            if let Some(claim) = &sb.active_claim {
+                crate::agent_claims::register_active_claim(
+                    &sb.agent_id,
+                    coord_http_base.clone(),
+                    machine_id,
+                    claim,
+                );
+            }
+            Ok(Json(ApiResponse::success(json!({
+                "isolation": "shared_branch",
+                "agent_id": sb.agent_id,
+                "branches": sb.branches.iter().map(|b| json!({
+                    "repo": b.repo,
+                    "branch": b.branch,
+                    "parent_sha": b.parent_sha,
+                    "checkout_path": b.checkout_path.to_string_lossy(),
+                })).collect::<Vec<_>>(),
+                "active_claim": sb.active_claim,
+            }))))
+        }
+        // Phase 3 — coord declined to materialize (a held upstream
+        // resource). Surface the wait reason so the caller logs/retries;
+        // nothing was created on disk and the claim was released.
+        Ok(MaterializeOutcome::Wait(w)) => {
+            info!(
+                "/agents/allocate-local wait: agent_id={} reason={:?} blocking={:?} retry_when={:?}",
+                w.agent_id, w.reason, w.blocking, w.retry_when
+            );
+            Ok(Json(ApiResponse::success(json!({
+                "isolation": "wait",
+                "agent_id": w.agent_id,
+                "reason": w.reason,
+                "blocking": w.blocking,
+                "retry_when": w.retry_when,
             }))))
         }
         Err(AllocateError::ClaimConflict(conflict)) => {

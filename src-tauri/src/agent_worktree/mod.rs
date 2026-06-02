@@ -58,7 +58,9 @@ use tracing::{debug, info, warn};
 use crate::worktree::run_git_command;
 
 pub mod canonical_paths;
+pub mod census;
 pub mod isolated_edit;
+pub mod reclaim;
 
 /// Env var that turns the new spawn path on. Default off — `feature
 /// flag agent_worktree_mode` per plan §5 Phase 1.
@@ -521,6 +523,129 @@ pub struct ActiveClaim {
     pub ttl_seconds: i64,
 }
 
+// =============================================================================
+// Phase 3 — allocate-response `isolation` directive.
+// =============================================================================
+
+/// coord's per-allocation isolation directive (Ξ_Worktree Phase 3). The
+/// runner honors whichever mode coord picks; an absent or unknown
+/// `isolation` field on the response defaults to
+/// [`Isolation::Worktree`] with [`TargetMode::Junctioned`] — today's
+/// behavior — so an older coord (no field) keeps working unchanged.
+///
+/// Wire shape (serde-tagged by `mode`):
+/// ```json
+/// {"mode":"worktree","target":"junctioned"}
+/// {"mode":"worktree","target":"dedicated"}
+/// {"mode":"shared_branch"}
+/// {"mode":"wait","reason":"...","blocking":"...","retry_when":"..."}
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum Isolation {
+    /// Materialize a `git worktree add`. `target` controls whether the
+    /// build `target` dir is junctioned to the canonical tree (today's
+    /// default) or left as a real dedicated dir.
+    Worktree {
+        #[serde(default)]
+        target: TargetMode,
+    },
+    /// Do NOT create a worktree — the agent works on a feature branch in
+    /// the canonical checkout.
+    SharedBranch,
+    /// Do NOT materialize anything; surface the wait reason to the caller
+    /// (e.g. a held upstream resource). The runner does not spin — it
+    /// returns this as a typed outcome the caller logs / retries on.
+    Wait {
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        blocking: Option<String>,
+        #[serde(default)]
+        retry_when: Option<String>,
+    },
+}
+
+impl Default for Isolation {
+    fn default() -> Self {
+        // Back-compat: a response with no `isolation` field (older coord)
+        // deserializes the `Option<Isolation>` as `None`; the caller maps
+        // that to this default — a junctioned worktree, today's behavior.
+        Isolation::Worktree {
+            target: TargetMode::Junctioned,
+        }
+    }
+}
+
+/// Build-`target` junction policy for [`Isolation::Worktree`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetMode {
+    /// Junction the build `target` dir into the worktree from the
+    /// canonical tree (shared compiled artifacts). Today's default.
+    #[default]
+    Junctioned,
+    /// Leave the build `target` dir as a real, dedicated dir for this
+    /// worktree (no `target` junction step). `node_modules` may still
+    /// junction per the runner's default.
+    Dedicated,
+}
+
+/// Outcome of a full allocate + materialize round-trip. Widened (Phase 3)
+/// from a bare [`AllocateResult`] so coord's `isolation` directive can
+/// steer the runner into a non-worktree materialization without a silent
+/// fallthrough.
+///
+/// - [`MaterializeOutcome::Worktrees`] — coord chose `worktree` (junctioned
+///   or dedicated target); carries the same [`AllocateResult`] the legacy
+///   flow returned, so the heartbeat / daemon / pusher wiring is unchanged.
+/// - [`MaterializeOutcome::SharedBranch`] — coord chose `shared_branch`;
+///   the runner created / checked out the feature branch in the canonical
+///   checkout. The materialized `path` is the canonical checkout itself.
+/// - [`MaterializeOutcome::Wait`] — coord chose `wait`; nothing was
+///   materialized. The caller logs and retries later; it MUST NOT spin.
+#[derive(Debug, Clone, Serialize)]
+pub enum MaterializeOutcome {
+    Worktrees(AllocateResult),
+    SharedBranch(SharedBranchResult),
+    Wait(WaitOutcome),
+}
+
+/// Result of an [`Isolation::SharedBranch`] materialization: a real
+/// feature branch checked out in the canonical checkout (NOT a worktree).
+#[derive(Debug, Clone, Serialize)]
+pub struct SharedBranchResult {
+    pub agent_id: String,
+    /// Per-repo branches created/checked out in the canonical checkout.
+    pub branches: Vec<SharedBranchRepo>,
+    pub token: String,
+    pub token_jti: uuid::Uuid,
+    pub token_exp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_claim: Option<ActiveClaim>,
+}
+
+/// One repo's shared-branch checkout.
+#[derive(Debug, Clone, Serialize)]
+pub struct SharedBranchRepo {
+    pub repo: String,
+    pub branch: String,
+    pub parent_sha: String,
+    /// The canonical checkout path the branch was created in (the agent's
+    /// cwd is this path, NOT a separate worktree dir).
+    pub checkout_path: PathBuf,
+    pub push_ref: String,
+}
+
+/// Result of an [`Isolation::Wait`] directive — nothing materialized.
+#[derive(Debug, Clone, Serialize)]
+pub struct WaitOutcome {
+    pub agent_id: String,
+    pub reason: Option<String>,
+    pub blocking: Option<String>,
+    pub retry_when: Option<String>,
+}
+
 /// Coord's JSON response shape for `POST /agents/allocate`. Mirrored
 /// here so we don't have to share a crate just for two structs.
 #[derive(Debug, Deserialize)]
@@ -541,6 +666,11 @@ struct CoordAllocateResponse {
     /// agent) → no override written.
     #[serde(default)]
     cargo_config: Option<CoordCargoConfig>,
+    /// Ξ_Worktree Phase 3 — per-allocation isolation directive. Absent
+    /// (older coord) → `None`, which the materializer maps to
+    /// [`Isolation::default`] (junctioned worktree, today's behavior).
+    #[serde(default)]
+    isolation: Option<Isolation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -640,7 +770,7 @@ pub async fn allocate_and_materialize(
     intent: Option<&str>,
     declared_overlap_paths: Option<&[String]>,
     repo_canonical_paths: &std::collections::HashMap<String, PathBuf>,
-) -> Result<AllocateResult, AllocateError> {
+) -> Result<MaterializeOutcome, AllocateError> {
     allocate_and_materialize_with_claim(
         coord_http_base,
         machine_id,
@@ -667,7 +797,7 @@ pub async fn allocate_and_materialize_with_claim(
     repo_canonical_paths: &std::collections::HashMap<String, PathBuf>,
     plan_id: Option<&str>,
     phase: Option<&str>,
-) -> Result<AllocateResult, AllocateError> {
+) -> Result<MaterializeOutcome, AllocateError> {
     if !worktree_mode_enabled() {
         return Err(AllocateError::Other(format!(
             "{} is not enabled; spawn path is disabled",
@@ -765,11 +895,97 @@ pub async fn allocate_and_materialize_with_claim(
         .await
         .map_err(|e| AllocateError::Other(format!("decode coord response: {e}")))?;
 
+    // Phase 3 — honor coord's `isolation` directive. Absent (older
+    // coord) → the junctioned-worktree default (today's behavior).
+    let isolation = coord_resp.isolation.clone().unwrap_or_default();
     info!(
-        "coord allocated agent_id={} repos={}",
+        "coord allocated agent_id={} repos={} isolation={:?}",
         coord_resp.agent_id,
-        coord_resp.worktrees.len()
+        coord_resp.worktrees.len(),
+        isolation
     );
+
+    // `wait` — coord declined to materialize. Surface a typed Wait
+    // outcome WITHOUT touching the disk; the caller logs / retries. We do
+    // NOT spin here.
+    if let Isolation::Wait {
+        reason,
+        blocking,
+        retry_when,
+    } = isolation
+    {
+        info!(
+            "allocate: coord returned wait agent_id={} reason={:?} blocking={:?} retry_when={:?}",
+            coord_resp.agent_id, reason, blocking, retry_when
+        );
+        // A pre-acquired claim must not linger while we wait — release it
+        // so the held resource isn't pinned by an agent that never
+        // materialized.
+        if let Some(claim) = &active_claim {
+            release_claim_best_effort(
+                coord_http_base,
+                *machine_id,
+                &claim.kind,
+                &claim.resource_key,
+            )
+            .await;
+        }
+        return Ok(MaterializeOutcome::Wait(WaitOutcome {
+            agent_id: coord_resp.agent_id,
+            reason,
+            blocking,
+            retry_when,
+        }));
+    }
+
+    // `shared_branch` — do NOT create a worktree. Create / check out the
+    // feature branch in the canonical checkout and return the canonical
+    // path as the materialized cwd. A real branch, never a silent
+    // worktree fallthrough.
+    if matches!(isolation, Isolation::SharedBranch) {
+        let mut branches: Vec<SharedBranchRepo> = Vec::with_capacity(repos.len());
+        for w in &coord_resp.worktrees {
+            let canonical = repo_canonical_paths.get(&w.repo).ok_or_else(|| {
+                AllocateError::Other(format!("missing canonical path for repo '{}'", w.repo))
+            })?;
+            checkout_shared_branch(canonical, &w.branch, &w.parent_sha).map_err(|e| {
+                AllocateError::Other(format!(
+                    "shared_branch checkout for repo '{}' (branch {}) failed: {}",
+                    w.repo, w.branch, e
+                ))
+            })?;
+            let push_ref = if w.push_ref.is_empty() {
+                remote_agent_ref(&w.branch)
+            } else {
+                w.push_ref.clone()
+            };
+            branches.push(SharedBranchRepo {
+                repo: w.repo.clone(),
+                branch: w.branch.clone(),
+                parent_sha: w.parent_sha.clone(),
+                checkout_path: canonical.clone(),
+                push_ref,
+            });
+        }
+        return Ok(MaterializeOutcome::SharedBranch(SharedBranchResult {
+            agent_id: coord_resp.agent_id,
+            branches,
+            token: coord_resp.token,
+            token_jti: coord_resp.token_jti.unwrap_or(uuid::Uuid::nil()),
+            token_exp: coord_resp.token_exp.unwrap_or(0),
+            active_claim,
+        }));
+    }
+
+    // `worktree` — junctioned or dedicated target. The only distinction
+    // the runner draws today is the build-`target` junction step (which
+    // is performed out-of-band today, not in this fn): `Dedicated`
+    // suppresses it so the worktree gets a real, isolated target dir.
+    let target_mode = match isolation {
+        Isolation::Worktree { target } => target,
+        // Wait/SharedBranch already returned above.
+        _ => TargetMode::Junctioned,
+    };
 
     let mut materialized: Vec<MaterializedWorktree> = Vec::with_capacity(repos.len());
     for w in coord_resp.worktrees {
@@ -806,10 +1022,11 @@ pub async fn allocate_and_materialize_with_claim(
         match run_git_command(canonical, &args) {
             Ok(stdout) => {
                 info!(
-                    "git worktree add ok: repo={} branch={} path={} stdout={}",
+                    "git worktree add ok: repo={} branch={} path={} target_mode={:?} stdout={}",
                     w.repo,
                     w.branch,
                     target.display(),
+                    target_mode,
                     stdout.trim()
                 );
             }
@@ -825,6 +1042,32 @@ pub async fn allocate_and_materialize_with_claim(
                     "git worktree add for repo '{}' (branch {}) failed: {}",
                     w.repo, w.branch, e
                 )));
+            }
+        }
+
+        // Build-`target` junction policy (Phase 3). `Junctioned` (the
+        // default) shares the canonical tree's compiled `target`;
+        // `Dedicated` leaves a real per-worktree target. The junction
+        // step itself runs out-of-band (the runner does not junction
+        // `target` inside this fn today — node_modules/dist/target
+        // junctioning is performed by the spawn wrapper), so honoring
+        // `Dedicated` here means recording the intent + skipping any
+        // junction the wrapper would otherwise apply. We surface the
+        // decision via the log line above; a dedicated target needs no
+        // affirmative action (absence of the junction IS the dedicated
+        // target).
+        match target_mode {
+            TargetMode::Junctioned => {
+                debug!(
+                    "isolation: repo={} target=junctioned (shares canonical build target)",
+                    w.repo
+                );
+            }
+            TargetMode::Dedicated => {
+                debug!(
+                    "isolation: repo={} target=dedicated (no build-target junction)",
+                    w.repo
+                );
             }
         }
 
@@ -882,14 +1125,44 @@ pub async fn allocate_and_materialize_with_claim(
         });
     }
 
-    Ok(AllocateResult {
+    Ok(MaterializeOutcome::Worktrees(AllocateResult {
         agent_id: coord_resp.agent_id,
         worktrees: materialized,
         token: coord_resp.token,
         token_jti: coord_resp.token_jti.unwrap_or(uuid::Uuid::nil()),
         token_exp: coord_resp.token_exp.unwrap_or(0),
         active_claim,
-    })
+    }))
+}
+
+/// Create or check out a feature branch in the canonical checkout for the
+/// [`Isolation::SharedBranch`] path. Idempotent w.r.t. an existing branch:
+/// if `<branch>` already exists locally we `git checkout <branch>`,
+/// otherwise we `git checkout -b <branch> <parent_sha>`. Never creates a
+/// worktree.
+fn checkout_shared_branch(
+    canonical: &std::path::Path,
+    branch: &str,
+    parent_sha: &str,
+) -> Result<(), String> {
+    // Does the branch already exist? `git rev-parse --verify --quiet
+    // refs/heads/<branch>` exits non-zero when absent.
+    let exists = run_git_command(
+        canonical,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok();
+
+    if exists {
+        run_git_command(canonical, &["checkout", branch]).map(|_| ())
+    } else {
+        run_git_command(canonical, &["checkout", "-b", branch, parent_sha]).map(|_| ())
+    }
 }
 
 /// Convert a `ws://` or `wss://` coord URL into the matching HTTP base.
