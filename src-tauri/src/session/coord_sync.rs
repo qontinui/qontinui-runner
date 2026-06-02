@@ -682,11 +682,14 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
 /// `payload` directly (`{id, kind, intent, state, started_at}`), so
 /// rebuilding for the wire is mostly relabeling.
 fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
-    // tenant_id is *not* on the outbox row — it lives inside the intent
-    // body the operator (or future tenant-resolver) supplies. Phase 2's
-    // local-first path persists the intent into the payload, so we look
-    // for it there. If absent, fall back to nil so coord returns a clean
-    // 400 (caller fix) rather than a 500.
+    // tenant_id resolution order: the intent/payload body (if the operator
+    // or a future resolver supplied it) → the device's `active_tenant_id`
+    // from `~/.qontinui/machine.json` → nil. The machine.json fallback is
+    // what makes a single-tenant operator's sessions visible on their
+    // tenant-scoped dashboard: without it, every session registers under
+    // the nil tenant `00000000-…` and the operator's `/sessions` view (which
+    // scopes to their resolved tenant) shows nothing despite a healthy
+    // pipeline.
     let intent = rec
         .payload
         .get("intent")
@@ -696,6 +699,10 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
         .get("tenant_id")
         .or_else(|| rec.payload.get("tenant_id"))
         .cloned()
+        .or_else(|| {
+            crate::session::dual_write::resolve_active_tenant_id()
+                .map(|u| JsonValue::String(u.to_string()))
+        })
         .unwrap_or_else(|| JsonValue::String(Uuid::nil().to_string()));
     let kind = rec
         .payload

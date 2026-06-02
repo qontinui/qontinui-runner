@@ -153,7 +153,11 @@ impl Default for DualWriteGate {
 /// Read `active_tenant_id` from `~/.qontinui/machine.json`. Returns `None`
 /// (gate stays dormant) on any failure — missing file, missing field,
 /// unparseable UUID. Single-tenant operators legitimately have no field.
-fn resolve_active_tenant_id() -> Option<Uuid> {
+///
+/// `pub(crate)` so the session-sync POST path can use the same resolved
+/// tenant to attribute sessions (otherwise they register under the nil
+/// tenant and are invisible to the operator's tenant-scoped dashboard).
+pub(crate) fn resolve_active_tenant_id() -> Option<Uuid> {
     let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
     let bytes = std::fs::read(path).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
