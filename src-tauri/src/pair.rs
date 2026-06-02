@@ -655,9 +655,9 @@ pub fn pair_via_browser(
     let state_expected = state_nonce.clone();
 
     // Spawn a current-thread tokio runtime + axum server on a worker
-    // thread. We could use the existing src/mcp/auth_callback.rs route,
-    // but it depends on Tauri-side state (ApiState/AppState); for the
-    // CLI we want an independent server.
+    // thread. This is a self-contained loopback callback server for the
+    // CLI pair flow — it depends on no Tauri-side state (ApiState/AppState),
+    // so it runs independently of the runner's main HTTP server.
     let (server_done_tx, server_done_rx) = std::sync::mpsc::channel::<()>();
     let server_handle = std::thread::spawn(move || -> Result<(), String> {
         let rt = tokio::runtime::Builder::new_current_thread()

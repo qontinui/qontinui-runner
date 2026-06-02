@@ -26,7 +26,7 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Runtime, State};
 use tracing::{info, warn};
 
-use crate::commands::compartments::{HealthCompartment, IntegrationCompartment};
+use crate::commands::compartments::IntegrationCompartment;
 use crate::commands::AppState;
 use crate::error::AppError;
 use crate::server_mode::{ServerModeConfig, ServerModeState};
@@ -155,13 +155,11 @@ pub async fn get_web_integration_status(
 // save_web_integration_settings
 // ---------------------------------------------------------------------------
 
-/// Internal implementation of `save_web_integration_settings` — shared
-/// between the Tauri command and the HTTP callback handler used by the
-/// browser-login flow.
+/// Internal implementation of `save_web_integration_settings`.
 ///
-/// Separated so the `GET /auth/runner-token-callback` handler (which runs
-/// inside an axum handler, not a Tauri command) can apply the same
-/// persist + hot-reload + emit logic without duplicating it.
+/// Takes `&AppState` (rather than a compartment) so it can apply the same
+/// persist + hot-reload + emit logic from any caller that holds the app
+/// state directly.
 ///
 /// Safe to call with `settings` equal to the currently-persisted values:
 /// the no-op short-circuit preserves idempotency.
@@ -285,10 +283,9 @@ pub async fn save_web_integration_settings<R: Runtime>(
             .map(str::to_string),
         runner_token,
     };
-    // `apply_web_integration_settings` takes `&AppState` because it is also
-    // invoked from the axum auth-callback handler. The compartment's inner
-    // `Arc<AppState>` is `pub(crate)`, so we can deref it cross-module to
-    // satisfy the existing signature without restructuring the helper.
+    // `apply_web_integration_settings` takes `&AppState`. The compartment's
+    // inner `Arc<AppState>` is `pub(crate)`, so we can deref it cross-module
+    // to satisfy the signature without restructuring the helper.
     apply_web_integration_settings(&integration.0, &app_handle, settings).await
 }
 
@@ -484,172 +481,6 @@ pub async fn test_web_integration_connection(
 }
 
 // ---------------------------------------------------------------------------
-// start_web_token_flow (Phase 3G-web-polish)
-// ---------------------------------------------------------------------------
-
-/// URL-encode a value for safe inclusion in a query string.
-///
-/// Scoped to just the characters we use here (hostnames, ports, hex state,
-/// HTTP URLs). We intentionally avoid pulling in `urlencoding` / `percent-encoding`
-/// as a dedicated dep — the set of characters we produce is tightly
-/// controlled.
-fn url_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(c),
-            _ => {
-                let mut buf = [0u8; 4];
-                for b in c.encode_utf8(&mut buf).as_bytes() {
-                    out.push_str(&format!("%{:02X}", b));
-                }
-            }
-        }
-    }
-    out
-}
-
-fn get_hostname_for_browser() -> String {
-    hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "runner".to_string())
-}
-
-/// Start a one-click "connect with web login" flow.
-///
-/// Persists the `backend_url` if provided (so the eventual callback's save
-/// has a valid backend to merge against), generates a random state, stores
-/// it in the in-memory [`TokenFlowStore`](crate::server_mode::TokenFlowStore),
-/// and opens the user's default browser at
-/// `{backend_url}/connect-runner?state=...&callback=...&runner_name=...`.
-///
-/// The web page at `/connect-runner` prompts the user to confirm token
-/// creation, POSTs to `/api/v1/runners/tokens`, and redirects the browser
-/// back to `http://127.0.0.1:<runner-port>/auth/runner-token-callback`
-/// where the token is captured and applied via
-/// [`apply_web_integration_settings`].
-///
-/// # Errors
-///
-/// Returns `Err` if:
-/// - `backend_url` is empty and no backend is persisted in settings.
-/// - `open::that` fails to launch the browser (e.g. no default handler).
-#[tauri::command]
-pub async fn start_web_token_flow<R: Runtime>(
-    integration: State<'_, IntegrationCompartment>,
-    health: State<'_, HealthCompartment>,
-    app_handle: AppHandle<R>,
-    backend_url: Option<String>,
-) -> Result<(), String> {
-    // Resolve effective backend URL.
-    let effective_backend: String = match backend_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(provided) => {
-            let trimmed = trim_backend_url(provided);
-            // Persist so the eventual callback (which merges token into
-            // current settings) sees this backend even if the user hasn't
-            // hit Save yet.
-            let mut full = settings::load_settings();
-            if full.web_integration.backend_url != trimmed {
-                full.web_integration.backend_url = trimmed.clone();
-                settings::save_settings(&full).map_err(|e| {
-                    String::from(AppError::ConfigError(format!(
-                        "failed to persist backend_url: {}",
-                        e
-                    )))
-                })?;
-                // Don't flip `enabled` — just staging the URL. The callback
-                // sets `enabled=true` when it lands the token.
-                if let Err(e) = app_handle.emit(WEB_INTEGRATION_CHANGED_EVENT, ()) {
-                    warn!(
-                        "failed to emit {} event during backend_url staging: {}",
-                        WEB_INTEGRATION_CHANGED_EVENT, e
-                    );
-                }
-            }
-            trimmed
-        }
-        None => {
-            let persisted = settings::load_settings()
-                .web_integration
-                .backend_url
-                .clone();
-            let trimmed = trim_backend_url(&persisted);
-            if trimmed.is_empty() {
-                return Err("backend_url not configured — please enter one first".to_string());
-            }
-            trimmed
-        }
-    };
-
-    // Generate state and store it.
-    let state = integration.token_flow().start(effective_backend.clone());
-
-    // Build callback URL (runner's own HTTP API). Use 127.0.0.1 not
-    // localhost so the regex on the web side can validate it strictly.
-    let runner_port = {
-        // Prefer the actually-bound port if we can read it from AppState;
-        // fall back to the env-var-driven value for the (unusual) case
-        // where this command fires before the HTTP server has recorded its
-        // port. The callback route lives on the same axum router, so once
-        // that router is up the port matches.
-        let bound = health.api_port().load(std::sync::atomic::Ordering::Relaxed);
-        if bound > 0 {
-            bound
-        } else {
-            crate::mcp::types::get_mcp_api_port()
-        }
-    };
-    let callback_url = format!(
-        "http://127.0.0.1:{}/auth/runner-token-callback",
-        runner_port
-    );
-
-    let runner_name = get_hostname_for_browser();
-
-    // `/connect-runner` is a Next.js page, not an API endpoint. In production
-    // the API and the web frontend are split hosts (`api.qontinui.io` vs
-    // `qontinui.io`); in split local dev they differ by port. Honor an explicit
-    // `web_base_url` override when set, else derive the frontend origin from the
-    // backend by stripping a leading `api.` label (a no-op for localhost / a
-    // unified origin), so the browser never lands on the API host — which has
-    // no `/connect-runner` page.
-    let web_origin = settings::load_settings()
-        .web_integration
-        .web_base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(trim_backend_url)
-        .unwrap_or_else(|| crate::api_config::derive_web_base_url(&effective_backend));
-
-    let web_url = format!(
-        "{}/connect-runner?state={}&callback={}&runner_name={}",
-        web_origin,
-        url_encode(&state),
-        url_encode(&callback_url),
-        url_encode(&runner_name),
-    );
-
-    info!(
-        "start_web_token_flow: opening browser to {}/connect-runner (callback_port={}, api_backend={})",
-        web_origin, runner_port, effective_backend
-    );
-
-    open::that(&web_url).map_err(|e| {
-        String::from(AppError::ProcessError(format!(
-            "failed to open browser: {}",
-            e
-        )))
-    })?;
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // redeem_pair_code — paste-pair via single-use 5-min code (Phase 2a.3)
 // ---------------------------------------------------------------------------
 
@@ -807,7 +638,6 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             get_web_integration_status,
             save_web_integration_settings,
             test_web_integration_connection,
-            start_web_token_flow,
             redeem_pair_code,
         ])
         .build()
@@ -930,26 +760,5 @@ mod ipc_wire_contract_tests {
         let args: TestConnectionArgs = serde_json::from_str(payload).expect("must deserialize");
         assert_eq!(args.backend_url, "http://x");
         assert_eq!(args.runner_token, "tok");
-    }
-
-    /// Mirror for `start_web_token_flow` — `backendUrl` is optional.
-    #[derive(Debug, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct StartFlowArgs {
-        backend_url: Option<String>,
-    }
-
-    #[test]
-    fn start_flow_accepts_missing_backend_url() {
-        let payload = r#"{}"#;
-        let args: StartFlowArgs = serde_json::from_str(payload).expect("empty must deserialize");
-        assert_eq!(args.backend_url, None);
-    }
-
-    #[test]
-    fn start_flow_accepts_camelcase_backend_url() {
-        let payload = r#"{"backendUrl": "http://x"}"#;
-        let args: StartFlowArgs = serde_json::from_str(payload).expect("must deserialize");
-        assert_eq!(args.backend_url.as_deref(), Some("http://x"));
     }
 }

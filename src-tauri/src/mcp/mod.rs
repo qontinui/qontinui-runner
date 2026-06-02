@@ -27,7 +27,6 @@ pub mod api_surface_diff;
 pub mod app_discovery;
 pub mod app_dispatch;
 pub mod app_registry;
-pub mod auth_callback;
 pub mod auto_continue;
 pub mod automation_runs;
 pub mod awas;

@@ -4,14 +4,24 @@
  * Settings for web integration, enabling this runner to register with
  * qontinui-web so it can be dispatched to and stream phase events back.
  *
- * Backed by the following Tauri commands (Phase 3G-runner):
+ * Backed by the following Tauri commands:
  *   - get_web_integration_status
  *   - save_web_integration_settings
  *   - test_web_integration_connection
- *   - start_web_token_flow   (optional; provided by 3G-web-polish — hidden when missing)
+ *   - cognito_sign_in          (one-click browser connect)
+ *   - redeem_pair_code         (browserless pair-code connect)
  *
  * Also listens to the "web-integration-changed" event so the UI refreshes
- * whenever the backing settings change (including via the web token flow).
+ * whenever the backing settings change.
+ *
+ * IA (progressive disclosure):
+ *   1. Enabled master toggle + status banner (top).
+ *   2. Primary — honest connection state. When connected, shows who/what is
+ *      connected. When not, surfaces the obvious connect CTA (browser Cognito
+ *      sign-in) and points at the inline sign-in screen.
+ *   3. Secondary — Pair with a code (first-class, for headless/remote runners).
+ *   4. Advanced (collapsed) — Backend URL override, Web base URL override,
+ *      legacy Runner Token, Test connection.
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -39,6 +49,12 @@ import type { LogFunction } from "./types";
 interface WebIntegrationStatus {
   enabled: boolean;
   backendUrl: string;
+  /**
+   * User-facing web-frontend origin override. Empty when unset (the backend
+   * then derives it from `backendUrl` via `derive_web_base_url`). Needed for
+   * split web/coord dev (Next:3001 vs FastAPI:8000).
+   */
+  webBaseUrl: string;
   runnerTokenMasked: string;
   runnerId: string | null;
   lastHeartbeatAt: string | null;
@@ -144,20 +160,27 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   // --- Form state (user edits, may diverge from `status`) -------------------
   const [formEnabled, setFormEnabled] = useState(false);
   const [formBackendUrl, setFormBackendUrl] = useState("");
+  /** Web base URL override input. Empty string → backend derives from backendUrl. */
+  const [formWebBaseUrl, setFormWebBaseUrl] = useState("");
   /** Token input value. Empty string means "unchanged, keep persisted token". */
   const [formToken, setFormToken] = useState("");
   const [tokenEdited, setTokenEdited] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [urlError, setUrlError] = useState<string | null>(null);
+  const [webBaseUrlError, setWebBaseUrlError] = useState<string | null>(null);
   const [testState, setTestState] = useState<TestConnectionUIState>({ state: "idle" });
 
-  // --- One-click token flow availability (3G-web-polish) ---------------------
-  const [tokenFlowAvailable, setTokenFlowAvailable] = useState<boolean>(false);
+  // --- One-click browser (Cognito) connect ----------------------------------
+  const [connecting, setConnecting] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
 
   // --- Help collapse ---------------------------------------------------------
   const [helpTokenOpen, setHelpTokenOpen] = useState(false);
   const [helpWhatOpen, setHelpWhatOpen] = useState(false);
+
+  // --- Advanced disclosure ---------------------------------------------------
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   // --- Pair-code paste flow (Phase 2a.3) -------------------------------------
   // Single-use 5-char-from-32-alphabet code minted by the operator on
@@ -182,10 +205,12 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   const applyStatusToForm = useCallback((next: WebIntegrationStatus) => {
     setFormEnabled(next.enabled);
     setFormBackendUrl(next.backendUrl);
+    setFormWebBaseUrl(next.webBaseUrl ?? "");
     // Token stays blank — the masked version is shown as placeholder.
     setFormToken("");
     setTokenEdited(false);
     setUrlError(null);
+    setWebBaseUrlError(null);
   }, []);
 
   const refreshStatus = useCallback(async (): Promise<WebIntegrationStatus | null> => {
@@ -240,62 +265,39 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     return () => clearInterval(id);
   }, [refreshStatus]);
 
-  // --- Feature-detect the one-click flow command ----------------------------
-  //
-  // There is no formal "does this Tauri command exist" API. We piggy-back on
-  // invoke's error contract: Tauri surfaces an unregistered command as an
-  // error containing a phrase like "not found" / "is not defined". Any OTHER
-  // error (validation, browser open failure, network) means the command IS
-  // wired — it just didn't like our probe. That's the signal we want.
-  //
-  // We invoke with an empty backendUrl (undefined) so that IF the command is
-  // already wired and IF invoking it successfully opens the browser, we don't
-  // inadvertently start a real flow just to test. The 3G-web-polish team's
-  // command takes an optional backendUrl; calling it with {} is valid, so on
-  // a live binary this probe may actually open the user's browser. To avoid
-  // that side effect, we defer the probe until the user hovers/focuses the
-  // button via lazy detection below instead. (See `handleStartWebTokenFlow`.)
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        // Use the core "get command list" capability if exposed; otherwise
-        // optimistically assume it's available and fall back on actual
-        // invocation failure at click time.
-        // Tauri exposes no public "list registered commands" — best we can do
-        // without side effects is assume it's available when the command name
-        // is known to be in the roadmap, and gracefully hide on real invoke
-        // failure. See handleStartWebTokenFlow.
-        if (!cancelled) setTokenFlowAvailable(true);
-      } catch {
-        if (!cancelled) setTokenFlowAvailable(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   // --- Derived state --------------------------------------------------------
   const isDirty = (() => {
     if (!status) return false;
     if (formEnabled !== status.enabled) return true;
     if (formBackendUrl.trim() !== status.backendUrl.trim()) return true;
+    if (formWebBaseUrl.trim() !== (status.webBaseUrl ?? "").trim()) return true;
     if (tokenEdited && formToken.length > 0) return true;
     return false;
   })();
 
-  const canSave = isDirty && !saving && !urlError;
+  const canSave = isDirty && !saving && !urlError && !webBaseUrlError;
 
   // Web-frontend origin for the "log into qontinui-web" help link. Derived from
   // the backend URL (api.qontinui.io → qontinui.io); null when the backend
   // field is empty/invalid, in which case the help text renders without a link.
   const webAppUrl = deriveWebAppUrl(formBackendUrl);
 
+  // Honest connection state for the Primary section. `wsConnected`/`runnerId`
+  // are now truthful for Cognito/pair-code runners (Rust status fix), so we can
+  // key the "this device is connected" view directly off them.
+  const isConnected = Boolean(status?.wsConnected && status?.runnerId);
+
   // --- Handlers -------------------------------------------------------------
   const handleBackendUrlChange = (value: string) => {
     setFormBackendUrl(value);
     setUrlError(validateBackendUrl(value));
+  };
+
+  const handleWebBaseUrlChange = (value: string) => {
+    setFormWebBaseUrl(value);
+    // Empty is valid — the backend falls back to deriving the web origin from
+    // the backend URL. A non-empty value must be a well-formed http(s) URL.
+    setWebBaseUrlError(value.trim() ? validateBackendUrl(value) : null);
   };
 
   const handleEnabledToggle = () => {
@@ -347,11 +349,22 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       setUrlError(urlValidation);
       return;
     }
+    const trimmedWebBaseUrl = formWebBaseUrl.trim();
+    if (trimmedWebBaseUrl) {
+      const webValidation = validateBackendUrl(trimmedWebBaseUrl);
+      if (webValidation) {
+        setWebBaseUrlError(webValidation);
+        return;
+      }
+    }
     setSaving(true);
     try {
       await invoke<void>("save_web_integration_settings", {
         enabled: formEnabled,
         backendUrl: formBackendUrl.trim(),
+        // Empty input → undefined so the backend clears the override and falls
+        // back to `derive_web_base_url(backendUrl)`.
+        webBaseUrl: trimmedWebBaseUrl || undefined,
         runnerToken: tokenEdited ? formToken : "",
       });
       onLog("success", "Web integration settings saved");
@@ -397,6 +410,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     }
   }, [
     formBackendUrl,
+    formWebBaseUrl,
     formEnabled,
     formToken,
     tokenEdited,
@@ -494,31 +508,37 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     }
   }, [pairCodeInput, formBackendUrl, onLog, refreshStatus]);
 
-  const handleStartWebTokenFlow = useCallback(async () => {
+  /**
+   * One-click browser connect via Cognito Hosted-UI (RFC 8252 PKCE). Opens the
+   * system browser; on success the Rust command pairs this device (minting a
+   * device JWT) and promotes the runner to Tier 2, then emits
+   * `web-integration-changed`, which refreshes status here. This is the
+   * canonical connect path (replaces the removed `start_web_token_flow`
+   * browser-token flow).
+   */
+  const handleCognitoConnect = useCallback(async () => {
+    const backendUrl = formBackendUrl.trim() || PLACEHOLDER_BACKEND_URL;
+    setConnecting(true);
+    setConnectError(null);
+    onLog("info", "Opening browser to sign in with Qontinui — complete the flow there");
     try {
-      await invoke<void>("start_web_token_flow", {
-        backendUrl: formBackendUrl.trim() || undefined,
-      });
-      onLog("info", "Opened web login in your browser…");
+      await invoke<{
+        userId: string;
+        email: string | null;
+        tenantId: string | null;
+        deviceId: string;
+      }>("cognito_sign_in", { backendUrl });
+      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+      await refreshStatus();
+      onLog("success", "Connected — this device is signed in to your Qontinui account");
     } catch (err) {
       const msg = String(err);
-      const notFound =
-        msg.includes("not found") ||
-        msg.includes("Command not allowed") ||
-        msg.includes("is not defined") ||
-        msg.includes("Command start_web_token_flow not");
-      if (notFound) {
-        // 3G-web-polish hasn't shipped yet. Hide the button going forward.
-        setTokenFlowAvailable(false);
-        onLog(
-          "info",
-          "Web login flow is not available on this runner build — paste a token manually.",
-        );
-      } else {
-        onLog("error", `Failed to start web token flow: ${msg}`);
-      }
+      setConnectError(msg);
+      onLog("error", `Connect failed: ${msg}`);
+    } finally {
+      setConnecting(false);
     }
-  }, [formBackendUrl, onLog]);
+  }, [formBackendUrl, onLog, refreshStatus]);
 
   // --- Render ---------------------------------------------------------------
   if (loading) {
@@ -671,38 +691,64 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         </label>
       </div>
 
-      {/* Backend URL + Token */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
-        <h4 className="font-medium text-sm">Backend</h4>
+      {/* PRIMARY — honest connection state + the obvious connect CTA.
+          Only meaningful once the integration is enabled. */}
+      {formEnabled &&
+        (isConnected ? (
+          <div className="flex items-start gap-2 rounded-lg bg-card/50 p-4">
+            <CheckCircle2 className="w-5 h-5 text-green-500 shrink-0 mt-0.5" />
+            <div className="space-y-0.5 min-w-0">
+              <div className="text-sm font-medium">This device is connected</div>
+              <div className="text-xs text-muted-foreground break-all">
+                Registered as runner <code className="font-mono">{status?.runnerId}</code> · last
+                heartbeat {formatRelativeTime(status?.lastHeartbeatAt ?? null)}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3 rounded-lg border border-primary/40 bg-card/50 p-4">
+            <div>
+              <div className="text-sm font-medium">Connect this runner</div>
+              <div className="text-xs text-muted-foreground">
+                Sign in to bind this device to your Qontinui account so it becomes dispatchable
+                from the web. The quickest way is to sign in on the runner&rsquo;s sign-in screen;
+                you can also connect in your browser here.
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleCognitoConnect}
+              disabled={connecting}
+              className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {connecting ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              {connecting ? "Waiting for browser…" : "Sign in with Qontinui"}
+            </button>
+            {connecting && (
+              <p className="text-[11px] text-muted-foreground">
+                Complete the sign-in in your browser. This panel updates automatically once this
+                device is connected.
+              </p>
+            )}
+            {connectError && (
+              <p className="text-[11px] text-destructive flex items-center gap-1">
+                <AlertTriangle className="w-3 h-3 shrink-0" /> {truncate(connectError, 140)}
+              </p>
+            )}
+          </div>
+        ))}
 
-        <div className="space-y-1.5">
-          <label htmlFor="web-integration-backend-url" className="text-xs font-medium">
-            Backend URL
-          </label>
-          <input
-            id="web-integration-backend-url"
-            type="url"
-            autoComplete="off"
-            spellCheck={false}
-            value={formBackendUrl}
-            onChange={(e) => handleBackendUrlChange(e.target.value)}
-            placeholder={PLACEHOLDER_BACKEND_URL}
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
-          />
-          {urlError ? (
-            <p className="text-[10px] text-destructive flex items-center gap-1">
-              <AlertTriangle className="w-3 h-3" /> {urlError}
-            </p>
-          ) : (
-            <p className="text-[10px] text-muted-foreground">
-              Base URL of the qontinui-web backend this runner will register with.
-            </p>
-          )}
+      {/* SECONDARY — Pair with a code. First-class (not hidden): the path for
+          headless / remote / local-tier runners that can't open a browser. */}
+      <div className="space-y-3 rounded-lg bg-card/50 p-4">
+        <div>
+          <h4 className="font-medium text-sm">Pair with a code</h4>
+          <p className="text-xs text-muted-foreground">
+            For headless or remote runners that can&rsquo;t open a browser. Generate a one-time
+            pair code on qontinui-web (Runners &rarr; Auth Tokens) and paste it here. The code
+            expires after 5 minutes.
+          </p>
         </div>
-
-        {/* Pair code paste flow (Phase 2a.3) — recommended for new pairs.
-            Sits above the long-lived runner-token input because pair
-            codes are the simpler/safer path for new operators. */}
         <div className="space-y-1.5">
           <label htmlFor="web-integration-pair-code" className="text-xs font-medium">
             Pair code (6 chars)
@@ -747,85 +793,142 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
               <AlertTriangle className="w-3 h-3" /> {truncate(pairCodeState.message, 120)}
             </p>
           )}
-          {pairCodeState.state === "idle" && (
-            <p className="text-[10px] text-muted-foreground">
-              Generate a one-time pair code on qontinui-web (Runners &rarr; Auth
-              Tokens) and paste it here. The code expires after 5 minutes.
-            </p>
+        </div>
+      </div>
+
+      {/* ADVANCED — overrides + legacy token, tucked away but reachable. */}
+      <details
+        className="rounded-lg bg-card/50 p-4"
+        open={advancedOpen}
+        onToggle={(e) => setAdvancedOpen((e.currentTarget as HTMLDetailsElement).open)}
+      >
+        <summary className="flex items-center gap-1.5 cursor-pointer text-sm font-medium select-none list-none">
+          {advancedOpen ? (
+            <ChevronDown className="w-4 h-4" />
+          ) : (
+            <ChevronRight className="w-4 h-4" />
           )}
-        </div>
+          Advanced
+        </summary>
 
-        <div className="space-y-1.5">
-          <label htmlFor="web-integration-token" className="text-xs font-medium">
-            Runner Token
-          </label>
-          <div className="flex items-stretch gap-2">
+        <div className="mt-4 space-y-4">
+          <div className="space-y-1.5">
+            <label htmlFor="web-integration-backend-url" className="text-xs font-medium">
+              Backend URL
+            </label>
             <input
-              id="web-integration-token"
-              type="password"
-              autoComplete="new-password"
-              autoCorrect="off"
+              id="web-integration-backend-url"
+              type="url"
+              autoComplete="off"
               spellCheck={false}
-              data-lpignore="true"
-              data-1p-ignore="true"
-              value={formToken}
-              onChange={(e) => {
-                setFormToken(e.target.value);
-                setTokenEdited(true);
-              }}
-              placeholder={
-                status?.runnerTokenMasked && status.runnerTokenMasked.length > 0
-                  ? status.runnerTokenMasked
-                  : "qontinui_runner_…"
-              }
-              className="flex-1 min-w-0 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
+              value={formBackendUrl}
+              onChange={(e) => handleBackendUrlChange(e.target.value)}
+              placeholder={PLACEHOLDER_BACKEND_URL}
+              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
             />
-            <button
-              type="button"
-              onClick={handleTestConnection}
-              disabled={testState.state === "testing"}
-              className="px-3 py-1.5 text-xs font-medium rounded-md bg-muted hover:bg-muted/70 transition-colors disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
-            >
-              {testState.state === "testing" ? "Testing…" : "Test connection"}
-            </button>
+            {urlError ? (
+              <p className="text-[10px] text-destructive flex items-center gap-1">
+                <AlertTriangle className="w-3 h-3" /> {urlError}
+              </p>
+            ) : (
+              <p className="text-[10px] text-muted-foreground">
+                Base URL of the qontinui-web backend (API) this runner registers with.
+              </p>
+            )}
           </div>
-          <div className="min-h-[1rem]">{renderTestResult()}</div>
-          <p className="text-[10px] text-muted-foreground">
-            Paste a token from qontinui-web. The token is never displayed in full;{" "}
-            {status?.runnerTokenMasked
-              ? "the placeholder shows its masked prefix."
-              : "no token is currently saved."}
-          </p>
+
+          <div className="space-y-1.5">
+            <label htmlFor="web-integration-web-base-url" className="text-xs font-medium">
+              Web base URL <span className="text-muted-foreground font-normal">(optional)</span>
+            </label>
+            <input
+              id="web-integration-web-base-url"
+              type="url"
+              autoComplete="off"
+              spellCheck={false}
+              value={formWebBaseUrl}
+              onChange={(e) => handleWebBaseUrlChange(e.target.value)}
+              placeholder={webAppUrl ?? "https://qontinui.io"}
+              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
+            />
+            {webBaseUrlError ? (
+              <p className="text-[10px] text-destructive flex items-center gap-1">
+                <AlertTriangle className="w-3 h-3" /> {webBaseUrlError}
+              </p>
+            ) : (
+              <p className="text-[10px] text-muted-foreground">
+                User-facing web frontend origin for sign-in links. Leave empty to derive it from
+                the Backend URL. Set this for split web/coord dev (e.g. web on :3001 vs API on
+                :8000).
+              </p>
+            )}
+          </div>
+
+          <div className="space-y-1.5">
+            <label htmlFor="web-integration-token" className="text-xs font-medium">
+              Runner Token <span className="text-muted-foreground font-normal">(legacy)</span>
+            </label>
+            <div className="flex items-stretch gap-2">
+              <input
+                id="web-integration-token"
+                type="password"
+                autoComplete="new-password"
+                autoCorrect="off"
+                spellCheck={false}
+                data-lpignore="true"
+                data-1p-ignore="true"
+                value={formToken}
+                onChange={(e) => {
+                  setFormToken(e.target.value);
+                  setTokenEdited(true);
+                }}
+                placeholder={
+                  status?.runnerTokenMasked && status.runnerTokenMasked.length > 0
+                    ? status.runnerTokenMasked
+                    : "qontinui_runner_…"
+                }
+                className="flex-1 min-w-0 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
+              />
+              <button
+                type="button"
+                onClick={handleTestConnection}
+                disabled={testState.state === "testing"}
+                className="px-3 py-1.5 text-xs font-medium rounded-md bg-muted hover:bg-muted/70 transition-colors disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+              >
+                {testState.state === "testing" ? "Testing…" : "Test connection"}
+              </button>
+            </div>
+            <div className="min-h-[1rem]">{renderTestResult()}</div>
+            <p className="text-[10px] text-muted-foreground">
+              Legacy long-lived token from qontinui-web. Prefer signing in or a pair code above.
+              The token is never displayed in full;{" "}
+              {status?.runnerTokenMasked
+                ? "the placeholder shows its masked prefix."
+                : "no token is currently saved."}
+            </p>
+          </div>
         </div>
+      </details>
 
-        {tokenFlowAvailable && formBackendUrl.trim() && (
-          <div>
-            <button
-              type="button"
-              onClick={handleStartWebTokenFlow}
-              className="text-xs text-primary hover:underline inline-flex items-center gap-1"
-            >
-              Or connect with a web login <ExternalLink className="w-3 h-3" />
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* Save button */}
-      <div className="flex justify-end">
-        <button
-          type="button"
-          onClick={handleSave}
-          disabled={!canSave}
-          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-            canSave
-              ? "bg-primary text-primary-foreground hover:bg-primary/90"
-              : "bg-muted text-muted-foreground cursor-not-allowed"
-          }`}
-        >
-          {saving ? "Saving…" : "Save"}
-        </button>
-      </div>
+      {/* Save — appears whenever there are unsaved changes (the Enabled toggle
+          or any Advanced field). Kept outside the Advanced disclosure so a
+          toggle change is always committable without expanding Advanced. */}
+      {isDirty && (
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={!canSave}
+            className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+              canSave
+                ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                : "bg-muted text-muted-foreground cursor-not-allowed"
+            }`}
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      )}
 
       {/* Help */}
       <div className="space-y-2">

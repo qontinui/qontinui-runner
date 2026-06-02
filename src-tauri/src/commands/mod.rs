@@ -387,14 +387,6 @@ pub struct AppState {
     /// Consumers should use [`AppState::current_server_mode`] which clones
     /// the inner `Option<ServerModeState>` under a read lock.
     pub server_mode: Arc<tokio::sync::RwLock<Option<crate::server_mode::ServerModeState>>>,
-    /// Pending browser-login token flow store (Phase 3G-web-polish).
-    ///
-    /// Single-slot: starting a new flow cancels any in-progress flow.
-    /// Populated by `commands::web_integration::start_web_token_flow` when
-    /// the user clicks "Connect with web login" in Settings; consumed by
-    /// `mcp::auth_callback::runner_token_callback_handler` when the user's
-    /// browser redirects back with `?state=...&token=...`.
-    pub token_flow: Arc<crate::server_mode::TokenFlowStore>,
     /// Nuanced runner-health: latest UI error reported by the React
     /// `ErrorBoundary` (Phase 3J.1/3J.2).
     ///

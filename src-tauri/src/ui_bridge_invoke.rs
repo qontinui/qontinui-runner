@@ -51,9 +51,8 @@ pub struct InvokeResponse {
 
 /// Keyed store of pending oneshot senders — one per in-flight invoke.
 ///
-/// Multiple invokes can be in-flight at once, unlike `TokenFlowStore`
-/// which is single-slot. The HashMap is keyed by `request_id` (a uuid v4
-/// string) which we generate fresh for every call.
+/// Multiple invokes can be in-flight at once. The HashMap is keyed by
+/// `request_id` (a uuid v4 string) which we generate fresh for every call.
 pub struct InvokeRequestStore {
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<InvokeResponse>>>>,
 }
@@ -185,15 +184,6 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         args_schema: "{ \"backendUrl\": string, \"runnerToken\": string }",
         response_schema: "{ \"runner_id\": string }",
         probe_with_empty_args: true,
-    },
-    ProxyableCommand {
-        name: "start_web_token_flow",
-        description: "Open the user's browser at `{backend_url}/connect-runner?state=...&callback=...&runner_name=...`, stashing state for the eventual callback that applies the issued runner token. `backendUrl` is optional — when omitted, uses the persisted backend URL.",
-        args_schema: "{ \"backendUrl\"?: string | null }",
-        response_schema: "null",
-        // `backendUrl` is optional, so an empty-args probe would actually
-        // open the user's browser. Skip.
-        probe_with_empty_args: false,
     },
     ProxyableCommand {
         name: "redeem_pair_code",
@@ -463,7 +453,6 @@ mod tests {
         assert!(is_allowlisted("get_web_integration_status"));
         assert!(is_allowlisted("save_web_integration_settings"));
         assert!(is_allowlisted("test_web_integration_connection"));
-        assert!(is_allowlisted("start_web_token_flow"));
         assert!(is_allowlisted("redeem_pair_code"));
     }
 

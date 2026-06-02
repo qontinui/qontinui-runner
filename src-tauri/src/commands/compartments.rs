@@ -207,10 +207,6 @@ impl IntegrationCompartment {
         &self.0.server_mode
     }
 
-    pub fn token_flow(&self) -> &Arc<crate::server_mode::TokenFlowStore> {
-        &self.0.token_flow
-    }
-
     pub fn usb_transport(
         &self,
     ) -> &Arc<tokio::sync::OnceCell<crate::mcp::transport::usb::UsbTransport>> {

@@ -12,11 +12,6 @@
 //! progresses. When `WebIntegrationSettings` change, callers tear down the
 //! state via [`ServerModeState::shutdown`] and the relay observes the flag
 //! and reconnects.
-//!
-//! # Token flow
-//!
-//! The "Connect with web login" OAuth-style flow is independent of the WS
-//! relay and lives in [`token_flow`].
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -25,10 +20,6 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::settings::WebIntegrationSettings;
-
-pub mod token_flow;
-
-pub use token_flow::{PendingTokenFlow, TokenFlowStore};
 
 // ---------------------------------------------------------------------------
 // Configuration
