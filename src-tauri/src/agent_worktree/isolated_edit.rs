@@ -55,6 +55,29 @@ pub struct IsolatedEditContext {
 
 impl Drop for IsolatedEditContext {
     fn drop(&mut self) {
+        // Ξ_FS observer producer (plan 2026-05-31 §6.2): on session end,
+        // diff each materialized worktree against its base `parent_sha` and
+        // push the per-path {pre_sha, post_sha, hunks} batch to coord's
+        // `POST /coord/fs/observations`. Gated behind
+        // `QONTINUI_FS_OBSERVER_ENABLED` (default off) inside the producer;
+        // best-effort and fire-and-forget — a coord failure NEVER blocks the
+        // session teardown. One `correlation_id` per drop groups a multi-repo
+        // logical edit (matching coord's predict/verify correlation model).
+        if super::fs_observer::fs_observer_enabled() {
+            let correlation_id = Some(uuid::Uuid::new_v4());
+            for w in &self.worktrees {
+                super::fs_observer::spawn_push_worktree_observations(
+                    self.coord_http_base.clone(),
+                    w.worktree_path.clone(),
+                    w.parent_sha.clone(),
+                    w.repo.clone(),
+                    Some(self.agent_id.clone()),
+                    correlation_id,
+                    None, // tenant_id not resolved in this context
+                );
+            }
+        }
+
         // Stop the heartbeat first so its tick can't race with the
         // release POST. `ClaimHeartbeatHandle`'s own Drop notifies its
         // cancel token; the task exits on the next tick boundary.
