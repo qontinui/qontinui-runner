@@ -59,6 +59,35 @@ pub struct ImportEdge {
     pub to_module: String,
     pub imported_names: Vec<String>,
     pub line: usize,
+    /// Repo-relative file path the specifier resolves to, or `None` if external/unresolved.
+    /// Same normalization as `FileNode.path` (forward slashes, project-prefix-stripped).
+    pub resolved_target: Option<String>,
+    /// How (or whether) `to_module` was bound to a file by the resolver pass.
+    pub resolution: ResolutionKind,
+}
+
+/// How an `ImportEdge`'s specifier was bound to a file by the deterministic resolver.
+///
+/// `External` is honest — a third-party/stdlib specifier with no in-repo target
+/// (not a failure). `Unresolved` flags an *internal-looking* specifier the resolver
+/// could not bind: a coverage hole to surface, never to hide.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionKind {
+    /// TS/JS relative specifier (`./`, `../`) resolved against the importing file's dir.
+    Relative,
+    /// TS/JS bare specifier resolved via tsconfig `paths`/`baseUrl` alias.
+    TsconfigPath,
+    /// TS/JS specifier resolved to a directory `index.*` entry.
+    PackageIndex,
+    /// Python dotted/relative module resolved to a `.py`/`__init__.py` file.
+    PythonModule,
+    /// Rust `mod`/`use` path resolved within the crate.
+    RustMod,
+    /// Third-party package / stdlib — honestly external, no in-repo target.
+    External,
+    /// Internal-looking specifier the resolver could not bind (a coverage hole).
+    Unresolved,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +210,10 @@ impl CodeGraph {
             }
         }
 
+        // Resolve imports once over the fully-walked graph (the import map).
+        let resolver = super::import_resolver::ImportResolver::new(&graph, project_path);
+        resolver.resolve_graph(&mut graph);
+
         graph.build_duration_ms = start.elapsed().as_millis() as u64;
         info!(
             "CodeGraph built in {}ms: {} files, {} functions, {} classes, {} imports, {} exports",
@@ -196,6 +229,12 @@ impl CodeGraph {
     }
 
     /// Compute blast radius for a set of changed files.
+    ///
+    /// Uses the resolved import graph (`ImportEdge.resolved_target`) for exact
+    /// dependency lookups — no substring heuristics. An edge contributes to the
+    /// blast radius only when its `resolved_target` is exactly a file in the
+    /// affected set, so alias/index imports are caught and substring collisions
+    /// (e.g. `to_module:"user"` vs `user_settings.ts`) never produce false hits.
     pub fn blast_radius(&self, changed_files: &[String]) -> BlastRadius {
         let changed_set: std::collections::HashSet<&str> =
             changed_files.iter().map(|s| s.as_str()).collect();
@@ -208,21 +247,15 @@ impl CodeGraph {
             .map(|e| format!("{} ({})", e.name, e.file_path))
             .collect();
 
-        // Find files that import from changed files (1-hop)
+        // Find files that import from changed files (1-hop) via exact resolved targets.
         let directly_affected: Vec<String> = self
             .imports
             .iter()
             .filter(|imp| {
-                // Check if the import's target module resolves to any changed file
-                changed_files.iter().any(|cf| {
-                    let module = imp.to_module.replace('.', "/");
-                    cf.contains(&module)
-                        || module.contains(
-                            cf.trim_end_matches(".ts")
-                                .trim_end_matches(".py")
-                                .trim_end_matches(".rs"),
-                        )
-                })
+                imp.resolved_target
+                    .as_deref()
+                    .map(|t| changed_set.contains(t))
+                    .unwrap_or(false)
             })
             .map(|imp| imp.from_file.clone())
             .collect::<std::collections::HashSet<_>>()
@@ -230,22 +263,17 @@ impl CodeGraph {
             .filter(|f| !changed_set.contains(f.as_str()))
             .collect();
 
-        // Find files that import from directly affected files (2-hop)
+        // Find files that import from directly affected files (2-hop).
         let direct_set: std::collections::HashSet<&str> =
             directly_affected.iter().map(|s| s.as_str()).collect();
         let transitively_affected: Vec<String> = self
             .imports
             .iter()
             .filter(|imp| {
-                directly_affected.iter().any(|af| {
-                    let module = imp.to_module.replace('.', "/");
-                    af.contains(&module)
-                        || module.contains(
-                            af.trim_end_matches(".ts")
-                                .trim_end_matches(".py")
-                                .trim_end_matches(".rs"),
-                        )
-                })
+                imp.resolved_target
+                    .as_deref()
+                    .map(|t| direct_set.contains(t))
+                    .unwrap_or(false)
             })
             .map(|imp| imp.from_file.clone())
             .collect::<std::collections::HashSet<_>>()
@@ -726,6 +754,12 @@ impl CachedCodeGraph {
             }
         }
 
+        // Re-resolve imports over the updated graph. Resolution is in-memory and
+        // cheap; this reproduces the same resolved edges a full rebuild would
+        // produce (the parse count above is what's bounded to changed files).
+        let resolver = super::import_resolver::ImportResolver::new(&self.graph, &self.project_path);
+        resolver.resolve_graph(&mut self.graph);
+
         self.graph.build_duration_ms = start.elapsed().as_millis() as u64;
         self.built_at = SystemTime::now();
 
@@ -742,6 +776,310 @@ impl CachedCodeGraph {
             self.incremental_update();
         }
         &self.graph
+    }
+}
+
+// ============================================================================
+// Fingerprint-incremental persistence (resolved Ξ_AST, app-data local file)
+// ============================================================================
+
+/// Per-file content fingerprint used for incremental invalidation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileFingerprint {
+    /// File size in bytes.
+    pub size: u64,
+    /// Modification time in seconds since the unix epoch (best-effort; 0 if unavailable).
+    pub mtime_secs: u64,
+    /// SHA-256 of the file contents (hex). The authoritative change signal —
+    /// mtime+size are a fast pre-check, the hash is the tie-breaker so a rebuild
+    /// reproduces the exact same graph regardless of clock skew.
+    pub hash: String,
+}
+
+/// The resolved code graph plus per-file fingerprints, persisted under app-data
+/// so a rebuild re-parses only changed files (UA's knowledge-graph.json pattern).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedCodeGraph {
+    /// Schema version, so a format change invalidates stale caches.
+    pub version: u32,
+    /// Absolute project path this graph was built for (sanity check on load).
+    pub project_path: String,
+    /// Repo-relative file path -> content fingerprint.
+    pub fingerprints: HashMap<String, FileFingerprint>,
+    /// The resolved graph.
+    pub graph: CodeGraph,
+    /// Count of files parsed on the most recent (incremental or full) build.
+    /// Diagnostic only — lets callers/tests assert incremental work.
+    pub last_parsed_count: usize,
+}
+
+const PERSISTED_GRAPH_VERSION: u32 = 1;
+
+/// Stable repo hash for the cache filename: SHA-256 of the normalized absolute path.
+pub fn repo_hash(project_path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let normalized = project_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    hex_encode(&digest)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+fn fingerprint_content(content: &str, meta: Option<&std::fs::Metadata>) -> FileFingerprint {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let hash = hex_encode(&hasher.finalize());
+    let size = meta.map(|m| m.len()).unwrap_or(content.len() as u64);
+    let mtime_secs = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    FileFingerprint {
+        size,
+        mtime_secs,
+        hash,
+    }
+}
+
+impl PersistedCodeGraph {
+    /// Save this persisted graph to its app-data cache file (`<repo-hash>.json`).
+    pub fn save(&self, project_path: &Path) -> std::io::Result<()> {
+        let path = crate::paths::get_code_graph_path(&repo_hash(project_path));
+        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, json)
+    }
+
+    /// Load a persisted graph from its app-data cache file, if present and valid
+    /// for this project path + schema version.
+    pub fn load(project_path: &Path) -> Option<PersistedCodeGraph> {
+        let path = crate::paths::get_code_graph_path(&repo_hash(project_path));
+        let json = std::fs::read_to_string(path).ok()?;
+        let persisted: PersistedCodeGraph = serde_json::from_str(&json).ok()?;
+        if persisted.version != PERSISTED_GRAPH_VERSION {
+            return None;
+        }
+        Some(persisted)
+    }
+}
+
+impl CodeGraph {
+    /// Build the resolved code graph using the persisted app-data cache for
+    /// fingerprint-incremental re-analysis: only files whose content fingerprint
+    /// changed (or new files) are re-parsed; deleted files are dropped; imports
+    /// are then re-resolved over the whole graph. The result is identical to a
+    /// full [`CodeGraph::build`].
+    ///
+    /// Returns the resolved graph and the number of files parsed this run
+    /// (0 if nothing changed since the last persisted build).
+    pub fn build_incremental(project_path: &Path) -> (CodeGraph, usize) {
+        let start = std::time::Instant::now();
+        let skip_dirs = [
+            "node_modules",
+            "target",
+            ".git",
+            "dist",
+            "build",
+            "__pycache__",
+            ".venv",
+            "venv",
+            ".next",
+            ".turbo",
+            "coverage",
+            ".worktrees",
+        ];
+
+        let source_files = collect_source_files(project_path, &skip_dirs);
+
+        // Build current relative-path -> (full path, content, fingerprint) map.
+        let mut current: HashMap<String, (PathBuf, String, FileFingerprint)> = HashMap::new();
+        for file_path in &source_files {
+            let rel_path = file_path
+                .strip_prefix(project_path)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !matches!(ext, "ts" | "tsx" | "js" | "jsx" | "py" | "rs") {
+                continue;
+            }
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let meta = std::fs::metadata(file_path).ok();
+            let fp = fingerprint_content(&content, meta.as_ref());
+            current.insert(rel_path, (file_path.clone(), content, fp));
+        }
+
+        // Load the previous persisted graph (if any & valid).
+        let prev = PersistedCodeGraph::load(project_path);
+
+        let (mut graph, mut fingerprints, to_parse): (
+            CodeGraph,
+            HashMap<String, FileFingerprint>,
+            Vec<String>,
+        ) = match prev {
+            Some(p) if p.project_path == project_path.to_string_lossy() => {
+                let mut graph = p.graph;
+                let mut fingerprints = p.fingerprints;
+
+                // Drop data for deleted files.
+                let deleted: Vec<String> = fingerprints
+                    .keys()
+                    .filter(|k| !current.contains_key(*k))
+                    .cloned()
+                    .collect();
+                if !deleted.is_empty() {
+                    let del_set: std::collections::HashSet<&str> =
+                        deleted.iter().map(|s| s.as_str()).collect();
+                    graph.files.retain(|f| !del_set.contains(f.path.as_str()));
+                    graph
+                        .functions
+                        .retain(|f| !del_set.contains(f.file_path.as_str()));
+                    graph
+                        .classes
+                        .retain(|c| !del_set.contains(c.file_path.as_str()));
+                    graph
+                        .imports
+                        .retain(|i| !del_set.contains(i.from_file.as_str()));
+                    graph
+                        .exports
+                        .retain(|e| !del_set.contains(e.file_path.as_str()));
+                    for d in &deleted {
+                        fingerprints.remove(d);
+                    }
+                }
+
+                // Changed + new files (fingerprint differs).
+                let to_parse: Vec<String> = current
+                    .iter()
+                    .filter(|(rel, (_, _, fp))| {
+                        fingerprints.get(*rel).map(|old| old != fp).unwrap_or(true)
+                    })
+                    .map(|(rel, _)| rel.clone())
+                    .collect();
+
+                // Remove stale per-file data for changed files before re-parsing.
+                let change_set: std::collections::HashSet<&str> =
+                    to_parse.iter().map(|s| s.as_str()).collect();
+                graph
+                    .files
+                    .retain(|f| !change_set.contains(f.path.as_str()));
+                graph
+                    .functions
+                    .retain(|f| !change_set.contains(f.file_path.as_str()));
+                graph
+                    .classes
+                    .retain(|c| !change_set.contains(c.file_path.as_str()));
+                graph
+                    .imports
+                    .retain(|i| !change_set.contains(i.from_file.as_str()));
+                graph
+                    .exports
+                    .retain(|e| !change_set.contains(e.file_path.as_str()));
+
+                (graph, fingerprints, to_parse)
+            }
+            _ => {
+                // No valid cache — full build (parse everything).
+                let graph = CodeGraph {
+                    files: Vec::new(),
+                    functions: Vec::new(),
+                    classes: Vec::new(),
+                    imports: Vec::new(),
+                    exports: Vec::new(),
+                    build_duration_ms: 0,
+                };
+                let to_parse: Vec<String> = current.keys().cloned().collect();
+                (graph, HashMap::new(), to_parse)
+            }
+        };
+
+        // Parse only the changed/new files.
+        let parsed_count = to_parse.len();
+        for rel_path in &to_parse {
+            if let Some((full_path, content, fp)) = current.get(rel_path) {
+                parse_file_into(&mut graph, rel_path, full_path, content);
+                fingerprints.insert(rel_path.clone(), fp.clone());
+            }
+        }
+
+        // Re-resolve imports over the whole (updated) graph — produces the same
+        // resolved edges as a full rebuild.
+        let resolver = super::import_resolver::ImportResolver::new(&graph, project_path);
+        resolver.resolve_graph(&mut graph);
+
+        graph.build_duration_ms = start.elapsed().as_millis() as u64;
+
+        // Persist.
+        let persisted = PersistedCodeGraph {
+            version: PERSISTED_GRAPH_VERSION,
+            project_path: project_path.to_string_lossy().to_string(),
+            fingerprints,
+            graph: graph.clone(),
+            last_parsed_count: parsed_count,
+        };
+        if let Err(e) = persisted.save(project_path) {
+            warn!("CodeGraph: failed to persist resolved graph: {}", e);
+        }
+
+        info!(
+            "CodeGraph incremental build in {}ms: {} files parsed ({} total)",
+            graph.build_duration_ms,
+            parsed_count,
+            graph.files.len()
+        );
+
+        (graph, parsed_count)
+    }
+}
+
+/// Parse a single source file into the graph (language dispatch shared by the
+/// full and incremental builders). Adds the FileNode and all parsed entities.
+fn parse_file_into(graph: &mut CodeGraph, rel_path: &str, full_path: &Path, content: &str) {
+    let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let line_count = content.lines().count();
+    let language = match ext {
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" => "javascript",
+        "py" => "python",
+        "rs" => "rust",
+        _ => return,
+    };
+
+    graph.files.push(FileNode {
+        path: rel_path.to_string(),
+        language: language.to_string(),
+        line_count,
+    });
+
+    match (language, ext) {
+        ("typescript", "tsx") | ("javascript", "jsx") => {
+            parse_typescript(content, rel_path, graph, true);
+        }
+        ("typescript" | "javascript", _) => {
+            parse_typescript(content, rel_path, graph, false);
+        }
+        ("python", _) => {
+            parse_python(content, rel_path, graph);
+        }
+        ("rust", _) => {
+            parse_rust(content, rel_path, graph);
+        }
+        _ => {}
     }
 }
 
@@ -942,6 +1280,8 @@ fn parse_typescript(content: &str, file_path: &str, graph: &mut CodeGraph, is_ts
                         to_module: source,
                         imported_names,
                         line: node.start_position().row + 1,
+                        resolved_target: None,
+                        resolution: ResolutionKind::Unresolved,
                     });
                 }
             }
@@ -1073,6 +1413,8 @@ fn parse_python(content: &str, file_path: &str, graph: &mut CodeGraph) {
                         to_module: module,
                         imported_names: names,
                         line: node.start_position().row + 1,
+                        resolved_target: None,
+                        resolution: ResolutionKind::Unresolved,
                     });
                 }
             }
@@ -1204,7 +1546,29 @@ fn parse_rust(content: &str, file_path: &str, graph: &mut CodeGraph) {
                     to_module: module,
                     imported_names: names,
                     line: node.start_position().row + 1,
+                    resolved_target: None,
+                    resolution: ResolutionKind::Unresolved,
                 });
+            }
+            // `mod foo;` declarations — a module-tree edge the resolver binds to foo.rs/foo/mod.rs.
+            // (An inline `mod foo { ... }` has a body and is NOT a file edge — skip it.)
+            "mod_item" => {
+                let has_body = node.child_by_field_name("body").is_some();
+                if !has_body {
+                    if let Some(name_node) = node.child_by_field_name("name") {
+                        let name = name_node.utf8_text(bytes).unwrap_or("").to_string();
+                        if !name.is_empty() {
+                            graph.imports.push(ImportEdge {
+                                from_file: file_path.to_string(),
+                                to_module: format!("mod {}", name),
+                                imported_names: vec![name],
+                                line: node.start_position().row + 1,
+                                resolved_target: None,
+                                resolution: ResolutionKind::Unresolved,
+                            });
+                        }
+                    }
+                }
             }
             // impl blocks - extract methods
             "impl_item" => {
@@ -1403,10 +1767,10 @@ export class App extends React.Component {
 
     #[test]
     fn test_blast_radius_with_imports() {
-        // The blast_radius module matching checks if cf.contains(module) or module.contains(cf_stem).
-        // For "./auth" -> stripped cf is "src/auth", module is "./auth".
-        // Neither contains the other, so we use "src/auth" as the module to match the real
-        // resolution pattern where module paths mirror file paths.
+        // Resolved-edge blast radius: edges carry exact `resolved_target` file
+        // paths (as the ImportResolver pass would populate), so lookups are exact —
+        // no substring heuristic. routes.ts -> auth.ts (1-hop), app.ts -> routes.ts
+        // (2-hop from auth.ts).
         let graph = CodeGraph {
             files: vec![
                 FileNode {
@@ -1430,15 +1794,19 @@ export class App extends React.Component {
             imports: vec![
                 ImportEdge {
                     from_file: "src/routes.ts".into(),
-                    to_module: "src/auth".into(),
+                    to_module: "./auth".into(),
                     imported_names: vec!["authenticate".into()],
                     line: 1,
+                    resolved_target: Some("src/auth.ts".into()),
+                    resolution: ResolutionKind::Relative,
                 },
                 ImportEdge {
                     from_file: "src/app.ts".into(),
-                    to_module: "src/routes".into(),
+                    to_module: "./routes".into(),
                     imported_names: vec!["router".into()],
                     line: 2,
+                    resolved_target: Some("src/routes.ts".into()),
+                    resolution: ResolutionKind::Relative,
                 },
             ],
             exports: vec![ExportNode {
@@ -1452,7 +1820,7 @@ export class App extends React.Component {
 
         let br = graph.blast_radius(&["src/auth.ts".to_string()]);
         assert!(
-            !br.directly_affected.is_empty(),
+            br.directly_affected.contains(&"src/routes.ts".to_string()),
             "routes.ts should be directly affected"
         );
         assert!(
@@ -1462,8 +1830,107 @@ export class App extends React.Component {
         assert!(br.total_impact_count >= 1);
         // 2-hop: app.ts imports routes.ts which imports auth.ts
         assert!(
-            !br.transitively_affected.is_empty(),
+            br.transitively_affected.contains(&"src/app.ts".to_string()),
             "app.ts should be transitively affected"
+        );
+    }
+
+    #[test]
+    fn test_blast_radius_no_substring_false_positive() {
+        // The OLD substring heuristic matched `to_module:"user"` against any file
+        // path containing "user" (e.g. user_settings.ts). With resolved edges, an
+        // import that resolves to a *different* file produces ZERO false positives.
+        let graph = CodeGraph {
+            files: vec![
+                FileNode {
+                    path: "src/user.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 10,
+                },
+                FileNode {
+                    path: "src/user_settings.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 10,
+                },
+                FileNode {
+                    path: "src/profile.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 10,
+                },
+            ],
+            functions: vec![],
+            classes: vec![],
+            imports: vec![
+                // profile.ts imports user_settings.ts (NOT user.ts).
+                ImportEdge {
+                    from_file: "src/profile.ts".into(),
+                    to_module: "./user_settings".into(),
+                    imported_names: vec!["settings".into()],
+                    line: 1,
+                    resolved_target: Some("src/user_settings.ts".into()),
+                    resolution: ResolutionKind::Relative,
+                },
+            ],
+            exports: vec![],
+            build_duration_ms: 0,
+        };
+
+        // Changing user.ts must NOT mark profile.ts as affected (old heuristic would
+        // have, because "user" is a substring of "user_settings").
+        let br = graph.blast_radius(&["src/user.ts".to_string()]);
+        assert!(
+            br.directly_affected.is_empty(),
+            "no file imports user.ts; expected zero directly-affected, got {:?}",
+            br.directly_affected
+        );
+        assert_eq!(br.total_impact_count, 0);
+
+        // Changing user_settings.ts DOES mark profile.ts as affected (exact edge).
+        let br2 = graph.blast_radius(&["src/user_settings.ts".to_string()]);
+        assert!(
+            br2.directly_affected
+                .contains(&"src/profile.ts".to_string()),
+            "profile.ts imports user_settings.ts and should be directly affected"
+        );
+    }
+
+    #[test]
+    fn test_blast_radius_catches_alias_import() {
+        // An `@/...` tsconfig alias import the OLD substring heuristic would have
+        // missed (the raw specifier "@/auth" shares no substring with "src/auth.ts").
+        // With the resolver having bound resolved_target, the edge is caught.
+        let graph = CodeGraph {
+            files: vec![
+                FileNode {
+                    path: "src/auth.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 10,
+                },
+                FileNode {
+                    path: "src/page.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 10,
+                },
+            ],
+            functions: vec![],
+            classes: vec![],
+            imports: vec![ImportEdge {
+                from_file: "src/page.ts".into(),
+                to_module: "@/auth".into(),
+                imported_names: vec!["login".into()],
+                line: 1,
+                resolved_target: Some("src/auth.ts".into()),
+                resolution: ResolutionKind::TsconfigPath,
+            }],
+            exports: vec![],
+            build_duration_ms: 0,
+        };
+
+        let br = graph.blast_radius(&["src/auth.ts".to_string()]);
+        assert!(
+            br.directly_affected.contains(&"src/page.ts".to_string()),
+            "alias import @/auth -> src/auth.ts should be caught; got {:?}",
+            br.directly_affected
         );
     }
 
@@ -1489,6 +1956,8 @@ export class App extends React.Component {
                 to_module: "./auth".into(),
                 imported_names: vec!["authenticate".into()],
                 line: 1,
+                resolved_target: Some("src/auth.ts".into()),
+                resolution: ResolutionKind::Relative,
             }],
             exports: vec![ExportNode {
                 name: "authenticate".into(),
@@ -1552,5 +2021,150 @@ impl MyService {
             methods.contains(&"get_name".to_string()),
             "Should find get_name method"
         );
+    }
+
+    // ---- resolver integration through CodeGraph::build -------------------
+
+    #[test]
+    fn test_build_resolves_imports_end_to_end() {
+        let tmp = std::env::temp_dir().join(format!(
+            "twinast-build-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(
+            tmp.join("src/auth.ts"),
+            "export function authenticate() { return true; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("src/routes.ts"),
+            "import { authenticate } from './auth';\nimport axios from 'axios';\nexport const router = 1;\n",
+        )
+        .unwrap();
+
+        let graph = CodeGraph::build(&tmp);
+
+        let rel = graph
+            .imports
+            .iter()
+            .find(|i| i.to_module == "./auth")
+            .expect("relative import present");
+        assert_eq!(rel.resolved_target.as_deref(), Some("src/auth.ts"));
+        assert_eq!(rel.resolution, ResolutionKind::Relative);
+
+        let ext = graph
+            .imports
+            .iter()
+            .find(|i| i.to_module == "axios")
+            .expect("external import present");
+        assert_eq!(ext.resolved_target, None);
+        assert_eq!(ext.resolution, ResolutionKind::External);
+
+        // Blast radius via resolved edges: changing auth.ts affects routes.ts.
+        let br = graph.blast_radius(&["src/auth.ts".to_string()]);
+        assert!(br.directly_affected.contains(&"src/routes.ts".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_file(crate::paths::get_code_graph_path(&repo_hash(&tmp)));
+    }
+
+    #[test]
+    fn test_build_incremental_reparses_only_changed_and_reproduces_full() {
+        let tmp = std::env::temp_dir().join(format!(
+            "twinast-incr-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(
+            tmp.join("src/auth.ts"),
+            "export function authenticate() { return true; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("src/routes.ts"),
+            "import { authenticate } from './auth';\nexport const router = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("src/util.ts"), "export function noop() {}\n").unwrap();
+
+        // Ensure a clean cache.
+        let _ = std::fs::remove_file(crate::paths::get_code_graph_path(&repo_hash(&tmp)));
+
+        // First build: full — parses all 3 files.
+        let (_g1, parsed1) = CodeGraph::build_incremental(&tmp);
+        assert_eq!(parsed1, 3, "first incremental build parses all files");
+
+        // No-op rebuild: nothing changed -> 0 parsed.
+        let (_g_noop, parsed_noop) = CodeGraph::build_incremental(&tmp);
+        assert_eq!(parsed_noop, 0, "unchanged rebuild re-parses nothing");
+
+        // Edit ONE file (change its content so the hash differs).
+        std::fs::write(
+            tmp.join("src/auth.ts"),
+            "export function authenticate() { return false; }\nexport function logout() {}\n",
+        )
+        .unwrap();
+
+        let (g_incr, parsed2) = CodeGraph::build_incremental(&tmp);
+        assert_eq!(parsed2, 1, "editing 1 file re-parses exactly 1 file");
+
+        // Reproduces the same graph as a full rebuild from scratch.
+        let g_full = CodeGraph::build(&tmp);
+
+        assert_eq!(
+            sorted_paths(&g_incr),
+            sorted_paths(&g_full),
+            "incremental file set matches full rebuild"
+        );
+        assert_eq!(
+            g_incr.functions.len(),
+            g_full.functions.len(),
+            "incremental functions match full rebuild"
+        );
+        // The new logout export from the edited file must be present incrementally.
+        assert!(
+            g_incr.exports.iter().any(|e| e.name == "logout"),
+            "edited file's new export reflected in incremental graph"
+        );
+        // Resolved edges reproduced.
+        let incr_resolved: Vec<_> = g_incr
+            .imports
+            .iter()
+            .map(|i| (i.from_file.clone(), i.resolved_target.clone()))
+            .collect();
+        let full_resolved: Vec<_> = g_full
+            .imports
+            .iter()
+            .map(|i| (i.from_file.clone(), i.resolved_target.clone()))
+            .collect();
+        assert_eq!(
+            sorted(incr_resolved),
+            sorted(full_resolved),
+            "incremental resolved edges match full rebuild"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_file(crate::paths::get_code_graph_path(&repo_hash(&tmp)));
+    }
+
+    fn now_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    fn sorted_paths(g: &CodeGraph) -> Vec<String> {
+        let mut v: Vec<String> = g.files.iter().map(|f| f.path.clone()).collect();
+        v.sort();
+        v
+    }
+
+    fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
+        v.sort();
+        v
     }
 }
