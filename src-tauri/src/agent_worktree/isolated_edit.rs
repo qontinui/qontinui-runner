@@ -23,8 +23,8 @@ use tracing::{info, warn};
 
 use super::{
     allocate_and_materialize_with_claim, release_claim_best_effort, spawn_heartbeat_task,
-    worktree_mode_enabled, ActiveClaim, AllocateError, ClaimHeartbeatHandle, MaterializedWorktree,
-    RepoRequest,
+    worktree_mode_enabled, ActiveClaim, AllocateError, ClaimHeartbeatHandle, MaterializeOutcome,
+    MaterializedWorktree, RepoRequest,
 };
 
 /// A held isolated edit context. While this value is live, the agent's
@@ -138,7 +138,7 @@ pub async fn acquire(
         });
     }
 
-    let result = allocate_and_materialize_with_claim(
+    let outcome = allocate_and_materialize_with_claim(
         &coord_http_base,
         &device_id,
         &repo_reqs,
@@ -149,6 +149,45 @@ pub async fn acquire(
         req.phase,
     )
     .await?;
+
+    // Phase 3 — normalize coord's isolation directive into the
+    // worktree-shaped `IsolatedEditContext`:
+    // - `Worktrees` → as-is.
+    // - `SharedBranch` → the canonical checkout IS the cwd; map each
+    //   per-repo branch into a `MaterializedWorktree` whose
+    //   `worktree_path` is the canonical checkout, so callers that read
+    //   `worktrees[0].worktree_path` get the right cwd (the shared
+    //   checkout) transparently.
+    // - `Wait` → surface as `Err(Other)` with a `wait:` prefix so the
+    //   caller logs/retries (it does NOT spin here). `acquire_for_terminal`
+    //   degrades to the shared cwd on this Err, which is the safe fallback.
+    let result: super::AllocateResult = match outcome {
+        MaterializeOutcome::Worktrees(r) => r,
+        MaterializeOutcome::SharedBranch(sb) => super::AllocateResult {
+            agent_id: sb.agent_id,
+            worktrees: sb
+                .branches
+                .into_iter()
+                .map(|b| MaterializedWorktree {
+                    repo: b.repo,
+                    branch: b.branch,
+                    parent_sha: b.parent_sha,
+                    worktree_path: b.checkout_path,
+                    push_ref: b.push_ref,
+                })
+                .collect(),
+            token: sb.token,
+            token_jti: sb.token_jti,
+            token_exp: sb.token_exp,
+            active_claim: sb.active_claim,
+        },
+        MaterializeOutcome::Wait(w) => {
+            return Err(AllocateError::Other(format!(
+                "wait: coord declined to materialize agent_id={} reason={:?} blocking={:?} retry_when={:?}",
+                w.agent_id, w.reason, w.blocking, w.retry_when
+            )));
+        }
+    };
 
     let heartbeat = result.active_claim.as_ref().map(|claim| {
         info!(
