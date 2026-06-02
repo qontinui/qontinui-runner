@@ -42,8 +42,9 @@ pub use metadata::{record_context_use, set_context_enabled, set_web_sync_status}
 
 // Re-export resolution and formatting
 pub use resolution::{
-    format_contexts_for_prompt, format_observation_memory_for_prompt, format_single_context,
-    inject_contexts, record_contexts_used, resolve_contexts,
+    context_matches_touched_paths, format_contexts_for_prompt,
+    format_observation_memory_for_prompt, format_single_context, inject_contexts,
+    inject_contexts_scoped, record_contexts_used, resolve_contexts, resolve_contexts_scoped,
 };
 
 // Re-export built-in contexts
@@ -53,7 +54,7 @@ pub use builtins::get_builtin_contexts;
 pub use project_contexts::{
     add_project_context_to_config, create_project_context, delete_project_context_from_config,
     get_project_context_from_config, get_project_contexts, get_project_contexts_from_config,
-    load_project_contexts_from_dir, update_project_context_in_config,
+    load_project_contexts_from_dir, update_project_context_in_config, MAX_TOTAL_CONTEXT_CHARS,
 };
 
 // Re-export special context handling

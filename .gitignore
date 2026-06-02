@@ -138,4 +138,5 @@ target-run/
 .build-state/
 target-rebuild/
 target-types-task/
+target-wt/
 *.log.err

@@ -206,6 +206,164 @@ pub fn resolve_contexts(
     result
 }
 
+/// Does a context's path-scope (its `auto_include.file_patterns`) admit the
+/// given set of touched paths?
+///
+/// Scoping rules (see `project_contexts.rs` for the model):
+/// - A context with NO `file_patterns` is unscoped ⇒ always attaches.
+/// - A scoped context attaches iff at least one touched path matches at least
+///   one of its globs.
+/// - A scoped context with an EMPTY `touched_paths` set does NOT attach
+///   (the task touches nothing the scope cares about). Conservative: a scoped
+///   rule should only appear when its files are in play.
+pub fn context_matches_touched_paths(ctx: &Context, touched_paths: &[String]) -> bool {
+    let patterns = match ctx
+        .auto_include
+        .as_ref()
+        .and_then(|ai| ai.file_patterns.as_ref())
+    {
+        Some(p) if !p.is_empty() => p,
+        _ => return true, // unscoped → always attaches
+    };
+
+    touched_paths.iter().any(|path| {
+        let normalized = path.replace('\\', "/");
+        patterns
+            .iter()
+            .any(|pat| glob_match::glob_match(pat, &normalized))
+    })
+}
+
+/// Category marker that [`crate::context::load_project_contexts_from_dir`]
+/// stamps on every ingested interop rule file (root `CLAUDE.md` / `AGENTS.md`
+/// / `.cursorrules`, `.cursor/rules/*.mdc`, nested rule files). Used to
+/// recognize always-attached rule-file contexts at resolution time.
+const RULE_FILE_CATEGORY: &str = "rule-file";
+
+/// Resolve contexts, then attach project rule-file contexts and apply
+/// path/glob scoping by the task's touched paths (Track C1 + C2).
+///
+/// Reuses [`resolve_contexts`] verbatim for the trigger-based resolution
+/// decision (explicit IDs + auto-detect against task text/actions/errors), so
+/// there is exactly ONE resolution model. It then layers in the rule-file
+/// *attachment* semantics that trigger-matching alone cannot express:
+///
+/// - Project rule-file contexts (`category == "rule-file"`) are
+///   **always-attached** by convention, NOT trigger-gated. Root rules
+///   (`CLAUDE.md` / `AGENTS.md` / `.cursorrules`) carry no `auto_include`, so
+///   plain `resolve_contexts` would never surface them; we add any that the
+///   trigger pass missed here.
+/// - The scope filter ([`context_matches_touched_paths`]) is then applied to
+///   the WHOLE set: unscoped contexts always survive; a scoped rule (e.g. a
+///   nested `src/foo/CLAUDE.md` → `src/foo/**`, or a `.mdc` with `globs:`)
+///   survives only when a touched path matches.
+pub fn resolve_contexts_scoped(
+    explicit_ids: &[String],
+    auto_detect: bool,
+    task_prompt: &str,
+    action_types: &[String],
+    recent_errors: &[String],
+    touched_paths: &[String],
+) -> ResolvedContexts {
+    let mut resolved = resolve_contexts(
+        explicit_ids,
+        auto_detect,
+        task_prompt,
+        action_types,
+        recent_errors,
+    );
+
+    // Attach always-on project rule-file contexts that the trigger-based pass
+    // above did not already include. Root rule files have no `auto_include`,
+    // so they are invisible to trigger matching — but the convention is that
+    // they always apply (subject to the scope filter below). Push them onto
+    // `auto_detected` with an explicit reason so provenance is recorded.
+    let already: std::collections::HashSet<String> = resolved
+        .explicit
+        .iter()
+        .chain(resolved.auto_detected.iter())
+        .map(|c| c.id.clone())
+        .collect();
+    for ctx in get_project_contexts() {
+        if ctx.category.as_deref() != Some(RULE_FILE_CATEGORY) {
+            continue;
+        }
+        if already.contains(&ctx.id) {
+            continue;
+        }
+        resolved.auto_detect_reasons.push(AutoDetectReason {
+            context_id: ctx.id.clone(),
+            reason: "ruleFile".to_string(),
+            matched_trigger: ctx
+                .auto_include
+                .as_ref()
+                .and_then(|ai| ai.file_patterns.as_ref())
+                .map(|p| p.join(","))
+                .unwrap_or_else(|| "always-attached".to_string()),
+        });
+        resolved.auto_detected.push(ctx);
+    }
+
+    resolved
+        .explicit
+        .retain(|c| context_matches_touched_paths(c, touched_paths));
+    resolved
+        .auto_detected
+        .retain(|c| context_matches_touched_paths(c, touched_paths));
+    let surviving: std::collections::HashSet<&str> = resolved
+        .explicit
+        .iter()
+        .chain(resolved.auto_detected.iter())
+        .map(|c| c.id.as_str())
+        .collect();
+    resolved
+        .auto_detect_reasons
+        .retain(|r| surviving.contains(r.context_id.as_str()));
+
+    resolved
+}
+
+/// Inject contexts into a prompt with path/glob scoping applied.
+///
+/// Path-scoped variant of [`inject_contexts`]: project-rule contexts that
+/// declare a `file_patterns` scope only attach when one of `touched_paths`
+/// matches. Reuses the same `resolve → format → prepend` plumbing — there is
+/// exactly one resolution model.
+pub fn inject_contexts_scoped(
+    base_prompt: &str,
+    context_ids: &[String],
+    auto_detect: bool,
+    task_prompt: &str,
+    action_types: &[String],
+    recent_errors: &[String],
+    touched_paths: &[String],
+) -> (String, Vec<String>) {
+    let resolved = resolve_contexts_scoped(
+        context_ids,
+        auto_detect,
+        task_prompt,
+        action_types,
+        recent_errors,
+        touched_paths,
+    );
+
+    let used_ids: Vec<String> = resolved
+        .explicit
+        .iter()
+        .chain(resolved.auto_detected.iter())
+        .map(|c| c.id.clone())
+        .collect();
+
+    let context_section = format_contexts_for_prompt(&resolved);
+
+    let enhanced = match context_section {
+        Some(section) => format!("{}{}", section, base_prompt),
+        None => base_prompt.to_string(),
+    };
+
+    (enhanced, used_ids)
+}
+
 /// Format a single context for injection into a prompt.
 fn format_context(ctx: &Context) -> String {
     let category_attr = ctx
@@ -375,4 +533,62 @@ pub fn format_single_context(ctx: &Context) -> String {
         "<context name=\"{}\"{}>\n{}\n</context>",
         ctx.name, category_attr, ctx.content
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::types::{Context, ContextAutoInclude};
+
+    fn ctx_with_patterns(patterns: Option<Vec<String>>) -> Context {
+        Context {
+            id: "t".to_string(),
+            name: "t".to_string(),
+            content: "body".to_string(),
+            category: None,
+            tags: vec![],
+            auto_include: patterns.map(|p| ContextAutoInclude {
+                file_patterns: Some(p),
+                ..Default::default()
+            }),
+            created_at: String::new(),
+            modified_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn unscoped_context_always_matches() {
+        let c = ctx_with_patterns(None);
+        assert!(context_matches_touched_paths(&c, &[]));
+        assert!(context_matches_touched_paths(&c, &["x.rs".to_string()]));
+    }
+
+    #[test]
+    fn scoped_context_matches_only_in_scope() {
+        let c = ctx_with_patterns(Some(vec!["src/api/**".to_string()]));
+        assert!(context_matches_touched_paths(
+            &c,
+            &["src/api/handler.rs".to_string()]
+        ));
+        assert!(!context_matches_touched_paths(
+            &c,
+            &["src/ui/view.rs".to_string()]
+        ));
+        assert!(!context_matches_touched_paths(&c, &[]));
+    }
+
+    #[test]
+    fn scoped_context_normalizes_windows_separators() {
+        let c = ctx_with_patterns(Some(vec!["src/api/**".to_string()]));
+        assert!(context_matches_touched_paths(
+            &c,
+            &["src\\api\\handler.rs".to_string()]
+        ));
+    }
+
+    #[test]
+    fn empty_patterns_treated_as_unscoped() {
+        let c = ctx_with_patterns(Some(vec![]));
+        assert!(context_matches_touched_paths(&c, &[]));
+    }
 }

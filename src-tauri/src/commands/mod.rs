@@ -435,6 +435,14 @@ pub struct AppState {
     /// `/wrappers/*` routes can resolve via the same OnceCell pattern as
     /// `app_registry` / `app_dispatcher`.
     pub wrapper_state: Arc<tokio::sync::OnceCell<Arc<crate::wrappers::WrapperState>>>,
+    /// Speculative MCP / link pre-hydration cache (Track C3), keyed by
+    /// `execution_id`. Populated best-effort before the first agentic turn with
+    /// a timestamped, prompt-ready summary of available MCP tools + the gist of
+    /// any URLs/issue-refs in the task description. Read once to prime the
+    /// first prompt; cleared on execution completion. Never on the task's
+    /// critical path — a pre-fetch failure leaves this empty and the task
+    /// proceeds unchanged.
+    pub prehydration_cache: Arc<crate::unified_workflow_executor::prehydration::PrehydrationCache>,
 }
 
 impl AppState {
