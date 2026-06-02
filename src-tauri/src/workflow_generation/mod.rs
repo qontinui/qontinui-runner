@@ -19,6 +19,7 @@ pub mod few_shot_curator;
 pub mod generator;
 pub mod gepa_optimizer;
 pub mod hardener;
+pub mod import_resolver;
 pub mod investigator;
 pub mod meta_workflow;
 pub mod pipeline_artifacts;

@@ -110,8 +110,13 @@ a scope registry (map scope → helper child).
   completion is Phase 3).
 - `credibility` is the triple from the theory (Phase 1): definitional/structural code
   queries are `(high,high,high)` — the LSP crosses the compiler boundary and is
-  authorially independent. The `code_graph_fallback` provenance lowers the *boundary*
-  axis to `medium` (syntactic, no resolution) and `coverage<1`.
+  authorially independent. The three `Ξ_AST`/`Ξ_Type` tiers form a clean 3-rung
+  *boundary* ladder: the syntactic `code_graph_fallback` provenance (raw, no import
+  resolution) is boundary **`low`** and `coverage<1`; the resolved-import
+  `code_graph_resolved` provenance (deterministic file binding, not the compiler's
+  resolver) is boundary **`medium`**; the LSP `ts-language-service` is boundary
+  **`high`**. Reserving `medium` for the resolved tier keeps the low/medium/high
+  triple unambiguously orderable across all three observers.
 
 ---
 

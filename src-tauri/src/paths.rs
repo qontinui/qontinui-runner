@@ -110,6 +110,27 @@ pub fn get_api_images_dir() -> PathBuf {
     path
 }
 
+/// Get the code-graph cache directory (`<app_data>/qontinui-runner/code-graph`).
+///
+/// Persists the resolved `Ξ_AST` code graph keyed by repo hash, for
+/// fingerprint-incremental re-analysis. This is NOT under `dev-logs` — it is a
+/// derived analysis cache, rooted directly at the runner's app-data dir so it is
+/// independent of the dev-logs override and the per-instance scoping.
+pub fn get_code_graph_dir() -> PathBuf {
+    let base = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("qontinui-runner")
+        .join("code-graph");
+    ensure_dir_exists(&base);
+    base
+}
+
+/// Get the persisted code-graph JSON path for a given repo hash
+/// (`<app_data>/qontinui-runner/code-graph/<repo-hash>.json`).
+pub fn get_code_graph_path(repo_hash: &str) -> PathBuf {
+    get_code_graph_dir().join(format!("{}.json", repo_hash))
+}
+
 /// Get the workflow debug log path (`<dev_logs>/workflow-debug.log`).
 pub fn get_workflow_debug_log_path() -> PathBuf {
     get_dev_logs_dir().join("workflow-debug.log")

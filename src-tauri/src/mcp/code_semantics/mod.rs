@@ -25,6 +25,7 @@
 //! - Node/TS permanently unavailable → degrade (symbol-lookup → code_graph_fallback;
 //!   resolution → `engine_unavailable`, coverage 0). Never 500 on a missing engine.
 
+pub mod code_graph_api;
 pub mod node_bridge;
 pub mod scope;
 
@@ -77,6 +78,17 @@ impl Credibility {
         }
     }
 
+    /// Resolved-import `Ξ_AST` (deterministic file binding, not the compiler's
+    /// resolver). Boundary `medium` per the Phase 1 credibility ladder: above the
+    /// raw syntactic tier, below the LSP `Ξ_Type` tier.
+    pub fn resolved() -> Self {
+        Credibility {
+            causal: "high".into(),
+            authorial: "high".into(),
+            boundary: "medium".into(),
+        }
+    }
+
     /// Cold / unavailable — boundary unknown, lowered.
     pub fn degraded() -> Self {
         Credibility {
@@ -106,6 +118,8 @@ pub const PROV_LSP: &str = "ts-language-service";
 pub const PROV_FALLBACK: &str = "code_graph_fallback";
 pub const PROV_INDEXING: &str = "indexing";
 pub const PROV_UNAVAILABLE: &str = "engine_unavailable";
+/// Resolved-import `Ξ_AST` provenance (Phase 1/2): deterministic file binding.
+pub const PROV_RESOLVED: &str = "code_graph_resolved";
 
 impl Envelope {
     /// Warm, resolved answer: posterior=1, coverage=1, credibility=(high,high,high).
@@ -148,6 +162,26 @@ impl Envelope {
             coverage: 0.0,
             provenance: PROV_INDEXING.into(),
             credibility: Credibility::degraded(),
+            staleness_seconds: None,
+            kernel: false,
+        }
+    }
+
+    /// Resolved-import `Ξ_AST` answer (the diff-impact / resolve-import surface,
+    /// CONTRACT §C). `observer` is `"code_graph"` (distinct from the LSP
+    /// `code_semantics` observer); `provenance="code_graph_resolved"`, boundary
+    /// `medium`. `coverage` < 1 honestly when the graph still has `Unresolved`
+    /// edges (a partial/cold graph) — never asserts a false "no impact".
+    /// `posterior` tracks coverage (high for a fully-resolved graph).
+    pub fn resolved(query: &str, result: Value, coverage: f64) -> Self {
+        Envelope {
+            observer: "code_graph".into(),
+            query: query.into(),
+            result,
+            posterior: coverage,
+            coverage,
+            provenance: PROV_RESOLVED.into(),
+            credibility: Credibility::resolved(),
             staleness_seconds: None,
             kernel: false,
         }
@@ -343,7 +377,9 @@ pub struct TypecheckReq {
 // Routes (CONTRACT §B)
 // ===========================================================================
 
-/// Routes contributed to the runner's main router from `mcp_api.rs`.
+/// Routes contributed to the runner's main router from `mcp_api.rs`. Includes
+/// the LSP `Ξ_Type` `/code-semantics/*` surface and the resolved-import `Ξ_AST`
+/// `/code-graph/*` diff blast-radius surface (Pillar 2).
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/code-semantics/health", get(health))
@@ -351,6 +387,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/code-semantics/signature", post(signature))
         .route("/code-semantics/find-references", post(find_references))
         .route("/code-semantics/typecheck", post(typecheck))
+        .merge(code_graph_api::routes())
 }
 
 /// GET /code-semantics/health — per CONTRACT §B.
