@@ -458,9 +458,44 @@ pub async fn connect_sdk_app(
     // Create HTTP client with timeout
     // 30s request timeout matches the UI Bridge IPC timeout — the app's snapshot/elements
     // endpoints proxy through the IPC layer and can take >10s on cold pages.
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5));
+
+    // Attach the operator's Cognito access token as a default `Authorization:
+    // Bearer` header on EVERY request this connection makes (health probe +
+    // every `/control/*` / `/sdk/*` relay call all go through `conn.client`).
+    //
+    // The web UI Bridge relay (`/api/ui-bridge/[...path]/_auth.ts`) gates all
+    // paths behind a verified Cognito bearer when `UI_BRIDGE_REQUIRE_AUTH=1`
+    // (prod, as of the 2026-05 Cognito relay-gating) — including `/health`.
+    // Without this header the runner's connect handshake 401s and the SDK can
+    // never attach. This is the "transport-side Authorization header" the relay
+    // auth comment says the consumer must add before the flag is flipped.
+    //
+    // Token is read from secure storage at connect time; reconnect (or
+    // auto-connect) picks up a refreshed token. Absent token (runner not signed
+    // in) → connect without it, preserving local/dev relays where the gate is
+    // off (they ignore the header) and surfacing a clean 401 against a gated
+    // relay rather than failing to build the client.
+    match crate::auth::AuthManager::new().get_access_token() {
+        Ok(token) if !token.is_empty() => {
+            match reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+                Ok(mut value) => {
+                    value.set_sensitive(true);
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                    builder = builder.default_headers(headers);
+                    debug!("SDK relay client: attached operator bearer for {}", url);
+                }
+                Err(e) => warn!("SDK relay client: malformed bearer, connecting without auth: {e}"),
+            }
+        }
+        Ok(_) => debug!("SDK relay client: empty access token; connecting without auth"),
+        Err(e) => debug!("SDK relay client: no access token ({e}); connecting without auth"),
+    }
+
+    let client = builder
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
