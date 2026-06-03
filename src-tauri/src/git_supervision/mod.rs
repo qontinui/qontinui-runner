@@ -40,6 +40,8 @@ use tauri::Emitter;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+pub mod commit_forwarder;
+
 /// Maximum number of supervision events kept in the in-process ring buffer.
 /// When full, the oldest entry is evicted to make room for the newest.
 pub const RING_CAPACITY: usize = 256;
@@ -140,6 +142,13 @@ impl SupervisionState {
                 event.id, event.kind, event.provenance
             );
         }
+
+        // Commit-action plan Phase 1: best-effort, env-gated, non-blocking
+        // forward of `commit`-kind events to coord's
+        // `POST /coord/commits/observations`. The spawn keeps the ring / Tauri
+        // path above untouched and undelayed; the helper itself no-ops unless
+        // `QONTINUI_COMMIT_FORWARDER_ENABLED` is set AND `event.kind == "commit"`.
+        commit_forwarder::spawn_forward_commit_event(&event);
     }
 
     /// Snapshot the ring (oldest → newest) for HTTP exposure / diagnostics.
