@@ -129,6 +129,14 @@ export class XtermBackend implements ITerminalBackend {
     this.term.scrollLines(amount);
   }
 
+  scrollPages(pageCount: number): void {
+    this.term.scrollPages(pageCount);
+  }
+
+  scrollToTop(): void {
+    this.term.scrollToTop();
+  }
+
   attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
     this.term.attachCustomKeyEventHandler(handler);
   }

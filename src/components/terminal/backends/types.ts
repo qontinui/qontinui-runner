@@ -129,6 +129,14 @@ export interface ITerminalBackend {
    * tracking mode. No-op when there is no scrollback to move through.
    */
   scrollLines(amount: number): void;
+  /**
+   * Scroll the viewport by `pageCount` pages (one page ≈ one screen height).
+   * Positive scrolls DOWN, negative UP. Backs the Shift+PageUp/PageDown
+   * keyboard shortcuts (VS Code "Scroll Up/Down (Page)").
+   */
+  scrollPages(pageCount: number): void;
+  /** Scroll the viewport to the very top of the scrollback (VS Code Ctrl+Home). */
+  scrollToTop(): void;
 
   // -- Key handling ---------------------------------------------------------
   /** Intercept key events before the terminal processes them. Return false to prevent default. */
