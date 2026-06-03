@@ -112,13 +112,25 @@ pub(crate) fn should_relay_idle_with(
 pub(crate) fn should_relay_idle(settings: &crate::settings::Settings) -> bool {
     let has_device_jwt = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) => !t.trim().is_empty(),
-        Err(_) => false,
+        Err(e) => {
+            tracing::debug!(error = %e, "relay idle check: get_access_token failed");
+            false
+        }
     };
-    should_relay_idle_with(
+    let idle = should_relay_idle_with(
         settings.tier,
         settings.web_integration.enabled,
         has_device_jwt,
-    )
+    );
+    if idle {
+        tracing::info!(
+            tier = ?settings.tier,
+            enabled = settings.web_integration.enabled,
+            has_device_jwt,
+            "backend_relay: idling (gate unmet)"
+        );
+    }
+    idle
 }
 
 /// Diagnostic snapshot of the relay's idle-gating inputs + live connection
@@ -382,11 +394,7 @@ async fn relay_loop(
             }
         }
 
-        let backend_url = web_integration
-            .backend_url
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
+        let backend_url = crate::api_config::get_api_base_url();
 
         let ws_url = format!(
             "{}/api/v1/devices/ws",
@@ -1265,7 +1273,11 @@ async fn handle_relay_command(
         }
 
         _ => {
-            warn!("Unknown relay command type: {}", msg_type);
+            warn!(
+                msg_type,
+                body = %serde_json::to_string(&data).unwrap_or_default(),
+                "Unknown relay command type"
+            );
             None
         }
     }
