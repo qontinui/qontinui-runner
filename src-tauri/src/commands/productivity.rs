@@ -1815,9 +1815,25 @@ pub fn get_coord_http_base() -> String {
 
 /// `get_fleet_health` — fetch coord's fleet-health rollup + active
 /// alerts in one call for the dashboard panel. Returns the merged JSON
-/// `{ health: <coord /fleet/health>, alerts: [...], coordBase }`.
-/// Errors are returned as `Err(String)` so the panel can render a
-/// retriable error state (coord down ≠ runner down).
+/// `{ health: <coord /fleet/health>, alerts: [...], coordBase, auth }`.
+///
+/// Both GETs carry the device-JWT (coord device-pairing token) when one
+/// is available locally. coord is anonymous TODAY, so the header is
+/// harmless; once coord starts gating these reads (a later phase) the
+/// `auth` field lets the panel render an honest auth state instead of
+/// conflating a 401/403 with "coord unreachable":
+///
+/// - `auth.state == "ok"`           — normal path
+/// - `auth.state == "unauthorized"` — a token was present but coord
+///                                     returned 401/403 (rejected/expired)
+/// - `auth.state == "unpaired"`     — NO device token locally AND coord
+///                                     returned 401/403 (needs pairing)
+///
+/// On a 401/403 the command still returns `Ok` (health → `null`,
+/// alerts → `[]`) carrying the auth state — it is NOT a transport error.
+/// Genuine network/parse errors on fleet/health keep returning `Err`
+/// (the panel's "coord unreachable — showing last known state" path);
+/// alerts stay best-effort `[]` for NON-auth failures.
 #[tauri::command]
 pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
     let base = coord_http_base_for_fleet();
@@ -1827,39 +1843,93 @@ pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
-    let health: serde_json::Value = client
-        .get(format!("{base}/coord/fleet/health"))
-        .send()
-        .await
-        .map_err(|e| format!("GET /coord/fleet/health: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("/coord/fleet/health status: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("parse /coord/fleet/health: {e}"))?;
+    // Attach the device-JWT to BOTH reads when we have one. An unpaired
+    // device has no token — we still issue the GETs anonymously (coord is
+    // anonymous today); the `have_token` flag lets us distinguish
+    // "unpaired" from "token present but rejected" if coord 401/403s.
+    let device_token = qontinui_runner_lib::auth::AuthManager::new()
+        .get_access_token()
+        .ok();
+    let have_token = device_token.is_some();
 
-    // Alerts are best-effort: a failure here still renders the machine
-    // grid (the more load-bearing half).
-    let alerts: serde_json::Value = match client
-        .get(format!("{base}/coord/alerts"))
+    let auth_get = |url: String| {
+        let mut req = client.get(url);
+        if let Some(tok) = device_token.as_deref() {
+            req = req.header("Authorization", format!("Bearer {tok}"));
+        }
+        req
+    };
+
+    // Tracks whether either GET returned an auth rejection (401/403).
+    let mut unauthorized = false;
+
+    // --- fleet/health ---
+    let health_resp = auth_get(format!("{base}/coord/fleet/health"))
         .send()
         .await
-        .and_then(|r| r.error_for_status())
-    {
-        Ok(r) => r
-            .json()
-            .await
-            .unwrap_or_else(|_| serde_json::json!({"alerts": []})),
+        .map_err(|e| format!("GET /coord/fleet/health: {e}"))?;
+    let health: serde_json::Value = {
+        let status = health_resp.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            // Auth rejection is NOT a transport error: return null health
+            // and let the structured `auth` state drive the panel.
+            unauthorized = true;
+            serde_json::Value::Null
+        } else {
+            health_resp
+                .error_for_status()
+                .map_err(|e| format!("/coord/fleet/health status: {e}"))?
+                .json()
+                .await
+                .map_err(|e| format!("parse /coord/fleet/health: {e}"))?
+        }
+    };
+
+    // --- alerts (best-effort for NON-auth errors only) ---
+    let alerts: serde_json::Value = match auth_get(format!("{base}/coord/alerts")).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                // A 401/403 sets the auth state rather than silently
+                // emptying — an auth failure must read as an auth failure.
+                unauthorized = true;
+                serde_json::json!({"alerts": []})
+            } else {
+                match resp.error_for_status() {
+                    Ok(r) => r
+                        .json()
+                        .await
+                        .unwrap_or_else(|_| serde_json::json!({"alerts": []})),
+                    Err(e) => {
+                        warn!("get_fleet_health: /coord/alerts failed: {e}");
+                        serde_json::json!({"alerts": []})
+                    }
+                }
+            }
+        }
         Err(e) => {
-            warn!("get_fleet_health: /coord/alerts failed: {e}");
+            warn!("get_fleet_health: /coord/alerts request failed: {e}");
             serde_json::json!({"alerts": []})
         }
+    };
+
+    // Structured auth state: "unpaired" distinguishes "needs pairing"
+    // (no token locally) from "unauthorized" (token present but rejected).
+    let auth = if unauthorized {
+        if have_token {
+            serde_json::json!({"state": "unauthorized"})
+        } else {
+            serde_json::json!({"state": "unpaired"})
+        }
+    } else {
+        serde_json::json!({"state": "ok"})
     };
 
     Ok(serde_json::json!({
         "health": health,
         "alerts": alerts.get("alerts").cloned().unwrap_or(serde_json::json!([])),
         "coordBase": base,
+        "auth": auth,
     }))
 }
 
