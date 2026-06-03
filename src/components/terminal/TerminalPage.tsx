@@ -8,7 +8,6 @@ import { SessionManagerPanel } from "./SessionManagerPanel";
 import { ZoneGrid } from "./ZoneGrid";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { DocFinderModal } from "./DocFinderModal";
-import { BatchOperationsBar } from "./BatchOperationsBar";
 import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
 import {
@@ -1063,9 +1062,9 @@ function TerminalPageInner({
 
             {zoneLayout.isMultiZone && <ZoneMinimap />}
 
-            {zoneLayout.isMultiZone && !transitionEffects.batchBarDismissed && (
-              <BatchOperationsBar />
-            )}
+            {/* Bulk approve/reject/broadcast now lives inline in the top
+                StatusStrip (see `BatchActions`), so it no longer floats over
+                the zone grid. */}
 
             {/* Mid-session predicted-collision toast (Phase 3). Overlays
                 the active terminal — positioned top-right of the
