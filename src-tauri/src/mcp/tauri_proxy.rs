@@ -188,9 +188,28 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 .inner()
                 .clone();
 
+            // L2 (shared-checkout coordination gap fix) — derive
+            // `intent_repo` from `working_dir` when the caller didn't
+            // declare one (no-op until `QONTINUI_AGENT_WORKTREE_MODE` is on).
+            let effective_intent_repo: Option<String> = a.intent_repo.clone().or_else(|| {
+                a.working_dir.as_deref().and_then(|wd| {
+                    let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
+                        std::path::Path::new(wd),
+                    );
+                    if let Some(ref repo) = derived {
+                        tracing::debug!(
+                            working_dir = %wd,
+                            derived_intent_repo = %repo,
+                            "tauri_proxy terminal_create: derived intent_repo from working_dir"
+                        );
+                    }
+                    derived
+                })
+            });
+
             let (working_dir, isolated_ctx) =
                 crate::agent_worktree::isolated_edit::acquire_for_terminal(
-                    a.intent_repo.as_deref(),
+                    effective_intent_repo.as_deref(),
                     a.title.as_deref().unwrap_or("Terminal edit session"),
                     a.working_dir,
                 )

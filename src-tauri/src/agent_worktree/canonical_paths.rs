@@ -12,7 +12,7 @@
 //! directory segment, so callers no longer need per-callsite
 //! `repo_canonical_paths` overrides for the standard layout.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use qontinui_runner_lib::observable_bridge::git_ops::repo_basename_from_url;
 
@@ -76,6 +76,79 @@ pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
     let segment = canonical_segment(repo)?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     Ok(PathBuf::from(format!("{home}/qontinui-root/{segment}")))
+}
+
+/// Reverse of [`default_canonical_path`]: given an absolute filesystem
+/// `path`, return the bare repo slug whose canonical checkout owns it, or
+/// `None` if `path` is not under any known canonical checkout in the
+/// runner's flat `<root>/<name>/` layout.
+///
+/// Algorithm (no hard-coded repo list — the layout is uniform):
+/// 1. Take the first path segment under the workspace root (`<root>/<seg>`).
+/// 2. Reconstruct that segment's canonical path via [`default_canonical_path`].
+/// 3. Confirm `path` is the canonical path itself or a descendant of it
+///    (an ancestor check that tolerates trailing components, worktree
+///    subdirs, etc.).
+///
+/// Comparison is best-effort case-insensitive on the prefix to tolerate
+/// Windows' case-insensitive drive paths (`D:/` vs `d:/`) without needing
+/// the path to exist on disk (so this works for not-yet-materialized
+/// paths and in unit tests). Both inputs are compared after lexical
+/// normalization of separators.
+///
+/// Used by Layer 2 of the shared-checkout coordination plan
+/// (`2026-06-03-shared-checkout-coordination-gap-fix.md`): when a terminal
+/// session's `intent_repo` is `None`, derive it from the session's
+/// `working_dir` so `acquire_for_terminal` can route through isolated
+/// worktree acquisition when `QONTINUI_AGENT_WORKTREE_MODE` is on. Also
+/// used by Layer 3 to resolve a Terminal-PTY session's repo for the coord
+/// worktree-claim lookup.
+pub fn repo_slug_for_path(path: &Path) -> Option<String> {
+    // Lexically normalize `path` to forward slashes + lowercase for a
+    // robust, on-disk-independent prefix comparison.
+    let norm = normalize_for_compare(&path.to_string_lossy());
+
+    // The first path segment under the workspace root is the candidate
+    // slug. We don't know the workspace root abstractly here, so we lean
+    // on `default_canonical_path` round-tripping: try each leading segment
+    // of `path` as a candidate slug and accept the one whose canonical
+    // path is an ancestor of `path`.
+    //
+    // In practice the canonical path is `<root>/<seg>`, so the candidate
+    // is the single segment immediately following the workspace root. We
+    // recover it by walking ancestors: for each ancestor `a` of `path`,
+    // `a.file_name()` is a candidate slug, and `default_canonical_path`
+    // of that slug must equal `a` (normalized) for it to be the owning
+    // checkout root.
+    let mut ancestor = Some(path);
+    while let Some(a) = ancestor {
+        if let Some(name) = a.file_name().and_then(|n| n.to_str()) {
+            if let Ok(canonical) = default_canonical_path(name) {
+                let canon_norm = normalize_for_compare(&canonical.to_string_lossy());
+                // `a` is the canonical checkout root for `name` iff its
+                // normalized path equals the reconstructed canonical path,
+                // AND the original `path` is that root or a descendant
+                // (guaranteed because `a` is an ancestor of `path`).
+                if canon_norm == normalize_for_compare(&a.to_string_lossy())
+                    && (norm == canon_norm || norm.starts_with(&format!("{canon_norm}/")))
+                {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        ancestor = a.parent();
+    }
+    None
+}
+
+/// Lowercase + forward-slash normalization for case/separator-insensitive
+/// path-prefix comparison that does NOT require the path to exist on disk
+/// (so it works for not-yet-created worktree paths and in unit tests).
+/// Strips a single trailing slash so `<root>/<name>` and `<root>/<name>/`
+/// compare equal.
+fn normalize_for_compare(s: &str) -> String {
+    let lowered = s.replace('\\', "/").to_lowercase();
+    lowered.trim_end_matches('/').to_string()
 }
 
 #[cfg(test)]
@@ -178,5 +251,49 @@ mod tests {
     fn default_path_propagates_validation_error() {
         assert!(default_canonical_path("").is_err());
         assert!(default_canonical_path("qontinui/").is_err());
+    }
+
+    #[test]
+    fn repo_slug_for_checkout_root() {
+        let root = default_canonical_path("qontinui-runner").unwrap();
+        assert_eq!(
+            repo_slug_for_path(&root),
+            Some("qontinui-runner".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_slug_for_descendant_path() {
+        let mut p = default_canonical_path("qontinui-runner").unwrap();
+        p.push("src-tauri");
+        p.push("src");
+        p.push("commands");
+        p.push("terminal.rs");
+        assert_eq!(repo_slug_for_path(&p), Some("qontinui-runner".to_string()));
+    }
+
+    #[test]
+    fn repo_slug_for_another_repo() {
+        let mut p = default_canonical_path("qontinui-coord").unwrap();
+        p.push("src");
+        assert_eq!(repo_slug_for_path(&p), Some("qontinui-coord".to_string()));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn repo_slug_is_case_insensitive_on_windows() {
+        // Windows drive paths are case-insensitive; a `d:/` working_dir
+        // must still resolve against the `D:/` canonical path.
+        let p = PathBuf::from("d:/qontinui-root/qontinui-runner/src-tauri");
+        assert_eq!(repo_slug_for_path(&p), Some("qontinui-runner".to_string()));
+    }
+
+    #[test]
+    fn repo_slug_outside_workspace_is_none() {
+        // A path that doesn't sit under any `<root>/<name>/` checkout must
+        // not falsely match. Use a path whose segments don't reconstruct
+        // to themselves via `default_canonical_path` (a temp dir).
+        let p = PathBuf::from("/some/unrelated/place/foo/bar");
+        assert_eq!(repo_slug_for_path(&p), None);
     }
 }

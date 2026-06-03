@@ -162,6 +162,17 @@ pub struct TerminalSession {
     /// teardown.
     isolated_edit_ctx:
         Arc<Mutex<Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>>>,
+    /// App handle, retained so the input-line warn hook
+    /// ([`Self::observe_input_for_warn`]) can emit the soft
+    /// `terminal-coord-warning` Tauri event off the PTY write path.
+    /// `None` only in unit-test fixtures that don't drive a real app.
+    app_handle: Option<AppHandle>,
+    /// L3 (shared-checkout coordination gap fix) — accumulates printable
+    /// keystroke bytes between line submits so a completed line can be
+    /// matched against branch-mutating git. Soft heuristic: backspace is
+    /// handled approximately, control sequences are dropped. Drained on
+    /// CR/LF. Cheap to keep on the hot path (a few bytes per keystroke).
+    input_line_buf: Arc<Mutex<String>>,
 }
 
 impl TerminalSession {
@@ -420,6 +431,9 @@ impl TerminalSession {
         let waiter_title = title.clone();
         let waiter_alive = is_alive.clone();
         let waiter_exit = exit_code.clone();
+        // Retain a clone for the session struct (input-line warn hook)
+        // before the original handle is moved into the waiter thread.
+        let session_app_handle = app_handle.clone();
         let waiter_app = app_handle;
         let waiter_coord_session_id = coord_session_id.clone();
         let waiter_on_exit = on_exit.clone();
@@ -541,6 +555,8 @@ impl TerminalSession {
             coord_session_id,
             on_exit,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
+            app_handle: Some(session_app_handle),
+            input_line_buf: Arc::new(Mutex::new(String::new())),
         })
     }
 
@@ -609,6 +625,70 @@ impl TerminalSession {
             .flush()
             .map_err(|e| format!("Failed to flush PTY: {}", e))?;
         Ok(())
+    }
+
+    /// L3 (shared-checkout coordination gap fix) — feed raw keystroke
+    /// bytes through the input-line buffer and, on a completed line
+    /// (CR/LF), evaluate it for a branch-mutating git command. If it
+    /// matches, kick off a best-effort coord lookup that emits a soft
+    /// `terminal-coord-warning` event when a PEER holds the worktree
+    /// claim on this session's repo.
+    ///
+    /// SOFT + CHEAP: this NEVER blocks, NEVER affects the actual PTY
+    /// write, and only does the (rare) coord lookup once a line that
+    /// matches the branch-mutating regex is submitted. Backspace handling
+    /// is approximate — this is a heuristic warn, not a parser. Called
+    /// from `terminal_write` AFTER the bytes are written to the PTY.
+    pub fn observe_input_for_warn(&self, data: &[u8]) {
+        // Collect any completed lines this chunk produced. We hold the
+        // buffer lock only for the cheap byte-walk, then release before
+        // spawning the async lookup.
+        let mut completed: Vec<String> = Vec::new();
+        if let Ok(mut buf) = self.input_line_buf.lock() {
+            for &b in data {
+                match b {
+                    // CR or LF — submit the line.
+                    0x0D | 0x0A => {
+                        if !buf.trim().is_empty() {
+                            completed.push(std::mem::take(&mut *buf));
+                        } else {
+                            buf.clear();
+                        }
+                    }
+                    // Backspace / DEL — approximate edit handling.
+                    0x08 | 0x7F => {
+                        buf.pop();
+                    }
+                    // Printable ASCII (incl. space). Control chars and
+                    // non-ASCII (escape sequences, arrow keys, UTF-8
+                    // multibyte) are dropped — this is a heuristic over
+                    // simple typed commands, not a full line editor.
+                    0x20..=0x7E => buf.push(b as char),
+                    _ => {}
+                }
+            }
+            // Cap the buffer so a pathological no-newline stream can't grow
+            // unbounded (e.g. a paste of a huge blob). 4 KiB is far beyond
+            // any real command line.
+            if buf.len() > 4096 {
+                buf.clear();
+            }
+        }
+
+        let Some(app_handle) = self.app_handle.clone() else {
+            return;
+        };
+        for line in completed {
+            if super::coord_warn::is_branch_mutating_git(&line) {
+                super::coord_warn::spawn_check_and_warn(
+                    app_handle.clone(),
+                    self.id.clone(),
+                    self.working_dir.clone(),
+                    self.coord_session_id(),
+                    line,
+                );
+            }
+        }
     }
 
     /// Submit `message` to a Claude-style interactive prompt running in
@@ -1017,6 +1097,10 @@ mod tests {
             coord_session_id: Arc::new(Mutex::new(None)),
             on_exit: Arc::new(Mutex::new(None)),
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
+            // No real Tauri app in unit fixtures — the input-line warn
+            // hook no-ops when this is `None`.
+            app_handle: None,
+            input_line_buf: Arc::new(Mutex::new(String::new())),
         }
     }
 
