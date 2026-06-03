@@ -5,23 +5,41 @@ import type { SessionState } from "./useZoneLayout";
  * These are checked against raw terminal output (may include ANSI sequences).
  */
 const NEEDS_INPUT_PATTERNS = [
-  // Claude Code tool approval prompts
-  /\? \(y\/n\)/,
-  /\? \(yes\/no\)/,
+  // Claude Code tool approval prompts. These are Claude-specific framings
+  // ("Allow X? (y/n)", "Do you want to proceed?") rather than the bare
+  // `(Y/n)` / `[y/N]` tokens that ordinary shell tooling (git, apt, package
+  // managers, npm) prints in non-blocking informational output — matching
+  // those latched plain *and* Claude sessions to `needs-input` when nothing
+  // was actually awaiting input (the "N need input" phantom). See the
+  // StatusStrip session-count plan, Bug 2.
+  /\? \(y\/n\)/i,
+  /\? \(yes\/no\)/i,
   /Allow .+\? \(/, // "Allow Read tool? (y/n)"
   /Do you want to proceed/i,
-  /Press enter to continue/i,
 
   // Claude Code interactive prompts
   /\? >/, // Claude input prompt
   /waiting for your (?:input|response)/i,
   /What would you like/i,
   /Please (?:provide|enter|specify)/i,
+];
 
-  // Git/CLI interactive prompts that might appear in Claude sessions
-  /\(Y\/n\)/,
-  /\[y\/N\]/,
-  /Continue\? \[/,
+/**
+ * Patterns that indicate the session is actively producing output again —
+ * i.e. the prompt that triggered `needs-input` has been answered / superseded
+ * and the session is no longer awaiting the user. Used to break the sticky
+ * `needs-input` latch from `handleOutput` (StatusStrip plan, Bug 3): the
+ * working/error/completed branches below intentionally refuse to override
+ * `needs-input`, so without an explicit "resumed" signal a tab stays
+ * `needs-input` forever once latched.
+ */
+const RESUMED_PATTERNS = [
+  /(?:Reading|Writing|Editing|Creating) /,
+  /Running (?:command|bash|test)/i,
+  /Searching /,
+  /Analyzing /,
+  /^[│├└─]/m, // Box-drawing chars from Claude's tool output
+  /esc to interrupt/i, // Claude Code shows this only while actively working
 ];
 
 /**
@@ -77,6 +95,15 @@ export function detectSessionState(text: string, currentState: SessionState): Se
   // Needs-input has highest priority — check both raw and stripped
   if (NEEDS_INPUT_PATTERNS.some((p) => p.test(text) || p.test(stripped))) {
     return "needs-input";
+  }
+
+  // Latch-breaker (Bug 3): when already `needs-input`, a clear "session is
+  // working again" signal (Claude resumed tool output) means the prompt was
+  // answered — transition back to `working` instead of staying stuck. Without
+  // this the working/error/completed branches below all return `null` for a
+  // `needs-input` tab, so the latch never decays on its own.
+  if (currentState === "needs-input" && RESUMED_PATTERNS.some((p) => p.test(stripped))) {
+    return "working";
   }
 
   // Error patterns

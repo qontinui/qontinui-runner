@@ -80,14 +80,18 @@ export function useShellIntegration({
             ref?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
           }, 50);
         }
-        // Shell prompt → could be idle or needs-input
-        // If a Claude Code session is running, prompt_start typically means
-        // it's waiting for user input. For a bare shell, it's idle.
+        // Shell prompt appeared. A `prompt_start` only means "a shell prompt
+        // is being drawn" — NOT that a Claude session is awaiting the user.
+        // Claude Code redraws its prompt frequently while idle, so latching
+        // every Claude-backed prompt_start to `needs-input` produced the
+        // "N need input" phantom (3 sessions, 0 actually waiting). Treat a
+        // bare prompt as `idle`; genuine "awaiting input" is detected from
+        // the prompt *text* by `sessionStateDetector` (tool-approval / y-n
+        // prompts), not from the prompt-start marker. Don't clobber a real
+        // `needs-input`/`error` that the detector already set.
         setSessionStates((prev) => {
-          const tab = tabs.find((t) => t.id === tabId);
-          if (tab?.claudeSessionId) {
-            return { ...prev, [tabId]: "needs-input" };
-          }
+          const current = prev[tabId];
+          if (current === "needs-input" || current === "error") return prev;
           return { ...prev, [tabId]: "idle" };
         });
       }
