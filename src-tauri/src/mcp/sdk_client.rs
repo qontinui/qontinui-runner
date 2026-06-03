@@ -1182,12 +1182,21 @@ async fn handle_element_action(
                 .get("waitOptions")
                 .cloned()
                 .unwrap_or(serde_json::json!(null));
+            // Forward the D3 effect-calculus per-request opt-in so the IPC path
+            // matches the WS/HTTP path (which forwards the body verbatim). Without
+            // this, `effect_check` would never receive `effectVerification` when
+            // the executor falls back to IPC.
+            let verify_effect = body
+                .get("verifyEffect")
+                .cloned()
+                .unwrap_or(serde_json::json!(null));
             let payload = serde_json::json!({
                 "elementId": id,
                 "action": {
                     "action": action_name,
                     "params": params,
-                    "waitOptions": wait_options
+                    "waitOptions": wait_options,
+                    "verifyEffect": verify_effect
                 }
             });
             match ui_bridge_request_sync(&state, "execute_action", payload).await {
