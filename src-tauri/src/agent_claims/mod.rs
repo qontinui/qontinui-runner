@@ -112,6 +112,7 @@ pub fn register_active_claim(
     let handle = spawn_heartbeat_task(
         coord_http_base,
         machine_id,
+        claim.agent_session_id,
         &kind,
         resource_key.clone(),
         ttl_seconds,
@@ -158,12 +159,20 @@ pub async fn release_for_agent(agent_id: &str) {
     };
     let coord_http_base = h.coord_http_base.clone();
     let machine_id = h.machine_id;
+    let agent_session_id = h.agent_session_id;
     let kind = h.kind.clone();
     let resource_key = h.resource_key.clone();
     // Drop the handle to cancel the heartbeat task.
     drop(h);
     // Then call /claims/release. Best-effort.
-    release_claim_best_effort(&coord_http_base, machine_id, &kind, &resource_key).await;
+    release_claim_best_effort(
+        &coord_http_base,
+        machine_id,
+        agent_session_id,
+        &kind,
+        &resource_key,
+    )
+    .await;
     info!(
         "agent_claims: released agent_id={} kind={} key={}",
         agent_id, kind, resource_key

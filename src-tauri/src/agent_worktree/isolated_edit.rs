@@ -91,7 +91,14 @@ impl Drop for IsolatedEditContext {
             let base = self.coord_http_base.clone();
             let mid = self.device_id;
             tokio::spawn(async move {
-                release_claim_best_effort(&base, mid, &claim.kind, &claim.resource_key).await;
+                release_claim_best_effort(
+                    &base,
+                    mid,
+                    claim.agent_session_id,
+                    &claim.kind,
+                    &claim.resource_key,
+                )
+                .await;
             });
         }
     }
@@ -114,6 +121,8 @@ pub struct AcquireRequest<'a> {
     /// precedence rules.
     pub plan_id: Option<&'a str>,
     pub phase: Option<&'a str>,
+    /// coord-assigned per-agent session id, folded into the claim owner token.
+    pub agent_session_id: Option<uuid::Uuid>,
 }
 
 /// Allocate isolated worktrees for the given repos.
@@ -164,6 +173,7 @@ pub async fn acquire(
     let outcome = allocate_and_materialize_with_claim(
         &coord_http_base,
         &device_id,
+        req.agent_session_id,
         &repo_reqs,
         req.intent,
         req.declared_overlap_paths,
@@ -223,6 +233,7 @@ pub async fn acquire(
         spawn_heartbeat_task(
             coord_http_base.clone(),
             device_id,
+            claim.agent_session_id,
             &claim.kind,
             claim.resource_key.clone(),
             claim.ttl_seconds,
@@ -280,6 +291,7 @@ pub async fn acquire_for_terminal(
         declared_overlap_paths: None,
         plan_id: None,
         phase: None,
+        agent_session_id: None,
     })
     .await
     {
@@ -360,6 +372,7 @@ mod tests {
                 declared_overlap_paths: None,
                 plan_id: None,
                 phase: None,
+                agent_session_id: None,
             })
             .await
             .expect("flag-off should return Ok(None), not Err");
