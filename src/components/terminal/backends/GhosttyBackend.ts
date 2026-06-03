@@ -132,6 +132,16 @@ export class GhosttyBackend implements ITerminalBackend {
     t.scrollLines?.(amount);
   }
 
+  scrollPages(pageCount: number): void {
+    const t = this.term as unknown as { scrollPages?: (n: number) => void };
+    t.scrollPages?.(pageCount);
+  }
+
+  scrollToTop(): void {
+    const t = this.term as unknown as { scrollToTop?: () => void };
+    t.scrollToTop?.();
+  }
+
   attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
     this.term.attachCustomKeyEventHandler(handler);
   }

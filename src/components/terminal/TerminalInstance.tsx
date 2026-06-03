@@ -10,6 +10,7 @@ import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { instanceStorage } from "@/lib/instance-storage";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
+import { matchScrollShortcut } from "./scrollKeys";
 
 export interface TerminalInstanceHandle {
   getSelection: () => string;
@@ -431,6 +432,33 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
               })
               .catch(() => {});
             return false; // prevent terminal default handling
+          }
+
+          // VS Code-parity scrollback navigation: Shift+PageUp/PageDown,
+          // Ctrl+Alt+PageUp/PageDown, Ctrl+Home/End. Scroll the focused
+          // terminal locally and swallow the key so it isn't forwarded to the
+          // PTY (xterm doesn't preventDefault on a `false` return, so we do it
+          // here to also stop any browser-default scroll/caret motion).
+          if (event.type === "keydown") {
+            const action = matchScrollShortcut(event);
+            if (action) {
+              event.preventDefault();
+              switch (action.kind) {
+                case "lines":
+                  backend.scrollLines(action.amount);
+                  break;
+                case "pages":
+                  backend.scrollPages(action.amount);
+                  break;
+                case "top":
+                  backend.scrollToTop();
+                  break;
+                case "bottom":
+                  backend.scrollToBottom();
+                  break;
+              }
+              return false;
+            }
           }
           return true;
         });
