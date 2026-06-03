@@ -22,6 +22,7 @@ pub mod component_errors;
 pub mod design;
 pub mod design_eval;
 pub mod diagnostics;
+pub mod effects;
 pub mod elements;
 pub mod errors;
 pub mod exploration;
@@ -345,6 +346,7 @@ pub(super) fn route_manifest() -> &'static [(&'static str, &'static str)] {
         all.extend_from_slice(capabilities::route_entries());
         all.extend_from_slice(design::route_entries());
         all.extend_from_slice(design_eval::route_entries());
+        all.extend_from_slice(effects::route_entries());
         all.extend_from_slice(elements::route_entries());
         all.extend_from_slice(errors::route_entries());
         all.extend_from_slice(exploration::route_entries());
@@ -394,6 +396,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .merge(capabilities::routes())
         .merge(design::routes())
         .merge(design_eval::routes())
+        .merge(effects::routes())
         .merge(elements::routes())
         .merge(errors::routes())
         .merge(exploration::routes())

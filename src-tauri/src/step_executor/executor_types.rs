@@ -651,6 +651,43 @@ pub struct ExecutionStepConfig {
     pub spec_check_fail_on: Option<Vec<String>>,
 
     // ========================================================================
+    // Effect-Check Step Fields (D3 effect-calculus Phase 3c)
+    // ========================================================================
+    /// Effect-Check: The element id to perform the action on. Required at
+    /// runtime; deserialization keeps it optional so legacy step JSON parses,
+    /// but the handler rejects missing/empty values with a clear error.
+    #[serde(
+        alias = "effectCheckElementId",
+        alias = "effect_check_element_id",
+        default
+    )]
+    pub effect_check_element_id: Option<String>,
+
+    /// Effect-Check: The action to perform on the element (e.g. "click",
+    /// "type"). Required at runtime. Defaults to "click" only via the handler
+    /// when omitted is NOT allowed — the handler requires an explicit action so
+    /// the effect signature resolution is unambiguous.
+    #[serde(alias = "effectCheckAction", alias = "effect_check_action", default)]
+    pub effect_check_action: Option<String>,
+
+    /// Effect-Check: Optional action-specific parameters, forwarded verbatim to
+    /// the SDK action endpoint (e.g. `{ "value": "hello" }` for a type action).
+    #[serde(alias = "effectCheckParams", alias = "effect_check_params", default)]
+    pub effect_check_params: Option<serde_json::Value>,
+
+    /// Effect-Check: Optional expected outcome — one of the five effect-calculus
+    /// outcome strings: "Confirmed" | "Surprise" | "Failure" | "Contradiction"
+    /// | "Partial". When set, the step passes iff the observed outcome matches.
+    /// When omitted, the step records the observed outcome and passes unless the
+    /// outcome is "Failure" or "Contradiction".
+    #[serde(
+        alias = "effectCheckExpectedOutcome",
+        alias = "effect_check_expected_outcome",
+        default
+    )]
+    pub effect_check_expected_outcome: Option<String>,
+
+    // ========================================================================
     // Console Error Handling
     // ========================================================================
     /// If true, step fails when console errors are captured during execution

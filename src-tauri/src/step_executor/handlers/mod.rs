@@ -85,6 +85,7 @@ pub(super) mod click_providers;
 mod code_execution;
 mod command;
 pub mod dag_nodes;
+mod effect_check;
 mod execute_playbook;
 mod native_accessibility;
 pub mod restart_process;
@@ -102,6 +103,7 @@ mod wrapper_action;
 // Re-export handlers for registration
 use code_execution::CodeExecutionHandler;
 use command::CommandHandler;
+use effect_check::EffectCheckHandler;
 use execute_playbook::ExecutePlaybookHandler;
 use native_accessibility::NativeAccessibilityHandler;
 use restart_process::RestartProcessHandler;
@@ -493,6 +495,7 @@ impl HandlerRegistry {
 
         registry.register(CodeExecutionHandler);
         registry.register(CommandHandler);
+        registry.register(EffectCheckHandler);
         registry.register(ExecutePlaybookHandler);
         registry.register(NativeAccessibilityHandler);
         registry.register(PromptStepHandler);
