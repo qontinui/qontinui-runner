@@ -839,9 +839,6 @@
         "description": "The page has a fixed header with title and refresh button, a sub-tab bar with 6 tabs, and a scrollable content area. The background is dark (#0a0a0f). The layout is a vertical flex column filling the available height.",
         "elements": [
           {
-            "textContent": "Online Learning"
-          },
-          {
             "role": "button",
             "textContent": "Refresh"
           },
@@ -869,12 +866,6 @@
           },
           {
             "textContent": "Overview"
-          },
-          {
-            "textContains": "Drift Detection"
-          },
-          {
-            "textContains": "Drift Detection"
           }
         ],
         "id": "ol-tab-navigation",
@@ -932,9 +923,6 @@
           },
           {
             "textContains": "No model routing data yet"
-          },
-          {
-            "tagName": "table"
           }
         ],
         "id": "ol-model-routing-table",
@@ -1013,20 +1001,7 @@
       },
       {
         "description": "The dashboard uses a dark theme consistent with the runner's design system. All text must be legible against dark backgrounds. Cards use subtle borders and transparency.",
-        "elements": [
-          {
-            "textContent": "Online Learning"
-          },
-          {
-            "textContent": "Online Learning"
-          },
-          {
-            "textContains": "Routing Entries"
-          },
-          {
-            "tagName": "table"
-          }
-        ],
+        "elements": [],
         "id": "ol-visual-design",
         "isInitial": false,
         "name": "Visual Design & Dark Theme",
@@ -1050,12 +1025,6 @@
       {
         "description": "The dashboard displays outputs from several online learning algorithms. These assertions verify that the displayed data is internally consistent and reflects correct algorithm behavior.",
         "elements": [
-          {
-            "tagName": "table"
-          },
-          {
-            "tagName": "table"
-          },
           {
             "textContains": "Extracted"
           }

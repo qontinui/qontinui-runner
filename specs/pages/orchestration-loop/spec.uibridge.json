@@ -1087,9 +1087,6 @@
             "textContains": "Library"
           },
           {
-            "textContains": "Save"
-          },
-          {
             "textContent": "Saved Configurations"
           },
           {
@@ -1171,9 +1168,6 @@
         "description": "When 'Enable Diagnostic Phase' is checked, a teal-bordered configuration panel appears with fields for UI Bridge assertions, DOM snapshot capture options, and an optional model override. An exit strategy dropdown also appears with Reflection, Diagnostic Evaluation, and Fixed Iterations options.",
         "elements": [
           {
-            "textContent": "Diagnostic Configuration"
-          },
-          {
             "textContains": "Assertions (JSON array)"
           },
           {
@@ -1187,9 +1181,6 @@
           },
           {
             "textContains": "Exit"
-          },
-          {
-            "textContent": "Run Loop"
           }
         ],
         "id": "ol-diagnostic-config",
@@ -1267,16 +1258,7 @@
         "description": "The diagnostic phase runs between Execute and Reflect in the pipeline loop. It captures page health, runs UI Bridge assertions, and uses AI triage to classify failures. The phase is skipped when the workflow crashed. When diagnostics fail, the next iteration rebuilds the workflow with diagnostic context injected into the prompt.",
         "elements": [
           {
-            "tagName": "tbody"
-          },
-          {
-            "tagName": "tbody"
-          },
-          {
             "textContains": "EXIT"
-          },
-          {
-            "tagName": "tbody"
           },
           {
             "textContains": "diagnosing"

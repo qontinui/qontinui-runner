@@ -323,9 +323,6 @@
         "description": "The Reflection Dashboard includes a 'Graph Insights' section that embeds CrossRunPatternsPanel, RuleInfluencePanel, PipelineEventsTimeline, StepProvenanceTimeline, and WorkflowVersionLineage as sub-panels within the existing reflection view.",
         "elements": [
           {
-            "textContent": "Graph Insights"
-          },
-          {
             "textContent": "Cross-Run Patterns"
           },
           {
@@ -340,9 +337,6 @@
       {
         "description": "The Active Dashboard shows a compact TopPatternsWidget that summarizes active cross-run patterns (recurring findings and fix oscillations), auto-hiding when no patterns exist.",
         "elements": [
-          {
-            "textContent": "Cross-Run Patterns"
-          },
           {
             "textContent": "recurring"
           },
@@ -398,13 +392,7 @@
         "description": "Graph data refreshes on two cadences: React Query polling (30s stale, 60s interval) and event-driven invalidation via useGraphDataRefresh when tasks or reflections complete. The TopPatternsWidget auto-hides when no active patterns exist.",
         "elements": [
           {
-            "textContent": "Cross-Run Patterns"
-          },
-          {
             "textContent": "pattern"
-          },
-          {
-            "textContent": "Cross-Run Patterns"
           }
         ],
         "id": "graph-insights-behavior",

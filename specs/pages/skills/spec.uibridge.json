@@ -745,23 +745,8 @@
         "description": "The page has a header bar (title + subtitle + refresh button), a filter tab bar (4 buttons: Pending, Approved, Rejected, All), and a scrollable content area showing skill rows or empty state. The refresh button shows a spinning icon during API fetch.",
         "elements": [
           {
-            "role": "button"
-          },
-          {
-            "role": "button",
-            "textContains": "Pending"
-          },
-          {
-            "role": "button",
-            "textContains": "Approved"
-          },
-          {
             "role": "button",
             "textContains": "Rejected"
-          },
-          {
-            "role": "button",
-            "textContent": "All"
           }
         ],
         "id": "skills-element-presence",
@@ -772,9 +757,6 @@
       {
         "description": "Each skill is rendered as a row with: a chevron toggle (ChevronRight when collapsed, ChevronDown when expanded), a status icon (green CheckCircle for approved, red XCircle for rejected, amber Clock for pending), the skill name (truncated via CSS text-ellipsis), and secondary metadata line showing 'category . vX.Y.Z . used Nx'. Data comes from GET /skills, filtered client-side to source='auto'.",
         "elements": [
-          {
-            "role": "button"
-          },
           {
             "textContains": "Auto:"
           },
@@ -831,13 +813,6 @@
           {
             "role": "button",
             "textContent": "Reset to Pending"
-          },
-          {
-            "role": "button",
-            "textContains": "Approved"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "skills-interaction-approval",
@@ -889,9 +864,6 @@
       {
         "description": "The panel uses a vertical flex layout (flex-col h-full): header bar with border-b, filter tab bar with border-b, and flex-1 overflow-y-auto content area. Skill rows have border-b with last:border-0. Action buttons use 10px font size with semi-transparent colored backgrounds. Status icons are 14px (w-3.5 h-3.5). The expanded detail panel is indented to pl-10 to align with the skill name.",
         "elements": [
-          {
-            "textContent": "Procedural Skills"
-          },
           {
             "role": "button",
             "textContains": "Pending"

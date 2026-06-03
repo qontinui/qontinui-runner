@@ -14,10 +14,14 @@
  * them — without it, the next regression only surfaces when someone
  * notices the SM is missing in a UI Bridge probe.
  *
- * Mechanism: walk every `*.spec.uibridge.json` in this directory, run each
- * `state.elements[]` through the SAME `convertElementCriteria` +
- * `elementQueryKey` helpers the runtime compiler uses, and assert no key
- * is shared across two states inside one spec.
+ * Mechanism: walk every `specs/pages/<page>/spec.uibridge.json` in the
+ * repo-root spec store (the corpus moved there from `src/specs/*.spec.uibridge.json`
+ * during the per-page spec reorg; this test originally walked its own
+ * directory, which has been empty of specs ever since — the discovery
+ * sanity check below is what caught it), run each `state.elements[]`
+ * through the SAME `convertElementCriteria` + `elementQueryKey` helpers
+ * the runtime compiler uses, and assert no key is shared across two
+ * states inside one spec.
  *
  * Source of truth for the canonical-form helpers is
  * `src/lib/compile-state-machine.ts` — this test imports them directly so
@@ -25,7 +29,7 @@
  * pass while the compiler still quarantines.
  */
 
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
@@ -35,7 +39,9 @@ import {
 } from "../lib/compile-state-machine";
 import type { SpecConfig } from "../lib/spec-prompt-builder";
 
-const SPECS_DIR = dirname(fileURLToPath(import.meta.url));
+// Repo-root spec store: specs/pages/<page>/spec.uibridge.json. This test
+// file lives at src/specs/, so the store is two levels up.
+const PAGES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "specs", "pages");
 
 interface DuplicateReport {
   specFile: string;
@@ -85,8 +91,12 @@ function findIntraSpecDuplicates(spec: SpecConfig): Array<{
 }
 
 describe("spec files: intra-spec elementId uniqueness", () => {
-  const specFiles = readdirSync(SPECS_DIR)
-    .filter((f) => f.endsWith(".spec.uibridge.json"))
+  // One spec per page dir. Not every page dir necessarily carries a spec
+  // (e.g. specs/pages/runner-root/ holds only generated build-ir output),
+  // so filter on the file actually existing.
+  const specFiles = readdirSync(PAGES_DIR)
+    .map((page) => join(page, "spec.uibridge.json"))
+    .filter((rel) => existsSync(join(PAGES_DIR, rel)))
     .sort();
 
   // Sanity check — if this drops to zero the glob is broken and the test
@@ -102,7 +112,7 @@ describe("spec files: intra-spec elementId uniqueness", () => {
       // spec (settings-security.spec.uibridge.json) shipped with one and
       // we don't want a static-validator failure to depend on a separate
       // encoding fix.
-      let raw = readFileSync(join(SPECS_DIR, file), "utf8");
+      let raw = readFileSync(join(PAGES_DIR, file), "utf8");
       if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
       const spec = JSON.parse(raw) as SpecConfig;
       const dupes = findIntraSpecDuplicates(spec);

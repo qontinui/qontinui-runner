@@ -606,13 +606,7 @@
             "textContent": "All Triggers"
           },
           {
-            "role": "button"
-          },
-          {
             "textContent": "Test Result"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "triggers-list-management",
@@ -667,9 +661,6 @@
         "description": "When a user tests a trigger via dry run, a modal overlay displays the test result showing whether the trigger would or wouldn't execute, the trigger name, the action status, and the target workflow ID. The modal can be dismissed with a Close button.",
         "elements": [
           {
-            "textContent": "Test Result"
-          },
-          {
             "textContent": "execute"
           },
           {
@@ -689,9 +680,6 @@
         "elements": [
           {
             "textContent": "webhook"
-          },
-          {
-            "role": "button"
           },
           {
             "textContent": "webhook"

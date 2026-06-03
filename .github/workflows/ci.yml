@@ -155,6 +155,16 @@ jobs:
       - name: Typecheck frontend code
         run: pnpm run typecheck
 
+      # Frontend unit tests (vitest). Until 2026-06-03 nothing in CI ran the
+      # vitest suite, so frontend-logic regressions (e.g. the
+      # ui-bridge-auto@0.1.6 regression-generator field drift that broke
+      # generateRegressionSuite for every IR, or the specs.compile guard
+      # silently walking an empty directory) merged green and rotted on main.
+      # Runs after typecheck (cheap fail-fast first) and before the vite
+      # build / cargo steps.
+      - name: Run frontend unit tests
+        run: pnpm test
+
       # Build the frontend before any cargo step. tauri::generate_context!()
       # in src-tauri/src/lib.rs reads tauri.conf.json at compile time and
       # panics if frontendDist (../dist) is missing — which broke `Clippy

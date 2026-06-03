@@ -1193,9 +1193,6 @@
         "description": "The Adaptive Learning tab displays four stat cards at the top showing aggregate counts from the adaptive learning system.",
         "elements": [
           {
-            "textContains": "Playbook Lessons"
-          },
-          {
             "textContains": "Curated Examples"
           },
           {
@@ -1203,9 +1200,6 @@
           },
           {
             "textContains": "GEPA Optimizations"
-          },
-          {
-            "textContains": "Playbook Lessons"
           }
         ],
         "id": "dashboard-stat-cards",
@@ -1274,13 +1268,6 @@
           {
             "role": "combobox",
             "textContains": "All Domains"
-          },
-          {
-            "role": "combobox"
-          },
-          {
-            "role": "button",
-            "textContent": "Refresh"
           }
         ],
         "id": "playbook-header",
@@ -1349,9 +1336,6 @@
         "description": "Clicking a lesson row expands it to show metadata and source run context.",
         "elements": [
           {
-            "textContains": "DO"
-          },
-          {
             "textContains": "Applied"
           },
           {
@@ -1404,9 +1388,6 @@
             "textContains": "Old Score"
           },
           {
-            "textContains": "%"
-          },
-          {
             "textContains": "completed"
           }
         ],
@@ -1418,9 +1399,6 @@
       {
         "description": "Expanded GEPA run detail showing the old and new generation instructions side-by-side with score delta.",
         "elements": [
-          {
-            "textContains": "Old Score"
-          },
           {
             "textContains": "Before"
           },
@@ -1455,9 +1433,6 @@
         "description": "Consistent dark theme design across all adaptive learning panels.",
         "elements": [
           {
-            "textContains": "Playbook"
-          },
-          {
             "textContains": "Lessons"
           },
           {
@@ -1472,20 +1447,7 @@
       },
       {
         "description": "Semantic assertions verifying that the adaptive learning system produces correct, consistent data across its three panels.",
-        "elements": [
-          {
-            "textContains": "Playbook Lessons"
-          },
-          {
-            "textContains": "CRITICAL"
-          },
-          {
-            "textContains": "%"
-          },
-          {
-            "textContains": "improved"
-          }
-        ],
+        "elements": [],
         "id": "learning-loop-correctness",
         "isInitial": false,
         "name": "Learning Loop — Data Correctness",

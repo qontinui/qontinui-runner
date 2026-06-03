@@ -874,9 +874,6 @@
         "description": "The page header establishes the Workflow Event History identity with a Radio icon, shows aggregate counts (event count, subscription count), and auto-refreshes data every 5 seconds.",
         "elements": [
           {
-            "textContent": "Workflow Event History"
-          },
-          {
             "textContent": "event"
           },
           {
@@ -982,9 +979,6 @@
             "textContent": "workflow.completed"
           },
           {
-            "textContent": "workflow"
-          },
-          {
             "textContent": "Timestamp"
           },
           {
@@ -1012,19 +1006,10 @@
         "description": "Grid of active event subscriptions below the event table. Each card shows event pattern (monospace), green active dot, and 'once' badge. Subscriptions registered by trigger_system for WorkflowChain triggers. Polls GET /inngest/subscriptions every 15 seconds.",
         "elements": [
           {
-            "textContent": "Active Subscriptions"
-          },
-          {
             "textContent": "workflow"
           },
           {
-            "textContent": "Active Subscriptions"
-          },
-          {
             "textContent": "once"
-          },
-          {
-            "textContent": "Active Subscriptions"
           }
         ],
         "id": "evh-subscriptions",
@@ -1069,13 +1054,7 @@
         "description": "All data auto-refreshes via polling through useRunnerQuery. Events + queue + circuit-breaker poll every 5s; subscriptions every 15s. Polling is deduplicated by shared API client.",
         "elements": [
           {
-            "textContent": "Workflow Event History"
-          },
-          {
             "textContent": "Active Subscriptions"
-          },
-          {
-            "textContent": "Workflow Event History"
           }
         ],
         "id": "evh-data-freshness",

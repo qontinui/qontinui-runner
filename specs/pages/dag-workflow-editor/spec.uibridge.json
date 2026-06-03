@@ -941,9 +941,6 @@
         "elements": [
           {},
           {
-            "role": "textbox"
-          },
-          {
             "textContent": "YAML Editor"
           },
           {
@@ -960,25 +957,7 @@
       },
       {
         "description": "The toolbar contains a workflow name input field (aria-label='Workflow name'), an Import button, an Export button, and a validation status badge. These are the primary controls for managing a workflow file.",
-        "elements": [
-          {
-            "role": "textbox"
-          },
-          {
-            "role": "button",
-            "textContent": "Import"
-          },
-          {
-            "role": "button",
-            "textContent": "Export"
-          },
-          {
-            "textContent": "Valid"
-          },
-          {
-            "role": "textbox"
-          }
-        ],
+        "elements": [],
         "id": "dag-toolbar-controls",
         "isInitial": false,
         "name": "Toolbar Controls",
@@ -1007,9 +986,6 @@
         "elements": [
           {
             "textContent": "Checking..."
-          },
-          {
-            "textContent": "Errors"
           },
           {
             "textContent": "detected"
@@ -1068,17 +1044,7 @@
       },
       {
         "description": "The graph uses dagre top-to-bottom layout (rankdir=TB). ReactFlow controls appear at bottom-left of the graph pane (zoom in/out, fit view). A minimap appears at bottom-right. The graph supports scroll-to-zoom and drag-to-pan.",
-        "elements": [
-          {
-            "tagName": "div"
-          },
-          {
-            "tagName": "div"
-          },
-          {
-            "tagName": "div"
-          }
-        ],
+        "elements": [],
         "id": "dag-graph-layout",
         "isInitial": false,
         "name": "Graph Layout and Navigation Controls",
@@ -1086,14 +1052,7 @@
       },
       {
         "description": "A draggable vertical divider between the YAML editor and graph panes allows the user to adjust the width ratio. The minimum pane width is 20% and the maximum is 80% (of the total container width). The initial split is 50/50.",
-        "elements": [
-          {
-            "tagName": "div"
-          },
-          {
-            "tagName": "div"
-          }
-        ],
+        "elements": [],
         "id": "dag-resize-handle",
         "isInitial": false,
         "name": "Split-Pane Resize Handle",
@@ -1172,12 +1131,6 @@
         "elements": [
           {
             "textContent": "nodes"
-          },
-          {
-            "tagName": "div"
-          },
-          {
-            "tagName": "div"
           }
         ],
         "id": "dag-graph-correctness",

@@ -17,20 +17,14 @@ export default defineConfig({
     },
   },
   resolve: {
-    alias: [
-      { find: "@", replacement: resolve(__dirname, "./src") },
-      {
-        find: /^@qontinui\/shared-types\/(.+)$/,
-        replacement: resolve(__dirname, "../qontinui-schemas/ts/dist/$1.js"),
-      },
-      {
-        find: "@qontinui/shared-types",
-        replacement: resolve(__dirname, "../qontinui-schemas/ts/dist/index.js"),
-      },
-      {
-        find: "@qontinui/workflow-utils",
-        replacement: resolve(__dirname, "../qontinui-workflow-utils/dist/index.js"),
-      },
-    ],
+    // @qontinui/* TS packages are consumed from npm (same as vite.config.ts —
+    // its alias block was removed when the packages moved to npm). The stale
+    // sibling-repo aliases that used to live here pointed at
+    // ../qontinui-schemas/ts/dist and ../qontinui-workflow-utils/dist, which
+    // don't exist on a fresh checkout (or any machine without those siblings
+    // built), so every test importing @qontinui/shared-types/* or
+    // @qontinui/workflow-utils failed to even load. node_modules has both
+    // packages with complete exports maps — no alias needed.
+    alias: [{ find: "@", replacement: resolve(__dirname, "./src") }],
   },
 });

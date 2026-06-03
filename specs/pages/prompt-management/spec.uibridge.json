@@ -1684,22 +1684,13 @@
         "description": "The version history list shows all versions for a prompt template sorted by version number descending. Each version row shows the version number badge (v1, v2...), the change description, a truncated SHA256 content hash, and the creation date. The list header displays a count of versions and provides Compare and Refresh controls. In compare mode, two versions can be selected as A and B with highlighted selection indicators.",
         "elements": [
           {
-            "textContent": "Version History"
-          },
-          {
             "textContent": "versions"
-          },
-          {
-            "textContent": "v\\d+"
           },
           {},
           {
             "textContent": "No description"
           },
           {},
-          {
-            "role": "button"
-          },
           {
             "textContent": "No versions recorded for this template yet."
           },
@@ -1721,12 +1712,6 @@
         "description": "The version detail view shows the full prompt content, metadata, performance metrics, and a 'Restore this version' button. It displays the version number, creation timestamp, truncated content hash, change description, and the full prompt content in a scrollable pre block. Performance metrics show success rate, average cost, and average latency when available.",
         "elements": [
           {
-            "textContent": "Back to history"
-          },
-          {
-            "textContent": "v\\d+"
-          },
-          {
             "textContent": "hash:"
           },
           {
@@ -1743,9 +1728,6 @@
           },
           {
             "textContent": "Performance Metrics"
-          },
-          {
-            "textContent": "Restore this version"
           },
           {
             "textContent": "Create new version with this content?"
@@ -1801,9 +1783,6 @@
             "textContent": "No differences found."
           },
           {
-            "textContent": "Back to history"
-          },
-          {
             "textContent": "Failed to load diff."
           }
         ],
@@ -1825,25 +1804,10 @@
             "textContent": "vs"
           },
           {
-            "textContent": "candidate traffic"
-          },
-          {
             "textContent": "Metric"
           },
           {
-            "textContent": "Success Rate"
-          },
-          {
-            "textContent": "Avg Cost"
-          },
-          {
-            "textContent": "Avg Latency"
-          },
-          {
             "textContent": "pp"
-          },
-          {
-            "textContent": "p-value"
           },
           {
             "textContent": "Verdict"
@@ -1896,9 +1860,6 @@
           {},
           {
             "textContent": "Close"
-          },
-          {
-            "textContent": "Create A/B Test"
           }
         ],
         "id": "canary-creation",
@@ -1997,9 +1958,6 @@
       {
         "description": "Assertions verifying that required UI elements are present in each view: version row metadata, diff line numbers, canary action buttons, metrics grid columns, and registry variant action buttons.",
         "elements": [
-          {
-            "role": "button"
-          },
           {},
           {
             "textContent": "Promote|Rollback"

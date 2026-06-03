@@ -971,9 +971,6 @@
             "textContent": "Avg Health"
           },
           {
-            "textContent": "Most Volatile"
-          },
-          {
             "textContent": "Components"
           }
         ],
@@ -984,21 +981,7 @@
       },
       {
         "description": "When reflection data is loaded, an interactive XYFlow (ReactFlow) graph renders component nodes laid out by dagre. Each node uses a custom HealthNode: health score > 0.7 renders green, 0.4–0.7 amber, < 0.4 red. Node width scales with activity (fix_count + causal_involvement_count). Nodes display the component's basename and parent directory as a secondary label. Edges connect components that have a relationship from reflection data. Clicking a node opens the ComponentDetailPanel on the right.",
-        "elements": [
-          {
-            "role": "graphics-document"
-          },
-          {
-            "role": "graphics-document"
-          },
-          {
-            "role": "graphics-document"
-          },
-          {
-            "role": "button",
-            "textContent": "Rebuild"
-          }
-        ],
+        "elements": [],
         "id": "arch-reflection-graph",
         "isInitial": false,
         "name": "Reflection Mode — Component Dependency Graph",
@@ -1041,19 +1024,7 @@
         "description": "When SDK Projects mode is active and architecture specs are loaded from connected apps, the panel shows: optional project selector (if multiple specs), stat cards (Features count, Dependencies count, Tech Stack count), a Features/Patterns scrollable list on the left, an optional detail panel for selected nodes, and a Tech Stack + Directories panel on the right. Data comes from UI Bridge architecture spec discovery via POST /ui-bridge/sdk/discover-and-cache.",
         "elements": [
           {
-            "textContent": "Features"
-          },
-          {
-            "textContent": "Dependencies"
-          },
-          {
             "textContent": "Tech Stack"
-          },
-          {
-            "role": "button"
-          },
-          {
-            "role": "combobox"
           }
         ],
         "id": "arch-sdk-projects-mode",
@@ -1098,10 +1069,6 @@
           {
             "role": "button",
             "textContent": "Overview"
-          },
-          {
-            "role": "button",
-            "textContent": "Developer"
           }
         ],
         "id": "arch-developer-mode",

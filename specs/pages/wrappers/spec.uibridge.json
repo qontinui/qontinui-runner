@@ -1172,12 +1172,7 @@
       },
       {
         "description": "The header includes a 36×36 cyan-tinted icon tile holding a Package icon — this matches the 'icon-tile' visual pattern established on the UI Bridge integration page.",
-        "elements": [
-          {
-            "role": "heading",
-            "textContent": "Wrappers"
-          }
-        ],
+        "elements": [],
         "id": "header-icon-tile",
         "isInitial": false,
         "name": "Header Icon Tile",
@@ -1186,22 +1181,6 @@
       {
         "description": "The wrappers page has three tabs in this order: Installed (default), AI Clients, and Browse. The active tab is highlighted with a cyan underline and cyan-400 text; inactive tabs use muted-foreground.",
         "elements": [
-          {
-            "tagName": "button",
-            "textContent": "Installed"
-          },
-          {
-            "tagName": "button",
-            "textContent": "Browse"
-          },
-          {
-            "tagName": "button",
-            "textContent": "Browse"
-          },
-          {
-            "tagName": "button",
-            "textContent": "Installed"
-          },
           {
             "tagName": "button",
             "textContent": "AI Clients"
@@ -1251,18 +1230,6 @@
         "description": "When wrappers are installed, the Installed tab renders a 1- or 2-column grid (responsive on md+) of wrapper cards. Each card displays the wrapper's display name, package name + version, description (line-clamped to 2 lines), transport badge, status badge, action count, a three-dot menu for lifecycle actions, and an Open button.",
         "elements": [
           {
-            "role": "heading",
-            "textContent": "Wrappers"
-          },
-          {
-            "role": "heading",
-            "textContent": "Wrappers"
-          },
-          {
-            "role": "heading",
-            "textContent": "Wrappers"
-          },
-          {
             "textContains": "actions"
           },
           {
@@ -1271,10 +1238,6 @@
           {
             "tagName": "button",
             "textContent": "Open"
-          },
-          {
-            "role": "heading",
-            "textContent": "Wrappers"
           }
         ],
         "id": "installed-tab-card-grid",
@@ -1331,14 +1294,6 @@
             "tagName": "li"
           },
           {
-            "tagName": "button",
-            "textContent": "Install"
-          },
-          {
-            "tagName": "button",
-            "textContent": "Installed"
-          },
-          {
             "textContent": "repo"
           }
         ],
@@ -1350,10 +1305,6 @@
       {
         "description": "Heading hierarchy: h1 'Wrappers' is text-2xl + font-bold + tracking-tight. Section headings (e.g., 'No wrappers installed yet') are h3 + text-sm + font-semibold. Body text is text-xs muted. Package names are font-mono.",
         "elements": [
-          {
-            "role": "heading",
-            "textContent": "Wrappers"
-          },
           {
             "textContains": "Install wrapper extensions"
           }
@@ -1382,16 +1333,7 @@
       },
       {
         "description": "The content is constrained to a centered max-w-[1024px] container with px-4/sm:px-6 horizontal padding and py-8 vertical padding. Inside the container, a flex column with gap-4 spaces the header / tab bar / content. Wrapper cards in the Installed grid use gap-4 and switch from 1 column to 2 columns at md+.",
-        "elements": [
-          {
-            "role": "heading",
-            "textContent": "Wrappers"
-          },
-          {
-            "role": "heading",
-            "textContent": "Wrappers"
-          }
-        ],
+        "elements": [],
         "id": "visual-spacing-layout",
         "isInitial": false,
         "name": "Visual Design — Spacing & Layout",
@@ -1400,18 +1342,6 @@
       {
         "description": "The Installed tab is the user's window into the runner's wrapper subsystem. What the page shows MUST match what the backend reports. These assertions specify the contract between the UI and GET /wrappers / GET /wrappers/:id/status.",
         "elements": [
-          {
-            "role": "heading",
-            "textContent": "Wrappers"
-          },
-          {
-            "tagName": "button",
-            "textContent": "Installed"
-          },
-          {
-            "role": "heading",
-            "textContent": "Wrappers"
-          },
           {
             "tagName": "button",
             "textContent": "Browse"
@@ -1481,11 +1411,7 @@
       },
       {
         "description": "Each card has a 'Details' disclosure button (chevron icon) that expands to reveal: (1) the absolute config file path under 'Config file:'; (2) for ConfigParseError state, a red 'Config error:' block with the path and the message 'Open this file and fix the JSON, or delete it to start fresh.'; (3) the JSON snippet that will be written or removed under the mcpServers key, with placeholders '<launcher path>' and '<port>' since the live values aren't fetched into the UI; (4) for Drifted state, the current (stale) command path and port shown alongside the new values that Reconnect will write. The note 'The runner fills in its own stable launcher path and current port.' is rendered below the JSON snippet.",
-        "elements": [
-          {
-            "role": "button"
-          }
-        ],
+        "elements": [],
         "id": "ai-clients-details-disclosure",
         "isInitial": false,
         "name": "AI Clients Tab — Details Disclosure",

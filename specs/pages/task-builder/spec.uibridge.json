@@ -235,17 +235,11 @@
         "description": "The left panel displays all saved tasks in a searchable list following the standard library builder layout. Each task item shows its name, category badge, a content preview (first 60 characters of the prompt text), and tag count. Users can browse the list, search by name, create new tasks, and select a task to load into the editor. The UI labels this as 'Tasks' though the underlying API uses 'prompts' as the resource name.",
         "elements": [
           {
-            "textContent": "Tasks"
-          },
-          {
             "role": "button",
             "textContent": "New"
           },
           {
             "role": "searchbox"
-          },
-          {
-            "textContent": "Tasks"
           }
         ],
         "id": "task-list-management",
@@ -257,17 +251,8 @@
         "description": "The right-panel editor provides fields for defining a task. The name field identifies the task in lists and pickers. The content field is a textarea for entering the full prompt text or AI instructions -- this is the most important field as it defines what the AI should do when this task is used in a workflow. An optional category field supports organizational grouping. Tags can be added for flexible labeling. The editor toolbar includes save and delete actions.",
         "elements": [
           {
-            "textContent": "Tasks"
-          },
-          {
-            "textContent": "Tasks"
-          },
-          {
             "role": "button",
             "textContent": "Save"
-          },
-          {
-            "textContent": "Tasks"
           }
         ],
         "id": "task-editor-config",

@@ -883,10 +883,6 @@
           },
           {
             "role": "button",
-            "textContent": "24h"
-          },
-          {
-            "role": "button",
             "textContent": "7d"
           },
           {
@@ -904,11 +900,7 @@
       },
       {
         "description": "The dashboard is accessible via the 'Automation Health' item in the OBSERVE sidebar group. It appears alongside LLM Analytics, Reflection, and other observability views. The sidebar item shows an Activity icon with green accent (#10B981).",
-        "elements": [
-          {
-            "textContains": "Automation Health"
-          }
-        ],
+        "elements": [],
         "id": "health-navigation",
         "isInitial": false,
         "name": "Navigation and Tab Access",
@@ -935,9 +927,6 @@
         "description": "Large centered numeric score (0-100) with color-coded label. Breakdown section below shows 5 metrics: Element Success Rate, Regression Rate, Stall Frequency (as percentages), Total Interactions and Unique Elements (as counts). Score = 0.30 * element_success_rate + 0.25 * (1 - regression_rate) + 0.25 * (1 - stall_frequency) + 0.20 base. Backed by GET /ui-bridge/analytics/health-score.",
         "elements": [
           {
-            "textContains": "Automation Health"
-          },
-          {
             "textContains": "window"
           },
           {
@@ -945,9 +934,6 @@
           },
           {
             "textContains": "Regression Rate"
-          },
-          {
-            "textContains": "Total Interactions"
           }
         ],
         "id": "health-score-data-display",
@@ -957,14 +943,7 @@
       },
       {
         "description": "The score number and label use semantic color coding: green (>= 90, 'Excellent'), yellow (>= 70, 'Good'), orange (>= 50, 'Fair'), red (< 50, 'Poor'). These thresholds communicate automation quality at a glance and match the color coding used throughout the dashboard for success rates.",
-        "elements": [
-          {
-            "textContains": "Automation Health"
-          },
-          {
-            "textContains": "Automation Health"
-          }
-        ],
+        "elements": [],
         "id": "health-score-semantics",
         "isInitial": false,
         "name": "Health Score Color and Label Semantics",
@@ -992,9 +971,6 @@
         "description": "All 9 panels handle three states consistently: loading (centered muted text), empty (reassuring message specific to each panel), and error (destructive red text with error string). When no interaction data exists, the health score shows 100% (1.0) with 0 interactions. Recommendations show 'No recommendations â€” automation is running well'. Element reliability shows 'No flaky elements detected (all elements have >90% success rate)'. Regressions show 'No regressions detected'.",
         "elements": [
           {
-            "textContains": "Total Interactions"
-          },
-          {
             "textContains": "automation is running well"
           },
           {
@@ -1019,13 +995,7 @@
         "description": "Three tables display tabular analytics data: Action Baselines (6 columns: Action, Count, Avg/Min/Max ms, Success%), Element Reliability (5 columns: Element, Interactions, Success Rate bar, Confidence, Last Failure), and Annotation Gaps (5 columns: Element, Type, Interactions, Success%, Label). All tables use consistent styling: text-xs headers, hover:bg-muted/50 rows, tabular-nums for numbers, font-mono for element IDs.",
         "elements": [
           {
-            "textContains": "Action Performance Baselines"
-          },
-          {
             "textContains": "Avg (ms)"
-          },
-          {
-            "textContains": "Element Reliability"
           },
           {
             "textContains": "Annotation Gaps"
@@ -1083,13 +1053,6 @@
         "elements": [
           {
             "textContains": "Total Interactions"
-          },
-          {
-            "textContains": "Automation Health"
-          },
-          {
-            "role": "button",
-            "textContent": "24h"
           }
         ],
         "id": "health-behavior-data-freshness",
@@ -1099,11 +1062,7 @@
       },
       {
         "description": "Architecture: UI Bridge action handlers (mcp/ui_bridge.rs, mcp/sdk_client.rs) persist events to ui_bridge_events table via insert_ui_bridge_event() when ?task_run_id= query param is present. Events flow through 17 SQL query functions in database/ui_bridge_ops.rs, exposed via 13 MCP HTTP endpoints under /ui-bridge/analytics/*. The knowledge graph (reflection/graph_engine.rs) loads UIElement nodes and InteractedWith edges for causal analysis. The stall detector (orchestration_loop/stall_detector.rs) fetches /ui-bridge/control/health-signals to detect UIStuck patterns. Token attribution flows through phase_token_usage.target_app. CTR auto-seeding pushes reliability data to SDK apps on connect.",
-        "elements": [
-          {
-            "textContains": "Automation Health"
-          }
-        ],
+        "elements": [],
         "id": "health-backend-architecture",
         "isInitial": false,
         "name": "Backend Data Pipeline Architecture",
@@ -1111,14 +1070,7 @@
       },
       {
         "description": "All panels use bg-card rounded-lg border border-border p-4 container styling. Headings use font-semibold with a Lucide icon. Tables use text-xs text-muted-foreground headers, py-2 px-3 cell padding, hover:bg-muted/50 row highlights, and tabular-nums for numeric alignment. Charts use h-48 height with ResponsiveContainer. The responsive grid uses grid-cols-1 md:grid-cols-2 gap-4.",
-        "elements": [
-          {
-            "textContains": "Automation Health"
-          },
-          {
-            "textContains": "Automation Health"
-          }
-        ],
+        "elements": [],
         "id": "health-design-consistency",
         "isInitial": false,
         "name": "Visual Design Consistency",

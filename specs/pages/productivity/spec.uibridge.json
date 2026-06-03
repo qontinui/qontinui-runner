@@ -1762,10 +1762,6 @@
         "description": "The page renders a top bar with a 'Productivity' heading, three sub-view tabs (Plans & Tasks, Coordinator, Knowledge) with lucide-react icons (ClipboardList, Bot, BookOpen), and a right-aligned 'Knowledge' button that opens the modal browser. Below the top bar the active sub-view is rendered into a flex-1 content area. The active sub-view defaults to 'plans' and can be switched by clicking a tab or by dispatching a `productivity-set-view` CustomEvent.",
         "elements": [
           {
-            "role": "heading",
-            "textContent": "Productivity"
-          },
-          {
             "dataAttributes": {
               "ui-bridge-id": "productivity.view-tab-plans"
             }

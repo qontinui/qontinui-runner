@@ -1174,12 +1174,6 @@
             "textContent": "Generate Tour"
           },
           {
-            "role": "button"
-          },
-          {
-            "role": "button"
-          },
-          {
             "role": "button",
             "textContent": "Regenerate"
           },
@@ -1268,19 +1262,7 @@
             "tagName": "div"
           },
           {
-            "role": "button",
-            "textContent": "Start Tour"
-          },
-          {
             "textContent": "min"
-          },
-          {
-            "role": "button",
-            "textContent": "Start Tour"
-          },
-          {
-            "role": "button",
-            "textContent": "HTML"
           }
         ],
         "id": "pt-tour-card",
@@ -1295,17 +1277,11 @@
             "textContent": "Next"
           },
           {
-            "role": "heading"
-          },
-          {
             "textContent": "Next"
           },
           {
             "role": "button",
             "textContent": "Next"
-          },
-          {
-            "textContent": "Demonstrating..."
           },
           {
             "role": "heading",
@@ -1325,14 +1301,6 @@
         "elements": [
           {
             "textContent": "steps"
-          },
-          {
-            "role": "button",
-            "textContent": "Start Tour"
-          },
-          {
-            "role": "button",
-            "textContent": "Start Tour"
           },
           {
             "role": "heading"
@@ -1375,10 +1343,6 @@
           },
           {
             "textContent": "Interactive tours that demonstrate features automatically"
-          },
-          {
-            "role": "button",
-            "textContent": "Start Tour"
           }
         ],
         "id": "pt-help-tab-integration",

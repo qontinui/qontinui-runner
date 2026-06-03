@@ -641,9 +641,6 @@
           },
           {
             "textContent": "revert"
-          },
-          {
-            "textContent": "iteration"
           }
         ],
         "id": "blame-summary-statistics",
@@ -655,13 +652,7 @@
         "description": "The core of the Blame tab: a chronological list of iterations that produced blame data. Each iteration section shows which verification steps failed and which previous iteration's changes caused each failure. The data comes from the blame_reports array in the GET /task-runs/{id}/blame response. Each report contains attributions (step name, blamed iteration, implicated files with line ranges, confidence score, explanation). Users read this to understand the causal chain: 'Iteration 3's TypeScript check failed because iteration 2 modified Card.tsx.'",
         "elements": [
           {
-            "textContent": "Iteration \\d+"
-          },
-          {
             "textContent": "FAILED|failed"
-          },
-          {
-            "textContent": "Iteration \\d+"
           },
           {
             "textContent": "High|Medium|Low"

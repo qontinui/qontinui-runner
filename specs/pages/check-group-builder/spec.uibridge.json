@@ -234,9 +234,6 @@
         "description": "The left panel presents all saved check groups in a searchable list following the standard library builder layout. Users can browse existing groups, create new ones, and select a group to load into the editor. Each list item shows the group name, the number of checks it contains, and any tags. The list supports search filtering to help users find specific groups in large libraries. Creating a new group opens a blank editor with default settings (sequential execution, stop on failure).",
         "elements": [
           {
-            "textContent": "Check Groups"
-          },
-          {
             "role": "button",
             "textContent": "New"
           },
@@ -252,15 +249,6 @@
       {
         "description": "The core function of the check group editor is composing a group from existing checks in the library. Users see a list of available checks they can add to the group, and a list of currently included checks showing their order. The check selector shows check names, types, and tool information so users can identify the right checks. Users can add and remove individual checks from the group, building up a verification suite that covers all necessary validation points.",
         "elements": [
-          {
-            "textContent": "Check Groups"
-          },
-          {
-            "textContent": "Check Groups"
-          },
-          {
-            "textContent": "Check Groups"
-          },
           {
             "role": "button",
             "textContent": "Save"

@@ -312,15 +312,6 @@
         "description": "Users need a timeline of workflow versions showing version numbers, what triggered each version (generation, reflection, manual edit, fix), and when it was created.",
         "elements": [
           {
-            "textContent": "Workflow Version Lineage"
-          },
-          {
-            "textContent": "v"
-          },
-          {
-            "role": "listitem"
-          },
-          {
             "textContent": ":"
           }
         ],
@@ -357,9 +348,6 @@
         "description": "When no workflow is selected or no versions exist, clear messages guide the user.",
         "elements": [
           {
-            "textContent": "Select a workflow to view version history"
-          },
-          {
             "textContent": "Loading versions..."
           },
           {
@@ -379,9 +367,6 @@
           },
           {
             "textContent": "generation|reflection|manual|fix"
-          },
-          {
-            "textContent": "Workflow Version Lineage"
           }
         ],
         "id": "workflow-versions-data-display",

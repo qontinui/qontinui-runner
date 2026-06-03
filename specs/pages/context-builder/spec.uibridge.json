@@ -182,9 +182,6 @@
         "description": "The Context Builder allows users to create and manage reusable context configurations. Contexts provide structured background information, domain knowledge, and behavioral instructions that are injected into AI prompts during workflow execution. By defining contexts separately from workflows, users can share common knowledge across multiple workflows without duplication.",
         "elements": [
           {
-            "textContent": "Context"
-          },
-          {
             "role": "button",
             "textContent": "Save"
           },

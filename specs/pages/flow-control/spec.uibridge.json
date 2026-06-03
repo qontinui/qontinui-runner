@@ -643,9 +643,6 @@
         "description": "Controls max simultaneous instances of this workflow. When limit reached, new executions queue and wait (FlowControlDecision::Wait). Optionally scoped by key. Backend: FlowControl.concurrency (ConcurrencyLimit), enforced by FlowControlEnforcer.check(), tracked by record_start/record_end.",
         "elements": [
           {
-            "textContent": "Concurrency"
-          },
-          {
             "role": "spinbutton"
           },
           {
@@ -668,9 +665,6 @@
         "elements": [
           {
             "textContent": "Throttle"
-          },
-          {
-            "textContent": "Max runs"
           },
           {
             "role": "button",
@@ -732,9 +726,6 @@
         "description": "Per-phase timeout overrides in minutes. Backend: PhaseTimeouts in orchestrator/state.rs, parsed from phase_timeouts_json in types.rs, enforced by check_timeout() in loop_handlers.rs. Defaults: setup=5min, execution=30min, verification=10min, completion=5min.",
         "elements": [
           {
-            "textContent": "Phase Timeouts"
-          },
-          {
             "textContent": "Setup"
           },
           {
@@ -751,9 +742,6 @@
           },
           {
             "textContent": "Execution"
-          },
-          {
-            "role": "spinbutton"
           }
         ],
         "id": "fc-phase-timeouts",
@@ -763,20 +751,7 @@
       },
       {
         "description": "Settings serialize to JSON and persist as flow_control_json and phase_timeouts_json on unified_workflows. On save, WorkflowEditor PATCHes via MCP API. On load, LoopController reads for enforcement. Both SQLite (v147) and PostgreSQL store these fields.",
-        "elements": [
-          {
-            "textContent": "Concurrency"
-          },
-          {
-            "textContent": "Concurrency"
-          },
-          {
-            "textContent": "Flow Control"
-          },
-          {
-            "textContent": "Flow Control"
-          }
-        ],
+        "elements": [],
         "id": "fc-persistence",
         "isInitial": false,
         "name": "Configuration Persistence and State Consistency",
@@ -800,9 +775,6 @@
       {
         "description": "The FlowControlPanel communicates changes to its parent (WorkflowEditor) via callbacks. When any flow control value changes, onFlowControlChange fires with the serialized JSON. When any timeout changes, onPhaseTimeoutsChange fires. The parent is responsible for saving via updateWorkflow().",
         "elements": [
-          {
-            "textContent": "Concurrency"
-          },
           {
             "textContent": "Phase Timeouts"
           }

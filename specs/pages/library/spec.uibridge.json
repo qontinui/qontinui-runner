@@ -232,16 +232,10 @@
         "description": "The Library Dashboard provides a bird's-eye view of all automation assets across every category. Users land here to quickly find recently modified items, understand what assets exist in their library, and navigate to the appropriate builder for editing. The page heading shows the total item count, and items are sorted by modification time with the most recently changed items appearing first. This makes the dashboard particularly useful for resuming work on recently edited assets.",
         "elements": [
           {
-            "textContent": "Library Dashboard"
-          },
-          {
             "textContent": "total items"
           },
           {
             "textContent": "Recently modified items across all categories"
-          },
-          {
-            "textContent": "Library Dashboard"
           }
         ],
         "id": "lib-dashboard-overview",
@@ -257,12 +251,6 @@
           },
           {
             "textContent": "All"
-          },
-          {
-            "textContent": "Library Dashboard"
-          },
-          {
-            "textContent": "Library Dashboard"
           }
         ],
         "id": "lib-search-filter",

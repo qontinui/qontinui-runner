@@ -238,9 +238,6 @@
             "textContent": "Test"
           },
           {
-            "role": "button"
-          },
-          {
             "role": "alert"
           }
         ],

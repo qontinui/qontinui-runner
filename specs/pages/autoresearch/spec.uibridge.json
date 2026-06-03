@@ -843,20 +843,11 @@
         "description": "The launch form or dialog allows the user to configure a new comparison run: select a workflow, choose a variation type (architecture or same), and optionally toggle worktree isolation. Submitting posts to POST /comparison/start via the runner HTTP API or via the Tauri qontinui_comparison.start_comparison command.",
         "elements": [
           {
-            "role": "group"
-          },
-          {
             "role": "checkbox"
           },
           {
             "role": "button",
             "textContent": "Run"
-          },
-          {
-            "role": "list"
-          },
-          {
-            "role": "list"
           }
         ],
         "id": "comparison-launch",
@@ -867,15 +858,6 @@
       {
         "description": "The page lists recent comparison runs fetched from GET /comparisons (up to 50 most recent, returned as an array of ComparisonRunView). Each run shows its ID (or short ID), workflow ID, variation type, status, and creation date. The list is the primary navigation surface for entering a run's detail view.",
         "elements": [
-          {
-            "role": "list"
-          },
-          {
-            "role": "list"
-          },
-          {
-            "role": "list"
-          },
           {
             "role": "button",
             "textContent": "Refresh"
@@ -909,15 +891,6 @@
         "elements": [
           {
             "role": "table"
-          },
-          {
-            "role": "region"
-          },
-          {
-            "role": "region"
-          },
-          {
-            "role": "region"
           }
         ],
         "id": "completed-comparison-detail",
@@ -927,23 +900,7 @@
       },
       {
         "description": "The page displays machine-readable metric comparisons across variants from StructuredComparisonReport (built by build_structured_report in comparison.rs). The HTTP API surfaces three metrics per completed entry from ComparisonEntryResultJson: success (bool → 1.0/0.0, higher=better), iterations (u32, lower=better), and duration_ms (u64, lower=better). A winner is identified by which variant wins the most metrics, with a confidence score expressed as winner_wins / total_metrics (0.0–1.0).",
-        "elements": [
-          {
-            "role": "table"
-          },
-          {
-            "role": "region"
-          },
-          {
-            "role": "table"
-          },
-          {
-            "role": "region"
-          },
-          {
-            "role": "region"
-          }
-        ],
+        "elements": [],
         "id": "metric-analysis",
         "isInitial": false,
         "name": "Structured Metric Analysis",
@@ -951,20 +908,7 @@
       },
       {
         "description": "The winner and confidence in StructuredComparisonReport are derived by a specific algorithm in build_structured_report (comparison.rs): winner = variant with the most metric wins (tie-broken by highest success_rate); confidence = winner_metric_wins / total_metrics_count (0.0–1.0). With 3 metrics, valid confidence values are 0.33, 0.67, or 1.0. An AI verification workflow can check that displayed winner and confidence match these formulas applied to the visible metric values.",
-        "elements": [
-          {
-            "role": "region"
-          },
-          {
-            "role": "region"
-          },
-          {
-            "role": "list"
-          },
-          {
-            "role": "region"
-          }
-        ],
+        "elements": [],
         "id": "comparison-algorithm-correctness",
         "isInitial": false,
         "name": "Comparison Algorithm Correctness",
@@ -999,9 +943,6 @@
           },
           {
             "role": "group"
-          },
-          {
-            "role": "region"
           }
         ],
         "id": "research-config",

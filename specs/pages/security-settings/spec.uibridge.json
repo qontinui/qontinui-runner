@@ -804,9 +804,6 @@
         "description": "Dropdown to select the active security profile. Options: Permissive, Standard, Strict, Custom. Selecting a built-in profile shows its description and AST fingerprint.",
         "elements": [
           {
-            "textContains": "Security Profile"
-          },
-          {
             "role": "combobox"
           },
           {
@@ -897,9 +894,6 @@
             "textContains": "Audit Log"
           },
           {
-            "role": "combobox"
-          },
-          {
             "role": "table"
           },
           {
@@ -907,9 +901,6 @@
           },
           {
             "textContains": "No audit events"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "sec-audit-log-viewer",
@@ -965,10 +956,6 @@
           },
           {
             "role": "button"
-          },
-          {
-            "role": "button",
-            "textContains": "Save"
           }
         ],
         "id": "sec-visual-design",

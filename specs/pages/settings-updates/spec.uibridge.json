@@ -737,10 +737,6 @@
         "elements": [
           {},
           {},
-          {
-            "role": "button",
-            "textContent": "Check for Updates"
-          },
           {}
         ],
         "id": "upd-current-version-card",
@@ -754,10 +750,6 @@
           {
             "role": "button",
             "textContent": "Check for Updates"
-          },
-          {
-            "role": "button",
-            "textContent": "Checking..."
           },
           {
             "role": "button",
@@ -789,10 +781,6 @@
           {},
           {
             "textContent": "Update checking is disabled in development builds."
-          },
-          {
-            "role": "button",
-            "textContent": "Download and Install Update"
           }
         ],
         "id": "upd-dev-mode-state",
@@ -809,10 +797,6 @@
             "textContent": "Release Notes"
           },
           {
-            "role": "button",
-            "textContent": "Download and Install Update"
-          },
-          {
             "textContent": "The application will restart automatically after the update is installed."
           }
         ],
@@ -826,15 +810,7 @@
         "elements": [
           {
             "role": "button",
-            "textContent": "Download and Install Update"
-          },
-          {
-            "role": "button",
             "textContent": "Installing Update..."
-          },
-          {
-            "role": "button",
-            "textContent": "Download and Install Update"
           }
         ],
         "id": "upd-install-flow",
@@ -848,10 +824,6 @@
           {},
           {
             "textContent": "You're running the latest version of Qontinui Runner."
-          },
-          {
-            "role": "button",
-            "textContent": "Download and Install Update"
           }
         ],
         "id": "upd-up-to-date-state",
@@ -863,11 +835,7 @@
         "description": "If `check_for_updates` or `install_update` throws an exception, the component stores the error message in state and renders an error card with an AlertCircle icon and the error text. The status card is not shown when an error card is displayed.",
         "elements": [
           {},
-          {},
-          {
-            "role": "button",
-            "textContent": "Check for Updates"
-          }
+          {}
         ],
         "id": "upd-error-state",
         "isInitial": false,
@@ -877,11 +845,7 @@
       {
         "description": "Only one status card variant can be shown at a time. The four possible status card states (development mode, update available, up to date, and nothing) are mutually exclusive — they are driven by a single `updateInfo` nullable value and a single `error` nullable string. The error card and status card are also mutually exclusive.",
         "elements": [
-          {},
-          {
-            "role": "button",
-            "textContent": "Checking..."
-          }
+          {}
         ],
         "id": "upd-state-mutual-exclusion",
         "isInitial": false,

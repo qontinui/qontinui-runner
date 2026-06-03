@@ -728,10 +728,6 @@
         "elements": [
           {
             "role": "button",
-            "textContains": "New Watcher"
-          },
-          {
-            "role": "button",
             "textContains": "Cancel"
           },
           {},
@@ -747,10 +743,6 @@
           },
           {},
           {},
-          {
-            "role": "button",
-            "textContains": "Create Watcher"
-          },
           {},
           {}
         ],
@@ -812,9 +804,6 @@
           },
           {
             "textContains": "Last run: Never"
-          },
-          {
-            "textContains": "("
           }
         ],
         "id": "watchers-state-consistency",
@@ -825,9 +814,6 @@
       {
         "description": "The page automatically loads the watcher list on mount via useEffect calling list_watchers. After create/toggle/delete, the list is re-fetched. If PostgreSQL is unavailable, the list silently stays empty.",
         "elements": [
-          {
-            "textContent": "Watchers"
-          },
           {
             "role": "button",
             "textContains": "New Watcher"

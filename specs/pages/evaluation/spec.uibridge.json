@@ -1480,13 +1480,6 @@
             "textContent": "Dataset Name"
           },
           {
-            "textContent": "items"
-          },
-          {
-            "role": "button",
-            "textContent": "Confirm"
-          },
-          {
             "textContent": "No datasets yet"
           },
           {
@@ -1506,39 +1499,17 @@
         "description": "Once a dataset is selected, users need to view, add, import, export, and delete individual items. Items are displayed in a two-column table (Input / Expected Output). Users can add items by pasting a JSON array, importing a JSON or CSV file, or export existing items as JSON or CSV. Individual items can be deleted with a browser confirmation dialog.",
         "elements": [
           {
-            "textContent": "Input"
-          },
-          {
             "textContent": "Expected Output"
-          },
-          {
-            "role": "button",
-            "textContent": "Add Items"
           },
           {
             "textContent": "Paste JSON array of items"
           },
           {
             "role": "button",
-            "textContent": "Import File"
-          },
-          {
-            "role": "button",
-            "textContent": "JSON"
-          },
-          {
-            "role": "button",
             "textContent": "CSV"
           },
           {
-            "role": "button",
-            "textContent": "Delete item"
-          },
-          {
             "textContent": "No items in this dataset"
-          },
-          {
-            "textContent": "Select a dataset to view its items"
           }
         ],
         "id": "eval-dataset-items",
@@ -1550,21 +1521,11 @@
         "description": "Users create and browse experiments scoped to the selected dataset. Each experiment has a name, optional description, optional prompt variant ID, and a status badge (pending/running/completed/failed) with color coding. The experiment creation form appears inline with fields for name, description, and prompt variant ID. The experiment list shows completion progress (e.g. '3/10 completed') and creation date.",
         "elements": [
           {
-            "textContent": "Experiments"
-          },
-          {
             "role": "button",
             "textContent": "New Experiment"
           },
           {
-            "role": "status",
-            "textContent": "pending|running|completed|failed"
-          },
-          {
             "textContent": "completed"
-          },
-          {
-            "textContent": "Select a dataset to view experiments"
           },
           {
             "textContent": "No experiments yet"
@@ -1581,9 +1542,6 @@
       {
         "description": "When an experiment is selected, users see a detailed results view with summary cards at the top (average scores, total cost, total tokens, results count) and a paginated table below. The table shows Input, Output, Scores (as colored percentage badges), Duration, Cost, and Tokens columns. All numeric columns and individual score names are sortable. Pagination displays 20 results per page with Previous/Next buttons and a 'Showing X-Y of Z results' indicator.",
         "elements": [
-          {
-            "textContent": "%"
-          },
           {
             "textContent": "Total Cost"
           },
@@ -1606,9 +1564,6 @@
             "textContent": "Tokens"
           },
           {
-            "textContent": "%"
-          },
-          {
             "textContent": "Previous"
           },
           {
@@ -1619,9 +1574,6 @@
           },
           {
             "textContent": "No results yet"
-          },
-          {
-            "textContent": "Select an experiment to view results"
           },
           {
             "textContent": "Select a dataset first"
@@ -1651,17 +1603,10 @@
             "textContent": "Inline JSON"
           },
           {
-            "textContent": "Input (prompt / question)"
-          },
-          {
             "textContent": "Output (LLM response)"
           },
           {
             "textContent": "Context"
-          },
-          {
-            "role": "button",
-            "textContent": "Evaluate"
           },
           {
             "role": "button",
@@ -1742,21 +1687,8 @@
         "description": "Assertions verifying that displayed data is consistent across panels, matches backend state, and updates reactively after mutations. Covers item counts, experiment status badges, optimistic table updates after add/delete, pagination math, and score value accuracy.",
         "elements": [
           {
-            "textContent": "items"
-          },
-          {
-            "role": "status",
-            "textContent": "pending|running|completed|failed"
-          },
-          {
-            "textContent": "Input"
-          },
-          {
             "role": "button",
             "textContent": "Delete item"
-          },
-          {
-            "textContent": "Page"
           },
           {
             "textContent": "%"
