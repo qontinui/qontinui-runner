@@ -22,6 +22,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 // Type for component render log entries
 export interface ComponentRenderLogEntry {
@@ -43,6 +44,8 @@ interface RenderLogEntryWire {
   data: Record<string, unknown>;
   visible_sections?: string[];
   task_run_id?: number;
+  /** Window that produced this entry ("main" for the primary window). */
+  window_label?: string;
 }
 
 /**
@@ -75,6 +78,8 @@ export async function logRender(
     data,
     visible_sections: options?.visibleSections,
     task_run_id: options?.taskRunId,
+    // Stamp the producing window so multi-window render logs are filterable.
+    window_label: getCurrentWindow().label,
   };
 
   try {

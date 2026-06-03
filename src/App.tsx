@@ -17,7 +17,8 @@ import { ContextualTutorial } from "./components/tutorial";
 import { DemoVisualOverlay } from "./components/demo-video/DemoVisualOverlay";
 import { getGraphQLClient } from "./lib/graphql-client";
 
-import { UIBridgeProvider, AutoRegisterProvider } from "@qontinui/ui-bridge";
+import { UIBridgeProvider, AutoRegisterProvider, UIBridgeWindowProvider } from "@qontinui/ui-bridge";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { setupEventHandlers, eventRouter } from "./managers";
 import {
@@ -905,6 +906,14 @@ export default function App() {
           just dev. Use [data-no-register] on any element you want to opt
           out individually.
         */}
+        {/*
+          Phase 0 of plans/2026-06-03-runner-popout-terminal-windows.md.
+          Declare this window's label once at the bridge root so every
+          `useUIElement` below registers under it. For the main window this
+          is "main" — the registry's default — so registration is byte-
+          identical to before; pop-out windows (Phase 1) supply "term-N".
+        */}
+        <UIBridgeWindowProvider windowLabel={getCurrentWindow().label}>
         <AutoRegisterProvider
           enabled
           idStrategy="prefer-existing"
@@ -940,6 +949,7 @@ export default function App() {
             </TenantProvider>
           </AuthProvider>
         </AutoRegisterProvider>
+        </UIBridgeWindowProvider>
       </UIBridgeProvider>
     </ApolloProvider>
   );
