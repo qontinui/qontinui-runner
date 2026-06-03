@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -836,17 +836,48 @@ pub async fn ui_bridge_get_element_state_handler(
 // Render log
 // ============================================================================
 
-/// Get render log entries.
+/// Optional query params for the render-log GET endpoint.
+#[derive(Debug, Default, Deserialize)]
+pub struct RenderLogQuery {
+    /// Filter to entries from this window. Unlabeled entries are treated as
+    /// `"main"`. Omit to return all entries (single-window default).
+    #[serde(rename = "windowLabel")]
+    pub window_label: Option<String>,
+}
+
+/// Get render log entries, optionally filtered by `?windowLabel=`.
 pub async fn ui_bridge_get_render_log_handler(
     State(state): State<Arc<ApiState>>,
+    Query(params): Query<RenderLogQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting render log");
 
     let log = state.ui_bridge_render_log.lock().await;
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "entries": *log,
-        "count": log.len()
-    }))))
+    match params.window_label.as_deref() {
+        // No filter — return the log verbatim (byte-identical to pre-window
+        // behavior; existing single-window callers are unaffected).
+        None => Ok(Json(ApiResponse::success(serde_json::json!({
+            "entries": *log,
+            "count": log.len()
+        })))),
+        // Filter to one window; an entry with no `windowLabel` counts as "main".
+        Some(want) => {
+            let entries: Vec<serde_json::Value> = log
+                .iter()
+                .filter(|e| {
+                    e.get("windowLabel")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(super::request::MAIN_WINDOW_LABEL)
+                        == want
+                })
+                .cloned()
+                .collect();
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "count": entries.len(),
+                "entries": entries,
+            }))))
+        }
+    }
 }
 
 /// Append an entry to the render log.
@@ -862,6 +893,52 @@ pub async fn ui_bridge_append_render_log_handler(
     log.push(entry);
     Ok(Json(ApiResponse::success(serde_json::json!({
         "count": log.len()
+    }))))
+}
+
+// ============================================================================
+// Runner-owned windows
+// ============================================================================
+
+/// Enumerate the runner process's OWN Tauri webview windows.
+///
+/// Distinct from `/ui-bridge/control/windows`, which enumerates OS desktop
+/// windows (Chrome, VS Code, …) for desktop automation. This lists the
+/// webviews THIS runner process hosts — just the main window today, plus the
+/// pop-out terminal windows that Phase 1 of
+/// `plans/2026-06-03-runner-popout-terminal-windows.md` will add — so UI Bridge
+/// clients can discover and address them by `windowLabel`.
+pub async fn ui_bridge_list_runner_windows_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use tauri::Manager;
+    let main_label = qontinui_runner_lib::get_main_window_label();
+    let mut windows: Vec<serde_json::Value> = state
+        .app_handle
+        .webview_windows()
+        .into_iter()
+        .map(|(label, win)| {
+            let kind = if label.as_str() == main_label {
+                "main"
+            } else {
+                "secondary"
+            };
+            serde_json::json!({
+                "label": label,
+                "kind": kind,
+                "title": win.title().ok(),
+            })
+        })
+        .collect();
+    // Deterministic ordering so callers/tests get stable output.
+    windows.sort_by(|a, b| {
+        a.get("label")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("label").and_then(|v| v.as_str()))
+    });
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "count": windows.len(),
+        "windows": windows,
     }))))
 }
 
@@ -1352,6 +1429,12 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(handle_render_log_snapshot),
         )
         .route("/ui-bridge/render-log/path", get(handle_render_log_path))
+        // Runner-owned webview windows (this process's own windows; distinct
+        // from the OS-window enumerator at `/ui-bridge/control/windows`).
+        .route(
+            "/ui-bridge/control/runner-windows",
+            get(ui_bridge_list_runner_windows_handler),
+        )
         // SDK relay liveness ping (distinct from `/ui-bridge/pong`)
         .route("/ui-bridge/heartbeat", post(ui_bridge_heartbeat_handler))
         // Pong + IPC response
@@ -1396,6 +1479,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("DELETE", "/ui-bridge/render-log"),
         ("POST", "/ui-bridge/render-log/snapshot"),
         ("GET", "/ui-bridge/render-log/path"),
+        ("GET", "/ui-bridge/control/runner-windows"),
         ("POST", "/ui-bridge/heartbeat"),
         ("POST", "/ui-bridge/pong"),
         ("POST", "/ui-bridge/ipc-response"),
