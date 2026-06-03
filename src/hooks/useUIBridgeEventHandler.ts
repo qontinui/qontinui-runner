@@ -27,6 +27,7 @@
 
 import { useEffect, useLayoutEffect, useCallback, useRef } from "react";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useUIBridge } from "@qontinui/ui-bridge";
 import type { StyleGuideConfig } from "@qontinui/ui-bridge";
 import { createLogger } from "@/lib/logger";
@@ -60,6 +61,12 @@ import { httpSendResponse, httpSendPong } from "./ui-bridge-events/utils";
  */
 export function useUIBridgeEventHandler(): void {
   const bridge = useUIBridge();
+  // This window's own Tauri webview label ("main" for the primary window).
+  // Stable for the window's lifetime — captured once in a ref. Used to (a)
+  // ignore `ui-bridge-request` events addressed to a different window and
+  // (b) stamp every response so the Rust dispatcher pairs it under the right
+  // (windowLabel, requestId) key. See Phase 0 of the pop-out terminal plan.
+  const myWindowLabelRef = useRef<string>(getCurrentWindow().label);
   const bridgeRef = useRef(bridge);
   const loadedStyleGuideRef = useRef<StyleGuideConfig | null>(null);
   const changeTrackerRef = useRef<InstanceType<
@@ -83,6 +90,14 @@ export function useUIBridgeEventHandler(): void {
    * Send a response back to the Rust backend
    */
   const sendResponse = useCallback(async (response: UIBridgeResponsePayload) => {
+    // Stamp this window's label so the Rust dispatcher pairs the response
+    // under the same (windowLabel, requestId) key the request was stored
+    // under. Defaulting omitted labels to "main" on the Rust side keeps this
+    // backward-compatible, but stamping explicitly is what makes multi-window
+    // routing unambiguous.
+    if (response.windowLabel === undefined) {
+      response = { ...response, windowLabel: myWindowLabelRef.current };
+    }
     // Send via HTTP first (primary). The Tauri emit path suffers from
     // double-serialization: Tauri serializes the payload to JSON for IPC,
     // then the Rust listener deserializes via serde_json::from_str(event.payload()).
@@ -228,6 +243,20 @@ export function useUIBridgeEventHandler(): void {
           }
 
           const payload = event.payload;
+
+          // Multi-window addressing (Phase 0): the Rust dispatcher stamps a
+          // target `windowLabel` only when it isn't "main". A window ignores
+          // any request addressed to a different window. When the field is
+          // absent (single-window default) every window — i.e. just "main"
+          // today — processes it, so behavior is unchanged.
+          const target = payload.windowLabel;
+          if (target && target !== myWindowLabelRef.current) {
+            log.debug(
+              `Ignoring request for window '${target}' (this window is '${myWindowLabelRef.current}')`,
+            );
+            return;
+          }
+
           log.debug("Received event:", payload.type, payload.requestId);
 
           // Handle the request asynchronously

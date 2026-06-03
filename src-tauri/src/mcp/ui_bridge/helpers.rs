@@ -194,10 +194,17 @@ pub(super) async fn direct_webview_evaluate_with_result(
     let request_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
 
+    // This direct-eval path always targets the main window, and the injected JS
+    // POSTs its response back without a `windowLabel` — so it must register and
+    // clean up under the SAME composite (main, id) key the response dispatcher
+    // computes (it defaults a missing label to "main"). See
+    // `super::request::pending_key`.
+    let pkey = super::request::pending_key(super::request::MAIN_WINDOW_LABEL, &request_id);
+
     // Register the pending request
     {
         let mut pending = state.ui_bridge_pending.lock().await;
-        pending.insert(request_id.clone(), tx);
+        pending.insert(pkey.clone(), tx);
         state
             .ui_bridge_pending_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -213,7 +220,7 @@ pub(super) async fn direct_webview_evaluate_with_result(
     if api_port == 0 {
         // Remove the pending request we just registered
         let mut pending = state.ui_bridge_pending.lock().await;
-        pending.remove(&request_id);
+        pending.remove(&pkey);
         state
             .ui_bridge_pending_count
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -307,7 +314,7 @@ pub(super) async fn direct_webview_evaluate_with_result(
         Err(_) => {
             // Clean up pending request
             let mut pending = state.ui_bridge_pending.lock().await;
-            if pending.remove(&request_id).is_some() {
+            if pending.remove(&pkey).is_some() {
                 state
                     .ui_bridge_pending_count
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
