@@ -227,6 +227,15 @@ fn enrich_commit_metadata(repo_path: &str) -> Option<serde_json::Value> {
     let author_email = author.email().unwrap_or("").to_string();
     let timestamp = commit.time().seconds();
 
+    // First-parent SHA (null for a root commit). The tree diff below already
+    // peels the first parent; this surfaces it on the payload so downstream
+    // consumers (the coord commit forwarder) can record the lineage edge.
+    let parent_sha = if commit.parent_count() > 0 {
+        commit.parent(0).ok().map(|p| p.id().to_string())
+    } else {
+        None
+    };
+
     // Compute changed files by diffing this commit's tree against its first
     // parent's tree. Initial commits (no parents) report every file in the
     // tree as added. If the diff fails for any reason, omit the field.
@@ -238,6 +247,7 @@ fn enrich_commit_metadata(repo_path: &str) -> Option<serde_json::Value> {
         "author_name": author_name,
         "author_email": author_email,
         "timestamp": timestamp,
+        "parent_sha": parent_sha,
         "changed_files": changed_files,
     }))
 }
