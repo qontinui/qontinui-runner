@@ -25,11 +25,14 @@
 //!     Partial}. `Failure` and `Contradiction` fail (Contradiction is an
 //!     emergency-stop signal).
 //!
-//! ## Known integration dependency
-//! `effect_check` can only PASS when the connected SDK app has effect
-//! verification enabled AND a signature resolves for the targeted
-//! `(action, element)`. Absent that, every run reports `unavailable` and fails —
-//! this is by design (the step's whole purpose is to assert the verification
+//! ## Integration dependency
+//! The step sends `verifyEffect: true` on the action request, which opts that
+//! single action into the SDK's predict-then-verify cycle (no server-wide flag
+//! needed). It can therefore PASS as long as a handler effect signature resolves
+//! for the targeted `(action, element)` in the connected SDK app. If no
+//! signature resolves (e.g. a `click` on an element without `reveals`), the
+//! response carries no `effectVerification` and the step reports `unavailable`
+//! and fails — by design (the step's whole purpose is to assert the verification
 //! exists and matches), not a runner bug.
 
 use async_trait::async_trait;
@@ -132,10 +135,7 @@ impl StepHandler for EffectCheckHandler {
             self_base,
             urlencoding::encode(&element_id)
         );
-        let mut body = json!({ "action": action });
-        if let Some(params) = &step.effect_check_params {
-            body["params"] = params.clone();
-        }
+        let body = build_action_body(&action, step.effect_check_params.as_ref());
 
         let http_resp = client.post(&action_url).json(&body).send().await;
         let response_json: serde_json::Value = match http_resp {
@@ -244,6 +244,20 @@ impl StepHandler for EffectCheckHandler {
     }
 }
 
+/// Build the action-request body sent to `/ui-bridge/sdk/element/{id}/action`.
+///
+/// Always sets `verifyEffect: true` — that opts this single action into the
+/// SDK's predict-then-verify cycle (per-request, no server-wide flag), so the
+/// response carries `effectVerification` for us to assert on. This is the whole
+/// point of the step.
+fn build_action_body(action: &str, params: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut body = json!({ "action": action, "verifyEffect": true });
+    if let Some(params) = params {
+        body["params"] = params.clone();
+    }
+    body
+}
+
 /// Whether `s` is one of the five canonical effect-calculus outcomes.
 fn is_valid_outcome(s: &str) -> bool {
     matches!(
@@ -282,6 +296,18 @@ mod tests {
         registry.register(EffectCheckHandler);
         assert!(registry.has_handler("effect_check"));
         assert!(registry.get("effect_check").is_some());
+    }
+
+    #[test]
+    fn action_body_always_requests_verification() {
+        let body = build_action_body("click", None);
+        assert_eq!(body["action"], "click");
+        assert_eq!(body["verifyEffect"], true);
+        assert!(body.get("params").is_none());
+
+        let body = build_action_body("type", Some(&json!({ "text": "hi" })));
+        assert_eq!(body["verifyEffect"], true);
+        assert_eq!(body["params"], json!({ "text": "hi" }));
     }
 
     #[test]
