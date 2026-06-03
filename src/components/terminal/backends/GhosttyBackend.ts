@@ -142,6 +142,24 @@ export class GhosttyBackend implements ITerminalBackend {
     t.scrollToTop?.();
   }
 
+  // ghostty-web has no search addon — find-in-terminal degrades to "no
+  // matches" and the find bar simply shows 0 results on this backend.
+  findNext(): boolean {
+    return false;
+  }
+
+  findPrevious(): boolean {
+    return false;
+  }
+
+  clearSearch(): void {
+    // no-op — nothing was highlighted
+  }
+
+  onSearchResults(): IDisposable {
+    return { dispose: () => {} };
+  }
+
   attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
     this.term.attachCustomKeyEventHandler(handler);
   }

@@ -74,6 +74,33 @@ export interface TerminalBackendOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Find-in-terminal (backend-agnostic subset of xterm's ISearchOptions)
+// ---------------------------------------------------------------------------
+
+export interface TerminalSearchOptions {
+  /** Treat the term as a regular expression. */
+  regex?: boolean;
+  /** Match whole words only. */
+  wholeWord?: boolean;
+  /** Case-sensitive matching. */
+  caseSensitive?: boolean;
+  /**
+   * Incremental search: expand the current selection if it still matches —
+   * used while the operator types so the active match doesn't jump ahead.
+   * Only affects findNext.
+   */
+  incremental?: boolean;
+}
+
+/** Fired when highlighted search results change (see `onSearchResults`). */
+export interface TerminalSearchResults {
+  /** Index of the active match, or -1 when none / over the highlight limit. */
+  resultIndex: number;
+  /** Total number of matches. */
+  resultCount: number;
+}
+
+// ---------------------------------------------------------------------------
 // Terminal backend interface
 // ---------------------------------------------------------------------------
 
@@ -137,6 +164,20 @@ export interface ITerminalBackend {
   scrollPages(pageCount: number): void;
   /** Scroll the viewport to the very top of the scrollback (VS Code Ctrl+Home). */
   scrollToTop(): void;
+
+  // -- Find-in-terminal (VS Code Ctrl+F parity) ------------------------------
+  /**
+   * Find the next match for `term` (wraps at the end). Returns false when no
+   * match exists. Highlights all matches when the backend supports
+   * decorations. Backends without search support return false.
+   */
+  findNext(term: string, options?: TerminalSearchOptions): boolean;
+  /** Find the previous match for `term` (wraps at the start). */
+  findPrevious(term: string, options?: TerminalSearchOptions): boolean;
+  /** Clear search highlights and the active-match selection. */
+  clearSearch(): void;
+  /** Subscribe to match-count changes while a search is active. */
+  onSearchResults(cb: (results: TerminalSearchResults) => void): IDisposable;
 
   // -- Key handling ---------------------------------------------------------
   /** Intercept key events before the terminal processes them. Return false to prevent default. */

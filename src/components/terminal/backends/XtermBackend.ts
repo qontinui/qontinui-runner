@@ -3,6 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { CanvasAddon } from "@xterm/addon-canvas";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 
 import type {
@@ -10,11 +11,27 @@ import type {
   ITerminalBackend,
   ITerminalLinkProvider,
   TerminalBackendOptions,
+  TerminalSearchOptions,
+  TerminalSearchResults,
 } from "./types";
+
+/**
+ * Match-highlight colors for find-in-terminal, aligned with the Tokyo Night
+ * theme in `TerminalInstance.TERMINAL_OPTIONS`. The two `*OverviewRuler`
+ * fields are required by the addon's types even though the runner doesn't
+ * render an overview ruler.
+ */
+const SEARCH_DECORATIONS = {
+  matchBackground: "#3d59a1",
+  matchOverviewRuler: "#3d59a1",
+  activeMatchBackground: "#ff9e64",
+  activeMatchColorOverviewRuler: "#ff9e64",
+};
 
 export class XtermBackend implements ITerminalBackend {
   private readonly term: Terminal;
   private readonly fitAddon: FitAddon;
+  private readonly searchAddon: SearchAddon;
   private container: HTMLElement | null = null;
 
   constructor(options: TerminalBackendOptions = {}) {
@@ -31,6 +48,8 @@ export class XtermBackend implements ITerminalBackend {
 
     this.fitAddon = new FitAddon();
     this.term.loadAddon(this.fitAddon);
+    this.searchAddon = new SearchAddon();
+    this.term.loadAddon(this.searchAddon);
   }
 
   open(container: HTMLElement): void {
@@ -135,6 +154,23 @@ export class XtermBackend implements ITerminalBackend {
 
   scrollToTop(): void {
     this.term.scrollToTop();
+  }
+
+  findNext(term: string, options?: TerminalSearchOptions): boolean {
+    return this.searchAddon.findNext(term, { ...options, decorations: SEARCH_DECORATIONS });
+  }
+
+  findPrevious(term: string, options?: TerminalSearchOptions): boolean {
+    return this.searchAddon.findPrevious(term, { ...options, decorations: SEARCH_DECORATIONS });
+  }
+
+  clearSearch(): void {
+    this.searchAddon.clearDecorations();
+    this.term.clearSelection();
+  }
+
+  onSearchResults(cb: (results: TerminalSearchResults) => void): IDisposable {
+    return this.searchAddon.onDidChangeResults(cb);
   }
 
   attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
