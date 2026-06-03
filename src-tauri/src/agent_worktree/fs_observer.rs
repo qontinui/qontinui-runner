@@ -97,17 +97,12 @@ fn is_always_dropped(rel_path: &str) -> bool {
     if DROP_DIR_SEGMENTS.iter().any(|seg| padded.contains(seg)) {
         return true;
     }
-    const DROP_SUFFIXES: &[&str] = &[
-        ".tmp", ".swp", ".swo", ".orig", ".rej", "~", ".pyc", ".log",
-    ];
+    const DROP_SUFFIXES: &[&str] = &[".tmp", ".swp", ".swo", ".orig", ".rej", "~", ".pyc", ".log"];
     if DROP_SUFFIXES.iter().any(|sfx| p.ends_with(sfx)) {
         return true;
     }
     // Drop OS junk.
-    matches!(
-        p.rsplit('/').next(),
-        Some(".DS_Store") | Some("Thumbs.db")
-    )
+    matches!(p.rsplit('/').next(), Some(".DS_Store") | Some("Thumbs.db"))
 }
 
 /// Parse the optional allowlist env var into a normalized prefix set. Empty
@@ -281,11 +276,7 @@ pub fn collect_observations(
 
     for delta in diff.deltas() {
         // Prefer the new (post) path; fall back to old for pure deletions.
-        let rel = match delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-        {
+        let rel = match delta.new_file().path().or_else(|| delta.old_file().path()) {
             Some(p) => p.to_string_lossy().replace('\\', "/"),
             None => continue,
         };
