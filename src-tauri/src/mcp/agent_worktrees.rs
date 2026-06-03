@@ -70,6 +70,11 @@ pub struct AllocateLocalRequest {
     /// falls back to `FileGlob`; otherwise no pre-flight claim.
     #[serde(default)]
     pub phase: Option<String>,
+    /// coord-assigned per-agent session id; folded into the
+    /// phase/worktree claim owner token so two agents on one machine are
+    /// distinct holders. Threaded onto acquire/heartbeat/release.
+    #[serde(default)]
+    pub agent_session_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +142,7 @@ pub async fn post_allocate_local(
     match allocate_and_materialize_with_claim(
         &coord_http_base,
         &machine_id,
+        req.agent_session_id,
         &repo_reqs,
         req.intent.as_deref(),
         req.declared_overlap_paths.as_deref(),

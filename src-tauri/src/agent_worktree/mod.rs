@@ -168,6 +168,7 @@ enum AcquireOutcome {
 async fn pre_allocate_claim(
     coord_http_base: &str,
     machine_id: &uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
     ctx: &ClaimSpawnContext,
 ) -> Result<AcquireOutcome, String> {
     let url = format!("{}/claims/acquire", coord_http_base.trim_end_matches('/'));
@@ -185,6 +186,7 @@ async fn pre_allocate_claim(
         "kind": ctx.kind,
         "resource_key": ctx.resource_key,
         "machine_id": machine_id.to_string(),
+        "agent_session_id": agent_session_id,
         "metadata": metadata,
     });
 
@@ -267,6 +269,8 @@ pub struct ClaimHeartbeatHandle {
     pub resource_key: String,
     pub machine_id: uuid::Uuid,
     pub coord_http_base: String,
+    /// Same value carried so the release POST matches the acquire's owner token.
+    pub agent_session_id: Option<uuid::Uuid>,
 }
 
 impl Drop for ClaimHeartbeatHandle {
@@ -286,6 +290,7 @@ impl Drop for ClaimHeartbeatHandle {
 pub fn spawn_heartbeat_task<F>(
     coord_http_base: String,
     machine_id: uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
     kind: &str,
     resource_key: String,
     ttl_seconds: i64,
@@ -318,7 +323,15 @@ where
                     return;
                 }
             }
-            match heartbeat_once(&base_clone, machine_id, &kind_owned, &resource_clone).await {
+            match heartbeat_once(
+                &base_clone,
+                machine_id,
+                agent_session_id,
+                &kind_owned,
+                &resource_clone,
+            )
+            .await
+            {
                 Ok(HeartbeatTickOutcome::Ok) => {}
                 Ok(HeartbeatTickOutcome::Stolen { current_holder }) => {
                     warn!(
@@ -344,6 +357,7 @@ where
         resource_key,
         machine_id,
         coord_http_base,
+        agent_session_id,
     }
 }
 
@@ -355,6 +369,7 @@ enum HeartbeatTickOutcome {
 async fn heartbeat_once(
     coord_http_base: &str,
     machine_id: uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
     kind: &str,
     resource_key: &str,
 ) -> Result<HeartbeatTickOutcome, String> {
@@ -363,6 +378,7 @@ async fn heartbeat_once(
         "kind": kind,
         "resource_key": resource_key,
         "machine_id": machine_id.to_string(),
+        "agent_session_id": agent_session_id,
         "metadata": {},
     });
     let client = reqwest::Client::builder()
@@ -405,6 +421,7 @@ async fn heartbeat_once(
 pub async fn release_claim_best_effort(
     coord_http_base: &str,
     machine_id: uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
     kind: &str,
     resource_key: &str,
 ) {
@@ -413,6 +430,7 @@ pub async fn release_claim_best_effort(
         "kind": kind,
         "resource_key": resource_key,
         "machine_id": machine_id.to_string(),
+        "agent_session_id": agent_session_id,
         "metadata": {},
     });
     let client = match reqwest::Client::builder()
@@ -522,6 +540,11 @@ pub struct ActiveClaim {
     pub kind: String,
     pub resource_key: String,
     pub ttl_seconds: i64,
+    /// coord-assigned per-agent session id; folded into the claim owner
+    /// token so two agents on one machine are distinct holders. Sent
+    /// identically on acquire/heartbeat/release. Plan
+    /// 2026-06-03-coord-session-scoped-claim-owner follow-up.
+    pub agent_session_id: Option<uuid::Uuid>,
 }
 
 // =============================================================================
@@ -775,6 +798,7 @@ pub async fn allocate_and_materialize(
     allocate_and_materialize_with_claim(
         coord_http_base,
         machine_id,
+        None,
         repos,
         intent,
         declared_overlap_paths,
@@ -792,6 +816,7 @@ pub async fn allocate_and_materialize(
 pub async fn allocate_and_materialize_with_claim(
     coord_http_base: &str,
     machine_id: &uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
     repos: &[RepoRequest],
     intent: Option<&str>,
     declared_overlap_paths: Option<&[String]>,
@@ -815,7 +840,7 @@ pub async fn allocate_and_materialize_with_claim(
     let claim_ctx =
         ClaimSpawnContext::from_intent_and_paths(intent, plan_id, phase, declared_overlap_paths);
     let active_claim = if let Some(ref ctx) = claim_ctx {
-        match pre_allocate_claim(coord_http_base, machine_id, ctx).await {
+        match pre_allocate_claim(coord_http_base, machine_id, agent_session_id, ctx).await {
             Ok(AcquireOutcome::Acquired { ttl_seconds }) => {
                 info!(
                     "claims/acquire ok kind={} key={} ttl={}s",
@@ -825,6 +850,7 @@ pub async fn allocate_and_materialize_with_claim(
                     kind: ctx.kind.to_string(),
                     resource_key: ctx.resource_key.clone(),
                     ttl_seconds,
+                    agent_session_id,
                 })
             }
             Ok(AcquireOutcome::Held(conflict)) => {
@@ -926,6 +952,7 @@ pub async fn allocate_and_materialize_with_claim(
             release_claim_best_effort(
                 coord_http_base,
                 *machine_id,
+                claim.agent_session_id,
                 &claim.kind,
                 &claim.resource_key,
             )
