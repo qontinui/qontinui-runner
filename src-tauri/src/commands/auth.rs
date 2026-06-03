@@ -114,6 +114,8 @@ struct ApiUserInfo {
     full_name: Option<String>,
     is_verified: bool,
     is_active: bool,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 /// Gets the current platform name
