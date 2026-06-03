@@ -502,10 +502,44 @@ pub async fn connect_sdk_app(
                 Err(e) => warn!("SDK relay client: malformed bearer, connecting without auth: {e}"),
             }
         }
-        _ => debug!(
-            "SDK relay client: no Cognito session (legacy/local install or not signed in); \
-             connecting without auth"
-        ),
+        _ => {
+            // No Cognito user session (device-paired runner, or legacy/local
+            // install). A device-paired runner DOES hold a coord-minted
+            // device-JWT in the access_token slot (`AuthManager::get_access_token`).
+            // The relay accepts a verified device-JWT as a fallback bearer, so
+            // attach it here — gated on `looks_like_jwt` so a legacy opaque
+            // `qontinui_runner_<random>` slot value is never sent (it would just
+            // 401). If there's no token, or it isn't JWT-shaped, fall through to
+            // today's behavior: connect with no Authorization header.
+            let device_jwt = crate::auth::AuthManager::new()
+                .get_access_token()
+                .ok()
+                .filter(|t| crate::auth::looks_like_jwt(t));
+            match device_jwt {
+                Some(token) => {
+                    match reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+                        Ok(mut value) => {
+                            value.set_sensitive(true);
+                            let mut headers = reqwest::header::HeaderMap::new();
+                            headers.insert(reqwest::header::AUTHORIZATION, value);
+                            builder = builder.default_headers(headers);
+                            debug!(
+                                "SDK relay client: no Cognito session; attached device-JWT \
+                                 fallback bearer for {}",
+                                url
+                            );
+                        }
+                        Err(e) => warn!(
+                            "SDK relay client: malformed device-JWT bearer, connecting without auth: {e}"
+                        ),
+                    }
+                }
+                None => debug!(
+                    "SDK relay client: no Cognito session and no JWT-shaped device token \
+                     (legacy/local install or not paired); connecting without auth"
+                ),
+            }
+        }
     }
 
     let client = builder
