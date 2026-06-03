@@ -902,7 +902,7 @@ pub async fn generate_unified_workflow_async_handler(
     let mut resolved_contexts = String::new();
     if let Some(ref ids) = request.context_ids {
         if !ids.is_empty() {
-            let resolved = crate::context::resolve_contexts(ids, false, "", &[], &[]);
+            let resolved = crate::context::resolve_contexts(ids, false, "", &[], &[], None);
             if let Some(formatted) = crate::context::format_contexts_for_prompt(&resolved) {
                 resolved_contexts.push_str(&formatted);
             }

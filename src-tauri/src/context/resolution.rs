@@ -4,7 +4,7 @@
 
 use super::builtins::get_builtin_contexts;
 use super::metadata::record_context_use;
-use super::project_contexts::get_project_contexts;
+use super::project_contexts::{get_project_contexts, load_project_contexts_from_dir};
 use super::storage::load_user_context_library;
 use super::types::{AutoDetectReason, Context, ResolvedContexts};
 use super::user_contexts::get_all_user_contexts;
@@ -58,25 +58,44 @@ pub fn should_auto_include(
     false
 }
 
+/// Select the project-context source.
+///
+/// `Some(path)` loads `.qontinui/contexts/` + interop rule files from that
+/// explicit workspace directory; `None` falls back to the process CWD
+/// (`get_project_contexts`). Threading an explicit path lets callers (e.g. the
+/// agentic verification loop) point the loaders at a task's workspace WITHOUT
+/// mutating the global process CWD — eliminating a chdir side-effect that could
+/// race across concurrent in-process resolutions.
+fn project_contexts_for(project_path: Option<&str>) -> Vec<Context> {
+    match project_path {
+        Some(p) => load_project_contexts_from_dir(p),
+        None => get_project_contexts(),
+    }
+}
+
 /// Resolve which contexts should be included in a prompt.
 ///
 /// This function:
 /// 1. Looks up explicit context IDs from user, project, and builtin sources
 /// 2. If auto_detect is true, evaluates all enabled contexts against the task/config
 /// 3. Merges and deduplicates the results
+///
+/// `project_path` selects the project-context source: `Some(dir)` reads that
+/// workspace; `None` uses the process CWD (back-compat default).
 pub fn resolve_contexts(
     explicit_ids: &[String],
     auto_detect: bool,
     task_prompt: &str,
     action_types: &[String],
     recent_errors: &[String],
+    project_path: Option<&str>,
 ) -> ResolvedContexts {
     let mut result = ResolvedContexts::default();
     let mut included_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Gather all available contexts (user + project + builtin)
     let user_contexts = get_all_user_contexts();
-    let project_contexts = get_project_contexts();
+    let project_contexts = project_contexts_for(project_path);
     let builtin_contexts = get_builtin_contexts();
     let library = load_user_context_library();
 
@@ -264,6 +283,7 @@ pub fn resolve_contexts_scoped(
     action_types: &[String],
     recent_errors: &[String],
     touched_paths: &[String],
+    project_path: Option<&str>,
 ) -> ResolvedContexts {
     let mut resolved = resolve_contexts(
         explicit_ids,
@@ -271,6 +291,7 @@ pub fn resolve_contexts_scoped(
         task_prompt,
         action_types,
         recent_errors,
+        project_path,
     );
 
     // Attach always-on project rule-file contexts that the trigger-based pass
@@ -284,7 +305,7 @@ pub fn resolve_contexts_scoped(
         .chain(resolved.auto_detected.iter())
         .map(|c| c.id.clone())
         .collect();
-    for ctx in get_project_contexts() {
+    for ctx in project_contexts_for(project_path) {
         if ctx.category.as_deref() != Some(RULE_FILE_CATEGORY) {
             continue;
         }
@@ -337,6 +358,7 @@ pub fn inject_contexts_scoped(
     action_types: &[String],
     recent_errors: &[String],
     touched_paths: &[String],
+    project_path: Option<&str>,
 ) -> (String, Vec<String>) {
     let resolved = resolve_contexts_scoped(
         context_ids,
@@ -345,6 +367,7 @@ pub fn inject_contexts_scoped(
         action_types,
         recent_errors,
         touched_paths,
+        project_path,
     );
 
     let used_ids: Vec<String> = resolved
@@ -421,6 +444,7 @@ pub fn inject_contexts(
     task_prompt: &str,
     action_types: &[String],
     recent_errors: &[String],
+    project_path: Option<&str>,
 ) -> (String, Vec<String>) {
     let resolved = resolve_contexts(
         context_ids,
@@ -428,6 +452,7 @@ pub fn inject_contexts(
         task_prompt,
         action_types,
         recent_errors,
+        project_path,
     );
 
     // Collect all context IDs that were used
