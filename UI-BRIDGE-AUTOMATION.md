@@ -123,12 +123,7 @@ curl -X POST http://localhost:9876/ui-bridge/invoke/test_web_integration_connect
     }
   }'
 
-# 4. Start a browser-login token flow (opens a tab in the user's default browser).
-curl -X POST http://localhost:9876/ui-bridge/invoke/start_web_token_flow \
-  -H 'Content-Type: application/json' \
-  -d '{"args": {"backendUrl": "http://localhost:8000"}}'
-
-# 5. Custom timeout (e.g. 10s).
+# 4. Custom timeout (e.g. 10s).
 curl -X POST 'http://localhost:9876/ui-bridge/invoke/get_web_integration_status?timeoutMs=10000' \
   -H 'Content-Type: application/json' \
   -d '{"args": {}}'

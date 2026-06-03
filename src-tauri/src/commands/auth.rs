@@ -498,37 +498,6 @@ pub fn set_runner_tier(tier: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Opens the system browser to `/connect-runner` with the runner's loopback
-/// callback URL.
-///
-/// This is the Settings → Account "Sign in to Qontinui" entry point used by
-/// `AccountSettings.tsx`. It is a thin wrapper over the existing
-/// `start_web_token_flow` machinery (same `TokenFlowStore` + same
-/// `/auth/runner-token-callback` handler) — kept as a separate command so
-/// the FE call site reads as a tier-promotion intent rather than a
-/// generic "open token flow" action.
-///
-/// The actual tier promotion happens in `mcp::auth_callback` when the
-/// user clicks Confirm in the browser; this command returns as soon as
-/// the browser has been launched.
-///
-/// # Errors
-///
-/// Returns `Err` if no `backend_url` is configured in settings or if
-/// `open::that` fails to launch a browser.
-#[tauri::command]
-pub async fn start_qontinui_sign_in<R: Runtime>(
-    integration: tauri::State<'_, crate::commands::compartments::IntegrationCompartment>,
-    health: tauri::State<'_, HealthCompartment>,
-    app_handle: tauri::AppHandle<R>,
-) -> Result<(), String> {
-    // Delegate to the existing token-flow command — same pending-flow store,
-    // same callback handler, same browser-launch logic. `backend_url = None`
-    // re-uses whatever is already persisted (or errors if nothing is).
-    crate::commands::web_integration::start_web_token_flow(integration, health, app_handle, None)
-        .await
-}
-
 /// Wire response for [`cognito_sign_in`]. Mirrors the credentials/pair-code
 /// confirmation shape so the FE shows a uniform "signed in" panel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -914,7 +883,6 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             get_api_port,
             get_runner_tier,
             set_runner_tier,
-            start_qontinui_sign_in,
             cognito_sign_in,
             cognito_sign_in_password,
             qontinui_sign_out,

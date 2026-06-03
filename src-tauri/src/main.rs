@@ -670,7 +670,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             cache
         },
         server_mode: server_mode_state.clone(),
-        token_flow: Arc::new(crate::server_mode::TokenFlowStore::new()),
         ui_error: Arc::new(ui_error::UiErrorState::new()),
         crash_dumps: Arc::new(crash_dumps::CrashDumpState::new()),
         usb_transport: Arc::new(tokio::sync::OnceCell::new()),
@@ -919,7 +918,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::logout,
             commands::auth::qontinui_sign_out,
             commands::auth::set_runner_tier,
-            commands::auth::start_qontinui_sign_in,
             commands::auth::cognito_sign_in,
             commands::auth::cognito_sign_in_password,
             commands::autostart::get_autostart_enabled,
@@ -1687,7 +1685,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::web_integration::get_web_integration_status,
             commands::web_integration::redeem_pair_code,
             commands::web_integration::save_web_integration_settings,
-            commands::web_integration::start_web_token_flow,
             commands::web_integration::test_web_integration_connection,
             commands::window_manager::activate_system_window,
             commands::window_manager::list_system_windows,

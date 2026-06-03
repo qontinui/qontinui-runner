@@ -953,8 +953,9 @@ impl Default for DebugSettings {
 /// `backend_url` points at the dev backend in debug builds (`http://localhost:8000`)
 /// or the production backend in release builds (`https://api.qontinui.io`).
 /// `runner_token` still defaults to empty — it must be granted by the user
-/// through the OAuth-style `start_web_token_flow`. The runner UI surfaces a
-/// "needs authorization" banner whenever `enabled && runner_token.is_empty()`.
+/// through one of the device-pairing flows (Cognito sign-in or pair-code
+/// redemption). The runner UI surfaces a "needs authorization" banner
+/// whenever `enabled && runner_token.is_empty()`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebIntegrationSettings {
     /// Master toggle. When false, the runner does not register, heartbeat, or emit events.

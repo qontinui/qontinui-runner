@@ -250,7 +250,7 @@ fn relay_runs_when_device_jwt_present() {
 
 // ----------------------------------------------------------------------------
 // #5 — Tier promotion / downgrade transitions (mirrors qontinui_sign_out
-//      and the auth_callback success path)
+//      and the device-pairing success path)
 // ----------------------------------------------------------------------------
 
 #[test]
@@ -260,7 +260,7 @@ fn tier_promotion_local_to_qontinui_sets_user_id() {
     s.qontinui_user_id = None;
     s.tier_initialized = true; // user has been through the wizard
 
-    // Apply the promotion path (mirrors auth_callback.rs on token receipt):
+    // Apply the promotion path (mirrors device-pairing on token receipt):
     s.web_integration.runner_token = "qontinui_runner_freshly_paired".to_string();
     s.qontinui_user_id = Some("u123".to_string());
     s.tier = RunnerTier::QontinuiAccount;

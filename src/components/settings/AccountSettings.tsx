@@ -3,13 +3,12 @@
  *
  * Settings sub-tab for the Qontinui account binding.
  *
- *   - Tier 0/1: shows a "Sign in to Qontinui" button that opens the
- *     browser-side `/connect-runner` flow. The actual tier promotion to
- *     Tier 2 happens server-side in `mcp::auth_callback` when the user
- *     confirms in the browser — the runner re-syncs via the existing
- *     `web-integration-changed` event (emitted by
- *     `apply_web_integration_settings`) which AuthProvider already
- *     listens for indirectly via `runner-tier-changed`.
+ *   - Tier 0/1: shows a "Sign in with Qontinui" button that opens the
+ *     system browser for Cognito Hosted-UI sign-in (`cognito_sign_in`,
+ *     RFC 8252 PKCE). The Rust command pairs the device and promotes the
+ *     runner to Tier 2 directly; this panel nudges tier consumers via
+ *     `runner-tier-changed` and the `web-integration-changed` event so the
+ *     view flips to the signed-in state immediately.
  *
  *   - Tier 2: shows the signed-in account (when available) and a "Sign
  *     out" button. Signing out clears the runner token but KEEPS the
@@ -36,14 +35,11 @@ interface AccountSettingsProps {
   onLog: LogFunction;
 }
 
-type FlowState = "idle" | "opening" | "awaiting-browser" | "error";
-
 const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
 export function AccountSettings({ onLog }: AccountSettingsProps) {
   const { tier, loading: tierLoading, refresh: refreshTier } = useRunnerTier();
   const { authStatus, logout: clearAuthState } = useAuth();
-  const [flowState, setFlowState] = useState<FlowState>("idle");
   const [flowError, setFlowError] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
 
@@ -66,27 +62,11 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       // Also re-fire `runner-tier-changed` so AuthProvider re-syncs its
       // JWT-flow gate now that we're (presumably) in Tier 2.
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
-      setFlowState((prev) => (prev === "awaiting-browser" ? "idle" : prev));
     });
     return () => {
       void unlistenPromise.then((un) => un());
     };
   }, [refreshTier]);
-
-  const handleSignIn = useCallback(async () => {
-    setFlowState("opening");
-    setFlowError(null);
-    try {
-      await invoke("start_qontinui_sign_in");
-      setFlowState("awaiting-browser");
-      onLog("info", "Opened browser for Qontinui sign-in — complete the flow there");
-    } catch (err) {
-      const msg = typeof err === "string" ? err : String(err);
-      setFlowError(msg);
-      setFlowState("error");
-      onLog("error", `Sign-in failed to start: ${msg}`);
-    }
-  }, [onLog]);
 
   const handleCognitoSignIn = useCallback(async () => {
     const backendUrl = credBackendUrl.trim();
@@ -195,8 +175,6 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
         />
       ) : (
         <SignedOutPanel
-          flowState={flowState}
-          onSignIn={handleSignIn}
           cognitoSigningIn={cognitoState === "signing-in"}
           onCognitoSignIn={handleCognitoSignIn}
           credBackendUrl={credBackendUrl}
@@ -263,8 +241,6 @@ function SignedInPanel({ email, userId, name, signingOut, onSignOut }: SignedInP
 }
 
 interface SignedOutPanelProps {
-  flowState: FlowState;
-  onSignIn: () => void;
   cognitoSigningIn: boolean;
   onCognitoSignIn: () => void;
   credBackendUrl: string;
@@ -272,15 +248,11 @@ interface SignedOutPanelProps {
 }
 
 function SignedOutPanel({
-  flowState,
-  onSignIn,
   cognitoSigningIn,
   onCognitoSignIn,
   credBackendUrl,
   onCredBackendUrlChange,
 }: SignedOutPanelProps) {
-  const inFlight = flowState === "opening" || flowState === "awaiting-browser";
-
   const cognitoDisabled = cognitoSigningIn || credBackendUrl.trim().length === 0;
 
   return (
@@ -332,30 +304,6 @@ function SignedOutPanel({
             Complete the sign-in in your browser. This panel will update automatically when the
             runner is bound.
           </p>
-        )}
-      </div>
-
-      {/* Browser SSO fallback. */}
-      <div className="space-y-3">
-        <div className="text-xs font-medium text-muted-foreground">Or use browser sign-in</div>
-        <button
-          type="button"
-          onClick={onSignIn}
-          disabled={inFlight}
-          className="inline-flex items-center gap-2 rounded bg-muted px-4 py-2 text-sm font-medium hover:bg-muted/70 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-        >
-          {inFlight ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogIn className="w-4 h-4" />}
-          Sign in to Qontinui
-        </button>
-
-        {flowState === "awaiting-browser" && (
-          <p className="text-xs text-muted-foreground">
-            Complete the sign-in in your browser. This panel will update automatically when the
-            runner is paired.
-          </p>
-        )}
-        {flowState === "opening" && (
-          <p className="text-xs text-muted-foreground">Opening browser…</p>
         )}
       </div>
     </div>
