@@ -462,37 +462,50 @@ pub async fn connect_sdk_app(
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5));
 
-    // Attach the operator's Cognito access token as a default `Authorization:
+    // Attach the operator's *Cognito* user bearer as a default `Authorization:
     // Bearer` header on EVERY request this connection makes (health probe +
     // every `/control/*` / `/sdk/*` relay call all go through `conn.client`).
     //
     // The web UI Bridge relay (`/api/ui-bridge/[...path]/_auth.ts`) gates all
-    // paths behind a verified Cognito bearer when `UI_BRIDGE_REQUIRE_AUTH=1`
-    // (prod, as of the 2026-05 Cognito relay-gating) — including `/health`.
-    // Without this header the runner's connect handshake 401s and the SDK can
-    // never attach. This is the "transport-side Authorization header" the relay
-    // auth comment says the consumer must add before the flag is flipped.
+    // paths behind a verified **Cognito** bearer when `UI_BRIDGE_REQUIRE_AUTH=1`
+    // (prod, as of the 2026-05 Cognito relay-gating) — including `/health`. It
+    // verifies the token against the web backend (`/users/me`), so it must be
+    // the Cognito access token, NOT the coord device-JWT in the `access_token`
+    // slot (`AuthManager::get_access_token`) — that slot is a coord-minted
+    // device JWT the Cognito-gated relay rejects (the bug in the first cut of
+    // this fix: it sent the device JWT and still 401'd).
     //
-    // Token is read from secure storage at connect time; reconnect (or
-    // auto-connect) picks up a refreshed token. Absent token (runner not signed
-    // in) → connect without it, preserving local/dev relays where the gate is
-    // off (they ignore the header) and surfacing a clean 401 against a gated
-    // relay rather than failing to build the client.
-    match crate::auth::AuthManager::new().get_access_token() {
-        Ok(token) if !token.is_empty() => {
+    // `ensure_fresh_cognito_bearer` is the single source of truth for the
+    // web-backend user bearer (same derivation `commands::auth` uses): it
+    // refreshes the Cognito access token first when it's near expiry, then
+    // returns it — or `None` for legacy/local-login installs with no Cognito
+    // session, in which case we connect without the header (local/dev relays
+    // with the gate off ignore it; a gated relay then surfaces a clean 401
+    // rather than a client-build failure).
+    match crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(
+        &crate::auth::AuthManager::new(),
+    )
+    .await
+    {
+        Some(token) if !token.is_empty() => {
             match reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
                 Ok(mut value) => {
                     value.set_sensitive(true);
                     let mut headers = reqwest::header::HeaderMap::new();
                     headers.insert(reqwest::header::AUTHORIZATION, value);
                     builder = builder.default_headers(headers);
-                    debug!("SDK relay client: attached operator bearer for {}", url);
+                    debug!(
+                        "SDK relay client: attached fresh Cognito bearer for {}",
+                        url
+                    );
                 }
                 Err(e) => warn!("SDK relay client: malformed bearer, connecting without auth: {e}"),
             }
         }
-        Ok(_) => debug!("SDK relay client: empty access token; connecting without auth"),
-        Err(e) => debug!("SDK relay client: no access token ({e}); connecting without auth"),
+        _ => debug!(
+            "SDK relay client: no Cognito session (legacy/local install or not signed in); \
+             connecting without auth"
+        ),
     }
 
     let client = builder
