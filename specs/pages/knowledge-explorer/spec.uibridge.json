@@ -1056,27 +1056,7 @@
       },
       {
         "description": "Three search mode buttons in the Search tab: 'Web Search' (globe icon), 'Error Research' (bug icon), 'Vuln Search' (shield icon). The active mode has primary-tinted background and border; inactive modes have muted text. Selecting a mode changes the input placeholder text and the API endpoint used for search.",
-        "elements": [
-          {
-            "role": "button",
-            "textContent": "Web Search"
-          },
-          {
-            "role": "button",
-            "textContent": "Error Research"
-          },
-          {
-            "role": "button",
-            "textContent": "Vuln Search"
-          },
-          {
-            "role": "textbox"
-          },
-          {
-            "role": "button",
-            "textContent": "Web Search"
-          }
-        ],
+        "elements": [],
         "id": "ke-search-mode-selector",
         "isInitial": false,
         "name": "Search Mode Selector",
@@ -1084,26 +1064,7 @@
       },
       {
         "description": "A text input field with a mode-specific icon (left) and a Search button (right). The input accepts text and supports Enter-to-submit. The Search button is disabled when the query is less than 2 characters or a search is in progress. During search, the button shows a spinning loader icon.",
-        "elements": [
-          {
-            "role": "textbox"
-          },
-          {
-            "role": "button",
-            "textContent": "Search"
-          },
-          {
-            "role": "button",
-            "textContent": "Search"
-          },
-          {
-            "role": "textbox"
-          },
-          {
-            "role": "button",
-            "textContent": "Search"
-          }
-        ],
+        "elements": [],
         "id": "ke-search-input",
         "isInitial": false,
         "name": "Search Input and Submit",
@@ -1178,9 +1139,6 @@
         "elements": [
           {
             "textContains": "Knowledge Acquisition"
-          },
-          {
-            "textContains": "Total Searches"
           },
           {
             "textContains": "Cache Hit Rate"

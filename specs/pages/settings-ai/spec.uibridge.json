@@ -1118,9 +1118,6 @@
           },
           {
             "role": "combobox"
-          },
-          {
-            "role": "spinbutton"
           }
         ],
         "id": "ai-claude-cli-section",
@@ -1162,16 +1159,10 @@
       {
         "description": "Visible only when claude_api provider is selected. Manages Claude API key storage in the OS keychain, model selection from four Claude model options, max tokens limit, and displays a per-token cost warning.",
         "elements": [
-          {
-            "role": "combobox"
-          },
           {},
           {
             "role": "button",
             "textContent": "Save Key"
-          },
-          {
-            "role": "combobox"
           },
           {
             "textContent": "per-token costs"
@@ -1186,18 +1177,6 @@
         "description": "Visible only when gemini_cli provider is selected. Configures authentication method (OAuth for Google account free tier, or API key), model selection from five Gemini models, execution mode, and timeout. Includes an npm install tip.",
         "elements": [
           {
-            "role": "combobox"
-          },
-          {
-            "role": "radio"
-          },
-          {
-            "role": "radio"
-          },
-          {
-            "role": "combobox"
-          },
-          {
             "textContent": "npm install -g @google/gemini-cli"
           }
         ],
@@ -1209,17 +1188,7 @@
       {
         "description": "Visible only when gemini_api provider is selected. Manages Gemini API key in the OS keychain, model selection, max output tokens, and temperature (creativity). Includes a cost savings note comparing Gemini Flash to Claude for simple tasks.",
         "elements": [
-          {
-            "role": "combobox"
-          },
           {},
-          {
-            "role": "button",
-            "textContent": "Save Key"
-          },
-          {
-            "role": "spinbutton"
-          },
           {
             "textContent": "Cost Savings"
           }

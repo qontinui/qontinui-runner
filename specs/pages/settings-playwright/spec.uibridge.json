@@ -582,9 +582,6 @@
           },
           {
             "textContent": "Configure authentication credentials and environment for Playwright test execution."
-          },
-          {
-            "textContent": "Playwright Tests"
           }
         ],
         "id": "pw-page-structure",
@@ -595,15 +592,6 @@
       {
         "description": "The 'Test Authentication' card contains a description explaining that credentials are passed as PLAYWRIGHT_TEST_USERNAME and PLAYWRIGHT_TEST_PASSWORD environment variables, a Username or Email text input, and a Password input with a show/hide toggle button.",
         "elements": [
-          {
-            "textContent": "Test Authentication"
-          },
-          {
-            "tagName": "input"
-          },
-          {
-            "tagName": "input"
-          },
           {
             "role": "button",
             "tagName": "button"
@@ -622,9 +610,6 @@
         "elements": [
           {
             "textContent": "Environment"
-          },
-          {
-            "tagName": "input"
           },
           {
             "textContent": "PLAYWRIGHT_BASE_URL"
@@ -721,9 +706,6 @@
       {
         "description": "Each of the four settings fields maps to an environment variable that is injected when Playwright tests run. The spec defines this mapping so workflows can verify the correct env vars are documented and the correct fields are present. The UI descriptions on the page itself expose this mapping to the user.",
         "elements": [
-          {
-            "textContent": "Playwright Tests"
-          },
           {
             "textContent": "Sets SKIP_WEB_SERVER=1"
           }

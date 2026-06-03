@@ -287,9 +287,6 @@
         "description": "Four new components are conditionally rendered in the LLM Observability Dashboard when target_app data exists in phase_token_usage: CostByTargetAppChart (horizontal bar), CostPerInteractionChart (vertical bar), PageComplexityTable (ranked table), and ModelActionMatrix (heatmap). All components are lazy-loaded.",
         "elements": [
           {
-            "textContains": "Cost by Target App"
-          },
-          {
             "textContains": "Cost per Successful Interaction"
           },
           {
@@ -351,11 +348,7 @@
       },
       {
         "description": "The LLM dashboard's existing time range selector (1d/7d/30d/all) controls the days parameter for all cost attribution queries. CostByTargetAppChart fetches from /analytics/token-usage/by-target-app?days=N. CostPerInteractionChart fetches from /analytics/token-usage/cost-per-interaction?days=N. Changing the time range should update all four new charts.",
-        "elements": [
-          {
-            "textContains": "LLM Analytics"
-          }
-        ],
+        "elements": [],
         "id": "llm-interaction-time-range",
         "isInitial": false,
         "name": "Time Range Interaction",
@@ -363,11 +356,7 @@
       },
       {
         "description": "Cost attribution data flows from the agentic phase executor. When a workflow step involves UI Bridge actions, get_active_sdk_app_name() extracts the connected app name via try_lock on the SDK connection manager, and record_phase_token_usage_with_target() writes it to phase_token_usage.target_app. This means cost attribution only appears for workflows that interact with SDK-connected apps during their agentic phase.",
-        "elements": [
-          {
-            "textContains": "LLM Analytics"
-          }
-        ],
+        "elements": [],
         "id": "llm-cost-behavior",
         "isInitial": false,
         "name": "Cost Attribution Pipeline Behavior",

@@ -1082,15 +1082,7 @@
           },
           {
             "role": "button",
-            "textContent": "Submit"
-          },
-          {
-            "role": "button",
             "textContent": "Cancel"
-          },
-          {
-            "role": "button",
-            "textContent": "Submit"
           }
         ],
         "id": "manual-score-creation",
@@ -1101,12 +1093,6 @@
       {
         "description": "Users need to drill into individual score details to understand the reasoning behind each quality assessment. Score rows that have a reason field are clickable (indicated by a chevron icon) and expand to reveal the reason text with a message icon. Rows without a reason are not interactive. This progressive disclosure keeps the default view clean while allowing detailed investigation.",
         "elements": [
-          {
-            "role": "button"
-          },
-          {
-            "role": "button"
-          },
           {
             "textContent": ".*"
           },

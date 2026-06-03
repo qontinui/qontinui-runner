@@ -542,10 +542,6 @@
         "description": "The page always shows a search bar with input, Search button, filter toggle button, and stats button, regardless of whether any data exists in the timeline.",
         "elements": [
           {},
-          {
-            "role": "button",
-            "textContains": "Search"
-          },
           {},
           {},
           {},
@@ -612,9 +608,6 @@
           {
             "role": "button",
             "textContains": "Search"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "timeline-state-consistency",

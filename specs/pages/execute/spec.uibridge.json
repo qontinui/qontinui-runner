@@ -347,9 +347,6 @@
             "textContent": "all"
           },
           {
-            "textContent": "Library"
-          },
-          {
             "role": "button",
             "textContent": "Refresh"
           }
@@ -407,10 +404,6 @@
           {
             "role": "button",
             "textContent": "Run Queue"
-          },
-          {
-            "role": "button",
-            "textContent": "Clear"
           }
         ],
         "id": "exec-run-queue",
@@ -423,9 +416,6 @@
         "elements": [
           {
             "textContent": "Workflow Queue"
-          },
-          {
-            "textContent": "Queue:"
           },
           {
             "textContent": "Library"

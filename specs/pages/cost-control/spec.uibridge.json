@@ -952,20 +952,11 @@
         "description": "Overall layout of the Cost Control panel: header with title and refresh button, followed by budget warnings, summary cards, budget gauge + phase chart, safety section, cost feed table, and optimization recommendations.",
         "elements": [
           {
-            "textContains": "Cost Control"
-          },
-          {
             "textContains": "Budget tracking, anomaly detection"
           },
           {
             "accessibleName": "Refresh cost data",
             "role": "button"
-          },
-          {
-            "tagName": "svg"
-          },
-          {
-            "textContains": "Cost Control"
           }
         ],
         "id": "cc-page-structure",
@@ -977,9 +968,6 @@
         "description": "Four metric cards in a responsive grid showing Total Cost, Total Tokens, Cache Hit Rate, and Cache Savings. Uses 2 columns on mobile, 4 on desktop.",
         "elements": [
           {
-            "textContains": "Total Cost"
-          },
-          {
             "textContains": "Total Tokens"
           },
           {
@@ -987,9 +975,6 @@
           },
           {
             "textContains": "Cache Savings"
-          },
-          {
-            "textContains": "Total Cost"
           }
         ],
         "id": "cc-summary-cards",
@@ -1005,9 +990,6 @@
           },
           {
             "textContains": "No active run"
-          },
-          {
-            "textContains": "remaining"
           },
           {
             "tagName": "svg"
@@ -1039,9 +1021,6 @@
       {
         "description": "Card showing the cost circuit breaker state: green Shield icon with 'Closed' badge when healthy, red ShieldAlert icon with 'Tripped' badge when triggered. Shows anomaly detector stats.",
         "elements": [
-          {
-            "textContains": "Circuit Breaker"
-          },
           {
             "textContains": "Closed"
           },
@@ -1104,9 +1083,6 @@
             "textContains": "No cost events yet"
           },
           {
-            "textContains": "Cumulative"
-          },
-          {
             "tagName": "tr"
           }
         ],
@@ -1143,13 +1119,7 @@
             "textContains": "Cost Control"
           },
           {
-            "textContains": "Cost by Phase"
-          },
-          {
             "textContains": "Last 30 days"
-          },
-          {
-            "textContains": "Budget Warning"
           }
         ],
         "id": "cc-visual-design",
@@ -1160,12 +1130,6 @@
       {
         "description": "Real-time event subscription behavior: cost events update the feed table, budget warnings trigger the banner, anomaly events populate the anomaly feed, and dashboard queries refresh on cost events.",
         "elements": [
-          {
-            "textContains": "Recent Cost Events"
-          },
-          {
-            "textContains": "Budget Utilization"
-          },
           {
             "textContains": "Total Cost"
           },

@@ -2520,21 +2520,6 @@
           },
           {
             "textContent": "State View"
-          },
-          {
-            "textContent": "Transitions"
-          },
-          {
-            "textContent": "Pathfinding"
-          },
-          {
-            "textContent": "Exploration Results"
-          },
-          {
-            "textContent": "Export"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "sm-tab-bar",
@@ -2634,9 +2619,6 @@
           },
           {
             "textContent": "Save Configuration"
-          },
-          {
-            "role": "generic"
           }
         ],
         "id": "sm-discovery-discover",
@@ -2652,18 +2634,6 @@
           },
           {
             "textContent": "No states discovered yet"
-          },
-          {
-            "role": "generic"
-          },
-          {
-            "role": "generic"
-          },
-          {
-            "role": "generic"
-          },
-          {
-            "role": "generic"
           }
         ],
         "id": "sm-graph-tab",
@@ -2682,12 +2652,6 @@
           },
           {
             "textContent": "Keyboard Shortcuts"
-          },
-          {
-            "role": "generic"
-          },
-          {
-            "role": "generic"
           }
         ],
         "id": "sm-graph-controls",
@@ -2705,15 +2669,6 @@
             "role": "textbox"
           },
           {
-            "role": "button"
-          },
-          {
-            "role": "generic"
-          },
-          {
-            "role": "generic"
-          },
-          {
             "textContent": "No capture screenshots available"
           }
         ],
@@ -2729,16 +2684,10 @@
             "textContent": "Transitions"
           },
           {
-            "role": "textbox"
-          },
-          {
             "textContent": "All from states"
           },
           {
             "textContent": "Action Playback"
-          },
-          {
-            "role": "generic"
           },
           {
             "textContent": "Select a transition to view its details"
@@ -2769,9 +2718,6 @@
           },
           {
             "textContent": "Dijkstra"
-          },
-          {
-            "role": "generic"
           }
         ],
         "id": "sm-pathfinding-tab",
@@ -2782,9 +2728,6 @@
       {
         "description": "When a state is selected in the Graph Editor, a w-80 side panel opens on the right showing the shared StateDetailPanel component. It provides a 'State Details' header with Close button, editable name, description, metadata grid, element list with type-colored badges, acceptance criteria list, domain knowledge cards, and save/delete actions.",
         "elements": [
-          {
-            "textContent": "State Details"
-          },
           {
             "textContent": "Name"
           },
@@ -2819,9 +2762,6 @@
             "textContent": "Edit Transition"
           },
           {
-            "role": "textbox"
-          },
-          {
             "textContent": "From States"
           },
           {
@@ -2829,9 +2769,6 @@
           },
           {
             "textContent": "Path Cost"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "sm-sidebar-transition-detail",
@@ -2891,9 +2828,6 @@
             "textContent": "Recent Exploration Runs"
           },
           {
-            "textContent": "Refresh"
-          },
-          {
             "textContent": "No exploration history"
           },
           {
@@ -2911,9 +2845,6 @@
       {
         "description": "When a run is selected, the detail view shows the report header (config name, strategy badge, timestamp), summary stats grid (Pass Rate, States, Transitions, Discrepancies), discrepancies by severity, expandable state detail cards with confidence scores and element verification, and an AI Analysis prompt button.",
         "elements": [
-          {
-            "role": "button"
-          },
           {
             "textContent": "Pass Rate"
           },
@@ -2946,12 +2877,6 @@
           },
           {
             "textContent": "Load into Runtime"
-          },
-          {
-            "role": "generic"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "sm-export-tab",
@@ -2962,12 +2887,6 @@
       {
         "description": "The state discovery algorithm uses fingerprint-based co-occurrence analysis to group UI elements into states. Co-occurrence data is collected via exploration (automated interaction) or recording (manual capture). Each capture produces a fingerprint of visible interactive elements. States are discovered by clustering fingerprints with similar element sets. The algorithm correctness can be verified by examining the discovered states' element lists and confidence scores.",
         "elements": [
-          {
-            "role": "generic"
-          },
-          {
-            "role": "generic"
-          },
           {
             "textContent": "captures"
           }
@@ -3047,9 +2966,6 @@
           },
           {
             "textContent": "Re-derive all"
-          },
-          {
-            "textContent": "State View"
           }
         ],
         "id": "sm-observation-pipeline",

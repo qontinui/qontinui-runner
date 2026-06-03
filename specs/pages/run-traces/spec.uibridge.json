@@ -1522,9 +1522,6 @@
             "textContent": "Comparison"
           },
           {
-            "textContent": "Agent Graph"
-          },
-          {
             "textContent": "Waterfall"
           }
         ],
@@ -1557,15 +1554,6 @@
       {
         "description": "The Flamechart view is a canvas-based (HTML5 Canvas) stacked visualization that shows span hierarchy by call depth, with each span's width proportional to its duration. Unlike the waterfall (which shows wall-clock position), the flamechart collapses idle gaps between sibling spans so it shows where time is *spent*. Children are packed proportionally within their parent's width range — a parent with two children of 600ms and 400ms allocates 60% and 40% of its width respectively, regardless of idle gaps between them. The canvas renders at device pixel ratio for crisp display on HiDPI screens, with a dark zinc-900 background. Phase colors use raw hex values (not Tailwind) for canvas rendering.",
         "elements": [
-          {
-            "tagName": "canvas"
-          },
-          {
-            "tagName": "canvas"
-          },
-          {
-            "tagName": "canvas"
-          },
           {
             "textContent": "Reset zoom"
           },
@@ -1603,9 +1591,6 @@
             "textContent": "Slower"
           },
           {
-            "textContent": "Run A"
-          },
-          {
             "textContent": "Duration comparison"
           },
           {
@@ -1624,13 +1609,7 @@
             "textContent": "Critical Path"
           },
           {
-            "role": "button"
-          },
-          {
             "tagName": "line"
-          },
-          {
-            "tagName": "canvas"
           },
           {
             "textContent": "Critical path"
@@ -1658,9 +1637,6 @@
           },
           {
             "textContent": "All Status"
-          },
-          {
-            "textContent": "spans"
           }
         ],
         "id": "traces-filtering-and-search",
@@ -1671,9 +1647,6 @@
       {
         "description": "When the user clicks a span in the Waterfall or Flamechart view, a 280px-wide detail panel opens on the right side showing comprehensive information about that span. The panel displays: span name (stripped of 'qontinui.' prefix), status (Success/Error), phase with colored badge, formatted duration, start and end timestamps, trace/span/parent IDs in monospace, error message (if any), and all span attributes as key-value pairs. When critical path is enabled, the panel also shows whether the span is on the critical path and its slack time. Clicking the same span again or clicking the close button deselects it.",
         "elements": [
-          {
-            "role": "button"
-          },
           {
             "textContent": "Status"
           },
@@ -1718,9 +1691,6 @@
           },
           {
             "textContent": "Input tokens"
-          },
-          {
-            "tagName": "canvas"
           },
           {
             "textContent": "tokens"
@@ -1783,9 +1753,6 @@
             "role": "toolbar"
           },
           {
-            "role": "button"
-          },
-          {
             "textContent": "Step"
           },
           {
@@ -1834,9 +1801,6 @@
             "textContent": "Min delta"
           },
           {
-            "textContent": "All Phases"
-          },
-          {
             "textContent": "Run A"
           },
           {
@@ -1856,15 +1820,6 @@
           },
           {
             "role": "separator"
-          },
-          {
-            "textContent": "Name"
-          },
-          {
-            "textContent": "setup|verification|agentic|completion|ai|python"
-          },
-          {
-            "textContent": "Search spans"
           }
         ],
         "id": "traces-visual-design",

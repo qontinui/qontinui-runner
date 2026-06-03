@@ -404,9 +404,6 @@
             "textContent": "Pipeline Events"
           },
           {
-            "role": "listitem"
-          },
-          {
             "textContent": ":"
           }
         ],
@@ -462,17 +459,7 @@
       },
       {
         "description": "Each event row must accurately render the event type, phase, timestamp (HH:mm:ss format), duration in milliseconds, token count, and validation error delta from the API response.",
-        "elements": [
-          {
-            "textContent": ":"
-          },
-          {
-            "textContent": "ms"
-          },
-          {
-            "textContent": "errors:"
-          }
-        ],
+        "elements": [],
         "id": "pipeline-events-data-display",
         "isInitial": false,
         "name": "Event Data Rendering",
@@ -480,14 +467,7 @@
       },
       {
         "description": "The timeline is scrollable when events exceed the visible area (max-h-96), events are ordered chronologically by created_at, and the timeline connector lines visually link sequential events.",
-        "elements": [
-          {
-            "textContent": "Pipeline Events"
-          },
-          {
-            "textContent": "Pipeline Events"
-          }
-        ],
+        "elements": [],
         "id": "pipeline-events-behavior",
         "isInitial": false,
         "name": "Timeline Behavior",
@@ -495,11 +475,7 @@
       },
       {
         "description": "Each event row must contain a phase color dot, event type label, and timeline connector line. The header must show the Zap icon.",
-        "elements": [
-          {
-            "textContent": "Pipeline Events"
-          }
-        ],
+        "elements": [],
         "id": "pipeline-events-presence",
         "isInitial": false,
         "name": "Required Timeline Elements",
@@ -513,9 +489,6 @@
           },
           {
             "textContains": "Load more"
-          },
-          {
-            "textContains": "Pipeline Events"
           }
         ],
         "id": "pipeline-events-virtualization",

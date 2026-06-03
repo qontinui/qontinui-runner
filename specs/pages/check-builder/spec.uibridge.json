@@ -275,15 +275,6 @@
         "description": "The right-panel editor provides all fields needed to define a check. Users select the check type (linter, formatter, etc.) and tool (eslint, prettier, mypy, etc.), which auto-populates sensible defaults for the name and command. Users can customize the command, set a working directory, configure a timeout, and toggle behavioral flags: auto-fix (attempt automatic fixes before reporting), fail-on-warning (treat warnings as failures), and is-critical (mark as a blocking check). Tags can be added for organization. The editor includes save and delete actions in the toolbar.",
         "elements": [
           {
-            "textContent": "Checks"
-          },
-          {
-            "textContent": "Checks"
-          },
-          {
-            "textContent": "Checks"
-          },
-          {
             "role": "button",
             "textContent": "Save"
           }
@@ -296,15 +287,6 @@
       {
         "description": "Checks are designed as reusable building blocks that integrate into the broader workflow system. Once saved, checks can be referenced by check groups (which bundle multiple checks together) and used directly as verification steps in workflows. The check type and tool categorization system ensures users can find and select appropriate checks when building workflows. Tags further aid organization and discovery across the library dashboard.",
         "elements": [
-          {
-            "textContent": "Checks"
-          },
-          {
-            "textContent": "Checks"
-          },
-          {
-            "textContent": "Checks"
-          },
           {
             "role": "button",
             "textContent": "Delete"

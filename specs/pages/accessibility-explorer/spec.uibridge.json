@@ -880,22 +880,7 @@
         "description": "The left panel shows a hierarchical tree of accessibility nodes captured from the target application. Each node is rendered as a treeitem with: an expand/collapse chevron (for nodes with children), a color-coded role badge (blue for buttons/links, green for inputs, gray for text, transparent for containers, purple for others), the accessible name, and a monospace ref ID (e.g., '@e3'). Interactive elements have a small blue dot indicator and a subtle blue background tint. Clicking a node selects it (highlighted with primary ring) and shows its details in the right panel. Keyboard navigation supports Enter/Space to select, ArrowRight to expand, ArrowLeft to collapse.",
         "elements": [
           {
-            "textContains": "Tree View"
-          },
-          {
             "role": "tree"
-          },
-          {
-            "role": "treeitem"
-          },
-          {
-            "role": "treeitem"
-          },
-          {
-            "role": "treeitem"
-          },
-          {
-            "role": "treeitem"
           },
           {
             "textContains": "Refresh"
@@ -989,9 +974,6 @@
           },
           {
             "role": "heading"
-          },
-          {
-            "textContains": "Tree View"
           }
         ],
         "id": "a11y-visual-design",

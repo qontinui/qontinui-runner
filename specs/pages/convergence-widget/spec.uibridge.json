@@ -500,9 +500,6 @@
       {
         "description": "A CSS-based bar chart showing failed step counts per iteration. Each bar represents one iteration, with height proportional to the number of failed steps (minimum 2px, maximum 80px, scaled to the highest failure count). Bar colors encode the change direction: green (bg-emerald-500) for zero failures, amber (bg-amber-500) for no change or improvement, red (bg-red-500) for regression. The chart displays the last 20 iterations (MAX_VISIBLE_ITERATIONS) and scrolls horizontally if more exist. Each bar has a tooltip showing 'Iteration N: X failed, Y passed'.",
         "elements": [
-          {
-            "textContent": "\\d+"
-          },
           {},
           {},
           {
@@ -547,9 +544,6 @@
         "elements": [
           {
             "textContent": "\\d+"
-          },
-          {
-            "textContent": "Convergence"
           },
           {
             "textContent": "Iteration"

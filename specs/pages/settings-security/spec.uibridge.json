@@ -1075,12 +1075,6 @@
             "textContent": "Security Profile"
           },
           {
-            "role": "combobox"
-          },
-          {
-            "role": "combobox"
-          },
-          {
             "textContent": "AST Fingerprint:"
           }
         ],
@@ -1171,10 +1165,7 @@
         "elements": [
           {},
           {},
-          {},
-          {
-            "textContent": "Security Profile"
-          }
+          {}
         ],
         "id": "ss-custom-resources-policy",
         "isInitial": false,

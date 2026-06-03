@@ -1062,13 +1062,7 @@
         "description": "The page header displays an 'Advanced' title with a wrench icon and a description explaining the purpose of the debug settings. This uses the shared SectionHeader component.",
         "elements": [
           {
-            "textContent": "Advanced"
-          },
-          {
             "textContent": "Developer and debugging options"
-          },
-          {
-            "textContent": "Advanced"
           }
         ],
         "id": "dbg-section-header",
@@ -1081,9 +1075,6 @@
         "elements": [
           {
             "textContent": "Failed to"
-          },
-          {
-            "textContent": "Save Debug Settings"
           }
         ],
         "id": "dbg-error-state",
@@ -1321,17 +1312,7 @@
       },
       {
         "description": "The Debug page integrates with the Rust backend through three Tauri IPC commands: 'get_debug_settings' (load on mount), 'set_debug_settings' (save button), and 'get_device_info' (load on mount + refresh). These are the data sources for all displayed information.",
-        "elements": [
-          {
-            "textContent": "Advanced"
-          },
-          {
-            "textContent": "Device Information"
-          },
-          {
-            "textContent": "Device Information"
-          }
-        ],
+        "elements": [],
         "id": "dbg-tauri-ipc-integration",
         "isInitial": false,
         "name": "Tauri IPC Integration",

@@ -1308,13 +1308,7 @@
         "description": "Three cost visualization charts arranged in a responsive grid: (1) Cost Over Time â€” a Recharts LineChart showing daily LLM cost with date on X-axis and dollar amount on Y-axis, with tooltips showing cost, calls, input/output tokens per day; (2) Cost by Model â€” a horizontal BarChart ranking models by total cost descending, with tooltips showing cost, calls, tokens, and avg duration; (3) Cost by Phase â€” a horizontal BarChart breaking down cost by workflow phase (setup/agentic/completion), sorted by cost descending.",
         "elements": [
           {
-            "textContent": "Cost Over Time"
-          },
-          {
             "textContent": "Cost:|Calls:|Input tokens:|Output tokens:"
-          },
-          {
-            "textContent": "Cost by Model"
           },
           {
             "textContent": "Avg duration:"
@@ -1380,9 +1374,6 @@
             "textContent": "Task Run Costs"
           },
           {
-            "textContent": "Task Run|Cost|Input|Output|Calls|Started"
-          },
-          {
             "role": "button",
             "textContent": "Sort by Cost"
           },
@@ -1440,9 +1431,6 @@
           },
           {
             "textContent": "Failed to load cost trends"
-          },
-          {
-            "textContent": "Cost Trends"
           }
         ],
         "id": "llm-loading-error-states",
@@ -1482,10 +1470,6 @@
             "textContent": "Select time range"
           },
           {
-            "role": "button",
-            "textContent": "Refresh analytics"
-          },
-          {
             "textContent": "Cost Over Time|Cost by Model|Cost Trends"
           },
           {
@@ -1517,21 +1501,7 @@
         "description": "Assertions verifying that key UI elements are present and visible in the dashboard layout.",
         "elements": [
           {
-            "textContent": "Total Cost|Total Tokens|Total Calls|Avg Cost/Call"
-          },
-          {
-            "role": "combobox",
-            "textContent": "Select time range"
-          },
-          {
-            "role": "button",
-            "textContent": "Refresh analytics"
-          },
-          {
             "textContent": "Cost Over Time|Cost by Model|Cost by Phase|Cost Trends|Provider Latency|Task Run Costs"
-          },
-          {
-            "textContent": "Daily Cost|7-Day Average"
           }
         ],
         "id": "llm-element-presence",

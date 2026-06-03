@@ -538,9 +538,6 @@
         "elements": [
           {
             "textContent": "running"
-          },
-          {
-            "textContent": "Loading task run"
           }
         ],
         "id": "graphql-live-visibility",

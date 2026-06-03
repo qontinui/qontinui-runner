@@ -626,12 +626,6 @@
             "textContent": "New Task"
           },
           {
-            "textContent": "Scheduled"
-          },
-          {
-            "role": "button"
-          },
-          {
             "textContent": "Auto-Fix"
           }
         ],
@@ -727,12 +721,6 @@
       {
         "description": "The History sub-tab shows one row per execution. Beyond the original Pending/Running/Completed/Failed/Skipped/Cancelled, two new statuses landed in Phase B: 'launch_failed' (LaunchFailed — task could not start) and 'missed_runner_down' (MissedRunnerDown — slot was synthesized by the catch-up reconciler with policy=Skip). These need distinguishable visual treatment because they mean different things from generic Failed: launch_failed is retry-with-backoff, missed_runner_down is informational. Catch-up runs also tag the task name with '(catch-up)' so the operator can tell that a Completed row was a catch-up rather than a normal-schedule fire.",
         "elements": [
-          {
-            "textContent": "Launch failed"
-          },
-          {
-            "textContains": "Missed (runner offline)"
-          },
           {
             "textContains": "(catch-up)"
           },

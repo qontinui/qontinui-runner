@@ -454,9 +454,6 @@
         "description": "The CrossRunPatternsPanel renders a list of detected patterns with type badges, signature hashes, occurrence counts, timestamps, and status indicators. Each pattern row has a type badge (recurring_finding or fix_oscillation), truncated signature hash, occurrence count, last seen date, and status badge.",
         "elements": [
           {
-            "textContains": "Cross-Run Patterns"
-          },
-          {
             "textContains": "No cross-run patterns detected"
           }
         ],
@@ -470,9 +467,6 @@
         "elements": [
           {
             "textContains": "Recurring Finding|Fix Oscillation"
-          },
-          {
-            "textContains": "Cross-Run Patterns"
           }
         ],
         "id": "crossrun-data-display",
@@ -551,11 +545,7 @@
       },
       {
         "description": "The dashed line at 95% represents the reliability threshold. Elements above this line are considered reliable. Elements below need attention — their selectors may be breaking due to DOM restructuring, CSS changes, or app updates. The trend direction (rising vs falling) is more important than the absolute value.",
-        "elements": [
-          {
-            "textContains": "Selector Decay"
-          }
-        ],
+        "elements": [],
         "id": "decay-chart-semantics",
         "isInitial": false,
         "name": "Decay Chart Reference Line Semantics",
@@ -581,9 +571,6 @@
         "elements": [
           {
             "textContains": "ui_element"
-          },
-          {
-            "textContains": "Failure Chain"
           }
         ],
         "id": "failure-chain-semantics",

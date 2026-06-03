@@ -506,12 +506,6 @@
             "textContent": "Application"
           },
           {
-            "textContent": "Auto-load Last Configuration on Startup"
-          },
-          {
-            "textContent": "Launch on System Startup"
-          },
-          {
             "textContent": "Tip:"
           }
         ],
@@ -590,13 +584,7 @@
         "description": "The 'Include AI Summary in New Workflows' toggle controls whether a completion-phase AI Summary step is automatically added when new workflows are created. This is a saved preference, not a live workflow modification.",
         "elements": [
           {
-            "textContent": "Include AI Summary in New Workflows"
-          },
-          {
             "textContent": "Automatically add an AI Summary step to the completion phase of new workflows"
-          },
-          {
-            "textContent": "Include AI Summary in New Workflows"
           }
         ],
         "id": "gen-summary-step-behavior",
@@ -610,12 +598,6 @@
           {
             "role": "button",
             "textContent": "Save"
-          },
-          {
-            "textContent": "General"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "gen-settings-persistence",

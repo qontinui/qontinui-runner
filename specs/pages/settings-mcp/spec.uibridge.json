@@ -1039,12 +1039,6 @@
           },
           {
             "textContent": "Configure external MCP (Model Context Protocol) servers"
-          },
-          {
-            "textContent": "Configured Servers"
-          },
-          {
-            "textContent": "What is MCP?"
           }
         ],
         "id": "mcp-page-structure",
@@ -1169,10 +1163,6 @@
           {
             "role": "button",
             "textContent": "Cancel"
-          },
-          {
-            "role": "button",
-            "textContent": "Create"
           }
         ],
         "id": "mcp-add-form-structure",
@@ -1191,9 +1181,6 @@
           },
           {
             "textContent": "Stdio transport is not yet fully implemented"
-          },
-          {
-            "textContent": "Run as subprocess"
           }
         ],
         "id": "mcp-transport-fields",
@@ -1288,13 +1275,7 @@
       {
         "description": "McpServerConfig is the canonical data structure for a configured MCP server. It is stored in the runner's PostgreSQL database and returned by list_mcp_servers and create/update commands. Understanding this model is essential for verifying that form submissions, CRUD operations, and status displays are correct.",
         "elements": [
-          {
-            "textContent": "Configured Servers"
-          },
-          {},
-          {
-            "textContent": "Configured Servers"
-          }
+          {}
         ],
         "id": "mcp-data-model",
         "isInitial": false,

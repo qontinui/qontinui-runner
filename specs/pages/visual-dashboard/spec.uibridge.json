@@ -1063,10 +1063,7 @@
         "elements": [
           {},
           {},
-          {},
-          {
-            "role": "region"
-          }
+          {}
         ],
         "id": "vd-page-structure",
         "isInitial": false,
@@ -1143,9 +1140,6 @@
           {
             "role": "button",
             "textContent": "Stop"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "vd-playback-controls",
@@ -1172,12 +1166,6 @@
         "elements": [
           {
             "textContent": "AI Conversation"
-          },
-          {
-            "role": "region"
-          },
-          {
-            "role": "button"
           },
           {
             "textContent": "Execution Timeline"

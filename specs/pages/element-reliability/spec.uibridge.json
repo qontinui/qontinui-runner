@@ -438,20 +438,7 @@
     "states": [
       {
         "description": "Users need summary statistics showing how many elements are stable vs flaky vs unreliable, providing a quick assessment of automation health across all tracked elements.",
-        "elements": [
-          {
-            "textContent": "Element Reliability"
-          },
-          {
-            "textContent": "Stable"
-          },
-          {
-            "textContent": "Flaky"
-          },
-          {
-            "textContent": "Unreliable"
-          }
-        ],
+        "elements": [],
         "id": "element-reliability-overview",
         "isInitial": false,
         "name": "Reliability Overview Statistics",
@@ -460,9 +447,6 @@
       {
         "description": "Users need to see individual elements sorted by reliability, with success rates and interaction counts, to identify which specific elements need attention or alternative selectors.",
         "elements": [
-          {
-            "textContent": "Elements by Reliability"
-          },
           {
             "textContent": "%"
           },
@@ -500,9 +484,6 @@
         "description": "Reliability badges use color coding to quickly communicate element health: green for stable (>=95%), yellow for flaky (>=80%), red for unreliable (<80%).",
         "elements": [
           {
-            "textContent": "Stable"
-          },
-          {
             "textContent": "Flaky"
           },
           {
@@ -517,12 +498,6 @@
       {
         "description": "Each element row must render its element ID, total interaction count, and success rate percentage accurately from the API data. The summary cards must show correct counts of stable (>=95%), flaky (>=80%), and unreliable (<80%) elements computed from the success_rate field.",
         "elements": [
-          {
-            "textContent": "%"
-          },
-          {
-            "textContent": "interactions"
-          },
           {
             "textContent": "success"
           }

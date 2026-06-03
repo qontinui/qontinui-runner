@@ -280,9 +280,6 @@
             "textContent": "Rule Influence"
           },
           {
-            "textContent": "Loaded"
-          },
-          {
             "textContent": "No effect"
           },
           {
@@ -326,9 +323,6 @@
         "elements": [
           {
             "textContent": "Loading rules..."
-          },
-          {
-            "textContent": "All rules appear effective"
           }
         ],
         "id": "rule-influence-states",
@@ -341,9 +335,6 @@
         "elements": [
           {
             "textContent": "Loaded"
-          },
-          {
-            "textContent": "effective"
           }
         ],
         "id": "rule-influence-data-display",

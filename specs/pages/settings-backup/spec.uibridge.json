@@ -1016,10 +1016,6 @@
           },
           {
             "textContent": "Export Options"
-          },
-          {
-            "role": "button",
-            "textContent": "Export"
           }
         ],
         "id": "bk-export-section",
@@ -1029,18 +1025,7 @@
       },
       {
         "description": "When the 'Export Options' toggle is expanded, a grid of 13 checkboxes is shown — one per data category. All 13 are checked by default (defaultExportOptions). Each checkbox label shows the category name and its current count in parentheses. Unchecking a category removes it from the export and reduces the N in 'Export (N items)'.",
-        "elements": [
-          {
-            "textContent": "Export Options"
-          },
-          {
-            "textContent": "Export Options"
-          },
-          {
-            "role": "button",
-            "textContent": "Export"
-          }
-        ],
+        "elements": [],
         "id": "bk-export-options-panel",
         "isInitial": false,
         "name": "Export Options — Category Selector",
@@ -1086,9 +1071,6 @@
       {
         "description": "After selecting a .json backup file, the page calls get_import_preview and shows an 'Import Preview' panel. The panel displays three metadata fields: Version (from manifest.version, e.g. '2.0.0'), App Version (from manifest.app_version), and Created (manifest.created_at formatted via toLocaleString()). A 'Cancel' button is visible to dismiss the preview and return to the idle state.",
         "elements": [
-          {
-            "textContent": "Import Preview"
-          },
           {
             "role": "button",
             "textContent": "Cancel"
@@ -1142,17 +1124,10 @@
         "description": "The Import Preview panel shows a grid of 13 data-count cells (same layout as the Your Data summary) and an amber warning banner. Selected categories are highlighted with a primary/10 background; deselected categories have 50% opacity. The warning banner text changes based on conflict_mode: 'overwrite' shows 'Existing items will be overwritten. This cannot be undone.' and 'skip' shows 'Existing items will be skipped. Only new items will be imported.'",
         "elements": [
           {
-            "textContent": "Import Preview"
-          },
-          {
             "textContent": "Existing items will be skipped"
           },
           {
             "textContent": "Existing items will be overwritten"
-          },
-          {
-            "role": "button",
-            "textContent": "Import Data"
           }
         ],
         "id": "bk-import-preview-grid-and-warning",
@@ -1229,9 +1204,6 @@
           },
           {
             "textContent": "Import Preview"
-          },
-          {
-            "textContent": "API keys stored in the system keychain are not included"
           }
         ],
         "id": "bk-data-model",

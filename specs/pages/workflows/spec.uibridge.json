@@ -703,9 +703,6 @@
             "textContent": "New"
           },
           {
-            "textContent": "Workflows"
-          },
-          {
             "role": "button"
           }
         ],
@@ -717,9 +714,6 @@
       {
         "description": "When a workflow is loaded, the main content area displays a structured editor organized into four execution phases: Setup (environment preparation commands), Verification (checks and tests run between AI iterations), Agentic (AI prompts and instructions that drive the automation), and Completion (cleanup and finalization steps). Each phase section supports adding, removing, reordering, and configuring individual steps with type-specific editors. Users can expand and collapse phase sections to focus on the phase they are editing. The phase structure ensures workflows follow a predictable execution pattern.",
         "elements": [
-          {
-            "textContent": "Setup"
-          },
           {
             "textContent": "Verification"
           },
@@ -872,9 +866,6 @@
           },
           {
             "textContent": "Reflection"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "wf-settings-configuration",

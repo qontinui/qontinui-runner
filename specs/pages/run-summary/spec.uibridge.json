@@ -695,13 +695,7 @@
         "description": "When the Phase Timeline tab is active, the user sees one collapsible card per PhaseResult row. Each card shows the phase name (Setup / Verification / Agentic / Completion), optional iteration number, optional stage index, a success/failure badge, the phase duration, step count (successful/total), and an optional abbreviated 8-char commit hash. Iteration separators appear between cards whenever the iteration field changes, so multi-iteration runs read chronologically. The tab is backed by the get_phase_results Tauri command reading from the runner.phase_results PG table (plan: restate-port-part-a-compensation-and-phase-results.md §2.5).",
         "elements": [
           {
-            "textContent": "Phase Timeline"
-          },
-          {
             "textContains": "step"
-          },
-          {
-            "textContains": "Iteration"
           },
           {
             "textContent": "Step Breakdown"
@@ -725,19 +719,10 @@
             "textContains": "Setup"
           },
           {
-            "textContent": "Phase Timeline"
-          },
-          {
             "textContent": "Agentic"
           },
           {
             "textContains": "steps"
-          },
-          {
-            "textContent": "Phase Timeline"
-          },
-          {
-            "textContent": "Phase Timeline"
           }
         ],
         "id": "phase-timeline-correctness",

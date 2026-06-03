@@ -254,18 +254,6 @@
         "description": "The right-panel editor provides all fields for defining a shell command. The command text field is the primary input where users enter the actual shell command or script to execute. Users set a descriptive name, specify a working directory for command execution, select the target platform (any, Windows, Linux, macOS), and configure a timeout in seconds. A category field and tag input support organizational needs. The editor toolbar includes save and delete actions.",
         "elements": [
           {
-            "textContent": "Shell Commands"
-          },
-          {
-            "textContent": "Shell Commands"
-          },
-          {
-            "textContent": "Shell Commands"
-          },
-          {
-            "textContent": "Shell Commands"
-          },
-          {
             "role": "button",
             "textContent": "Save"
           }
@@ -278,12 +266,6 @@
       {
         "description": "Shell commands support organizational metadata to help users manage large command libraries. Categories group commands by function (e.g., build, test, deploy). Tags provide flexible cross-cutting labels for discovery through the library dashboard. The combination of name, category, and tags ensures commands are easy to find when building workflows, whether through the library dashboard search or the workflow builder's step picker.",
         "elements": [
-          {
-            "textContent": "Shell Commands"
-          },
-          {
-            "textContent": "Shell Commands"
-          },
           {
             "role": "button",
             "textContent": "Delete"

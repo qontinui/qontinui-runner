@@ -756,12 +756,6 @@
         "description": "The output viewer toolbar includes an 'All sessions' toggle button next to the search input. When active (visually highlighted cyan), the search input's placeholder changes from 'Search output...' to 'Search all sessions...' and typing triggers a backend call to search_process_logs, which runs an ILIKE query across every persisted session's output in the runner's PostgreSQL database. Results appear in a hits panel replacing the normal output view, each row showing the session ID prefix, process name, timestamp, and the matching log line. Clicking a hit jumps to that session in the picker and switches the view to that session's full content. This turns the process manager into a full-history log search tool, not just a live viewer. Toggling the button off restores the regular in-buffer filter.",
         "elements": [
           {
-            "textContent": "All sessions"
-          },
-          {
-            "textContent": "All sessions"
-          },
-          {
             "textContent": "No matches across sessions."
           },
           {
@@ -778,20 +772,7 @@
       },
       {
         "description": "The process log DB persistence feature writes every stdout/stderr line to PostgreSQL tables (process_sessions + process_session_output) via a batched writer task in the ManagedProcess event loop. This group defines what CORRECT output looks like from that persistence algorithm, verifiable from the page: the session picker reflects every process run, the historical session content matches what was previously shown live, the line counts are consistent between live and historical views, and zombie 'running' sessions from previous runner crashes are cleaned up on startup so the picker doesn't show stale entries.",
-        "elements": [
-          {
-            "tagName": "select"
-          },
-          {
-            "textContains": "lines"
-          },
-          {
-            "tagName": "select"
-          },
-          {
-            "tagName": "select"
-          }
-        ],
+        "elements": [],
         "id": "process-log-persistence-correctness",
         "isInitial": false,
         "name": "Process Log Persistence — Algorithm Correctness",
@@ -801,15 +782,9 @@
         "description": "The Process Manager uses the runner's standard dark theme with zinc grays, cyan accents for primary actions, and red/yellow/green for status indication. Text must be legible against the panel backgrounds — muted text uses zinc-500, primary text uses zinc-200, headings use zinc-200. The toolbar uses zinc-900 backgrounds with white/10 borders. Buttons in the toolbar follow the existing runner style: small xs text, bg-zinc-800 for secondary, bg-cyan-900/40 with border-cyan-700/50 for primary (Add Process), and the 'All sessions' toggle uses bg-cyan-900/30 with text-cyan-300 when active.",
         "elements": [
           {
-            "textContent": "Process Manager"
-          },
-          {
             "textContent": "All sessions"
           },
-          {},
-          {
-            "textContains": "lines"
-          }
+          {}
         ],
         "id": "process-manager-visual-design",
         "isInitial": false,

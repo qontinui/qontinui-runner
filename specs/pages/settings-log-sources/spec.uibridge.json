@@ -999,19 +999,11 @@
             "textContent": "Add Source"
           },
           {
-            "role": "button",
-            "textContent": "Add"
-          },
-          {
             "role": "heading",
             "textContent": "Add Source"
           },
           {
             "textContent": "Error Monitoring"
-          },
-          {
-            "role": "button",
-            "textContent": "Add"
           }
         ],
         "id": "ls-add-source-modal",

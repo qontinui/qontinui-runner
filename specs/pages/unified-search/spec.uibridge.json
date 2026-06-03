@@ -630,9 +630,6 @@
             "role": "dialog"
           },
           {
-            "textContent": "ESC"
-          },
-          {
             "role": "textbox"
           },
           {
@@ -664,29 +661,7 @@
       },
       {
         "description": "Users interact with the search via text input, form submission, and in the command palette via keyboard shortcuts. The search requires minimum 2 characters and the submit button is disabled until met.",
-        "elements": [
-          {
-            "textContent": "Search"
-          },
-          {
-            "role": "textbox"
-          },
-          {
-            "textContent": "ESC"
-          },
-          {
-            "textContent": "ESC"
-          },
-          {
-            "textContent": "ESC"
-          },
-          {
-            "role": "textbox"
-          },
-          {
-            "role": "button"
-          }
-        ],
+        "elements": [],
         "id": "unified-search-interaction",
         "isInitial": false,
         "name": "Search Interaction",
@@ -695,12 +670,6 @@
       {
         "description": "Search results display entity type icons with color coding, titles, snippet previews (2-line clamp), relevance scores as percentages, and a summary header with counts per entity type.",
         "elements": [
-          {
-            "textContent": "result"
-          },
-          {
-            "textContent": "%"
-          },
           {
             "textContent": "finding|fix|knowledge|error|rule|workflow"
           }

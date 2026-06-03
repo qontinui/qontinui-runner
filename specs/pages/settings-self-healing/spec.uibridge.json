@@ -856,16 +856,10 @@
         "description": "The self-healing tab renders a titled page header, a descriptive subtitle, and three collapsible section panels. This group verifies the top-level structure is present after settings have loaded.",
         "elements": [
           {
-            "textContent": "Self-Healing Configuration"
-          },
-          {
             "textContent": "Configure automation self-healing features"
           },
           {
             "textContent": "Action Caching"
-          },
-          {
-            "textContent": "Visual Validation"
           },
           {
             "textContent": "LLM Assistance"
@@ -900,9 +894,6 @@
           },
           {
             "textContent": "Action caching prevents redundant template matching"
-          },
-          {
-            "textContent": "Action Caching"
           },
           {
             "textContent": "Cache TTL (seconds)"
@@ -1175,9 +1166,6 @@
         "elements": [
           {
             "textContent": "Settings saved successfully!"
-          },
-          {
-            "textContent": "Self-Healing Configuration"
           }
         ],
         "id": "sh-feedback-alerts",
@@ -1188,12 +1176,6 @@
       {
         "description": "Self-healing settings are persisted via save_self_healing_settings and retrieved via get_self_healing_settings. The data model has exactly six fields. API keys are stored separately in the OS keychain. This group verifies the round-trip integrity and the semantic contract of the settings object.",
         "elements": [
-          {
-            "textContent": "Self-Healing Configuration"
-          },
-          {
-            "textContent": "Self-Healing Configuration"
-          },
           {
             "textContent": "passed to qontinui Python when executing workflows"
           }

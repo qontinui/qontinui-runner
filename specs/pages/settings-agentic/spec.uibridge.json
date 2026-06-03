@@ -790,16 +790,10 @@
         "description": "The Advanced AI tab renders a page header with Brain icon, a descriptive subtitle, four collapsible section panels, and two action buttons at the bottom. This group verifies the top-level structure after settings load.",
         "elements": [
           {
-            "textContent": "Advanced AI Features"
-          },
-          {
             "textContent": "Configure intelligent agentic features"
           },
           {
             "textContent": "Memory Compression"
-          },
-          {
-            "textContent": "Advanced AI Features"
           }
         ],
         "id": "aa-page-structure",
@@ -810,10 +804,7 @@
       {
         "description": "On mount, the page concurrently fetches agentic settings via get_agentic_settings (Tauri IPC) and reflection settings via GET /reflection/settings (HTTP). During the fetch, a loading indicator replaces the full form. This group verifies loading and transition-to-loaded behavior.",
         "elements": [
-          {},
-          {
-            "textContent": "Advanced AI Features"
-          }
+          {}
         ],
         "id": "aa-loading-state",
         "isInitial": false,
@@ -834,12 +825,6 @@
           },
           {
             "textContent": "Memory compression prevents context overflow by summarizing"
-          },
-          {
-            "textContent": "Memory Compression"
-          },
-          {
-            "textContent": "Memory Compression"
           }
         ],
         "id": "aa-memory-compression",
@@ -955,9 +940,6 @@
         "elements": [
           {
             "textContent": "Settings saved successfully!"
-          },
-          {
-            "textContent": "Advanced AI Features"
           }
         ],
         "id": "aa-feedback-alerts",

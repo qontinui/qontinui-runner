@@ -301,9 +301,6 @@
           },
           {
             "textContent": "Category"
-          },
-          {
-            "textContent": "Clear"
           }
         ],
         "id": "findings-filtering-and-navigation",

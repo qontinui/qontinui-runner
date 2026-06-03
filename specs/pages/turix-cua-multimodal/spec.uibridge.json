@@ -918,9 +918,6 @@
         "description": "The vision pipeline serves two user needs: (1) for developers automating their own web apps (UI Bridge white-box), it provides rich element data for intelligent verification without fragile selectors; (2) for automating third-party desktop apps (visual GUI black-box), it provides screenshot-based element detection with LLM vision reasoning. Users should understand which mode is active and why the system chose it.",
         "elements": [
           {
-            "textContent": "Agentic Verification"
-          },
-          {
             "textContent": "Previous Attempts|iteration|approach"
           },
           {

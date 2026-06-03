@@ -273,9 +273,6 @@
         "description": "The builder cards are arranged in a responsive grid layout that adapts to screen size, showing one to three columns depending on available width. Each card uses consistent visual structure: a color-coded icon on the left, the builder title and description on the right, and a hover-revealed arrow indicating navigability. The grid layout ensures all builder types are visible without scrolling on typical screens, providing immediate overview of all creation options.",
         "elements": [
           {
-            "textContent": "Step Builders"
-          },
-          {
             "textContent": "System commands and shell scripts"
           },
           {

@@ -935,16 +935,7 @@
         "description": "The page container uses data-page-id='observations' and stacks MemoryHealthPanel (border-b separator) above ObservationBrowser. Both sections are simultaneously visible without page-level scrolling.",
         "elements": [
           {
-            "textContent": "Memory Health"
-          },
-          {
-            "textContent": "Observation Memory"
-          },
-          {
             "textContent": "Cross-session knowledge from past runs"
-          },
-          {
-            "textContent": "Memory Health"
           }
         ],
         "id": "mem-page-layout",
@@ -987,9 +978,6 @@
           },
           {
             "textContent": "Last Consolidation"
-          },
-          {
-            "textContent": "Memory Health"
           }
         ],
         "id": "mem-health-stats",
@@ -1050,9 +1038,6 @@
       {
         "description": "When open, the create form contains a title input (aria-label: 'Observation title', placeholder: 'Observation title...'), a content textarea (aria-label: 'Observation content', placeholder: 'Content (markdown supported)...'), a type dropdown (aria-label: 'Observation type'), and Save/Cancel buttons. Save is disabled until both title and content are non-empty.",
         "elements": [
-          {
-            "role": "textbox"
-          },
           {
             "role": "combobox"
           },
@@ -1118,9 +1103,6 @@
         "description": "Result rows each show: a chevron icon (right=collapsed, down=expanded), a color-coded type badge, truncated title, 'rev {N}' badge if revisionCount>1, 'relevance: {N}%' if rank>0, 2-line content preview (contentPreview field), and a metadata footer with [topicKey] (if non-null) and the updatedAt date.",
         "elements": [
           {
-            "textContent": "decision"
-          },
-          {
             "textContent": "rev "
           },
           {
@@ -1135,9 +1117,6 @@
       {
         "description": "Clicking a result row expands it showing full content (from GET /observations/{id}) in a <pre> block, plus: content hash (first 12 chars as 'Hash: {hash}...'), scope ('Scope: {scope}'), duplicate prevention count if >0, and a red Delete button. Only one row is expanded at a time.",
         "elements": [
-          {
-            "textContent": "Observation Memory"
-          },
           {
             "textContent": "Hash:"
           },
@@ -1177,13 +1156,7 @@
         "description": "Observations are temporal knowledge artifacts with revision history and content deduplication. The UI must accurately surface these invariants. Topic-key upsert (same topic_key → increment revisionCount, snapshot old version), content-hash deduplication (same SHA-256 within 15min → blocked, duplicates_prevented increments), and scope-based organization are backend behaviors visible through the UI.",
         "elements": [
           {
-            "textContent": "rev "
-          },
-          {
             "textContent": "Duplicates prevented"
-          },
-          {
-            "textContent": "Observation Memory"
           }
         ],
         "id": "mem-data-model",

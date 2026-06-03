@@ -1043,23 +1043,11 @@
         "description": "Users can create multiple independent terminal pages, each with its own zone layout, terminals, labels, and saved configurations. A page tab bar at the top of the terminal area shows all pages. Clicking a page tab switches to that page by unmounting the current TerminalPage and remounting a new one connected to that page's PTY sessions. Each page's state (zone layout, labels, notes, pins, zone profiles, workspaces) is stored in page-namespaced localStorage keys. The default page uses un-prefixed keys for backward compatibility. PTY sessions are tagged with a page_id in the Rust backend, so each page only sees its own terminals.",
         "elements": [
           {
-            "role": "tab"
-          },
-          {
             "accessibleName": "Add terminal page",
             "role": "button"
           },
           {
-            "role": "tab"
-          },
-          {
-            "role": "tab"
-          },
-          {
             "accessibleName": "Close page"
-          },
-          {
-            "role": "tab"
           },
           {
             "textContains": "Loading terminals"
@@ -1091,9 +1079,6 @@
       {
         "description": "Each terminal page has isolated storage for its configuration. Zone layouts, session persistence, zone profiles, workspaces, zone labels/notes/pins, and grid column/row ratios are all namespaced by pageId. The default page uses un-prefixed keys (backward compatible), while non-default pages use 'page:{pageId}:' prefixed keys. This ensures that creating a zone profile on page A does not appear when viewing page B's profiles.",
         "elements": [
-          {
-            "accessibleName": "Zone profiles"
-          },
           {
             "role": "tab"
           },

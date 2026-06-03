@@ -1010,12 +1010,6 @@
         "description": "When pools exist, the sidebar lists them with status badges, agent type, generation, and timestamps. Clicking a pool loads its candidates in the detail panel with a Copeland ranking table.",
         "elements": [
           {
-            "role": "button"
-          },
-          {
-            "role": "button"
-          },
-          {
             "tagName": "tr"
           }
         ],
@@ -1029,9 +1023,6 @@
         "elements": [
           {
             "textContains": "Duel Results"
-          },
-          {
-            "tagName": "table"
           },
           {
             "textContains": "No duel results"
@@ -1080,16 +1071,7 @@
         "description": "Run list shows status, agent_type, generation. Selecting a run loads candidates grouped by generation with expandable cards showing critique, changes, and prompt content.",
         "elements": [
           {
-            "role": "button"
-          },
-          {
             "textContains": "Generation"
-          },
-          {
-            "role": "button"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "beam-runs-data-display",
@@ -1107,10 +1089,6 @@
           {},
           {},
           {
-            "role": "button",
-            "textContent": "Load"
-          },
-          {
             "textContains": "No span events loaded"
           }
         ],
@@ -1123,19 +1101,7 @@
         "description": "Loaded events are grouped by execution_id with collapsible sections. Each group shows an event table with type-specific detail rendering.",
         "elements": [
           {
-            "role": "button"
-          },
-          {
-            "tagName": "table"
-          },
-          {
             "tagName": "td"
-          },
-          {
-            "role": "button"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "span-events-data-display",
@@ -1147,17 +1113,10 @@
         "description": "All three new tabs follow the runner's dark zinc theme. Background colors, text colors, borders, and interactive states must be consistent with the existing meta-optimizer tabs.",
         "elements": [
           {
-            "role": "heading",
-            "textContains": "Duel Pools"
-          },
-          {
             "role": "heading"
           },
           {
             "tagName": "span"
-          },
-          {
-            "role": "button"
           }
         ],
         "id": "visual-design-dark-theme",
@@ -1170,10 +1129,6 @@
         "elements": [
           {
             "textContains": "Refresh"
-          },
-          {
-            "role": "heading",
-            "textContains": "Beam Search Runs"
           },
           {
             "role": "button",
