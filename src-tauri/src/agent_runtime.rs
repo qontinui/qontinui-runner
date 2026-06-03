@@ -354,17 +354,35 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
     // because coord's default `events.*` subscription delivers every event,
     // most frames legitimately are not ours.
     if let Some(channel) = value.get("channel").and_then(|c| c.as_str()) {
-        let expected = format!("events.agent.spawn_requested.{device_id}");
-        if channel != expected {
-            // Not our channel — silently ignore.
-            return Ok(());
-        }
-        match parse_envelope_payload(&value) {
-            Some(payload) => spawn_run_task(payload),
-            None => {
-                warn!("agent_runtime: spawn envelope on {channel} had no parseable payload/body")
+        let spawn_ch = format!("events.agent.spawn_requested.{device_id}");
+        let stop_ch = format!("events.agent.stop_requested.{device_id}");
+        if channel == spawn_ch {
+            match parse_envelope_payload(&value) {
+                Some(payload) => spawn_run_task(payload),
+                None => {
+                    warn!(
+                        "agent_runtime: spawn envelope on {channel} had no parseable payload/body"
+                    )
+                }
+            }
+        } else if channel == stop_ch {
+            // Operator stop (coord `agents_spawn::post_stop`): cancel the running
+            // agent's token so its run loop kills the subprocess and does NOT
+            // restart. No-op if this runner isn't running that agent_id.
+            match parse_stop_agent_id(&value) {
+                Some(agent_id) => {
+                    let running_here = request_agent_stop(agent_id);
+                    info!(
+                        "agent_runtime: stop_requested agent_id={agent_id} (running_here={running_here})"
+                    );
+                }
+                None => {
+                    warn!("agent_runtime: stop envelope on {channel} had no parseable agent_id")
+                }
             }
         }
+        // Any other events.* frame (coord's default subscription delivers all)
+        // is not ours — ignore.
         return Ok(());
     }
 
@@ -396,16 +414,63 @@ fn parse_envelope_payload(envelope: &serde_json::Value) -> Option<LaunchPayload>
     }
 }
 
+/// Extract `agent_id` from a coord stop envelope (`{channel, payload|body}`),
+/// whose inner is `{"agent_id": "<uuid>", "at": ...}`. Mirrors
+/// `parse_envelope_payload`'s string-or-object inner handling.
+fn parse_stop_agent_id(envelope: &serde_json::Value) -> Option<uuid::Uuid> {
+    let inner = envelope.get("payload").or_else(|| envelope.get("body"))?;
+    let obj: serde_json::Value = match inner.as_str() {
+        Some(s) => serde_json::from_str(s).ok()?,
+        None => inner.clone(),
+    };
+    obj.get("agent_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+}
+
+/// Per-agent cancellation registry. A coord `events.agent.stop_requested`
+/// frame cancels the token for that agent_id; `run_agent_subprocess` selects
+/// on it to kill the subprocess and break WITHOUT restarting. The entry is
+/// inserted in `spawn_run_task` and removed when the run task finishes.
+#[allow(clippy::type_complexity)]
+fn agent_stops() -> &'static std::sync::Mutex<
+    std::collections::HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>,
+> {
+    static AGENT_STOPS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>,
+        >,
+    > = std::sync::OnceLock::new();
+    AGENT_STOPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Cancel a running agent's stop token. Returns true if the agent_id was
+/// running on this runner (idempotent: cancelling an already-cancelled token
+/// is a no-op).
+fn request_agent_stop(agent_id: uuid::Uuid) -> bool {
+    if let Some(tok) = agent_stops().lock().unwrap().get(&agent_id) {
+        tok.cancel();
+        true
+    } else {
+        false
+    }
+}
+
 fn spawn_run_task(payload: LaunchPayload) {
+    let agent_id = payload.agent_id;
     info!(
         "agent_runtime: spawn-request received agent_id={} worktrees={}",
-        payload.agent_id,
+        agent_id,
         payload.worktrees.len()
     );
+    let stop = tokio_util::sync::CancellationToken::new();
+    agent_stops().lock().unwrap().insert(agent_id, stop.clone());
     tokio::spawn(async move {
-        if let Err(e) = run_agent_subprocess(payload).await {
+        if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
+        // Drop the registry entry once the run task is fully done.
+        agent_stops().lock().unwrap().remove(&agent_id);
     });
 }
 
@@ -418,7 +483,10 @@ fn spawn_run_task(payload: LaunchPayload) {
 /// 2. Spawn `claude` CLI in the first worktree with the initial prompt.
 /// 3. Start heartbeat + log-forwarder background tasks.
 /// 4. Wait for exit; restart up to 3× on crash; report final status.
-async fn run_agent_subprocess(mut payload: LaunchPayload) -> anyhow::Result<()> {
+async fn run_agent_subprocess(
+    mut payload: LaunchPayload,
+    stop: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
     // Coord emits each worktree's `repo` as a full `owner/name` slug and its
     // `worktree_path` for COORD's OWN host (a Linux `/root/qontinui-root.wt/...`
     // path) — neither is valid on this runner's filesystem. The runner owns its
@@ -469,6 +537,12 @@ async fn run_agent_subprocess(mut payload: LaunchPayload) -> anyhow::Result<()> 
     let mut final_reason: Option<String> = None;
 
     loop {
+        // Stop requested during a restart back-off (or before the first spawn):
+        // bail without (re)spawning.
+        if stop.is_cancelled() {
+            final_reason = Some("stopped by operator before (re)spawn".to_string());
+            break;
+        }
         match spawn_claude_child(&primary_wt, &payload.initial_prompt).await {
             Ok(mut child) => {
                 let pid = child.id().map(|p| p as i64);
@@ -481,7 +555,31 @@ async fn run_agent_subprocess(mut payload: LaunchPayload) -> anyhow::Result<()> 
                         payload.agent_id
                     );
                 }
-                let exit = pump_subprocess(payload.agent_id, &mut child, log_path.as_deref()).await;
+                // Race the subprocess pump against an operator stop. On stop we
+                // let the pump future drop (releasing &mut child), then kill the
+                // child and break WITHOUT restarting.
+                let mut pump_exit = None;
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => {}
+                    e = pump_subprocess(payload.agent_id, &mut child, log_path.as_deref()) => {
+                        pump_exit = Some(e);
+                    }
+                }
+                let exit = match pump_exit {
+                    Some(e) => e,
+                    None => {
+                        info!(
+                            "agent_runtime: stop requested for agent_id={}; terminating \
+                             subprocess (no restart)",
+                            payload.agent_id
+                        );
+                        let _ = child.kill().await;
+                        final_reason =
+                            Some("stopped by operator (events.agent.stop_requested)".to_string());
+                        break;
+                    }
+                };
                 match exit {
                     Ok(0) => {
                         info!(
@@ -1069,6 +1167,33 @@ mod tests {
         let p = local_worktree_path(root, uuid::Uuid::nil(), "qontinui/qontinui-runner");
         assert!(p.ends_with(Path::new("qontinui-runner")));
         assert!(p.to_string_lossy().contains(".agent-worktrees"));
+    }
+
+    #[test]
+    fn stop_envelope_parses_agent_id() {
+        let aid = uuid::Uuid::now_v7();
+        let inner = serde_json::json!({ "agent_id": aid, "at": "2026-06-03T00:00:00Z" });
+        // coord's stop envelope: {channel, payload: "<json-string>"} (post_stop)
+        let env_str = serde_json::json!({
+            "channel": "events.agent.stop_requested.x",
+            "payload": serde_json::to_string(&inner).unwrap(),
+        });
+        assert_eq!(parse_stop_agent_id(&env_str), Some(aid));
+        // object-inner form is also accepted
+        let env_obj = serde_json::json!({ "channel": "x", "body": inner });
+        assert_eq!(parse_stop_agent_id(&env_obj), Some(aid));
+        // junk / missing → None (never panics)
+        assert_eq!(
+            parse_stop_agent_id(&serde_json::json!({ "payload": "not json" })),
+            None
+        );
+        assert_eq!(parse_stop_agent_id(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn request_agent_stop_missing_is_false() {
+        // An agent_id not running on this runner is a no-op (false), never panics.
+        assert!(!request_agent_stop(uuid::Uuid::now_v7()));
     }
 
     #[test]
