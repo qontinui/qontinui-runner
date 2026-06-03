@@ -324,6 +324,10 @@ export class XtermBackend implements ITerminalBackend {
     this.term.attachCustomKeyEventHandler(handler);
   }
 
+  isBracketedPasteEnabled(): boolean {
+    return this.term.modes.bracketedPasteMode;
+  }
+
   registerLinkProvider(provider: ITerminalLinkProvider): IDisposable {
     return this.term.registerLinkProvider({
       provideLinks(bufferLineNumber, callback) {

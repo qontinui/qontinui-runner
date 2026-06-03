@@ -252,6 +252,15 @@ export interface ITerminalBackend {
   /** Intercept key events before the terminal processes them. Return false to prevent default. */
   attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void;
 
+  // -- Paste ----------------------------------------------------------------
+  /**
+   * Whether the running app has enabled DEC private mode 2004 (bracketed
+   * paste). When true, pasted text must be wrapped in `\x1b[200~` …
+   * `\x1b[201~` so the TUI treats it as a single atomic block instead of
+   * interpreting embedded newlines as submit keystrokes.
+   */
+  isBracketedPasteEnabled(): boolean;
+
   // -- Links ----------------------------------------------------------------
   /** Register a custom link provider for detecting clickable links in terminal output. */
   registerLinkProvider(provider: ITerminalLinkProvider): IDisposable;

@@ -11,6 +11,7 @@ import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { getTerminalDebug, recordPaintGrid } from "./terminalDebug";
 import { instanceStorage } from "@/lib/instance-storage";
 import { consumeInputChunk } from "./consumeInputChunk";
+<<<<<<< HEAD
 import { preparePasteData } from "./preparePaste";
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 import { matchScrollShortcut } from "./scrollKeys";
@@ -27,6 +28,9 @@ import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
  * pre-replay write-everything behavior.
  */
 type TerminalOutputPayload = TerminalOutputEvent & { offset?: number };
+=======
+import { buildPastePayload } from "./pastePayload";
+>>>>>>> 09226bb6 (fix(terminal): wrap interactive pastes in bracketed-paste markers)
 
 export interface TerminalInstanceHandle {
   getSelection: () => string;
@@ -674,6 +678,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
               .then((text) => {
                 if (text) {
                   // Write directly to PTY instead of paste to avoid double
+<<<<<<< HEAD
                   // paste when WebView2 also fires a native paste event. Run
                   // the clipboard text through the same bracketed-paste +
                   // newline normalization xterm's own paste would apply — a raw
@@ -682,6 +687,14 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
                   // `preparePaste.ts`.
                   const prepared = preparePasteData(text, backend.bracketedPasteMode);
                   const bytes = encoder.encode(prepared);
+=======
+                  // paste when WebView2 also fires a native paste event.
+                  // Wrap in bracketed-paste markers (when the TUI enabled
+                  // mode 2004) so large multi-line pastes arrive atomically
+                  // and don't get their leading lines submitted as Enter.
+                  const payload = buildPastePayload(text, backend.isBracketedPasteEnabled());
+                  const bytes = encoder.encode(payload);
+>>>>>>> 09226bb6 (fix(terminal): wrap interactive pastes in bracketed-paste markers)
                   invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(
                     () => {},
                   );
@@ -846,10 +859,18 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
                 handler: async () => {
                   const text = await navigator.clipboard.readText().catch(() => "");
                   if (text) {
+<<<<<<< HEAD
                     // Same bracketed-paste + newline normalization as the
                     // Ctrl+V path (see `preparePaste.ts`).
                     const prepared = preparePasteData(text, backend.bracketedPasteMode);
                     const bytes = encoder.encode(prepared);
+=======
+                    const payload = buildPastePayload(
+                      text,
+                      backendRef.current?.isBracketedPasteEnabled() ?? false,
+                    );
+                    const bytes = encoder.encode(payload);
+>>>>>>> 09226bb6 (fix(terminal): wrap interactive pastes in bracketed-paste markers)
                     invoke("terminal_write", {
                       terminalId: termId,
                       data: uint8ToBase64(bytes),

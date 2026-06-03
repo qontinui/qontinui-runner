@@ -213,6 +213,10 @@ export class GhosttyBackend implements ITerminalBackend {
     this.term.attachCustomKeyEventHandler(handler);
   }
 
+  isBracketedPasteEnabled(): boolean {
+    return this.term.hasBracketedPaste();
+  }
+
   registerLinkProvider(provider: ITerminalLinkProvider): IDisposable {
     // ghostty-web's registerLinkProvider returns void (not IDisposable).
     // ghostty-web's ILink.activate takes (event: MouseEvent) — no text param.
