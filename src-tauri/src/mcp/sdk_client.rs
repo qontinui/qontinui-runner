@@ -482,29 +482,44 @@ pub async fn connect_sdk_app(
     // session, in which case we connect without the header (local/dev relays
     // with the gate off ignore it; a gated relay then surfaces a clean 401
     // rather than a client-build failure).
-    match crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(
-        &crate::auth::AuthManager::new(),
-    )
-    .await
-    {
-        Some(token) if !token.is_empty() => {
+    // Pick the bearer: prefer the Cognito user token; fall back to the coord
+    // device-JWT. The relay accepts BOTH as of qontinui-web #412 — it tries
+    // `/users/me` (Cognito) then `/api/v1/devices/me` (coord device-JWT) — so a
+    // device-paired runner with NO Cognito session (`ensure_fresh_cognito_bearer`
+    // == None — the common headless/fleet case) authenticates via the device-JWT
+    // in the `access_token` slot. Without this fallback such runners send no
+    // bearer and the gated relay 401s their connect handshake.
+    let auth_manager = crate::auth::AuthManager::new();
+    let bearer: Option<(String, &str)> =
+        match crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(&auth_manager).await {
+            Some(token) if !token.is_empty() => Some((token, "Cognito user")),
+            _ => match auth_manager.get_access_token() {
+                // Only a real JWT (the coord device-JWT) — never the legacy
+                // `qontinui_runner_<random>` opaque slot value, which the relay
+                // can't verify.
+                Ok(token) if crate::auth::looks_like_jwt(&token) => {
+                    Some((token, "coord device-JWT"))
+                }
+                _ => None,
+            },
+        };
+
+    match bearer {
+        Some((token, kind)) => {
             match reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
                 Ok(mut value) => {
                     value.set_sensitive(true);
                     let mut headers = reqwest::header::HeaderMap::new();
                     headers.insert(reqwest::header::AUTHORIZATION, value);
                     builder = builder.default_headers(headers);
-                    debug!(
-                        "SDK relay client: attached fresh Cognito bearer for {}",
-                        url
-                    );
+                    debug!("SDK relay client: attached {kind} bearer for {}", url);
                 }
                 Err(e) => warn!("SDK relay client: malformed bearer, connecting without auth: {e}"),
             }
         }
-        _ => debug!(
-            "SDK relay client: no Cognito session (legacy/local install or not signed in); \
-             connecting without auth"
+        None => debug!(
+            "SDK relay client: no Cognito session and no device-JWT (legacy/local install or \
+             not paired); connecting without auth"
         ),
     }
 
