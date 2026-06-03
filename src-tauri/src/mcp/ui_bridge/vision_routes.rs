@@ -2209,7 +2209,10 @@ async fn vision_baseline_handler(
         .snapshot
         .elements
         .iter()
-        .map(|e| (e.id.clone(), e.bbox))
+        // `bbox` is now `Option<Region>` — only elements with a measured bbox
+        // can participate in layout-shift baselines; skip bbox-less (hidden/
+        // unmeasured) elements rather than failing the whole baseline.
+        .filter_map(|e| e.bbox.map(|b| (e.id.clone(), b)))
         .collect();
     let registered_at_unix_ms = chrono::Utc::now().timestamp_millis();
     let entry = BaselineRegistryEntry {
