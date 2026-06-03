@@ -1444,14 +1444,22 @@ impl LoopController {
                         "  Stage {}: Using AGENTIC VERIFICATION architecture",
                         stage_num
                     );
-                    self.run_agentic_verification_loop(
-                        &mut stage_loop_config,
-                        has_agentic,
-                        &stage.agentic_steps,
-                        &mut all_step_results,
-                        logger,
-                    )
-                    .await
+                    let agentic_result = self
+                        .run_agentic_verification_loop(
+                            &mut stage_loop_config,
+                            has_agentic,
+                            &stage.agentic_steps,
+                            &mut all_step_results,
+                            logger,
+                        )
+                        .await;
+                    // Track C3: drop the per-execution pre-hydration cache entry
+                    // now that the agentic loop has finished consuming it.
+                    self.app_state
+                        .prehydration_cache
+                        .remove(&stage_loop_config.execution_id)
+                        .await;
+                    agentic_result
                 } else if matches!(
                     stage_loop_config.workflow_architecture,
                     Some(crate::agentic_verification::WorkflowArchitecture::MultiAgentPipeline)

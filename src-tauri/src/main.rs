@@ -677,6 +677,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         app_registry: Arc::new(tokio::sync::OnceCell::new()),
         app_dispatcher: Arc::new(tokio::sync::OnceCell::new()),
         wrapper_state: Arc::new(tokio::sync::OnceCell::new()),
+        prehydration_cache: Arc::new(
+            crate::unified_workflow_executor::prehydration::PrehydrationCache::new(),
+        ),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();

@@ -77,6 +77,7 @@ pub mod output_parser;
 mod phase_configs;
 mod phase_helpers;
 mod phases;
+pub mod prehydration;
 pub mod replay;
 mod resume;
 pub mod review_subtask;

@@ -257,6 +257,24 @@ impl IterationHistory {
     fn to_json(&self) -> String {
         serde_json::to_string(&self.entries).unwrap_or_else(|_| "[]".to_string())
     }
+
+    /// All distinct file paths touched across iterations so far.
+    ///
+    /// Used to drive path/glob scoping of project rule-file contexts (Track C):
+    /// a subdirectory-scoped rule attaches once the worker touches a file
+    /// matching its glob.
+    fn all_touched_paths(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for entry in &self.entries {
+            for f in &entry.files_touched {
+                if seen.insert(f.clone()) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Extract an IterationSummary from a worker's output and the verification verdict.
@@ -293,6 +311,54 @@ fn extract_iteration_summary(
         files_touched,
         confidence_delta: verdict.confidence - prev_confidence,
     }
+}
+
+/// Build the project-context section for the agentic loop's pre-LLM prompt
+/// assembly (Track C2).
+///
+/// Reuses the SINGLE resolution model from `context::resolution`:
+/// `resolve_contexts_scoped` (auto-detect against the goal text + path/glob
+/// scoping against the worker's touched paths) → `format_contexts_for_prompt`.
+/// This is the same plumbing the unified-workflow and generator paths use; the
+/// agentic loop previously injected NO project contexts at all.
+///
+/// `project_path`, when set, is used as the CWD so the rule-file ingestion
+/// (CLAUDE.md / AGENTS.md / .cursorrules / .mdc + .qontinui/contexts) reads the
+/// task's actual workspace rather than the runner process CWD.
+///
+/// Returns `None` when no contexts resolve (no rule files / nothing matches),
+/// so callers can cheaply skip injection.
+fn build_project_context_section(
+    goal: &str,
+    touched_paths: &[String],
+    project_path: Option<&str>,
+) -> Option<String> {
+    // Scope rule-file ingestion to the task workspace if known. The context
+    // loaders key off the process CWD, so temporarily set it. Best-effort:
+    // if the chdir fails we fall back to the current CWD.
+    let restore_cwd = project_path.and_then(|p| {
+        let prev = std::env::current_dir().ok();
+        if std::env::set_current_dir(p).is_ok() {
+            prev
+        } else {
+            None
+        }
+    });
+
+    let resolved = crate::context::resolve_contexts_scoped(
+        &[],  // no explicit IDs — agentic loop relies on auto-detect + always-attached rules
+        true, // auto_detect against the goal text
+        goal, // task_prompt
+        &[],  // action_types — n/a for the agentic loop
+        &[],  // recent_errors — verifier feeds these separately
+        touched_paths,
+    );
+
+    if let Some(prev) = restore_cwd {
+        let _ = std::env::set_current_dir(prev);
+    }
+
+    crate::context::format_contexts_for_prompt(&resolved)
 }
 
 impl LoopController {
@@ -376,6 +442,19 @@ impl LoopController {
         // Save original model/provider overrides so we can restore after each iteration
         let original_model_override = config.model_override.clone();
         let original_provider_override = config.provider_override.clone();
+
+        // ── Track C3: speculative MCP / link pre-hydration ─────────────────
+        // Before the first agentic turn, best-effort pre-fetch available MCP
+        // tools + any URLs/issue-refs in the goal. Strictly never-blocking:
+        // bounded + error-swallowing inside `prehydrate`. The cached summary
+        // (timestamp-labeled) is injected ONLY into the first iteration's
+        // prompts so the model is primed without paying a tool round-trip.
+        let prehydration_summary = crate::unified_workflow_executor::prehydration::prehydrate(
+            &self.app_state,
+            &config.execution_id,
+            &goal,
+        )
+        .await;
 
         loop {
             iteration += 1;
@@ -530,6 +609,26 @@ impl LoopController {
 
                 // Build context for the verifier: include previous iteration results
                 let mut verifier_context = verifier_system;
+
+                // Track C2: inject resolved project contexts (rule files +
+                // .qontinui/contexts), path/glob-scoped to the touched paths.
+                if let Some(section) = build_project_context_section(
+                    &goal,
+                    &iteration_history.all_touched_paths(),
+                    config.project_path.as_deref(),
+                ) {
+                    verifier_context.push_str("\n\n");
+                    verifier_context.push_str(&section);
+                }
+
+                // Track C3: prime the FIRST verifier turn with pre-hydrated data.
+                if iteration == 1 {
+                    if let Some(ref summary) = prehydration_summary {
+                        verifier_context.push_str("\n\n");
+                        verifier_context.push_str(summary);
+                    }
+                }
+
                 if let Some(last_result) = iteration_results.last() {
                     verifier_context.push_str(&format!(
                         "\n\n## Previous Iteration ({}) Summary\nWorker action: {}\n",
@@ -936,6 +1035,26 @@ impl LoopController {
                     goal
                 )
             };
+
+            // Track C2: inject resolved project contexts (rule files +
+            // .qontinui/contexts) into the WORKER prompt too, path/glob-scoped
+            // to whatever files have been touched so far this run.
+            if let Some(section) = build_project_context_section(
+                &goal,
+                &iteration_history.all_touched_paths(),
+                config.project_path.as_deref(),
+            ) {
+                worker_failure_context.push_str("\n\n");
+                worker_failure_context.push_str(&section);
+            }
+
+            // Track C3: prime the FIRST worker turn with pre-hydrated data.
+            if iteration == 1 {
+                if let Some(ref summary) = prehydration_summary {
+                    worker_failure_context.push_str("\n\n");
+                    worker_failure_context.push_str(summary);
+                }
+            }
 
             // Inject compressed iteration history so the worker knows what was already tried
             let history_context = iteration_history.to_context_string();
