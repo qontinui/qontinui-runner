@@ -4,6 +4,8 @@
 //! natural language descriptions using AI.
 
 pub mod benchmark;
+#[cfg(test)]
+mod blast_radius_bench;
 pub mod code_graph;
 pub mod complexity;
 pub mod consistency;
