@@ -46,6 +46,14 @@ pub struct AcquireArgs {
     pub kind: ClaimKindDto,
     pub resource_key: String,
     pub machine_id: String,
+    /// Stable per-session UUID. Coord folds this into the claim's
+    /// session-scoped owner token (`machine_id:agent_session_id`), so a
+    /// caller that supplies it is a distinct holder from another session
+    /// on the same machine. `None` → coord's legacy bare-machine behavior.
+    /// Plan `2026-06-03-coord-session-scoped-claim-owner`. The same value
+    /// MUST be sent on the matching release.
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
     #[serde(default)]
     pub ttl_seconds: Option<i64>,
     #[serde(default)]
@@ -65,6 +73,12 @@ pub struct ReleaseArgs {
     pub kind: ClaimKindDto,
     pub resource_key: String,
     pub machine_id: String,
+    /// Must match the `agent_session_id` sent at acquire — coord's
+    /// release Lua compares the owner token, so a mismatched or omitted
+    /// session yields `not_held` against a session-scoped claim. Plan
+    /// `2026-06-03-coord-session-scoped-claim-owner`.
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
 }
 
 pub type ReleaseResultDto = serde_json::Value;
@@ -119,6 +133,7 @@ pub async fn claims_acquire(args: AcquireArgs) -> Result<AcquireResultDto, Strin
         "kind": args.kind,
         "resource_key": args.resource_key,
         "machine_id": args.machine_id,
+        "agent_session_id": args.agent_session_id,
         "ttl_seconds": args.ttl_seconds,
         "metadata": args.metadata,
     });
@@ -166,9 +181,10 @@ pub async fn claims_release(args: ReleaseArgs) -> Result<ReleaseResultDto, Strin
         "kind": args.kind,
         "resource_key": args.resource_key,
         "machine_id": args.machine_id,
+        "agent_session_id": args.agent_session_id,
         // /claims/release requires the full ClaimRequest shape but only
-        // consults `kind`/`resource_key`/`machine_id`. The rest are
-        // ignored.
+        // consults `kind`/`resource_key`/`machine_id`/`agent_session_id`
+        // (the owner-token match key). The rest are ignored.
         "metadata": serde_json::Value::Object(Default::default()),
     });
 
