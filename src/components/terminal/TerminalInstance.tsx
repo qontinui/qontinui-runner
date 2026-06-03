@@ -3,15 +3,13 @@ import { FilePathLinkProvider } from "./FilePathLinkProvider";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useUIBridgeOptional } from "@qontinui/ui-bridge";
-import type {
-  TerminalOutputEvent,
-  TerminalExitEvent,
-} from "@qontinui/shared-types/tauri-events";
+import type { TerminalOutputEvent, TerminalExitEvent } from "@qontinui/shared-types/tauri-events";
 import { createTerminalBackend } from "./backends";
 import type { BackendType, ITerminalBackend } from "./backends";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { instanceStorage } from "@/lib/instance-storage";
 import { consumeInputChunk } from "./consumeInputChunk";
+import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 
 export interface TerminalInstanceHandle {
   getSelection: () => string;
@@ -172,6 +170,10 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     const outputDecoderRef = useRef(new TextDecoder());
     const firstInputReportedRef = useRef(false);
     const inputAccumulatorRef = useRef("");
+    // Fractional carry for the Shift+wheel local-scroll override — sub-line
+    // pixel deltas (trackpads) accumulate here so slow scrolling advances
+    // smoothly instead of snapping a whole line per tick. See `wheelScroll.ts`.
+    const wheelScrollAccumRef = useRef(0);
 
     // Expose selection, write, and scrollback API to parent components
     useImperativeHandle(ref, () => ({
@@ -238,6 +240,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       let ackTimer: ReturnType<typeof setInterval> | null = null;
       let observer: ResizeObserver | null = null;
       let blockNativePaste: ((e: Event) => void) | null = null;
+      let wheelScrollOverride: ((e: WheelEvent) => void) | null = null;
       // Layer 2 bootstrap: idle-debounced grid re-paint. The live listener
       // resets this timer on every received byte; when the stream goes
       // quiet for IDLE_REPAINT_MS we re-fetch the Rust grid and overlay
@@ -354,6 +357,36 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         if (viewport) {
           viewport.classList.add("scrollbar-dark");
         }
+
+        // Shift+wheel → always scroll the local scrollback, even when the
+        // foreground program has captured the wheel via a mouse-tracking mode
+        // (DECSET 1000/1002/1003). xterm.js sets `handleMouseWheel: false` in
+        // that state and forwards the wheel to the app, so a plain wheel can't
+        // scroll the buffer; its `attachCustomWheelEventHandler` is also
+        // bypassed once mouse mode is on. We intercept on the container in the
+        // CAPTURE phase (before xterm's own bubble-phase listeners on the
+        // viewport/screen) and, only when Shift is held, take the event over.
+        // Un-modified wheel events are left untouched so the app keeps its
+        // mouse interaction — matching the Konsole / GNOME Terminal / Windows
+        // Terminal "Shift bypasses application mouse reporting" convention.
+        wheelScrollOverride = (e: WheelEvent) => {
+          if (!e.shiftKey) return;
+          const b = backendRef.current;
+          if (!b) return;
+          // Take over: stop xterm (and the app) from also seeing this wheel.
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          wheelScrollAccumRef.current += wheelToLineDelta(e, b.rows, DEFAULT_CELL_HEIGHT_PX);
+          const whole = Math.trunc(wheelScrollAccumRef.current);
+          if (whole !== 0) {
+            wheelScrollAccumRef.current -= whole;
+            b.scrollLines(whole);
+          }
+        };
+        container.addEventListener("wheel", wheelScrollOverride, {
+          capture: true,
+          passive: false,
+        });
 
         // Initial fit after layout settles
         requestAnimationFrame(() => fitTerminal());
@@ -741,6 +774,9 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         if (idleTimer) clearTimeout(idleTimer);
         if (fitTimerRef.current) clearTimeout(fitTimerRef.current);
         observer?.disconnect();
+        if (wheelScrollOverride) {
+          container.removeEventListener("wheel", wheelScrollOverride, { capture: true });
+        }
         for (const d of disposables) d.dispose();
         const inputEl = backendRef.current?.getInputElement();
         if (inputEl && blockNativePaste) {

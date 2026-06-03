@@ -125,6 +125,10 @@ export class XtermBackend implements ITerminalBackend {
     this.term.scrollToBottom();
   }
 
+  scrollLines(amount: number): void {
+    this.term.scrollLines(amount);
+  }
+
   attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
     this.term.attachCustomKeyEventHandler(handler);
   }
