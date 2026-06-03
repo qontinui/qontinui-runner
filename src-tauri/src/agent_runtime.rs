@@ -345,19 +345,26 @@ async fn connect_and_pump(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result
 async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
     let value: serde_json::Value = serde_json::from_str(txt)?;
 
-    // Envelope shape: {"channel":"events.agent.spawn_requested.<id>","body":<LaunchPayload>}
+    // Envelope shape from coord's `/ws` Redis->WS fanout (coord/src/ws.rs):
+    //   {"channel":"events.agent.spawn_requested.<id>","payload":"<json-string>"}
+    // where `payload` is the raw Redis message — the LaunchPayload serialized
+    // as a STRING. Older/test fixtures used {"channel","body":<object>}; we
+    // accept both (see `parse_envelope_payload`). On a miss we log + return Ok:
+    // a malformed or foreign frame must never kill the subscribe loop, and
+    // because coord's default `events.*` subscription delivers every event,
+    // most frames legitimately are not ours.
     if let Some(channel) = value.get("channel").and_then(|c| c.as_str()) {
         let expected = format!("events.agent.spawn_requested.{device_id}");
         if channel != expected {
-            // Not for us — silently ignore.
+            // Not our channel — silently ignore.
             return Ok(());
         }
-        let body = value
-            .get("body")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("envelope missing body"))?;
-        let payload: LaunchPayload = serde_json::from_value(body)?;
-        spawn_run_task(payload);
+        match parse_envelope_payload(&value) {
+            Some(payload) => spawn_run_task(payload),
+            None => {
+                warn!("agent_runtime: spawn envelope on {channel} had no parseable payload/body")
+            }
+        }
         return Ok(());
     }
 
@@ -371,6 +378,22 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
         spawn_run_task(payload);
     }
     Ok(())
+}
+
+/// Extract a `LaunchPayload` from a coord `/ws` envelope.
+///
+/// Coord's fanout (`coord/src/ws.rs`) emits `{"channel", "payload": "<json>"}`
+/// where `payload` is the raw Redis message — the LaunchPayload serialized as
+/// a STRING. Older/test fixtures used `{"channel", "body": <object>}`. Accept
+/// both field names, and accept the inner value as a JSON string (`from_str`)
+/// or a nested object (`from_value`). Returns `None` if neither yields a
+/// parseable payload.
+fn parse_envelope_payload(envelope: &serde_json::Value) -> Option<LaunchPayload> {
+    let inner = envelope.get("payload").or_else(|| envelope.get("body"))?;
+    match inner.as_str() {
+        Some(s) => serde_json::from_str(s).ok(),
+        None => serde_json::from_value(inner.clone()).ok(),
+    }
 }
 
 fn spawn_run_task(payload: LaunchPayload) {
@@ -395,7 +418,22 @@ fn spawn_run_task(payload: LaunchPayload) {
 /// 2. Spawn `claude` CLI in the first worktree with the initial prompt.
 /// 3. Start heartbeat + log-forwarder background tasks.
 /// 4. Wait for exit; restart up to 3× on crash; report final status.
-async fn run_agent_subprocess(payload: LaunchPayload) -> anyhow::Result<()> {
+async fn run_agent_subprocess(mut payload: LaunchPayload) -> anyhow::Result<()> {
+    // Coord emits each worktree's `repo` as a full `owner/name` slug and its
+    // `worktree_path` for COORD's OWN host (a Linux `/root/qontinui-root.wt/...`
+    // path) — neither is valid on this runner's filesystem. The runner owns its
+    // local worktree layout, so rewrite every path to a local, platform-correct
+    // one (`<QONTINUI_ROOT>/.agent-worktrees/<agent_id>/<repo-name>`) before
+    // materializing or using it as the agent's cwd.
+    let agent_id = payload.agent_id;
+    if let Some(root) = qontinui_root_dir() {
+        for wt in &mut payload.worktrees {
+            wt.worktree_path = local_worktree_path(&root, agent_id, &wt.repo)
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+
     // Step 1: materialize worktrees.
     if let Err(e) = materialize_worktrees(&payload).await {
         report_spawn_failed(
@@ -514,7 +552,7 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
     let root = qontinui_root_dir()
         .ok_or_else(|| anyhow::anyhow!("no qontinui-root directory configured"))?;
     for wt in &payload.worktrees {
-        let repo_root = root.join(&wt.repo);
+        let repo_root = root.join(local_repo_name(&wt.repo));
         if !repo_root.exists() {
             return Err(anyhow::anyhow!(
                 "primary repo {} not found at {}",
@@ -580,6 +618,26 @@ fn qontinui_root_dir() -> Option<PathBuf> {
     dirs::home_dir()
         .map(|h| h.join("qontinui-root"))
         .filter(|p| p.is_dir())
+}
+
+/// The local primary-checkout directory NAME for a coord repo slug. Coord uses
+/// `owner/name` slugs (e.g. `qontinui/qontinui-runner`); the runner's primary
+/// checkouts live at `<QONTINUI_ROOT>/<name>`. A bare name passes through.
+fn local_repo_name(repo: &str) -> &str {
+    repo.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(repo)
+}
+
+/// The local worktree path the runner materializes for an agent's repo. The
+/// runner owns this layout; coord's emitted `worktree_path` (computed for its
+/// own host) is ignored. Scheme:
+/// `<QONTINUI_ROOT>/.agent-worktrees/<agent_id>/<repo-name>`.
+fn local_worktree_path(root: &Path, agent_id: uuid::Uuid, repo: &str) -> PathBuf {
+    root.join(".agent-worktrees")
+        .join(agent_id.to_string())
+        .join(local_repo_name(repo))
 }
 
 /// Write `.mcp.json` into the agent's primary worktree directory so the
@@ -960,6 +1018,57 @@ mod tests {
         assert_eq!(round_tripped.worktrees.len(), 1);
         assert_eq!(round_tripped.worktrees[0].repo, "qontinui-runner");
         assert_eq!(round_tripped.plan_phase, Some(4));
+    }
+
+    #[test]
+    fn coord_ws_string_payload_envelope_parses() {
+        // Reproduces coord's ACTUAL `/ws` fanout shape: a {channel, payload}
+        // envelope where `payload` is the LaunchPayload serialized as a STRING
+        // (coord/src/ws.rs relays the raw Redis message text). The pre-fix
+        // consumer looked only for `body` as an object and dropped this frame
+        // with "envelope missing body" — the bug that blocked the live spawn.
+        let device = uuid::Uuid::now_v7();
+        let inner = serde_json::json!({
+            "agent_id": uuid::Uuid::now_v7(),
+            "target_device_id": device,
+            "worktrees": [],
+            "jwt": "t",
+            "jwt_exp": 0,
+            "initial_prompt": "go",
+            "claim_token": "agent:x",
+        });
+        // payload as a STRING (coord's real shape)
+        let envelope = serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "payload": serde_json::to_string(&inner).unwrap(),
+        });
+        let parsed =
+            parse_envelope_payload(&envelope).expect("coord string-payload envelope must parse");
+        assert_eq!(parsed.target_device_id, device);
+
+        // Legacy {channel, body:<object>} still parses.
+        let legacy = serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "body": inner,
+        });
+        assert!(parse_envelope_payload(&legacy).is_some());
+
+        // Garbage payload yields None (and must not panic).
+        let junk = serde_json::json!({ "channel": "x", "payload": "not json" });
+        assert!(parse_envelope_payload(&junk).is_none());
+    }
+
+    #[test]
+    fn local_paths_strip_owner_slug() {
+        assert_eq!(
+            local_repo_name("qontinui/qontinui-runner"),
+            "qontinui-runner"
+        );
+        assert_eq!(local_repo_name("qontinui-runner"), "qontinui-runner");
+        let root = Path::new("D:/qontinui-root");
+        let p = local_worktree_path(root, uuid::Uuid::nil(), "qontinui/qontinui-runner");
+        assert!(p.ends_with(Path::new("qontinui-runner")));
+        assert!(p.to_string_lossy().contains(".agent-worktrees"));
     }
 
     #[test]
