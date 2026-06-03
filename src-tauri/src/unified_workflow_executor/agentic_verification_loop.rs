@@ -322,9 +322,12 @@ fn extract_iteration_summary(
 /// This is the same plumbing the unified-workflow and generator paths use; the
 /// agentic loop previously injected NO project contexts at all.
 ///
-/// `project_path`, when set, is used as the CWD so the rule-file ingestion
-/// (CLAUDE.md / AGENTS.md / .cursorrules / .mdc + .qontinui/contexts) reads the
-/// task's actual workspace rather than the runner process CWD.
+/// `project_path`, when set, is passed straight through the resolution API so
+/// rule-file ingestion (CLAUDE.md / AGENTS.md / .cursorrules / .mdc +
+/// .qontinui/contexts) reads the task's actual workspace. It does NOT mutate
+/// the process CWD — the path is threaded as an explicit argument, so
+/// concurrent in-process resolutions can't race on a shared global directory.
+/// When `None`, resolution falls back to the process CWD.
 ///
 /// Returns `None` when no contexts resolve (no rule files / nothing matches),
 /// so callers can cheaply skip injection.
@@ -333,18 +336,6 @@ fn build_project_context_section(
     touched_paths: &[String],
     project_path: Option<&str>,
 ) -> Option<String> {
-    // Scope rule-file ingestion to the task workspace if known. The context
-    // loaders key off the process CWD, so temporarily set it. Best-effort:
-    // if the chdir fails we fall back to the current CWD.
-    let restore_cwd = project_path.and_then(|p| {
-        let prev = std::env::current_dir().ok();
-        if std::env::set_current_dir(p).is_ok() {
-            prev
-        } else {
-            None
-        }
-    });
-
     let resolved = crate::context::resolve_contexts_scoped(
         &[],  // no explicit IDs — agentic loop relies on auto-detect + always-attached rules
         true, // auto_detect against the goal text
@@ -352,11 +343,8 @@ fn build_project_context_section(
         &[],  // action_types — n/a for the agentic loop
         &[],  // recent_errors — verifier feeds these separately
         touched_paths,
+        project_path, // scope rule-file ingestion to the task workspace, no chdir
     );
-
-    if let Some(prev) = restore_cwd {
-        let _ = std::env::set_current_dir(prev);
-    }
 
     crate::context::format_contexts_for_prompt(&resolved)
 }

@@ -811,7 +811,7 @@ pub fn generate_workflow(
         // Resolve explicitly selected context IDs (user + builtin + project)
         if let Some(ref ids) = request.context_ids {
             if !ids.is_empty() {
-                let resolved = context::resolve_contexts(ids, false, "", &[], &[]);
+                let resolved = context::resolve_contexts(ids, false, "", &[], &[], None);
                 if let Some(formatted) = context::format_contexts_for_prompt(&resolved) {
                     ctx.push_str(&formatted);
                 }
@@ -2424,7 +2424,7 @@ fn run_builder_agent(
 
     if let Some(ref ids) = request.context_ids {
         if !ids.is_empty() {
-            let resolved = context::resolve_contexts(ids, false, "", &[], &[]);
+            let resolved = context::resolve_contexts(ids, false, "", &[], &[], None);
             if let Some(formatted) = context::format_contexts_for_prompt(&resolved) {
                 context_section.push_str(&formatted);
             }

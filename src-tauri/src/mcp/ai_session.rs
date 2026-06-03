@@ -1737,6 +1737,7 @@ pub async fn run_prompt(
                 &prompt_content, // Use original prompt for auto-detection matching
                 &action_types,
                 &recent_errors,
+                None, // CWD-based project contexts (no explicit workspace path here)
             );
 
             if !used_ids.is_empty() {
