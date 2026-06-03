@@ -70,35 +70,50 @@ pub(crate) fn try_refresh_credentials(creds_path: &Path) -> Option<String> {
 
     // The token endpoint requires JSON body (not form-encoded) and a Node-like
     // User-Agent to pass Cloudflare's bot detection on platform.claude.com.
-    let client = reqwest::blocking::Client::new();
-    let response = match client
-        .post(TOKEN_URL)
-        .header("Content-Type", "application/json")
-        .header("User-Agent", "node/22.13.1")
-        .header("Accept", "application/json, text/plain, */*")
-        .json(&serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-            "scope": scope_str,
-        }))
-        .send()
-    {
-        Ok(r) => r,
+    //
+    // Run the blocking HTTP call on a dedicated OS thread so that
+    // `reqwest::blocking::Client`'s internal tokio runtime is created and
+    // dropped outside any existing async runtime context. Without this,
+    // dropping the client inside `tokio::task::spawn_blocking` panics with
+    // "Cannot drop a runtime in a context where blocking is not allowed".
+    let request_body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+        "scope": scope_str,
+    });
+    let http_result: Result<(bool, u16, String), String> = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .post(TOKEN_URL)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "node/22.13.1")
+            .header("Accept", "application/json, text/plain, */*")
+            .json(&request_body)
+            .send()
+            .map_err(|e| format!("{e}"))?;
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        Ok((status.is_success(), status.as_u16(), body))
+    })
+    .join()
+    .map_err(|_| "OAuth refresh thread panicked".to_string())
+    .and_then(|r| r);
+
+    let (success, status_code, body) = match http_result {
+        Ok(t) => t,
         Err(e) => {
             warn!("OAuth refresh: request failed: {}", e);
             return None;
         }
     };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        warn!("OAuth refresh: server returned {}: {}", status, body);
+    if !success {
+        warn!("OAuth refresh: server returned {}: {}", status_code, body);
         return None;
     }
 
-    let token_response: serde_json::Value = match response.json() {
+    let token_response: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
             warn!("OAuth refresh: response parse failed: {}", e);
