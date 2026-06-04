@@ -55,13 +55,38 @@ pub async fn terminal_create(
         working_dir.as_deref().unwrap_or(""),
     );
 
+    // L2 (shared-checkout coordination gap fix) — when the caller did
+    // NOT declare an `intent_repo`, derive it from the session's
+    // `working_dir`: if that directory sits inside a known canonical
+    // checkout (`<root>/<repo>/...`), treat the session as editing that
+    // repo. This makes `acquire_for_terminal` route through isolated
+    // worktree acquisition when `QONTINUI_AGENT_WORKTREE_MODE` is on.
+    // SAFE: when the flag is off (the default), `acquire_for_terminal`
+    // still returns `(working_dir, None)`, so the derivation has ZERO
+    // effect until the operator flips the flag.
+    let effective_intent_repo: Option<String> = intent_repo.clone().or_else(|| {
+        working_dir.as_deref().and_then(|wd| {
+            let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
+                std::path::Path::new(wd),
+            );
+            if let Some(ref repo) = derived {
+                tracing::debug!(
+                    working_dir = %wd,
+                    derived_intent_repo = %repo,
+                    "terminal_create: derived intent_repo from working_dir"
+                );
+            }
+            derived
+        })
+    });
+
     // Phase 2 — route through the shared `acquire_for_terminal` helper
     // so this entry point + the HTTP-proxy / backend-relay siblings stay
     // in lockstep. When `intent_repo` is `None`, the helper is a no-op;
     // when it's `Some(_)` but worktree mode is off or allocation fails,
     // the helper returns the original `working_dir` and logs.
     let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
-        intent_repo.as_deref(),
+        effective_intent_repo.as_deref(),
         title.as_deref().unwrap_or("Terminal edit session"),
         working_dir,
     )
@@ -98,7 +123,7 @@ pub async fn terminal_create(
     let intent = Intent {
         kind: SessionKind::TerminalShell,
         purpose,
-        repo: intent_repo,
+        repo: effective_intent_repo,
         branch: None,
         plan_slug,
         correlation_topic,
@@ -214,6 +239,12 @@ pub fn terminal_write(
     })?;
 
     session.write(&bytes)?;
+
+    // L3 (shared-checkout coordination gap fix) — observe typed input for
+    // branch-mutating git so a soft coord-conflict warning can surface
+    // when a peer holds the worktree claim. Best-effort + non-blocking;
+    // runs AFTER the write so it never delays keystroke delivery.
+    session.observe_input_for_warn(&bytes);
 
     Ok(CommandResponse {
         success: true,
