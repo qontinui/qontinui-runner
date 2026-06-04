@@ -51,6 +51,7 @@ import { MidSessionToast } from "./MidSessionToast";
 import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner";
 import { WaitingLockBanner } from "./WaitingLockBanner";
 import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
+import { CoordWarningBanner } from "./CoordWarningBanner";
 
 const logger = createLogger("TerminalPage");
 
@@ -1012,6 +1013,17 @@ function TerminalPageInner({
             {activeTab?.claudeSessionId && (
               <DeconflictAdvisoryBanner taskRunId={activeTab.claudeSessionId} />
             )}
+
+            {/* L3 (shared-checkout coordination gap fix) — soft warning
+                when branch-mutating git is typed into THIS terminal's PTY
+                while a coord peer holds the worktree claim on the repo.
+                NOT gated on `claudeSessionId` (it applies to any terminal,
+                including plain shells where an operator types `git
+                switch` by hand). `activeId` is the active tab id, which
+                equals the backend terminal id (ZoneGrid passes
+                `terminalId={zoneTab.id}`). Soft + dismissible; never
+                blocks input. */}
+            <CoordWarningBanner activeTerminalId={activeId ?? undefined} />
           </div>
 
           {uiState.showControlPanel && zoneLayout.isMultiZone && (

@@ -2155,9 +2155,28 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             .and_then(|v| v.as_str())
             .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
+        // L2 (shared-checkout coordination gap fix) — derive `intent_repo`
+        // from `working_dir` when the caller didn't declare one (no-op
+        // until `QONTINUI_AGENT_WORKTREE_MODE` is on).
+        let effective_intent_repo: Option<String> = intent_repo.clone().or_else(|| {
+            working_dir.as_deref().and_then(|wd| {
+                let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
+                    std::path::Path::new(wd),
+                );
+                if let Some(ref repo) = derived {
+                    tracing::debug!(
+                        working_dir = %wd,
+                        derived_intent_repo = %repo,
+                        "backend_relay terminal_create: derived intent_repo from working_dir"
+                    );
+                }
+                derived
+            })
+        });
+
         let (working_dir, isolated_ctx) =
             crate::agent_worktree::isolated_edit::acquire_for_terminal(
-                intent_repo.as_deref(),
+                effective_intent_repo.as_deref(),
                 title.as_deref().unwrap_or("Terminal edit session"),
                 working_dir,
                 agent_session_id,

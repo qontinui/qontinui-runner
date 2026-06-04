@@ -124,6 +124,14 @@ export class GhosttyBackend implements ITerminalBackend {
     this.term.scrollToBottom();
   }
 
+  scrollLines(amount: number): void {
+    // ghostty-web mirrors xterm's scroll API, but guard defensively so a
+    // build lacking `scrollLines` degrades the Shift+wheel override to a
+    // no-op instead of throwing.
+    const t = this.term as unknown as { scrollLines?: (n: number) => void };
+    t.scrollLines?.(amount);
+  }
+
   attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
     this.term.attachCustomKeyEventHandler(handler);
   }
