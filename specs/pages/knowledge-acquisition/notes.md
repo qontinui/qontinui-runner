@@ -1,3 +1,0 @@
-# KnowledgeAcquisition
-
-_(notes)_

@@ -1,3 +1,0 @@
-# UnifiedSearchPanel
-
-_(notes)_
