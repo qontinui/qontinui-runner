@@ -304,6 +304,13 @@ export interface UseSessionManagerReturn {
   frozenCount: number;
   needsInputCount: number;
   activeCount: number;
+  // Session-model counts for the Terminal-page StatusStrip (Claude
+  // sessions, not PTY tabs). See `statusCounts` for the bucketing.
+  sessionCount: number;
+  workingCount: number;
+  idleCount: number;
+  completedCount: number;
+  errorCount: number;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -347,6 +354,79 @@ const STATUS_PRIORITY: Record<SessionLiveStatus, number> = {
   completed: 5,
   dormant: 6,
 };
+
+/** Counts surfaced to the Terminal-page StatusStrip pills. */
+export interface StatusCounts {
+  sessionCount: number;
+  workingCount: number;
+  idleCount: number;
+  completedCount: number;
+  errorCount: number;
+}
+
+/** Minimal shape `computeStatusCounts` needs from a {@link UnifiedSession}. */
+export interface StatusCountsInput {
+  liveStatus: SessionLiveStatus;
+  isOrphaned: boolean;
+}
+
+/**
+ * Pure bucketing for the Terminal-page StatusStrip. Counts only the
+ * *live / actively-managed* Claude sessions, dropping dormant historical
+ * transcripts and orphaned (tab-less) `frozen` transcripts. Extracted as a
+ * pure function so the bucketing rules are unit-testable without mounting the
+ * hook. See the long-form rationale on the `statusCounts` memo below.
+ *
+ * - `dormant` → excluded (the bulk historical over-count).
+ * - orphaned `frozen` (`isOrphaned`) → excluded (resumable historical session).
+ * - tab-backed `frozen` → counts as `idle`.
+ * - `active-in-zone` / `active-external` → `working`.
+ * - `needs-input` / `error` / `completed` → their own bucket, all counted in
+ *   the total.
+ */
+export function computeStatusCounts(sessions: readonly StatusCountsInput[]): StatusCounts {
+  const counts: Record<SessionLiveStatus, number> = {
+    "active-in-zone": 0,
+    "active-external": 0,
+    frozen: 0,
+    "needs-input": 0,
+    completed: 0,
+    error: 0,
+    dormant: 0,
+  };
+  // Live frozen = a stale session still open as a tab in this window.
+  // Orphaned frozen (no tab) is a resumable historical transcript → excluded.
+  let liveFrozen = 0;
+  for (const s of sessions) {
+    // Drop dormant historical transcripts and orphaned (tab-less) frozen
+    // transcripts — they are not actively-managed sessions.
+    if (s.liveStatus === "dormant") continue;
+    if (s.liveStatus === "frozen" && s.isOrphaned) continue;
+    counts[s.liveStatus]++;
+    if (s.liveStatus === "frozen") liveFrozen++;
+  }
+  // working = both running flavors (in-zone + external).
+  const workingCount = counts["active-in-zone"] + counts["active-external"];
+  // idle = genuinely-live-but-paused sessions, i.e. a stale tab still open
+  // in this window (live `frozen`). Orphaned/dormant historical transcripts
+  // were already excluded above, so this no longer balloons.
+  const idleCount = liveFrozen;
+  const completedCount = counts.completed;
+  const errorCount = counts.error;
+  const needsInputLive = counts["needs-input"];
+  // Total = the live managed set: working + idle + needs-input + error +
+  // completed. Equivalently the count of sessions that survived the
+  // dormant/orphan filter above. Reconciles with the per-bucket pills.
+  const sessionCount =
+    workingCount + idleCount + needsInputLive + errorCount + completedCount;
+  return {
+    sessionCount,
+    workingCount,
+    idleCount,
+    completedCount,
+    errorCount,
+  };
+}
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
@@ -871,6 +951,44 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     [allSessions],
   );
 
+  // Per-status breakdown for the Terminal-page StatusStrip pills.
+  //
+  // CRITICAL SCOPE: the strip must count only the *live / actively-managed*
+  // Claude sessions the operator currently has open — NOT every historical
+  // on-disk transcript. `allSessions` is built from `transcriptSessions`
+  // (`transcript_list_sessions` returns EVERY `.jsonl` with message_count > 0
+  // across all accounts — hundreds on a long-lived machine), so
+  // `allSessions.length` is the wrong total: it counts dormant historical
+  // transcripts that aren't running. The operator's "18 sessions / 14 idle"
+  // complaint (and a fresh runner's "438 sessions / 436 idle") is exactly
+  // this over-count — the inflation is the `dormant` bucket (every never-
+  // reopened transcript defaults to `dormant`) plus orphaned `frozen`
+  // transcripts (a `likely_frozen` digest with NO live PTY tab in this
+  // window — `isOrphaned`, i.e. a resumable historical session, not a stuck
+  // live one).
+  //
+  // A session is LIVE — and thus counted by the strip — iff it is NOT a
+  // historical/dormant transcript. Concretely it is dropped when:
+  //   - `liveStatus === "dormant"` — the default for a transcript with no
+  //     live PTY tab in this window and no recent external activity (every
+  //     never-reopened on-disk transcript), i.e. the bulk over-count; OR
+  //   - it is an orphaned `frozen` transcript (`isOrphaned` — a `likely_frozen`
+  //     digest with NO live tab: a resumable historical session, not a stuck
+  //     live one).
+  // Everything that survives is genuinely live: `active-in-zone` /
+  // `active-external` (running), `needs-input` / `error` / `completed`
+  // (always tab-backed — only the `if (tab)` branch sets them), and
+  // tab-backed (non-orphaned) `frozen` (a stale tab still open here →
+  // "idle"). This is status-semantic rather than keyed on the raw
+  // `zoneTabId` pointer so debug-injected fixtures (which carry an explicit
+  // `injected_live_status` but no real tab) are still counted when their
+  // status is a live one — matching what the operator sees rendered.
+  //
+  // Buckets are mapped explicitly over the 7 SessionLiveStatus values so
+  // adding a new status forces a compile-time decision here rather than
+  // silently dropping it.
+  const statusCounts = useMemo(() => computeStatusCounts(allSessions), [allSessions]);
+
   // ── Desktop notifications for frozen sessions ──────────────────────────────
 
   const prevFrozenCountRef = useRef(0);
@@ -987,5 +1105,11 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     frozenCount,
     needsInputCount,
     activeCount,
+    // Session-model counts for the StatusStrip (excludes PTY-only tabs).
+    sessionCount: statusCounts.sessionCount,
+    workingCount: statusCounts.workingCount,
+    idleCount: statusCounts.idleCount,
+    completedCount: statusCounts.completedCount,
+    errorCount: statusCounts.errorCount,
   };
 }

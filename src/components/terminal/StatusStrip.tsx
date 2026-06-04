@@ -114,7 +114,7 @@ const STATE_COLORS: Record<SessionState, string> = {
 
 export function StatusStrip() {
   const session = useTerminalSession();
-  const { tabs, sessionStates, fileLockStates, zoneLayout, workflowGen } = session;
+  const { sessionStates, fileLockStates, zoneLayout, workflowGen, sessionManager } = session;
   const planFileName = workflowGen.planFileName;
   const isPlanLoading = workflowGen.isPlanLoading;
   const {
@@ -154,33 +154,28 @@ export function StatusStrip() {
     return () => clearInterval(id);
   }, []);
 
-  // Counts + derived signals. Reused across the pill list AND the
-  // outer auto-hide gate. Working/completed/idle feed the Phase-9f
-  // state-breakdown pill (sibling to the existing needs-input / error
-  // pills, which keep their own callsites because they're clickable).
+  // Session-shape counts come from the Claude-session model
+  // (`useSessionManager.statusCounts`), scoped to the LIVE / actively-managed
+  // set — NOT raw PTY tabs and NOT every historical on-disk transcript.
+  // Counting raw tabs inflated the total (18 tabs → "18 sessions"); counting
+  // ALL `allSessions` inflated it the other way (hundreds of dormant
+  // historical transcripts → "438 sessions / 436 idle"). statusCounts keeps
+  // only sessions tied to a live PTY tab in this window (or active-external),
+  // so working = active-in-zone + active-external, idle = stale-tab `frozen`
+  // still open here, and dormant/orphaned historical transcripts are dropped.
   const {
+    sessionCount,
     needsInputCount,
     errorCount,
     workingCount,
     completedCount,
     idleCount,
-    stuckLocks,
-    maxStuckMs,
-    longestStuckTabId,
-  } = useMemo(() => {
-    let needsInput = 0;
-    let errors = 0;
-    let working = 0;
-    let completed = 0;
-    let idle = 0;
-    for (const tab of tabs) {
-      const state = sessionStates[tab.id] ?? "idle";
-      if (state === "needs-input") needsInput++;
-      else if (state === "error") errors++;
-      else if (state === "working") working++;
-      else if (state === "completed") completed++;
-      else if (state === "idle") idle++;
-    }
+  } = sessionManager;
+
+  // File-lock "stuck" pill still operates on PTY tabs (a lock is held by
+  // a terminal, not a transcript session), so it keeps its tab-scoped
+  // derivation here.
+  const { stuckLocks, maxStuckMs, longestStuckTabId } = useMemo(() => {
     let stuck = 0;
     let maxMs = 0;
     let longestTabId: string | null = null;
@@ -198,20 +193,14 @@ export function StatusStrip() {
       }
     }
     return {
-      needsInputCount: needsInput,
-      errorCount: errors,
-      workingCount: working,
-      completedCount: completed,
-      idleCount: idle,
       stuckLocks: stuck,
       maxStuckMs: maxMs,
       longestStuckTabId: longestTabId,
     };
     // The tick covers cadence-driven re-eval for the maxStuckMs reading;
-    // tabs / sessionStates / fileLockStates cover state-driven re-eval.
-  }, [tabs, sessionStates, fileLockStates]);
+    // fileLockStates covers state-driven re-eval.
+  }, [fileLockStates]);
 
-  const sessionCount = tabs.length;
   const isMultiZone = sessionCount > 1;
 
   const wrapperCount = wrapperTools.length;
@@ -390,7 +379,7 @@ export function StatusStrip() {
           icon={<TerminalSquare className="w-2.5 h-2.5" />}
           text={`${sessionCount} sessions`}
           color="#565f89"
-          title={`${sessionCount} terminal sessions open in this page`}
+          title={`${sessionCount} Claude sessions tracked on this page`}
         />
       )}
 
