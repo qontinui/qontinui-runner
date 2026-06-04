@@ -1,3 +1,0 @@
-# ElementReliabilityDashboard
-
-_(notes)_

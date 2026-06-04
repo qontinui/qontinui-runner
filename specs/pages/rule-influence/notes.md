@@ -1,3 +1,0 @@
-# RuleInfluencePanel
-
-_(notes)_
