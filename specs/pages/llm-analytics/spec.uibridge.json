@@ -361,7 +361,8 @@
           },
           {
             "id": "heading-2-llm-analytics",
-            "role": "heading"
+            "role": "heading",
+            "textContent": "LLM Analytics"
           },
           {
             "id": "content-paragraph-token-usage-costs-an-0"
@@ -380,7 +381,8 @@
           },
           {
             "id": "llm-analytics-refresh",
-            "role": "button"
+            "role": "button",
+            "accessibleName": "Refresh analytics"
           }
         ],
         "id": "la-toolbar",
@@ -414,7 +416,8 @@
           },
           {
             "id": "scripted-output-refresh",
-            "role": "button"
+            "role": "button",
+            "accessibleName": "Refresh scripted-output stats"
           }
         ],
         "id": "la-scripted-output",
@@ -431,7 +434,8 @@
           },
           {
             "id": "emitter-provider-save",
-            "role": "button"
+            "role": "button",
+            "textContent": "Save"
           },
           {
             "id": "emitter-gemma-endpoint",
@@ -448,15 +452,18 @@
         "elements": [
           {
             "id": "heading-4-fallbacks-by-reason",
-            "role": "heading"
+            "role": "heading",
+            "textContent": "Fallbacks by reason"
           },
           {
             "id": "cell-r0-c0-table",
-            "role": "columnheader"
+            "role": "columnheader",
+            "textContent": "Reason"
           },
           {
             "id": "button-refresh-one-shot-stats",
-            "role": "button"
+            "role": "button",
+            "accessibleName": "Refresh one-shot stats"
           }
         ],
         "id": "la-oneshot-fallbacks",

@@ -331,15 +331,18 @@
         "elements": [
           {
             "id": "heading-3-advanced",
-            "role": "heading"
+            "role": "heading",
+            "textContent": "Advanced"
           },
           {
             "id": "heading-4-debug",
-            "role": "heading"
+            "role": "heading",
+            "textContent": "Debug"
           },
           {
             "id": "button-save-debug-settings",
-            "role": "button"
+            "role": "button",
+            "textContent": "Save Debug Settings"
           }
         ],
         "id": "sd-debug-content",
@@ -370,14 +373,16 @@
         "elements": [
           {
             "id": "heading-4-device-information",
-            "role": "heading"
+            "role": "heading",
+            "textContent": "Device Information"
           },
           {
             "id": "content-label-device-id-0"
           },
           {
             "id": "button-refresh-device-info",
-            "role": "button"
+            "role": "button",
+            "accessibleName": "Refresh device info"
           }
         ],
         "id": "sd-device-info",
@@ -390,14 +395,16 @@
         "elements": [
           {
             "id": "heading-4-experimental",
-            "role": "heading"
+            "role": "heading",
+            "textContent": "Experimental"
           },
           {
             "id": "content-paragraph-these-features-are-e-0"
           },
           {
             "id": "button-xtermjs-0",
-            "role": "button"
+            "role": "button",
+            "textContent": "xterm.js (default)"
           }
         ],
         "id": "sd-experimental",
@@ -410,15 +417,18 @@
         "elements": [
           {
             "id": "tab-debug-22",
-            "role": "tab"
+            "role": "tab",
+            "textContent": "Debug"
           },
           {
             "id": "tab-account-0",
-            "role": "tab"
+            "role": "tab",
+            "textContent": "Account"
           },
           {
             "id": "tab-ai-providers-2",
-            "role": "tab"
+            "role": "tab",
+            "textContent": "AI Providers"
           }
         ],
         "id": "sd-tab-rail",

@@ -349,23 +349,28 @@
         "elements": [
           {
             "id": "button-progress-0",
-            "role": "button"
+            "role": "button",
+            "textContent": "Progress"
           },
           {
             "id": "button-recommendations-1",
-            "role": "button"
+            "role": "button",
+            "textContent": "Recommendations"
           },
           {
             "id": "button-prompt-optimization-2",
-            "role": "button"
+            "role": "button",
+            "textContent": "Prompt Optimization"
           },
           {
             "id": "button-adaptive-learning-11",
-            "role": "button"
+            "role": "button",
+            "textContent": "Adaptive Learning"
           },
           {
             "id": "button-prompt-evolution-13",
-            "role": "button"
+            "role": "button",
+            "textContent": "Prompt Evolution"
           }
         ],
         "id": "mo-sub-nav",
@@ -378,11 +383,13 @@
         "elements": [
           {
             "id": "button-capture-baseline",
-            "role": "button"
+            "role": "button",
+            "textContent": "Capture Baseline"
           },
           {
             "id": "button-refresh",
-            "role": "button"
+            "role": "button",
+            "textContent": "Refresh"
           }
         ],
         "id": "mo-baseline-controls",
