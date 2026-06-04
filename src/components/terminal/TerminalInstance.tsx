@@ -95,6 +95,13 @@ const TERMINAL_OPTIONS = {
     "'Cascadia Code', 'Fira Code', 'JetBrains Mono', Menlo, Monaco, 'Courier New', monospace",
   lineHeight: 1.2,
   scrollback: 10000,
+  // VS Code parity: Alt+click moves the shell cursor to the clicked column
+  // (synthesized arrow keys; `terminal.integrated.altClickMovesCursor` is ON
+  // by default in VS Code), and double-click word selection uses VS Code's
+  // separator set (adds backtick, box-drawing dash, smart quotes, pipe to
+  // xterm's default).
+  altClickMovesCursor: true,
+  wordSeparator: " ()[]{}',\"`─‘’“”|",
   theme: {
     background: "#1a1b26",
     foreground: "#c0caf5",

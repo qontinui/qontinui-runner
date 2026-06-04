@@ -45,6 +45,8 @@ export class XtermBackend implements ITerminalBackend {
       cursorBlink: options.cursorBlink,
       cursorStyle: options.cursorStyle,
       theme: options.theme,
+      altClickMovesCursor: options.altClickMovesCursor,
+      wordSeparator: options.wordSeparator,
       allowProposedApi: true,
     });
 

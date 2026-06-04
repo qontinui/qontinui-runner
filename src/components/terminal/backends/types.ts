@@ -71,6 +71,14 @@ export interface TerminalBackendOptions {
   cursorBlink?: boolean;
   cursorStyle?: "block" | "underline" | "bar";
   theme?: ITerminalTheme;
+  /**
+   * Alt+click repositions the shell cursor by synthesizing arrow-key
+   * presses (VS Code `terminal.integrated.altClickMovesCursor`, default ON
+   * there). Only meaningful on backends that support it (xterm).
+   */
+  altClickMovesCursor?: boolean;
+  /** Word-boundary characters for double-click selection (VS Code parity). */
+  wordSeparator?: string;
 }
 
 // ---------------------------------------------------------------------------
