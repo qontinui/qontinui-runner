@@ -45,10 +45,38 @@ the code_graph fallback).
   `{"references": [ {"file","line","col","kind": "call|import|impl|reference|definition"} ]}`
 
 - `typecheck {"file": "<abs>", "overlay_patch?": {"file": "<abs>", "new_text": "<str>"}}` →
-  `{"ok": <bool>, "errors": [ {"file","line","col","code": <int>, "message"} ], "overlay": <bool>,
+  `{"ok": <bool>, "errors": [ {"file","line","col","code": <int|str|null>, "message"} ], "overlay": <bool>,
+    "coverage": <float>,
     "changed_signatures": [ {"name","before_hash","after_hash"} ],
     "removed_symbols": [ {"name","kind","referenced_by": [ {"file","line"} ]} ] }`
-  With `overlay_patch`: apply `new_text` for `overlay_patch.file` **in-memory only**
+
+  **Language dispatch (Phase A).** `typecheck` dispatches by the target file's
+  extension to one of three checkers; the result shape above is uniform across all
+  three (the `code` field typing differs — see below):
+  - **TypeScript / JavaScript** (default, any non-`.rs`/`.py`/`.pyi` file) → the TS
+    **Language Service** with a **true in-memory overlay** (this §A stdio command).
+    `code` is the numeric TS diagnostic code (`<int>`).
+  - **Python** (`.py`/`.pyi`) → **`mypy`**. Post-write observe runs mypy on the
+    on-disk file; predict (`overlay_patch`) uses **`mypy --shadow-file`** — a TRUE
+    overlay, the real file is never modified. `code` is the bracketed mypy error
+    code **string** (e.g. `"assignment"`, `"name-defined"`), or `null`. Only
+    `error:`-severity lines count into `errors[]` (`note:`/`warning:` ignored). Both
+    paths report `coverage: 1.0` / provenance `mypy`.
+  - **Rust** (`.rs`) → **`cargo check --message-format=json`**. Post-write observe is
+    full fidelity (`coverage: 1.0` / provenance `cargo-check`); `code` is the rustc
+    code string (e.g. `"E0308"`) or `null`. Predict (`overlay_patch`) has **no
+    in-memory overlay** (a write-then-restore mutation window in a live working tree
+    is unacceptable), so it returns a **syntactic-only** prediction of changed/removed
+    `pub` items with `errors: []`, `overlay: true`, and **`coverage: 0.5`** /
+    provenance `cargo-syntactic`. The honest coverage<1 routes coord's
+    `classify_edit_outcome` to **Partial** rather than asserting a clean predict.
+
+  The §A `coverage` field mirrors the envelope's `coverage` (§C); coord's
+  `EditPrediction::from_typecheck_result` reads coverage from the **result body**
+  (defaulting 0.0 when absent), so all three checkers include it in the body and the
+  TS dispatch lifts the envelope coverage into the body if absent.
+
+  With `overlay_patch` (TS): apply `new_text` for `overlay_patch.file` **in-memory only**
   (never write disk), recompute diagnostics for `file`, then clear the overlay. This is
   D3 `predict-effect`. `changed_signatures`/`removed_symbols` compare the overlaid
   file's exported symbol set against the on-disk version (2b). `removed_symbols`
@@ -66,11 +94,17 @@ TS frontend). v1 supports the single default TS scope but the code is structured
 a scope registry (map scope → helper child).
 
 - `GET  /code-semantics/health` →
-  `{"status": "ok", "scopes": [ {"scope","language","indexed","file_count","provenance"} ]}`
+  `{"status": "ok", "scopes": [ {"scope","language","indexed","file_count","provenance"} ],
+    "engines": [ {"language": "rust"|"python", "available": <bool>} ]}`
+  The `scopes[]` entries are the per-scope TS index state (unchanged). The new
+  `engines[]` array reports Phase-A *engine* availability for the Rust (`cargo
+  check`) and Python (`mypy`) typecheck dispatchers (not per-scope index state).
 - `POST /code-semantics/symbol-lookup`  body `{"scope?","file?","name","kind?"}`
 - `POST /code-semantics/signature`      body `{"scope?","file","name?","kind?","line?","col?"}`
 - `POST /code-semantics/find-references` body `{"scope?","file","name?","line?","col?","cross_repo?": false}`
 - `POST /code-semantics/typecheck`      body `{"scope?","file","overlay_patch?": {"file","new_text"}}`
+  — dispatches by `file` extension (§A): `.rs` → `cargo check`, `.py`/`.pyi` → `mypy`,
+  else the TS Language Service.
 
 ### Cold-index / coverage (D4) — load-bearing
 
@@ -88,6 +122,20 @@ a scope registry (map scope → helper child).
   (symbol-lookup) / `coverage=0` `provenance="engine_unavailable"` (resolution queries).
   Never 500 on a missing engine.
 
+#### Rust / Python typecheck dispatch (Phase A) — same honest posture
+
+- **Rust** (`.rs`): `cargo`/manifest unavailable → `engine_unavailable` (coverage 0,
+  never a fabricated clean). Observe (no overlay) → real `cargo check` → coverage 1.0,
+  `provenance="cargo-check"`, `credibility=(high,high,high)`. A nonzero cargo exit
+  **with** parsed error diagnostics is a valid "observed errors" result; a nonzero exit
+  with **no** diagnostics (bad manifest / toolchain) → `engine_unavailable`. Predict
+  (overlay) → syntactic-only, `errors:[]`, `overlay:true`, **coverage 0.5**,
+  `provenance="cargo-syntactic"`, boundary `medium`.
+- **Python** (`.py`/`.pyi`): `mypy` unavailable → `engine_unavailable`. Observe / predict
+  → `mypy` (predict via `--shadow-file`, true overlay) → coverage 1.0,
+  `provenance="mypy"`, `credibility=(high,high,high)`. `mypy` exit ≥2 (crash) →
+  `engine_unavailable`, never a fabricated clean; exit 0/1 are clean/has-errors.
+
 ---
 
 ## C. Uniform observation envelope (both sidecar HTTP responses and coord MCP output)
@@ -99,7 +147,7 @@ a scope registry (map scope → helper child).
   "result": { ...query-specific payload (the §A result body, lifted) ... },
   "posterior": 1.0,
   "coverage": 1.0,
-  "provenance": "ts-language-service|code_graph_fallback|indexing|engine_unavailable",
+  "provenance": "ts-language-service|code_graph_fallback|code_graph_resolved|indexing|engine_unavailable|mypy|cargo-check|cargo-syntactic",
   "credibility": { "causal": "high", "authorial": "high", "boundary": "high" },
   "staleness_seconds": null,
   "kernel": false
@@ -117,6 +165,13 @@ a scope registry (map scope → helper child).
   resolver) is boundary **`medium`**; the LSP `ts-language-service` is boundary
   **`high`**. Reserving `medium` for the resolved tier keeps the low/medium/high
   triple unambiguously orderable across all three observers.
+- **Phase-A typecheck provenances** slot onto the same ladder: `mypy` and
+  `cargo-check` are full-fidelity type-checker observations → boundary **`high`** /
+  coverage 1.0 (peers of `ts-language-service`). `cargo-syntactic` (the Rust
+  overlay-predict fallback, no compile) sits at boundary **`medium`** / coverage 0.5,
+  alongside `code_graph_resolved` — above raw syntactic, below a real type-check — so
+  coord's `classify_edit_outcome` honestly routes a Rust predict to **Partial** rather
+  than asserting a clean answer it never compiled.
 
 ---
 
