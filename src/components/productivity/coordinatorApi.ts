@@ -311,7 +311,29 @@ export interface FleetAlert {
   page_due_at: string | null;
 }
 
-/** Merged payload from the `get_fleet_health` command. */
+/** Structured device-auth state for the fleet reads.
+ *
+ * coord is anonymous today, so this is `ok` in practice; once coord
+ * starts gating `/coord/fleet/health` + `/coord/alerts` (a later phase)
+ * the backend distinguishes an auth rejection (401/403) from a transport
+ * error so the panel can render an honest auth state rather than the
+ * "coord unreachable" banner:
+ * - `ok`           — normal
+ * - `unauthorized` — a device token was present but coord rejected it
+ *                    (rejected/expired) → re-pair to restore the view
+ * - `unpaired`     — no device token locally and coord 401/403'd → pair
+ *
+ * Optional for back-compat with an older backend during dev (absent →
+ * treated as `ok`). */
+export interface FleetAuth {
+  state: "ok" | "unauthorized" | "unpaired";
+}
+
+/** Merged payload from the `get_fleet_health` command.
+ *
+ * `health` is `null` when coord returned an auth rejection (401/403) —
+ * the structured `auth` state drives the panel in that case rather than
+ * the stale machine grid. */
 export interface FleetHealth {
   health: {
     machines: FleetMachineSnapshot[];
@@ -320,9 +342,11 @@ export interface FleetHealth {
     alerts: { critical: number; warning: number; info: number };
     kv_bucket: string;
     as_of: string;
-  };
+  } | null;
   alerts: FleetAlert[];
   coordBase: string;
+  /** Optional for back-compat with an older backend (absent → `ok`). */
+  auth?: FleetAuth;
 }
 
 /** Fetch coord's fleet-health rollup + active alerts via the runner

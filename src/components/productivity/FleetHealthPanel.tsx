@@ -28,6 +28,7 @@ import { createLogger } from "@/lib/logger";
 import {
   getFleetHealth,
   type FleetAlert,
+  type FleetAuth,
   type FleetHealth,
   type FleetMachineSnapshot,
 } from "./coordinatorApi";
@@ -68,6 +69,40 @@ function ago(ts: string | null): string {
   return `${Math.round(s / 3600)}h ago`;
 }
 
+/** Derived view-state for the panel — pure so it's unit-testable under
+ *  the runner's node-environment vitest (no jsdom to render the JSX).
+ *
+ *  An auth rejection (coord 401/403) is NOT a transport error: it must
+ *  read as an auth failure, not "coord unreachable", and must NOT show
+ *  the stale machine grid as if current. coord is anonymous today so
+ *  `auth.state` is `ok` in practice; an absent `auth` (older backend
+ *  during dev) is treated as `ok` for back-compat. */
+export function deriveFleetView(data: FleetHealth | null): {
+  authState: FleetAuth["state"];
+  isUnauthorized: boolean;
+  isUnpaired: boolean;
+  isAuthBlocked: boolean;
+  machines: FleetMachineSnapshot[];
+  alerts: FleetAlert[];
+  rollup: { critical: number; warning: number; info: number };
+} {
+  const authState = data?.auth?.state ?? "ok";
+  const isUnauthorized = authState === "unauthorized";
+  const isUnpaired = authState === "unpaired";
+  const isAuthBlocked = isUnauthorized || isUnpaired;
+  return {
+    authState,
+    isUnauthorized,
+    isUnpaired,
+    isAuthBlocked,
+    // When auth-blocked, drop any stale grid/alerts so we never render
+    // them as if current.
+    machines: isAuthBlocked ? [] : data?.health?.machines ?? [],
+    alerts: isAuthBlocked ? [] : data?.alerts ?? [],
+    rollup: data?.health?.alerts ?? { critical: 0, warning: 0, info: 0 },
+  };
+}
+
 export function FleetHealthPanel() {
   const [data, setData] = useState<FleetHealth | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -101,9 +136,8 @@ export function FleetHealthPanel() {
     return () => window.clearInterval(id);
   }, [load]);
 
-  const machines = data?.health.machines ?? [];
-  const alerts = data?.alerts ?? [];
-  const rollup = data?.health.alerts ?? { critical: 0, warning: 0, info: 0 };
+  const { isUnauthorized, isUnpaired, isAuthBlocked, machines, alerts, rollup } =
+    deriveFleetView(data);
 
   return (
     <section
@@ -147,14 +181,43 @@ export function FleetHealthPanel() {
         </button>
       </header>
 
-      {error && (
+      {/* A genuine command rejection (coord unreachable / parse error) ≠
+          runner broken — keep the last good frame behind a retriable
+          banner. Suppressed when coord returned an auth rejection: that
+          gets its own honest auth state below, not a "coord unreachable"
+          message. */}
+      {error && !isAuthBlocked && (
         <div className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400">
           coord unreachable — showing last known state. ({error})
         </div>
       )}
 
-      {/* Per-machine state grid */}
-      {machines.length === 0 ? (
+      {/* Auth-rejected: token present but coord rejected/expired it. Honest
+          about the cause — this is NOT a network blip — and does not show
+          the stale machine grid as if it were current. */}
+      {isUnauthorized ? (
+        <div
+          className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-400"
+          data-ui-bridge-id="productivity.fleet-health-unauthorized"
+        >
+          <div className="font-semibold text-foreground">Fleet view requires sign-in</div>
+          <p className="mt-1 text-amber-400/90">
+            This device&apos;s coord token was rejected or expired. Re-pair the
+            device to restore the fleet view.
+          </p>
+        </div>
+      ) : isUnpaired ? (
+        <div
+          className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-400"
+          data-ui-bridge-id="productivity.fleet-health-unpaired"
+        >
+          <div className="font-semibold text-foreground">Device not paired</div>
+          <p className="mt-1 text-amber-400/90">
+            Pair this device with coord to see fleet health.
+          </p>
+        </div>
+      ) : machines.length === 0 ? (
+        /* Per-machine state grid */
         <div className="rounded-md border border-border/40 bg-muted/10 p-3 text-xs text-muted-foreground">
           No machines registered with a pollable /health URL yet.
         </div>
