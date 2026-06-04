@@ -33,6 +33,57 @@ struct JwtExpClaim {
     exp: i64,
 }
 
+/// Leeway (seconds) applied when deciding whether a device-JWT is expired
+/// for *attach* purposes. A small clock-skew margin so a token that's a few
+/// seconds from expiry is treated as already-dead rather than attached and
+/// 401'd a moment later by the relay.
+const EXPIRY_LEEWAY_SECS: i64 = 30;
+
+/// Decode the `exp` (unix seconds) claim from a JWT *without* verifying its
+/// signature. Returns `None` when the input is not a 3-segment JWT or the
+/// payload fails to base64/JSON-decode (e.g. a legacy opaque
+/// `qontinui_runner_<random>` bearer).
+///
+/// This is the single decode site shared by [`AuthManager::device_jwt_needs_refresh`]
+/// (refresher staleness), the SDK-connect expired-token guard, and the
+/// `/auth/freshness` introspection route. Signature verification is
+/// intentionally out of scope — coord re-verifies the JWT on every WS
+/// handshake; the only thing read here is the unverified `exp` for staleness
+/// decisions and operator introspection.
+pub(crate) fn decode_jwt_exp(token: &str) -> Option<i64> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    // Try URL_SAFE_NO_PAD first (the JWT spec mandates no-padding), but
+    // accept URL_SAFE defensively too.
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[1]))
+        .ok()?;
+    let claim: JwtExpClaim = serde_json::from_slice(&payload_bytes).ok()?;
+    Some(claim.exp)
+}
+
+/// Returns `true` iff `token` is a JWT whose `exp` is already in the past
+/// (with [`EXPIRY_LEEWAY_SECS`] of leeway). A non-JWT / undecodable token
+/// returns `false` — callers that want a shape check should use
+/// [`looks_like_jwt`] first; this helper answers only "is this decodable
+/// JWT past its expiry?" and never claims an opaque token is expired.
+pub(crate) fn jwt_is_expired(token: &str) -> bool {
+    match decode_jwt_exp(token) {
+        Some(exp) => {
+            let now = chrono::Utc::now().timestamp();
+            now - EXPIRY_LEEWAY_SECS >= exp
+        }
+        None => false,
+    }
+}
+
 /// When `QONTINUI_DISABLE_KEYCHAIN` is set, keychain reads return an error
 /// (callers fall back to file storage) and keychain writes are no-ops. The
 /// keychain path is best-effort migration backup; file storage is the source
@@ -139,23 +190,50 @@ impl AuthManager {
     ///
     /// Returns an error if the token is not found in any storage.
     pub fn get_access_token(&self) -> Result<String> {
-        // Try file storage first (primary)
+        // Try file storage first (primary).
+        //
+        // Distinguish two failure modes (item 5 of the auth-friction plan):
+        //   - file ABSENT  → first-run / never-paired; keychain fallback +
+        //     migration (overwrite the `.enc`) is the correct bootstrap.
+        //   - file PRESENT but load failed → the store is malformed (parse /
+        //     decrypt error). We STILL fall back to the keychain for an
+        //     in-memory token (availability), but we must NOT overwrite the
+        //     `.enc` file — doing so would mask the corruption (no forensics)
+        //     and resurrect potentially-stale keychain tokens over a present
+        //     store. So we suppress the migrate-write in this case.
+        let store_present = self.secure_storage.store_file_exists();
         match self.secure_storage.get_access_token() {
             Ok(token) => {
                 debug!("Retrieved access token from secure storage");
                 return Ok(token);
             }
             Err(e) => {
-                debug!("Access token not in secure storage: {}", e);
+                if store_present {
+                    warn!(
+                        "Secure storage present but access token could not be loaded \
+                         (malformed/undecryptable store): {}. Falling back to keychain WITHOUT \
+                         overwriting the .enc file (left intact for forensics).",
+                        e
+                    );
+                } else {
+                    debug!("Access token not in secure storage (no store file): {}", e);
+                }
             }
         }
 
-        // Fall back to keychain (for migration)
+        // Fall back to keychain (for migration).
         match self.get_access_token_from_keychain() {
             Ok(token) => {
-                info!("Retrieved access token from keychain (migrating to secure storage)");
-                // Migrate: try to get refresh token too and store both in secure storage
-                if let Ok(refresh) = self.get_refresh_token_from_keychain() {
+                info!("Retrieved access token from keychain");
+                // Only migrate (overwrite the `.enc`) when the store file is
+                // ABSENT — first-run bootstrap. When the store is present but
+                // unreadable, leave it untouched (see above).
+                if store_present {
+                    warn!(
+                        "Skipping keychain→secure-storage migration: a malformed store file is \
+                         present and must not be overwritten."
+                    );
+                } else if let Ok(refresh) = self.get_refresh_token_from_keychain() {
                     if let Err(e) = self.secure_storage.store_tokens(&token, &refresh) {
                         warn!("Failed to migrate tokens to secure storage: {}", e);
                     } else {
@@ -373,38 +451,39 @@ impl AuthManager {
         if token.is_empty() {
             return Ok(true);
         }
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() != 3 {
-            debug!("device_jwt_needs_refresh: token is not a 3-segment JWT (likely legacy opaque) — treating as needs-refresh");
-            return Ok(true);
+        // Unparseable tokens (non-3-segment legacy opaque bearers, or a
+        // payload that fails base64/JSON-decode) get treated as needs-refresh
+        // so the refresher heals legacy installs.
+        match crate::auth::decode_jwt_exp(&token) {
+            Some(exp) => {
+                let now = chrono::Utc::now().timestamp();
+                Ok(now + REFRESH_BEFORE_EXPIRY_SECS >= exp)
+            }
+            None => {
+                debug!(
+                    "device_jwt_needs_refresh: access_token is not a decodable JWT \
+                     (likely legacy opaque) — treating as needs-refresh"
+                );
+                Ok(true)
+            }
         }
-        // Try URL_SAFE_NO_PAD first (the JWT spec mandates no-padding), but
-        // accept URL_SAFE defensively too.
-        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(parts[1])
-            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[1]));
-        let payload_bytes = match payload_bytes {
-            Ok(b) => b,
-            Err(e) => {
-                debug!(
-                    "device_jwt_needs_refresh: middle segment base64-decode failed ({e}) \
-                     — treating as needs-refresh"
-                );
-                return Ok(true);
-            }
-        };
-        let claim: JwtExpClaim = match serde_json::from_slice(&payload_bytes) {
-            Ok(c) => c,
-            Err(e) => {
-                debug!(
-                    "device_jwt_needs_refresh: payload JSON-decode failed ({e}) \
-                     — treating as needs-refresh"
-                );
-                return Ok(true);
-            }
-        };
-        let now = chrono::Utc::now().timestamp();
-        Ok(now + REFRESH_BEFORE_EXPIRY_SECS >= claim.exp)
+    }
+
+    /// Returns the decoded (unverified) `exp` of the device-JWT in the
+    /// `access_token` slot, or `None` if the slot is empty, missing, or holds
+    /// a non-decodable (legacy opaque) bearer. Used by the `/auth/freshness`
+    /// introspection route to compute an expiry delta without exposing the
+    /// token. Reuses the shared [`decode_jwt_exp`] machinery.
+    pub fn access_token_exp(&self) -> Option<i64> {
+        let token = self.get_access_token().ok()?;
+        crate::auth::decode_jwt_exp(&token)
+    }
+
+    /// Returns the absolute Cognito (oauth) access-token expiry in unix
+    /// seconds, if a Cognito session is present. Thin pass-through to
+    /// `SecureStorage::get_oauth_expires_at`.
+    pub fn oauth_expires_at(&self) -> Option<i64> {
+        self.secure_storage.get_oauth_expires_at()
     }
 
     // ========================================================================
@@ -628,6 +707,71 @@ mod looks_like_jwt_tests {
 }
 
 #[cfg(test)]
+mod jwt_exp_tests {
+    use super::{decode_jwt_exp, jwt_is_expired, EXPIRY_LEEWAY_SECS};
+    use base64::Engine;
+
+    /// Build a syntactically-valid (unsigned) JWT with the given `exp` claim.
+    /// Header/signature are throwaway — only the middle segment is decoded.
+    fn jwt_with_exp(exp: i64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{exp}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn decodes_exp_from_valid_jwt() {
+        let token = jwt_with_exp(1_900_000_000);
+        assert_eq!(decode_jwt_exp(&token), Some(1_900_000_000));
+    }
+
+    #[test]
+    fn decode_returns_none_for_opaque_token() {
+        assert_eq!(decode_jwt_exp("qontinui_runner_abc123"), None);
+    }
+
+    #[test]
+    fn decode_returns_none_for_empty() {
+        assert_eq!(decode_jwt_exp(""), None);
+        assert_eq!(decode_jwt_exp("   "), None);
+    }
+
+    #[test]
+    fn decode_returns_none_for_malformed_payload() {
+        // Three segments but the middle is not valid base64url JSON.
+        assert_eq!(decode_jwt_exp("aaa.!!!.ccc"), None);
+        // Valid base64 but not JSON with an `exp` field.
+        let not_json = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
+        assert_eq!(decode_jwt_exp(&format!("aaa.{not_json}.ccc")), None);
+    }
+
+    #[test]
+    fn expired_token_is_expired() {
+        let now = chrono::Utc::now().timestamp();
+        // Comfortably past expiry (beyond the leeway window).
+        let token = jwt_with_exp(now - EXPIRY_LEEWAY_SECS - 60);
+        assert!(jwt_is_expired(&token));
+    }
+
+    #[test]
+    fn fresh_token_is_not_expired() {
+        let now = chrono::Utc::now().timestamp();
+        let token = jwt_with_exp(now + 3600);
+        assert!(!jwt_is_expired(&token));
+    }
+
+    #[test]
+    fn malformed_token_is_not_reported_expired() {
+        // A non-decodable token must NOT be claimed expired — only a
+        // decodable-past-exp JWT counts. (looks_like_jwt is the shape gate.)
+        assert!(!jwt_is_expired("qontinui_runner_abc123"));
+        assert!(!jwt_is_expired(""));
+        assert!(!jwt_is_expired("aaa.!!!.ccc"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
@@ -685,6 +829,42 @@ mod tests {
         // Clear and verify
         auth_manager.clear_tokens().unwrap();
         assert!(!auth_manager.has_tokens());
+    }
+
+    /// Item 5: a malformed-but-PRESENT store file must NOT be overwritten by
+    /// the keychain-migration fallback. `get_access_token` may fall back to
+    /// the keychain for availability, but the `.enc` bytes stay byte-identical
+    /// (left intact for forensics) rather than being clobbered with a fresh
+    /// store derived from (potentially stale) keychain tokens.
+    #[test]
+    fn malformed_store_present_is_not_overwritten() {
+        // Keep keychain out of the picture so the test is deterministic on
+        // every platform: with no keychain entry, get_access_token returns
+        // Err — exactly the case where the OLD code would have re-migrated
+        // and overwritten the file had a keychain token existed.
+        let temp_dir = env::temp_dir().join("qontinui_test_auth");
+        let storage_path = temp_dir.join("malformed_store_present_is_not_overwritten.enc");
+        let _ = fs::remove_file(&storage_path);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // Write garbage bytes — present, but neither decryptable nor parseable.
+        let garbage = b"this-is-not-a-valid-encrypted-token-store\x00\x01\x02".to_vec();
+        fs::write(&storage_path, &garbage).unwrap();
+
+        let storage = SecureStorage::with_path(storage_path.clone()).unwrap();
+        let mgr = AuthManager::with_storage(storage);
+
+        // Load attempt: with no keychain token available this errors, but the
+        // important invariant is the file-untouched check below.
+        let _ = mgr.get_access_token();
+
+        let after = fs::read(&storage_path).expect("store file must still exist");
+        assert_eq!(
+            after, garbage,
+            "malformed store file must be left byte-identical (not overwritten)"
+        );
+
+        let _ = fs::remove_file(&storage_path);
     }
 }
 

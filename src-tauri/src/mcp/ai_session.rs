@@ -249,6 +249,66 @@ pub async fn idle_status(State(state): State<Arc<ApiState>>) -> Json<Vec<Session
 }
 
 // ============================================================================
+// Token freshness introspection (`GET /auth/freshness`)
+// ============================================================================
+
+/// Response for `GET /auth/freshness` — token staleness as *deltas from now*,
+/// never the tokens or any absolute secret.
+///
+/// All deltas are seconds-from-now (negative = already expired). `None` means
+/// the corresponding token is absent (no Cognito session, or no decodable
+/// device-JWT). This lets an operator ask a running runner "how stale are
+/// your tokens?" over HTTP without decrypting `auth_tokens.enc` out-of-band.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshnessResponse {
+    /// The device-JWT/access-token `exp` minus now (seconds). `None` when the
+    /// `access_token` slot is empty or holds a non-decodable (legacy opaque)
+    /// bearer.
+    pub access_token_exp_in_s: Option<i64>,
+    /// The Cognito `oauth_expires_at` minus now (seconds). `None` when no
+    /// Cognito session is present.
+    pub oauth_expires_in_s: Option<i64>,
+    /// Whether this runner is paired (a `paired_user.json` exists on disk).
+    pub paired: bool,
+}
+
+/// Pure delta computation, extracted so it can be unit-tested without disk
+/// I/O. Converts absolute unix-second expiries into seconds-from-`now`
+/// deltas; `None` inputs pass through as `None`.
+fn compute_freshness_deltas(
+    access_token_exp: Option<i64>,
+    oauth_expires_at: Option<i64>,
+    now: i64,
+    paired: bool,
+) -> FreshnessResponse {
+    FreshnessResponse {
+        access_token_exp_in_s: access_token_exp.map(|exp| exp - now),
+        oauth_expires_in_s: oauth_expires_at.map(|exp| exp - now),
+        paired,
+    }
+}
+
+/// `GET /auth/freshness` — local-only token-freshness introspection.
+///
+/// Returns expiry deltas for the device-JWT (`access_token` slot) and the
+/// Cognito access token, plus whether the runner is paired. NEVER returns
+/// tokens or absolute secrets — only seconds-from-now deltas. This is a
+/// top-level local route (outside the `/ui-bridge/*` family), reachable only
+/// on the runner's local server.
+pub async fn auth_freshness(State(_state): State<Arc<ApiState>>) -> Json<FreshnessResponse> {
+    let auth_manager = crate::auth::AuthManager::new();
+    let now = chrono::Utc::now().timestamp();
+    let paired = qontinui_runner_lib::pair::read_paired_user_id_from_disk().is_some();
+    Json(compute_freshness_deltas(
+        auth_manager.access_token_exp(),
+        auth_manager.oauth_expires_at(),
+        now,
+        paired,
+    ))
+}
+
+// ============================================================================
 // Routes
 // ============================================================================
 
@@ -268,6 +328,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/restart-runner", post(restart_runner))
         .route("/prompts/run", post(run_prompt))
         .route("/sessions/idle-status", get(idle_status))
+        .route("/auth/freshness", get(auth_freshness))
         .route(
             "/sessions/{session_id}/promote-to-worktree",
             post(promote_session_to_worktree_handler),
@@ -2383,5 +2444,38 @@ mod tests {
         let now_ms_2 = now_ms_1 + 1_000;
         let second = build_idle_entries(snapshot, now_ms_2);
         assert_eq!(second[0].idle_ms, 1_000);
+    }
+
+    // ------------------------------------------------------------------
+    // `GET /auth/freshness` — compute_freshness_deltas (item 4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn freshness_computes_positive_and_negative_deltas() {
+        let now = 1_700_000_000_i64;
+        // access token expires 1h from now; oauth already expired 5m ago.
+        let r = compute_freshness_deltas(Some(now + 3_600), Some(now - 300), now, true);
+        assert_eq!(r.access_token_exp_in_s, Some(3_600));
+        assert_eq!(r.oauth_expires_in_s, Some(-300));
+        assert!(r.paired);
+    }
+
+    #[test]
+    fn freshness_passes_none_through() {
+        let now = 1_700_000_000_i64;
+        let r = compute_freshness_deltas(None, None, now, false);
+        assert_eq!(r.access_token_exp_in_s, None);
+        assert_eq!(r.oauth_expires_in_s, None);
+        assert!(!r.paired);
+    }
+
+    #[test]
+    fn freshness_never_leaks_absolute_expiry() {
+        // The delta must be relative to `now`, not the absolute unix-seconds
+        // expiry that lives in storage.
+        let now = 1_700_000_000_i64;
+        let r = compute_freshness_deltas(Some(1_700_000_050), Some(1_700_000_010), now, true);
+        assert_eq!(r.access_token_exp_in_s, Some(50));
+        assert_eq!(r.oauth_expires_in_s, Some(10));
     }
 }
