@@ -280,6 +280,7 @@ pub async fn acquire_for_terminal(
     intent_repo: Option<&str>,
     purpose: &str,
     working_dir: Option<String>,
+    agent_session_id: Option<uuid::Uuid>,
 ) -> (Option<String>, Option<IsolatedEditContext>) {
     let Some(repo) = intent_repo else {
         return (working_dir, None);
@@ -291,7 +292,7 @@ pub async fn acquire_for_terminal(
         declared_overlap_paths: None,
         plan_id: None,
         phase: None,
-        agent_session_id: None,
+        agent_session_id,
     })
     .await
     {

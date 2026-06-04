@@ -966,6 +966,11 @@ pub async fn launch_coordinator_session(
             Some("qontinui-runner"),
             "Coordinator session",
             Some(primary_repo_path.clone()),
+            // No stable per-session id exists yet at spawn time — the new
+            // Coordinator establishes its own identity via
+            // `try_acquire_coordinator_lease` inside the spawned CLI
+            // process, not in this scope. None is correct here.
+            None,
         )
         .await;
     let repo_path = effective_repo_path.unwrap_or(primary_repo_path);
@@ -1038,6 +1043,14 @@ pub async fn spawn_worker_session(
     let primary_repo_path = resolve_runner_repo_path()
         .ok_or_else(|| "Failed to resolve qontinui-runner repo path".to_string())?;
 
+    // The worker's stable session id. Generated here (ahead of the
+    // worktree allocate) so it can be folded into the isolated-worktree
+    // claim's owner token — this is the per-worker identity the terminal
+    // is being created FOR (later handed to `WorkerSession::new` + coord
+    // registration). Distinguishes two workers spawned on one machine as
+    // distinct claim holders.
+    let task_run_id = Uuid::new_v4().to_string();
+
     // Phase 2 — worker sessions always intend to edit qontinui-runner
     // (the Coordinator's `assign-task` dispatch targets runner code).
     // Route through `acquire_for_terminal` so this path stays in
@@ -1048,6 +1061,7 @@ pub async fn spawn_worker_session(
             Some(&intent_repo),
             "Worker session",
             Some(primary_repo_path.clone()),
+            uuid::Uuid::parse_str(&task_run_id).ok(),
         )
         .await;
     let repo_path = effective_repo_path.unwrap_or(primary_repo_path);
@@ -1075,8 +1089,6 @@ pub async fn spawn_worker_session(
             effective_config_dir.as_deref(),
         );
     }
-
-    let task_run_id = Uuid::new_v4().to_string();
 
     let title = title_hint.unwrap_or_else(|| next_worker_title(&terminal_manager));
     // PowerShell 5.1 doesn't accept `&&`, and the pty already starts

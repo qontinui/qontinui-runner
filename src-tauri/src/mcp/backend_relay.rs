@@ -2145,11 +2145,22 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        // Stable session id of the agent issuing this relay request, if the
+        // caller supplied one — folded into the claim owner token so distinct
+        // agent sessions on one machine are distinct holders. Sourced from the
+        // request payload (the initiator's context), NOT the runner's process
+        // env. Absent / unparseable → None.
+        let agent_session_id = data
+            .get("agent_session_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
         let (working_dir, isolated_ctx) =
             crate::agent_worktree::isolated_edit::acquire_for_terminal(
                 intent_repo.as_deref(),
                 title.as_deref().unwrap_or("Terminal edit session"),
                 working_dir,
+                agent_session_id,
             )
             .await;
 

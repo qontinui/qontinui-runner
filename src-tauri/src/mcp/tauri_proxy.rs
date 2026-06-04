@@ -177,6 +177,13 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 /// PTY cwd instead of `working_dir`. Mirrors the `intent_repo`
                 /// argument on the `terminal_create` Tauri command.
                 intent_repo: Option<String>,
+                /// Stable session id of the agent creating this terminal,
+                /// supplied by the proxy caller (the initiator's context).
+                /// Folded into the isolated-worktree claim's owner token so
+                /// distinct agent sessions on one machine are distinct
+                /// holders. Absent → None.
+                #[serde(default)]
+                agent_session_id: Option<uuid::Uuid>,
             }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
@@ -193,6 +200,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                     a.intent_repo.as_deref(),
                     a.title.as_deref().unwrap_or("Terminal edit session"),
                     a.working_dir,
+                    a.agent_session_id,
                 )
                 .await;
 
