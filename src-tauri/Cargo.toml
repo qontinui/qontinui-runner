@@ -137,7 +137,7 @@ vte = "0.15"
 unicode-width = "0.2"
 arboard = "3.4"
 dashmap = "6"
-lru = "0.12"
+lru = "0.16"
 xcap = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 tempfile = "3"
