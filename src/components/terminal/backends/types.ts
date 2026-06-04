@@ -121,6 +121,14 @@ export interface ITerminalBackend {
 
   // -- Scrolling ------------------------------------------------------------
   scrollToBottom(): void;
+  /**
+   * Scroll the viewport by `amount` lines through the scrollback. Positive
+   * scrolls DOWN (toward newest output), negative scrolls UP (into history).
+   * Used by the Shift+wheel local-scroll override in `TerminalInstance` to
+   * scroll even when the foreground app has captured the wheel via a mouse
+   * tracking mode. No-op when there is no scrollback to move through.
+   */
+  scrollLines(amount: number): void;
 
   // -- Key handling ---------------------------------------------------------
   /** Intercept key events before the terminal processes them. Return false to prevent default. */
