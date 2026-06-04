@@ -1,3 +1,0 @@
-# AdvancedSettings
-
-_(notes)_

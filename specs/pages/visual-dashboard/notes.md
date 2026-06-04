@@ -1,3 +1,0 @@
-# ActiveDashboardPage
-
-_(notes)_

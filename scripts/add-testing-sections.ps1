@@ -232,14 +232,12 @@ function Spec-HasTesting {
 $specs = [ordered]@{
     "runner:api-surface"                  = "runner_api-surface.json"
     "runner:architecture"                 = "runner_architecture.json"
-    "runner:autoresearch"                 = "runner_autoresearch.json"
     "runner:dag-workflow-editor"          = "runner_dag-workflow-editor.json"
     "runner:decision-trail"               = "runner_decision-trail.json"
     "runner:demo-video"                   = "runner_demo-video.json"
     "runner:development-intelligence"     = "runner_development-intelligence.json"
     "runner:image-quality-tests"          = "runner_image-quality-tests.json"
     "runner:llm-analytics"                = "runner_llm-analytics.json"
-    "runner:memory"                       = "runner_memory.json"
     "runner:meta-optimizer"               = "runner_meta-optimizer.json"
     "runner:product-tours"                = "runner_product-tours.json"
     "runner:project-explainer"            = "runner_project-explainer.json"
@@ -261,8 +259,6 @@ $specs = [ordered]@{
     "runner:settings-world-state-verifier" = "runner_settings-world-state-verifier.json"
     "runner:specs"                        = "runner_specs.json"
     "runner:terminal"                     = "runner_terminal.json"
-    "runner:vga"                          = "runner_vga.json"
-    "runner:visual-dashboard"             = "runner_visual-dashboard.json"
 }
 
 $FENCE = [char]96 + [char]96 + [char]96  # triple backtick — avoids escape headaches inside the here-string

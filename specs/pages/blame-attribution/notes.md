@@ -1,3 +1,0 @@
-# BlameAttributionTab
-
-_(notes)_

@@ -656,7 +656,7 @@
     }
   ],
   "metadata": {
-    "component": "workflows",
+    "component": "workflow-builder",
     "tags": [
       "workflow-builder",
       "ai-generation",

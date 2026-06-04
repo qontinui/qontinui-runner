@@ -149,7 +149,7 @@
     }
   ],
   "metadata": {
-    "component": "run-image-recognition",
+    "component": "run-logs",
     "tags": [
       "run-image-recognition",
       "visual-automation",

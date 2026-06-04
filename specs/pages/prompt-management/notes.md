@@ -1,3 +1,0 @@
-# PromptRegistryTab
-
-_(notes)_

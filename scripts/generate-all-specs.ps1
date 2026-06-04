@@ -135,21 +135,21 @@ function Extract-AndSave-Spec {
 # Parallel arrays: button slug (from page label) and correct spec ID (runner:{navId})
 $pageBtns = @(
     "backend-connection", "advanced-ai", "ai-providers",
-    "architecture", "autoresearch", "backup", "dag-editor", "dashboard",
+    "architecture", "backup", "dag-editor",
     "debug", "decision-trail", "demo-videos", "dev-intelligence", "explainer",
     "general", "image-quality", "llm-analytics", "log-sources", "mcp-servers",
-    "memory", "meta-optimizer", "mobile", "playwright", "product-tours",
+    "meta-optimizer", "mobile", "playwright", "product-tours",
     "security", "self-healing", "session-recap", "specs", "storage",
-    "updates", "visual-gui", "world-state-verifier"
+    "updates", "world-state-verifier"
 )
 $pageSpecIds = @(
     "runner:settings-backend-connection", "runner:settings-agentic", "runner:settings-ai",
-    "runner:architecture", "runner:autoresearch", "runner:settings-backup", "runner:dag-workflow-editor", "runner:visual-dashboard",
+    "runner:architecture", "runner:settings-backup", "runner:dag-workflow-editor",
     "runner:settings-debug", "runner:decision-trail", "runner:demo-video", "runner:development-intelligence", "runner:project-explainer",
     "runner:settings-general", "runner:image-quality-tests", "runner:llm-analytics", "runner:settings-log-sources", "runner:settings-mcp",
-    "runner:memory", "runner:meta-optimizer", "runner:settings-mobile", "runner:settings-playwright", "runner:product-tours",
+    "runner:meta-optimizer", "runner:settings-mobile", "runner:settings-playwright", "runner:product-tours",
     "runner:settings-security", "runner:settings-self-healing", "runner:session-recap", "runner:specs", "runner:settings-storage",
-    "runner:settings-updates", "runner:vga", "runner:settings-world-state-verifier"
+    "runner:settings-updates", "runner:settings-world-state-verifier"
 )
 
 Log "=== Spec generation loop. $($pageBtns.Count) pages to process. ==="
