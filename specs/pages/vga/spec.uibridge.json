@@ -1460,7 +1460,13 @@
       },
       {
         "description": "The Transitions tab renders TransitionsPanel showing the list of transitions with source/target states, action types, and runtime introspection data. When the tab opens with an active config, the runner API is queried for permitted and blocked triggers, surfacing the live state machine execution context alongside the static transition list.",
-        "elements": [],
+        "elements": [
+          {
+            "tagName": "button",
+            "textContent": "Transitions",
+            "id": "sm-tab-transitions"
+          }
+        ],
         "id": "vga-transitions-tab",
         "isInitial": false,
         "name": "Transitions Tab",

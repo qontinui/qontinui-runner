@@ -1172,7 +1172,12 @@
       },
       {
         "description": "The header includes a 36×36 cyan-tinted icon tile holding a Package icon — this matches the 'icon-tile' visual pattern established on the UI Bridge integration page.",
-        "elements": [],
+        "elements": [
+          {
+            "tagName": "p",
+            "textContains": "Install wrapper extensions"
+          }
+        ],
         "id": "header-icon-tile",
         "isInitial": false,
         "name": "Header Icon Tile",
@@ -1411,7 +1416,12 @@
       },
       {
         "description": "Each card has a 'Details' disclosure button (chevron icon) that expands to reveal: (1) the absolute config file path under 'Config file:'; (2) for ConfigParseError state, a red 'Config error:' block with the path and the message 'Open this file and fix the JSON, or delete it to start fresh.'; (3) the JSON snippet that will be written or removed under the mcpServers key, with placeholders '<launcher path>' and '<port>' since the live values aren't fetched into the UI; (4) for Drifted state, the current (stale) command path and port shown alongside the new values that Reconnect will write. The note 'The runner fills in its own stable launcher path and current port.' is rendered below the JSON snippet.",
-        "elements": [],
+        "elements": [
+          {
+            "tagName": "button",
+            "textContent": "Details"
+          }
+        ],
         "id": "ai-clients-details-disclosure",
         "isInitial": false,
         "name": "AI Clients Tab — Details Disclosure",

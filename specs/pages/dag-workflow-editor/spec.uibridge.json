@@ -957,7 +957,21 @@
       },
       {
         "description": "The toolbar contains a workflow name input field (aria-label='Workflow name'), an Import button, an Export button, and a validation status badge. These are the primary controls for managing a workflow file.",
-        "elements": [],
+        "elements": [
+          {
+            "role": "textbox",
+            "ariaLabel": "Workflow name",
+            "tagName": "input"
+          },
+          {
+            "tagName": "button",
+            "textContent": "Import"
+          },
+          {
+            "tagName": "button",
+            "textContent": "Export"
+          }
+        ],
         "id": "dag-toolbar-controls",
         "isInitial": false,
         "name": "Toolbar Controls",
@@ -1044,7 +1058,16 @@
       },
       {
         "description": "The graph uses dagre top-to-bottom layout (rankdir=TB). ReactFlow controls appear at bottom-left of the graph pane (zoom in/out, fit view). A minimap appears at bottom-right. The graph supports scroll-to-zoom and drag-to-pan.",
-        "elements": [],
+        "elements": [
+          {
+            "role": "button",
+            "ariaLabel": "Zoom In"
+          },
+          {
+            "role": "button",
+            "ariaLabel": "Fit View"
+          }
+        ],
         "id": "dag-graph-layout",
         "isInitial": false,
         "name": "Graph Layout and Navigation Controls",
