@@ -1896,19 +1896,32 @@ mod tests {
 
     /// `error_chain` must surface every nested `source()` — the whole
     /// point is recovering the connect/DNS/TLS detail that `Display` on
-    /// the outermost error hides.
+    /// the outermost error hides. (NB: `io::Error::new(kind, payload)`
+    /// does NOT expose the payload via `source()` — it forwards the
+    /// payload's own source — so the fixture needs a real wrapper type.)
     #[test]
     fn error_chain_walks_sources() {
-        let root = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "os error 10061");
-        let mid = std::io::Error::new(std::io::ErrorKind::Other, root);
-        let rendered = error_chain(&mid);
-        assert!(
-            rendered.contains("os error 10061"),
-            "source chain detail missing from: {rendered}"
-        );
-        assert!(
-            rendered.contains(": "),
-            "chain separator missing from: {rendered}"
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let outer = Outer(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "os error 10061",
+        ));
+        let rendered = error_chain(&outer);
+        assert_eq!(
+            rendered, "error sending request: os error 10061",
+            "full source chain must be rendered"
         );
     }
 
