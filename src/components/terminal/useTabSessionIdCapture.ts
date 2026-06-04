@@ -73,6 +73,14 @@ interface CaptureParams {
   /** Used to skip capture for tabs that already have a session id
    *  (e.g. resume path beat us to it) and for diagnostics. */
   tabs: TerminalTab[];
+  /**
+   * Fired the instant a `claudeSessionId` is bound to a tab — the durable
+   * session-registry OPEN hook. The hook itself stays zone-agnostic; the
+   * consumer (TerminalPage) resolves the tab's zone and records the OPEN
+   * synchronously (NOT via the debounced localStorage snapshot). Optional
+   * `configDir` is the Claude config dir captured from the transcript.
+   */
+  onSessionIdBound?: (tabId: string, claudeSessionId: string, configDir?: string) => void;
 }
 
 interface UseTabSessionIdCaptureResult {
@@ -100,7 +108,15 @@ interface UseTabSessionIdCaptureResult {
 export function useTabSessionIdCapture({
   updateTab,
   tabs,
+  onSessionIdBound,
 }: CaptureParams): UseTabSessionIdCaptureResult {
+  // Keep the latest callback in a ref so `startCapture`'s identity stays
+  // stable (it only depends on `updateTab`); the bind site reads the live
+  // callback without re-creating the polling closure on every render.
+  const onSessionIdBoundRef = useRef(onSessionIdBound);
+  useEffect(() => {
+    onSessionIdBoundRef.current = onSessionIdBound;
+  }, [onSessionIdBound]);
   // Tabs reference: kept fresh so `startCapture` can read the latest
   // `claudeSessionId` and skip already-bound tabs.
   const tabsRef = useRef(tabs);
@@ -232,6 +248,10 @@ export function useTabSessionIdCapture({
             // Persist durably so a later state churn / remount that drops the
             // live id off the tab object can still be recovered at save time.
             rememberSessionId(tabId, data.session_id, data.config_dir);
+            // Record the OPEN in the durable backend session registry the
+            // instant the id is known. Zone-agnostic here — the consumer
+            // resolves the zone and fires the synchronous record.
+            onSessionIdBoundRef.current?.(tabId, data.session_id, data.config_dir);
             handle.cancelled = true;
             inFlight.current.delete(tabId);
             return;
