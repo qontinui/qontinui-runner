@@ -1075,7 +1075,14 @@
       },
       {
         "description": "A draggable vertical divider between the YAML editor and graph panes allows the user to adjust the width ratio. The minimum pane width is 20% and the maximum is 80% (of the total container width). The initial split is 50/50.",
-        "elements": [],
+        "elements": [
+          {
+            "role": "separator",
+            "ariaLabel": "Resize editor panes",
+            "tagName": "div",
+            "id": "dag-resize-handle"
+          }
+        ],
         "id": "dag-resize-handle",
         "isInitial": false,
         "name": "Split-Pane Resize Handle",

@@ -702,6 +702,11 @@
         "elements": [
           {
             "textContent": "Watchers"
+          },
+          {
+            "role": "button",
+            "ariaLabel": "Watchers",
+            "tagName": "button"
           }
         ],
         "id": "watchers-navigation",

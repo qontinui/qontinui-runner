@@ -1178,6 +1178,11 @@
         "elements": [
           {
             "textContent": "passed to qontinui Python when executing workflows"
+          },
+          {
+            "role": "tab",
+            "textContent": "Self-Healing",
+            "tagName": "button"
           }
         ],
         "id": "sh-settings-persistence",

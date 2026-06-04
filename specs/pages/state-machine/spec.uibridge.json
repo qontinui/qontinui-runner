@@ -2889,6 +2889,11 @@
         "elements": [
           {
             "textContent": "captures"
+          },
+          {
+            "role": "button",
+            "textContent": "Discovery",
+            "tagName": "button"
           }
         ],
         "id": "sm-discovery-algorithm",
