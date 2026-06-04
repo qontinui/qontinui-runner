@@ -27,6 +27,15 @@ const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
     ],
   },
   {
+    title: "Find (focused terminal)",
+    shortcuts: [
+      { keys: "Ctrl+F", description: "Find in terminal scrollback" },
+      { keys: "Enter / F3", description: "Next match" },
+      { keys: "Shift+Enter / Shift+F3", description: "Previous match" },
+      { keys: "Escape", description: "Close find (clears highlights)" },
+    ],
+  },
+  {
     title: "Scrolling (focused terminal)",
     shortcuts: [
       { keys: "Shift+Wheel", description: "Scroll scrollback even when an app captures the wheel" },

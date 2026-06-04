@@ -1,11 +1,12 @@
-import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
+import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
 import { FilePathLinkProvider } from "./FilePathLinkProvider";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useUIBridgeOptional } from "@qontinui/ui-bridge";
 import type { TerminalOutputEvent, TerminalExitEvent } from "@qontinui/shared-types/tauri-events";
 import { createTerminalBackend } from "./backends";
-import type { BackendType, ITerminalBackend } from "./backends";
+import type { BackendType, ITerminalBackend, TerminalSearchResults } from "./backends";
+import { TerminalFindBar } from "./TerminalFindBar";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { instanceStorage } from "@/lib/instance-storage";
 import { consumeInputChunk } from "./consumeInputChunk";
@@ -175,6 +176,79 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     // pixel deltas (trackpads) accumulate here so slow scrolling advances
     // smoothly instead of snapping a whole line per tick. See `wheelScroll.ts`.
     const wheelScrollAccumRef = useRef(0);
+
+    // ── Find-in-terminal (VS Code Ctrl+F parity) ─────────────────────────
+    // State drives the TerminalFindBar overlay; the refs mirror it so the
+    // backend key handler (created once in the init effect) and runFind can
+    // read fresh values without re-running the effect.
+    const [findOpen, setFindOpen] = useState(false);
+    // Bumped on every Ctrl+F so a re-press while already open remounts the
+    // bar (key prop), refocusing + selecting the query like VS Code.
+    const [findFocusSeq, setFindFocusSeq] = useState(0);
+    const [findQuery, setFindQuery] = useState("");
+    const [findOpts, setFindOpts] = useState({
+      caseSensitive: false,
+      wholeWord: false,
+      regex: false,
+    });
+    const [findResults, setFindResults] = useState<TerminalSearchResults>({
+      resultIndex: -1,
+      resultCount: 0,
+    });
+    const findQueryRef = useRef(findQuery);
+    findQueryRef.current = findQuery;
+    const findOptsRef = useRef(findOpts);
+    findOptsRef.current = findOpts;
+
+    /**
+     * Run a search pass against the backend. `incremental` keeps the active
+     * match anchored while the operator types (VS Code behavior); plain
+     * next/prev navigation passes false to advance. Invalid regexes are
+     * swallowed — the addon throws on bad patterns mid-typing (e.g. "[").
+     */
+    const runFind = useCallback((direction: "next" | "prev", incremental = false) => {
+      const b = backendRef.current;
+      if (!b) return;
+      const q = findQueryRef.current;
+      if (!q) {
+        b.clearSearch();
+        setFindResults({ resultIndex: -1, resultCount: 0 });
+        return;
+      }
+      const opts = { ...findOptsRef.current, incremental };
+      try {
+        if (direction === "next") b.findNext(q, opts);
+        else b.findPrevious(q, opts);
+      } catch {
+        // Invalid regex while typing — leave previous results in place.
+      }
+    }, []);
+
+    const handleFindQueryChange = useCallback(
+      (q: string) => {
+        setFindQuery(q);
+        findQueryRef.current = q; // searchable immediately, before re-render
+        runFind("next", true);
+      },
+      [runFind],
+    );
+
+    const toggleFindOpt = useCallback(
+      (key: "caseSensitive" | "wholeWord" | "regex") => {
+        const next = { ...findOptsRef.current, [key]: !findOptsRef.current[key] };
+        findOptsRef.current = next;
+        setFindOpts(next);
+        runFind("next", true);
+      },
+      [runFind],
+    );
+
+    const closeFind = useCallback(() => {
+      setFindOpen(false);
+      setFindResults({ resultIndex: -1, resultCount: 0 });
+      backendRef.current?.clearSearch();
+      backendRef.current?.focus();
+    }, []);
 
     // Expose selection, write, and scrollback API to parent components
     useImperativeHandle(ref, () => ({
@@ -399,6 +473,13 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           }),
         );
 
+        // Find-in-terminal match counts → TerminalFindBar ("k of n").
+        disposables.push(
+          backend.onSearchResults((results) => {
+            setFindResults(results);
+          }),
+        );
+
         // Handle Ctrl+C copy (when text is selected) and Ctrl+V paste.
         // Tauri's webview doesn't fire the browser clipboard events that xterm.js
         // relies on, so we intercept the keys and use the clipboard API manually.
@@ -432,6 +513,39 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
               })
               .catch(() => {});
             return false; // prevent terminal default handling
+          }
+
+          // VS Code-parity find: Ctrl+F opens the find bar; F3 / Shift+F3
+          // jump to the next/previous match (opening the bar if needed).
+          // Swallowed so the keys never reach the PTY — Ctrl+F would
+          // otherwise be forward-char in readline/PSReadLine.
+          if (
+            event.type === "keydown" &&
+            (event.ctrlKey || event.metaKey) &&
+            !event.altKey &&
+            !event.shiftKey &&
+            event.key.toLowerCase() === "f"
+          ) {
+            event.preventDefault();
+            setFindOpen(true);
+            setFindFocusSeq((s) => s + 1);
+            return false;
+          }
+          if (
+            event.type === "keydown" &&
+            event.key === "F3" &&
+            !event.ctrlKey &&
+            !event.altKey &&
+            !event.metaKey
+          ) {
+            event.preventDefault();
+            setFindOpen(true);
+            if (findQueryRef.current) {
+              runFind(event.shiftKey ? "prev" : "next");
+            } else {
+              setFindFocusSeq((s) => s + 1);
+            }
+            return false;
           }
 
           // VS Code-parity scrollback navigation: Shift+PageUp/PageDown,
@@ -838,11 +952,31 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     prevVisibleRef.current = visible;
 
     return (
-      <div
-        ref={containerRef}
-        className={`h-full w-full ${visible ? "" : "hidden"}`}
-        style={{ padding: "4px 0 0 4px" }}
-      />
+      // Wrapper exists so the find bar can overlay as a React-managed
+      // sibling: xterm imperatively appends its own DOM into the inner
+      // container div, and mixing React children with foreign nodes in the
+      // same parent invites reconciliation surprises.
+      <div className={`relative h-full w-full ${visible ? "" : "hidden"}`}>
+        <div ref={containerRef} className="h-full w-full" style={{ padding: "4px 0 0 4px" }} />
+        {findOpen && (
+          <TerminalFindBar
+            key={findFocusSeq}
+            query={findQuery}
+            onQueryChange={handleFindQueryChange}
+            resultIndex={findResults.resultIndex}
+            resultCount={findResults.resultCount}
+            caseSensitive={findOpts.caseSensitive}
+            wholeWord={findOpts.wholeWord}
+            regex={findOpts.regex}
+            onToggleCase={() => toggleFindOpt("caseSensitive")}
+            onToggleWholeWord={() => toggleFindOpt("wholeWord")}
+            onToggleRegex={() => toggleFindOpt("regex")}
+            onNext={() => runFind("next")}
+            onPrev={() => runFind("prev")}
+            onClose={closeFind}
+          />
+        )}
+      </div>
     );
   },
 );

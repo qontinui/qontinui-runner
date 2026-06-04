@@ -1,5 +1,6 @@
 export type { BackendType, ITerminalBackend, TerminalBackendOptions } from "./types";
 export type { ITerminalLinkProvider, ITerminalLink, IDisposable } from "./types";
+export type { TerminalSearchOptions, TerminalSearchResults } from "./types";
 
 export { XtermBackend } from "./XtermBackend";
 
