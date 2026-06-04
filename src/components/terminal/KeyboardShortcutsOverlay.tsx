@@ -27,6 +27,18 @@ const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
     ],
   },
   {
+    title: "Scrolling (focused terminal)",
+    shortcuts: [
+      { keys: "Shift+Wheel", description: "Scroll scrollback even when an app captures the wheel" },
+      { keys: "Shift+PageUp", description: "Scroll up one page" },
+      { keys: "Shift+PageDown", description: "Scroll down one page" },
+      { keys: "Ctrl+Alt+PageUp", description: "Scroll up one line" },
+      { keys: "Ctrl+Alt+PageDown", description: "Scroll down one line" },
+      { keys: "Ctrl+Home", description: "Scroll to top" },
+      { keys: "Ctrl+End", description: "Scroll to bottom" },
+    ],
+  },
+  {
     title: "Layouts",
     shortcuts: [
       { keys: "Ctrl+Shift+1", description: "Single layout" },
