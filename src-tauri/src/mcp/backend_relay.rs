@@ -521,6 +521,26 @@ async fn relay_loop(
                 let state_outbound = api_state.clone();
                 let state_heartbeat = api_state.clone();
                 let mut shutdown_clone = shutdown_rx.clone();
+                // Mark the loop-level `kick_rx` seen at the current version
+                // BEFORE cloning it for the connected select. This is the
+                // fix for the reconnect kick-loop: a `watch::Receiver` clone
+                // inherits the SOURCE receiver's last-observed version, and
+                // `changed()` resolves whenever the channel version is newer
+                // than that. The connected arm below awaits `kick_clone`'s
+                // `changed()`, which marks only the CLONE seen — the loop
+                // owner `kick_rx` stays at the pre-kick version. Without this
+                // `borrow_and_update`, a single kick (which ends the connected
+                // select, tears down, and `continue`s) would re-enter here,
+                // clone `kick_rx` *still at the pre-kick version*, and the new
+                // `kick_clone.changed()` would resolve IMMEDIATELY on the same
+                // already-handled kick → tear down → loop, seeding a tight
+                // connect/teardown loop (~23 cycles in 20s observed) that
+                // hammered the device-WS register path and pressured the web
+                // backend's Redis pool. Marking `kick_rx` seen here means each
+                // fresh `kick_clone` starts level with the channel, so exactly
+                // ONE genuine kick triggers exactly ONE reconnect.
+                kick_rx.borrow_and_update();
+
                 // Clone the kick receiver so an established connection can be
                 // torn down on a kick (settings change / tier demotion /
                 // sign-out). Without this arm the connected select only ends
@@ -2700,5 +2720,78 @@ mod tests {
         let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["error"], "invalid HTTP method");
+    }
+
+    // ------------------------------------------------------------------
+    // Reconnect kick-loop guard (watch-channel mark-seen invariant).
+    //
+    // The connected `tokio::select!` in `relay_loop` awaits a CLONED kick
+    // receiver (`kick_clone`). A `watch::Receiver` clone inherits the
+    // SOURCE receiver's last-observed version, and `changed()` resolves
+    // whenever the channel version is newer than what the receiver has
+    // seen — and marks only the receiver it's called on. The bug: the
+    // connected arm marked `kick_clone` seen but left the loop owner
+    // `kick_rx` at the pre-kick version, so on `continue` → reconnect the
+    // freshly-cloned `kick_clone` (inheriting `kick_rx`'s STALE version)
+    // saw the same already-handled kick as still-pending and re-fired
+    // immediately, seeding a tight connect/teardown loop.
+    //
+    // The fix calls `kick_rx.borrow_and_update()` at connect time, right
+    // before cloning. The async loop itself is impractical to unit-test,
+    // so these pin the exact `watch` semantics the fix depends on:
+    // `try_recv`/`has_changed` model `changed()`'s readiness.
+
+    #[test]
+    fn cloned_kick_receiver_inherits_source_seen_version() {
+        // A clone taken AFTER the source observed the latest version starts
+        // level with the channel — `has_changed()` is false until a NEW send.
+        let (tx, mut rx) = watch::channel(0u64);
+        let _ = tx.send(1); // a kick
+        rx.borrow_and_update(); // loop owner marks it seen (the fix)
+
+        let clone_after = rx.clone();
+        assert!(
+            !clone_after.has_changed().expect("sender alive"),
+            "a clone taken after the source marked the kick seen MUST start \
+             level — otherwise the connected select re-fires on the same kick"
+        );
+    }
+
+    #[test]
+    fn one_kick_triggers_one_teardown_then_quiesces() {
+        // Model the connect → clone → kick → teardown → reconnect → clone
+        // sequence. With the `borrow_and_update` fix, the SECOND clone (the
+        // reconnect) sees no pending change, so a single kick = a single
+        // teardown rather than a self-perpetuating loop.
+        let (tx, mut kick_rx) = watch::channel(0u64);
+
+        // ---- connect #1 ----
+        kick_rx.borrow_and_update(); // the fix: mark seen at connect
+        let mut kick_clone_1 = kick_rx.clone();
+        // one genuine kick arrives while connected
+        let _ = tx.send(1);
+        assert!(
+            kick_clone_1.has_changed().expect("sender alive"),
+            "the connected arm MUST observe the (one) genuine kick"
+        );
+        kick_clone_1.borrow_and_update(); // connected arm consumes it, then `continue`
+
+        // ---- reconnect / connect #2 (no new kick has been sent) ----
+        kick_rx.borrow_and_update(); // the fix again, at the new connect
+        let kick_clone_2 = kick_rx.clone();
+        assert!(
+            !kick_clone_2.has_changed().expect("sender alive"),
+            "after handling one kick, the reconnect's fresh clone MUST NOT \
+             see a pending change — this is the regression guard against the \
+             tight connect/teardown loop"
+        );
+
+        // ---- a SECOND genuine kick still tears down (intent preserved) ----
+        let mut kick_clone_2 = kick_clone_2;
+        let _ = tx.send(2);
+        assert!(
+            kick_clone_2.has_changed().expect("sender alive"),
+            "a NEW kick must still force exactly one reconnect"
+        );
     }
 }
