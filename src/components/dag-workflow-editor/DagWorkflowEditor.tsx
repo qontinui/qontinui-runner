@@ -340,6 +340,10 @@ export function DagWorkflowEditor() {
 
         {/* Resize handle */}
         <div
+          role="separator"
+          aria-label="Resize editor panes"
+          aria-orientation="vertical"
+          data-ui-bridge-id="dag-resize-handle"
           onMouseDown={handleMouseDown}
           className={cn(
             "flex-shrink-0 w-1.5 cursor-col-resize relative group flex items-center justify-center",

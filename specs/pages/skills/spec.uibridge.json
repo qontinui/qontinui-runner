@@ -747,6 +747,11 @@
           {
             "role": "button",
             "textContains": "Rejected"
+          },
+          {
+            "role": "button",
+            "textContent": "All",
+            "tagName": "button"
           }
         ],
         "id": "skills-element-presence",

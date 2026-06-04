@@ -909,6 +909,11 @@
         "elements": [
           {
             "textContent": "Ctrl+Shift+T"
+          },
+          {
+            "role": "tab",
+            "textContent": "Terminal",
+            "tagName": "button"
           }
         ],
         "id": "term-multi-tab",

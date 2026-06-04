@@ -206,6 +206,11 @@
         "elements": [
           {
             "textContent": "Shortcuts"
+          },
+          {
+            "role": "tab",
+            "textContent": "Shortcuts",
+            "tagName": "button"
           }
         ],
         "id": "help-shortcuts",

@@ -1392,6 +1392,11 @@
           {
             "role": "button",
             "textContains": "onnect"
+          },
+          {
+            "role": "button",
+            "textContent": "AI Clients",
+            "tagName": "button"
           }
         ],
         "id": "ai-clients-status-pills",
