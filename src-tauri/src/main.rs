@@ -466,13 +466,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // future. Same posture as the supervisor's interval-style background
     // tasks — a one-shot `block_on` is the wrong shape because the
     // heartbeat task lives for the runner's entire lifetime.
+    // The heartbeat gets its OWN OS thread + single-thread runtime,
+    // isolated from the publisher/census/reclaim/agent-runtime tasks
+    // below. Those siblings walk dozens of git worktrees with
+    // synchronous `git` subprocess calls and real-file stat sweeps,
+    // which block their runtime's only worker for minutes at a time on
+    // a busy machine. When all five tasks shared one worker thread, the
+    // heartbeat starved into silent multi-minute stalls — the
+    // 2026-06-03 fleet-liveness outage: the device aged out of
+    // `/coord/fleet/state` (120s TTL vs 30s cadence) while the loop
+    // neither ticked nor warned, on a freshly-built binary. A
+    // current_thread runtime hosting ONLY the 30s heartbeat guarantees
+    // fleet liveness can't be starved by sibling blocking work.
     std::thread::Builder::new()
         .name("fleet-heartbeat".to_string())
         .spawn(|| {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .thread_name("fleet-hb-rt")
                 .build()
             {
                 Ok(rt) => rt,
@@ -486,11 +496,45 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             };
             rt.block_on(async {
                 fleet::spawn_heartbeat();
+                // Park this thread's runtime forever so the spawned
+                // interval task keeps ticking for the runner's lifetime.
+                std::future::pending::<()>().await;
+            });
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| {
+            warn!(
+                "fleet::heartbeat: failed to spawn dedicated OS thread ({e}). \
+                 Skipping periodic heartbeat — runner still boots."
+            );
+        });
+
+    std::thread::Builder::new()
+        .name("fleet-publishers".to_string())
+        .spawn(|| {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("fleet-pub-rt")
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    warn!(
+                        "fleet::publishers: failed to build dedicated tokio runtime ({e}). \
+                         Skipping tree publisher / census / reclaim / agent runtime — \
+                         runner still boots."
+                    );
+                    return;
+                }
+            };
+            rt.block_on(async {
                 // Plan 2026-05-19-coordinator-production-readiness.md
-                // Phase 1 — periodic primary-tree state publisher. Same
-                // runtime / OS-thread as the heartbeat task so we don't
-                // pay for a second long-lived thread; the publisher's
-                // 60s cadence is way below the heartbeat's 30s scale.
+                // Phase 1 — periodic primary-tree state publisher. These
+                // four tasks share one worker thread; they're all
+                // best-effort publishers/pollers that tolerate delaying
+                // each other (unlike the heartbeat above, which feeds
+                // coord's 120s liveness TTL and must never be starved).
                 fleet::spawn_tree_publisher();
                 // Ξ_Worktree census (Phase 1) — periodic disk-footprint
                 // + junction-status + volume-free-space census of every

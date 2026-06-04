@@ -268,6 +268,24 @@ struct DeviceBudgetRequest {
     max_concurrent_builds: i32,
 }
 
+/// Render an error with its full `source()` chain. `Display` on
+/// `reqwest::Error` alone collapses connect/DNS/TLS detail into the generic
+/// "error sending request for url (…)" — which made the 2026-06-03
+/// fleet-heartbeat outage undiagnosable from the WARN logs (every failed
+/// tick printed the same opaque line while the root cause stayed hidden in
+/// the source chain). Walk the chain so failure WARNs carry the root cause
+/// (e.g. "dns error", "os error 10060", schannel detail).
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(cause) = src {
+        s.push_str(": ");
+        s.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    s
+}
+
 /// Resolve the coord HTTP base. Source-of-truth chain: env `COORD_HTTP_URL`
 /// → `~/.qontinui/profiles.json` active profile's `coord_url` (ws→http).
 ///
@@ -332,7 +350,7 @@ async fn post_budget_with_retry(
                 last_err = format!("POST {url} -> HTTP {status}: {body_text}");
             }
             Err(e) => {
-                last_err = format!("POST {url} failed: {e}");
+                last_err = format!("POST {url} failed: {}", error_chain(&e));
             }
         }
         // Don't sleep after the final attempt.
@@ -617,7 +635,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("POST {url}: {e}"))?;
+        .map_err(|e| format!("POST {url}: {}", error_chain(&e)))?;
 
     let status = resp.status();
     if status.is_success() {
@@ -806,10 +824,26 @@ pub fn spawn_heartbeat() {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Failure-streak counter: each WARN carries the running count (so
+        // log timestamps reveal whether ticks are actually firing every
+        // `secs`), and recovery logs once at info — the success path is
+        // otherwise debug-quiet, which hid the 2026-06-03 outage's
+        // intermittency from the default log level.
+        let mut consecutive_failures: u32 = 0;
         loop {
             tick.tick().await;
-            if let Err(e) = heartbeat_to_coord().await {
-                warn!("fleet::heartbeat: {e}");
+            match heartbeat_to_coord().await {
+                Err(e) => {
+                    consecutive_failures += 1;
+                    warn!("fleet::heartbeat: {e} (consecutive_failures={consecutive_failures})");
+                }
+                Ok(()) if consecutive_failures > 0 => {
+                    info!(
+                        "fleet::heartbeat: recovered after {consecutive_failures} failed tick(s)"
+                    );
+                    consecutive_failures = 0;
+                }
+                Ok(()) => {}
             }
         }
     });
@@ -1751,7 +1785,8 @@ pub async fn publish_tree_state() -> Result<(), String> {
             }
             Err(e) => {
                 warn!(
-                    "fleet::tree_publisher: POST {url} for {repo} failed: {e}",
+                    "fleet::tree_publisher: POST {url} for {repo} failed: {}",
+                    error_chain(&e),
                     repo = payload.repo
                 );
                 false
@@ -1858,6 +1893,37 @@ mod tests {
     }
 
     // ---- PR Merge Orchestrator Phase 8 D8.0 — claude probe -----------
+
+    /// `error_chain` must surface every nested `source()` — the whole
+    /// point is recovering the connect/DNS/TLS detail that `Display` on
+    /// the outermost error hides. (NB: `io::Error::new(kind, payload)`
+    /// does NOT expose the payload via `source()` — it forwards the
+    /// payload's own source — so the fixture needs a real wrapper type.)
+    #[test]
+    fn error_chain_walks_sources() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let outer = Outer(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "os error 10061",
+        ));
+        let rendered = error_chain(&outer);
+        assert_eq!(
+            rendered, "error sending request: os error 10061",
+            "full source chain must be rendered"
+        );
+    }
 
     /// Smoke: the probe never panics; whether `claude` is on PATH varies
     /// per host so we only assert the function returns a `bool`. This
