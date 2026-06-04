@@ -619,7 +619,15 @@ pub fn build_census() -> Option<WorktreeCensusReq> {
 /// a successful POST; `Err` only on a built-payload transport / non-2xx
 /// failure (the caller logs + retries next tick).
 pub async fn tick_once() -> Result<(), String> {
-    let req = match build_census() {
+    // build_census stats real files under every worktree's node_modules/
+    // target and shells out to git — a synchronous multi-second disk walk.
+    // Run it on the blocking pool so the shared fleet-publishers runtime's
+    // async worker isn't pinned for the duration (the starvation class
+    // PR #391 isolated the heartbeat from).
+    let req = match tokio::task::spawn_blocking(build_census)
+        .await
+        .map_err(|e| format!("census walk panicked: {e}"))?
+    {
         Some(r) => r,
         None => return Ok(()),
     };

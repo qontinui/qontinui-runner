@@ -1755,7 +1755,20 @@ pub async fn publish_tree_state() -> Result<(), String> {
             continue;
         }
 
-        let mut payload = match capture_tree(&path) {
+        // capture_tree shells out to ~7 synchronous git subprocesses per
+        // repo — multi-second on big or index-locked worktrees, and this
+        // machine has dozens of them. Run it on the blocking pool so the
+        // fleet-publishers runtime's async worker isn't pinned for the
+        // whole walk (PR #391 isolated the heartbeat from this starvation;
+        // this removes the starvation at its source). A panic inside the
+        // closure surfaces as a JoinError → treated as a skip, same as
+        // capture_tree returning None.
+        let capture_path = path.clone();
+        let mut payload = match tokio::task::spawn_blocking(move || capture_tree(&capture_path))
+            .await
+            .ok()
+            .flatten()
+        {
             Some(p) => p,
             None => {
                 debug!(
