@@ -275,6 +275,18 @@ impl SecureStorage {
             .ok_or_else(|| anyhow::anyhow!("Device ID not found in storage"))
     }
 
+    /// Returns whether the encrypted storage file is present on disk.
+    ///
+    /// Distinguishes "no store yet" (first-run / never paired) from "store
+    /// present but unreadable" (a `load_tokens()` parse/decrypt failure on an
+    /// existing file). Callers use this to avoid masking a malformed-but-present
+    /// store: a parse failure with the file PRESENT must not trigger a keychain
+    /// re-migration that overwrites the `.enc` file. See
+    /// `AuthManager::get_access_token`.
+    pub fn store_file_exists(&self) -> bool {
+        self.storage_path.exists()
+    }
+
     /// Checks if tokens exist in storage.
     pub fn has_tokens(&self) -> bool {
         match self.load_tokens() {

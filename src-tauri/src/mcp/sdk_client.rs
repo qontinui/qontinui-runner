@@ -153,6 +153,27 @@ struct ConnectionHealthResult {
     app_name: String,
 }
 
+/// Which bearer (if any) the connect handshake attached, surfaced on the
+/// connect response so callers can see the auth choice at the default log
+/// level (it was previously only visible at `debug!`). NEVER the token —
+/// just the kind. Values:
+/// - `"cognito"` — a fresh Cognito user access token (relay `/users/me`).
+/// - `"device-jwt"` — the coord device-JWT in the `access_token` slot
+///   (relay `/api/v1/devices/me`).
+/// - `"device-jwt-expired-skipped"` — a device-JWT was present but already
+///   past its `exp`, so it was NOT attached; the connect proceeded
+///   unauthenticated (see [`connect_sdk_app`]).
+/// - `"none"` — no Cognito session and no usable device-JWT (legacy/local
+///   install or not paired); connected without auth.
+/// - `"reused"` — an existing connection was reused/switched-to; no fresh
+///   handshake ran, so the bearer choice was NOT re-evaluated (whatever was
+///   attached at original connect time is still in effect).
+const AUTH_PATH_COGNITO: &str = "cognito";
+const AUTH_PATH_DEVICE_JWT: &str = "device-jwt";
+const AUTH_PATH_DEVICE_JWT_EXPIRED: &str = "device-jwt-expired-skipped";
+const AUTH_PATH_NONE: &str = "none";
+const AUTH_PATH_REUSED: &str = "reused";
+
 /// Connect response
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,6 +181,26 @@ pub struct ConnectResponse {
     pub app: SdkAppInfo,
     pub url: String,
     pub base_path: String,
+    /// Which bearer the handshake attached. See the `AUTH_PATH_*` constants.
+    /// Serialized as a plain string; NEVER carries the token itself.
+    pub auth_path: String,
+}
+
+/// Error returned by [`connect_sdk_app`], carrying both the human-readable
+/// message and the `auth_path` chosen for the (failed) handshake so the
+/// caller can surface the bearer-kind in the error envelope. `Display`
+/// yields just the message, so existing `format!("{e}")` / `.to_string()`
+/// call sites keep their previous behavior.
+#[derive(Debug)]
+pub struct ConnectError {
+    pub message: String,
+    pub auth_path: String,
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 // =============================================================================
@@ -408,6 +449,10 @@ async fn handle_connect(
                 app: conn.app_info.clone(),
                 url: conn.app_url.clone(),
                 base_path: conn.base_path.clone(),
+                // No fresh handshake was performed — we reused an existing
+                // connection — so the bearer choice was not re-evaluated.
+                // `"none"` would falsely read as "unauthenticated".
+                auth_path: AUTH_PATH_REUSED.to_string(),
             };
             info!(
                 "Switched active connection to already-connected SDK app: {}",
@@ -437,7 +482,14 @@ async fn handle_connect(
             });
             Json(ApiResponse::success(response))
         }
-        Err(e) => Json(ApiResponse::error(e)),
+        Err(e) => {
+            // Thread the chosen `auth_path` into the error envelope (item 2)
+            // via the sibling `hint` field — callers can see which bearer the
+            // failed handshake attached without it living in `error` prose.
+            let mut resp = ApiResponse::<ConnectResponse>::error(e.message);
+            resp.hint = Some(serde_json::json!({ "authPath": e.auth_path }));
+            Json(resp)
+        }
     }
 }
 
@@ -454,7 +506,7 @@ pub async fn connect_sdk_app(
     app_name: Option<String>,
     app_type: Option<String>,
     framework: Option<String>,
-) -> Result<ConnectResponse, String> {
+) -> Result<ConnectResponse, ConnectError> {
     // Create HTTP client with timeout
     // 30s request timeout matches the UI Bridge IPC timeout — the app's snapshot/elements
     // endpoints proxy through the IPC layer and can take >10s on cold pages.
@@ -490,15 +542,45 @@ pub async fn connect_sdk_app(
     // in the `access_token` slot. Without this fallback such runners send no
     // bearer and the gated relay 401s their connect handshake.
     let auth_manager = crate::auth::AuthManager::new();
+    // Pick the bearer AND record which `auth_path` we took, so the choice is
+    // visible on the connect response (item 2) rather than only at `debug!`.
+    // `bearer` carries the (token, human-readable-kind) to attach; `auth_path`
+    // is the machine-readable tag surfaced to callers (one of the
+    // `AUTH_PATH_*` constants).
+    let mut auth_path: &str = AUTH_PATH_NONE;
     let bearer: Option<(String, &str)> =
         match crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(&auth_manager).await {
-            Some(token) if !token.is_empty() => Some((token, "Cognito user")),
+            Some(token) if !token.is_empty() => {
+                auth_path = AUTH_PATH_COGNITO;
+                Some((token, "Cognito user"))
+            }
             _ => match auth_manager.get_access_token() {
                 // Only a real JWT (the coord device-JWT) — never the legacy
                 // `qontinui_runner_<random>` opaque slot value, which the relay
                 // can't verify.
                 Ok(token) if crate::auth::looks_like_jwt(&token) => {
-                    Some((token, "coord device-JWT"))
+                    // Item 3: the stored device-JWT can be long-expired (primary
+                    // down → refresher dead). Attaching an expired JWT yields a
+                    // flat relay 401 indistinguishable from "relay rejects device
+                    // tokens" (the relay's 401 is deliberately undifferentiated
+                    // for anti-fingerprinting). Decode the `exp` (no signature
+                    // verification — coord re-verifies on the WS handshake) and,
+                    // if past expiry, skip attachment and connect unauthenticated
+                    // so the failure mode is observable runner-side.
+                    if crate::auth::jwt_is_expired(&token) {
+                        let ago = crate::auth::decode_jwt_exp(&token)
+                            .map(|exp| chrono::Utc::now().timestamp() - exp)
+                            .unwrap_or(0);
+                        warn!(
+                            "SDK relay client: device-JWT expired {ago}s ago — skipping bearer \
+                             and connecting unauthenticated (token_expired_skipping)"
+                        );
+                        auth_path = AUTH_PATH_DEVICE_JWT_EXPIRED;
+                        None
+                    } else {
+                        auth_path = AUTH_PATH_DEVICE_JWT;
+                        Some((token, "coord device-JWT"))
+                    }
                 }
                 _ => None,
             },
@@ -512,23 +594,34 @@ pub async fn connect_sdk_app(
                     let mut headers = reqwest::header::HeaderMap::new();
                     headers.insert(reqwest::header::AUTHORIZATION, value);
                     builder = builder.default_headers(headers);
-                    debug!("SDK relay client: attached {kind} bearer for {}", url);
+                    info!("SDK relay client: attached {kind} bearer for {}", url);
                 }
                 Err(e) => warn!("SDK relay client: malformed bearer, connecting without auth: {e}"),
             }
+        }
+        None if auth_path == AUTH_PATH_DEVICE_JWT_EXPIRED => {
+            // Already logged at `warn!` above with the expiry delta.
         }
         None => debug!(
             "SDK relay client: no Cognito session and no device-JWT (legacy/local install or \
              not paired); connecting without auth"
         ),
     }
+    let auth_path = auth_path.to_string();
 
-    let client = builder
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let client = builder.build().map_err(|e| ConnectError {
+        message: format!("Failed to create HTTP client: {}", e),
+        auth_path: auth_path.clone(),
+    })?;
 
     // Try to hit the health endpoint to validate the app
-    let (base_path, health_data) = try_health_check(&client, url).await?;
+    let (base_path, health_data) =
+        try_health_check(&client, url)
+            .await
+            .map_err(|message| ConnectError {
+                message,
+                auth_path: auth_path.clone(),
+            })?;
 
     // Extract app info from health response or from provided hints
     let ui_bridge_meta = health_data
@@ -587,6 +680,7 @@ pub async fn connect_sdk_app(
         app: app_info.clone(),
         url: url.to_string(),
         base_path: base_path.clone(),
+        auth_path,
     };
 
     // Store connection in manager and set as active
@@ -2511,6 +2605,10 @@ async fn handle_switch(
             app: conn.app_info.clone(),
             url: conn.app_url.clone(),
             base_path: conn.base_path.clone(),
+            // Switching to an already-established connection — no handshake,
+            // so the bearer choice was not re-evaluated. `"none"` would
+            // falsely read as "unauthenticated".
+            auth_path: AUTH_PATH_REUSED.to_string(),
         };
         manager.active_url = Some(url.clone());
         manager.active_responsive = None;
