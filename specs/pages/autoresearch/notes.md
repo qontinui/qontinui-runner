@@ -1,3 +1,0 @@
-# AutoresearchPage
-
-_(notes)_

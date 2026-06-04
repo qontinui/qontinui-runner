@@ -1,3 +1,0 @@
-# TuriXCUAMultimodalPipeline
-
-_(notes)_

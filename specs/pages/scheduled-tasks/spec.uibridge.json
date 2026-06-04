@@ -587,7 +587,7 @@
     }
   ],
   "metadata": {
-    "component": "scheduled-tasks",
+    "component": "scheduler",
     "tags": [
       "scheduler",
       "scheduled-tasks",

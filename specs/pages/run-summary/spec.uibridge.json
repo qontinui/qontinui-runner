@@ -610,7 +610,7 @@
     }
   ],
   "metadata": {
-    "component": "run-summary",
+    "component": "run-recap",
     "tags": [
       "run-summary",
       "recap",

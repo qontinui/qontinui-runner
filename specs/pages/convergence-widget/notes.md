@@ -1,3 +1,0 @@
-# ConvergenceWidget
-
-_(notes)_

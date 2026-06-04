@@ -326,7 +326,7 @@
     }
   ],
   "metadata": {
-    "component": "execute",
+    "component": "workflow-queue",
     "tags": [
       "execute",
       "workflow-queue",
