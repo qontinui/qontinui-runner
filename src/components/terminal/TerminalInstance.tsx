@@ -549,10 +549,11 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           }
 
           // VS Code-parity scrollback navigation: Shift+PageUp/PageDown,
-          // Ctrl+Alt+PageUp/PageDown, Ctrl+Home/End. Scroll the focused
-          // terminal locally and swallow the key so it isn't forwarded to the
-          // PTY (xterm doesn't preventDefault on a `false` return, so we do it
-          // here to also stop any browser-default scroll/caret motion).
+          // Ctrl+Alt+PageUp/PageDown, Ctrl+Home/End, Ctrl+Up/Down (prev/next
+          // command via OSC 633;A marks). Scroll the focused terminal locally
+          // and swallow the key so it isn't forwarded to the PTY (xterm
+          // doesn't preventDefault on a `false` return, so we do it here to
+          // also stop any browser-default scroll/caret motion).
           if (event.type === "keydown") {
             const action = matchScrollShortcut(event);
             if (action) {
@@ -569,6 +570,12 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
                   break;
                 case "bottom":
                   backend.scrollToBottom();
+                  break;
+                case "prevCommand":
+                  backend.scrollToPreviousCommand();
+                  break;
+                case "nextCommand":
+                  backend.scrollToNextCommand();
                   break;
               }
               return false;

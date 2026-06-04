@@ -45,6 +45,8 @@ const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
       { keys: "Ctrl+Alt+PageDown", description: "Scroll down one line" },
       { keys: "Ctrl+Home", description: "Scroll to top" },
       { keys: "Ctrl+End", description: "Scroll to bottom" },
+      { keys: "Ctrl+↑", description: "Jump to previous command prompt" },
+      { keys: "Ctrl+↓", description: "Jump to next command prompt" },
     ],
   },
   {
