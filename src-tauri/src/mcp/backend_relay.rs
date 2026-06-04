@@ -2165,6 +2165,16 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        // Stable session id of the agent issuing this relay request, if the
+        // caller supplied one — folded into the claim owner token so distinct
+        // agent sessions on one machine are distinct holders. Sourced from the
+        // request payload (the initiator's context), NOT the runner's process
+        // env. Absent / unparseable → None.
+        let agent_session_id = data
+            .get("agent_session_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
         // L2 (shared-checkout coordination gap fix) — derive `intent_repo`
         // from `working_dir` when the caller didn't declare one (no-op
         // until `QONTINUI_AGENT_WORKTREE_MODE` is on).
@@ -2189,6 +2199,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 effective_intent_repo.as_deref(),
                 title.as_deref().unwrap_or("Terminal edit session"),
                 working_dir,
+                agent_session_id,
             )
             .await;
 

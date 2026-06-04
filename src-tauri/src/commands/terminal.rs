@@ -85,10 +85,15 @@ pub async fn terminal_create(
     // in lockstep. When `intent_repo` is `None`, the helper is a no-op;
     // when it's `Some(_)` but worktree mode is off or allocation fails,
     // the helper returns the original `working_dir` and logs.
+    // This Tauri command is invoked by the operator's frontend — an
+    // interactive/UI-created terminal with no agent session to attribute.
+    // The coord session id is only minted later (registration below), and
+    // it identifies the coord row, not the spawning agent. None is correct.
     let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
         effective_intent_repo.as_deref(),
         title.as_deref().unwrap_or("Terminal edit session"),
         working_dir,
+        None,
     )
     .await;
 

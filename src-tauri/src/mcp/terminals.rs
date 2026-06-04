@@ -50,6 +50,12 @@ pub struct CreateTerminalRequest {
     /// argument on the `terminal_create` Tauri command + HTTP-SDK proxy.
     #[serde(default)]
     pub intent_repo: Option<String>,
+    /// Stable session id of the agent creating this terminal. Folded into
+    /// the isolated-worktree claim's owner token so two different agent
+    /// sessions on one machine are distinct holders. None for
+    /// interactive/UI-created terminals (no session to attribute).
+    #[serde(default)]
+    pub agent_session_id: Option<uuid::Uuid>,
 }
 
 /// Request body for writing data to a terminal.
@@ -151,6 +157,7 @@ pub async fn create_terminal_handler(
             .as_deref()
             .unwrap_or("HTTP terminal edit session"),
         request.working_dir,
+        request.agent_session_id,
     )
     .await;
 
