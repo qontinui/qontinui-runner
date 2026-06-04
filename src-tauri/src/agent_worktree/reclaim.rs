@@ -491,7 +491,14 @@ pub async fn tick_once() -> Result<(), String> {
         .await
         .map_err(|e| format!("decode reclaim pull: {e}"))?;
 
-    execute_pull(&pull);
+    // execute_pull runs synchronous git/cmd subprocesses and filesystem
+    // removals — potentially long (junction unlinks + worktree deletes).
+    // Run it on the blocking pool so the shared fleet-publishers runtime's
+    // async worker isn't pinned for the duration (the starvation class
+    // PR #391 isolated the heartbeat from).
+    tokio::task::spawn_blocking(move || execute_pull(&pull))
+        .await
+        .map_err(|e| format!("reclaim execution panicked: {e}"))?;
     Ok(())
 }
 
