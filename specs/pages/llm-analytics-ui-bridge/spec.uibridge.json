@@ -348,7 +348,13 @@
       },
       {
         "description": "The LLM dashboard's existing time range selector (1d/7d/30d/all) controls the days parameter for all cost attribution queries. CostByTargetAppChart fetches from /analytics/token-usage/by-target-app?days=N. CostPerInteractionChart fetches from /analytics/token-usage/cost-per-interaction?days=N. Changing the time range should update all four new charts.",
-        "elements": [],
+        "elements": [
+          {
+            "role": "combobox",
+            "ariaLabel": "Select time range",
+            "tagName": "select"
+          }
+        ],
         "id": "llm-interaction-time-range",
         "isInitial": false,
         "name": "Time Range Interaction",
