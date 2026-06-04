@@ -197,6 +197,7 @@ mod video_recorder;
 mod vision;
 mod wake_handler; // Phase F.1 — qontinui:// custom-URL deep-link wake handler
 mod win32_compat;
+mod window_assignments;
 mod window_manager;
 mod window_placement;
 mod workflow;
@@ -1634,6 +1635,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal_analysis::analyze_plan_progress,
             commands::terminal_analysis::analyze_session_summary,
             commands::terminal_analysis::get_latest_plan_content,
+            // Pop-out terminal windows (Phase 1)
+            commands::terminal_windows::assign_session_to_window,
+            commands::terminal_windows::close_terminal_window,
+            commands::terminal_windows::focus_runner_window,
+            commands::terminal_windows::get_window_assignments,
+            commands::terminal_windows::list_runner_windows,
+            commands::terminal_windows::open_terminal_window,
             commands::test_orchestrator::delete_orchestration_plan,
             commands::test_orchestrator::execute_test_orchestration,
             commands::test_orchestrator::generate_test_from_orchestration,
@@ -1947,6 +1955,49 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 );
                 app.manage(pane_store);
+
+                // Phase 1 (pop-out terminal windows) — persisted window↔session
+                // ownership + the runner's own window registry. Co-located with
+                // the pane store under `.qontinui/runner`, same atomic-write
+                // pattern. `ensure_main` records the "main" window on boot.
+                // Namespaced by API port (mirrors the lifecycle store above) so
+                // each runner instance owns its own windows — without this a
+                // temp runner (9877+) would read/clobber the primary's
+                // window-assignments and try to render its pop-outs.
+                let wa_api_port = crate::mcp::types::get_mcp_api_port();
+                let wa_file_name = if wa_api_port == 9876 {
+                    "window-assignments.json".to_string()
+                } else {
+                    format!("window-assignments-{wa_api_port}.json")
+                };
+                let window_assignments_path = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".qontinui")
+                    .join("runner")
+                    .join(&wa_file_name);
+                let window_assignments = std::sync::Arc::new(
+                    match window_assignments::WindowAssignments::open(&window_assignments_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %window_assignments_path.display(),
+                                "window_assignments: open failed — using ephemeral fallback"
+                            );
+                            let fallback = std::env::temp_dir()
+                                .join(format!("qontinui-runner-{wa_file_name}"));
+                            window_assignments::WindowAssignments::open(&fallback)
+                                .expect("window_assignments: ephemeral open failed")
+                        }
+                    },
+                );
+                window_assignments.ensure_main(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0),
+                );
+                app.manage(window_assignments);
 
                 // Durable, backend-owned terminal-session lifecycle registry,
                 // keyed by `claudeSessionId`. Source of truth for "which
@@ -3159,6 +3210,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 info!("Window close requested");
+
+                // Phase 1: a pop-out terminal window ("term-N") closing must NOT
+                // run the main-window app-quit cleanup below. Reassign its
+                // sessions back to "main" (never orphan a PTY), emit the
+                // window-closed / session-assignment-changed events, and return.
+                // Only the "main" window falls through to the shutdown path.
+                let win_label = window.label().to_string();
+                if win_label != window_assignments::MAIN_WINDOW_LABEL
+                    && commands::terminal_windows::handle_window_close(window.app_handle(), &win_label)
+                {
+                    return;
+                }
+
                 let app_state = window.state::<Arc<AppState>>();
 
                 // Intentional close — clear the session file so instances are NOT

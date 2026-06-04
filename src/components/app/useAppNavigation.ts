@@ -123,6 +123,16 @@ export function useAppNavigation(): UseAppNavigationReturn {
   const { registerNavigate } = useNavigation();
 
   const [activeTab, setActiveTab] = useState<MainTabId>(() => {
+    // Phase 1 (pop-out terminal windows): a window opened with the
+    // `?view=terminal` boot hint renders the Terminal page directly and
+    // ignores the shared persisted active-tab (which is the main window's).
+    try {
+      if (new URLSearchParams(window.location.search).get("view") === "terminal") {
+        return "terminal";
+      }
+    } catch {
+      /* non-DOM / parse failure — fall through to the persisted tab */
+    }
     const stored = instanceStorage.getItem("qontinui-main-active-tab");
     return migrateTabId(stored);
   });

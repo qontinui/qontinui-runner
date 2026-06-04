@@ -12,6 +12,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { wheelToLineDelta, DEFAULT_CELL_HEIGHT_PX } from "./wheelScroll";
 import { matchScrollShortcut } from "./scrollKeys";
+import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 
 export interface TerminalInstanceHandle {
   getSelection: () => string;
@@ -171,6 +172,15 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     onOutputRef.current = onOutput;
     const onTitleChangeRef = useRef(onTitleChange);
     onTitleChangeRef.current = onTitleChange;
+    // Phase 1 (pop-out windows): owner-gated stdin. Only the window that owns
+    // this session forwards user input to the PTY; during a transient
+    // double-mount (a tab moving between windows) this prevents double-SEND
+    // (output still double-renders identically — benign). Kept in a ref so the
+    // long-lived onData/onBinary closures read the freshest value. Defaults to
+    // owned (true) in the single-window / no-provider case.
+    const { isOwned } = useWindowAssignments();
+    const isOwnedRef = useRef(true);
+    isOwnedRef.current = isOwned(terminalId);
     /**
      * Most-recently reported title — guards `onTitleChange` against firing on
      * every paintGrid (200ms idle cadence) when the title is unchanged.
@@ -700,6 +710,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
               }
             }
 
+            if (!isOwnedRef.current) return; // owner-gated stdin (Phase 1)
             const bytes = encoder.encode(data);
             invoke("terminal_write", {
               terminalId,
@@ -711,6 +722,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         // Forward binary data (e.g. paste with special chars)
         disposables.push(
           backend.onBinary((data) => {
+            if (!isOwnedRef.current) return; // owner-gated stdin (Phase 1)
             const bytes = new Uint8Array(data.length);
             for (let i = 0; i < data.length; i++) {
               bytes[i] = data.charCodeAt(i);
