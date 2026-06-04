@@ -483,6 +483,12 @@ pub struct RenderLogEntry {
     /// Optional: task run ID if applicable
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_run_id: Option<i64>,
+    /// Window that produced this entry ("main" for the primary window; "term-N"
+    /// for pop-out windows in Phase 1). Optional + skipped when None so existing
+    /// entries and readers are unaffected; consumers treat a missing value as
+    /// "main". See plan `2026-06-03-runner-popout-terminal-windows.md` Phase 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_label: Option<String>,
 }
 
 /// Get the path to the render log file

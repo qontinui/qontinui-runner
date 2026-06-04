@@ -7,6 +7,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { RenderLogStorage, RenderLogEntry, RenderLogEntryType } from "@qontinui/ui-bridge";
 
 /**
@@ -20,6 +21,8 @@ interface BackendRenderLogEntry {
   data: Record<string, unknown>;
   visible_sections?: string[];
   task_run_id?: number;
+  /** Window that produced this entry ("main" for the primary window). */
+  window_label?: string;
 }
 
 function convertToBackendFormat(entry: RenderLogEntry, taskRunId?: number): BackendRenderLogEntry {
@@ -40,6 +43,9 @@ function convertToBackendFormat(entry: RenderLogEntry, taskRunId?: number): Back
     trigger: (entry.metadata?.trigger as string) || entry.type,
     data: entry.data as Record<string, unknown>,
     task_run_id: taskRunId,
+    // Stamp the producing window so multi-window render logs can be filtered
+    // by `?windowLabel=`. "main" for the primary window (Phase 0).
+    window_label: getCurrentWindow().label,
   };
 }
 

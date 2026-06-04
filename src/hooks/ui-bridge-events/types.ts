@@ -492,6 +492,14 @@ void _handledCoversUnion;
 export interface UIBridgeRequestPayload {
   requestId: string;
   type: UIBridgeRequestType;
+  /**
+   * Target window for this request (multi-window hosts, Phase 0 of the pop-out
+   * terminal-windows plan). Absent for the single-window default — the runner's
+   * Rust dispatcher only stamps it when targeting a non-`"main"` window. Each
+   * window's listener ignores events whose `windowLabel` is set and differs
+   * from its own `getCurrentWindow().label`.
+   */
+  windowLabel?: string;
   elementId?: string;
   componentId?: string;
   actionId?: string;
@@ -575,6 +583,14 @@ export interface UIBridgeRequestPayload {
 export interface UIBridgeResponsePayload {
   requestId: string;
   type: UIBridgeRequestType;
+  /**
+   * The responding window's own label (`getCurrentWindow().label`). The Rust
+   * response dispatcher pairs `(windowLabel, requestId)` against its pending
+   * map; omitting it falls back to `"main"`, which is exactly the key the
+   * single-window default registers under. Always stamped by the runner's
+   * `sendResponse` so multi-window responses can't be mis-routed.
+   */
+  windowLabel?: string;
   success: boolean;
   data?: unknown;
   error?: string;

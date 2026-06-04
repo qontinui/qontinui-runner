@@ -21,6 +21,39 @@ pub(super) fn get_ui_bridge_timeout_ms() -> u64 {
     Timeouts::ui_bridge_ipc().as_millis() as u64
 }
 
+/// Default window label for single-window operation. Phase 0 of the pop-out
+/// terminal-windows plan (`plans/2026-06-03-runner-popout-terminal-windows.md`):
+/// every request currently targets the main window; a windowed dispatch overload
+/// arrives with Phase 1's pop-out windows.
+pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
+
+/// Build the `ui_bridge_pending` map key.
+///
+/// Keying by `(window_label, request_id)` rather than `request_id` alone makes a
+/// response from a window the request was NOT addressed to a no-op (its computed
+/// key can't match the stored one), which structurally eliminates the broadcast
+/// response race once multiple windows mount the SDK. `request_id` is a UUID, so
+/// the delimiter can never collide with a (simple `main`/`term-N`) window label.
+/// Both dispatch paths (this module and `helpers::direct_webview_evaluate_with_result`)
+/// and the response dispatcher route through this single helper so the key shape
+/// can never drift between producer and consumer.
+pub(crate) fn pending_key(window_label: &str, request_id: &str) -> String {
+    format!("{window_label}\u{1f}{request_id}")
+}
+
+/// Whether targeted per-window `ui-bridge-request` emit is enabled.
+///
+/// Default OFF — the shipping single-window behavior broadcasts the event to all
+/// windows exactly as before (`app_handle.emit`), so Phase 0 is byte-identical to
+/// pre-window-aware behavior. Phase 1 flips this on (env `QONTINUI_UI_BRIDGE_MULTI_WINDOW=1`)
+/// once pop-out windows mount the SDK, so each request reaches only its target
+/// window. Read per-call so it can be toggled without a restart during rollout.
+fn multi_window_dispatch_enabled() -> bool {
+    std::env::var("QONTINUI_UI_BRIDGE_MULTI_WINDOW")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Gather structured readiness diagnostics when the frontend readiness gate
 /// times out. Returns a JSON object with all available diagnostic fields so
 /// agents can diagnose why the WebView never became ready.
@@ -276,6 +309,29 @@ async fn ui_bridge_request_inner(
 ) -> Result<serde_json::Value, String> {
     let request_id = uuid::Uuid::new_v4().to_string();
 
+    // Phase 0: every request targets the main window. A windowed dispatch
+    // overload (carrying an explicit target label) arrives with Phase 1's
+    // pop-out windows; until then this is always "main", so the wire shape and
+    // pending key are identical to pre-window-aware behavior.
+    let window_label = MAIN_WINDOW_LABEL.to_string();
+
+    // Carry the target window in the (flattened) envelope payload ONLY when it
+    // is non-default, so the default single-window request is byte-identical on
+    // the wire. The frontend listener reads `windowLabel` and ignores events not
+    // addressed to its own `getCurrentWindow().label`.
+    let additional_payload = if window_label != MAIN_WINDOW_LABEL {
+        let mut p = additional_payload;
+        if let Some(obj) = p.as_object_mut() {
+            obj.insert(
+                "windowLabel".to_string(),
+                serde_json::Value::String(window_label.clone()),
+            );
+        }
+        p
+    } else {
+        additional_payload
+    };
+
     // Build the typed envelope (Stage 1 of the ui-bridge-request envelope
     // concretization — see commit ea5d9a61f deferral note). Wire shape:
     // `{ requestId, type, ...additional_payload }`. Empty `Value::Object`
@@ -300,20 +356,33 @@ async fn ui_bridge_request_inner(
     // Create oneshot channel for the response
     let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
 
-    // Store the sender in the pending map
+    // Store the sender in the pending map under the composite (window, id) key.
+    let pkey = pending_key(&window_label, &request_id);
     {
         let mut pending = state.ui_bridge_pending.lock().await;
-        pending.insert(request_id.clone(), tx);
+        pending.insert(pkey.clone(), tx);
         state
             .ui_bridge_pending_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Emit request to React frontend
-    if let Err(e) = state.app_handle.emit("ui-bridge-request", &event_payload) {
+    // Emit request to the React frontend. Default (flag off): broadcast to all
+    // windows exactly as before. Flag on (Phase 1): target the specific window,
+    // falling back to broadcast if its webview can't be resolved (e.g. mid
+    // teardown) so a request is never silently dropped.
+    let emit_result = if multi_window_dispatch_enabled() {
+        use tauri::Manager;
+        match state.app_handle.get_webview_window(&window_label) {
+            Some(win) => win.emit("ui-bridge-request", &event_payload),
+            None => state.app_handle.emit("ui-bridge-request", &event_payload),
+        }
+    } else {
+        state.app_handle.emit("ui-bridge-request", &event_payload)
+    };
+    if let Err(e) = emit_result {
         // Clean up the pending entry
         let mut pending = state.ui_bridge_pending.lock().await;
-        if pending.remove(&request_id).is_some() {
+        if pending.remove(&pkey).is_some() {
             state
                 .ui_bridge_pending_count
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -341,7 +410,7 @@ async fn ui_bridge_request_inner(
         Err(_) => {
             // Timeout - clean up the pending entry
             let mut pending = state.ui_bridge_pending.lock().await;
-            if pending.remove(&request_id).is_some() {
+            if pending.remove(&pkey).is_some() {
                 state
                     .ui_bridge_pending_count
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -371,9 +440,18 @@ pub async fn handle_ui_bridge_response(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // The responding window echoes its own label; absent for the single-window
+    // default (and for any pre-window-aware frontend), so fall back to "main" —
+    // which is exactly the key both dispatch paths store under in Phase 0.
+    let window_label = response
+        .get("windowLabel")
+        .and_then(|v| v.as_str())
+        .unwrap_or(MAIN_WINDOW_LABEL);
+
     if let Some(request_id) = request_id {
+        let pkey = pending_key(window_label, &request_id);
         let mut pending_map = pending.lock().await;
-        if let Some(sender) = pending_map.remove(&request_id) {
+        if let Some(sender) = pending_map.remove(&pkey) {
             pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             // Extract the data portion of the response
             let data = response.get("data").cloned().unwrap_or(response.clone());
@@ -464,10 +542,78 @@ mod wrap_ipc_result_tests {
     //! `wrap_ipc_result` helper. Lock down each decision point: inner
     //! success, inner failure (with/without error field), absent success
     //! field, and non-bool success values.
-    use super::wrap_ipc_result;
+    use super::{handle_ui_bridge_response, pending_key, wrap_ipc_result, MAIN_WINDOW_LABEL};
     use axum::http::StatusCode;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::ops::Deref;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::{oneshot, Mutex};
+
+    // ── Window-aware dispatch (Phase 0) ─────────────────────────────────────
+
+    #[test]
+    fn pending_key_is_distinct_per_window_for_same_request_id() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        // Same request id in two windows must NOT collide on the pending map.
+        assert_ne!(pending_key("main", id), pending_key("term-1", id));
+        // Same (window, id) is stable so insert and remove agree.
+        assert_eq!(pending_key("main", id), pending_key("main", id));
+    }
+
+    #[tokio::test]
+    async fn response_routes_only_to_the_addressed_window() {
+        // Two windows registered the SAME request id; a response from one must
+        // resolve only that window's sender and leave the other pending.
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let id = "req-abc";
+        let (tx_main, rx_main) = oneshot::channel::<serde_json::Value>();
+        let (tx_term, rx_term) = oneshot::channel::<serde_json::Value>();
+        {
+            let mut p = pending.lock().await;
+            p.insert(pending_key("main", id), tx_main);
+            p.insert(pending_key("term-1", id), tx_term);
+        }
+        count.store(2, Ordering::Relaxed);
+
+        let response = json!({ "requestId": id, "windowLabel": "term-1", "data": { "ok": true } });
+        handle_ui_bridge_response(pending.clone(), count.clone(), response).await;
+
+        // term-1's sender fired with the unwrapped data...
+        assert_eq!(
+            rx_term.await.expect("term-1 sender fired"),
+            json!({ "ok": true })
+        );
+        // ...main's entry is untouched (still pending, count decremented by one).
+        let p = pending.lock().await;
+        assert!(p.contains_key(&pending_key("main", id)));
+        assert!(!p.contains_key(&pending_key("term-1", id)));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        drop(rx_main);
+    }
+
+    #[tokio::test]
+    async fn response_without_label_defaults_to_main() {
+        // A response that omits windowLabel (pre-window-aware frontend, or the
+        // direct-eval path) must resolve the "main" key it was stored under.
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let id = "req-xyz";
+        let (tx, rx) = oneshot::channel::<serde_json::Value>();
+        {
+            let mut p = pending.lock().await;
+            p.insert(pending_key(MAIN_WINDOW_LABEL, id), tx);
+        }
+        count.store(1, Ordering::Relaxed);
+
+        let response = json!({ "requestId": id, "data": { "v": 1 } });
+        handle_ui_bridge_response(pending.clone(), count.clone(), response).await;
+
+        assert_eq!(rx.await.expect("main sender fired"), json!({ "v": 1 }));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn inner_success_returns_http_200() {
