@@ -160,6 +160,65 @@ pub fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
     })
 }
 
+/// Which source supplied the `tenant_id` forwarded to pair-cli. Drives the
+/// observability info-log (fallbacks 2 + 3 are logged so the eventual
+/// cognito-home-tenant-attribute-sync fix has a signal to watch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TenantSource {
+    /// The OAuth/runner bearer token's own `tenant_id` claim (priority 1,
+    /// the historical happy path).
+    OAuthClaim,
+    /// The outgoing persisted device-JWT's `tenant_id` claim (priority 2).
+    OutgoingDeviceJwt,
+    /// `~/.qontinui/machine.json::active_tenant_id` (priority 3).
+    MachineJson,
+}
+
+impl TenantSource {
+    fn label(self) -> &'static str {
+        match self {
+            TenantSource::OAuthClaim => "OAuth claim",
+            TenantSource::OutgoingDeviceJwt => "outgoing device-JWT",
+            TenantSource::MachineJson => "machine.json",
+        }
+    }
+}
+
+/// Pure tenant-id resolution: walk the ordered fallback chain and return the
+/// first usable `(tenant_id, source)`, or `None` if every source is
+/// absent/malformed.
+///
+/// Order (see the call site in [`try_refresh_once`] for the prod-breakage
+/// rationale):
+///   1. `oauth_token`'s `tenant_id` JWT claim,
+///   2. `outgoing_jwt`'s `tenant_id` JWT claim (the device-JWT we're about to
+///      replace — still parseable even when expired),
+///   3. `machine_tenant` (pre-resolved `machine.json::active_tenant_id`).
+///
+/// Factored out as a pure fn (no disk / no AuthManager) so the ordering is
+/// unit-testable without faking `~/.qontinui` or spinning a tokio runtime.
+pub(crate) fn resolve_pair_tenant_id(
+    oauth_token: &str,
+    outgoing_jwt: Option<&str>,
+    machine_tenant: Option<uuid::Uuid>,
+) -> Option<(uuid::Uuid, TenantSource)> {
+    let from_claim = |token: &str| {
+        qontinui_runner_lib::pair::tenant_id_from_oauth_claim(token)
+            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+    };
+
+    if let Some(t) = from_claim(oauth_token) {
+        return Some((t, TenantSource::OAuthClaim));
+    }
+    if let Some(t) = outgoing_jwt.and_then(from_claim) {
+        return Some((t, TenantSource::OutgoingDeviceJwt));
+    }
+    if let Some(t) = machine_tenant {
+        return Some((t, TenantSource::MachineJson));
+    }
+    None
+}
+
 /// Attempt one refresh against `pair_base` using `runner_token` as the
 /// bearer + `device_id` / `user_id` as the wire body / header fields.
 /// Factored out of the inline Pair-arm body so the Phase 5.2 tests can
@@ -169,6 +228,11 @@ pub fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
 /// the underlying [`pair_with_auth_token_with_ids`] hits
 /// `{pair_base}/api/v1/devices/pair-cli`, which the backend proxies to
 /// coord with `tenant_id` resolved from the authenticated user.
+///
+/// The `tenant_id` forwarded to pair-cli is resolved via the
+/// [`resolve_pair_tenant_id`] fallback chain (OAuth claim → outgoing
+/// device-JWT claim → machine.json) — see that function + the call site for
+/// the prod-breakage rationale.
 ///
 /// Invariant: a non-2xx HTTP response, a network error, or a
 /// spawn_blocking join failure all collapse to
@@ -181,30 +245,52 @@ pub(crate) async fn try_refresh_once(
     runner_token: &str,
     device_id: &str,
     user_id: &str,
+    machine_tenant: Option<uuid::Uuid>,
 ) -> RefreshOutcome {
     let base = pair_base.to_string();
     let token = runner_token.to_string();
     let did = device_id.to_string();
     let uid = user_id.to_string();
 
-    // Resolve tenant_id from the OAuth/runner token's `tenant_id` claim.
-    // Phase 2 of the default-tenant-propagation plan makes tenant_id a
-    // required field on `POST /api/v1/devices/pair-cli` (the web-backend
-    // proxy that fronts coord since PR #224); the refresher reuses the
-    // same endpoint to re-mint the device JWT, so it must forward a
-    // tenant_id. Absent/malformed → keep the existing JWT.
-    let tenant_id = match qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)
-        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
-    {
-        Some(t) => t,
-        None => {
-            warn!(
-                "device_jwt_refresher: OAuth token has no usable tenant_id claim; \
-                 keeping existing JWT"
-            );
-            return RefreshOutcome::KeptExisting;
-        }
-    };
+    // Resolve tenant_id for `POST /api/v1/devices/pair-cli` (the web-backend
+    // proxy that fronts coord since PR #224); the refresher reuses the same
+    // endpoint to re-mint the device JWT, so it must forward a tenant_id.
+    //
+    // FALLBACK CHAIN (the OAuth claim alone broke prod: the operator's Cognito
+    // token carries NO tenant_id claim, so every tick bailed with
+    // "keeping existing JWT" → the device-JWT expired → coord's fleet-auth
+    // gate 403'd the fleet panel + the relay flapped). We try, in order:
+    //   1. the OAuth/runner token's `tenant_id` claim (original behavior),
+    //   2. the OUTGOING persisted device-JWT's own `tenant_id` claim — coord
+    //      verified that tenant at the last mint and the web backend
+    //      re-validates server-side on pair-cli, so the runner is only
+    //      forwarding a hint ("coord is the authority on tenant_id"),
+    //   3. `machine_tenant` — `~/.qontinui/machine.json::active_tenant_id`,
+    //      resolved by the CALLER (the refresher loop passes
+    //      `session::dual_write::resolve_active_tenant_id()`; tests inject
+    //      `Some`/`None` directly so they stay hermetic on any host).
+    // Only if ALL THREE are absent/malformed do we keep the existing JWT.
+    let outgoing_jwt = auth_manager.get_access_token().ok();
+    let (tenant_id, tenant_source) =
+        match resolve_pair_tenant_id(&token, outgoing_jwt.as_deref(), machine_tenant) {
+            Some(resolved) => resolved,
+            None => {
+                warn!(
+                    "device_jwt_refresher: no tenant_id from OAuth claim, outgoing \
+                     device-JWT, or machine.json::active_tenant_id; keeping existing JWT"
+                );
+                return RefreshOutcome::KeptExisting;
+            }
+        };
+    if tenant_source != TenantSource::OAuthClaim {
+        // Observability for the cognito-home-tenant-attribute-sync plan that
+        // will eventually fix the OAuth claim at the source. Once the Cognito
+        // token carries tenant_id again, this info line stops firing.
+        info!(
+            "device_jwt_refresher: tenant_id resolved from {} (OAuth claim absent)",
+            tenant_source.label()
+        );
+    }
 
     // pair_with_auth_token_with_ids is reqwest::blocking — must run via
     // spawn_blocking or it stalls the tokio runtime.
@@ -461,6 +547,7 @@ async fn refresher_loop(
                     &bearer_token,
                     &device_id,
                     &user_id,
+                    crate::session::dual_write::resolve_active_tenant_id(),
                 )
                 .await;
                 match outcome {
@@ -599,6 +686,72 @@ mod tests {
         assert_eq!(d3, Decision::IdleWrongTier);
     }
 
+    // ---- resolve_pair_tenant_id ordering (pure, no disk / no AuthManager) ----
+
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    /// Build a JWT-shaped token. When `tenant` is `Some`, embed it as the
+    /// `tenant_id` claim; when `None`, omit the claim entirely (mirrors the
+    /// operator's Cognito token that broke prod).
+    fn jwt(tenant: Option<&str>) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = match tenant {
+            Some(t) => URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"x","tenant_id":"{t}"}}"#)),
+            None => URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#),
+        };
+        format!("{header}.{payload}.sig")
+    }
+
+    const T_OAUTH: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const T_JWT: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const T_MACHINE: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+    #[test]
+    fn tenant_prefers_oauth_claim_over_all_fallbacks() {
+        let machine = uuid::Uuid::parse_str(T_MACHINE).unwrap();
+        let got =
+            resolve_pair_tenant_id(&jwt(Some(T_OAUTH)), Some(&jwt(Some(T_JWT))), Some(machine))
+                .expect("resolves");
+        assert_eq!(got.0, uuid::Uuid::parse_str(T_OAUTH).unwrap());
+        assert_eq!(got.1, TenantSource::OAuthClaim);
+    }
+
+    #[test]
+    fn tenant_falls_back_to_outgoing_jwt_when_oauth_claim_absent() {
+        // The prod scenario: Cognito bearer has NO tenant_id, but the device
+        // JWT we're about to replace still carries one.
+        let machine = uuid::Uuid::parse_str(T_MACHINE).unwrap();
+        let got = resolve_pair_tenant_id(&jwt(None), Some(&jwt(Some(T_JWT))), Some(machine))
+            .expect("resolves");
+        assert_eq!(got.0, uuid::Uuid::parse_str(T_JWT).unwrap());
+        assert_eq!(got.1, TenantSource::OutgoingDeviceJwt);
+    }
+
+    #[test]
+    fn tenant_falls_back_to_machine_json_when_no_jwt_claims() {
+        // OAuth claim absent AND the outgoing JWT has no tenant claim →
+        // machine.json::active_tenant_id wins.
+        let machine = uuid::Uuid::parse_str(T_MACHINE).unwrap();
+        let got =
+            resolve_pair_tenant_id(&jwt(None), Some(&jwt(None)), Some(machine)).expect("resolves");
+        assert_eq!(got.0, machine);
+        assert_eq!(got.1, TenantSource::MachineJson);
+        // Also works when there's no outgoing JWT at all.
+        let got2 =
+            resolve_pair_tenant_id(&jwt(None), None, Some(machine)).expect("resolves w/o jwt");
+        assert_eq!(got2.1, TenantSource::MachineJson);
+    }
+
+    #[test]
+    fn tenant_none_when_all_sources_absent() {
+        // No OAuth claim, no/claimless outgoing JWT, no machine.json → None
+        // (caller keeps the existing JWT — the preserved historical behavior).
+        assert!(resolve_pair_tenant_id(&jwt(None), Some(&jwt(None)), None).is_none());
+        assert!(resolve_pair_tenant_id(&jwt(None), None, None).is_none());
+        // A non-JWT opaque OAuth token + nothing else → None.
+        assert!(resolve_pair_tenant_id("opaque-not-a-jwt", None, None).is_none());
+    }
+
     #[test]
     fn refresh_check_interval_is_five_minutes() {
         // Pin the constant so a future refactor that "tunes" it has to
@@ -709,19 +862,31 @@ mod try_refresh_once_tests {
         status: StatusCode,
         body: String,
         hits: Arc<Mutex<u32>>,
+        last_body: Arc<Mutex<Option<String>>>,
     }
 
-    async fn handler(State(s): State<MockState>, _h: HeaderMap, _b: Bytes) -> (StatusCode, String) {
+    async fn handler(State(s): State<MockState>, _h: HeaderMap, b: Bytes) -> (StatusCode, String) {
         *s.hits.lock().unwrap() += 1;
+        *s.last_body.lock().unwrap() = Some(String::from_utf8_lossy(&b).to_string());
         (s.status, s.body.clone())
+    }
+
+    /// Captured per-request server-side state: how many times pair-cli was
+    /// hit and the body of the most recent request (so a test can assert the
+    /// forwarded `tenant_id`).
+    struct MockCapture {
+        hits: Arc<Mutex<u32>>,
+        last_body: Arc<Mutex<Option<String>>>,
     }
 
     fn spawn_mock(
         status: StatusCode,
         body: String,
-    ) -> (String, Arc<Mutex<u32>>, tokio::sync::oneshot::Sender<()>) {
+    ) -> (String, MockCapture, tokio::sync::oneshot::Sender<()>) {
         let hits = Arc::new(Mutex::new(0u32));
+        let last_body = Arc::new(Mutex::new(None));
         let hits_for_handler = hits.clone();
+        let last_body_for_handler = last_body.clone();
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = std_listener.local_addr().expect("addr").port();
         std_listener.set_nonblocking(true).expect("nb");
@@ -736,6 +901,7 @@ mod try_refresh_once_tests {
                     status,
                     body,
                     hits: hits_for_handler,
+                    last_body: last_body_for_handler,
                 };
                 let app: Router = Router::new()
                     // Mirror the live route — pair::pair_with_auth_token_with_ids
@@ -755,7 +921,11 @@ mod try_refresh_once_tests {
             });
         });
         std::thread::sleep(Duration::from_millis(50));
-        (format!("http://127.0.0.1:{port}"), hits, tx)
+        (
+            format!("http://127.0.0.1:{port}"),
+            MockCapture { hits, last_body },
+            tx,
+        )
     }
 
     const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -775,6 +945,26 @@ mod try_refresh_once_tests {
         format!("{}.{}.test-signature", header, payload)
     }
 
+    /// An OAuth/runner bearer with NO `tenant_id` claim — mirrors the
+    /// operator's live Cognito token that broke prod (every refresh tick
+    /// bailed on the missing claim until this fallback chain landed).
+    fn tok_no_tenant() -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"runner"}"#);
+        format!("{}.{}.test-signature", header, payload)
+    }
+
+    /// A device-JWT-shaped token carrying both `exp` (so
+    /// `device_jwt_needs_refresh` can decode it) and a `tenant_id` claim (so
+    /// the fallback-2 resolution can read it from the outgoing slot).
+    fn synth_jwt_with_tenant(exp: i64, tenant: &str) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(format!("{{\"exp\":{exp},\"tenant_id\":\"{tenant}\"}}").as_bytes());
+        let sig = b64url(b"fake-sig");
+        format!("{header}.{payload}.{sig}")
+    }
+
     #[tokio::test]
     async fn refresher_handles_coord_401_without_clearing_jwt() {
         // Setup: AuthManager holds a valid-shape (not-yet-expired) JWT.
@@ -785,19 +975,19 @@ mod try_refresh_once_tests {
         let existing_jwt = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
         mgr.store_tokens(&existing_jwt, "").expect("store");
 
-        let (base, hits, _shutdown) = spawn_mock(
+        let (base, cap, _shutdown) = spawn_mock(
             StatusCode::UNAUTHORIZED,
             r#"{"error":"token expired"}"#.to_string(),
         );
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
         assert_eq!(
             outcome,
             RefreshOutcome::KeptExisting,
             "401 must yield KeptExisting (not Replaced, not PersistFailed)"
         );
         assert_eq!(
-            *hits.lock().unwrap(),
+            *cap.hits.lock().unwrap(),
             1,
             "web backend pair-cli endpoint should be hit exactly once"
         );
@@ -818,12 +1008,12 @@ mod try_refresh_once_tests {
         let existing_jwt = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
         mgr.store_tokens(&existing_jwt, "").expect("store");
 
-        let (base, _hits, _shutdown) = spawn_mock(
+        let (base, _cap, _shutdown) = spawn_mock(
             StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":"coord overloaded"}"#.to_string(),
         );
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
         assert_eq!(outcome, RefreshOutcome::KeptExisting);
 
         let still = mgr.get_access_token().expect("token still present");
@@ -853,9 +1043,9 @@ mod try_refresh_once_tests {
         })
         .to_string();
 
-        let (base, _hits, _shutdown) = spawn_mock(StatusCode::OK, body);
+        let (base, _cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID).await;
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
         match outcome {
             RefreshOutcome::Replaced { new_jwt: got } => {
                 assert_eq!(got, new_jwt, "Replaced must carry the new JWT");
@@ -896,6 +1086,144 @@ mod try_refresh_once_tests {
              refresher replaces it with a real device-JWT. Without this, \
              pre-Phase-3 paired installs are permanently wedged on the \
              opaque bearer and the relay 401-spins every reconnect."
+        );
+    }
+
+    #[tokio::test]
+    async fn refresher_uses_outgoing_jwt_tenant_when_oauth_claim_absent() {
+        // PROD BUG REGRESSION: the OAuth/runner bearer carries NO tenant_id
+        // (the operator's Cognito token) but the OUTGOING device-JWT — the one
+        // we're about to replace — still carries its own tenant_id claim. The
+        // refresh MUST proceed using the JWT-sourced tenant (fallback 2), NOT
+        // bail. Before the fallback chain this case stranded the runner: the
+        // device-JWT expired, coord's fleet-auth gate 403'd the panel, and the
+        // relay flapped.
+        //
+        // The outgoing JWT carries the tenant, so fallback 2 short-circuits
+        // before machine.json is ever consulted — fully hermetic regardless of
+        // the host's ~/.qontinui.
+        let mgr = test_auth_manager("uses_outgoing_jwt_tenant");
+        let jwt_tenant = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let existing_jwt =
+            synth_jwt_with_tenant(chrono::Utc::now().timestamp() + 30 * 60, jwt_tenant);
+        mgr.store_tokens(&existing_jwt, "").expect("store");
+
+        let new_jwt = synth_jwt(chrono::Utc::now().timestamp() + 4 * 60 * 60);
+        let body = serde_json::json!({
+            "token": new_jwt,
+            "device_id": "11111111-1111-4111-8111-111111111111",
+            "user_id":   "22222222-2222-4222-8222-222222222222",
+            "jti":       "33333333-3333-4333-8333-333333333333",
+            "exp":       chrono::Utc::now().timestamp() + 4 * 60 * 60,
+        })
+        .to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let outcome = try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, None).await;
+        match outcome {
+            RefreshOutcome::Replaced { new_jwt: got } => {
+                assert_eq!(got, new_jwt, "Replaced must carry the new JWT");
+            }
+            other => panic!(
+                "expected Replaced (refresh must proceed via the outgoing-JWT \
+                 tenant fallback), got {other:?}"
+            ),
+        }
+        // The mock must have received the tenant_id sourced from the OUTGOING
+        // device-JWT (not the OAuth bearer, which had none).
+        let sent = cap
+            .last_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("pair-cli received a request body");
+        let sent_json: serde_json::Value =
+            serde_json::from_str(&sent).expect("request body is JSON");
+        assert_eq!(
+            sent_json.get("tenant_id").and_then(|v| v.as_str()),
+            Some(jwt_tenant),
+            "pair-cli must receive the tenant_id resolved from the outgoing device-JWT"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresher_keeps_existing_when_no_tenant_source_at_all() {
+        // BEHAVIOR PRESERVED: OAuth bearer has no tenant claim, the persisted
+        // device-JWT has no tenant claim, AND the caller-injected
+        // `machine_tenant` is `None`. (`try_refresh_once` no longer reads
+        // `~/.qontinui` itself — the prod loop passes
+        // `resolve_active_tenant_id()`, tests inject directly — so this is
+        // hermetic on any host.) All three sources absent → the refresher MUST
+        // bail with KeptExisting: no HTTP call, JWT untouched — the same
+        // warn-and-keep path as before the fallback chain.
+        let mgr = test_auth_manager("keeps_existing_no_tenant_source");
+        // Persisted device-JWT carries NO tenant claim → fallbacks 1 + 2 miss.
+        let existing_jwt = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        mgr.store_tokens(&existing_jwt, "").expect("store");
+
+        // Mock would 200 with a fresh JWT — it must NEVER be consulted.
+        let new_jwt = synth_jwt(chrono::Utc::now().timestamp() + 4 * 60 * 60);
+        let body = serde_json::json!({ "token": new_jwt }).to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let outcome = try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, None).await;
+
+        assert_eq!(
+            outcome,
+            RefreshOutcome::KeptExisting,
+            "no usable tenant from any source MUST yield KeptExisting"
+        );
+        assert_eq!(
+            *cap.hits.lock().unwrap(),
+            0,
+            "pair-cli must NOT be hit when no tenant_id can be resolved"
+        );
+        let still = mgr.get_access_token().expect("token still present");
+        assert_eq!(
+            still, existing_jwt,
+            "JWT in access_token slot must be UNCHANGED when no tenant resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresher_uses_machine_tenant_when_no_jwt_claims() {
+        // Fallback 3: OAuth bearer + persisted device-JWT both lack a tenant
+        // claim, but the caller-injected `machine_tenant`
+        // (machine.json::active_tenant_id in prod) supplies one → the refresh
+        // proceeds and pair-cli is hit exactly once.
+        let mgr = test_auth_manager("uses_machine_tenant");
+        let existing_jwt = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        mgr.store_tokens(&existing_jwt, "").expect("store");
+
+        let new_jwt = synth_jwt(chrono::Utc::now().timestamp() + 4 * 60 * 60);
+        // Full PairCompleteResponse shape (token alone fails the decode —
+        // device_id/user_id/jti/exp are required fields).
+        let body = serde_json::json!({
+            "token": new_jwt,
+            "device_id": "11111111-1111-4111-8111-111111111111",
+            "user_id":   "22222222-2222-4222-8222-222222222222",
+            "jti":       "33333333-3333-4333-8333-333333333333",
+            "exp":       chrono::Utc::now().timestamp() + 4 * 60 * 60,
+        })
+        .to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let machine = uuid::Uuid::parse_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
+        let outcome =
+            try_refresh_once(&mgr, &base, &tok_no_tenant(), DID, UID, Some(machine)).await;
+
+        match outcome {
+            RefreshOutcome::Replaced { new_jwt: got } => {
+                assert_eq!(got, new_jwt, "Replaced must carry the new JWT");
+            }
+            other => {
+                panic!("machine tenant present → refresh must proceed (Replaced), got {other:?}")
+            }
+        }
+        assert_eq!(
+            *cap.hits.lock().unwrap(),
+            1,
+            "pair-cli should be hit exactly once when machine tenant supplies the id"
         );
     }
 }
