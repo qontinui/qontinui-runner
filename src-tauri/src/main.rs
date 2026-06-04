@@ -1841,6 +1841,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // the existing setup body rely on non-`move` semantics; see
             // the comment block above this closure).
             {
+                // Phase 0 multi-user readiness — normalize the operator's
+                // legacy `machine.json` so the canonical `device_id` key is
+                // present before any consumer reads it (the session machinery
+                // below + the coord data-plane bearer). No-op when the file is
+                // already canonical / missing.
+                qontinui_runner_lib::pair::ensure_device_id_persisted();
+
                 let app_handle = app.handle().clone();
                 let term_state: tauri::State<'_, std::sync::Arc<terminal::TerminalManager>> =
                     app.state();

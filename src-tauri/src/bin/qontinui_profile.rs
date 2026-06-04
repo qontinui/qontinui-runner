@@ -601,6 +601,11 @@ fn cmd_device_init(name_arg: Option<&str>) -> ExitCode {
         eprintln!("write {} failed: {}", path.display(), e);
         return ExitCode::from(2);
     }
+    // Phase 0 multi-user readiness — ensure the canonical `device_id` key
+    // lands even if a legacy `machine_id`-only file slipped past the
+    // DeviceFile serialization (e.g. a sibling reader rewrote it). No-op
+    // when already canonical.
+    qontinui_runner_lib::pair::ensure_device_id_persisted_at(&path);
     if was_new {
         println!(
             "wrote machine.json: {} (host={})",

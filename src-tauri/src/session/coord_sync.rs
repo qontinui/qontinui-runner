@@ -614,28 +614,38 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // session start; we just forward it.
             let body = rebuild_create_body(rec);
             let url = format!("{base}/sessions");
-            inner.http.post(&url).json(&body).send().await
+            crate::auth::attach_device_auth(inner.http.post(&url).json(&body))
+                .send()
+                .await
         }
         "heartbeat" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
             let body = json!({ "heartbeat": true });
-            inner.http.patch(&url).json(&body).send().await
+            crate::auth::attach_device_auth(inner.http.patch(&url).json(&body))
+                .send()
+                .await
         }
         "state_change" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
             // The payload carries whatever fields the runner changed —
             // forward the subset coord understands.
             let body = state_change_body(&rec.payload);
-            inner.http.patch(&url).json(&body).send().await
+            crate::auth::attach_device_auth(inner.http.patch(&url).json(&body))
+                .send()
+                .await
         }
         "closed" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
-            inner.http.delete(&url).send().await
+            crate::auth::attach_device_auth(inner.http.delete(&url))
+                .send()
+                .await
         }
         "claim_stolen" => {
             let url = format!("{base}/sessions/{}/steal", rec.session_id);
             let body = steal_body(rec);
-            inner.http.post(&url).json(&body).send().await
+            crate::auth::attach_device_auth(inner.http.post(&url).json(&body))
+                .send()
+                .await
         }
         other => {
             // OutputChunk + HandoffRequest are Phase 7/8 — defined now

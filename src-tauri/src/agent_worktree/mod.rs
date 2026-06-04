@@ -194,9 +194,7 @@ async fn pre_allocate_claim(
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("build claim http client: {e}"))?;
-    let resp = client
-        .post(&url)
-        .json(&body)
+    let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -385,9 +383,7 @@ async fn heartbeat_once(
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("build heartbeat client: {e}"))?;
-    let resp = client
-        .post(&url)
-        .json(&body)
+    let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -443,7 +439,10 @@ pub async fn release_claim_best_effort(
             return;
         }
     };
-    match client.post(&url).json(&body).send().await {
+    match crate::auth::attach_device_auth(client.post(&url).json(&body))
+        .send()
+        .await
+    {
         Ok(r) => {
             debug!(
                 "release_claim_best_effort: kind={kind} key={resource_key} status={}",
@@ -902,9 +901,7 @@ pub async fn allocate_and_materialize_with_claim(
     });
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .json(&body)
+    let resp = crate::auth::attach_device_auth(reqwest::Client::new().post(&url).json(&body))
         .send()
         .await
         .map_err(|e| AllocateError::Other(format!("POST {url}: {e}")))?;

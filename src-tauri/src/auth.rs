@@ -475,6 +475,86 @@ impl Default for AuthManager {
     }
 }
 
+// ============================================================================
+// Device-JWT data-plane bearer — Phase 0 runner↔coord multi-user readiness.
+//
+// The runner's coord data-plane HTTP calls (session register/heartbeat/state,
+// claim acquire/heartbeat/release, agent allocate) were unauthenticated. The
+// device-JWT already exists (minted by pairing, stored in the access_token
+// slot); these helpers attach it as `Authorization: Bearer <jwt>` on each call
+// when present. Coord still accepts anonymous calls, so a missing token (an
+// unpaired runner / empty keychain) is NEVER fatal — the request goes out
+// exactly as before.
+// ============================================================================
+
+/// Total data-plane calls that passed through [`attach_device_auth`].
+static DATA_PLANE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Subset of those that carried the device-JWT bearer header.
+static DATA_PLANE_AUTHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Gate so the unpaired-runner warning is logged at most once per process.
+static MISSING_TOKEN_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// Returns the stored device-JWT as a bearer string, or `None` when no token
+/// is available (unpaired runner, missing keychain entry, storage IO error).
+///
+/// NEVER fatal and NEVER panics — every failure mode collapses to `None`, and
+/// callers fall back to sending the request unauthenticated (coord accepts
+/// anonymous data-plane writes). The missing-token case is logged at most once
+/// per process via [`MISSING_TOKEN_WARNED`] so the frequent heartbeat path
+/// can't spam the log.
+///
+/// No caching: `AuthManager::get_access_token()` is a cheap local encrypted-
+/// file read, and the device-JWT has only a 4-hour TTL (refreshed in place by
+/// the refresher loop), so a stale long-lived cache would risk presenting an
+/// expired bearer. Reading per-call keeps us always-current.
+pub fn device_bearer() -> Option<String> {
+    match AuthManager::new().get_access_token() {
+        Ok(token) if !token.trim().is_empty() => Some(token),
+        Ok(_) => {
+            MISSING_TOKEN_WARNED.call_once(|| {
+                warn!(
+                    "coord data-plane: no device-JWT stored (empty token) — \
+                     sending coord calls unauthenticated; pair this runner to authenticate"
+                );
+            });
+            None
+        }
+        Err(e) => {
+            MISSING_TOKEN_WARNED.call_once(|| {
+                warn!(
+                    "coord data-plane: device-JWT unavailable ({e}) — \
+                     sending coord calls unauthenticated; pair this runner to authenticate"
+                );
+            });
+            None
+        }
+    }
+}
+
+/// Attach the device-JWT bearer to a coord data-plane request when one is
+/// available, otherwise return the builder unchanged. Also drives the
+/// auth-coverage metric (the dogfood signal Phase 1 gates on): every call is
+/// counted in `DATA_PLANE_TOTAL`, and calls that carried the header in
+/// `DATA_PLANE_AUTHED`. A coverage summary is emitted at info level every 25th
+/// call so an operator can watch the unpaired→paired transition without a new
+/// dependency.
+pub fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let total = DATA_PLANE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let rb = match device_bearer() {
+        Some(token) => {
+            DATA_PLANE_AUTHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            rb.header("Authorization", format!("Bearer {token}"))
+        }
+        None => rb,
+    };
+    if total.is_multiple_of(25) {
+        let authed = DATA_PLANE_AUTHED.load(std::sync::atomic::Ordering::Relaxed);
+        let pct = (authed as f64 / total as f64) * 100.0;
+        info!("coord data-plane auth coverage: {authed}/{total} ({pct:.0}%)");
+    }
+    rb
+}
+
 /// Returns true if `s` looks like a JWS Compact Serialization
 /// (three base64url segments separated by `.`). Used by Phase 4 of the
 /// unified-devices migration to distinguish a real device-JWT from the

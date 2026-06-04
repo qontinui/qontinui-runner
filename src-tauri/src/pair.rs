@@ -146,6 +146,93 @@ fn read_device_id() -> Result<String, String> {
     Ok(parsed.device_id)
 }
 
+/// Backfill the canonical `device_id` key into `~/.qontinui/machine.json`
+/// when the file predates the `machine_id`→`device_id` rename.
+///
+/// The operator's live file is the legacy shape
+/// `{"machine_id": "...", "hostname": "...", "active_tenant_id": "..."}`.
+/// Reads already work via serde aliases, but the canonical `device_id` key is
+/// absent; this normalizes the file so readers that key off `device_id`
+/// literally (without the alias) see it too. `machine_id` is intentionally
+/// PRESERVED — other readers may still alias off it — and every sibling field
+/// is carried verbatim.
+///
+/// Resolves the path via `dirs::home_dir()` and delegates to
+/// [`ensure_device_id_persisted_at`]. Missing/unreadable machine.json is a
+/// no-op (never fatal): a runner that has never run `device init` simply has
+/// nothing to normalize.
+pub fn ensure_device_id_persisted() {
+    let Some(path) = machine_file_path() else {
+        return;
+    };
+    ensure_device_id_persisted_at(&path);
+}
+
+/// Path-parameterized core of [`ensure_device_id_persisted`] (testable
+/// without touching the real home directory).
+///
+/// If the file parses as a JSON object that has `machine_id` but no
+/// `device_id`, atomically rewrites it (temp file + rename, matching
+/// `commands::tenant::write_active_tenant_id`) adding `device_id` with the
+/// same value while preserving all other fields. Any other shape — already
+/// canonical, missing file, non-object, unparseable — is left untouched.
+pub fn ensure_device_id_persisted_at(path: &std::path::Path) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return, // Missing/unreadable → nothing to normalize.
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(
+                "ensure_device_id_persisted: {} is not valid JSON ({e}) — skipping",
+                path.display()
+            );
+            return;
+        }
+    };
+    let serde_json::Value::Object(mut obj) = value else {
+        return;
+    };
+    // Already canonical, or no legacy key to backfill from → no-op.
+    if obj.contains_key("device_id") {
+        return;
+    }
+    let Some(machine_id) = obj.get("machine_id").cloned() else {
+        return;
+    };
+    obj.insert("device_id".to_string(), machine_id);
+
+    let pretty = match serde_json::to_vec_pretty(&serde_json::Value::Object(obj)) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("ensure_device_id_persisted: serialize failed: {e}");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &pretty) {
+        tracing::warn!(
+            "ensure_device_id_persisted: write {} failed: {e}",
+            tmp.display()
+        );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(
+            "ensure_device_id_persisted: rename {} → {} failed: {e}",
+            tmp.display(),
+            path.display()
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    tracing::info!(
+        "machine.json: backfilled canonical device_id key at {}",
+        path.display()
+    );
+}
+
 /// Path to the paired-user JSON written by `device pair` and read by
 /// `device init` to attach a `user_id` to the register payload. Lives
 /// under the Tauri app's local data directory (alongside
@@ -1108,6 +1195,98 @@ mod tests {
         let parsed: PairedUserFile = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.user_id, original.user_id);
         assert_eq!(parsed.tenant_id, original.tenant_id);
+    }
+
+    // ------------------------------------------------------------------------
+    // ensure_device_id_persisted_at — machine.json device_id backfill
+    // (Phase 0 multi-user readiness). All variants operate on a tempdir path
+    // so they never touch the operator's real ~/.qontinui.
+    // ------------------------------------------------------------------------
+
+    fn read_json(path: &std::path::Path) -> serde_json::Value {
+        let bytes = std::fs::read(path).expect("read machine.json");
+        serde_json::from_slice(&bytes).expect("parse machine.json")
+    }
+
+    #[test]
+    fn backfill_adds_device_id_and_preserves_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        // Legacy shape — exactly the operator's live file.
+        std::fs::write(
+            &path,
+            r#"{"machine_id":"abc-123","hostname":"laptop","active_tenant_id":"tenant-9"}"#,
+        )
+        .unwrap();
+
+        ensure_device_id_persisted_at(&path);
+
+        let v = read_json(&path);
+        // Canonical key added with the same value...
+        assert_eq!(v.get("device_id").and_then(|x| x.as_str()), Some("abc-123"));
+        // ...legacy key preserved (other readers may still alias off it)...
+        assert_eq!(
+            v.get("machine_id").and_then(|x| x.as_str()),
+            Some("abc-123")
+        );
+        // ...and every sibling field carried verbatim.
+        assert_eq!(v.get("hostname").and_then(|x| x.as_str()), Some("laptop"));
+        assert_eq!(
+            v.get("active_tenant_id").and_then(|x| x.as_str()),
+            Some("tenant-9")
+        );
+    }
+
+    #[test]
+    fn backfill_leaves_canonical_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        let canonical = r#"{"device_id":"keep-me","hostname":"box"}"#;
+        std::fs::write(&path, canonical).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        ensure_device_id_persisted_at(&path);
+
+        // Byte-for-byte identical — no rewrite when device_id already present.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn backfill_missing_file_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        // File does not exist.
+        ensure_device_id_persisted_at(&path);
+        assert!(!path.exists(), "must not create the file");
+    }
+
+    #[test]
+    fn backfill_file_without_machine_id_is_noop() {
+        // Neither canonical nor legacy id key → nothing to backfill from.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        let original = r#"{"hostname":"box"}"#;
+        std::fs::write(&path, original).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        ensure_device_id_persisted_at(&path);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn backfill_unparseable_file_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("machine.json");
+        std::fs::write(&path, b"not json at all {{{").unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        ensure_device_id_persisted_at(&path);
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "unparseable file left untouched");
     }
 }
 
