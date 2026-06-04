@@ -164,6 +164,15 @@ export interface ITerminalBackend {
   scrollPages(pageCount: number): void;
   /** Scroll the viewport to the very top of the scrollback (VS Code Ctrl+Home). */
   scrollToTop(): void;
+  /**
+   * Jump the viewport to the previous shell prompt (VS Code Ctrl+Up "Scroll
+   * to Previous Command"). Prompt positions come from OSC 633;A shell
+   * integration marks tracked by the backend; no-op when no marks exist
+   * (shell integration not installed, or a backend without marker support).
+   */
+  scrollToPreviousCommand(): void;
+  /** Jump to the next shell prompt (VS Code Ctrl+Down); bottom when none ahead. */
+  scrollToNextCommand(): void;
 
   // -- Find-in-terminal (VS Code Ctrl+F parity) ------------------------------
   /**

@@ -8,6 +8,7 @@
  *   Scroll page up / down    Shift+PageUp     / Shift+PageDown
  *   Scroll line up / down    Ctrl+Alt+PageUp  / Ctrl+Alt+PageDown
  *   Scroll to top / bottom   Ctrl+Home        / Ctrl+End
+ *   Prev / next command      Ctrl+Up          / Ctrl+Down
  *
  * Wired into the per-terminal `attachCustomKeyEventHandler` in
  * `TerminalInstance`, which scrolls the focused terminal's scrollback and
@@ -24,7 +25,9 @@ export type ScrollAction =
   | { kind: "lines"; amount: number }
   | { kind: "pages"; amount: number }
   | { kind: "top" }
-  | { kind: "bottom" };
+  | { kind: "bottom" }
+  | { kind: "prevCommand" }
+  | { kind: "nextCommand" };
 
 /** The subset of `KeyboardEvent` the mapping depends on. */
 export interface KeyLike {
@@ -58,9 +61,14 @@ export function matchScrollShortcut(e: KeyLike): ScrollAction | null {
   }
 
   // Top / bottom — Ctrl+Home / Ctrl+End (⌘ on macOS), no Alt/Shift.
+  // Command navigation — Ctrl+Up / Ctrl+Down (⌘ on macOS): jump between
+  // shell prompts (VS Code "Scroll to Previous/Next Command", driven by
+  // OSC 633;A shell-integration marks).
   if (cmdOrCtrl && !altKey && !shiftKey) {
     if (key === "Home") return { kind: "top" };
     if (key === "End") return { kind: "bottom" };
+    if (key === "ArrowUp") return { kind: "prevCommand" };
+    if (key === "ArrowDown") return { kind: "nextCommand" };
   }
 
   return null;

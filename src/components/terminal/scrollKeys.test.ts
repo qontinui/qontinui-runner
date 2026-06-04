@@ -39,12 +39,24 @@ describe("matchScrollShortcut", () => {
     expect(matchScrollShortcut(k({ key: "End", ctrlKey: true }))).toEqual({ kind: "bottom" });
   });
 
+  it("maps Ctrl+Up / Ctrl+Down to previous / next command navigation", () => {
+    expect(matchScrollShortcut(k({ key: "ArrowUp", ctrlKey: true }))).toEqual({
+      kind: "prevCommand",
+    });
+    expect(matchScrollShortcut(k({ key: "ArrowDown", ctrlKey: true }))).toEqual({
+      kind: "nextCommand",
+    });
+  });
+
   it("accepts Cmd (metaKey) as a Ctrl alias for macOS", () => {
     expect(matchScrollShortcut(k({ key: "Home", metaKey: true }))).toEqual({ kind: "top" });
     expect(matchScrollShortcut(k({ key: "End", metaKey: true }))).toEqual({ kind: "bottom" });
     expect(matchScrollShortcut(k({ key: "PageUp", metaKey: true, altKey: true }))).toEqual({
       kind: "lines",
       amount: -1,
+    });
+    expect(matchScrollShortcut(k({ key: "ArrowUp", metaKey: true }))).toEqual({
+      kind: "prevCommand",
     });
   });
 
@@ -63,5 +75,12 @@ describe("matchScrollShortcut", () => {
     expect(matchScrollShortcut(k({ key: "Home", shiftKey: true }))).toBeNull();
     // Ctrl+Shift+Home should not scroll (Shift disqualifies the top binding).
     expect(matchScrollShortcut(k({ key: "Home", ctrlKey: true, shiftKey: true }))).toBeNull();
+    // Bare arrows belong to the app (history navigation in shells/TUIs).
+    expect(matchScrollShortcut(k({ key: "ArrowUp" }))).toBeNull();
+    expect(matchScrollShortcut(k({ key: "ArrowDown" }))).toBeNull();
+    // Ctrl+Shift+Arrows are page-level focus-history shortcuts — leave them.
+    expect(matchScrollShortcut(k({ key: "ArrowUp", ctrlKey: true, shiftKey: true }))).toBeNull();
+    // Ctrl+Alt+Arrows are not bound — leave them for the app.
+    expect(matchScrollShortcut(k({ key: "ArrowDown", ctrlKey: true, altKey: true }))).toBeNull();
   });
 });

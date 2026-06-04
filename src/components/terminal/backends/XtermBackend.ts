@@ -1,4 +1,4 @@
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type IMarker } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { CanvasAddon } from "@xterm/addon-canvas";
@@ -33,6 +33,8 @@ export class XtermBackend implements ITerminalBackend {
   private readonly fitAddon: FitAddon;
   private readonly searchAddon: SearchAddon;
   private container: HTMLElement | null = null;
+  /** OSC 633;A prompt-start markers, in registration (= buffer) order. */
+  private promptMarkers: IMarker[] = [];
 
   constructor(options: TerminalBackendOptions = {}) {
     this.term = new Terminal({
@@ -50,6 +52,27 @@ export class XtermBackend implements ITerminalBackend {
     this.term.loadAddon(this.fitAddon);
     this.searchAddon = new SearchAddon();
     this.term.loadAddon(this.searchAddon);
+
+    // Track shell-prompt positions for Ctrl+Up/Ctrl+Down command navigation
+    // (VS Code "Scroll to Previous/Next Command"). OSC 633;A fires at every
+    // prompt start when shell integration is installed; registerMarker pins
+    // the cursor's buffer line and keeps it stable as scrollback trims (the
+    // marker disposes itself when its line scrolls out of the buffer).
+    // Registered as a SECOND OSC 633 handler — returning false lets the
+    // `onOsc633` subscriber (TerminalInstance shell-integration wiring) run
+    // for the same payload.
+    this.term.parser.registerOscHandler(633, (data: string) => {
+      if (data === "A") {
+        this.promptMarkers.push(this.term.registerMarker(0));
+      }
+      return false;
+    });
+  }
+
+  /** Drop disposed markers (line === -1) and return the live, sorted list. */
+  private livePromptMarkers(): IMarker[] {
+    this.promptMarkers = this.promptMarkers.filter((m) => !m.isDisposed && m.line >= 0);
+    return this.promptMarkers;
   }
 
   open(container: HTMLElement): void {
@@ -154,6 +177,35 @@ export class XtermBackend implements ITerminalBackend {
 
   scrollToTop(): void {
     this.term.scrollToTop();
+  }
+
+  scrollToPreviousCommand(): void {
+    const viewportTop = this.term.buffer.active.viewportY;
+    const markers = this.livePromptMarkers();
+    // Last prompt strictly above the current viewport top. When the earliest
+    // prompt is already at/above the top, fall through to the very top so
+    // repeated presses still make progress (matches VS Code).
+    for (let i = markers.length - 1; i >= 0; i--) {
+      if (markers[i].line < viewportTop) {
+        this.term.scrollToLine(markers[i].line);
+        return;
+      }
+    }
+    if (markers.length > 0) this.term.scrollToTop();
+    // No markers at all (no shell integration): deliberate no-op — a blind
+    // jump to the top of 10k lines of scrollback would be a surprise.
+  }
+
+  scrollToNextCommand(): void {
+    const viewportTop = this.term.buffer.active.viewportY;
+    const markers = this.livePromptMarkers();
+    for (const m of markers) {
+      if (m.line > viewportTop) {
+        this.term.scrollToLine(m.line);
+        return;
+      }
+    }
+    if (markers.length > 0) this.term.scrollToBottom();
   }
 
   findNext(term: string, options?: TerminalSearchOptions): boolean {

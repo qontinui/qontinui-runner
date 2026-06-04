@@ -142,6 +142,12 @@ export class GhosttyBackend implements ITerminalBackend {
     t.scrollToTop?.();
   }
 
+  // ghostty-web has no marker API — command navigation degrades to a no-op
+  // (same posture as find below: the binding simply does nothing here).
+  scrollToPreviousCommand(): void {}
+
+  scrollToNextCommand(): void {}
+
   // ghostty-web has no search addon — find-in-terminal degrades to "no
   // matches" and the find bar simply shows 0 results on this backend.
   findNext(): boolean {
