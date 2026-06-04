@@ -42,6 +42,23 @@ interface WorkerRegisteredPayload {
 }
 
 /**
+ * Pure helper: resolve the durable session-CLOSE record args for a tab that is
+ * being EXPLICITLY closed by the user. Returns `null` when the tab has no
+ * `claudeSessionId` (a plain shell — nothing to record). Exported so the close-
+ * recording contract can be unit-tested without booting React (vitest runs in
+ * a `node` environment with no React Testing Library — see existing
+ * `useTerminalManager.test.ts`).
+ */
+export function buildSessionCloseRecord(
+  tabs: TerminalTab[],
+  id: string,
+): { claudeSessionId: string; reason: "explicit" } | null {
+  const closing = tabs.find((t) => t.id === id);
+  if (!closing?.claudeSessionId) return null;
+  return { claudeSessionId: closing.claudeSessionId, reason: "explicit" };
+}
+
+/**
  * Pure helper: decide whether `tabs` should be replaced when applying a
  * worker mark for `terminalId`. Returns the next tabs array (same identity
  * if no change), and a `buffered` flag the caller uses to record the mark
@@ -289,9 +306,15 @@ export function useTerminalManager(pageId: string = "default") {
   }, []);
 
   const closeTerminal = useCallback((id: string) => {
+    // Capture the closing tab's Claude session id (read-only) so we can record
+    // an EXPLICIT durable close after the state update. We read it out of the
+    // updater's `prev` without mutating inside the updater (StrictMode double-
+    // invokes updaters in dev).
+    let closeRecord: ReturnType<typeof buildSessionCloseRecord> = null;
     // Update React state immediately so the UI is responsive.
     // The Rust-side close (process kill + thread join) runs in the background.
     setTabs((prev) => {
+      closeRecord = buildSessionCloseRecord(prev, id);
       const next = prev.filter((t) => t.id !== id);
       setActiveId((currentActive) => {
         if (currentActive !== id) return currentActive;
@@ -300,6 +323,14 @@ export function useTerminalManager(pageId: string = "default") {
       });
       return next;
     });
+
+    // Record the durable session CLOSE for an explicit user close (only when
+    // the tab was running a Claude session). Fire-and-forget.
+    if (closeRecord) {
+      invoke<CommandResponse>("terminal_session_record_close", closeRecord).catch(() => {
+        // Best-effort — the live close still proceeds below.
+      });
+    }
 
     // Only invoke Rust close for terminal tabs (plan tabs have no PTY)
     if (!id.startsWith("plan-")) {

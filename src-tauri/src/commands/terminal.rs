@@ -11,6 +11,7 @@ use crate::claude_session::SessionManager;
 use crate::commands::CommandResponse;
 use crate::error::AppError;
 use crate::session::pane_store::{PaneKey, PaneSessionStore};
+use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::{strip_ansi, TerminalManager};
 
@@ -716,6 +717,83 @@ pub fn terminal_collect_session_metadata(
     })
 }
 
+/// Record (or refresh) a Claude terminal session in the durable,
+/// backend-owned lifecycle registry, keyed by `claudeSessionId`.
+///
+/// This is the source of truth for "which Claude sessions exist and which
+/// grid zone each belongs to" — replacing the fragile `localStorage`
+/// snapshot. Calling it again with the same `claude_session_id` updates the
+/// existing record in place (structural dedup), which is what prevents the
+/// duplicate-session bug.
+///
+/// Synchronous + fast: [`SessionLifecycleStore::record_open`] fsyncs the
+/// atomic write before returning, so the frontend can rely on durability the
+/// instant this resolves.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn terminal_session_record_open(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+    config_dir: Option<String>,
+    working_dir: Option<String>,
+    page_id: Option<String>,
+    zone_index: i32,
+    title: Option<String>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    let record = TerminalSessionRecord {
+        claude_session_id,
+        config_dir,
+        working_dir,
+        page_id: page_id.unwrap_or_else(|| "default".to_string()),
+        zone_index,
+        title,
+        terminal_id,
+        // record_open seeds these from `now`; values here are placeholders.
+        opened_at: 0,
+        last_seen_at: 0,
+        state: "open".to_string(),
+        closed_at: None,
+        close_reason: None,
+    };
+    store.record_open(record);
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
+/// Mark a Claude terminal session closed in the lifecycle registry. No-op
+/// (still succeeds) if the session is absent or already closed.
+#[tauri::command]
+pub fn terminal_session_record_close(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+    reason: String,
+) -> Result<CommandResponse, String> {
+    store.record_close(&claude_session_id, &reason);
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    })
+}
+
+/// List every currently-open Claude terminal session from the lifecycle
+/// registry. The grid hydrates its session tiles from this instead of
+/// `localStorage`.
+#[tauri::command]
+pub fn terminal_session_list_open(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+) -> Result<CommandResponse, String> {
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "sessions": store.open_records() })),
+    })
+}
+
 /// Build the Tauri plugin that registers this module's command handlers.
 ///
 /// Non-generic because handlers accept concrete `tauri::AppHandle`.
@@ -737,6 +815,9 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_grid_text,
             terminal_grid_search,
             terminal_grid_diff,
+            terminal_session_record_open,
+            terminal_session_record_close,
+            terminal_session_list_open,
         ])
         .build()
 }

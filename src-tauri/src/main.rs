@@ -1622,6 +1622,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_list,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_save_scrollback,
+            commands::terminal::terminal_session_list_open,
+            commands::terminal::terminal_session_record_close,
+            commands::terminal::terminal_session_record_open,
             commands::terminal::terminal_set_title,
             commands::terminal::terminal_write,
             commands::terminal_analysis::analyze_architecture,
@@ -1937,6 +1940,162 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 );
                 app.manage(pane_store);
+
+                // Durable, backend-owned terminal-session lifecycle registry,
+                // keyed by `claudeSessionId`. Source of truth for "which
+                // Claude sessions exist and which grid zone each belongs to",
+                // replacing the fragile frontend `localStorage` snapshot.
+                // Co-located with the pane store + session outbox under
+                // `.qontinui/runner` (same home-dir resolution + temp-dir
+                // fallback). A background poll (spawned below) lazily flips
+                // dead sessions to `closed`.
+                // Namespace the registry file by API port so each runner
+                // instance owns its own sessions — mirrors the frontend
+                // `instance-storage.ts` convention (port 9876 → base name,
+                // every other port → `-<port>` suffix). Without this a temp
+                // runner (9877+) would read the primary's open records and
+                // try to `claude --resume` the primary's live sessions.
+                let lifecycle_api_port = crate::mcp::types::get_mcp_api_port();
+                let lifecycle_file_name = if lifecycle_api_port == 9876 {
+                    "terminal-sessions.json".to_string()
+                } else {
+                    format!("terminal-sessions-{}.json", lifecycle_api_port)
+                };
+                let lifecycle_store_path = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".qontinui")
+                    .join("runner")
+                    .join(&lifecycle_file_name);
+                let lifecycle_store = std::sync::Arc::new(
+                    match session::session_lifecycle_store::SessionLifecycleStore::open(
+                        &lifecycle_store_path,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %lifecycle_store_path.display(),
+                                "session: lifecycle store open failed — using ephemeral fallback"
+                            );
+                            let fallback = std::env::temp_dir().join(format!(
+                                "qontinui-runner-{}",
+                                lifecycle_file_name
+                            ));
+                            session::session_lifecycle_store::SessionLifecycleStore::open(&fallback)
+                                .expect("session: ephemeral lifecycle store open failed")
+                        }
+                    },
+                );
+                let poll_lifecycle_store = lifecycle_store.clone();
+                app.manage(lifecycle_store);
+
+                // Infrequent liveness poll for lazy close-detection. Every
+                // 45s it snapshots open lifecycle records against the live
+                // terminal manager + a single system process snapshot, runs
+                // the pure `classify` decision core (asymmetric — NEVER closes
+                // on uncertainty), and flips confidently-dead sessions to
+                // `closed`. Detached for the process lifetime; wrapped so a
+                // fallible tick never panics the loop.
+                let poll_tm = term_for_session.clone();
+                tauri::async_runtime::spawn(async move {
+                    use std::collections::HashMap as StdHashMap;
+                    use std::time::Duration;
+
+                    use session::session_lifecycle_store::{classify, PollAction};
+
+                    // claudeSessionId -> consecutive zero-descendant ticks,
+                    // carried across ticks to debounce `NeedsConfirm`.
+                    let mut consecutive_dead: StdHashMap<String, u32> = StdHashMap::new();
+
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(45)).await;
+
+                        let open = poll_lifecycle_store.open_records();
+                        if open.is_empty() {
+                            // Forget any stale counters and prune, then idle.
+                            consecutive_dead.clear();
+                            poll_lifecycle_store
+                                .prune(chrono::Utc::now().timestamp_millis());
+                            continue;
+                        }
+
+                        let live = poll_tm.list();
+
+                        for rec in &open {
+                            // Match the live terminal: by id first, then the
+                            // (page_id, title, working_dir) triple as fallback.
+                            let info = live
+                                .iter()
+                                .find(|i| i.id == rec.terminal_id)
+                                .or_else(|| {
+                                    live.iter().find(|i| {
+                                        i.page_id == rec.page_id
+                                            && rec
+                                                .title
+                                                .as_deref()
+                                                .map(|t| t == i.title)
+                                                .unwrap_or(false)
+                                            && rec
+                                                .working_dir
+                                                .as_deref()
+                                                .map(|w| w == i.working_dir)
+                                                .unwrap_or(false)
+                                    })
+                                });
+
+                            let (live_is_alive, descendant_count, snapshot_ok) = match info {
+                                None => (None, 0usize, true),
+                                Some(info) => {
+                                    let pid = info.pid.unwrap_or(0);
+                                    let (descendants, parent_map) =
+                                        crate::process_capture::process_tree::discover_descendants_with_parent_map(pid)
+                                            .await;
+                                    // A totally-empty system parent_map means
+                                    // the snapshot helper failed → Skip.
+                                    let snapshot_ok = !parent_map.is_empty();
+                                    let alive = crate::process_capture::health::pid_alive(pid);
+                                    (Some(alive), descendants.len(), snapshot_ok)
+                                }
+                            };
+
+                            let prior = consecutive_dead
+                                .get(&rec.claude_session_id)
+                                .copied()
+                                .unwrap_or(0);
+                            let action =
+                                classify(live_is_alive, descendant_count, prior, snapshot_ok);
+
+                            match action {
+                                PollAction::KeepAlive => {
+                                    poll_lifecycle_store.touch(&rec.claude_session_id);
+                                    consecutive_dead.remove(&rec.claude_session_id);
+                                }
+                                PollAction::NeedsConfirm => {
+                                    consecutive_dead
+                                        .insert(rec.claude_session_id.clone(), prior + 1);
+                                    tracing::debug!(
+                                        claude_session = %rec.claude_session_id,
+                                        "session lifecycle poll: zero descendants — confirming before close"
+                                    );
+                                }
+                                PollAction::Close => {
+                                    poll_lifecycle_store
+                                        .record_close(&rec.claude_session_id, "poll-dead");
+                                    consecutive_dead.remove(&rec.claude_session_id);
+                                    tracing::info!(
+                                        claude_session = %rec.claude_session_id,
+                                        "session lifecycle poll: closing dead session"
+                                    );
+                                }
+                                PollAction::Skip => {
+                                    // Uncertain — do NOT touch the counter.
+                                }
+                            }
+                        }
+
+                        poll_lifecycle_store.prune(chrono::Utc::now().timestamp_millis());
+                    }
+                });
 
                 // Plan §Phase 3/7/10 — start the coord-sync background loops
                 // (drain, heartbeat, Phase 7 handoff receiver, Phase 10

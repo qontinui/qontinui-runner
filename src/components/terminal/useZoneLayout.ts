@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 
 // ── Layout Definitions ─────────────────────────────────────────────────────
@@ -165,6 +165,63 @@ function persistState(pageId: string, state: PersistedState) {
   }
 }
 
+// ── Pure assignment reconciliation ─────────────────────────────────────────
+
+/**
+ * Pure reducer behind the "auto-assign tabs to empty zones" effect. Given the
+ * previous `zoneIndex → tabId` map, the current live `tabIds`, the layout's
+ * zone count, and the set of zones RESERVED by a session record (claimed via
+ * `assignTabToZone` during restore), produce the next assignment map:
+ *
+ *   - drop assignments for tabs that no longer exist,
+ *   - creation-order auto-fill unassigned tabs into empty zones,
+ *   - but NEVER fill a reserved-yet-empty zone (so a plain shell created first
+ *     can't steal the zone a Claude session record claimed — the creation-order
+ *     bug this registry fix targets).
+ *
+ * Returns `prev` (same identity) when nothing changed. Exported so the
+ * regression test can assert the binding without booting React.
+ */
+export function reconcileAssignments(
+  prev: ZoneAssignments,
+  tabIds: string[],
+  maxZones: number,
+  reservedZones: ReadonlySet<number> = new Set(),
+): ZoneAssignments {
+  const hasDeadAssignments = Object.values(prev).some((tabId) => !tabIds.includes(tabId));
+  const assignedTabIds = new Set(Object.values(prev));
+  const hasUnassigned = tabIds.some((id) => !assignedTabIds.has(id));
+
+  if (!hasDeadAssignments && !hasUnassigned) return prev;
+
+  const next = { ...prev };
+
+  // Remove assignments for tabs that no longer exist
+  if (hasDeadAssignments) {
+    for (const [zoneIdx, tabId] of Object.entries(next)) {
+      if (!tabIds.includes(tabId)) {
+        delete next[Number(zoneIdx)];
+      }
+    }
+  }
+
+  // Find unassigned tabs and fill empty zone slots. Skip zones a session
+  // record has RESERVED so a plain shell created first can never steal a
+  // Claude session's zone.
+  if (hasUnassigned) {
+    const nowAssigned = new Set(Object.values(next));
+    const unassigned = tabIds.filter((id) => !nowAssigned.has(id));
+    for (let z = 0; z < maxZones && unassigned.length > 0; z++) {
+      if (reservedZones.has(z) && !next[z]) continue;
+      if (!(z in next) || !next[z]) {
+        next[z] = unassigned.shift()!;
+      }
+    }
+  }
+
+  return next;
+}
+
 // ── Hook ───────────────────────────────────────────────────────────────────
 
 export function useZoneLayout(tabIds: string[], pageId: string = "default") {
@@ -178,6 +235,15 @@ export function useZoneLayout(tabIds: string[], pageId: string = "default") {
   /** Zone index that is temporarily maximized (null = normal grid) */
   const [maximizedZone, setMaximizedZone] = useState<number | null>(null);
 
+  // Zones explicitly claimed by a durable session record during restore.
+  // The creation-order auto-fill below MUST NOT steal these even while the
+  // record's tab hasn't landed in `tabIds` yet — otherwise a plain shell
+  // created first grabs zone 0/3 and the real Claude session spills to an
+  // unassigned slot (the creation-order bug this registry fix targets).
+  // `assignTabToZone` registers the zone here so the guard holds across the
+  // async restore window; the reservation is cleared once the zone is filled.
+  const reservedZonesRef = useRef<Set<number>>(new Set());
+
   const layout = LAYOUT_PRESETS.find((l) => l.id === layoutId) ?? LAYOUT_PRESETS[0];
 
   // Persist on changes
@@ -187,40 +253,9 @@ export function useZoneLayout(tabIds: string[], pageId: string = "default") {
 
   // Auto-assign tabs to empty zones when tabs change
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- sync assignments when tab list changes
-    setAssignments((prev) => {
-      // Check if any removals or additions are needed before cloning
-      const hasDeadAssignments = Object.values(prev).some((tabId) => !tabIds.includes(tabId));
-      const assignedTabIds = new Set(Object.values(prev));
-      const hasUnassigned = tabIds.some((id) => !assignedTabIds.has(id));
-
-      if (!hasDeadAssignments && !hasUnassigned) return prev;
-
-      const next = { ...prev };
-
-      // Remove assignments for tabs that no longer exist
-      if (hasDeadAssignments) {
-        for (const [zoneIdx, tabId] of Object.entries(next)) {
-          if (!tabIds.includes(tabId)) {
-            delete next[Number(zoneIdx)];
-          }
-        }
-      }
-
-      // Find unassigned tabs and fill empty zone slots
-      if (hasUnassigned) {
-        const nowAssigned = new Set(Object.values(next));
-        const unassigned = tabIds.filter((id) => !nowAssigned.has(id));
-        const maxZones = layout.zones.length;
-        for (let z = 0; z < maxZones && unassigned.length > 0; z++) {
-          if (!(z in next) || !next[z]) {
-            next[z] = unassigned.shift()!;
-          }
-        }
-      }
-
-      return next;
-    });
+    setAssignments((prev) =>
+      reconcileAssignments(prev, tabIds, layout.zones.length, reservedZonesRef.current),
+    );
   }, [tabIds, layout.zones.length]);
 
   const setLayoutId = useCallback(
@@ -262,6 +297,10 @@ export function useZoneLayout(tabIds: string[], pageId: string = "default") {
   );
 
   const assignTabToZone = useCallback((zoneIndex: number, tabId: string) => {
+    // Reserve the zone so the creation-order auto-fill can't steal it while the
+    // tab is mid-creation (restore path). Cleared in the setter below once the
+    // zone holds its intended tab.
+    if (zoneIndex >= 0) reservedZonesRef.current.add(zoneIndex);
     setAssignments((prev) => {
       const next = { ...prev };
       // If this tab is already in another zone, swap
@@ -278,6 +317,9 @@ export function useZoneLayout(tabIds: string[], pageId: string = "default") {
         }
       }
       next[zoneIndex] = tabId;
+      // The zone now holds its intended tab — drop the reservation so a later
+      // genuine vacancy can be auto-filled normally.
+      reservedZonesRef.current.delete(zoneIndex);
       return next;
     });
   }, []);

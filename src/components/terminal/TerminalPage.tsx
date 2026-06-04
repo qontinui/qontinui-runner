@@ -1,5 +1,7 @@
-import { useEffect, useCallback, useMemo, useState } from "react";
+import { useEffect, useCallback, useMemo, useState, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useUIComponent } from "@qontinui/ui-bridge";
+import { createLogger } from "@/lib/logger";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { SessionManagerPanel } from "./SessionManagerPanel";
@@ -42,12 +44,15 @@ import {
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
+import { buildSessionOpenArgs } from "./sessionRecordArgs";
 import { useRegistryAwareness } from "./useRegistryAwareness";
 import { useMidSessionProbe, useMidSessionProbeEnabled } from "./useMidSessionProbe";
 import { MidSessionToast } from "./MidSessionToast";
 import { HoldingLockBanner, shouldShowHoldingBanner } from "./HoldingLockBanner";
 import { WaitingLockBanner } from "./WaitingLockBanner";
 import { DeconflictAdvisoryBanner } from "./DeconflictAdvisoryBanner";
+
+const logger = createLogger("TerminalPage");
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -430,11 +435,105 @@ function TerminalPageInner({
   // `enable_mid_session_path_prediction` localStorage flag.
   const midSessionProbeEnabled = useMidSessionProbeEnabled();
   const midSessionProbe = useMidSessionProbe(tabs, { enabled: midSessionProbeEnabled });
+  // Latest-value refs so the durable-registry record callback below stays
+  // identity-stable while still reading the freshest assignments/tabs. The
+  // capture hook fires the callback from a long-lived polling closure, so a
+  // stale closure would resolve the wrong zone / working dir.
+  const assignmentsRef = useRef(zoneLayout.assignments);
+  useEffect(() => {
+    assignmentsRef.current = zoneLayout.assignments;
+  }, [zoneLayout.assignments]);
+  const tabsRef = useRef(tabs);
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
+
+  /**
+   * Durable session-registry OPEN recorder. Fired the instant a tab binds a
+   * `claudeSessionId` (via the capture hook). Resolves the tab's current zone
+   * by reverse-lookup over the live assignments, then records the OPEN
+   * synchronously through the backend command (NOT the debounced localStorage
+   * snapshot). Fire-and-forget — a failed record only loses the durable
+   * restore hint, the live session is unaffected.
+   */
+  const recordSessionOpen = useCallback(
+    (tabId: string, claudeSessionId: string, configDir?: string) => {
+      const args = buildSessionOpenArgs({
+        assignments: assignmentsRef.current,
+        tabs: tabsRef.current,
+        tabId,
+        claudeSessionId,
+        configDir,
+        pageId,
+      });
+      invoke("terminal_session_record_open", { ...args }).catch((err) => {
+        logger.warn(`terminal_session_record_open failed for ${claudeSessionId}: ${err}`);
+      });
+    },
+    [pageId],
+  );
+
   // Post-spawn polling hook that captures Claude CLI's session id from
   // the on-disk transcript and updates `tab.claudeSessionId` so the
   // commit traffic light has something to key on. Plan §1.5
-  // "Frontend session-id capture".
-  const { startCapture: startSessionIdCapture } = useTabSessionIdCapture({ updateTab, tabs });
+  // "Frontend session-id capture". Also records the durable session OPEN
+  // the instant the id is bound (zone resolved in `recordSessionOpen`).
+  const { startCapture: startSessionIdCapture } = useTabSessionIdCapture({
+    updateTab,
+    tabs,
+    onSessionIdBound: recordSessionOpen,
+  });
+
+  // Zone-move backstop: when a Claude session is dragged between zones the
+  // recorded `zoneIndex` must follow. Watch `zoneLayout.assignments` and, after
+  // a short debounce, re-emit `terminal_session_record_open` for any tab whose
+  // resolved zone changed since the last emit. We track the last-emitted zone
+  // per claudeSessionId in a ref so a re-render that doesn't move anything emits
+  // nothing. The initial bind already records via `recordSessionOpen`, so we
+  // seed the ref on first observation to avoid a redundant double-record.
+  const lastEmittedZoneRef = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const assignments = zoneLayout.assignments;
+      const seen = new Set<string>();
+      for (const tab of tabs) {
+        if (!tab.claudeSessionId) continue;
+        seen.add(tab.claudeSessionId);
+        const zoneIndex = Number(
+          Object.entries(assignments).find(([, id]) => id === tab.id)?.[0] ?? -1,
+        );
+        const prevZone = lastEmittedZoneRef.current.get(tab.claudeSessionId);
+        if (prevZone === undefined) {
+          // First observation — seed without emitting; the id-bind path
+          // already recorded the OPEN with the correct zone.
+          lastEmittedZoneRef.current.set(tab.claudeSessionId, zoneIndex);
+          continue;
+        }
+        if (prevZone === zoneIndex) continue;
+        lastEmittedZoneRef.current.set(tab.claudeSessionId, zoneIndex);
+        invoke("terminal_session_record_open", {
+          ...buildSessionOpenArgs({
+            assignments,
+            tabs,
+            tabId: tab.id,
+            claudeSessionId: tab.claudeSessionId,
+            configDir: tab.claudeConfigDir,
+            pageId,
+          }),
+        }).catch((err) => {
+          logger.warn(
+            `terminal_session_record_open (zone-move) failed for ${tab.claudeSessionId}: ${err}`,
+          );
+        });
+      }
+      // Drop tracking for sessions that no longer exist so a reused
+      // claudeSessionId re-seeds cleanly.
+      for (const sid of [...lastEmittedZoneRef.current.keys()]) {
+        if (!seen.has(sid)) lastEmittedZoneRef.current.delete(sid);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [zoneLayout.assignments, tabs, pageId]);
   const {
     labelsAndTags,
     eventHistory,
@@ -497,6 +596,7 @@ function TerminalPageInner({
   } = useUIStateCx();
 
   useTerminalInitialization({
+    pageId,
     tabs,
     terminalRefs,
     reconnectToExistingSessions,
@@ -518,6 +618,19 @@ function TerminalPageInner({
 
   const handleExit = useCallback(
     (terminalId: string, exitCode: number | null) => {
+      // Record the durable session CLOSE when a pty backing a Claude session
+      // exits. Read the latest tab from the ref so this stays identity-stable.
+      const claudeSessionId = tabsRef.current.find(
+        (t) => t.id === terminalId,
+      )?.claudeSessionId;
+      if (claudeSessionId) {
+        invoke("terminal_session_record_close", {
+          claudeSessionId,
+          reason: "pty-exit",
+        }).catch((err) => {
+          logger.warn(`terminal_session_record_close (pty-exit) failed for ${claudeSessionId}: ${err}`);
+        });
+      }
       updateTab(terminalId, { isAlive: false, exitCode });
       stateTracking.handleExit(terminalId, exitCode);
     },
