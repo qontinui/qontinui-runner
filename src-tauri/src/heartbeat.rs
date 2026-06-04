@@ -116,9 +116,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             }
         };
 
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+        let hostname = crate::fleet::canonical_hostname().unwrap_or_else(|| "unknown".to_string());
 
         let instance_name = crate::instance::instance_name();
 
