@@ -25,9 +25,13 @@
 //! - Node/TS permanently unavailable → degrade (symbol-lookup → code_graph_fallback;
 //!   resolution → `engine_unavailable`, coverage 0). Never 500 on a missing engine.
 
+pub mod cargo_check;
 pub mod code_graph_api;
+pub mod lang;
+pub mod mypy_check;
 pub mod node_bridge;
 pub mod scope;
+pub mod syntactic;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -120,6 +124,16 @@ pub const PROV_INDEXING: &str = "indexing";
 pub const PROV_UNAVAILABLE: &str = "engine_unavailable";
 /// Resolved-import `Ξ_AST` provenance (Phase 1/2): deterministic file binding.
 pub const PROV_RESOLVED: &str = "code_graph_resolved";
+/// Python `mypy` typecheck provenance (Phase A): full-fidelity, true overlay via
+/// `--shadow-file`. Boundary `high` (crosses the type checker).
+pub const PROV_MYPY: &str = "mypy";
+/// Rust `cargo check` observe provenance (Phase A): full-fidelity post-write
+/// diagnostics. Boundary `high`.
+pub const PROV_CARGO: &str = "cargo-check";
+/// Rust syntactic-only overlay-predict provenance (Phase A): no compile ran, so
+/// `coverage=0.5` and boundary `medium` (mirrors the resolved-import tier). coord
+/// routes this honestly to `Partial`.
+pub const PROV_CARGO_SYNTACTIC: &str = "cargo-syntactic";
 
 impl Envelope {
     /// Warm, resolved answer: posterior=1, coverage=1, credibility=(high,high,high).
@@ -414,8 +428,17 @@ async fn health(State(_state): State<Arc<ApiState>>) -> Json<Value> {
             "provenance": provenance,
         }));
     }
+    drop(reg);
 
-    Json(json!({ "status": "ok", "scopes": scopes }))
+    // Phase A: report engine availability for the Rust (`cargo check`) and Python
+    // (`mypy`) typecheck dispatchers alongside the TS scopes. These are *engine*
+    // availability probes, not per-scope index state.
+    let engines = json!([
+        { "language": "rust", "available": cargo_check::is_available() },
+        { "language": "python", "available": mypy_check::is_available() },
+    ]);
+
+    Json(json!({ "status": "ok", "scopes": scopes, "engines": engines }))
 }
 
 /// POST /code-semantics/symbol-lookup
@@ -534,20 +557,51 @@ async fn find_references(
     .await
 }
 
-/// POST /code-semantics/typecheck (with overlay_patch ⇒ 2b predict-effect)
+/// POST /code-semantics/typecheck (with overlay_patch ⇒ 2b predict-effect).
+///
+/// Dispatches by the target file's extension (Phase A): Rust (`.rs`) →
+/// `cargo check`; Python (`.py`/`.pyi`) → `mypy`; everything else → the TS
+/// Language-Service path (unchanged). All three lift `coverage` into the §A
+/// result body (coord reads coverage from the body).
 async fn typecheck(
     State(_state): State<Arc<ApiState>>,
     Json(req): Json<TypecheckReq>,
 ) -> Json<Envelope> {
     let q = "typecheck";
-    let scope = req.scope.clone();
-    let file = req.file.clone();
-    resolution_query(q, scope.as_deref(), Some(&file), move |bridge| {
-        let file = req.file.clone();
-        let overlay = req.overlay_patch.clone();
-        async move { bridge.typecheck(&file, overlay).await }
-    })
-    .await
+    let file_path = Path::new(&req.file);
+    match lang::detect_language(file_path) {
+        lang::Lang::Rust => {
+            Json(cargo_check::typecheck(file_path, req.overlay_patch.clone()).await)
+        }
+        lang::Lang::Python => {
+            Json(mypy_check::typecheck(file_path, req.overlay_patch.clone()).await)
+        }
+        lang::Lang::Ts => {
+            let scope = req.scope.clone();
+            let file = req.file.clone();
+            let mut env = resolution_query(q, scope.as_deref(), Some(&file), move |bridge| {
+                let file = req.file.clone();
+                let overlay = req.overlay_patch.clone();
+                async move { bridge.typecheck(&file, overlay).await }
+            })
+            .await;
+            // Mirror the envelope coverage into the §A result body if absent, so
+            // coord's `EditPrediction::from_typecheck_result` (which reads
+            // coverage FROM the body) sees it for the TS path too.
+            lift_coverage_into_body(&mut env.0);
+            env
+        }
+    }
+}
+
+/// Ensure the typecheck result body carries a `coverage` field mirroring the
+/// envelope's. coord reads coverage from the body (defaulting 0.0 when absent);
+/// the Rust/Python checkers set it themselves, this covers the TS path.
+fn lift_coverage_into_body(env: &mut Envelope) {
+    let coverage = env.coverage;
+    if let Value::Object(map) = &mut env.result {
+        map.entry("coverage").or_insert_with(|| json!(coverage));
+    }
 }
 
 /// Shared driver for resolution queries (signature / find-references /
