@@ -1879,6 +1879,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         )
                     }
                 };
+                // Session-automation Phase 0 — keep an outbox handle for the
+                // AI-session coord registrar so it writes to the SAME outbox the
+                // CoordSync drain loop drains (registration reuses the existing
+                // drain → auth → retry → 409-idempotency machinery).
+                let registrar_outbox = outbox.clone();
                 let coord_sync_facade = session::coord_sync::CoordSync::new(outbox);
                 let pty_transport: session::DynTransport =
                     std::sync::Arc::new(session::transport::pty::PtyTransport::new(
@@ -1905,6 +1910,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         uuid::Uuid::parse_str(s).ok()
                     })
                     .unwrap_or_else(uuid::Uuid::new_v4);
+                // Session-automation Phase 0 (R1–R6) — register authenticated
+                // AI sessions into coord.sessions with their task_run_id, so
+                // they are visible + addressable + correctly stale to coord.
+                // Managed as Tauri state so the interactive AI-session commands
+                // (create/resume/send_user_message/close) can reach it.
+                let ai_coord_registrar = std::sync::Arc::new(
+                    claude_session::coord_register::AiCoordRegistrar::new(
+                        registrar_outbox,
+                        machine_id,
+                    ),
+                );
+                app.manage(ai_coord_registrar);
                 // Phase 3 — wire the coord-sync drain + heartbeat loops.
                 // `attach_app_handle` enables the conflict-event emit;
                 // `attach_registry` gives the heartbeat loop a way to

@@ -741,6 +741,15 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
             body["claude_code_session_id"] = ccsid.clone();
         }
     }
+    // Session-automation Phase 0 — forward the runner `SessionManager` key
+    // (UUIDv4 `task_run_id`) so coord persists `coord.sessions.task_run_id`
+    // for inject-target resolution. Omitted when absent/null; coord's
+    // `CreateSessionRequest.task_run_id` is `#[serde(default)]`.
+    if let Some(trid) = rec.payload.get("task_run_id") {
+        if !trid.is_null() {
+            body["task_run_id"] = trid.clone();
+        }
+    }
     body
 }
 
@@ -1519,6 +1528,42 @@ mod tests {
         };
         let body = rebuild_create_body(&without);
         assert!(body.get("claude_code_session_id").is_none());
+    }
+
+    /// Session-automation Phase 0 — `rebuild_create_body` forwards the
+    /// `task_run_id` from a Started payload into the `POST /sessions` body so
+    /// coord persists `coord.sessions.task_run_id`; absent → key omitted.
+    #[test]
+    fn rebuild_create_body_forwards_task_run_id() {
+        let with = OutboxRecord {
+            machine_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            seq: 1,
+            event_kind: "started".into(),
+            payload: json!({
+                "id": Uuid::nil(),
+                "kind": "agentic",
+                "intent": { "purpose": "ai session" },
+                "task_run_id": "11111111-2222-3333-4444-555555555555"
+            }),
+            recorded_at: Utc::now(),
+            acked_at: None,
+        };
+        let body = rebuild_create_body(&with);
+        assert_eq!(body["task_run_id"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(body["session_kind"], "agentic");
+
+        // Absent (terminal pane / peer mirror) → key omitted, not null.
+        let without = OutboxRecord {
+            payload: json!({
+                "id": Uuid::nil(),
+                "kind": "terminal_shell",
+                "intent": { "kind": "terminal_shell", "purpose": "p" }
+            }),
+            ..with
+        };
+        let body = rebuild_create_body(&without);
+        assert!(body.get("task_run_id").is_none());
     }
 
     /// state_change_body forwards only the known coord fields and
