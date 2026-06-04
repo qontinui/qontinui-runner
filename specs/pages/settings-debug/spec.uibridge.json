@@ -1,0 +1,451 @@
+{
+  "description": "Debug Settings -- the Settings page with the Advanced/Debug sub-tab active. It surfaces developer and debugging options (image-match debug mode, top-matches-to-display), device information for support (device id, name, platform), and experimental feature toggles. The page is the shared Settings arm (component dir: Settings); the canonical settings-debug tab maps to the Settings 'advanced' sub-tab. A horizontal settings tab rail lets the user move between all settings sub-views.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Advanced section heading is present",
+          "enabled": true,
+          "id": "sd-debug-content-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "heading-3-advanced",
+              "role": "heading"
+            },
+            "label": "Advanced section heading",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Debug sub-section heading is present",
+          "enabled": true,
+          "id": "sd-debug-content-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "heading-4-debug",
+              "role": "heading"
+            },
+            "label": "Debug sub-section heading",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Save Debug Settings button is present",
+          "enabled": true,
+          "id": "sd-debug-content-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "button-save-debug-settings",
+              "role": "button"
+            },
+            "label": "Save Debug Settings button",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "With the Advanced (debug) sub-tab active, the settings body shows an Advanced section containing a Debug sub-section (developer + debugging options such as image-match debug mode and top-matches-to-display) and a Save Debug Settings action.",
+      "id": "sd-debug-content",
+      "name": "Advanced / Debug Settings Content",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Developer/debugging options descriptive paragraph is present",
+          "enabled": true,
+          "id": "sd-debug-options-elem-0",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "content-paragraph-developer-and-debugg-0"
+            },
+            "label": "Developer options description",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Enable Image Match Debug Mode label is present",
+          "enabled": true,
+          "id": "sd-debug-options-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "content-label-enable-image-match-d-0"
+            },
+            "label": "Image Match Debug Mode label",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Top Matches to Display label is present",
+          "enabled": true,
+          "id": "sd-debug-options-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "content-label-top-matches-to-displ-0"
+            },
+            "label": "Top Matches to Display label",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Debug sub-section exposes the actual developer toggles and inputs: an Enable Image Match Debug Mode toggle (collects and displays detailed match diagnostics) and a Top Matches to Display numeric control bounding how many top match candidates are shown.",
+      "id": "sd-debug-options",
+      "name": "Debug Options Controls",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Device Information heading is present",
+          "enabled": true,
+          "id": "sd-device-info-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "heading-4-device-information",
+              "role": "heading"
+            },
+            "label": "Device Information heading",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Device ID field label is present",
+          "enabled": true,
+          "id": "sd-device-info-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "content-label-device-id-0"
+            },
+            "label": "Device ID label",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Refresh device info button is present",
+          "enabled": true,
+          "id": "sd-device-info-elem-2",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "button-refresh-device-info",
+              "role": "button"
+            },
+            "label": "Refresh device info button",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A Device Information section shows system information useful for debugging and support: device id, device name, and platform, with a Refresh device info action to re-read the values.",
+      "id": "sd-device-info",
+      "name": "Device Information Section",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Experimental section heading is present",
+          "enabled": true,
+          "id": "sd-experimental-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "heading-4-experimental",
+              "role": "heading"
+            },
+            "label": "Experimental section heading",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Experimental warning paragraph is present",
+          "enabled": true,
+          "id": "sd-experimental-elem-1",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "content-paragraph-these-features-are-e-0"
+            },
+            "label": "Experimental warning",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "xterm.js default terminal-renderer option is present",
+          "enabled": true,
+          "id": "sd-experimental-elem-2",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "button-xtermjs-0",
+              "role": "button"
+            },
+            "label": "xterm.js renderer option",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "An Experimental section warns that the features below are experimental and may be unstable, and houses experimental toggles such as the alternate terminal renderer (xterm.js default vs ghostty-web experimental).",
+      "id": "sd-experimental",
+      "name": "Experimental Features Section",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Debug settings sub-tab is present",
+          "enabled": true,
+          "id": "sd-tab-rail-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "tab-debug-22",
+              "role": "tab"
+            },
+            "label": "Debug sub-tab",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Account settings sub-tab is present",
+          "enabled": true,
+          "id": "sd-tab-rail-elem-1",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "tab-account-0",
+              "role": "tab"
+            },
+            "label": "Account sub-tab",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "AI Providers settings sub-tab is present",
+          "enabled": true,
+          "id": "sd-tab-rail-elem-2",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "tab-ai-providers-2",
+              "role": "tab"
+            },
+            "label": "AI Providers sub-tab",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A horizontal tab rail lists every settings sub-view (Account, Backend Connection, AI Providers, Advanced AI, Self-Healing, ... Debug, Updates). The Debug tab activates this page's advanced/debug content; the Account and AI Providers tabs are representative sibling sub-views.",
+      "id": "sd-tab-rail",
+      "name": "Settings Sub-Tab Rail",
+      "source": "ai-generated"
+    }
+  ],
+  "metadata": {
+    "component": "Settings",
+    "tags": [
+      "settings",
+      "debug",
+      "advanced",
+      "developer-options",
+      "device-info",
+      "experimental",
+      "diagnostics"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "With the Advanced (debug) sub-tab active, the settings body shows an Advanced section containing a Debug sub-section (developer + debugging options such as image-match debug mode and top-matches-to-display) and a Save Debug Settings action.",
+        "elements": [
+          {
+            "id": "heading-3-advanced",
+            "role": "heading"
+          },
+          {
+            "id": "heading-4-debug",
+            "role": "heading"
+          },
+          {
+            "id": "button-save-debug-settings",
+            "role": "button"
+          }
+        ],
+        "id": "sd-debug-content",
+        "isInitial": true,
+        "name": "Advanced / Debug Settings Content",
+        "transitions": []
+      },
+      {
+        "description": "The Debug sub-section exposes the actual developer toggles and inputs: an Enable Image Match Debug Mode toggle (collects and displays detailed match diagnostics) and a Top Matches to Display numeric control bounding how many top match candidates are shown.",
+        "elements": [
+          {
+            "id": "content-paragraph-developer-and-debugg-0"
+          },
+          {
+            "id": "content-label-enable-image-match-d-0"
+          },
+          {
+            "id": "content-label-top-matches-to-displ-0"
+          }
+        ],
+        "id": "sd-debug-options",
+        "isInitial": false,
+        "name": "Debug Options Controls",
+        "transitions": []
+      },
+      {
+        "description": "A Device Information section shows system information useful for debugging and support: device id, device name, and platform, with a Refresh device info action to re-read the values.",
+        "elements": [
+          {
+            "id": "heading-4-device-information",
+            "role": "heading"
+          },
+          {
+            "id": "content-label-device-id-0"
+          },
+          {
+            "id": "button-refresh-device-info",
+            "role": "button"
+          }
+        ],
+        "id": "sd-device-info",
+        "isInitial": false,
+        "name": "Device Information Section",
+        "transitions": []
+      },
+      {
+        "description": "An Experimental section warns that the features below are experimental and may be unstable, and houses experimental toggles such as the alternate terminal renderer (xterm.js default vs ghostty-web experimental).",
+        "elements": [
+          {
+            "id": "heading-4-experimental",
+            "role": "heading"
+          },
+          {
+            "id": "content-paragraph-these-features-are-e-0"
+          },
+          {
+            "id": "button-xtermjs-0",
+            "role": "button"
+          }
+        ],
+        "id": "sd-experimental",
+        "isInitial": false,
+        "name": "Experimental Features Section",
+        "transitions": []
+      },
+      {
+        "description": "A horizontal tab rail lists every settings sub-view (Account, Backend Connection, AI Providers, Advanced AI, Self-Healing, ... Debug, Updates). The Debug tab activates this page's advanced/debug content; the Account and AI Providers tabs are representative sibling sub-views.",
+        "elements": [
+          {
+            "id": "tab-debug-22",
+            "role": "tab"
+          },
+          {
+            "id": "tab-account-0",
+            "role": "tab"
+          },
+          {
+            "id": "tab-ai-providers-2",
+            "role": "tab"
+          }
+        ],
+        "id": "sd-tab-rail",
+        "isInitial": false,
+        "name": "Settings Sub-Tab Rail",
+        "transitions": [
+          {
+            "activateStates": [
+              "sd-debug-content"
+            ],
+            "deactivateStates": [],
+            "id": "sd-open-debug-subtab",
+            "name": "Open Debug Sub-Tab",
+            "process": [
+              {
+                "action": "click",
+                "target": {
+                  "id": "tab-debug-22",
+                  "role": "tab"
+                }
+              }
+            ],
+            "staysVisible": true
+          }
+        ]
+      }
+    ]
+  },
+  "version": "1.0.0"
+}

@@ -1,0 +1,470 @@
+{
+  "description": "LLM Analytics page -- the runner's LLM observability dashboard. It reports token usage, cost, and provider performance over a selectable time range, and exposes two productivity surfaces: the Scripted Output (think-in-code) panel with its emitter-provider cascade controls, and the One-shot LLM productivity stack with a fallbacks-by-reason breakdown. The page is rendered by the LlmObservabilityDashboard component (component dir: llm-observability) under the canonical llm-analytics tab.",
+  "groups": [
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "LLM Analytics page root container is present",
+          "enabled": true,
+          "id": "la-page-root-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "llm-analytics-root"
+            },
+            "label": "LLM Analytics page root",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "LLM Analytics page heading is present",
+          "enabled": true,
+          "id": "la-page-root-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "heading-2-llm-analytics",
+              "role": "heading"
+            },
+            "label": "LLM Analytics heading",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Page sub-title paragraph is present",
+          "enabled": true,
+          "id": "la-page-root-elem-2",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "content-paragraph-token-usage-costs-an-0"
+            },
+            "label": "Page sub-title",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The dashboard mounts a page root container with the page heading (LLM Analytics) and a sub-title describing its scope (token usage, costs, and provider performance). The root carries a UI Bridge id so consumers can anchor to the page even before any data loads.",
+      "id": "la-page-root",
+      "name": "LLM Analytics Page Root",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Time-range selector control is present",
+          "enabled": true,
+          "id": "la-toolbar-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "llm-analytics-time-range"
+            },
+            "label": "Time-range selector",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Refresh-analytics button is present",
+          "enabled": true,
+          "id": "la-toolbar-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "llm-analytics-refresh",
+              "role": "button"
+            },
+            "label": "Refresh analytics button",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "A toolbar lets the user scope analytics to a rolling window via a time-range selector and re-pull the data via a Refresh control. Both are instrumented with stable UI Bridge ids.",
+      "id": "la-toolbar",
+      "name": "Time-Range & Refresh Toolbar",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "No-usage-data message is present",
+          "enabled": true,
+          "id": "la-usage-empty-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "content-paragraph-no-llm-usage-data-av-0"
+            },
+            "label": "No-usage-data message",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Run-workflows guidance message is present",
+          "enabled": true,
+          "id": "la-usage-empty-elem-1",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "content-paragraph-run-some-workflows-t-1"
+            },
+            "label": "Run-workflows guidance",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "Until workflows have produced LLM telemetry, the token-usage / cost panel shows an empty state explaining that no LLM usage data is available yet and prompting the user to run some workflows to start collecting analytics.",
+      "id": "la-usage-empty",
+      "name": "Token Usage Empty State",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Scripted Output panel root is present",
+          "enabled": true,
+          "id": "la-scripted-output-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "scripted-output-root"
+            },
+            "label": "Scripted Output panel root",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Scripted Output metric tiles strip is present",
+          "enabled": true,
+          "id": "la-scripted-output-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "scripted-output-tiles"
+            },
+            "label": "Scripted Output metric tiles",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Scripted Output refresh button is present",
+          "enabled": true,
+          "id": "la-scripted-output-elem-2",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "scripted-output-refresh",
+              "role": "button"
+            },
+            "label": "Scripted Output refresh button",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Scripted Output panel tracks the think-in-code emitter path: a panel root, a metric-tiles strip (attempts / emitter calls / cache), and a Refresh control to re-pull scripted-output stats. Its heading reads 'Scripted Output (think-in-code)'.",
+      "id": "la-scripted-output",
+      "name": "Scripted Output (think-in-code) Panel",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Emitter provider selector is present",
+          "enabled": true,
+          "id": "la-emitter-provider-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "emitter-provider-select",
+              "role": "combobox"
+            },
+            "label": "Emitter provider selector",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Emitter provider Save button is present",
+          "enabled": true,
+          "id": "la-emitter-provider-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "emitter-provider-save",
+              "role": "button"
+            },
+            "label": "Save emitter provider button",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Gemma local endpoint field is present",
+          "enabled": true,
+          "id": "la-emitter-provider-elem-2",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "emitter-gemma-endpoint",
+              "role": "textbox"
+            },
+            "label": "Gemma endpoint field",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The Emitter provider section configures the LLM cascade (Auto: Claude then Gemma local, force-Claude, etc.). It exposes a provider selector, a Save action, and Gemma-local endpoint / model-alias fields with a reachability indicator.",
+      "id": "la-emitter-provider",
+      "name": "Emitter Provider Cascade Controls",
+      "source": "ai-generated"
+    },
+    {
+      "assertions": [
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Fallbacks-by-reason heading is present",
+          "enabled": true,
+          "id": "la-oneshot-fallbacks-elem-0",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "heading-4-fallbacks-by-reason",
+              "role": "heading"
+            },
+            "label": "Fallbacks by reason heading",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "Fallbacks table Reason column header is present",
+          "enabled": true,
+          "id": "la-oneshot-fallbacks-elem-1",
+          "reviewed": false,
+          "severity": "critical",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "cell-r0-c0-table",
+              "role": "columnheader"
+            },
+            "label": "Reason column header",
+            "type": "search"
+          }
+        },
+        {
+          "assertionType": "exists",
+          "category": "element-presence",
+          "description": "One-shot stats refresh button is present",
+          "enabled": true,
+          "id": "la-oneshot-fallbacks-elem-2",
+          "reviewed": false,
+          "severity": "warning",
+          "source": "ai-generated",
+          "target": {
+            "criteria": {
+              "id": "button-refresh-one-shot-stats",
+              "role": "button"
+            },
+            "label": "One-shot stats refresh button",
+            "type": "search"
+          }
+        }
+      ],
+      "category": "element-presence",
+      "description": "The One-shot LLM (productivity stack) section includes a Fallbacks by reason breakdown rendered as a table with Reason / Count / Share columns, plus a Refresh control for one-shot stats. The column headers are stable UI Bridge cells.",
+      "id": "la-oneshot-fallbacks",
+      "name": "One-shot LLM Fallbacks Breakdown",
+      "source": "ai-generated"
+    }
+  ],
+  "metadata": {
+    "component": "llm-observability",
+    "tags": [
+      "llm-analytics",
+      "llm-observability",
+      "token-usage",
+      "cost-tracking",
+      "provider-performance",
+      "scripted-output",
+      "one-shot",
+      "emitter-provider",
+      "tier-2"
+    ]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "description": "The dashboard mounts a page root container with the page heading (LLM Analytics) and a sub-title describing its scope (token usage, costs, and provider performance). The root carries a UI Bridge id so consumers can anchor to the page even before any data loads.",
+        "elements": [
+          {
+            "id": "llm-analytics-root"
+          },
+          {
+            "id": "heading-2-llm-analytics",
+            "role": "heading"
+          },
+          {
+            "id": "content-paragraph-token-usage-costs-an-0"
+          }
+        ],
+        "id": "la-page-root",
+        "isInitial": true,
+        "name": "LLM Analytics Page Root",
+        "transitions": []
+      },
+      {
+        "description": "A toolbar lets the user scope analytics to a rolling window via a time-range selector and re-pull the data via a Refresh control. Both are instrumented with stable UI Bridge ids.",
+        "elements": [
+          {
+            "id": "llm-analytics-time-range"
+          },
+          {
+            "id": "llm-analytics-refresh",
+            "role": "button"
+          }
+        ],
+        "id": "la-toolbar",
+        "isInitial": false,
+        "name": "Time-Range & Refresh Toolbar",
+        "transitions": []
+      },
+      {
+        "description": "Until workflows have produced LLM telemetry, the token-usage / cost panel shows an empty state explaining that no LLM usage data is available yet and prompting the user to run some workflows to start collecting analytics.",
+        "elements": [
+          {
+            "id": "content-paragraph-no-llm-usage-data-av-0"
+          },
+          {
+            "id": "content-paragraph-run-some-workflows-t-1"
+          }
+        ],
+        "id": "la-usage-empty",
+        "isInitial": false,
+        "name": "Token Usage Empty State",
+        "transitions": []
+      },
+      {
+        "description": "The Scripted Output panel tracks the think-in-code emitter path: a panel root, a metric-tiles strip (attempts / emitter calls / cache), and a Refresh control to re-pull scripted-output stats. Its heading reads 'Scripted Output (think-in-code)'.",
+        "elements": [
+          {
+            "id": "scripted-output-root"
+          },
+          {
+            "id": "scripted-output-tiles"
+          },
+          {
+            "id": "scripted-output-refresh",
+            "role": "button"
+          }
+        ],
+        "id": "la-scripted-output",
+        "isInitial": false,
+        "name": "Scripted Output (think-in-code) Panel",
+        "transitions": []
+      },
+      {
+        "description": "The Emitter provider section configures the LLM cascade (Auto: Claude then Gemma local, force-Claude, etc.). It exposes a provider selector, a Save action, and Gemma-local endpoint / model-alias fields with a reachability indicator.",
+        "elements": [
+          {
+            "id": "emitter-provider-select",
+            "role": "combobox"
+          },
+          {
+            "id": "emitter-provider-save",
+            "role": "button"
+          },
+          {
+            "id": "emitter-gemma-endpoint",
+            "role": "textbox"
+          }
+        ],
+        "id": "la-emitter-provider",
+        "isInitial": false,
+        "name": "Emitter Provider Cascade Controls",
+        "transitions": []
+      },
+      {
+        "description": "The One-shot LLM (productivity stack) section includes a Fallbacks by reason breakdown rendered as a table with Reason / Count / Share columns, plus a Refresh control for one-shot stats. The column headers are stable UI Bridge cells.",
+        "elements": [
+          {
+            "id": "heading-4-fallbacks-by-reason",
+            "role": "heading"
+          },
+          {
+            "id": "cell-r0-c0-table",
+            "role": "columnheader"
+          },
+          {
+            "id": "button-refresh-one-shot-stats",
+            "role": "button"
+          }
+        ],
+        "id": "la-oneshot-fallbacks",
+        "isInitial": false,
+        "name": "One-shot LLM Fallbacks Breakdown",
+        "transitions": []
+      }
+    ]
+  },
+  "version": "1.0.0"
+}
