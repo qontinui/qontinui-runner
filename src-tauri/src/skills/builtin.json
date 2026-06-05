@@ -602,14 +602,6 @@
       "steps": [
         {
           "type": "command",
-          "name": "Focus Window",
-          "command": "curl -sf -X POST http://localhost:9876/gui-config/focus-window > /dev/null && sleep 1 && echo 'Window focused'",
-          "working_directory": ".",
-          "fail_on_error": false,
-          "timeout_seconds": 5
-        },
-        {
-          "type": "command",
           "name": "Discover Elements",
           "command": "curl -sf -X POST {{base_url}}/control/discover -H \"Content-Type: application/json\" -d '{\"interactive_only\": false}' | python -c \"import sys,json; d=json.load(sys.stdin); c=d.get('count',d.get('data',{}).get('count',0)); print(f'Discovered {c} elements')\"",
           "working_directory": ".",
