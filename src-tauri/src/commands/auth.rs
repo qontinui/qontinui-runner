@@ -858,6 +858,29 @@ pub fn device_jwt_present() -> Result<bool, String> {
     Ok(crate::auth::looks_like_jwt(&token))
 }
 
+/// Returns the runner's coord **device-JWT** (the token stored in
+/// `AuthManager`'s `access_token` slot), or `None` when the device is unpaired
+/// — i.e. the slot is empty or does not hold a JWT-shaped value.
+///
+/// The CI-runner settings panel attaches this as `Authorization: Bearer <jwt>`
+/// on its loopback calls to the supervisor (`:9875` enable/disable), which now
+/// require + forward the credential so coord can enforce `FleetPrincipal` on
+/// the registration-token mint. A `None` return is the FE's cue to surface a
+/// "pair this runner first" CTA rather than calling the supervisor anonymously.
+///
+/// Unlike [`get_access_token_for_websocket`], this neither requires tier-2 nor
+/// errors when unpaired: it is a credential *probe*, so a missing token is a
+/// normal `Ok(None)`, not an error.
+#[tauri::command]
+pub fn get_coord_device_token() -> Result<Option<String>, String> {
+    let token = AuthManager::new().get_access_token().unwrap_or_default();
+    if crate::auth::looks_like_jwt(&token) {
+        Ok(Some(token))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Tauri-command wrapper around the device-JWT refresher's `kick` API.
 ///
 /// Used by `WebIntegrationAuthBanner`'s "retry manually" CTA when the
@@ -889,6 +912,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             cognito_sign_in_password,
             qontinui_sign_out,
             device_jwt_present,
+            get_coord_device_token,
             kick_device_jwt_refresher_cmd,
         ])
         .build()
