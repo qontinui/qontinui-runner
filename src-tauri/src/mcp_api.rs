@@ -1833,16 +1833,29 @@ pub fn create_router(
         .with_state(api_state)
 }
 
-/// Convert a caught handler panic into a JSON 500 response that matches the
-/// runner's `ApiResponse<()>` shape. Wired onto the main API router via
-/// `tower_http::catch_panic::CatchPanicLayer::custom`.
+/// Build the `NOT_FOUND` error message for an unmatched `(method, path)`.
 ///
-/// The panic payload is `Box<dyn Any + Send>`; downcast to the two common
-/// concrete types (`&'static str` from `panic!("literal")` and `String` from
-/// `panic!("{}", x)`) and fall back to a generic message otherwise.
+/// For an unmatched path under the `/ui-bridge/` surface we append a discovery
+/// hint pointing at the two self-describing endpoints (`/ui-bridge/_routes` for
+/// the route manifest, `/ui-bridge/commands` for invokable commands) so a caller
+/// that fat-fingered a route can find the real one without grepping the source.
+/// Non-`/ui-bridge/` paths keep the bare message unchanged.
+fn not_found_message(method: &axum::http::Method, path: &str) -> String {
+    let base = format!("No route for {} {}", method, path);
+    if path.starts_with("/ui-bridge/") {
+        format!(
+            "{base} — discover routes at GET /ui-bridge/_routes, \
+             invokable commands at GET /ui-bridge/commands"
+        )
+    } else {
+        base
+    }
+}
+
 /// Canonical JSON 404 handler for unmatched routes. See the `.fallback(...)`
 /// call in `build_router` for why this exists (envelope universality + the
-/// debug envelope_audit layer).
+/// debug envelope_audit layer). For unmatched `/ui-bridge/*` paths the error
+/// message also names the discovery endpoints — see `not_found_message`.
 async fn not_found_handler(
     method: axum::http::Method,
     uri: axum::http::Uri,
@@ -1850,12 +1863,19 @@ async fn not_found_handler(
     use axum::response::IntoResponse;
 
     let body = crate::mcp::types::ApiResponse::<()>::error_with_code(
-        format!("No route for {} {}", method, uri.path()),
+        not_found_message(&method, uri.path()),
         "NOT_FOUND",
     );
     (axum::http::StatusCode::NOT_FOUND, axum::Json(body)).into_response()
 }
 
+/// Convert a caught handler panic into a JSON 500 response that matches the
+/// runner's `ApiResponse<()>` shape. Wired onto the main API router via
+/// `tower_http::catch_panic::CatchPanicLayer::custom`.
+///
+/// The panic payload is `Box<dyn Any + Send>`; downcast to the two common
+/// concrete types (`&'static str` from `panic!("literal")` and `String` from
+/// `panic!("{}", x)`) and fall back to a generic message otherwise.
 fn runner_panic_handler(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -2005,6 +2025,28 @@ mod panic_catcher_tests {
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["success"], false);
         assert!(body["error"].as_str().unwrap().contains("panicked"));
+    }
+}
+
+#[cfg(test)]
+mod not_found_message_tests {
+    use super::not_found_message;
+    use axum::http::Method;
+
+    #[test]
+    fn ui_bridge_path_appends_discovery_hint() {
+        let msg = not_found_message(&Method::GET, "/ui-bridge/elements");
+        // Keeps the canonical prefix...
+        assert!(msg.starts_with("No route for GET /ui-bridge/elements"));
+        // ...and names both discovery endpoints so the hint can't dangle.
+        assert!(msg.contains("GET /ui-bridge/_routes"));
+        assert!(msg.contains("GET /ui-bridge/commands"));
+    }
+
+    #[test]
+    fn non_ui_bridge_path_is_unchanged() {
+        let msg = not_found_message(&Method::POST, "/api/v1/whatever");
+        assert_eq!(msg, "No route for POST /api/v1/whatever");
     }
 }
 
