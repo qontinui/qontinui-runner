@@ -26,7 +26,15 @@ use crate::terminal::{strip_ansi, TerminalManager};
 /// worktree path as the session's cwd, instead of the operator's primary
 /// checkout. Observation/read-only callers leave `intent_repo: None` and
 /// keep the legacy shared-cwd behavior — that path is unchanged.
+/// `command` (Decision 3 of the visible-gate-continuations plan) is an optional
+/// program+args override threaded down to [`TerminalSession::spawn`]: when
+/// `Some([program, args…])` the session runs that program as its PTY child
+/// instead of the interactive shell. The gate-continuation terminal branch uses
+/// this to launch `claude "<prompt>"` directly. Every operator-opened / frontend
+/// terminal passes `None`, keeping the interactive-shell path byte-for-byte
+/// unchanged.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn terminal_create(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     session_registry: tauri::State<'_, Arc<SessionRegistry>>,
@@ -40,6 +48,7 @@ pub async fn terminal_create(
     intent_repo: Option<String>,
     plan_slug: Option<String>,
     correlation_topic: Option<String>,
+    command: Option<Vec<String>>,
 ) -> Result<CommandResponse, String> {
     // R2 (session-lifecycle-cleanup) — derive the STABLE pane identity from
     // the create-time triple the frontend round-trips on restore
@@ -107,6 +116,7 @@ pub async fn terminal_create(
         cols,
         rows,
         app_handle,
+        command,
     )?;
 
     // Park the isolated edit context on the terminal session so its
@@ -828,6 +838,109 @@ pub fn terminal_session_list_open(
         message: None,
         data: Some(serde_json::json!({ "sessions": store.open_records() })),
     })
+}
+
+/// Backend-task entry point for creating a terminal session + coord row from a
+/// non-Tauri context (e.g. the gate-continuation runtime task, which has no
+/// `tauri::State` extractors — it reaches the managed `Arc`s via the global
+/// `tauri_app_handle`). Mirrors the registration body of [`terminal_create`]:
+/// create the PTY session (with an optional `command` override), park a
+/// pre-acquired isolated-edit context so its claim heartbeat lives for the
+/// session's lifetime + releases on close, register/attach the coord session,
+/// and install the on-exit close hook.
+///
+/// Unlike [`terminal_create`] this does NOT acquire a worktree itself — the
+/// gate-continuation path already acquired one (with its heartbeat) in P0.1 and
+/// hands the resulting `IsolatedEditContext` in via `isolated_ctx` so ownership
+/// (and the heartbeat) transfers to the terminal session. Returns the new
+/// terminal id and the coord session id (when registration succeeded).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_terminal_session_backend(
+    terminal_manager: &Arc<TerminalManager>,
+    session_registry: &Arc<SessionRegistry>,
+    app_handle: tauri::AppHandle,
+    title: String,
+    working_dir: String,
+    plan_slug: Option<String>,
+    correlation_topic: Option<String>,
+    intent_repo: Option<String>,
+    command: Option<Vec<String>>,
+    isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+) -> Result<(String, Option<uuid::Uuid>), String> {
+    let info = terminal_manager.create(
+        Some(title.clone()),
+        Some(working_dir.clone()),
+        None,
+        None,
+        None,
+        app_handle,
+        command,
+    )?;
+
+    // Park the pre-acquired isolated edit context on the session so its
+    // heartbeat + claim live as long as the PTY and release on close — the
+    // visible session keeps the SAME claim bookkeeping the headless path holds.
+    if let Some(ctx) = isolated_ctx {
+        if let Some(session) = terminal_manager.get(&info.id) {
+            session.set_isolated_edit_ctx(ctx);
+        }
+    }
+
+    // Coord registration — mirror every terminal session into the coordinator's
+    // session plane (same as the interactive `terminal_create`). Best-effort:
+    // a coord hiccup must not fail the spawn.
+    let purpose = if title.trim().len() >= 3 {
+        title
+    } else {
+        "Gate continuation terminal session".to_string()
+    };
+    let intent = Intent {
+        kind: SessionKind::TerminalShell,
+        purpose,
+        repo: intent_repo,
+        branch: None,
+        plan_slug,
+        correlation_topic,
+        declared_paths: vec![std::path::PathBuf::from(&working_dir)],
+        share_output: true,
+        redact_secrets: None,
+    };
+
+    let mut coord_session_id: Option<uuid::Uuid> = None;
+    match session_registry.register_external(intent) {
+        Ok(coord_id) => {
+            coord_session_id = Some(coord_id);
+            if let Some(session) = terminal_manager.get(&info.id) {
+                session.set_coord_session_id(coord_id);
+                let close_registry = session_registry.clone();
+                session.set_on_exit(Box::new(move |coord_id| {
+                    if let Err(e) = close_registry.close_by_id(coord_id) {
+                        warn!(
+                            coord_session = %coord_id,
+                            error = %e,
+                            "gate-continuation terminal exit hook: coord session close failed"
+                        );
+                    }
+                }));
+                let rx = session.subscribe_output();
+                session_registry.attach_output_pipe(coord_id, rx, true);
+            }
+            info!(
+                terminal_id = %info.id,
+                coord_session = %coord_id,
+                "create_terminal_session_backend: coord session ready"
+            );
+        }
+        Err(e) => {
+            warn!(
+                terminal_id = %info.id,
+                error = %e,
+                "create_terminal_session_backend: coord registration failed — terminal unaffected"
+            );
+        }
+    }
+
+    Ok((info.id, coord_session_id))
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.

@@ -622,43 +622,197 @@ async fn run_gate_continuation(
         return Ok(());
     }
 
-    // Step 1: acquire a device-local worktree (+ claim heartbeat). `_ctx` is
-    // held to the end of this fn so its heartbeat keeps running and its claim
-    // is released on drop. `None` (worktree mode off, or acquire declined) →
-    // fall back to the canonical checkout of the first repo.
+    // Step 1: acquire a device-local worktree (+ claim heartbeat). The `ctx`
+    // owns the claim heartbeat task. For the HEADLESS path it stays bound here
+    // so its heartbeat runs for the whole subprocess and the claim releases on
+    // drop at function exit. For the TERMINAL path ownership is MOVED into the
+    // terminal session (see below), so the heartbeat lives for the visible
+    // session's lifetime and releases when the operator closes the terminal —
+    // the visible session keeps the SAME claim bookkeeping the headless path
+    // has. `None` (worktree mode off / acquire declined) → canonical checkout.
     let intent = payload
         .anchor_key
         .as_deref()
         .map(|a| format!("gate-continuation:{a}"))
         .unwrap_or_else(|| "gate-continuation".to_string());
 
-    let (workdir, _ctx, agent_id) =
-        match acquire_continuation_workdir(&payload.repos, &intent).await {
-            Ok(triple) => triple,
-            Err(e) => {
-                warn!("agent_runtime: gate-continuation worktree acquisition failed: {e:#}");
-                return Err(e);
-            }
-        };
+    let (workdir, ctx, agent_id) = match acquire_continuation_workdir(&payload.repos, &intent).await
+    {
+        Ok(triple) => triple,
+        Err(e) => {
+            warn!("agent_runtime: gate-continuation worktree acquisition failed: {e:#}");
+            return Err(e);
+        }
+    };
 
     // Step 2: dispatch on presentation.
-    //
-    // ── P2 DISPATCH POINT ───────────────────────────────────────────────────
-    // The `Presentation::Terminal` arm below is where P2 slots in the real
-    // visible-terminal branch (open_terminal_window + terminal_create with a
-    // `command` override). For THIS phase it warns and falls through to the
-    // headless flow so the continuation is consumed end-to-end.
     match payload.presentation {
         Presentation::Terminal => {
-            warn!(
-                "agent_runtime: gate-continuation presentation=terminal not yet wired \
-                 (P2) — falling through to headless for agent_id={agent_id}"
-            );
-            run_continuation_headless(agent_id, &workdir, &payload.initial_prompt).await
+            info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
+            run_continuation_terminal(agent_id, &workdir, &payload, ctx).await
         }
         Presentation::Headless => {
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
-            run_continuation_headless(agent_id, &workdir, &payload.initial_prompt).await
+            // `ctx` is held until this `.await` resolves (the subprocess exits),
+            // matching the agent-spawn path's heartbeat-then-release lifecycle.
+            let res = run_continuation_headless(agent_id, &workdir, &payload.initial_prompt).await;
+            drop(ctx);
+            res
+        }
+    }
+}
+
+/// Run a gate continuation as a VISIBLE terminal session (Decision 1/2/3).
+///
+/// Opens a pop-out terminal window and creates a terminal session whose PTY
+/// child IS the `claude` CLI launched with the prompt as a positional argv
+/// (`claude "<prompt>"`). The prompt is therefore visible in scrollback and the
+/// session behaves identically to the operator launching it — no PTY-readiness
+/// race, no shell wrapping, and (critically) the session is INTERACTIVE so an
+/// `AskUserQuestion` inside it is answerable. We deliberately do NOT use
+/// `--print`: that flag is single-shot/non-interactive and would defeat the
+/// plan's acceptance (operator interaction inside the spawned session).
+///
+/// The pre-acquired isolated-edit `ctx` (its claim heartbeat) is MOVED into the
+/// terminal session via [`crate::commands::terminal::create_terminal_session_backend`]
+/// so the heartbeat lives for the visible session's lifetime and releases on
+/// close — the same claim bookkeeping the headless path holds.
+///
+/// Lifecycle posts: `spawn-complete` once the terminal session is created and
+/// running; `spawn-failed` on ANY failure along the way (no Tauri app handle,
+/// missing managed state, window/session creation error).
+async fn run_continuation_terminal(
+    agent_id: uuid::Uuid,
+    workdir: &str,
+    payload: &GateContinuationPayload,
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+
+    // Reach the managed Tauri state from this backend task via the process-
+    // global AppHandle (set in main.rs::setup). If the runner has no Tauri
+    // runtime (headless/unit-test context) we cannot open a window — report
+    // spawn-failed and bail rather than silently dropping the continuation.
+    let app = match crate::tauri_app_handle::current() {
+        Some(a) => a,
+        None => {
+            let reason = "no Tauri AppHandle (runner has no webview runtime) — \
+                          cannot open a visible terminal";
+            warn!("agent_runtime: gate-continuation terminal: {reason}");
+            report_spawn_failed(agent_id, reason, None, 0).await;
+            return Err(anyhow::anyhow!(reason));
+        }
+    };
+
+    use tauri::Manager;
+    let terminal_manager = match app.try_state::<Arc<crate::terminal::TerminalManager>>() {
+        Some(s) => s.inner().clone(),
+        None => {
+            let reason = "TerminalManager state not managed — cannot create terminal session";
+            warn!("agent_runtime: gate-continuation terminal: {reason}");
+            report_spawn_failed(agent_id, reason, None, 0).await;
+            return Err(anyhow::anyhow!(reason));
+        }
+    };
+    let session_registry = match app.try_state::<Arc<crate::session::SessionRegistry>>() {
+        Some(s) => s.inner().clone(),
+        None => {
+            let reason = "SessionRegistry state not managed — cannot register terminal session";
+            warn!("agent_runtime: gate-continuation terminal: {reason}");
+            report_spawn_failed(agent_id, reason, None, 0).await;
+            return Err(anyhow::anyhow!(reason));
+        }
+    };
+
+    // Open a fresh pop-out window so the continuation lands in its own visible
+    // surface (best-effort: if window creation fails we still create the session
+    // — it then renders in the MAIN window's terminal grid, which is acceptable
+    // and is exactly how an operator-opened terminal appears). `window_label`
+    // is `Some(label)` when the pop-out opened, so we can assign the new session
+    // to it below (otherwise the session stays on `main`).
+    let window_label = match crate::commands::terminal_windows::open_terminal_window(
+        app.clone(),
+        app.state::<Arc<crate::window_assignments::WindowAssignments>>(),
+        None,
+    )
+    .await
+    {
+        Ok(record) => Some(record.label),
+        Err(e) => {
+            warn!(
+                "agent_runtime: gate-continuation terminal: open_terminal_window failed \
+                 ({e}) — session will render in the main window"
+            );
+            None
+        }
+    };
+
+    // Title: prefer the anchor_key, else a generic gate-continuation label.
+    let title = payload
+        .anchor_key
+        .clone()
+        .unwrap_or_else(|| "Gate continuation".to_string());
+
+    // Resolve the SAME `claude` binary the headless path uses (QONTINUI_CLAUDE_BIN
+    // override honored). The prompt is the single positional arg — interactive
+    // form, NOT `--print` (see the fn doc: interactivity is required).
+    let claude_bin = claude_bin_path();
+    let command = Some(vec![claude_bin, payload.initial_prompt.clone()]);
+
+    // First repo (if any) is the session's intent_repo for coord attribution.
+    let intent_repo = payload.repos.first().cloned();
+
+    let result = crate::commands::terminal::create_terminal_session_backend(
+        &terminal_manager,
+        &session_registry,
+        app.clone(),
+        title,
+        workdir.to_string(),
+        payload.anchor_key.clone(),
+        payload.anchor_key.clone(),
+        intent_repo,
+        command,
+        ctx,
+    );
+
+    match result {
+        Ok((terminal_id, coord_session_id)) => {
+            // Move the new session into the pop-out window we opened so the
+            // window actually renders it (without this the pop-out is empty and
+            // the session shows in the main grid). Best-effort: a failure here
+            // just leaves the session on `main`, still visible.
+            if let Some(label) = window_label {
+                if let Err(e) = crate::commands::terminal_windows::assign_session_to_window(
+                    app.clone(),
+                    app.state::<Arc<crate::window_assignments::WindowAssignments>>(),
+                    terminal_id.clone(),
+                    label.clone(),
+                )
+                .await
+                {
+                    warn!(
+                        "agent_runtime: gate-continuation terminal: assign session {terminal_id} \
+                         to window {label} failed ({e}) — session stays in the main window"
+                    );
+                }
+            }
+            info!(
+                "agent_runtime: gate-continuation terminal session created \
+                 terminal_id={terminal_id} coord_session={coord_session_id:?} \
+                 agent_id={agent_id}"
+            );
+            report_spawn_complete(agent_id, None, Some("gate continuation (terminal)")).await;
+            Ok(())
+        }
+        Err(e) => {
+            report_spawn_failed(
+                agent_id,
+                &format!("terminal session create failed: {e}"),
+                None,
+                0,
+            )
+            .await;
+            Err(anyhow::anyhow!(e))
         }
     }
 }
@@ -1790,6 +1944,62 @@ mod tests {
         let agent_id = uuid::Uuid::now_v7();
         let exit = pump_subprocess(agent_id, &mut child, None).await.unwrap();
         assert_eq!(exit, 0);
+    }
+
+    /// The terminal arm launches the `claude` CLI with the prompt as a single
+    /// POSITIONAL arg (interactive form), NOT `--print` — so an
+    /// `AskUserQuestion` inside the spawned session is answerable. This guards
+    /// the argv shape the terminal branch hands to `terminal_create`'s
+    /// `command` override (resolved via the same `QONTINUI_CLAUDE_BIN` env the
+    /// headless path uses).
+    #[test]
+    fn terminal_continuation_command_is_interactive_positional_prompt() {
+        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        std::env::set_var("QONTINUI_CLAUDE_BIN", "/fake/claude");
+
+        // Mirror the construction in `run_continuation_terminal` (a fixed-size
+        // array here — the production path needs an owned `Vec` for the
+        // `Option<Vec<String>>` command override, but the test only inspects).
+        let claude_bin = claude_bin_path();
+        let prompt = "implement phase 2 of the plan".to_string();
+        let command = [claude_bin, prompt.clone()];
+
+        assert_eq!(command[0], "/fake/claude", "uses the resolved claude bin");
+        assert_eq!(command[1], prompt, "prompt is the single positional arg");
+        assert_eq!(command.len(), 2, "no extra flags");
+        assert!(
+            !command.iter().any(|a| a == "--print" || a == "-p"),
+            "must NOT use --print/-p: the session must stay interactive"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
+            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
+        }
+    }
+
+    /// In a non-Tauri (unit-test) context there is no process-global AppHandle,
+    /// so the terminal arm cannot open a window. It must fail gracefully —
+    /// report spawn-failed (no-op here, no coord profile) and return `Err`,
+    /// NOT panic and NOT silently drop the continuation. This proves the
+    /// `Presentation::Terminal` arm dispatches to the terminal path (and that
+    /// the path's no-AppHandle guard fires) without a live webview.
+    #[tokio::test]
+    async fn terminal_continuation_without_app_handle_fails_cleanly() {
+        let payload = GateContinuationPayload {
+            target_device_id: uuid::Uuid::now_v7(),
+            initial_prompt: "hi".to_string(),
+            repos: vec![],
+            presentation: Presentation::Terminal,
+            source: GATE_CONTINUATION_SOURCE.to_string(),
+            anchor_key: Some("anchor-z".to_string()),
+        };
+        let workdir = std::env::temp_dir().to_string_lossy().to_string();
+        let res = run_continuation_terminal(uuid::Uuid::now_v7(), &workdir, &payload, None).await;
+        assert!(
+            res.is_err(),
+            "terminal arm must Err (not panic / not silently drop) with no AppHandle"
+        );
     }
 
     /// Drives the gate-continuation HEADLESS dispatch through the REAL

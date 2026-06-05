@@ -230,6 +230,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 a.cols,
                 a.rows,
                 state.app_handle.clone(),
+                None,
             ) {
                 Ok(info) => {
                     if let Some(ctx) = isolated_ctx {

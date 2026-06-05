@@ -29,6 +29,13 @@ impl TerminalManager {
     }
 
     /// Create a new terminal session, returning its info.
+    ///
+    /// `command` is an optional program+args override (Decision 3) forwarded to
+    /// [`TerminalSession::spawn`]: `Some([program, args…])` runs that program as
+    /// the PTY child (the gate-continuation terminal branch launches `claude`
+    /// this way); `None` keeps the interactive-shell behavior every
+    /// operator-opened terminal uses.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
         title: Option<String>,
@@ -37,6 +44,7 @@ impl TerminalManager {
         cols: Option<u16>,
         rows: Option<u16>,
         app_handle: AppHandle,
+        command: Option<Vec<String>>,
     ) -> Result<TerminalInfo, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
@@ -61,6 +69,7 @@ impl TerminalManager {
             rows,
             app_handle,
             self.interceptor.clone(),
+            command,
         )?;
 
         let info = session.info();
