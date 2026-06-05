@@ -448,24 +448,39 @@ fn strip_diff_prefix(s: &str) -> String {
 // Scope / helpers
 // ===========================================================================
 
-/// Resolve a scope to a project directory, reusing the sidecar's scope model.
-/// Order: explicit `scope` (project dir or tsconfig) → the first changed file's
-/// nearest enclosing tsconfig → the default scope. For a non-TS scope given an
-/// explicit project dir that has no tsconfig, fall back to treating that dir as
-/// the project root directly (the single default-scope degenerate case, Q7).
+/// Resolve a scope to a project directory for the multi-language `Ξ_AST` graph.
+/// An explicit `scope` selector is checked FIRST — as a repo name (cross-repo
+/// registry), then a tsconfig path, then an existing dir — so a non-TS repo
+/// (coord/Rust, web/Python) resolves to its OWN root instead of silently falling
+/// back to the runner's default TS frontend (the prior behavior, which made the
+/// surface single-repo). Only when no explicit selector resolves do we fall back
+/// to the file hint's nearest tsconfig and then the default scope.
 fn resolve_project_scope(scope: Option<&str>, hint_file: Option<&String>) -> Option<Scope> {
-    if let Some(s) = scope::resolve_scope(scope, hint_file.map(|f| f.as_str())) {
-        return Some(s);
-    }
-    // No tsconfig anywhere — if an explicit scope dir was given and exists, use it
-    // as a raw project root (language-agnostic; CodeGraph::build walks any of TS/Py/Rust).
     if let Some(s) = scope {
+        // (a) Repo NAME / `owner/name` slug → local checkout dir (cross-repo
+        //     Ξ_AST; CodeGraph::build walks TS/JS/Python/Rust under it).
+        if let Some(dir) = scope::repo_dir(s) {
+            return Some(raw_dir_scope(&dir));
+        }
         let p = Path::new(s);
+        // (b) Explicit tsconfig.json file → TS scope (LSP-compatible).
+        if p.is_file() && p.file_name().map(|n| n == "tsconfig.json").unwrap_or(false) {
+            return Some(Scope::ts(p));
+        }
+        // (c) Explicit existing dir → TS scope if it has a tsconfig, else a raw
+        //     multi-language project root.
         if p.is_dir() {
+            let tsconfig = p.join("tsconfig.json");
+            if tsconfig.exists() {
+                return Some(Scope::ts(&tsconfig));
+            }
             return Some(raw_dir_scope(p));
         }
+        // An explicit selector that is neither a known repo nor a path falls
+        // through to the file-hint / default resolution below.
     }
-    None
+    // No explicit scope resolved: the file hint's nearest tsconfig, then default.
+    scope::resolve_scope(None, hint_file.map(|f| f.as_str()))
 }
 
 /// A degenerate scope whose `project` descriptor is a raw directory (no tsconfig).
@@ -789,5 +804,29 @@ new file mode 100644
         let s = raw_dir_scope(Path::new("/some/project"));
         let dir = scope_project_dir(&s);
         assert_eq!(scope::normalize(&dir), "/some/project");
+    }
+
+    #[test]
+    fn explicit_dir_without_tsconfig_resolves_to_raw_multilang_root() {
+        // The core cross-repo fix: an explicit existing dir with NO tsconfig must
+        // resolve to a raw multi-language project root AT that dir — not silently
+        // fall back to the runner's default TS frontend (the prior single-repo bug).
+        let tmp = std::env::temp_dir().join("qontinui_xrepo_api_test_root");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let s = resolve_project_scope(Some(tmp.to_str().unwrap()), None).expect("scope resolves");
+        assert_eq!(s.language, "mixed");
+        assert_eq!(s.key, scope::normalize(&tmp));
+        // scope_project_dir of a raw scope returns the real dir (synthetic tsconfig parent).
+        assert_eq!(scope_project_dir(&s), tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn unknown_selector_falls_through_to_default_scope() {
+        // A selector that is neither a known repo nor an existing path falls
+        // through to the default scope (the runner frontend tsconfig), never erroring.
+        let s = resolve_project_scope(Some("not-a-real-repo-or-path-xyz"), None);
+        assert!(s.is_some(), "should fall back to default TS scope");
+        assert!(s.unwrap().key.ends_with("tsconfig.json"));
     }
 }
