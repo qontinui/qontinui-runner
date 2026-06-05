@@ -93,7 +93,12 @@ const SETTINGS_TABS = [
   { id: "general", label: "General" },
   { id: "storage", label: "Storage" },
   { id: "backup", label: "Backup" },
-  { id: "instances", label: "Runner Instances" },
+  // Phase 3 (pop-out terminal windows): pop-out windows supersede the
+  // multi-process instance launcher for the everyday "another terminal window"
+  // case, so this tab is relabeled to signal it's now advanced/testing surface.
+  // The `id` stays "instances" so routing / UI-Bridge sub-tab mapping / specs
+  // are unchanged.
+  { id: "instances", label: "Advanced / Testing" },
   { id: "otel", label: "OpenTelemetry" },
   { id: "containers", label: "Container Isolation" },
   { id: "ci-runner", label: "CI Runner" },

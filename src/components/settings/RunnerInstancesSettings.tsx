@@ -13,7 +13,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Monitor, Plus, Trash2, Play, Square, ChevronDown, ChevronRight } from "lucide-react";
+import { Monitor, Plus, Trash2, Play, Square, ChevronDown, ChevronRight, Info } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getApiPort } from "@/lib/runner-api";
 import type { LogFunction } from "./types";
@@ -1054,10 +1054,26 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
   return (
     <div className="space-y-4">
       <SectionHeader
-        title="Runner Instances"
-        description="Launch additional runner instances on different ports for concurrent AI workflow automation."
+        title="Advanced / Testing"
+        description="Supervisor-driven temp runner placements and the multi-process instance launcher. For everyday use, prefer pop-out terminal windows."
         icon={<Monitor />}
       />
+
+      {/* Phase 3 (pop-out terminal windows): steer the common case away from
+          the multi-process instance launcher below. A second terminal window
+          no longer needs a second runner process + port — the Terminal tab can
+          pop one out in-process. The launcher is retained for advanced/testing
+          (e.g. exercising secondary-runner registration) but is no longer the
+          recommended path. */}
+      <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 p-2.5 text-xs text-muted-foreground">
+        <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        <span>
+          Want another terminal window? Use{" "}
+          <span className="font-medium text-foreground">pop-out windows</span> from the
+          Terminal tab — same process, no extra port. The multi-process instance launcher
+          below is for advanced / testing scenarios.
+        </span>
+      </div>
 
       {/* Temp runner placements (supervisor-consumed list, distinct from
           per-named-instance placements below) */}
