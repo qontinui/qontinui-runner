@@ -177,6 +177,16 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     /// Spawn a new terminal session with a shell process.
+    ///
+    /// `command` is an optional program-and-args override (Decision 3 of
+    /// `plans/2026-06-05-visible-gate-continuations-and-plan-ready-predicate.md`):
+    /// when `Some([program, args…])` the session runs that program as its PTY
+    /// child instead of the interactive shell — this is how the gate-continuation
+    /// terminal branch launches the `claude` CLI directly with the prompt as
+    /// argv. When `None` (every operator-opened / frontend terminal), the session
+    /// falls back to [`Self::build_shell_command`] byte-for-byte, so the
+    /// interactive-terminal path is untouched.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: TerminalId,
         title: String,
@@ -186,6 +196,7 @@ impl TerminalSession {
         rows: u16,
         app_handle: AppHandle,
         interceptor: Arc<OutputInterceptor>,
+        command: Option<Vec<String>>,
     ) -> Result<Self, String> {
         let pty_system = native_pty_system();
 
@@ -198,8 +209,9 @@ impl TerminalSession {
             })
             .map_err(|e| format!("Failed to open PTY: {}", e))?;
 
-        // Build shell command
-        let mut cmd = Self::build_shell_command();
+        // Build the PTY child command: an explicit program+args override
+        // (Decision 3) when supplied, else the interactive shell.
+        let mut cmd = Self::build_command_from(command);
 
         // Set working directory
         let cwd = if working_dir.is_empty() {
@@ -558,6 +570,31 @@ impl TerminalSession {
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
         })
+    }
+
+    /// Build the PTY child [`CommandBuilder`] from an optional program+args
+    /// override (Decision 3).
+    ///
+    /// - `Some([program, args…])` → run `program` directly with `args` as the
+    ///   session's child. The gate-continuation terminal branch uses this to
+    ///   launch `claude "<prompt>"` so the prompt is visible in scrollback and
+    ///   the session behaves identically to the operator launching it (no
+    ///   PTY-readiness race, no shell wrapping).
+    /// - `Some([])` (empty) → no program to run; fall back to the shell so we
+    ///   never spawn an empty command.
+    /// - `None` → [`Self::build_shell_command`], the interactive-shell path
+    ///   every operator-opened terminal takes. Back-compat by construction.
+    fn build_command_from(command: Option<Vec<String>>) -> CommandBuilder {
+        match command {
+            Some(parts) if !parts.is_empty() => {
+                let mut cmd = CommandBuilder::new(&parts[0]);
+                for arg in &parts[1..] {
+                    cmd.arg(arg);
+                }
+                cmd
+            }
+            _ => Self::build_shell_command(),
+        }
     }
 
     /// Build the platform-appropriate shell command, injecting shell integration if possible.
@@ -1102,6 +1139,56 @@ mod tests {
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
         }
+    }
+
+    #[test]
+    fn build_command_from_override_uses_program_and_args() {
+        // Decision 3: an explicit override runs that program with its args as
+        // the PTY child (argv[0]=program, argv[1..]=args).
+        let cmd = TerminalSession::build_command_from(Some(vec![
+            "claude".to_string(),
+            "do the thing".to_string(),
+        ]));
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(argv, vec!["claude".to_string(), "do the thing".to_string()]);
+    }
+
+    #[test]
+    fn build_command_from_program_only_has_no_extra_args() {
+        let cmd = TerminalSession::build_command_from(Some(vec!["claude".to_string()]));
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(argv, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn build_command_from_none_falls_back_to_shell() {
+        // None → the interactive shell path (back-compat by construction). The
+        // shell program is platform-specific, but it must NOT be `claude` and
+        // must match what `build_shell_command` produces.
+        let fallback = TerminalSession::build_command_from(None);
+        let shell = TerminalSession::build_shell_command();
+        assert_eq!(
+            fallback.get_argv().first(),
+            shell.get_argv().first(),
+            "None override must fall back to the shell program"
+        );
+    }
+
+    #[test]
+    fn build_command_from_empty_vec_falls_back_to_shell() {
+        // An empty override is meaningless (no program) → fall back to the
+        // shell rather than spawning nothing.
+        let fallback = TerminalSession::build_command_from(Some(vec![]));
+        let shell = TerminalSession::build_shell_command();
+        assert_eq!(fallback.get_argv().first(), shell.get_argv().first());
     }
 
     #[test]

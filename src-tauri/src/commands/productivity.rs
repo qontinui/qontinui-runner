@@ -982,6 +982,7 @@ pub async fn launch_coordinator_session(
         None,
         None,
         app_handle.clone(),
+        None,
     )?;
 
     if let Some(ctx) = isolated_ctx {
@@ -1117,6 +1118,7 @@ pub async fn spawn_worker_session(
         Some(dom_cols),
         Some(dom_rows),
         app_handle.clone(),
+        None,
     )?;
 
     // Phase 2 — park the isolated edit context on the TerminalSession

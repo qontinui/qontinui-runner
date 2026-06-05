@@ -2220,6 +2220,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             cols,
             rows,
             api_state.app_handle.clone(),
+            None,
         ) {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {

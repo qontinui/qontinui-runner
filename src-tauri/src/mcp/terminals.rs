@@ -168,6 +168,7 @@ pub async fn create_terminal_handler(
         request.cols,
         request.rows,
         app_handle,
+        None,
     ) {
         Ok(info) => {
             if let Some(ctx) = isolated_ctx {
