@@ -149,17 +149,25 @@ interface PersistedState {
   focusedZone: number;
 }
 
-function storageKey(pageId: string): string {
-  return pageId === "default" ? BASE_STORAGE_KEY : `page:${pageId}:${BASE_STORAGE_KEY}`;
+// Phase 1 (pop-out windows): pop-out windows share the main window's
+// localStorage (same WebView2 profile per process), so each window's zone
+// layout MUST be namespaced by its `windowLabel` or they clobber each other.
+// `"main"` keeps the legacy key unchanged (existing layouts preserved).
+function storageKey(pageId: string, windowLabel: string = "main"): string {
+  const base = pageId === "default" ? BASE_STORAGE_KEY : `page:${pageId}:${BASE_STORAGE_KEY}`;
+  return windowLabel === "main" ? base : `${base}:window:${windowLabel}`;
 }
 
-function loadPersistedState(pageId: string): PersistedState | null {
-  return instanceStorage.getJSON<PersistedState | null>(storageKey(pageId), null);
+function loadPersistedState(pageId: string, windowLabel?: string): PersistedState | null {
+  return instanceStorage.getJSON<PersistedState | null>(
+    storageKey(pageId, windowLabel),
+    null,
+  );
 }
 
-function persistState(pageId: string, state: PersistedState) {
+function persistState(pageId: string, windowLabel: string | undefined, state: PersistedState) {
   try {
-    instanceStorage.setJSON(storageKey(pageId), state);
+    instanceStorage.setJSON(storageKey(pageId, windowLabel), state);
   } catch {
     // ignore storage errors
   }
@@ -224,8 +232,12 @@ export function reconcileAssignments(
 
 // ── Hook ───────────────────────────────────────────────────────────────────
 
-export function useZoneLayout(tabIds: string[], pageId: string = "default") {
-  const [persistedState] = useState(() => loadPersistedState(pageId));
+export function useZoneLayout(
+  tabIds: string[],
+  pageId: string = "default",
+  windowLabel: string = "main",
+) {
+  const [persistedState] = useState(() => loadPersistedState(pageId, windowLabel));
 
   const [layoutId, setLayoutIdState] = useState<string>(persistedState?.layoutId ?? "single");
   const [assignments, setAssignments] = useState<ZoneAssignments>(
@@ -248,8 +260,8 @@ export function useZoneLayout(tabIds: string[], pageId: string = "default") {
 
   // Persist on changes
   useEffect(() => {
-    persistState(pageId, { layoutId, assignments, focusedZone });
-  }, [pageId, layoutId, assignments, focusedZone]);
+    persistState(pageId, windowLabel, { layoutId, assignments, focusedZone });
+  }, [pageId, windowLabel, layoutId, assignments, focusedZone]);
 
   // Auto-assign tabs to empty zones when tabs change
   useEffect(() => {

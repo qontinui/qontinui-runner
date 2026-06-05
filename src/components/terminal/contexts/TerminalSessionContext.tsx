@@ -59,6 +59,7 @@ import {
   type RefObject,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useWindowAssignments, MAIN_WINDOW_LABEL } from "./WindowAssignmentsContext";
 
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
@@ -188,11 +189,38 @@ export function TerminalSessionProvider({
 }: TerminalSessionProviderProps) {
   // ---- TerminalCore ----
   const terminalManager = useTerminalManager(pageId);
-  const { tabs, activeId, setActiveId, updateTab, renameTab, createTerminal } =
+  const { tabs: allTabs, activeId, setActiveId, updateTab, renameTab, createTerminal } =
     terminalManager;
 
+  // Phase 1 (pop-out windows): render only the tabs THIS window owns. With a
+  // single ("main") window and no assignments every tab is owned by "main", so
+  // `tabs === allTabs` and every downstream consumer behaves byte-identically.
+  const { windowLabel: myWindowLabel, isOwned } = useWindowAssignments();
+  const tabs = useMemo(() => allTabs.filter((t) => isOwned(t.id)), [allTabs, isOwned]);
+
+  // A terminal created in a pop-out window must belong to THAT window, not the
+  // default "main". Assign it immediately after creation (the broadcast event
+  // then drops it from main and claims it here). No-op in the main window.
+  const createTerminalForWindow = useCallback<typeof createTerminal>(
+    async (title?: string, workingDir?: string) => {
+      const id = await createTerminal(title, workingDir);
+      if (id && myWindowLabel !== MAIN_WINDOW_LABEL) {
+        try {
+          await invoke("assign_session_to_window", {
+            sessionId: id,
+            windowLabel: myWindowLabel,
+          });
+        } catch {
+          /* best-effort: tab still works, just stays in main */
+        }
+      }
+      return id;
+    },
+    [createTerminal, myWindowLabel],
+  );
+
   const tabIds = useMemo(() => tabs.map((t) => t.id), [tabs]);
-  const zoneLayout = useZoneLayout(tabIds, pageId);
+  const zoneLayout = useZoneLayout(tabIds, pageId, myWindowLabel);
 
   // Sync focused zone → active tab.
   useEffect(() => {
@@ -486,6 +514,10 @@ export function TerminalSessionProvider({
     () => ({
       // TerminalCore
       ...terminalManager,
+      // Phase 1: override the manager's full tab set + creator with the
+      // window-scoped versions so this window renders/creates only its tabs.
+      tabs,
+      createTerminal: createTerminalForWindow,
       pageId,
       zoneLayout,
       terminalRefs,
@@ -521,6 +553,8 @@ export function TerminalSessionProvider({
     }),
     [
       terminalManager,
+      tabs,
+      createTerminalForWindow,
       pageId,
       zoneLayout,
       stateTracking,

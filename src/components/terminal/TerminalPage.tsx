@@ -12,6 +12,7 @@ import { BatchOperationsBar } from "./BatchOperationsBar";
 import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
 import { useTerminalPageId } from "./TerminalPageContext";
+import { WindowAssignmentsProvider } from "./contexts/WindowAssignmentsContext";
 import {
   TerminalSessionProvider,
   useTerminalSession,
@@ -64,6 +65,10 @@ interface TerminalPageProps {
 export function TerminalPage(props: TerminalPageProps) {
   const pageId = useTerminalPageId();
   return (
+    // Phase 1 (pop-out windows): WindowAssignmentsProvider sits above the
+    // session provider so tab-ownership filtering + owner-gated stdin can read
+    // "which window owns which session". A no-op in the single-window case.
+    <WindowAssignmentsProvider>
     <TerminalSessionProvider
       pageId={pageId}
       onNavigateToBuilder={props.onNavigateToBuilder}
@@ -81,6 +86,7 @@ export function TerminalPage(props: TerminalPageProps) {
         </TransitionEffectsProvider>
       </ZoneMetadataProvider>
     </TerminalSessionProvider>
+    </WindowAssignmentsProvider>
   );
 }
 
@@ -143,6 +149,60 @@ function TerminalPageInner({
             title: t.title,
             isAlive: Boolean(t.isAlive),
           })),
+      },
+      // Phase 1 (pop-out terminal windows) — open/close pop-out OS windows and
+      // move terminal tabs between them. Reachable by agents and the operator.
+      {
+        id: "open-terminal-window",
+        label: "Open Terminal Window",
+        description:
+          "Open a new pop-out OS window (same process) that hosts its own terminal tabs. Returns the new window record { label, kind, ... }.",
+        handler: async () => invoke("open_terminal_window", { placement: null }),
+      },
+      {
+        id: "pop-out-active-terminal",
+        label: "Pop Out Active Terminal",
+        description:
+          "Open a new pop-out window and move the active terminal tab into it. Returns { window, terminalId }.",
+        handler: async () => {
+          if (!activeId) throw new Error("no active terminal to pop out");
+          const rec = await invoke<{ label: string }>("open_terminal_window", {
+            placement: null,
+          });
+          await invoke("assign_session_to_window", {
+            sessionId: activeId,
+            windowLabel: rec.label,
+          });
+          return { window: rec.label, terminalId: activeId };
+        },
+      },
+      {
+        id: "move-terminal-to-window",
+        label: "Move Terminal To Window",
+        description:
+          "Move a terminal tab to a window. Params: { terminalId: string, windowLabel: string } where windowLabel is 'main' or 'term-N'.",
+        paramSchema: { terminalId: "string", windowLabel: "string ('main' | 'term-N')" },
+        handler: async (params?: unknown) => {
+          const { terminalId, windowLabel: target } = (params ?? {}) as {
+            terminalId?: string;
+            windowLabel?: string;
+          };
+          if (!terminalId || !target) {
+            throw new Error("move-terminal-to-window requires { terminalId, windowLabel }");
+          }
+          await invoke("assign_session_to_window", {
+            sessionId: terminalId,
+            windowLabel: target,
+          });
+          return { ok: true };
+        },
+      },
+      {
+        id: "list-runner-windows",
+        label: "List Runner Windows",
+        description:
+          "Return this runner process's own windows [{ label, kind, title }] (main + pop-outs).",
+        handler: async () => invoke("list_runner_windows"),
       },
     ],
   });
