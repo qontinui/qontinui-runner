@@ -56,8 +56,10 @@ pub enum WindowKind {
     PopOut,
 }
 
-/// Window geometry, persisted for Phase-2 restore. Logical pixels.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Window geometry, persisted for Phase-2 restore. Physical pixels (global
+/// desktop coordinates), matching what `set_position`/`set_size` consume on
+/// restore — see `commands::terminal_windows::restore_pop_out_windows`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowGeometry {
     pub x: i32,
     pub y: i32,
@@ -309,6 +311,80 @@ impl WindowAssignments {
             .unwrap_or_default()
     }
 
+    /// Pop-out (`term-N`) records only — the windows to recreate on boot.
+    /// `"main"` is created by the normal startup path, never restored here.
+    pub fn pop_out_records(&self) -> Vec<WindowRecord> {
+        self.inner
+            .lock()
+            .map(|s| {
+                s.windows
+                    .values()
+                    .filter(|r| r.kind == WindowKind::PopOut)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Record a window's last-known geometry (for Phase-2 restore). Persists
+    /// only when the geometry actually changed (so the periodic capture poll
+    /// is a no-op while a window sits still — no disk churn). Returns `true`
+    /// when it wrote. Unknown labels are ignored.
+    pub fn update_geometry(&self, label: &str, geometry: WindowGeometry) -> bool {
+        let snapshot = {
+            let mut s = match self.inner.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "window_assignments: lock poisoned on update_geometry");
+                    return false;
+                }
+            };
+            match s.windows.get_mut(label) {
+                Some(rec) if rec.geometry.as_ref() != Some(&geometry) => {
+                    rec.geometry = Some(geometry);
+                }
+                _ => return false, // unknown window, or geometry unchanged
+            }
+            s.clone()
+        };
+        self.persist(&snapshot);
+        true
+    }
+
+    /// Drop `session_owner` entries whose target window no longer exists in the
+    /// registry (e.g. a hand-edited or partially-written state file), reverting
+    /// those sessions to the default `"main"`. Run once on boot, after the
+    /// window set is known. Returns the session ids that were reassigned.
+    /// `"main"` is always a valid target even before `ensure_main`.
+    pub fn reconcile_orphans(&self) -> Vec<String> {
+        let (orphans, snapshot) = {
+            let mut s = match self.inner.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "window_assignments: lock poisoned on reconcile_orphans");
+                    return Vec::new();
+                }
+            };
+            let orphans: Vec<String> = s
+                .session_owner
+                .iter()
+                .filter(|(_, owner)| {
+                    owner.as_str() != MAIN_WINDOW_LABEL && !s.windows.contains_key(owner.as_str())
+                })
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            if orphans.is_empty() {
+                return Vec::new();
+            }
+            for sid in &orphans {
+                s.session_owner.remove(sid);
+            }
+            (orphans, s.clone())
+        };
+        self.persist(&snapshot);
+        orphans
+    }
+
     fn persist(&self, state: &WindowAssignmentsState) {
         if let Err(e) = write_state(&self.path, state) {
             warn!(
@@ -453,6 +529,60 @@ mod tests {
         assert!(wa.snapshot().windows.contains_key("term-1"));
         // Next allocation continues monotonically after restore.
         assert_eq!(wa.create_window(None, None, 20).label, "term-2");
+    }
+
+    #[test]
+    fn update_geometry_persists_only_on_change() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let w = wa.create_window(None, None, 10);
+        let g = WindowGeometry {
+            x: 100,
+            y: 200,
+            w: 800,
+            h: 600,
+            maximized: false,
+        };
+        // First write persists.
+        assert!(wa.update_geometry(&w.label, g.clone()));
+        // Identical write is a no-op (no disk churn during the idle poll).
+        assert!(!wa.update_geometry(&w.label, g.clone()));
+        // A different geometry persists again.
+        let g2 = WindowGeometry { x: 150, ..g };
+        assert!(wa.update_geometry(&w.label, g2.clone()));
+        // Unknown window is ignored.
+        assert!(!wa.update_geometry("term-999", g2.clone()));
+        // Survives reopen.
+        let records = wa.pop_out_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].geometry.as_ref(), Some(&g2));
+    }
+
+    #[test]
+    fn pop_out_records_excludes_main() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        wa.create_window(None, None, 10);
+        wa.create_window(None, None, 20);
+        let pops = wa.pop_out_records();
+        assert_eq!(pops.len(), 2);
+        assert!(pops.iter().all(|r| r.kind == WindowKind::PopOut));
+        assert!(pops.iter().all(|r| r.label != "main"));
+    }
+
+    #[test]
+    fn reconcile_orphans_reassigns_dangling_owners_to_main() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let w = wa.create_window(None, None, 10); // term-1 exists
+        wa.assign_session("sess-live", &w.label); // valid owner
+        wa.assign_session("sess-orphan", "term-7"); // term-7 never existed
+        let reassigned = wa.reconcile_orphans();
+        assert_eq!(reassigned, vec!["sess-orphan".to_string()]);
+        assert_eq!(wa.owner_of("sess-orphan"), "main"); // reverted
+        assert_eq!(wa.owner_of("sess-live"), "term-1"); // untouched
+                                                        // Idempotent: a second pass finds nothing.
+        assert!(wa.reconcile_orphans().is_empty());
     }
 
     #[test]

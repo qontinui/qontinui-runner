@@ -49,6 +49,11 @@ pub async fn terminal_create(
     plan_slug: Option<String>,
     correlation_topic: Option<String>,
     command: Option<Vec<String>>,
+    // Phase 2 (pop-out windows): the label of the window creating this pane.
+    // Absent/"main" → the legacy key (back-compat); a "term-N" pop-out folds
+    // the label into the pane identity so same-(title,cwd) panes in different
+    // windows don't collide on one coord session.
+    window_label: Option<String>,
 ) -> Result<CommandResponse, String> {
     // R2 (session-lifecycle-cleanup) — derive the STABLE pane identity from
     // the create-time triple the frontend round-trips on restore
@@ -58,10 +63,11 @@ pub async fn terminal_create(
     // before `page_id` is moved into `terminal_manager.create`. Used to
     // look up / persist this pane's coord session id so a restart RESUMES
     // the prior coord row instead of orphaning it.
-    let pane_key = PaneKey::from_create(
+    let pane_key = PaneKey::from_create_in_window(
         page_id.as_deref().unwrap_or("default"),
         title.as_deref().unwrap_or(""),
         working_dir.as_deref().unwrap_or(""),
+        window_label.as_deref().unwrap_or("main"),
     );
 
     // L2 (shared-checkout coordination gap fix) — when the caller did

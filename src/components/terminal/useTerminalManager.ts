@@ -95,7 +95,7 @@ export function applyWorkerMark(
 // `#[serde(rename_all = "camelCase")]`. Future serde renames break this
 // file at compile time instead of silently dropping events.
 
-export function useTerminalManager(pageId: string = "default") {
+export function useTerminalManager(pageId: string = "default", windowLabel: string = "main") {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const nextTitleNum = useRef(1);
@@ -266,6 +266,10 @@ export function useTerminalManager(pageId: string = "default") {
           title: displayTitle,
           workingDir: workingDir ?? null,
           pageId: pageId !== "default" ? pageId : null,
+          // Phase 2 (pop-out windows): tag the pane with its owning window so
+          // its coord-session identity doesn't collide with a same-(title,cwd)
+          // pane in another window. "main" → omitted (legacy/back-compat key).
+          windowLabel: windowLabel !== "main" ? windowLabel : null,
         });
 
         if (!result.success || !result.data) return null;
@@ -293,7 +297,7 @@ export function useTerminalManager(pageId: string = "default") {
         return null;
       }
     },
-    [pageId],
+    [pageId, windowLabel],
   );
 
   const createPlanTab = useCallback((filePath: string): string => {

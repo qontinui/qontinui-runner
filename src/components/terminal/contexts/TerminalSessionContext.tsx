@@ -188,15 +188,17 @@ export function TerminalSessionProvider({
   onNavigateToActive,
   children,
 }: TerminalSessionProviderProps) {
-  // ---- TerminalCore ----
-  const terminalManager = useTerminalManager(pageId);
-  const { tabs: allTabs, activeId, setActiveId, updateTab, renameTab, createTerminal } =
-    terminalManager;
-
   // Phase 1 (pop-out windows): render only the tabs THIS window owns. With a
   // single ("main") window and no assignments every tab is owned by "main", so
   // `tabs === allTabs` and every downstream consumer behaves byte-identically.
+  // Read first so the window label flows into the terminal manager below
+  // (Phase 2: the create-time pane key is tagged with the owning window).
   const { windowLabel: myWindowLabel, isOwned } = useWindowAssignments();
+
+  // ---- TerminalCore ----
+  const terminalManager = useTerminalManager(pageId, myWindowLabel);
+  const { tabs: allTabs, activeId, setActiveId, updateTab, renameTab, createTerminal } =
+    terminalManager;
   const tabs = useMemo(() => allTabs.filter((t) => isOwned(t.id)), [allTabs, isOwned]);
 
   // A terminal created in a pop-out window must belong to THAT window, not the
