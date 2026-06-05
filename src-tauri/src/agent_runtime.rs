@@ -95,6 +95,59 @@ pub struct AllocatedWorktree {
     pub push_ref: Option<String>,
 }
 
+/// How a gate continuation should be surfaced to the operator.
+///
+/// `terminal` is the default (per the plan's Decision 1) so that a coord
+/// that does NOT yet forward the field — every coord on `origin/main` today —
+/// deserializes to the operator-visible mode. A parallel coord phase adds the
+/// field; this arm tolerates both its absence (→ `Terminal`) and its presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Presentation {
+    /// Open a visible terminal session the operator can see and interact with.
+    /// **P2 wires the real visible-terminal branch**; in THIS phase it logs a
+    /// warning and falls through to the headless flow.
+    #[default]
+    Terminal,
+    /// Run the `claude` CLI as a headless tokio child (today's behavior, used
+    /// for fleet/CI continuations with no interactive surface).
+    Headless,
+}
+
+/// Minimal gate-continuation spawn payload published by coord's
+/// `spawn_continuation()` to `events.agent.spawn_requested.<device>`.
+///
+/// This is **deliberately NOT** the full agent-spawn [`LaunchPayload`]: coord's
+/// gate engine owns the *intent* (which repos, what prompt, how to present it)
+/// but NOT the device-local resources (worktrees, claim token, JWT). Those are
+/// minted on the runner — `agent_id`, `worktrees`, `jwt`, `jwt_exp`, and
+/// `claim_token` are absent here on purpose, and the handler acquires them
+/// device-locally via [`crate::agent_worktree::isolated_edit::acquire`]
+/// (Decision 6). A `source` of `"gate_continuation"` is the wire discriminator
+/// that routes a frame into this arm instead of the `LaunchPayload` arm.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GateContinuationPayload {
+    pub target_device_id: uuid::Uuid,
+    pub initial_prompt: String,
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Defaults to [`Presentation::Terminal`] when coord omits the field
+    /// (every coord on `origin/main` today omits it).
+    #[serde(default)]
+    pub presentation: Presentation,
+    /// Wire discriminator. Always `"gate_continuation"` for this shape; the
+    /// arm only deserializes a frame here after confirming this value, so a
+    /// foreign `source` never reaches this struct.
+    #[serde(default)]
+    pub source: String,
+    /// The gate anchor that cleared (for logging / correlation).
+    #[serde(default)]
+    pub anchor_key: Option<String>,
+}
+
+/// The `source` discriminator coord stamps on a gate-continuation spawn frame.
+const GATE_CONTINUATION_SOURCE: &str = "gate_continuation";
+
 #[derive(Debug, Clone, Serialize)]
 struct SpawnCompleteBody {
     pid: Option<i64>,
@@ -343,12 +396,29 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
         let spawn_ch = format!("events.agent.spawn_requested.{device_id}");
         let stop_ch = format!("events.agent.stop_requested.{device_id}");
         if channel == spawn_ch {
-            match parse_envelope_payload(&value) {
-                Some(payload) => spawn_run_task(payload),
-                None => {
-                    warn!(
+            // Decision 6: a gate-continuation frame carries coord's MINIMAL
+            // payload (no agent_id/worktrees/jwt/claim_token), which can NEVER
+            // deserialize into the full `LaunchPayload` the agent-spawn path
+            // needs. Route it by its `source` discriminator into the dedicated
+            // arm FIRST; only fall back to the `LaunchPayload` parse for the
+            // agent-spawn source. This is the fix for the 2026-06-03
+            // "dispatched but never consumed" drop.
+            if envelope_is_gate_continuation(&value) {
+                match parse_gate_continuation_payload(&value) {
+                    Some(payload) => spawn_gate_continuation_task(payload, device_id),
+                    None => warn!(
+                        "agent_runtime: gate-continuation envelope on {channel} had no \
+                         parseable payload/body"
+                    ),
+                }
+            } else {
+                match parse_envelope_payload(&value) {
+                    Some(payload) => spawn_run_task(payload),
+                    None => {
+                        warn!(
                         "agent_runtime: spawn envelope on {channel} had no parseable payload/body"
                     )
+                    }
                 }
             }
         } else if channel == stop_ch {
@@ -398,6 +468,46 @@ fn parse_envelope_payload(envelope: &serde_json::Value) -> Option<LaunchPayload>
         Some(s) => serde_json::from_str(s).ok(),
         None => serde_json::from_value(inner.clone()).ok(),
     }
+}
+
+/// Peel a coord `/ws` envelope's inner payload into an owned
+/// `serde_json::Value`, accepting both the `payload` (current coord) and
+/// legacy `body` field names, and the inner value as a JSON string
+/// (`from_str`) or a nested object. Returns `None` if neither yields valid
+/// JSON. Shared by the gate-continuation and source-sniffing helpers so the
+/// string-vs-object handling stays in lockstep with [`parse_envelope_payload`].
+fn envelope_inner_value(envelope: &serde_json::Value) -> Option<serde_json::Value> {
+    let inner = envelope.get("payload").or_else(|| envelope.get("body"))?;
+    match inner.as_str() {
+        Some(s) => serde_json::from_str(s).ok(),
+        None => Some(inner.clone()),
+    }
+}
+
+/// Does this spawn-request envelope carry the gate-continuation discriminator
+/// (`source == "gate_continuation"`)? Used to route a frame into the dedicated
+/// gate-continuation arm BEFORE attempting the full-`LaunchPayload` parse — the
+/// two shapes are mutually exclusive (a gate-continuation frame has no
+/// `agent_id`/`worktrees`/`jwt`, so it can never deserialize as a
+/// `LaunchPayload`, and vice versa).
+fn envelope_is_gate_continuation(envelope: &serde_json::Value) -> bool {
+    envelope_inner_value(envelope)
+        .and_then(|v| {
+            v.get("source")
+                .and_then(|s| s.as_str())
+                .map(|s| s == GATE_CONTINUATION_SOURCE)
+        })
+        .unwrap_or(false)
+}
+
+/// Extract a [`GateContinuationPayload`] from a coord `/ws` envelope. Mirrors
+/// [`parse_envelope_payload`]'s string-or-object inner handling. Returns `None`
+/// if the inner JSON does not deserialize into the minimal continuation shape.
+fn parse_gate_continuation_payload(
+    envelope: &serde_json::Value,
+) -> Option<GateContinuationPayload> {
+    let inner = envelope_inner_value(envelope)?;
+    serde_json::from_value(inner).ok()
 }
 
 /// Extract `agent_id` from a coord stop envelope (`{channel, payload|body}`),
@@ -458,6 +568,221 @@ fn spawn_run_task(payload: LaunchPayload) {
         // Drop the registry entry once the run task is fully done.
         agent_stops().lock().unwrap().remove(&agent_id);
     });
+}
+
+// =============================================================================
+// Gate-continuation path (Decision 6)
+// =============================================================================
+
+/// Spawn the run task for a gate continuation. Unlike the agent-spawn path,
+/// the device-local resources (worktree, claim, JWT) are NOT supplied by coord
+/// — they are acquired inside [`run_gate_continuation`].
+fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uuid::Uuid) {
+    info!(
+        "agent_runtime: gate-continuation received target_device_id={} presentation={:?} \
+         repos={} anchor_key={:?}",
+        payload.target_device_id,
+        payload.presentation,
+        payload.repos.len(),
+        payload.anchor_key,
+    );
+    tokio::spawn(async move {
+        if let Err(e) = run_gate_continuation(payload, device_id).await {
+            error!("agent_runtime: run_gate_continuation failed: {e:#}");
+        }
+    });
+}
+
+/// End-to-end run of one gate continuation:
+/// 1. Acquire a device-local worktree (+ claim heartbeat) from `repos` via the
+///    same `isolated_edit::acquire` machinery the agent-spawn path uses. When
+///    `QONTINUI_AGENT_WORKTREE_MODE` is off, fall back to the canonical
+///    checkout of the first repo (no isolation) so the continuation still runs.
+/// 2. Dispatch on `presentation`:
+///    - `Headless` → spawn the `claude` CLI as a tokio child (existing flow),
+///      posting `spawn-complete`/`spawn-failed` lifecycle to coord.
+///    - `Terminal` → **P2** opens a visible terminal session here; for THIS
+///      phase, log a warning and fall through to the headless flow so the
+///      continuation is still consumed end-to-end.
+///
+/// The claim heartbeat is owned by the returned `IsolatedEditContext`, held
+/// alive for the whole subprocess lifetime and released on drop (matching the
+/// agent-spawn path's 30s heartbeat + release lifecycle).
+async fn run_gate_continuation(
+    payload: GateContinuationPayload,
+    device_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    // Defensive: coord's WS pattern filter is device-scoped, but a frame that
+    // somehow targets another device must not run here.
+    if payload.target_device_id != device_id {
+        debug!(
+            "agent_runtime: gate-continuation target_device_id={} != local {device_id}; ignoring",
+            payload.target_device_id
+        );
+        return Ok(());
+    }
+
+    // Step 1: acquire a device-local worktree (+ claim heartbeat). `_ctx` is
+    // held to the end of this fn so its heartbeat keeps running and its claim
+    // is released on drop. `None` (worktree mode off, or acquire declined) →
+    // fall back to the canonical checkout of the first repo.
+    let intent = payload
+        .anchor_key
+        .as_deref()
+        .map(|a| format!("gate-continuation:{a}"))
+        .unwrap_or_else(|| "gate-continuation".to_string());
+
+    let (workdir, _ctx, agent_id) =
+        match acquire_continuation_workdir(&payload.repos, &intent).await {
+            Ok(triple) => triple,
+            Err(e) => {
+                warn!("agent_runtime: gate-continuation worktree acquisition failed: {e:#}");
+                return Err(e);
+            }
+        };
+
+    // Step 2: dispatch on presentation.
+    //
+    // ── P2 DISPATCH POINT ───────────────────────────────────────────────────
+    // The `Presentation::Terminal` arm below is where P2 slots in the real
+    // visible-terminal branch (open_terminal_window + terminal_create with a
+    // `command` override). For THIS phase it warns and falls through to the
+    // headless flow so the continuation is consumed end-to-end.
+    match payload.presentation {
+        Presentation::Terminal => {
+            warn!(
+                "agent_runtime: gate-continuation presentation=terminal not yet wired \
+                 (P2) — falling through to headless for agent_id={agent_id}"
+            );
+            run_continuation_headless(agent_id, &workdir, &payload.initial_prompt).await
+        }
+        Presentation::Headless => {
+            info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
+            run_continuation_headless(agent_id, &workdir, &payload.initial_prompt).await
+        }
+    }
+}
+
+/// Resolve the working directory for a gate continuation. Returns
+/// `(workdir, isolated_edit_ctx, agent_id)`.
+///
+/// - Worktree mode ON and `acquire` succeeds → the materialized worktree path,
+///   the held `IsolatedEditContext` (keeps the claim heartbeat alive), and the
+///   coord-allocated agent_id (parsed to a UUID; a fresh UUID if coord returned
+///   a non-UUID id, used only for lifecycle correlation).
+/// - Worktree mode OFF / acquire declined / `repos` empty → the canonical
+///   checkout of the first repo (or `QONTINUI_ROOT`), `None` context, and a
+///   fresh correlation UUID. The continuation still runs, just without
+///   per-agent isolation — the same graceful degrade `acquire_for_terminal`
+///   uses.
+async fn acquire_continuation_workdir(
+    repos: &[String],
+    intent: &str,
+) -> anyhow::Result<(
+    String,
+    Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    uuid::Uuid,
+)> {
+    use crate::agent_worktree::isolated_edit::{acquire, AcquireRequest};
+
+    if !repos.is_empty() {
+        match acquire(AcquireRequest {
+            repos,
+            intent: Some(intent),
+            declared_overlap_paths: None,
+            plan_id: None,
+            phase: None,
+            agent_session_id: None,
+        })
+        .await
+        {
+            Ok(Some(ctx)) => {
+                let workdir = ctx
+                    .worktrees
+                    .first()
+                    .map(|w| w.worktree_path.to_string_lossy().to_string())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("gate-continuation: acquire returned no worktrees")
+                    })?;
+                // coord's agent_id is canonically a UUID; if it isn't, fall back
+                // to a fresh one for lifecycle correlation only.
+                let agent_id =
+                    uuid::Uuid::parse_str(&ctx.agent_id).unwrap_or_else(|_| uuid::Uuid::now_v7());
+                return Ok((workdir, Some(ctx), agent_id));
+            }
+            Ok(None) => {
+                debug!(
+                    "agent_runtime: gate-continuation worktree mode off — using canonical checkout"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "agent_runtime: gate-continuation acquire failed ({e}); \
+                     falling back to canonical checkout"
+                );
+            }
+        }
+    }
+
+    // Fallback: canonical checkout of the first repo, else QONTINUI_ROOT.
+    let workdir = repos
+        .first()
+        .and_then(|r| {
+            crate::agent_worktree::canonical_paths::default_canonical_path(r)
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .or_else(|| qontinui_root_dir().map(|p| p.to_string_lossy().to_string()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("gate-continuation: no canonical checkout or QONTINUI_ROOT resolved")
+        })?;
+    Ok((workdir, None, uuid::Uuid::now_v7()))
+}
+
+/// Run a gate continuation as a headless `claude` child (the existing
+/// subprocess flow), posting `spawn-complete` on first successful spawn and
+/// `spawn-failed` on a non-zero / failed exit. Mirrors the agent-spawn path's
+/// lifecycle posts so a continuation is observable on coord the same way.
+async fn run_continuation_headless(
+    agent_id: uuid::Uuid,
+    workdir: &str,
+    initial_prompt: &str,
+) -> anyhow::Result<()> {
+    let log_path = agent_log_path(agent_id);
+    match spawn_claude_child(workdir, initial_prompt).await {
+        Ok(mut child) => {
+            let pid = child.id().map(|p| p as i64);
+            report_spawn_complete(agent_id, pid, Some("gate continuation")).await;
+            let exit = pump_subprocess(agent_id, &mut child, log_path.as_deref()).await;
+            match exit {
+                Ok(0) => {
+                    info!(
+                        "agent_runtime: gate-continuation agent_id={agent_id} exited cleanly \
+                         (code=0)"
+                    );
+                    Ok(())
+                }
+                Ok(code) => {
+                    report_spawn_failed(
+                        agent_id,
+                        &format!("non-zero exit code {code}"),
+                        Some(code),
+                        0,
+                    )
+                    .await;
+                    Ok(())
+                }
+                Err(e) => {
+                    report_spawn_failed(agent_id, &format!("pump failure: {e}"), None, 0).await;
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            report_spawn_failed(agent_id, &format!("spawn failure: {e}"), None, 0).await;
+            Err(e)
+        }
+    }
 }
 
 // =============================================================================
@@ -1140,6 +1465,167 @@ mod tests {
         // Garbage payload yields None (and must not panic).
         let junk = serde_json::json!({ "channel": "x", "payload": "not json" });
         assert!(parse_envelope_payload(&junk).is_none());
+    }
+
+    /// Documents the OLD (broken) behavior: coord's minimal gate-continuation
+    /// payload does NOT deserialize into the full `LaunchPayload`, so the
+    /// pre-fix consumer dropped it with "had no parseable payload". This is the
+    /// 2026-06-03 "dispatched but never consumed" root cause — a payload-shape
+    /// mismatch, NOT a transport bug.
+    #[test]
+    fn minimal_gate_continuation_does_not_parse_as_launch_payload() {
+        let device = uuid::Uuid::now_v7();
+        // The EXACT minimal shape coord's `spawn_continuation()` publishes.
+        let inner = serde_json::json!({
+            "target_device_id": device,
+            "initial_prompt": "go",
+            "repos": ["qontinui-runner"],
+            "source": "gate_continuation",
+            "anchor_key": "plan:foo:phase:1",
+        });
+
+        // It must NOT parse as a LaunchPayload (missing agent_id/worktrees/
+        // jwt/jwt_exp/claim_token — all non-Option).
+        assert!(
+            serde_json::from_value::<LaunchPayload>(inner.clone()).is_err(),
+            "minimal gate-continuation payload must NOT deserialize as LaunchPayload"
+        );
+
+        // And the LaunchPayload envelope parser returns None on it — the old
+        // drop path.
+        let envelope = serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "payload": serde_json::to_string(&inner).unwrap(),
+        });
+        assert!(
+            parse_envelope_payload(&envelope).is_none(),
+            "LaunchPayload envelope parse must miss the gate-continuation shape (the drop)"
+        );
+
+        // But the NEW arm recognizes + parses it.
+        assert!(
+            envelope_is_gate_continuation(&envelope),
+            "source=gate_continuation must route into the dedicated arm"
+        );
+        let parsed = parse_gate_continuation_payload(&envelope)
+            .expect("gate-continuation arm must parse the minimal payload");
+        assert_eq!(parsed.target_device_id, device);
+        assert_eq!(parsed.initial_prompt, "go");
+        assert_eq!(parsed.repos, vec!["qontinui-runner".to_string()]);
+    }
+
+    /// The minimal payload parses both WITHOUT a `presentation` field (coord on
+    /// `origin/main` today omits it → default `Terminal`) and WITH it (the
+    /// parallel coord phase forwards it → the explicit value wins). Accepts
+    /// both the string-inner and object-inner envelope variants.
+    #[test]
+    fn gate_continuation_parses_with_and_without_presentation() {
+        let device = uuid::Uuid::now_v7();
+
+        // (a) WITHOUT presentation → default Terminal. Object-inner variant.
+        let no_pres = serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "body": serde_json::json!({
+                "target_device_id": device,
+                "initial_prompt": "say hi",
+                "repos": [],
+                "source": "gate_continuation",
+            }),
+        });
+        let p = parse_gate_continuation_payload(&no_pres)
+            .expect("payload without presentation must parse");
+        assert_eq!(
+            p.presentation,
+            Presentation::Terminal,
+            "absent presentation must default to Terminal"
+        );
+        assert!(p.repos.is_empty());
+
+        // (b) WITH presentation=headless. String-inner variant (coord's real
+        // /ws fanout shape).
+        let inner = serde_json::json!({
+            "target_device_id": device,
+            "initial_prompt": "say hi",
+            "repos": ["qontinui-coord"],
+            "presentation": "headless",
+            "source": "gate_continuation",
+            "anchor_key": "anchor-x",
+        });
+        let with_pres = serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "payload": serde_json::to_string(&inner).unwrap(),
+        });
+        let p = parse_gate_continuation_payload(&with_pres)
+            .expect("payload with presentation must parse");
+        assert_eq!(p.presentation, Presentation::Headless);
+        assert_eq!(p.anchor_key.as_deref(), Some("anchor-x"));
+
+        // (c) WITH presentation=terminal, explicit.
+        let inner_t = serde_json::json!({
+            "target_device_id": device,
+            "initial_prompt": "x",
+            "repos": [],
+            "presentation": "terminal",
+            "source": "gate_continuation",
+        });
+        let with_term = serde_json::json!({ "payload": serde_json::to_string(&inner_t).unwrap() });
+        assert_eq!(
+            parse_gate_continuation_payload(&with_term)
+                .unwrap()
+                .presentation,
+            Presentation::Terminal
+        );
+    }
+
+    /// Source-routing: only a `source == "gate_continuation"` frame is claimed
+    /// by the gate-continuation arm. An agent-spawn (`LaunchPayload`) frame and
+    /// a frame with no/other source must NOT route here, so the existing
+    /// `LaunchPayload` path stays untouched for agent spawns.
+    #[test]
+    fn source_routing_distinguishes_continuation_from_agent_spawn() {
+        let device = uuid::Uuid::now_v7();
+
+        // A full agent-spawn LaunchPayload frame (no gate_continuation source).
+        let launch = serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "payload": serde_json::to_string(&serde_json::json!({
+                "agent_id": uuid::Uuid::now_v7(),
+                "target_device_id": device,
+                "worktrees": [],
+                "jwt": "t",
+                "jwt_exp": 0,
+                "initial_prompt": "go",
+                "claim_token": "agent:x",
+            }))
+            .unwrap(),
+        });
+        assert!(
+            !envelope_is_gate_continuation(&launch),
+            "agent-spawn frame must NOT route into the gate-continuation arm"
+        );
+        // It still parses as a LaunchPayload (the untouched path).
+        assert!(
+            parse_envelope_payload(&launch).is_some(),
+            "agent-spawn frame must still parse as LaunchPayload"
+        );
+
+        // A gate-continuation frame routes the other way.
+        let cont = serde_json::json!({
+            "payload": serde_json::to_string(&serde_json::json!({
+                "target_device_id": device,
+                "initial_prompt": "go",
+                "repos": ["qontinui-runner"],
+                "source": "gate_continuation",
+            }))
+            .unwrap(),
+        });
+        assert!(envelope_is_gate_continuation(&cont));
+        assert!(parse_envelope_payload(&cont).is_none());
+
+        // A frame with no source at all → not a continuation (won't steal
+        // agent spawns or junk).
+        let no_source = serde_json::json!({ "payload": "{\"initial_prompt\":\"x\"}" });
+        assert!(!envelope_is_gate_continuation(&no_source));
     }
 
     #[test]
