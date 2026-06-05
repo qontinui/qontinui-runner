@@ -55,39 +55,14 @@ pub fn start_git_watcher(
                     let path_str = path.to_string_lossy().to_string();
                     let path_normalized = path_str.replace('\\', "/");
 
-                    let (event_type, details) = if path_normalized.contains(".git/HEAD")
-                        || path_normalized.ends_with("HEAD")
-                    {
-                        if !events_clone.contains(&"branch_switch".to_string()) {
-                            continue;
-                        }
-                        // Read current branch from HEAD
-                        let branch = read_current_branch(&repo_path_clone);
-                        ("branch_switch", branch)
-                    } else if path_normalized.contains("refs/heads/") {
-                        if !events_clone.contains(&"commit".to_string()) {
-                            continue;
-                        }
-                        // Extract branch name from path
-                        let branch = path_normalized
-                            .split("refs/heads/")
-                            .last()
-                            .unwrap_or("unknown")
-                            .to_string();
-                        ("commit", branch)
-                    } else if path_normalized.contains("refs/tags/") {
-                        if !events_clone.contains(&"tag".to_string()) {
-                            continue;
-                        }
-                        let tag = path_normalized
-                            .split("refs/tags/")
-                            .last()
-                            .unwrap_or("unknown")
-                            .to_string();
-                        ("tag", tag)
-                    } else {
+                    let Some((event_type, details)) =
+                        classify_ref_path(&path_normalized, &repo_path_clone)
+                    else {
                         continue;
                     };
+                    if !events_clone.iter().any(|e| e == event_type) {
+                        continue;
+                    }
 
                     // Apply branch filter
                     if let Some(ref filter) = branch_filter_clone {
@@ -123,7 +98,9 @@ pub fn start_git_watcher(
                     // base payload so the supervision channel never breaks
                     // the existing trigger pipeline.
                     if event_type == "commit" {
-                        if let Some(commit_meta) = enrich_commit_metadata(&repo_path_clone) {
+                        if let Some(commit_meta) =
+                            enrich_commit_metadata(&repo_path_clone, Some(&details))
+                        {
                             if let Some(obj) = event_data.as_object_mut() {
                                 for (k, v) in commit_meta.as_object().into_iter().flatten() {
                                     obj.insert(k.clone(), v.clone());
@@ -201,6 +178,42 @@ pub fn start_git_watcher(
     Ok(watcher)
 }
 
+/// Classify a normalized (forward-slash) filesystem path under `.git/` into
+/// a `(event_type, detail)` pair, or `None` for paths the watcher ignores.
+///
+/// Lock files are ignored explicitly: git updates refs via a lock-file dance
+/// (write `refs/heads/<branch>.lock`, then rename it onto
+/// `refs/heads/<branch>`). The lock event fires first, so it used to win the
+/// trigger debounce window — events carried a phantom `<branch>.lock` branch
+/// and enrichment ran before the ref was updated. The rename-target event for
+/// the real ref follows immediately and is the one that drives the pipeline.
+fn classify_ref_path(path_normalized: &str, repo_path: &str) -> Option<(&'static str, String)> {
+    if path_normalized.ends_with(".lock") {
+        return None;
+    }
+    if path_normalized.contains(".git/HEAD") || path_normalized.ends_with("HEAD") {
+        // Read current branch from HEAD
+        Some(("branch_switch", read_current_branch(repo_path)))
+    } else if path_normalized.contains("refs/heads/") {
+        // Extract branch name from path
+        let branch = path_normalized
+            .split("refs/heads/")
+            .last()
+            .unwrap_or("unknown")
+            .to_string();
+        Some(("commit", branch))
+    } else if path_normalized.contains("refs/tags/") {
+        let tag = path_normalized
+            .split("refs/tags/")
+            .last()
+            .unwrap_or("unknown")
+            .to_string();
+        Some(("tag", tag))
+    } else {
+        None
+    }
+}
+
 /// Enrich a `commit` event payload with libgit2-derived metadata.
 ///
 /// Returns a `serde_json::Value` (object) with keys:
@@ -212,13 +225,19 @@ pub fn start_git_watcher(
 ///   - `changed_files`: array of `{path, status}` objects (status is one of
 ///     "added" | "modified" | "deleted" | "renamed" | "typechange" | "other")
 ///
-/// Returns `None` if the repository can't be opened, HEAD can't be peeled
-/// to a commit, or any other git2 error occurs. Callers should fall back
+/// `branch` is the name of the changed ref when known. The commit is resolved
+/// from `refs/heads/<branch>` rather than HEAD: linked-worktree commits update
+/// the shared branch ref while the main checkout's HEAD points elsewhere, so
+/// peeling HEAD mis-attributed them to whatever the main checkout had checked
+/// out. Falls back to HEAD when the branch is unknown or the ref lookup fails
+/// (e.g. the ref was deleted between the event and enrichment).
+///
+/// Returns `None` if the repository can't be opened, no commit can be
+/// resolved, or any other git2 error occurs. Callers should fall back
 /// to the minimal pre-enrichment payload in that case.
-fn enrich_commit_metadata(repo_path: &str) -> Option<serde_json::Value> {
+fn enrich_commit_metadata(repo_path: &str, branch: Option<&str>) -> Option<serde_json::Value> {
     let repo = git2::Repository::open(repo_path).ok()?;
-    let head = repo.head().ok()?;
-    let commit = head.peel_to_commit().ok()?;
+    let commit = resolve_event_commit(&repo, branch)?;
 
     let sha = commit.id().to_string();
     let message = commit.message().unwrap_or("").trim().to_string();
@@ -250,6 +269,22 @@ fn enrich_commit_metadata(repo_path: &str) -> Option<serde_json::Value> {
         "parent_sha": parent_sha,
         "changed_files": changed_files,
     }))
+}
+
+/// Resolve the commit a watcher event refers to: the tip of the changed
+/// branch ref when known, else the repo HEAD.
+fn resolve_event_commit<'r>(
+    repo: &'r git2::Repository,
+    branch: Option<&str>,
+) -> Option<git2::Commit<'r>> {
+    if let Some(branch) = branch {
+        if let Ok(oid) = repo.refname_to_id(&format!("refs/heads/{branch}")) {
+            if let Ok(commit) = repo.find_commit(oid) {
+                return Some(commit);
+            }
+        }
+    }
+    repo.head().ok()?.peel_to_commit().ok()
 }
 
 /// Diff a commit against its first parent (or an empty tree for the initial
@@ -317,5 +352,82 @@ fn read_current_branch(repo_path: &str) -> String {
             }
         }
         Err(_) => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_ignores_ref_lock_files() {
+        // Git's ref-update lock-file dance must not produce events: the
+        // phantom "<branch>.lock" branch polluted commit observations and
+        // won the debounce window from the real ref event.
+        assert!(classify_ref_path("D:/repo/.git/refs/heads/main.lock", ".").is_none());
+        assert!(classify_ref_path("D:/repo/.git/refs/heads/feat/x.lock", ".").is_none());
+        assert!(classify_ref_path("D:/repo/.git/refs/tags/v1.0.lock", ".").is_none());
+        assert!(classify_ref_path("D:/repo/.git/HEAD.lock", ".").is_none());
+    }
+
+    #[test]
+    fn classify_extracts_branch_and_tag() {
+        assert_eq!(
+            classify_ref_path("D:/repo/.git/refs/heads/main", "."),
+            Some(("commit", "main".to_string()))
+        );
+        assert_eq!(
+            classify_ref_path("D:/repo/.git/refs/heads/feat/nested-branch", "."),
+            Some(("commit", "feat/nested-branch".to_string()))
+        );
+        assert_eq!(
+            classify_ref_path("D:/repo/.git/refs/tags/v1.2.3", "."),
+            Some(("tag", "v1.2.3".to_string()))
+        );
+        // Unrelated .git internals stay ignored.
+        assert!(classify_ref_path("D:/repo/.git/config", ".").is_none());
+        assert!(classify_ref_path("D:/repo/.git/index", ".").is_none());
+    }
+
+    /// Stage `name` with `content` and commit it on HEAD; returns the new OID.
+    fn commit_file(repo: &git2::Repository, name: &str, content: &str, msg: &str) -> git2::Oid {
+        let workdir = repo.workdir().unwrap();
+        std::fs::write(workdir.join(name), content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(name)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Watcher Test", "watcher@test.local").unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap()
+    }
+
+    #[test]
+    fn enrich_resolves_changed_ref_not_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let first = commit_file(&repo, "a.txt", "one", "first");
+        let side_tip = repo.find_commit(first).unwrap();
+        repo.branch("side", &side_tip, false).unwrap();
+        let second = commit_file(&repo, "a.txt", "two", "second");
+        let path = dir.path().to_string_lossy().to_string();
+
+        // Changed-ref resolution: the named branch's tip, not HEAD. This is
+        // the linked-worktree case — a commit on another branch updates the
+        // shared ref while this checkout's HEAD points elsewhere.
+        let meta = enrich_commit_metadata(&path, Some("side")).expect("enrich side");
+        assert_eq!(meta["sha"], first.to_string());
+        assert_eq!(meta["message"], "first");
+
+        // No branch known → HEAD (pre-existing behavior).
+        let meta = enrich_commit_metadata(&path, None).expect("enrich head");
+        assert_eq!(meta["sha"], second.to_string());
+
+        // Unresolvable branch → HEAD fallback, not None.
+        let meta = enrich_commit_metadata(&path, Some("does-not-exist")).expect("enrich fallback");
+        assert_eq!(meta["sha"], second.to_string());
     }
 }
