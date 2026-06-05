@@ -51,6 +51,20 @@ pub struct IsolatedEditContext {
     // only consumer.
     coord_http_base: String,
     device_id: uuid::Uuid,
+
+    // ---- Ambient edit-effect loop (Phase 3, plan
+    // 2026-06-05-edit-effect-loop-adoption) ----
+    // The `predict`-side stash filled at acquisition and read by the
+    // `verify`-side spawn in `Drop`. Shared `Arc<Mutex<_>>` so the
+    // fire-and-forget predict task can fill it after `acquire` returns.
+    edit_loop_stash: super::edit_effect_loop::PredictionStash,
+    // The single correlation id tying this context's predict to its verify.
+    // Minted at acquire so both calls (predict at acquire, verify at drop)
+    // share it.
+    edit_loop_correlation_id: uuid::Uuid,
+    // The declared touch set, captured so `Drop`'s verify call can scope the
+    // FS-observation lookup to the same paths the predict declared.
+    edit_loop_declared_paths: Vec<String>,
 }
 
 impl Drop for IsolatedEditContext {
@@ -76,6 +90,25 @@ impl Drop for IsolatedEditContext {
                     None, // tenant_id not resolved in this context
                 );
             }
+        }
+
+        // Ambient edit-effect loop — verify side (Phase 3, plan
+        // 2026-06-05-edit-effect-loop-adoption). AFTER the Ξ_FS observations
+        // push so coord has the realized post-shas to verify against, and
+        // under the SAME `correlation_id` minted at acquire so the prediction
+        // and its verification tie together. Flag-checked inside `spawn_verify`
+        // (default off, flips with `QONTINUI_FS_OBSERVER_ENABLED` once quiet)
+        // and drop-safe: it spawns onto the current runtime, never blocking
+        // `Drop` — same mechanism the fs_observations push uses.
+        for w in &self.worktrees {
+            super::edit_effect_loop::spawn_verify(
+                self.coord_http_base.clone(),
+                w.worktree_path.clone(),
+                w.repo.clone(),
+                self.edit_loop_declared_paths.clone(),
+                self.edit_loop_correlation_id,
+                self.edit_loop_stash.clone(),
+            );
         }
 
         // Stop the heartbeat first so its tick can't race with the
@@ -246,6 +279,31 @@ pub async fn acquire(
         )
     });
 
+    // Ambient edit-effect loop — predict side (Phase 3, plan
+    // 2026-06-05-edit-effect-loop-adoption). Fire-and-forget a
+    // `predict-and-check` per materialized worktree right after acquisition,
+    // stashing the response for the verify side that fires in `Drop`. One
+    // correlation id ties the two. Flag-checked inside `spawn_predict`
+    // (default off) so this stays an unconditional call. `declared_overlap_paths`
+    // is the predicted touch set AND the declared scope at acquisition time.
+    let edit_loop_declared_paths: Vec<String> = req
+        .declared_overlap_paths
+        .map(|p| p.to_vec())
+        .unwrap_or_default();
+    let edit_loop_correlation_id = uuid::Uuid::new_v4();
+    let edit_loop_stash = super::edit_effect_loop::new_stash();
+    for w in &result.worktrees {
+        super::edit_effect_loop::spawn_predict(
+            coord_http_base.clone(),
+            w.repo.clone(),
+            w.parent_sha.clone(),
+            edit_loop_declared_paths.clone(),
+            req.intent.map(|s| s.to_string()),
+            edit_loop_correlation_id,
+            edit_loop_stash.clone(),
+        );
+    }
+
     Ok(Some(IsolatedEditContext {
         agent_id: result.agent_id,
         worktrees: result.worktrees,
@@ -253,6 +311,9 @@ pub async fn acquire(
         _heartbeat: heartbeat,
         coord_http_base,
         device_id,
+        edit_loop_stash,
+        edit_loop_correlation_id,
+        edit_loop_declared_paths,
     }))
 }
 
