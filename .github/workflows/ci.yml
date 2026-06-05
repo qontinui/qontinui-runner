@@ -296,6 +296,65 @@ jobs:
         #      `--no-bundle` — compilation + link is the sanity gate we want.
         run: pnpm run tauri build --debug --no-bundle
 
+  # Phase 3 / F2 — debug test-fixtures seam gate.
+  #
+  # The `mcp::test_fixtures` module (the `/ui-bridge/test/*` session-injection
+  # seam used by the manual-UI acceptance harness) must NEVER compile into a
+  # production release build. It is gated by
+  # `#[cfg(any(debug_assertions, feature = "test-fixtures"))]` in three places.
+  # The honest "binary does not contain the route string" check needs a full
+  # `cargo build --release` (~30 min) which this repo's CI deliberately omits
+  # (the test job builds `--debug --no-bundle`). So we enforce the gate at
+  # SOURCE level here: a fast (seconds, no cargo) grep that the three cfg
+  # anchors are intact. Deleting any one of them — which is exactly how the
+  # seam would leak into release — fails this job. A complementary set of
+  # Rust unit tests (`module_cfg_gate_is_first_non_comment_line` &c. in
+  # test_fixtures.rs) asserts the same anchors from inside the debug test leg;
+  # this job additionally holds if the whole module is ever removed.
+  seam-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Assert test-fixtures seam stays cfg-gated out of release builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          gate='#!\[cfg(any(debug_assertions, feature = "test-fixtures"))\]'
+          gate_outer='#\[cfg(any(debug_assertions, feature = "test-fixtures"))\]'
+
+          fail=0
+
+          # 1. Module-level inner attribute must be the first significant line
+          #    of test_fixtures.rs.
+          tf=src-tauri/src/mcp/test_fixtures.rs
+          first=$(grep -vE '^\s*(//|$)' "$tf" | head -n1)
+          if [ "$first" != '#![cfg(any(debug_assertions, feature = "test-fixtures"))]' ]; then
+            echo "::error file=$tf::module cfg gate missing or not the first significant line (got: $first)"
+            fail=1
+          fi
+
+          # 2. `pub mod test_fixtures;` in mcp/mod.rs must be cfg-gated on the
+          #    line directly above it.
+          if ! grep -Pzo "$gate_outer\n\s*pub mod test_fixtures;" src-tauri/src/mcp/mod.rs >/dev/null; then
+            echo "::error file=src-tauri/src/mcp/mod.rs::pub mod test_fixtures; is not immediately preceded by the cfg gate"
+            fail=1
+          fi
+
+          # 3. The routes() merge in mcp_api.rs must be cfg-gated on the line
+          #    directly above it.
+          if ! grep -Pzo "$gate_outer\n\s*let base_router = base_router.merge\(crate::mcp::test_fixtures::routes\(\)\);" src-tauri/src/mcp_api.rs >/dev/null; then
+            echo "::error file=src-tauri/src/mcp_api.rs::test_fixtures::routes() merge is not immediately preceded by the cfg gate"
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "Debug test-fixtures seam gate FAILED — the /ui-bridge/test/* injection seam could leak into a release build."
+            exit 1
+          fi
+          echo "Debug test-fixtures seam gate OK — all three cfg anchors intact."
+
   security:
     runs-on: ubuntu-latest
 

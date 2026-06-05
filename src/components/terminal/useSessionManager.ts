@@ -17,6 +17,7 @@ import type { TranscriptSession } from "./useTranscriptSessions";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState } from "./useZoneLayout";
 import type { CommandResponse } from "./types";
+import { isInjectedSession } from "./syntheticTabs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -1019,6 +1020,15 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   const resumeSession = useCallback(
     (session: UnifiedSession) => {
+      // F1 inertness: a debug-injected fake has no real transcript on disk —
+      // resuming it would spawn a stray `claude --resume <fake-id>` against a
+      // session id that doesn't exist. No-op it.
+      if (isInjectedSession(session)) {
+        console.warn(
+          `[test-fixtures] ignoring resume on synthetic tab ${session.zoneTabId ?? session.sessionId}`,
+        );
+        return;
+      }
       onResumeSession(session._transcript);
     },
     [onResumeSession],
@@ -1061,7 +1071,19 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   }, []);
 
   const bulkResume = useCallback(async () => {
-    const toResume = allSessions.filter((s) => selectedIds.has(s.sessionId));
+    // F1 inertness: drop synthetic-backed fakes from the bulk set — they have
+    // no real transcript to resume (see `resumeSession`).
+    const toResume = allSessions.filter(
+      (s) => selectedIds.has(s.sessionId) && !isInjectedSession(s),
+    );
+    const skipped = allSessions.filter(
+      (s) => selectedIds.has(s.sessionId) && isInjectedSession(s),
+    );
+    for (const s of skipped) {
+      console.warn(
+        `[test-fixtures] ignoring resume on synthetic tab ${s.zoneTabId ?? s.sessionId}`,
+      );
+    }
     setSelectedIds(new Set());
     // Resume sequentially with a small delay to let each tab initialize
     for (const session of toResume) {

@@ -22,6 +22,20 @@ export interface TranscriptSession {
    * predicates can fire without a real PTY tab being open.
    */
   injected_live_status?: string | null;
+  /**
+   * Optional synthetic-tab spec populated only by the runner's debug-gated
+   * test-fixtures path for a *tab-backed* injected fake. When present,
+   * `deriveSyntheticTabs` (`syntheticTabs.ts`) turns it into a minimal
+   * `TerminalTab` that flows through the REAL `useSessionManager`
+   * tab-correlation path — the only way to place a fake in the `idle` or
+   * tab-backed `error` / `completed` StatusStrip buckets. Real transcripts
+   * omit the field entirely.
+   */
+  injected_tab?: {
+    is_alive: boolean;
+    exit_code: number | null;
+    quiet_ms: number | null;
+  } | null;
 }
 
 export interface TranscriptMessage {

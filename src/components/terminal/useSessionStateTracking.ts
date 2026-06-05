@@ -7,6 +7,14 @@ export interface UseSessionStateTrackingParams {
   processOutput?: (tabId: string, text: string) => void;
   /** Read rendered lines from the xterm buffer (handles cursor movements correctly). */
   getBufferLines?: (tabId: string, maxLines: number) => string[];
+  /**
+   * Pre-age seeds for `lastOutputTimeRef`, keyed by tab id (used by the
+   * debug-gated synthetic-tab seam, `syntheticTabs.ts`). Each entry is applied
+   * ONLY if the tab has no recorded output yet, so a real recording is never
+   * clobbered. Seeding a value in the past lets the existing 60s staleness
+   * sweep classify a synthetic "idle" tab stale on its next tick.
+   */
+  seedLastOutput?: Record<string, number>;
 }
 
 export interface UseSessionStateTrackingReturn {
@@ -26,7 +34,7 @@ export interface UseSessionStateTrackingReturn {
 export function useSessionStateTracking(
   params: UseSessionStateTrackingParams,
 ): UseSessionStateTrackingReturn {
-  const { tabs, processOutput, getBufferLines } = params;
+  const { tabs, processOutput, getBufferLines, seedLastOutput } = params;
   const getBufferLinesRef = useRef(getBufferLines);
   useEffect(() => {
     getBufferLinesRef.current = getBufferLines;
@@ -109,6 +117,22 @@ export function useSessionStateTracking(
     }, 2000);
     return () => clearInterval(interval);
   }, []); // Stable interval — reads tabs via ref
+
+  // ── Seed pre-aged lastOutput for synthetic (test-fixture) tabs ────────────
+  //
+  // Apply each seed ONLY when the tab has no recorded output yet so a real
+  // recording is never clobbered. The seeded (past) timestamp lets the 60s
+  // staleness sweep above mark a synthetic "idle" tab stale on its next tick.
+  // The dead-tab cleanup effect below removes vanished tabs' ref entries, so
+  // no extra cleanup is needed here.
+  useEffect(() => {
+    if (!seedLastOutput) return;
+    for (const [tabId, ts] of Object.entries(seedLastOutput)) {
+      if (lastOutputTimeRef.current[tabId] === undefined) {
+        lastOutputTimeRef.current[tabId] = ts;
+      }
+    }
+  }, [seedLastOutput]);
 
   // ── Clean up state for removed tabs ──────────────────────────────────────
 
