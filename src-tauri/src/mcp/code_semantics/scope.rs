@@ -1,10 +1,13 @@
 //! Scope resolution for the code-semantics observer.
 //!
-//! A "scope" is a (repo, language) selector. v1 supports a single default TS
-//! scope (the runner's own frontend project), but the code is structured for a
-//! registry: given a file path, resolve the nearest enclosing `tsconfig.json`
-//! and use its directory as the scope key.
+//! A "scope" is a (repo, language) selector. The TS `Ξ_Type` language service
+//! uses the tsconfig-anchored default scope (the runner's own frontend project).
+//! The multi-language `Ξ_AST` code-graph surface additionally resolves a scope
+//! to ANY sibling repo checkout via [`repo_dir`] (a repo→dir registry), so
+//! `coord_diff_impact` / `coord_change_conflict` can answer for coord (Rust),
+//! web (Python), etc. — not only the runner's TS frontend.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A resolved scope: the language and the project root (tsconfig path).
@@ -44,6 +47,94 @@ pub fn default_ts_scope() -> Option<Scope> {
     } else {
         None
     }
+}
+
+/// The workspace root holding the sibling repo checkouts. Resolution order:
+///   1. env `QONTINUI_WORKSPACE_ROOT` (explicit, for non-standard layouts /
+///      deployed binaries),
+///   2. the runner checkout's grandparent (`CARGO_MANIFEST_DIR/../..` — the dir
+///      that contains `qontinui-runner` and its sibling repos, the dev layout).
+pub fn workspace_root() -> Option<PathBuf> {
+    if let Ok(r) = std::env::var("QONTINUI_WORKSPACE_ROOT") {
+        let p = PathBuf::from(r);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent() // qontinui-runner
+        .and_then(Path::parent) // workspace root (contains the sibling repos)
+        .map(Path::to_path_buf)
+}
+
+/// Explicit `repo-name → dir` overrides parsed from `QONTINUI_CODE_GRAPH_ROOTS`
+/// (`name=dir,name=dir,…`). Takes precedence over the sibling convention so a
+/// non-standard checkout layout can still be mapped.
+fn registry_overrides() -> HashMap<String, PathBuf> {
+    let mut map = HashMap::new();
+    if let Ok(raw) = std::env::var("QONTINUI_CODE_GRAPH_ROOTS") {
+        for entry in raw.split(',') {
+            if let Some((name, dir)) = entry.split_once('=') {
+                let (name, dir) = (name.trim(), dir.trim());
+                if !name.is_empty() && !dir.is_empty() {
+                    map.insert(name.to_string(), PathBuf::from(dir));
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Resolve a repo selector to a local checkout directory for the multi-language
+/// `Ξ_AST` code graph. Accepts a bare repo name (`qontinui-coord`, `coord`) or an
+/// `owner/name` slug (`qontinui/qontinui-coord`). Resolution: the
+/// `QONTINUI_CODE_GRAPH_ROOTS` override, then `<workspace_root>/<name>`, then
+/// `<workspace_root>/qontinui-<name>`. Returns `None` for an unknown repo or any
+/// path-like selector (so the caller resolves real paths as directories and an
+/// unknown selector falls back to the default scope — never an error).
+pub fn repo_dir(selector: &str) -> Option<PathBuf> {
+    repo_dir_with(selector, &registry_overrides(), workspace_root().as_deref())
+}
+
+/// Pure core of [`repo_dir`] (the overrides + workspace root are injected so the
+/// resolution rules are unit-testable against a temp layout, no env / no real
+/// sibling checkouts).
+fn repo_dir_with(
+    selector: &str,
+    overrides: &HashMap<String, PathBuf>,
+    root: Option<&Path>,
+) -> Option<PathBuf> {
+    let sel = selector.trim();
+    // Reject path-like selectors — those are resolved as directories by the
+    // caller, not as repo names. (`:` rejects Windows drive paths like `D:/…`.)
+    if sel.is_empty()
+        || sel.starts_with('.')
+        || sel.starts_with('/')
+        || sel.contains('\\')
+        || sel.contains(':')
+    {
+        return None;
+    }
+    // Accept an `owner/name` slug by taking the trailing name component.
+    let name = sel.rsplit('/').next().unwrap_or(sel);
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(dir) = overrides.get(name) {
+        if dir.is_dir() {
+            return Some(dir.clone());
+        }
+    }
+    let root = root?;
+    let direct = root.join(name);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    let prefixed = root.join(format!("qontinui-{name}"));
+    if prefixed.is_dir() {
+        return Some(prefixed);
+    }
+    None
 }
 
 /// Resolve a scope from an optional explicit `scope` selector and/or a file
@@ -134,5 +225,66 @@ mod tests {
     fn default_ts_scope_exists() {
         // The runner frontend has a tsconfig.json.
         assert!(default_ts_scope().is_some());
+    }
+
+    #[test]
+    fn repo_dir_rejects_path_like_selectors() {
+        let empty = HashMap::new();
+        let root = std::env::temp_dir();
+        for sel in [
+            "",
+            "D:/qontinui-root/qontinui-coord", // Windows drive path
+            "/abs/path",
+            "./rel",
+            "a\\b",
+            "C:\\x",
+        ] {
+            assert_eq!(
+                repo_dir_with(sel, &empty, Some(&root)),
+                None,
+                "should reject path-like selector {sel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_dir_resolves_name_slug_prefix_and_override() {
+        // A temp workspace: a `qontinui-coord` sibling + a `qontinui-web` override
+        // pointing at a non-conventional dir.
+        let base = std::env::temp_dir().join("qontinui_xrepo_scope_test");
+        let coord = base.join("qontinui-coord");
+        std::fs::create_dir_all(&coord).unwrap();
+        let web = base.join("custom-web-dir");
+        std::fs::create_dir_all(&web).unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert("qontinui-web".to_string(), web.clone());
+
+        // bare exact name → <root>/qontinui-coord
+        assert_eq!(
+            repo_dir_with("qontinui-coord", &overrides, Some(&base)).as_deref(),
+            Some(coord.as_path())
+        );
+        // short name → <root>/qontinui-<name> (prefix convention)
+        assert_eq!(
+            repo_dir_with("coord", &overrides, Some(&base)).as_deref(),
+            Some(coord.as_path())
+        );
+        // owner/name slug → trailing component
+        assert_eq!(
+            repo_dir_with("qontinui/qontinui-coord", &overrides, Some(&base)).as_deref(),
+            Some(coord.as_path())
+        );
+        // override beats the sibling convention
+        assert_eq!(
+            repo_dir_with("qontinui-web", &overrides, Some(&base)).as_deref(),
+            Some(web.as_path())
+        );
+        // unknown repo → None (honest miss; caller falls back to default scope)
+        assert_eq!(
+            repo_dir_with("definitely-absent-repo", &overrides, Some(&base)),
+            None
+        );
+        // no workspace root + no override → None
+        assert_eq!(repo_dir_with("coord", &HashMap::new(), None), None);
     }
 }
