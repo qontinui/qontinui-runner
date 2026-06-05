@@ -32,13 +32,45 @@
 //! env `QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS`). Best-effort: a failing
 //! tick `warn!`s and retries; the loop never panics.
 //!
-//! ## Arming
+//! ## Arming (per-action, fail-safe)
 //!
-//! coord ships `dry_run = true` by default — every instruction is LOGGED
-//! ("would do X") and nothing destructive happens. The operator flips
-//! `COORD_WORKTREE_RECLAIM_ENABLED` server-side to set `dry_run = false`,
-//! which arms execution. Defense in depth: even when armed, the runner
-//! NEVER acts on an `is_dirty` worktree (coord also filters these).
+//! Arming is **per-action**, so the recoverable `rejunction` path can
+//! graduate to default-on while destructive `remove` stays behind the
+//! hardest gate (Phase 6.4 / Q1). coord ships two booleans in the pull:
+//! `rejunction_armed` and `remove_armed`. Both default `false` runner-side
+//! (`#[serde(default)]`), so a missing field — or an older coord that only
+//! sends `dry_run` — fails SAFE: the action is advisory-only and every
+//! instruction is merely LOGGED ("would do X"), nothing destructive
+//! happens. This is exactly the posture the single `dry_run=true` default
+//! used to give, now split per action.
+//!
+//! * `remove_armed`     ← coord's `COORD_WORKTREE_RECLAIM_ENABLED`.
+//! * `rejunction_armed` ← graduates to default-on server-side once G6 is
+//!   proven (rejunction never touches source, so it's recoverable).
+//!
+//! Defense in depth: even when armed, the runner NEVER acts on an
+//! `is_dirty` worktree (coord also filters these), and G6 (below) SKIPS any
+//! worktree that is currently building.
+//!
+//! ## G6 — in-flight-build guard (runner-only)
+//!
+//! Before executing ANY instruction's steps for a worktree, the runner
+//! checks whether that worktree is currently being built and SKIPS it this
+//! tick if so (logged at info with reason `building`). Two conservative
+//! signals, either of which trips the guard:
+//!
+//!   (a) **cargo lock probe** — for each profile dir under the worktree's
+//!       `target/` (`target/debug`, `target/release`, and `target/*/` one
+//!       level deep), if a `.cargo-lock` file is present we try to open it
+//!       with write share-mode. While `cargo` holds the build, that open
+//!       fails with a sharing violation on Windows → building.
+//!   (b) **recent-activity window** — if the mtime of any sink top-level
+//!       (`target/`, `node_modules/`) or the worktree root is younger than
+//!       `QONTINUI_WORKTREE_RECLAIM_ACTIVITY_WINDOW_SECS` (default 600s),
+//!       the tree was just touched → treat as active.
+//!
+//! Conservative on error: a missing path is fine (not building); an
+//! unexpected IO error is treated AS building (skip, retry next tick).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -53,26 +85,35 @@ use super::census::is_junction;
 /// Override via `QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS`.
 const DEFAULT_RECLAIM_INTERVAL_SECS: u64 = 300;
 
+/// Default G6 "recently active" window — 600s. A worktree whose `target/`,
+/// `node_modules/`, or root was touched within this window is treated as
+/// actively building and skipped. Override via
+/// `QONTINUI_WORKTREE_RECLAIM_ACTIVITY_WINDOW_SECS`.
+const DEFAULT_ACTIVITY_WINDOW_SECS: u64 = 600;
+
 // ---------------------------------------------------------------------------
 // Wire types — coord serializes these.
 // ---------------------------------------------------------------------------
 
 /// The pull-endpoint body: `GET {coord}/coord/worktree-reclaim/{device_id}`.
+///
+/// Per-action arming (Q1): `remove` and `rejunction` are armed
+/// independently. BOTH flags default `false` (`#[serde(default)]`), so a
+/// missing field — or an older coord that only sends the legacy `dry_run` —
+/// fails SAFE: the action is advisory-only (logged "would do X"), never
+/// destructive. This replaces the single global `dry_run` bool.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReclaimPull {
-    /// When `true` (coord's default), every instruction is LOGGED but no
-    /// destructive action runs. The operator arms execution server-side
-    /// via `COORD_WORKTREE_RECLAIM_ENABLED`.
-    #[serde(default = "default_dry_run")]
-    pub dry_run: bool,
+    /// Arms the non-destructive `rejunction` action. Defaults `false`
+    /// (fail-safe). coord graduates this to default-on once G6 is proven.
+    #[serde(default)]
+    pub rejunction_armed: bool,
+    /// Arms the destructive `remove` action. Defaults `false` (fail-safe).
+    /// coord drives this from `COORD_WORKTREE_RECLAIM_ENABLED`.
+    #[serde(default)]
+    pub remove_armed: bool,
     #[serde(default)]
     pub instructions: Vec<ReclaimInstruction>,
-}
-
-/// `dry_run` defaults to `true` so a missing/older-coord field fails
-/// SAFE — never destructive.
-fn default_dry_run() -> bool {
-    true
 }
 
 /// What coord wants done to one worktree.
@@ -148,14 +189,20 @@ pub enum ReclaimStep {
 /// execution time, where we have the real disk). This is the function the
 /// unit tests pin: it guarantees junction-unlinks come before the
 /// worktree removal, that a dirty instruction yields only a `Skip`, and
-/// that a dry-run yields only `Skip`s.
+/// that an UNARMED action yields only `Skip`s.
+///
+/// Arming is per-action (Q1): a `Remove` is destructive only when
+/// `remove_armed`; a `Rejunction` creates junctions only when
+/// `rejunction_armed`. An unarmed action logs "would do X" exactly like the
+/// old global dry-run path.
 ///
 /// `canonical_path` is the repo's canonical checkout — the junction target
 /// root for a `rejunction`. `None` when the runner couldn't resolve it
 /// (then a rejunction degrades to a `Skip`).
 pub fn plan_reclaim(
     instr: &ReclaimInstruction,
-    dry_run: bool,
+    rejunction_armed: bool,
+    remove_armed: bool,
     canonical_path: Option<&Path>,
 ) -> Vec<ReclaimStep> {
     // Defense in depth #1 — NEVER act on a dirty worktree.
@@ -165,11 +212,18 @@ pub fn plan_reclaim(
             instr.worktree_path
         ))];
     }
-    // Defense in depth #2 — a dry-run does nothing destructive. We still
-    // emit a Skip per instruction so the caller logs "would do X".
-    if dry_run {
+
+    // Per-action arming — an unarmed action is advisory-only. We still emit
+    // a Skip so the caller logs "would do X".
+    let armed = match &instr.action {
+        ReclaimAction::Remove => remove_armed,
+        ReclaimAction::Rejunction => rejunction_armed,
+        // Unknown actions are never "armed" — they always no-op below.
+        ReclaimAction::Unknown(_) => true,
+    };
+    if !armed {
         return vec![ReclaimStep::Skip(format!(
-            "dry_run: would {:?} worktree {} (reason={})",
+            "unarmed: would {:?} worktree {} (reason={})",
             instr.action, instr.worktree_path, instr.reason
         ))];
     }
@@ -394,6 +448,101 @@ fn worktree_is_dirty(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// G6 — in-flight-build guard (runner-only). Pure-ish + injectable for tests.
+// ---------------------------------------------------------------------------
+
+/// Resolve the G6 activity window (seconds) from the env, default 600s.
+fn activity_window_secs() -> u64 {
+    std::env::var("QONTINUI_WORKTREE_RECLAIM_ACTIVITY_WINDOW_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_ACTIVITY_WINDOW_SECS)
+}
+
+/// True iff `path` exists and its mtime is younger than `window`.
+/// A missing path → `false` (not active). An unreadable mtime is treated
+/// conservatively as active (`true`) — we'd rather skip than reclaim a tree
+/// we can't reason about.
+fn path_recently_touched(path: &Path, window: Duration) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        // Missing path is fine — nothing to be active.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        // Any other IO error → conservative: treat as active.
+        Err(_) => return true,
+    };
+    match meta.modified() {
+        Ok(mtime) => match mtime.elapsed() {
+            // Younger than the window → recently touched.
+            Ok(elapsed) => elapsed < window,
+            // mtime in the future (clock skew) → treat as recently touched.
+            Err(_) => true,
+        },
+        // Unreadable mtime → conservative: active.
+        Err(_) => true,
+    }
+}
+
+/// True iff a `.cargo-lock` under any profile dir of `target_dir` cannot be
+/// opened with write share-mode — i.e. a live `cargo` invocation holds it.
+///
+/// We probe `target/debug`, `target/release`, and every `target/*/`
+/// directory one level deep (covers custom profiles + per-triple dirs). A
+/// `.cargo-lock` that opens cleanly (or is absent) → not building; a
+/// sharing/permission failure → building.
+fn cargo_lock_held(target_dir: &Path) -> bool {
+    // Collect candidate profile dirs: the two well-known ones plus any
+    // first-level subdir of `target/`.
+    let mut profile_dirs: Vec<PathBuf> = vec![target_dir.join("debug"), target_dir.join("release")];
+    if let Ok(entries) = std::fs::read_dir(target_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                profile_dirs.push(p);
+            }
+        }
+    }
+
+    for dir in profile_dirs {
+        let lock = dir.join(".cargo-lock");
+        match std::fs::symlink_metadata(&lock) {
+            // No lock file here — this profile isn't building.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Can't even stat it (other error) → conservative: building.
+            Err(_) => return true,
+            Ok(_) => {}
+        }
+        // Lock present — try an exclusive-ish open. On Windows, while cargo
+        // holds it, opening with write access fails with a sharing
+        // violation (PermissionDenied). A clean open → cargo is NOT holding
+        // it (stale lock from a crashed build).
+        match std::fs::OpenOptions::new().write(true).open(&lock) {
+            Ok(_) => continue, // openable → not held → not building (this dir)
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true, // sharing/permission failure → building
+        }
+    }
+    false
+}
+
+/// G6: is this worktree currently being built? Either signal → skip.
+/// Injectable (takes the worktree root) so tests drive it with tempdirs.
+///
+///   (a) a held `.cargo-lock` under `<worktree>/target/`, or
+///   (b) `target/`, `node_modules/`, or the worktree root touched within
+///       `window`.
+fn worktree_is_building(worktree: &Path, window: Duration) -> bool {
+    let target = worktree.join("target");
+    if cargo_lock_held(&target) {
+        return true;
+    }
+    // Recent-activity window across the sink top-levels + the root.
+    path_recently_touched(&target, window)
+        || path_recently_touched(&worktree.join("node_modules"), window)
+        || path_recently_touched(worktree, window)
+}
+
 /// Execute all instructions in one pull.
 fn execute_pull(pull: &ReclaimPull) {
     if pull.instructions.is_empty() {
@@ -401,30 +550,53 @@ fn execute_pull(pull: &ReclaimPull) {
         return;
     }
     info!(
-        "worktree_reclaim: {} instruction(s), dry_run={}",
+        "worktree_reclaim: {} instruction(s), rejunction_armed={} remove_armed={}",
         pull.instructions.len(),
-        pull.dry_run
+        pull.rejunction_armed,
+        pull.remove_armed
     );
+    let window = Duration::from_secs(activity_window_secs());
     for instr in &pull.instructions {
-        // Execution-time re-check: even if coord said clean, refuse a
-        // worktree that's dirty right now.
         let wt = PathBuf::from(&instr.worktree_path);
-        let dirty_now = !pull.dry_run && instr.action == ReclaimAction::Remove && {
-            let d = worktree_is_dirty(&wt);
-            if d {
+
+        // Whether THIS instruction's action is armed (would actually do
+        // something destructive/mutating this tick). Skip the execution-time
+        // guards entirely for an unarmed (advisory) instruction so the
+        // "would do X" Skip still logs.
+        let armed = match &instr.action {
+            ReclaimAction::Remove => pull.remove_armed,
+            ReclaimAction::Rejunction => pull.rejunction_armed,
+            ReclaimAction::Unknown(_) => false,
+        };
+
+        if armed {
+            // G6 — never act on a worktree that is currently building.
+            if worktree_is_building(&wt, window) {
+                info!(
+                    "worktree_reclaim: {} building — skipping (reason=building)",
+                    instr.worktree_path
+                );
+                continue;
+            }
+
+            // Execution-time re-check: even if coord said clean, refuse a
+            // worktree that's dirty right now (only relevant for Remove).
+            if instr.action == ReclaimAction::Remove && worktree_is_dirty(&wt) {
                 warn!(
                     "worktree_reclaim: {} dirty at execution time — skipping remove (INV defense)",
                     instr.worktree_path
                 );
+                continue;
             }
-            d
-        };
-        if dirty_now {
-            continue;
         }
 
         let canonical = super::canonical_paths::default_canonical_path(&instr.repo).ok();
-        let steps = plan_reclaim(instr, pull.dry_run, canonical.as_deref());
+        let steps = plan_reclaim(
+            instr,
+            pull.rejunction_armed,
+            pull.remove_armed,
+            canonical.as_deref(),
+        );
         for step in &steps {
             if let Err(e) = execute_step(step) {
                 warn!("worktree_reclaim: step {step:?} failed: {e}");
@@ -552,7 +724,8 @@ mod tests {
     #[test]
     fn remove_unlinks_every_junction_before_removing_worktree() {
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
-        let steps = plan_reclaim(&i, false, None);
+        // remove_armed=true.
+        let steps = plan_reclaim(&i, false, true, None);
 
         // Exactly: UnlinkJunction(target), UnlinkJunction(node_modules),
         // RemoveWorktree(path) — junctions first, in order.
@@ -581,7 +754,7 @@ mod tests {
             &["a", "b", "c", "node_modules", "target"],
             false,
         );
-        let steps = plan_reclaim(&i, false, None);
+        let steps = plan_reclaim(&i, false, true, None);
         let remove_idx = steps
             .iter()
             .position(|s| matches!(s, ReclaimStep::RemoveWorktree(_)))
@@ -601,7 +774,7 @@ mod tests {
     #[test]
     fn remove_with_no_junctions_is_just_a_removal() {
         let i = instr(ReclaimAction::Remove, &[], false);
-        let steps = plan_reclaim(&i, false, None);
+        let steps = plan_reclaim(&i, false, true, None);
         assert_eq!(
             steps,
             vec![ReclaimStep::RemoveWorktree(PathBuf::from(
@@ -613,7 +786,8 @@ mod tests {
     #[test]
     fn dirty_instruction_yields_no_destructive_steps() {
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], true);
-        let steps = plan_reclaim(&i, false, None);
+        // Even fully armed, a dirty worktree yields only a Skip.
+        let steps = plan_reclaim(&i, true, true, None);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
         // No unlink / remove / create anywhere.
@@ -626,9 +800,12 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_yields_no_destructive_steps() {
+    fn unarmed_remove_yields_no_destructive_steps() {
+        // remove_armed=false → advisory-only Skip even though it's clean.
         let i = instr(ReclaimAction::Remove, &["target", "node_modules"], false);
-        let steps = plan_reclaim(&i, /* dry_run */ true, None);
+        let steps = plan_reclaim(
+            &i, /* rejunction */ false, /* remove */ false, None,
+        );
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
         assert!(!steps.iter().any(|s| matches!(
@@ -640,12 +817,60 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_skips_even_a_rejunction() {
+    fn unarmed_rejunction_skips_even_with_canonical() {
+        // rejunction_armed=false → advisory-only Skip.
         let i = instr(ReclaimAction::Rejunction, &["target"], false);
         let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-        let steps = plan_reclaim(&i, true, Some(&canonical));
+        let steps = plan_reclaim(&i, false, false, Some(&canonical));
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
+    }
+
+    #[test]
+    fn rejunction_armed_but_remove_unarmed_skips_removes() {
+        // The graduated state: rejunction default-on, remove still gated.
+        // A Remove instruction is advisory-only...
+        let rm = instr(ReclaimAction::Remove, &["target"], false);
+        let steps = plan_reclaim(
+            &rm, /* rejunction */ true, /* remove */ false, None,
+        );
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(steps[0], ReclaimStep::Skip(_)));
+        assert!(!steps.iter().any(|s| matches!(
+            s,
+            ReclaimStep::UnlinkJunction(_) | ReclaimStep::RemoveWorktree(_)
+        )));
+
+        // ...while a Rejunction in the SAME tick actually executes.
+        let rj = instr(ReclaimAction::Rejunction, &["target"], false);
+        let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
+        let rj_steps = plan_reclaim(&rj, true, false, Some(&canonical));
+        assert_eq!(
+            rj_steps,
+            vec![ReclaimStep::CreateJunction {
+                link: PathBuf::from("D:/qontinui-root/qontinui-runner-wt-foo/target"),
+                target: PathBuf::from("D:/qontinui-root/qontinui-runner/target"),
+            }]
+        );
+    }
+
+    #[test]
+    fn both_unarmed_yields_nothing_destructive() {
+        // Defaults-absent equivalent: neither action armed → only Skips,
+        // nothing destructive, for either action kind.
+        for action in [ReclaimAction::Remove, ReclaimAction::Rejunction] {
+            let i = instr(action, &["target", "node_modules"], false);
+            let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
+            let steps = plan_reclaim(&i, false, false, Some(&canonical));
+            assert_eq!(steps.len(), 1);
+            assert!(matches!(steps[0], ReclaimStep::Skip(_)));
+            assert!(!steps.iter().any(|s| matches!(
+                s,
+                ReclaimStep::UnlinkJunction(_)
+                    | ReclaimStep::RemoveWorktree(_)
+                    | ReclaimStep::CreateJunction { .. }
+            )));
+        }
     }
 
     #[test]
@@ -656,7 +881,8 @@ mod tests {
             false,
         );
         let canonical = PathBuf::from("D:/qontinui-root/qontinui-runner");
-        let steps = plan_reclaim(&i, false, Some(&canonical));
+        // rejunction_armed=true.
+        let steps = plan_reclaim(&i, true, false, Some(&canonical));
         assert_eq!(
             steps,
             vec![
@@ -675,7 +901,8 @@ mod tests {
     #[test]
     fn rejunction_without_canonical_path_skips() {
         let i = instr(ReclaimAction::Rejunction, &["target"], false);
-        let steps = plan_reclaim(&i, false, None);
+        // Armed, but no canonical path → degrades to Skip.
+        let steps = plan_reclaim(&i, true, false, None);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
     }
@@ -687,7 +914,8 @@ mod tests {
             &["target"],
             false,
         );
-        let steps = plan_reclaim(&i, false, None);
+        // Even with both flags armed, an unknown action is a no-op Skip.
+        let steps = plan_reclaim(&i, true, true, None);
         assert_eq!(steps.len(), 1);
         assert!(matches!(steps[0], ReclaimStep::Skip(_)));
     }
@@ -740,17 +968,30 @@ mod tests {
     }
 
     #[test]
-    fn pull_dry_run_defaults_true_when_absent() {
-        // A pull body missing `dry_run` must fail SAFE (dry_run=true).
+    fn pull_arming_defaults_off_when_absent() {
+        // A pull body missing both arming flags must fail SAFE: neither
+        // action armed (advisory-only). Also covers an OLD coord that only
+        // ships the legacy `dry_run` field — unknown fields are ignored and
+        // arming stays off.
         let j = r#"{"instructions":[]}"#;
         let p: ReclaimPull = serde_json::from_str(j).unwrap();
-        assert!(p.dry_run, "missing dry_run must default to true (safe)");
+        assert!(
+            !p.rejunction_armed,
+            "missing rejunction_armed → false (safe)"
+        );
+        assert!(!p.remove_armed, "missing remove_armed → false (safe)");
+
+        let legacy = r#"{"dry_run": false, "instructions": []}"#;
+        let lp: ReclaimPull = serde_json::from_str(legacy).unwrap();
+        assert!(!lp.rejunction_armed, "old-coord dry_run ignored → unarmed");
+        assert!(!lp.remove_armed, "old-coord dry_run ignored → unarmed");
     }
 
     #[test]
     fn pull_parses_full_shape() {
         let j = r#"{
-            "dry_run": false,
+            "rejunction_armed": true,
+            "remove_armed": false,
             "instructions": [
                 {
                     "worktree_path": "D:/qontinui-root/qontinui-runner-wt-x",
@@ -763,12 +1004,94 @@ mod tests {
             ]
         }"#;
         let p: ReclaimPull = serde_json::from_str(j).unwrap();
-        assert!(!p.dry_run);
+        assert!(p.rejunction_armed);
+        assert!(!p.remove_armed);
         assert_eq!(p.instructions.len(), 1);
         assert_eq!(p.instructions[0].action, ReclaimAction::Remove);
         assert_eq!(
             p.instructions[0].junctioned_paths,
             vec!["target".to_string(), "node_modules".to_string()]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // G6 — in-flight-build guard.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn g6_missing_paths_are_not_building() {
+        // A worktree dir that doesn't exist (no target, no node_modules,
+        // root absent) → not building.
+        let dir = tempfile::tempdir().unwrap();
+        let ghost = dir.path().join("does-not-exist");
+        assert!(!worktree_is_building(&ghost, Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn g6_recent_root_mtime_is_building() {
+        // A freshly-created worktree root (mtime = now) is within any
+        // reasonable window → active.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            worktree_is_building(dir.path(), Duration::from_secs(600)),
+            "a just-touched root must read as building"
+        );
+    }
+
+    #[test]
+    fn g6_old_tree_with_no_lock_is_not_building() {
+        // Zero-length window makes "recent" impossible; with no .cargo-lock
+        // the tree reads as not building.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        assert!(
+            !worktree_is_building(dir.path(), Duration::from_secs(0)),
+            "no lock + window 0 → not building"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn g6_held_cargo_lock_is_building() {
+        // Simulate cargo holding the lock: open the .cargo-lock with a
+        // share mode that denies write (FILE_SHARE_READ only), mirroring
+        // cargo's exclusive build lock, then probe.
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+
+        let dir = tempfile::tempdir().unwrap();
+        let debug = dir.path().join("target").join("debug");
+        std::fs::create_dir_all(&debug).unwrap();
+        let lock = debug.join(".cargo-lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        // Hold it open with write-denied sharing.
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&lock)
+            .unwrap();
+
+        // Window 0 isolates the lock signal from the mtime signal.
+        assert!(
+            worktree_is_building(dir.path(), Duration::from_secs(0)),
+            "a held .cargo-lock must read as building"
+        );
+        drop(_held);
+        // Once released, the lock opens cleanly → not building (window 0).
+        assert!(!worktree_is_building(dir.path(), Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn g6_unheld_cargo_lock_is_not_building() {
+        // A present-but-unheld .cargo-lock (crashed build) + window 0 →
+        // not building (openable).
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("target").join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::write(release.join(".cargo-lock"), b"").unwrap();
+        assert!(!worktree_is_building(dir.path(), Duration::from_secs(0)));
     }
 }

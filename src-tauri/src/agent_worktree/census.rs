@@ -117,6 +117,23 @@ pub struct WorktreeCensus {
     /// Sum of the non-junction real bytes attributable to this worktree
     /// (`nm_bytes + target_bytes`). A junctioned dir contributes 0.
     pub attributable_bytes: u64,
+
+    /// G2 "work landed" — whether this worktree's HEAD is already
+    /// represented on `origin/main`, computed cheaply from local git only:
+    ///
+    /// * `Some(true)`  — HEAD is an ancestor of `origin/main` (true merge /
+    ///   fast-forward), OR every commit unique to HEAD has a patch-id
+    ///   equivalent already on `origin/main` (rebase / cherry-pick).
+    /// * `Some(false)` — HEAD has commits not represented on `origin/main`.
+    /// * `None`        — couldn't determine (no `origin/main` ref, detached
+    ///   oddity, git failure). Coord's gate treats `None` as NOT landed.
+    ///
+    /// **Squash merges are NOT detectable here** — a squash rewrites the
+    /// commits into a single new commit with a fresh patch-id, so neither
+    /// the ancestry nor the `git cherry` patch-id test sees it. Coord
+    /// covers squashes independently via the PR `close_cause='merged'`
+    /// signal; this field is only the ancestry/patch-id half of G2.
+    pub landed_in_main: Option<bool>,
 }
 
 /// Full census body POSTed to coord.
@@ -470,6 +487,75 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
+/// Compute G2 `landed_in_main` for a worktree using local git only.
+///
+/// 1. `git merge-base --is-ancestor HEAD origin/main` exit 0 → `Some(true)`
+///    (HEAD is on origin/main via a true merge / fast-forward).
+/// 2. Else `git cherry origin/main HEAD`: if it emits ≥1 line and EVERY
+///    line starts with `-`, every HEAD-unique commit has a patch-id
+///    equivalent already on origin/main (rebase / cherry-pick) → `Some(true)`.
+/// 3. Else `Some(false)` — there is genuinely-unlanded work.
+/// 4. Any git failure / missing `origin/main` / detached oddity → `None`
+///    (honest unknown; coord's gate treats `None` as not-landed).
+///
+/// Squash merges are deliberately NOT covered (the patch-id changes) —
+/// coord handles those via the PR `close_cause='merged'` signal.
+fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
+    // Require a resolvable origin/main ref; without it we can't answer.
+    git_capture(
+        worktree,
+        &["rev-parse", "--verify", "--quiet", "origin/main"],
+    )?;
+
+    let wt = worktree.to_str()?;
+
+    // (1) Ancestry test — exit 0 means HEAD is an ancestor of origin/main.
+    if let Ok(status) = Command::new("git")
+        .args([
+            "-C",
+            wt,
+            "merge-base",
+            "--is-ancestor",
+            "HEAD",
+            "origin/main",
+        ])
+        .status()
+    {
+        if status.success() {
+            return Some(true);
+        }
+    } else {
+        // git itself failed to spawn / run — honest unknown.
+        return None;
+    }
+
+    // (2) Patch-id test via `git cherry`. Lines starting `-` are commits
+    // whose patch-id already exists on the upstream; `+` lines are
+    // genuinely-unlanded. ALL lines must be `-` (and there must be ≥1).
+    let cherry = git_capture(worktree, &["cherry", "origin/main", "HEAD"])?;
+    let mut saw_line = false;
+    for line in cherry.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        saw_line = true;
+        if !line.starts_with('-') {
+            // A `+` (unlanded) line → not fully landed.
+            return Some(false);
+        }
+    }
+    if saw_line {
+        // Every line was `-` → all HEAD-unique commits already upstream.
+        return Some(true);
+    }
+
+    // (3) No cherry lines + not an ancestor: HEAD == origin/main tip would
+    // have been caught by the ancestry test, so this is the no-info case —
+    // treat as not landed (there is nothing showing it landed).
+    Some(false)
+}
+
 /// Build the census row for a single worktree dir.
 fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     let branch =
@@ -495,6 +581,10 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
 
     let attributable_bytes = nm_bytes.saturating_add(target_bytes);
 
+    // G2: ancestry/patch-id "landed in origin/main" — local git only,
+    // None when undeterminable (no origin/main, git failure).
+    let landed_in_main = compute_landed_in_main(worktree);
+
     WorktreeCensus {
         repo: repo.to_string(),
         path: worktree.to_string_lossy().to_string(),
@@ -510,6 +600,7 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         target_bytes,
         last_access_mtime,
         attributable_bytes,
+        landed_in_main,
     }
 }
 
@@ -799,6 +890,65 @@ mod tests {
         assert!(!row.target_present);
         assert_eq!(row.attributable_bytes, 0);
         assert!(row.last_access_mtime.is_some(), "dir mtime should read");
+        // No git repo → no origin/main ref → landed_in_main is the honest
+        // unknown `None` (which coord's gate reads as not-landed).
+        assert!(row.landed_in_main.is_none());
+    }
+
+    #[test]
+    fn landed_in_main_is_none_without_origin_main() {
+        // A real git repo but no `origin/main` ref → undeterminable → None.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args([&["-C", path.to_str().unwrap()], args].concat())
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} should succeed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), b"x").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-q", "-m", "c1"]);
+        // No origin/main ref exists → compute returns None.
+        assert!(compute_landed_in_main(path).is_none());
+    }
+
+    #[test]
+    fn landed_in_main_true_when_head_is_ancestor_of_origin_main() {
+        // Build a repo, create an `origin/main` ref AT HEAD via a local
+        // bare "remote", then verify HEAD-is-ancestor → Some(true).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let wt = path.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args([&["-C", wt], args].concat())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), b"x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "c1"]);
+        // Point a local origin/main remote-tracking ref straight at HEAD.
+        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        git(&["update-ref", "refs/remotes/origin/main", &head]);
+        assert_eq!(compute_landed_in_main(path), Some(true));
+
+        // Add an unlanded commit on top → HEAD no longer ancestor and no
+        // patch-id match → Some(false).
+        std::fs::write(path.join("b.txt"), b"y").unwrap();
+        git(&["add", "b.txt"]);
+        git(&["commit", "-q", "-m", "c2"]);
+        assert_eq!(compute_landed_in_main(path), Some(false));
     }
 
     #[test]
