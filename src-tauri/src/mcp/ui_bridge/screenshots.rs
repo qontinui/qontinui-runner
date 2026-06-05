@@ -31,6 +31,8 @@ use axum::{
     response::Json,
 };
 use serde::Deserialize;
+#[cfg(windows)]
+use tracing::debug;
 use tracing::{error, info, warn};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -68,6 +70,12 @@ fn encode_image_to_base64(image: &image::DynamicImage) -> Result<String, String>
 /// Capture the runner's own window by cropping from a monitor screenshot.
 /// xcap skips same-process windows, so we capture the monitor and crop.
 ///
+/// Returns the cropped `RgbaImage` plus the monitor's `scale_factor`.
+/// This is the single source of truth for the monitor-crop fallback path:
+/// both `capture_runner_window` (base64 entry point here) and
+/// `vision_routes::capture_runner_window_frame` (RGBA → `Frame`) call it,
+/// so the two previously line-for-line-duplicated crop bodies are now one.
+///
 /// DPI handling:
 /// - Tauri `outer_position()` / `outer_size()` return physical pixels.
 /// - xcap `Monitor::x()` / `y()` return logical coordinates (dmPosition).
@@ -76,14 +84,16 @@ fn encode_image_to_base64(image: &image::DynamicImage) -> Result<String, String>
 ///
 /// To match monitors: convert Tauri physical position to logical using scale_factor.
 /// To crop the image: work in physical pixels (image coords = physical).
-fn capture_runner_window(
+///
+/// Runs the synchronous xcap call on the calling thread — callers must wrap in
+/// `tokio::task::spawn_blocking`.
+pub(super) fn capture_runner_window_crop(
     phys_x: i32,
     phys_y: i32,
     phys_w: u32,
     phys_h: u32,
     scale: f64,
-    _title: &str,
-) -> Result<CapturedRunnerWindow, String> {
+) -> Result<(image::RgbaImage, f64), String> {
     let mgr = screen::MonitorManager::detect()?;
 
     // Convert Tauri physical position to logical for monitor matching.
@@ -96,6 +106,7 @@ fn capture_runner_window(
     let monitor = mgr
         .at_logical_point(logical_center_x, logical_center_y)
         .ok_or_else(|| "Runner window not on any monitor".to_string())?;
+    let monitor_scale = monitor.scale_factor;
 
     let captured = screen::CapturedScreenshot::from_monitor(&mgr, monitor.index)?;
 
@@ -133,14 +144,188 @@ fn capture_runner_window(
     }
 
     let cropped = captured.image.crop_imm(crop_x, crop_y, crop_w, crop_h);
-    let b64 = encode_image_to_base64(&cropped)?;
-    let _ = scale;
+    Ok((cropped.to_rgba8(), monitor_scale))
+}
+
+/// Monitor-crop capture returning a base64 PNG + dims (the legacy fallback
+/// shape for `capture_runner_window_base64`). Thin wrapper over the shared
+/// [`capture_runner_window_crop`].
+fn capture_runner_window(
+    phys_x: i32,
+    phys_y: i32,
+    phys_w: u32,
+    phys_h: u32,
+    scale: f64,
+    _title: &str,
+) -> Result<CapturedRunnerWindow, String> {
+    let (rgba, _monitor_scale) =
+        capture_runner_window_crop(phys_x, phys_y, phys_w, phys_h, scale)?;
+    let width = rgba.width() as i32;
+    let height = rgba.height() as i32;
+    let b64 = encode_image_to_base64(&image::DynamicImage::ImageRgba8(rgba))?;
 
     Ok(CapturedRunnerWindow {
         screenshot: b64,
-        width: crop_w as i32,
-        height: crop_h as i32,
+        width,
+        height,
     })
+}
+
+/// Occlusion-immune capture of the runner's WebView2 composition surface via
+/// `ICoreWebView2::CapturePreview`. Unlike the monitor-crop fallback (which
+/// screenshots the physical screen and crops, so it captures whatever pixels
+/// are on top — an occluding window, the desktop if minimized, etc.),
+/// `CapturePreview` renders the webview's own composition surface regardless
+/// of z-order, focus, or occlusion.
+///
+/// Returns the PNG bytes. The work is scheduled onto the WebView2 UI thread
+/// via Tauri's `with_webview` (which returns immediately); the completion
+/// handler — also fired on the UI thread — reads the in-memory `IStream`
+/// and sends the bytes back over a `oneshot` channel that this async fn
+/// awaits with a 5s timeout. We never block the UI thread.
+#[cfg(windows)]
+pub(super) async fn capture_webview_contents(state: &Arc<ApiState>) -> Result<Vec<u8>, String> {
+    use tauri::Manager;
+
+    // webview2-com re-exports the WebView2 COM types as `Microsoft`; they are
+    // generated against `windows 0.61`, which is also what our renamed
+    // `windows-capture` dep (alias `win`) provides — so `IStream` /
+    // `SHCreateMemStream` here are the *same* types `CapturePreview` expects.
+    use webview2_com::CapturePreviewCompletedHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
+    use windows_capture::Win32::System::Com::IStream;
+    use windows_capture::Win32::UI::Shell::SHCreateMemStream;
+
+    let window = state
+        .app_handle
+        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .ok_or_else(|| "Runner window not found".to_string())?;
+
+    // Physical inner size — logged against the CapturePreview dims on first
+    // capture so hardware verification can confirm the surface-size contract.
+    let inner = window.inner_size().ok();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<u8>, String>>();
+
+    // `with_webview` schedules the closure on the UI thread and returns
+    // immediately; the closure runs there (so all COM calls below, and the
+    // CapturePreview completion handler, execute on the WebView2 UI thread).
+    window
+        .with_webview(move |wv| {
+            // SAFETY: every call in this block is a COM call into WebView2 /
+            // shlwapi. They run on the WebView2 UI thread (`with_webview`
+            // guarantees this), the COM objects are kept alive across the
+            // call by the surrounding scope, and the completion handler owns
+            // the only `oneshot::Sender`. `SHCreateMemStream(None)` allocates
+            // a fresh growable in-memory stream.
+            let result: Result<(), String> = (|| unsafe {
+                let controller = wv.controller();
+                let core = controller
+                    .CoreWebView2()
+                    .map_err(|e| format!("CoreWebView2(): {e}"))?;
+
+                let stream: IStream =
+                    SHCreateMemStream(None).ok_or_else(|| "SHCreateMemStream returned null".to_string())?;
+
+                // Move the stream into the completion handler so it stays
+                // alive until CapturePreview finishes writing, then read it.
+                let stream_for_handler = stream.clone();
+                let handler = CapturePreviewCompletedHandler::create(Box::new(
+                    // The handler receives the already-`.ok()`-converted result
+                    // (webview2-com's `ClosureArg for HRESULT` Output is
+                    // `windows::core::Result<()>`), not a raw HRESULT.
+                    move |hr_result: windows_capture::core::Result<()>| -> windows_capture::core::Result<()> {
+                        let payload = read_capture_stream(hr_result, &stream_for_handler);
+                        // Receiver may have timed out and dropped; ignore.
+                        let _ = tx.send(payload);
+                        Ok(())
+                    },
+                ));
+
+                core.CapturePreview(
+                    COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+                    &stream,
+                    &handler,
+                )
+                .map_err(|e| format!("CapturePreview: {e}"))?;
+                Ok(())
+            })();
+
+            if let Err(e) = result {
+                warn!("CapturePreview scheduling failed on UI thread: {}", e);
+                // tx was moved into the handler only on the success path; on
+                // the error path it is dropped here, which wakes the awaiter
+                // with a RecvError → falls back to monitor-crop.
+            }
+        })
+        .map_err(|e| format!("with_webview failed: {e}"))?;
+
+    // Await the UI-thread completion handler with a timeout so a wedged UI
+    // thread never hangs the caller — callers fall back to monitor-crop.
+    let bytes = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(payload)) => payload?,
+        Ok(Err(_recv)) => return Err("CapturePreview handler dropped sender".to_string()),
+        Err(_elapsed) => return Err("CapturePreview timed out after 5s".to_string()),
+    };
+
+    // Log CapturePreview dims vs physical inner_size on success so the
+    // hardware-verification step can confirm the surface-size contract.
+    if let Ok(img) = image::load_from_memory(&bytes) {
+        debug!(
+            "CapturePreview produced {}x{} PNG ({} bytes); window inner_size = {:?}",
+            img.width(),
+            img.height(),
+            bytes.len(),
+            inner.map(|s| (s.width, s.height))
+        );
+    }
+
+    Ok(bytes)
+}
+
+/// Drain a CapturePreview `IStream` into a `Vec<u8>`. Runs inside the
+/// CapturePreview completion handler on the WebView2 UI thread.
+#[cfg(windows)]
+fn read_capture_stream(
+    hr_result: windows_capture::core::Result<()>,
+    stream: &windows_capture::Win32::System::Com::IStream,
+) -> Result<Vec<u8>, String> {
+    use windows_capture::Win32::System::Com::{STATFLAG_NONAME, STATSTG, STREAM_SEEK_SET};
+
+    hr_result.map_err(|e| format!("CapturePreview HRESULT: {e}"))?;
+
+    // SAFETY: COM IStream calls on a live stream owned by the caller. We Stat
+    // the size, rewind to the start, then read exactly that many bytes.
+    unsafe {
+        let mut stat = STATSTG::default();
+        stream
+            .Stat(&mut stat, STATFLAG_NONAME)
+            .map_err(|e| format!("IStream::Stat: {e}"))?;
+        let size = stat.cbSize as usize;
+
+        stream
+            .Seek(0, STREAM_SEEK_SET, None)
+            .map_err(|e| format!("IStream::Seek: {e}"))?;
+
+        let mut buf = vec![0u8; size];
+        let mut total_read: usize = 0;
+        while total_read < size {
+            let mut chunk_read: u32 = 0;
+            let remaining = (size - total_read) as u32;
+            let hr = stream.Read(
+                buf.as_mut_ptr().add(total_read) as *mut core::ffi::c_void,
+                remaining,
+                Some(&mut chunk_read),
+            );
+            hr.ok().map_err(|e| format!("IStream::Read: {e}"))?;
+            if chunk_read == 0 {
+                break;
+            }
+            total_read += chunk_read as usize;
+        }
+        buf.truncate(total_read);
+        Ok(buf)
+    }
 }
 
 /// Capture the runner's own window as a base64 PNG string.
@@ -150,6 +335,29 @@ fn capture_runner_window(
 /// Does not require the UI Bridge SDK — uses native xcap capture.
 pub async fn capture_runner_window_base64(state: &Arc<ApiState>) -> Option<(String, i32, i32)> {
     use tauri::Manager;
+
+    // Prefer the occlusion-immune WebView2 CapturePreview path on Windows;
+    // fall back to monitor-crop on any error (timeout, COM failure, etc.).
+    #[cfg(windows)]
+    {
+        match capture_webview_contents(state).await {
+            Ok(png) => {
+                use base64::Engine;
+                match image::load_from_memory(&png) {
+                    Ok(img) => {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+                        return Some((b64, img.width() as i32, img.height() as i32));
+                    }
+                    Err(e) => {
+                        warn!("CapturePreview PNG decode failed: {}; falling back to monitor-crop", e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("CapturePreview capture failed: {}; falling back to monitor-crop", e);
+            }
+        }
+    }
 
     let window = state
         .app_handle

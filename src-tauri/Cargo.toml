@@ -190,6 +190,24 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-core = "0.58"
+# Occlusion-immune runner-window capture via WebView2 `CapturePreview`
+# (`screenshots::capture_webview_contents`). `webview2-com` is resolved
+# transitively by `wry` already; promoting it to a direct dep pins it in
+# lockstep with WRY's version so `PlatformWebview::controller()` returns the
+# *same* `ICoreWebView2Controller` type (a version skew would be a hard type
+# mismatch). The capture path needs `Microsoft::Web::WebView2::Win32`
+# (re-exported by webview2-com as `Microsoft`) plus a few `windows`-crate COM
+# helpers (`IStream`, `SHCreateMemStream`). webview2-com 0.38 links against
+# `windows 0.61` (NOT our direct `windows = 0.58`), so the COM helpers must
+# come from a renamed 0.61 dep — using 0.58 here would yield an `IStream` type
+# that `CapturePreview`'s generic bound rejects. See
+# `reference_runner_modules_in_bin_not_lib.md` (capture lives in the BIN).
+webview2-com = "0.38"
+windows-capture = { package = "windows", version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
 libloading = "0.8"  # JAB adapter (Windows-only) loads WindowsAccessBridge-64.dll
 
 [target.'cfg(target_os = "macos")'.dependencies]

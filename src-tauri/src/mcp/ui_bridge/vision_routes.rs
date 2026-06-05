@@ -443,75 +443,18 @@ pub struct MutationOccurredResponse {
 // Capture helpers — xcap → image::RgbaImage → vision_core::Frame
 // ============================================================================
 
-/// Capture the runner's own window as an RGBA buffer plus the scale factor.
-///
-/// Mirrors the cropping logic in
-/// `screenshots::capture_runner_window` (xcap captures the monitor under the
-/// window, then we crop to the runner's inner-position rect), but returns the
-/// raw [`RgbaImage`] instead of going through base64 PNG. Caller wraps it in
-/// a [`Frame`] via [`frame_from_rgba`].
-///
-/// Runs on the calling thread (synchronous xcap call). Callers should wrap in
-/// `tokio::task::spawn_blocking`.
-fn capture_runner_window_rgba(
-    phys_x: i32,
-    phys_y: i32,
-    phys_w: u32,
-    phys_h: u32,
-    scale: f64,
-) -> Result<(RgbaImage, f64), String> {
-    use crate::screen::{CapturedScreenshot, MonitorManager};
-
-    let mgr = MonitorManager::detect()?;
-
-    let logical_x = (phys_x as f64 / scale) as i32;
-    let logical_y = (phys_y as f64 / scale) as i32;
-    let logical_center_x = logical_x + (phys_w as f64 / scale / 2.0) as i32;
-    let logical_center_y = logical_y + (phys_h as f64 / scale / 2.0) as i32;
-
-    let monitor = mgr
-        .at_logical_point(logical_center_x, logical_center_y)
-        .ok_or_else(|| "Runner window not on any monitor".to_string())?;
-    let monitor_scale = monitor.scale_factor;
-
-    let captured = CapturedScreenshot::from_monitor(&mgr, monitor.index)?;
-
-    let (rel_local_x, rel_local_y) = monitor.to_monitor_local(logical_x, logical_y);
-    let (rel_phys_x, rel_phys_y) = monitor.logical_to_physical(rel_local_x, rel_local_y);
-
-    let crop_x = rel_phys_x.max(0) as u32;
-    let crop_y = rel_phys_y.max(0) as u32;
-    let crop_w = if rel_phys_x < 0 {
-        phys_w.saturating_sub((-rel_phys_x) as u32)
-    } else {
-        phys_w
-    }
-    .min(captured.physical_width.saturating_sub(crop_x));
-    let crop_h = if rel_phys_y < 0 {
-        phys_h.saturating_sub((-rel_phys_y) as u32)
-    } else {
-        phys_h
-    }
-    .min(captured.physical_height.saturating_sub(crop_y));
-
-    if crop_w == 0 || crop_h == 0 {
-        return Err(format!(
-            "Runner window has zero visible area (crop {}x{} at ({}, {}), image {}x{})",
-            crop_w, crop_h, crop_x, crop_y, captured.physical_width, captured.physical_height
-        ));
-    }
-
-    let cropped = captured.image.crop_imm(crop_x, crop_y, crop_w, crop_h);
-    Ok((cropped.to_rgba8(), monitor_scale))
-}
-
 /// Capture the runner window and return a vision-core [`Frame`].
 ///
-/// Acquires a permit from `state.vision_capture_semaphore` before invoking
-/// xcap. xcap is GDI-bound on Windows and exhibits the "fits-2-parallel-
-/// then-thrashes" pattern documented in `proj_supervisor_build_pool.md` —
-/// the bounded permit pool (size 2) prevents thrash under multi-agent load.
-/// Permit is held for the entire `spawn_blocking` span and released on drop.
+/// On Windows, tries the occlusion-immune WebView2 `CapturePreview` path first
+/// (`screenshots::capture_webview_contents`); on any error it falls back to the
+/// monitor-crop path (`screenshots::capture_runner_window_crop`, the single
+/// shared crop fn — formerly duplicated here as `capture_runner_window_rgba`).
+///
+/// Acquires a permit from `state.vision_capture_semaphore` around *whichever*
+/// backend runs. xcap is GDI-bound on Windows and exhibits the "fits-2-
+/// parallel-then-thrashes" pattern documented in `proj_supervisor_build_pool.md`
+/// — the bounded permit pool (size 2) prevents thrash under multi-agent load;
+/// it is harmless overhead for CapturePreview.
 pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result<Frame, String> {
     use tauri::Manager;
 
@@ -537,10 +480,38 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
         .acquire()
         .await
         .map_err(|e| format!("capture semaphore acquire: {}", e))?;
-    let (rgba, monitor_scale) =
-        tokio::task::spawn_blocking(move || capture_runner_window_rgba(x, y, w, h, scale))
-            .await
-            .map_err(|e| format!("capture task join error: {}", e))??;
+
+    // Prefer occlusion-immune WebView2 CapturePreview on Windows.
+    #[cfg(windows)]
+    {
+        match super::screenshots::capture_webview_contents(state).await {
+            Ok(png) => match image::load_from_memory(&png) {
+                Ok(img) => {
+                    let scale_factor = window.scale_factor().unwrap_or(scale);
+                    return Ok(Frame::from_rgba(
+                        img.to_rgba8(),
+                        FrameSource {
+                            kind: qontinui_vision_core::FrameSourceKind::Window,
+                            scale_factor,
+                            captured_at: chrono::Utc::now(),
+                        },
+                    ));
+                }
+                Err(e) => {
+                    warn!("CapturePreview PNG decode failed: {}; falling back to monitor-crop", e);
+                }
+            },
+            Err(e) => {
+                warn!("CapturePreview capture failed: {}; falling back to monitor-crop", e);
+            }
+        }
+    }
+
+    let (rgba, monitor_scale) = tokio::task::spawn_blocking(move || {
+        super::screenshots::capture_runner_window_crop(x, y, w, h, scale)
+    })
+    .await
+    .map_err(|e| format!("capture task join error: {}", e))??;
 
     Ok(Frame::from_rgba(
         rgba,
