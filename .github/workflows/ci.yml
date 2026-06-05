@@ -321,15 +321,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gate='#!\[cfg(any(debug_assertions, feature = "test-fixtures"))\]'
-          gate_outer='#\[cfg(any(debug_assertions, feature = "test-fixtures"))\]'
+          # PCRE patterns — parens MUST be escaped (unescaped they're capture
+          # groups and the literal source text never matches).
+          gate_outer='#\[cfg\(any\(debug_assertions, feature = "test-fixtures"\)\)\]'
 
           fail=0
 
           # 1. Module-level inner attribute must be the first significant line
-          #    of test_fixtures.rs.
+          #    of test_fixtures.rs. NOTE: `-m1` (not `| head -n1`) — under
+          #    `pipefail`, head quitting after one line SIGPIPEs grep and
+          #    fails the job with exit 2 before any anchor is checked.
           tf=src-tauri/src/mcp/test_fixtures.rs
-          first=$(grep -vE '^\s*(//|$)' "$tf" | head -n1)
+          first=$(grep -m1 -vE '^\s*(//|$)' "$tf")
           if [ "$first" != '#![cfg(any(debug_assertions, feature = "test-fixtures"))]' ]; then
             echo "::error file=$tf::module cfg gate missing or not the first significant line (got: $first)"
             fail=1
@@ -337,14 +340,14 @@ jobs:
 
           # 2. `pub mod test_fixtures;` in mcp/mod.rs must be cfg-gated on the
           #    line directly above it.
-          if ! grep -Pzo "$gate_outer\n\s*pub mod test_fixtures;" src-tauri/src/mcp/mod.rs >/dev/null; then
+          if ! grep -Pzo "$gate_outer\r?\n\s*pub mod test_fixtures;" src-tauri/src/mcp/mod.rs >/dev/null; then
             echo "::error file=src-tauri/src/mcp/mod.rs::pub mod test_fixtures; is not immediately preceded by the cfg gate"
             fail=1
           fi
 
           # 3. The routes() merge in mcp_api.rs must be cfg-gated on the line
           #    directly above it.
-          if ! grep -Pzo "$gate_outer\n\s*let base_router = base_router.merge\(crate::mcp::test_fixtures::routes\(\)\);" src-tauri/src/mcp_api.rs >/dev/null; then
+          if ! grep -Pzo "$gate_outer\r?\n\s*let base_router = base_router.merge\(crate::mcp::test_fixtures::routes\(\)\);" src-tauri/src/mcp_api.rs >/dev/null; then
             echo "::error file=src-tauri/src/mcp_api.rs::test_fixtures::routes() merge is not immediately preceded by the cfg gate"
             fail=1
           fi
