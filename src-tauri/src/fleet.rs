@@ -922,6 +922,20 @@ struct TreeStatePayload {
     /// ref doesn't resolve (coord persists the column's `DEFAULT 0`).
     #[serde(skip_serializing_if = "Option::is_none")]
     local_ahead: Option<i32>,
+    /// Commits HEAD is behind `origin/<default_branch>` — the distance
+    /// from the canonical default ref, computed ONLY when the tree is
+    /// parked on a NON-default named branch (`branch` known,
+    /// `default_branch` known, and they differ). `None` otherwise: on the
+    /// default branch the existing `behind_count` (vs `origin/<branch>`,
+    /// which == `origin/<default>`) already covers it, and detached/
+    /// unknown-branch states can't name a meaningful comparison branch.
+    /// A checkout parked on a squash-merged feature branch reads `0` for
+    /// `behind_count` (its own remote ref hasn't advanced) — the distance
+    /// from `origin/<default>` is the signal that catches that stale tree.
+    /// Reflects last-fetched remote state — no network fetch. `None` if
+    /// the `rev-list` fails (e.g. `origin/<default>` unresolved locally).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behind_default_count: Option<i32>,
 }
 
 /// Maximum number of dirty paths included per row (the column is unbounded
@@ -954,6 +968,23 @@ fn qontinui_root() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Decide which branch (if any) the `behind_default_count` rev-list should
+/// compare against. Returns `Some(default_branch)` ONLY when the tree is on
+/// a known, non-default named branch — i.e. `branch` is a real branch (not
+/// `(detached)`), and it differs from `default_branch`. Returns `None` on
+/// the default branch (where `behind_count` already covers the distance) or
+/// when the branch is detached/unknown (no meaningful comparison). Pure so
+/// the gating is unit-testable without shelling to git.
+fn behind_default_compare_branch<'a>(branch: &str, default_branch: &'a str) -> Option<&'a str> {
+    if branch == "(detached)" || branch.is_empty() {
+        return None;
+    }
+    if branch == default_branch {
+        return None;
+    }
+    Some(default_branch)
 }
 
 /// Capture the state of a single primary git tree at `repo_path`. Returns
@@ -1171,6 +1202,41 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             }
         });
 
+    // behind_default_count: commits HEAD is behind `origin/<default>` —
+    // ONLY when parked on a non-default named branch (see
+    // `behind_default_compare_branch`). On the default branch the existing
+    // `behind_count` (vs `origin/<branch>` == `origin/<default>`) already
+    // covers it, so we emit `None` there. The signal that matters: a tree
+    // sitting on a squash-merged feature branch reads `behind_count == 0`
+    // (its own remote ref is stale) yet is many commits behind
+    // `origin/<default>`. Same no-fetch posture as `behind_count` above; a
+    // failed rev-list (e.g. `origin/<default>` unresolved) → `None`, never
+    // an error.
+    let behind_default_count: Option<i32> =
+        match behind_default_compare_branch(&branch, &default_branch) {
+            Some(cmp) => Command::new("git")
+                .args([
+                    "-C",
+                    repo_path.to_str()?,
+                    "rev-list",
+                    "--count",
+                    &format!("HEAD..origin/{cmp}"),
+                ])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        String::from_utf8_lossy(&o.stdout)
+                            .trim()
+                            .parse::<i32>()
+                            .ok()
+                    } else {
+                        None
+                    }
+                }),
+            None => None,
+        };
+
     // device_id is filled in by the caller (it's identity-side, not
     // per-repo). Punch in a placeholder; the publisher overwrites it.
     Some(TreeStatePayload {
@@ -1189,6 +1255,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         head_detached,
         untracked_count,
         local_ahead,
+        behind_default_count,
     })
 }
 
@@ -2079,6 +2146,98 @@ mod tests {
             response_tenant_id(r#"{"tenant_id":"not-a-uuid"}"#),
             None,
             "non-UUID tenant_id → None"
+        );
+    }
+
+    // ---- behind_default_count (stale-primary-checkout guard, Phase 1c) ----
+
+    /// The gating helper: `behind_default_count` is only meaningful when
+    /// parked on a non-default named branch. On the default branch
+    /// `behind_count` already covers the distance, and detached/empty
+    /// branch states can't name a comparison branch.
+    #[test]
+    fn behind_default_compare_branch_only_on_nondefault_named_branch() {
+        // Non-default named branch → compare against the default.
+        assert_eq!(
+            behind_default_compare_branch("chkguard/foo", "main"),
+            Some("main"),
+            "a feature branch must compare against origin/<default>"
+        );
+        // On the default branch → None (behind_count already covers it).
+        assert_eq!(
+            behind_default_compare_branch("main", "main"),
+            None,
+            "on the default branch there's nothing extra to compute"
+        );
+        // Detached HEAD → None (no meaningful comparison branch).
+        assert_eq!(
+            behind_default_compare_branch("(detached)", "main"),
+            None,
+            "detached HEAD has no comparison branch"
+        );
+        // Empty branch (defensive) → None.
+        assert_eq!(
+            behind_default_compare_branch("", "main"),
+            None,
+            "empty branch name has no comparison branch"
+        );
+        // Non-`main` default is honored.
+        assert_eq!(
+            behind_default_compare_branch("topic", "develop"),
+            Some("develop"),
+            "the configured default branch is what we compare against"
+        );
+    }
+
+    /// `behind_default_count` is `#[serde(skip_serializing_if = Option::is_none)]`
+    /// so the default-branch case (where it's `None`) keeps the same wire
+    /// shape as before this field existed — no regression for coord ingest.
+    #[test]
+    fn tree_payload_omits_none_behind_default_count() {
+        let p = TreeStatePayload {
+            device_id: uuid::Uuid::nil(),
+            repo: "qontinui-runner".into(),
+            branch: "main".into(),
+            head_sha: "deadbeef".into(),
+            dirty: false,
+            dirty_files: None,
+            last_edit_at: None,
+            behind_count: Some(0),
+            head_detached: Some(false),
+            untracked_count: Some(0),
+            local_ahead: Some(0),
+            behind_default_count: None,
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert!(
+            body.get("behind_default_count").is_none(),
+            "None behind_default_count must be omitted from the upsert wire"
+        );
+    }
+
+    /// When set (the stale-feature-branch case), `behind_default_count`
+    /// appears on the wire as a number so coord's watcher can consume it.
+    #[test]
+    fn tree_payload_serializes_behind_default_count() {
+        let p = TreeStatePayload {
+            device_id: uuid::Uuid::nil(),
+            repo: "qontinui-runner".into(),
+            branch: "chkguard/stale".into(),
+            head_sha: "deadbeef".into(),
+            dirty: false,
+            dirty_files: None,
+            last_edit_at: None,
+            behind_count: Some(0),
+            head_detached: Some(false),
+            untracked_count: Some(0),
+            local_ahead: Some(0),
+            behind_default_count: Some(42),
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            body.get("behind_default_count").and_then(|v| v.as_i64()),
+            Some(42),
+            "a set behind_default_count must appear on the upsert wire"
         );
     }
 }
