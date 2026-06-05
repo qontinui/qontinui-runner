@@ -308,7 +308,21 @@ use crate::session::SessionKind;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    /// `QONTINUI_SESSION_AUTOMATION_REGISTER` is process-global mutable
+    /// state; tests that set/remove it race when the harness runs them on
+    /// parallel threads (one test's `remove_var` lands between another's
+    /// `set_var("0")` and its assert — seen flaking on windows-latest).
+    /// Every env-touching test holds this lock for its full body. Poisoning
+    /// is harmless — each test resets the var on entry — so recover with
+    /// `into_inner`.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn registrar() -> (AiCoordRegistrar, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -318,6 +332,7 @@ mod tests {
 
     #[test]
     fn register_writes_started_row_and_indexes_both_directions() {
+        let _env = env_lock();
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -342,6 +357,7 @@ mod tests {
 
     #[test]
     fn reregister_is_idempotent_no_duplicate_started_row() {
+        let _env = env_lock();
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -364,6 +380,7 @@ mod tests {
 
     #[test]
     fn heartbeat_only_after_register_and_keyed_by_session() {
+        let _env = env_lock();
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -395,6 +412,7 @@ mod tests {
 
     #[test]
     fn close_emits_closed_row_and_evicts_index() {
+        let _env = env_lock();
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
@@ -416,6 +434,7 @@ mod tests {
 
     #[test]
     fn disabled_gate_registers_nothing() {
+        let _env = env_lock();
         std::env::set_var("QONTINUI_SESSION_AUTOMATION_REGISTER", "0");
         let (reg, _dir) = registrar();
         let trid = Uuid::new_v4().to_string();
