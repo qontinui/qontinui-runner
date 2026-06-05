@@ -223,17 +223,38 @@ fn coord_http_base() -> Option<String> {
 }
 
 /// Resolve the coord WS URL from the active profile's `coord_url`,
-/// normalizing the scheme to `ws://` / `wss://` and appending the
-/// `/ws` path with an `events.agent.*` pattern filter.
+/// normalizing the scheme to `ws://` / `wss://` and ensuring the `/ws`
+/// path is present (exactly once) with an `events.agent.*` pattern filter.
 ///
-/// Mirrors `session::handoff::coord_ws_url` which appends
-/// `/ws?pattern=qontinui.sessions.*`. The coord `/ws` endpoint is a
-/// Redis pub/sub bridge at the `/ws` path (not the root); connecting to
-/// the root returns 401 from the ALB.
+/// Mirrors `session::handoff::coord_ws_url`, but unlike that path — which
+/// receives the coord HTTP base with `/ws` already stripped — this reads the
+/// RAW profile `coord_url`, whose shipped `dev`/`production` values ALREADY
+/// end in `/ws` (e.g. `wss://coord.qontinui.io/ws`, see
+/// `bin/qontinui_profile.rs`). The construction is therefore made idempotent
+/// via [`build_coord_ws_url`]: appending `/ws` to an already-`/ws` base would
+/// produce `…/ws/ws` → 401 at the ALB → the subscribe loop never connects in
+/// prod. The coord `/ws` endpoint is a Redis pub/sub bridge at the `/ws` path
+/// (not the root); connecting to the root also returns 401.
 fn coord_ws_url(device_id: uuid::Uuid) -> Option<String> {
     let coord_url = qontinui_runner_lib::profiles::load_strict()
         .ok()?
         .coord_url?;
+    Some(build_coord_ws_url(&coord_url, device_id))
+}
+
+/// Pure builder for the coord agent-spawn WS subscription URL. Extracted from
+/// [`coord_ws_url`] so it can be unit-tested without global profile state.
+///
+/// Normalization rule:
+/// 1. Trim whitespace and any trailing `/`.
+/// 2. Swap the scheme: `https://`→`wss://`, `http://`→`ws://`; leave an
+///    already-`ws(s)://` base (or any other scheme) untouched.
+/// 3. Append `/ws` ONLY if the base does not already end in `/ws` (the trailing
+///    `/` was stripped in step 1, so a `…/ws/` input is handled too). This makes
+///    the construction idempotent for the shipped profiles whose `coord_url`
+///    already ends in `/ws`, while still appending it for a bare host URL.
+/// 4. Append the device-scoped `events.agent.spawn_requested.<device>` pattern.
+fn build_coord_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String {
     let base = coord_url.trim().trim_end_matches('/');
     let ws_base = base
         .strip_prefix("https://")
@@ -243,9 +264,13 @@ fn coord_ws_url(device_id: uuid::Uuid) -> Option<String> {
                 .map(|rest| format!("ws://{rest}"))
         })
         .unwrap_or_else(|| base.to_string());
-    Some(format!(
-        "{ws_base}/ws?pattern=events.agent.spawn_requested.{device_id}"
-    ))
+    // Idempotent: don't double-append `/ws` when the base already ends in it.
+    let ws_base = if ws_base.ends_with("/ws") {
+        ws_base
+    } else {
+        format!("{ws_base}/ws")
+    };
+    format!("{ws_base}?pattern=events.agent.spawn_requested.{device_id}")
 }
 
 /// Read `~/.qontinui/machine.json` → device_id. Falls back to None.
@@ -1581,6 +1606,68 @@ mod tests {
         assert_eq!(round_tripped.worktrees.len(), 1);
         assert_eq!(round_tripped.worktrees[0].repo, "qontinui-runner");
         assert_eq!(round_tripped.plan_phase, Some(4));
+    }
+
+    #[test]
+    fn build_coord_ws_url_appends_ws_to_bare_host() {
+        // A bare host URL (no `/ws`) gets `/ws` appended, scheme swapped.
+        let device = uuid::Uuid::nil();
+        assert_eq!(
+            build_coord_ws_url("http://localhost:9870", device),
+            format!("ws://localhost:9870/ws?pattern=events.agent.spawn_requested.{device}")
+        );
+        assert_eq!(
+            build_coord_ws_url("https://coord.qontinui.io", device),
+            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
+        );
+    }
+
+    #[test]
+    fn build_coord_ws_url_does_not_double_append_ws() {
+        // The shipped `dev`/`production` profiles' coord_url ALREADY ends in
+        // `/ws` (see bin/qontinui_profile.rs). Must produce a single `/ws`,
+        // not `/ws/ws` (which 401s at the ALB and blocks the subscribe loop).
+        let device = uuid::Uuid::nil();
+        assert_eq!(
+            build_coord_ws_url("wss://coord.qontinui.io/ws", device),
+            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
+        );
+        assert_eq!(
+            build_coord_ws_url("ws://localhost:9870/ws", device),
+            format!("ws://localhost:9870/ws?pattern=events.agent.spawn_requested.{device}")
+        );
+        // https→wss conversion preserved on an already-`/ws` https base.
+        assert_eq!(
+            build_coord_ws_url("https://coord.qontinui.io/ws", device),
+            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
+        );
+    }
+
+    #[test]
+    fn build_coord_ws_url_normalizes_trailing_slash_after_ws() {
+        // A `…/ws/` input (trailing slash) is normalized to a single `/ws`,
+        // not `/ws/ws` and not `/ws/`.
+        let device = uuid::Uuid::nil();
+        assert_eq!(
+            build_coord_ws_url("wss://coord.qontinui.io/ws/", device),
+            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
+        );
+        // A bare host with a trailing slash still gets exactly one `/ws`.
+        assert_eq!(
+            build_coord_ws_url("https://coord.qontinui.io/", device),
+            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
+        );
+    }
+
+    #[test]
+    fn build_coord_ws_url_preserves_already_ws_scheme() {
+        // An already-`ws://`/`wss://` base keeps its scheme (no http prefix to
+        // swap) and is not double-appended.
+        let device = uuid::Uuid::nil();
+        assert_eq!(
+            build_coord_ws_url("ws://h:9870/ws", device),
+            format!("ws://h:9870/ws?pattern=events.agent.spawn_requested.{device}")
+        );
     }
 
     #[test]
