@@ -80,9 +80,14 @@
 //!
 //! After a seed call returns 200, the strip does NOT update synchronously.
 //! Two async latencies stack before the rendered counts converge:
-//!   1. The frontend re-polls `transcript_list_sessions` on its own cadence;
-//!      only then does the seeded fake (and any derived synthetic tab) enter
-//!      `useSessionManager`.
+//!   1. The frontend must refetch `transcript_list_sessions`; only then does
+//!      the seeded fake (and any derived synthetic tab) enter
+//!      `useSessionManager`. Every mutating route here emits a
+//!      `test-fixtures-injected-changed` Tauri event that
+//!      `useTranscriptSessions` listens for and refetches on immediately —
+//!      this is what makes seeding/clearing deterministic even when the
+//!      runner window is hidden (its 30s auto-refresh poll is
+//!      visibility-gated and never ticks in a backgrounded window).
 //!   2. For a tab-backed `idle` fake, the 60s **staleness sweep tick** must
 //!      fire once more after the synthetic tab's pre-aged `lastOutput` seed is
 //!      installed before `frozen`→idle is counted. The pre-age guarantees the
@@ -437,6 +442,39 @@ pub fn injected_test_sessions() -> Vec<TestSession> {
     guard.values().cloned().collect()
 }
 
+/// AppHandle captured at router-merge time (`mcp_api::create_router`) so the
+/// mutating endpoints can emit `test-fixtures-injected-changed`.
+///
+/// `useTranscriptSessions` listens for that event and refetches immediately —
+/// its 30s auto-refresh poll is visibility-gated (a hidden/backgrounded
+/// window never ticks), so without the event a seeded or cleared scenario
+/// would stay invisible to an acceptance driver until the window regains
+/// focus. Unit tests never call `set_app_handle`, so the emit is a no-op
+/// there by construction.
+fn app_handle_slot() -> &'static OnceLock<tauri::AppHandle> {
+    static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+    &APP_HANDLE
+}
+
+/// Capture the AppHandle for change-event emission. Idempotent — only the
+/// first call wins (create_router runs once per process).
+pub fn set_app_handle(handle: tauri::AppHandle) {
+    let _ = app_handle_slot().set(handle);
+}
+
+/// Best-effort `test-fixtures-injected-changed` emit after a registry
+/// mutation. Never fails the request — the event is a freshness hint, not
+/// part of the route contract.
+fn emit_injected_changed(action: &str, count: usize) {
+    if let Some(handle) = app_handle_slot().get() {
+        use tauri::Emitter;
+        let _ = handle.emit(
+            "test-fixtures-injected-changed",
+            serde_json::json!({ "action": action, "count": count }),
+        );
+    }
+}
+
 /// Core insert path shared by `inject_session_handler` and the
 /// scenario-seeder. Validates the request, builds the `TestSession`, runs TTL
 /// eviction, and inserts under `task_run_id`. Returns the stored
@@ -621,11 +659,14 @@ async fn inject_session_handler(
     Json(req): Json<InjectSessionRequest>,
 ) -> Result<Json<InjectSessionResponse>, (StatusCode, Json<InjectSessionError>)> {
     match insert_session(req) {
-        Ok((task_run_id, session_id)) => Ok(Json(InjectSessionResponse {
-            success: true,
-            task_run_id,
-            session_id,
-        })),
+        Ok((task_run_id, session_id)) => {
+            emit_injected_changed("inject", 1);
+            Ok(Json(InjectSessionResponse {
+                success: true,
+                task_run_id,
+                session_id,
+            }))
+        }
         Err((code, err)) => Err((code, Json(err))),
     }
 }
@@ -641,9 +682,11 @@ pub struct ClearSessionsResponse {
 }
 
 async fn clear_sessions_handler() -> Json<ClearSessionsResponse> {
+    let cleared_count = clear_all_sessions();
+    emit_injected_changed("clear", cleared_count);
     Json(ClearSessionsResponse {
         success: true,
-        cleared_count: clear_all_sessions(),
+        cleared_count,
     })
 }
 
@@ -659,9 +702,11 @@ async fn clear_sessions_handler() -> Json<ClearSessionsResponse> {
 /// fakes are gone from the registry, `merge_with_injected` stops projecting
 /// them and the synthetic tabs cease to exist with no separate teardown.
 async fn clear_injected_handler() -> Json<ClearSessionsResponse> {
+    let cleared_count = clear_all_sessions();
+    emit_injected_changed("clear", cleared_count);
     Json(ClearSessionsResponse {
         success: true,
-        cleared_count: clear_all_sessions(),
+        cleared_count,
     })
 }
 
@@ -851,6 +896,8 @@ async fn seed_scenario_handler(
         session_ids.len(),
         session_ids,
     );
+
+    emit_injected_changed("seed", session_ids.len());
 
     Ok(Json(SeedScenarioResponse {
         success: true,

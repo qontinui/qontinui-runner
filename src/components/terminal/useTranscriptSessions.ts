@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { CommandResponse } from "./types";
 
 export interface TranscriptSession {
@@ -85,6 +86,22 @@ export function useTranscriptSessions(): UseTranscriptSessionsResult {
       didLoad.current = true;
       fetchSessions();
     }
+  }, [fetchSessions]);
+
+  // Immediate refetch when the debug-gated test-fixtures seam mutates the
+  // injected-session registry (seed / inject / clear). The 30s poll below is
+  // visibility-gated — a hidden or backgrounded window never ticks — so
+  // without this event an acceptance driver that seeds or clears a scenario
+  // would not see the StatusStrip update until the window regains focus.
+  // Real builds without the seam never emit the event, so this is inert in
+  // production.
+  useEffect(() => {
+    const unlistenPromise = listen("test-fixtures-injected-changed", () => {
+      fetchSessions();
+    });
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
   }, [fetchSessions]);
 
   // Auto-refresh every 30 seconds to pick up newly created sessions.
