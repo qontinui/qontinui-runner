@@ -1791,4 +1791,49 @@ mod tests {
         let exit = pump_subprocess(agent_id, &mut child, None).await.unwrap();
         assert_eq!(exit, 0);
     }
+
+    /// Drives the gate-continuation HEADLESS dispatch through the REAL
+    /// `spawn_claude_child` + `pump_subprocess` path with a fake `claude` bin
+    /// (a portable shell that prints + exits 0). Proves the arm spawns a child
+    /// and returns `Ok(())` end-to-end. The coord lifecycle POSTs
+    /// (`spawn-complete`/`spawn-failed`) no-op gracefully here because no
+    /// `coord_url` profile is configured in the test env (`coord_http_base()`
+    /// returns `None`), so this asserts the SPAWN path, not the HTTP posts.
+    ///
+    /// Gated behind `QONTINUI_AGENT_RUNTIME_E2E=1` (the shell-as-claude
+    /// substitution mutates process env globally; keep it opt-in like
+    /// `fake_claude_e2e_smoke`).
+    #[tokio::test]
+    async fn gate_continuation_headless_spawns_child() {
+        if std::env::var("QONTINUI_AGENT_RUNTIME_E2E").ok().as_deref() != Some("1") {
+            return;
+        }
+        // Use a portable shell as the fake `claude`: prints a line, exits 0.
+        let prev = std::env::var("QONTINUI_CLAUDE_BIN").ok();
+        std::env::set_var(
+            "QONTINUI_CLAUDE_BIN",
+            if cfg!(target_os = "windows") {
+                "cmd"
+            } else {
+                "sh"
+            },
+        );
+        // On Windows the bin is `cmd`; spawn_claude_child passes the prompt on
+        // stdin and closes it — `cmd` with no args reads stdin then exits. On
+        // Unix, `sh` reads stdin commands then exits. Either way the child
+        // spawns and the pump observes a clean exit.
+        let workdir = std::env::temp_dir().to_string_lossy().to_string();
+        let agent_id = uuid::Uuid::now_v7();
+        let res =
+            run_continuation_headless(agent_id, &workdir, "echo gate-continuation-proof").await;
+        assert!(
+            res.is_ok(),
+            "gate-continuation headless dispatch must spawn + return Ok: {res:?}"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
+            None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
+        }
+    }
 }
