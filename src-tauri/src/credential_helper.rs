@@ -86,17 +86,24 @@ async fn fetch_registered_repos(coord_base: &str) -> Result<Vec<String>, String>
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
-    let resp = client
-        .get(&url)
+    let resp = crate::coord_http::coord_get(&client, &url)
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "GET /coord/canonical-repos returned {}",
-            resp.status().as_u16()
-        ));
+        let code = resp.status().as_u16();
+        if code == 401 || code == 403 {
+            // Credential-helper setup can fire BEFORE the device-JWT exists
+            // (early in session setup / before pairing completes). Once coord
+            // gates canonical-repos with FleetPrincipal, the anonymous GET is
+            // rejected until the token lands. Not fatal — the caller skips
+            // helper install this time and retries on the next session setup.
+            warn!(
+                "credential_helper: canonical-repos GET unauthorized ({code}) — retrying after device pairing/auth"
+            );
+        }
+        return Err(format!("GET /coord/canonical-repos returned {code}"));
     }
 
     let body: serde_json::Value = resp

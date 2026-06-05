@@ -1859,18 +1859,13 @@ pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
     // device has no token — we still issue the GETs anonymously (coord is
     // anonymous today); the `have_token` flag lets us distinguish
     // "unpaired" from "token present but rejected" if coord 401/403s.
-    let device_token = qontinui_runner_lib::auth::AuthManager::new()
-        .get_access_token()
-        .ok();
-    let have_token = device_token.is_some();
+    //
+    // The bearer is attached by the shared [`crate::coord_http::coord_get`]
+    // helper (same token source as the write-path `attach_device_auth`);
+    // `have_token` reads the same availability check.
+    let have_token = crate::coord_http::have_device_token();
 
-    let auth_get = |url: String| {
-        let mut req = client.get(url);
-        if let Some(tok) = device_token.as_deref() {
-            req = req.header("Authorization", format!("Bearer {tok}"));
-        }
-        req
-    };
+    let auth_get = |url: String| crate::coord_http::coord_get(&client, url);
 
     // Tracks whether either GET returned an auth rejection (401/403).
     let mut unauthorized = false;

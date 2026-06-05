@@ -473,8 +473,8 @@ async fn get_heatmap_live(
         "{}/coord/worktree-dirty?heatmap=true",
         base.trim_end_matches('/')
     );
-    match reqwest::Client::new()
-        .get(&url)
+    let client = reqwest::Client::new();
+    match crate::coord_http::coord_get(&client, &url)
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
