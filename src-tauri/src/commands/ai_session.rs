@@ -123,7 +123,10 @@ pub async fn list_ai_sessions(
 pub async fn send_user_message(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
-    ai_coord_registrar: tauri::State<'_, Arc<crate::claude_session::coord_register::AiCoordRegistrar>>,
+    ai_coord_registrar: tauri::State<
+        '_,
+        Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+    >,
     task_run_id: String,
     message: String,
 ) -> Result<CommandResponse, String> {
@@ -316,7 +319,10 @@ pub async fn get_ai_session_state(
 pub async fn create_ai_session(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
-    ai_coord_registrar: tauri::State<'_, Arc<crate::claude_session::coord_register::AiCoordRegistrar>>,
+    ai_coord_registrar: tauri::State<
+        '_,
+        Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+    >,
     app_state: tauri::State<'_, StorageCompartment>,
     task_name: Option<String>,
 ) -> Result<CommandResponse, String> {
@@ -450,7 +456,10 @@ pub async fn create_ai_session(
 pub async fn close_ai_session(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
-    ai_coord_registrar: tauri::State<'_, Arc<crate::claude_session::coord_register::AiCoordRegistrar>>,
+    ai_coord_registrar: tauri::State<
+        '_,
+        Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+    >,
     app_state: tauri::State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {

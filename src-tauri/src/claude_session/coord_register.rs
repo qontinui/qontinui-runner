@@ -72,7 +72,10 @@ use crate::session::SessionEventKind;
 /// (including unset) leaves it ON.
 fn registration_enabled() -> bool {
     match std::env::var("QONTINUI_SESSION_AUTOMATION_REGISTER") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
         Err(_) => true,
     }
 }
@@ -216,9 +219,7 @@ impl AiCoordRegistrar {
         }
 
         // Record the R4 index only after the durable outbox write succeeds.
-        if let (Ok(mut fwd), Ok(mut rev)) =
-            (self.inner.forward.lock(), self.inner.reverse.lock())
-        {
+        if let (Ok(mut fwd), Ok(mut rev)) = (self.inner.forward.lock(), self.inner.reverse.lock()) {
             fwd.insert(session_id, task_run_id.to_string());
             rev.insert(task_run_id.to_string(), session_id);
         }
@@ -324,7 +325,10 @@ mod tests {
         let coord_id = reg.register_session(&trid, "fix the thing", None).unwrap();
 
         // R4 index resolves both ways.
-        assert_eq!(reg.task_run_id_for(&coord_id).as_deref(), Some(trid.as_str()));
+        assert_eq!(
+            reg.task_run_id_for(&coord_id).as_deref(),
+            Some(trid.as_str())
+        );
         assert_eq!(reg.session_id_for(&trid), Some(coord_id));
 
         // Exactly one Started row in the outbox, carrying task_run_id + agentic.
@@ -403,13 +407,10 @@ mod tests {
         assert!(reg.session_id_for(&trid).is_none());
 
         // A Closed row was written for the coord id.
-        let closed = reg
-            .inner
-            .outbox
-            .pending()
-            .unwrap()
-            .into_iter()
-            .any(|r| r.event_kind == SessionEventKind::Closed.as_str() && r.session_id == coord_id);
+        let closed =
+            reg.inner.outbox.pending().unwrap().into_iter().any(|r| {
+                r.event_kind == SessionEventKind::Closed.as_str() && r.session_id == coord_id
+            });
         assert!(closed, "a Closed outbox row must be emitted on close");
     }
 
