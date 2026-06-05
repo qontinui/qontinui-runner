@@ -158,8 +158,7 @@ fn capture_runner_window(
     scale: f64,
     _title: &str,
 ) -> Result<CapturedRunnerWindow, String> {
-    let (rgba, _monitor_scale) =
-        capture_runner_window_crop(phys_x, phys_y, phys_w, phys_h, scale)?;
+    let (rgba, _monitor_scale) = capture_runner_window_crop(phys_x, phys_y, phys_w, phys_h, scale)?;
     let width = rgba.width() as i32;
     let height = rgba.height() as i32;
     let b64 = encode_image_to_base64(&image::DynamicImage::ImageRgba8(rgba))?;
@@ -349,12 +348,18 @@ pub async fn capture_runner_window_base64(state: &Arc<ApiState>) -> Option<(Stri
                         return Some((b64, img.width() as i32, img.height() as i32));
                     }
                     Err(e) => {
-                        warn!("CapturePreview PNG decode failed: {}; falling back to monitor-crop", e);
+                        warn!(
+                            "CapturePreview PNG decode failed: {}; falling back to monitor-crop",
+                            e
+                        );
                     }
                 }
             }
             Err(e) => {
-                warn!("CapturePreview capture failed: {}; falling back to monitor-crop", e);
+                warn!(
+                    "CapturePreview capture failed: {}; falling back to monitor-crop",
+                    e
+                );
             }
         }
     }

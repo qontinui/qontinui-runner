@@ -498,11 +498,17 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
                     ));
                 }
                 Err(e) => {
-                    warn!("CapturePreview PNG decode failed: {}; falling back to monitor-crop", e);
+                    warn!(
+                        "CapturePreview PNG decode failed: {}; falling back to monitor-crop",
+                        e
+                    );
                 }
             },
             Err(e) => {
-                warn!("CapturePreview capture failed: {}; falling back to monitor-crop", e);
+                warn!(
+                    "CapturePreview capture failed: {}; falling back to monitor-crop",
+                    e
+                );
             }
         }
     }
