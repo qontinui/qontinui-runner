@@ -10,6 +10,7 @@
 //! - Interrupt support for stopping mid-turn
 //! - Autonomous-to-interactive context switching
 
+pub mod coord_register;
 pub mod dispatcher;
 pub mod federation;
 pub mod manager;

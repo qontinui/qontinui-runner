@@ -939,7 +939,7 @@ impl SessionHandle {
 /// explicitly so the runner-local outbox row sorts naturally with the
 /// coord row — UUIDv4 would still work for correctness but defeats the
 /// `(machine_id, session_id, seq)` "time-ordered" intuition.
-fn uuid_v7() -> Uuid {
+pub(crate) fn uuid_v7() -> Uuid {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();

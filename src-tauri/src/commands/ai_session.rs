@@ -123,6 +123,10 @@ pub async fn list_ai_sessions(
 pub async fn send_user_message(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
+    ai_coord_registrar: tauri::State<
+        '_,
+        Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+    >,
     task_run_id: String,
     message: String,
 ) -> Result<CommandResponse, String> {
@@ -131,6 +135,13 @@ pub async fn send_user_message(
         task_run_id,
         message.len()
     );
+
+    // Session-automation Phase 0 (R3) — operator interaction is the ONLY signal
+    // that refreshes this session's coord heartbeat. Driving the heartbeat off
+    // `send_user_message` (rather than the unconditional registry heartbeat
+    // loop) is what lets an idle session age to `stale` so the inject trigger
+    // can fire (P0.2). Best-effort + no-op when the session isn't registered.
+    ai_coord_registrar.heartbeat_on_interaction(&task_run_id);
 
     let session = session_manager
         .get(&task_run_id)
@@ -308,6 +319,10 @@ pub async fn get_ai_session_state(
 pub async fn create_ai_session(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
+    ai_coord_registrar: tauri::State<
+        '_,
+        Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+    >,
     app_state: tauri::State<'_, StorageCompartment>,
     task_name: Option<String>,
 ) -> Result<CommandResponse, String> {
@@ -403,6 +418,12 @@ pub async fn create_ai_session(
                 task_run_id, e
             );
         }
+
+        // Session-automation Phase 0 (R1) — register the authenticated session
+        // into coord.sessions carrying its task_run_id, so it is visible +
+        // addressable + correctly stale to coord. Best-effort: a registration
+        // failure never blocks the live AI session.
+        ai_coord_registrar.register_session(&task_run_id, &name, None);
     }
 
     // 4. Return result
@@ -435,6 +456,10 @@ pub async fn create_ai_session(
 pub async fn close_ai_session(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
+    ai_coord_registrar: tauri::State<
+        '_,
+        Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+    >,
     app_state: tauri::State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
@@ -444,6 +469,10 @@ pub async fn close_ai_session(
     if let Some(session) = session_manager.remove(&task_run_id) {
         let _ = session.close();
     }
+
+    // Session-automation Phase 0 (R5) — emit the coord `closed` event + evict
+    // the R4 index so coord.sessions doesn't leak a ghost row. Best-effort.
+    ai_coord_registrar.close_session(&task_run_id);
 
     // Update DB status
     let _ = app_state
@@ -1195,6 +1224,14 @@ pub async fn resume_ai_sessions(
         }
     };
 
+    // Session-automation Phase 0 (R2) — the coord registrar (managed Tauri
+    // state). Resolved here (not injected) because this fn is called internally
+    // with bare args. `None` only before `.setup()` finished managing it, in
+    // which case resume simply doesn't register (best-effort).
+    let ai_coord_registrar = app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+        .map(|s| s.inner().clone());
+
     let my_port = app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1364,6 +1401,12 @@ pub async fn resume_ai_sessions(
                     "AI session resume: create_emergent_task failed for {}: {}",
                     task_run_id, e
                 );
+            }
+
+            // R2 — re-register the resumed session with coord (idempotent;
+            // a fresh coord row is minted carrying the same task_run_id).
+            if let Some(reg) = ai_coord_registrar.as_ref() {
+                reg.register_session(&task_run_id, &task_name, None);
             }
         }
 
