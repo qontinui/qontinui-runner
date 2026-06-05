@@ -296,6 +296,48 @@ jobs:
         #      `--no-bundle` — compilation + link is the sanity gate we want.
         run: pnpm run tauri build --debug --no-bundle
 
+  # Gating frontend unit-test lane (vitest).
+  #
+  # The matrix `test` job above also runs `pnpm test`, but it is wedged between
+  # the heavy Rust/Tauri steps (sibling clones, swapfile, ~40-70 min cargo) and
+  # only completes after that whole leg. A frontend-logic regression therefore
+  # can't fail fast and the signal is entangled with cargo flakiness/timeouts.
+  # This standalone job runs ONLY the frontend toolchain (pnpm install + vitest)
+  # on ubuntu-latest in ~1-2 min, giving a fast independent gate. It deliberately
+  # does NOT clone sibling repos or install the Rust toolchain: the vitest suite
+  # imports @qontinui/* exclusively from npm (see vitest.config.ts — the stale
+  # sibling-repo aliases were removed) and never reads the auto-generated
+  # src/lib/spec-registry.ts (that static import is a typecheck/build concern,
+  # not a test-time one). 764 tests across 64 files all pass on main as of this
+  # job's introduction, so it is born green and is a real required check.
+  frontend-tests:
+    name: Frontend unit tests (vitest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Mirror the matrix job's frontend setup EXACTLY: pnpm 10.33.2, node 20,
+      # pnpm cache keyed on the root lockfile, frozen-lockfile install.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run frontend unit tests
+        run: pnpm test
+
   # Phase 3 / F2 — debug test-fixtures seam gate.
   #
   # The `mcp::test_fixtures` module (the `/ui-bridge/test/*` session-injection
