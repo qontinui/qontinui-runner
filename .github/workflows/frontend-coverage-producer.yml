@@ -1,0 +1,75 @@
+name: Frontend Coverage Producer
+
+# Per-test-FILE -> touched-file coverage producer for coord (qontinui-runner).
+#
+# This is a NON-GATING, main-only job. It runs `vitest run --coverage` once per
+# test file (vitest's default per-file isolation makes that attribution exact)
+# and POSTs the resulting per-file coverage map + JUnit results to coord's
+# existing ingest routes. Per-file vitest startup is slow (~5-15s each) and
+# there are 60+ test files, so a full run is several minutes — far too slow for
+# a PR gate, but fine here: the map is cached per (repo, head_sha) in coord and
+# PR lanes only consume it. It NEVER blocks a PR and the producer script itself
+# is best-effort (exits 0 on any failure), so this workflow going red cannot
+# break the merge pipeline. It is intentionally NOT a required check.
+#
+# Granularity note: vitest 4 + @vitest/coverage-v8 have no per-test-CASE
+# coverage contexts, so the resolved granularity is per-test-FILE; test_id is
+# the repo-relative test file path (e.g. "src/components/foo.test.tsx" — runner's
+# frontend is the repo ROOT, so there is no "frontend/" prefix). The JUnit
+# results POSTed alongside are per-test-CASE with classname rewritten to that
+# same repo-relative test-file path, so every result test_id (`classname::name`)
+# shares the coverage observation's test_id as an exact prefix (documented in the
+# script).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "vitest.config.ts"
+      - "vite.config.ts"
+      - "scripts/export-test-coverage.mjs"
+      - ".github/workflows/frontend-coverage-producer.yml"
+  workflow_dispatch:
+
+# Don't pile up producer runs if several main pushes land quickly; the latest
+# head_sha is the one worth mapping.
+concurrency:
+  group: frontend-coverage-producer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  produce:
+    name: Per-file coverage -> coord
+    runs-on: ubuntu-latest
+    # Generous budget for the per-file loop over 60+ test files; non-gating so
+    # the wall-clock never blocks anything.
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout qontinui-runner
+        uses: actions/checkout@v5
+
+      # Mirror ci.yml's frontend-tests lane setup so coverage runs in the same
+      # environment the gating lane validates: pnpm 10.33.2, node 20.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Produce per-file coverage and POST to coord (best-effort)
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          # COORD_HTTP_URL defaults to https://coord.qontinui.io in the script;
+          # set here only to target a non-prod coord.
+        run: node scripts/export-test-coverage.mjs
