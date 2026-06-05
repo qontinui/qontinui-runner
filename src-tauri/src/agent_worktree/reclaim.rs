@@ -526,6 +526,14 @@ fn cargo_lock_held(target_dir: &Path) -> bool {
     false
 }
 
+/// G6 probe with the env-resolved activity window — the shared entrypoint
+/// for the executor AND the census shadow-mode report
+/// ([`super::census`] pushes the result per worktree per tick as
+/// `building`, so coord can gauge would-be G6 skips while arming is OFF).
+pub(super) fn probe_building(worktree: &Path) -> bool {
+    worktree_is_building(worktree, Duration::from_secs(activity_window_secs()))
+}
+
 /// G6: is this worktree currently being built? Either signal → skip.
 /// Injectable (takes the worktree root) so tests drive it with tempdirs.
 ///
@@ -569,9 +577,23 @@ fn execute_pull(pull: &ReclaimPull) {
             ReclaimAction::Unknown(_) => false,
         };
 
+        // G6 — evaluated for EVERY instruction, armed or not. Unarmed
+        // ("shadow mode") logs the would-skip so the census-carried
+        // `building` fact + these lines give the Q1 graduation its
+        // prove-out data while arming is still OFF; armed skips for real.
+        let building = worktree_is_building(&wt, window);
+        if building && !armed {
+            info!(
+                "worktree_reclaim: {} building — WOULD skip (reason=building, shadow/unarmed)",
+                instr.worktree_path
+            );
+            // fall through: the unarmed plan still logs its advisory
+            // "would do X" Skip step below.
+        }
+
         if armed {
             // G6 — never act on a worktree that is currently building.
-            if worktree_is_building(&wt, window) {
+            if building {
                 info!(
                     "worktree_reclaim: {} building — skipping (reason=building)",
                     instr.worktree_path

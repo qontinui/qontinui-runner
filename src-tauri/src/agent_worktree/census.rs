@@ -134,6 +134,16 @@ pub struct WorktreeCensus {
     /// covers squashes independently via the PR `close_cause='merged'`
     /// signal; this field is only the ancestry/patch-id half of G2.
     pub landed_in_main: Option<bool>,
+
+    /// G6 shadow-mode probe — whether this worktree is currently building
+    /// per [`super::reclaim::worktree_is_building`] (cargo `.cargo-lock`
+    /// exclusive-open probe + recent-activity mtime window). Reported every
+    /// census tick regardless of reclaim arming, so coord can gauge
+    /// "instructions that WOULD have been G6-skipped" while arming is still
+    /// OFF — the passive prove-out feed for the Q1 rejunction graduation.
+    /// `Some(_)` is the live probe result; old runners omit the field and
+    /// coord reads NULL (honest unknown).
+    pub building: Option<bool>,
 }
 
 /// Full census body POSTed to coord.
@@ -585,6 +595,10 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     // None when undeterminable (no origin/main, git failure).
     let landed_in_main = compute_landed_in_main(worktree);
 
+    // G6 shadow-mode: the same build probe the reclaim executor uses,
+    // reported every tick regardless of arming (the passive prove-out feed).
+    let building = Some(super::reclaim::probe_building(worktree));
+
     WorktreeCensus {
         repo: repo.to_string(),
         path: worktree.to_string_lossy().to_string(),
@@ -601,6 +615,7 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         last_access_mtime,
         attributable_bytes,
         landed_in_main,
+        building,
     }
 }
 
@@ -893,6 +908,9 @@ mod tests {
         // No git repo → no origin/main ref → landed_in_main is the honest
         // unknown `None` (which coord's gate reads as not-landed).
         assert!(row.landed_in_main.is_none());
+        // G6 shadow probe always reports: a freshly-created tempdir has a
+        // root mtime inside the activity window → Some(true).
+        assert_eq!(row.building, Some(true));
     }
 
     #[test]
