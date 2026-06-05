@@ -647,8 +647,7 @@ pub async fn tick_once() -> Result<(), String> {
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("build reclaim http client: {e}"))?;
-    let resp = client
-        .get(&url)
+    let resp = crate::coord_http::coord_get(&client, &url)
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;

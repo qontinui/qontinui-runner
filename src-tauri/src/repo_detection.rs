@@ -81,8 +81,7 @@ async fn fetch_registered_repos() -> Result<HashSet<String>, String> {
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
-    let resp = client
-        .get(&url)
+    let resp = crate::coord_http::coord_get(&client, &url)
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;

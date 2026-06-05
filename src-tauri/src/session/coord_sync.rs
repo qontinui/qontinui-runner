@@ -975,14 +975,24 @@ async fn fetch_session_coordination_flag(
 ) -> Result<bool, String> {
     let base = inner.coord_url.trim_end_matches('/');
     let url = format!("{base}/tenant-policy?tenant_id={tenant_id}");
-    let resp = inner
-        .http
-        .get(&url)
+    let resp = crate::coord_http::coord_get(&inner.http, &url)
         .send()
         .await
         .map_err(|e| format!("transport: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("status {}", resp.status()));
+    let status = resp.status();
+    if !status.is_success() {
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            // The tenant-policy poll can spin up before the device-JWT
+            // exists (it starts as soon as a tenant resolves). Once coord
+            // gates /tenant-policy with FleetPrincipal, the anonymous GET is
+            // rejected until the token lands. Not fatal — the loop keeps the
+            // cached cutover flag and re-ticks. One line.
+            tracing::warn!(
+                "coord_sync: tenant-policy GET unauthorized ({}) — retrying after device pairing/auth",
+                status.as_u16()
+            );
+        }
+        return Err(format!("status {status}"));
     }
     let body: JsonValue = resp.json().await.map_err(|e| format!("decode: {e}"))?;
     body.get("session_coordination_enabled")

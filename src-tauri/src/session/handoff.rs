@@ -350,6 +350,15 @@ async fn run_catchup(
                 materialize_logged(registry, http, coord_url, &handoff).await;
             }
         }
+        Err(HandoffError::Status(401 | 403, _)) => {
+            // Pre-pairing / early-reconnect window: coord (once it gates the
+            // handoff readers with FleetPrincipal) rejects the anonymous GET
+            // until the device-JWT lands. Not fatal — the catch-up re-runs on
+            // the next (re)connect, and the push path stays active. One line.
+            tracing::warn!(
+                "session handoff: catch-up GET unauthorized (401/403) — retrying after device pairing/auth"
+            );
+        }
         Err(e) => {
             tracing::debug!(error = %e, "session handoff: catch-up GET failed (push path still active)");
         }
@@ -472,8 +481,7 @@ async fn fetch_pending(
         coord_url.trim_end_matches('/'),
         device_id
     );
-    let resp = http
-        .get(&url)
+    let resp = crate::coord_http::coord_get(http, &url)
         .send()
         .await
         .map_err(|e| HandoffError::Http(format!("GET {url}: {e}")))?;
@@ -503,8 +511,7 @@ async fn fetch_state(
         coord_url.trim_end_matches('/'),
         source_session_id
     );
-    let resp = http
-        .get(&url)
+    let resp = crate::coord_http::coord_get(http, &url)
         .send()
         .await
         .map_err(|e| HandoffError::Http(format!("GET {url}: {e}")))?;
