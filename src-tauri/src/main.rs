@@ -957,6 +957,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::check_auth_status,
             commands::auth::device_jwt_present,
             commands::auth::get_access_token_for_websocket,
+            commands::auth::get_coord_device_token,
             commands::auth::get_api_port,
             commands::auth::get_device_info,
             commands::auth::get_user_projects,

@@ -7,6 +7,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Play, Square, Info, X, Check, CircleDot } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getAccentColors } from "@/design-system";
@@ -29,6 +30,32 @@ interface CiRunnerSettingsProps {
 
 const SUPERVISOR_BASE = "http://localhost:9875";
 const POLL_INTERVAL_MS = 10_000;
+
+// Shown when the runner is unpaired (no coord device-JWT). Enabling/disabling
+// the CI runner mints a GitHub Actions registration token via coord, which now
+// requires a FleetPrincipal — so we MUST present the device credential and
+// never call the supervisor anonymously.
+const UNPAIRED_ERROR =
+  "Pair this runner before enabling CI — no device credential. " +
+  "Sign in / pair under Settings → Account, then try again.";
+
+// Sentinel for the unpaired case so the catch-blocks can render the actionable
+// message verbatim (without the "Failed to …" prefix the generic path adds).
+class UnpairedError extends Error {}
+
+/**
+ * Resolve the runner's coord device-JWT via the Tauri command, or throw an
+ * {@link UnpairedError} when the device is unpaired (command returns null).
+ * Returns the `Authorization: Bearer <jwt>` value to attach to supervisor calls
+ * that perform the FleetPrincipal-gated registration-token mint.
+ */
+async function deviceBearerHeader(): Promise<string> {
+  const token = await invoke<string | null>("get_coord_device_token");
+  if (!token) {
+    throw new UnpairedError(UNPAIRED_ERROR);
+  }
+  return `Bearer ${token}`;
+}
 
 // Toggle Switch (matches ContainerSettings / SelfHealingSettings pattern)
 function ToggleSwitch({
@@ -118,9 +145,10 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     setError(null);
     setActionSuccess(null);
     try {
+      const authHeader = await deviceBearerHeader();
       const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/enable`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Authorization: authHeader },
         body: JSON.stringify({
           labels: ["self-hosted", "qontinui"],
         }),
@@ -135,6 +163,11 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
       await fetchStatus();
       setTimeout(() => setActionSuccess(null), 3000);
     } catch (err) {
+      if (err instanceof UnpairedError) {
+        setError(err.message);
+        onLog("error", `Cannot enable CI runner: ${err.message}`);
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       setError(`Failed to enable CI runner: ${msg}`);
       onLog("error", `Failed to enable CI runner: ${msg}`);
@@ -148,8 +181,10 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     setError(null);
     setActionSuccess(null);
     try {
+      const authHeader = await deviceBearerHeader();
       const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/disable`, {
         method: "POST",
+        headers: { Authorization: authHeader },
       });
       if (!resp.ok) {
         const body = await resp.text();
@@ -160,6 +195,11 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
       await fetchStatus();
       setTimeout(() => setActionSuccess(null), 3000);
     } catch (err) {
+      if (err instanceof UnpairedError) {
+        setError(err.message);
+        onLog("error", `Cannot disable CI runner: ${err.message}`);
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       setError(`Failed to disable CI runner: ${msg}`);
       onLog("error", `Failed to disable CI runner: ${msg}`);
