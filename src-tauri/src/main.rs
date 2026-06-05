@@ -553,9 +553,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // coord's pending per-device reclaim instructions and
                 // execute the INV-W4 safe path (unlink junctions FIRST,
                 // then remove the worktree; or recreate a drifted
-                // junction). coord ships dry_run=true by default (the
-                // poller only LOGS what it would do); the operator arms
-                // execution server-side via COORD_WORKTREE_RECLAIM_ENABLED.
+                // junction). Arming is per-action: rejunction_armed /
+                // remove_armed both default OFF (the poller only LOGS what
+                // it would do); coord arms remove via
+                // COORD_WORKTREE_RECLAIM_ENABLED and graduates rejunction
+                // to default-on once the G6 build-guard is proven.
                 // Default 300s cadence (env
                 // QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS). Same machine-
                 // wide, anonymous, device-keyed posture as the census.
