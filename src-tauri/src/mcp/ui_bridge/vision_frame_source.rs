@@ -177,6 +177,7 @@ fn frame_from_screenshot_json(body: &serde_json::Value) -> Result<Frame, String>
             kind: FrameSourceKind::Device,
             scale_factor,
             captured_at: Utc::now(),
+            capture_backend: None,
         },
     ))
 }
@@ -200,6 +201,7 @@ impl FrameProvider for AdbScreencapSource {
                 kind: FrameSourceKind::Device,
                 scale_factor: 1.0,
                 captured_at: Utc::now(),
+                capture_backend: None,
             },
         ))
     }

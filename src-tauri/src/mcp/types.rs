@@ -277,6 +277,20 @@ pub struct ApiState {
     /// navigate). Folded into the cache key so any state-changing action
     /// transparently busts cache entries — no clock-based TTL needed.
     pub vision_mutation_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative count of runner-window frames served by the WebView2
+    /// CapturePreview backend since process start. Surfaced in `vision/health`.
+    pub vision_capture_preview_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative count of runner-window frames served by the monitor-crop
+    /// fallback backend since process start. Surfaced in `vision/health`.
+    pub vision_monitor_crop_count: Arc<std::sync::atomic::AtomicU64>,
+    /// First-seen flag for the CapturePreview→monitor-crop fallback this
+    /// session. The first fallback is promoted to `info!`; subsequent ones
+    /// stay `warn!`.
+    pub vision_capture_fallback_seen: Arc<std::sync::atomic::AtomicBool>,
+    /// Reason + timestamp of the most recent CapturePreview→monitor-crop
+    /// fallback this session, or `None`. Surfaced in `vision/health`.
+    pub vision_last_fallback:
+        Arc<std::sync::Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>>>,
     /// Phase 6 vision baselines: name → snapshot bboxes + provenance.
     /// Populated by `POST /ui-bridge/vision/baseline`, read by the
     /// `NoLayoutShiftSince { baseline }` assertion. Lives in-process —
