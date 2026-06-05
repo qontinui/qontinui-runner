@@ -143,9 +143,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 tempfile = "3"
 # notify-rust removed — replaced by tauri-plugin-notification (session 15)
 
-# MCP (Model Context Protocol) client
-rmcp = "0.1"
-
 # Restate durable execution (optional — behind `restate` feature flag)
 restate-sdk = { version = "0.10", optional = true }
 # Required when the `restate` feature is on so local types can implement
