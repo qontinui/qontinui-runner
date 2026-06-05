@@ -10,7 +10,7 @@
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::executor::{get_or_create_default_bridge, with_default_bridge};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -110,6 +110,34 @@ fn focus_runner_window(app_handle: &tauri::AppHandle) -> Result<(), String> {
     })?;
     info!("GUI Config: Runner window focused for screenshot capture");
     Ok(())
+}
+
+/// Whether the runner's main window currently holds the OS foreground.
+///
+/// `set_focus()` can return `Ok` while Windows foreground-lock silently refuses
+/// to raise the window (another app owns the foreground). Comparing the runner
+/// window's HWND to `GetForegroundWindow()` — after the focus transition has
+/// settled — detects that no-op so the caller can report it honestly instead of
+/// claiming a capture-ready window. On non-Windows there is no foreground-lock
+/// equivalent, so we report confirmed.
+#[cfg(windows)]
+fn runner_window_has_foreground(app_handle: &tauri::AppHandle) -> Result<bool, String> {
+    use tauri::Manager;
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let win = app_handle
+        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .ok_or_else(|| "runner main window not found".to_string())?;
+    let hwnd = win
+        .hwnd()
+        .map_err(|e| format!("window hwnd() failed: {e}"))?;
+    // SAFETY: GetForegroundWindow takes no arguments and only reads OS state.
+    let foreground = unsafe { GetForegroundWindow() };
+    Ok(hwnd.0 as isize == foreground.0 as isize)
+}
+
+#[cfg(not(windows))]
+fn runner_window_has_foreground(_app_handle: &tauri::AppHandle) -> Result<bool, String> {
+    Ok(true)
 }
 
 // ============================================================================
@@ -356,19 +384,42 @@ pub async fn capture_multi_state(
 /// Brings the runner window to the foreground. Called by the Python bridge
 /// before each screenshot capture to ensure the runner's content is visible.
 ///
-/// Reports focus failure honestly: if the runner window can't be found or
-/// `set_focus()` errors, this returns 500 rather than a false success. (A
-/// Windows foreground-lock that makes `set_focus()` a *silent* no-op — Ok
-/// returned but the window never comes forward — is only fully addressed by
-/// occlusion-immune per-window capture; see the follow-up capture plan.)
+/// Reports focus failure honestly: returns 500 (not a false success) if the
+/// runner window can't be found, `set_focus()` errors, OR `set_focus()`
+/// silently no-ops — i.e. it returned `Ok` but the window never actually
+/// reached the foreground (Windows foreground-lock when another app owns
+/// focus). The post-settle `GetForegroundWindow()` check catches that no-op so
+/// a caller doesn't proceed to capture an occluded window believing it's on
+/// top. (Removing the focus dependency entirely is the occlusion-immune
+/// per-window capture follow-up; this endpoint stays load-bearing for
+/// full-screen / Python-HAL captures, which remain focus-dependent.)
 pub async fn focus_window(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     focus_runner_window(&state.app_handle)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    // Small delay to let the window manager finish the focus transition
+    // Small delay to let the window manager finish the focus transition.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    Ok(Json(ApiResponse::success(())))
+    // Verify the window actually reached the foreground — `set_focus()` can
+    // return Ok while foreground-lock keeps another window on top.
+    match runner_window_has_foreground(&state.app_handle) {
+        Ok(true) => Ok(Json(ApiResponse::success(()))),
+        Ok(false) => {
+            warn!(
+                "GUI Config: focus-window no-op — runner did not reach the \
+                 foreground (foreground-lock / another window holds focus)"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(
+                    "runner window did not reach the foreground (another window \
+                     holds focus / Windows foreground-lock); a capture now may \
+                     show the occluding window",
+                )),
+            ))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
 }
 
 /// POST /gui-config/start-executor
