@@ -99,15 +99,17 @@ fn detect_window_geometry(
 /// Screenshots capture the full screen, so the runner window must be on top.
 /// Without this, other windows (terminals, editors) covering the runner would
 /// be captured instead of the runner's UI.
-fn focus_runner_window(app_handle: &tauri::AppHandle) {
+fn focus_runner_window(app_handle: &tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
-    if let Some(win) = app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
-        if let Err(e) = win.set_focus() {
-            error!("GUI Config: Failed to focus runner window: {}", e);
-        } else {
-            info!("GUI Config: Runner window focused for screenshot capture");
-        }
-    }
+    let win = app_handle
+        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .ok_or_else(|| "runner main window not found".to_string())?;
+    win.set_focus().map_err(|e| {
+        error!("GUI Config: Failed to focus runner window: {}", e);
+        format!("failed to focus runner window: {e}")
+    })?;
+    info!("GUI Config: Runner window focused for screenshot capture");
+    Ok(())
 }
 
 // ============================================================================
@@ -353,10 +355,17 @@ pub async fn capture_multi_state(
 ///
 /// Brings the runner window to the foreground. Called by the Python bridge
 /// before each screenshot capture to ensure the runner's content is visible.
+///
+/// Reports focus failure honestly: if the runner window can't be found or
+/// `set_focus()` errors, this returns 500 rather than a false success. (A
+/// Windows foreground-lock that makes `set_focus()` a *silent* no-op — Ok
+/// returned but the window never comes forward — is only fully addressed by
+/// occlusion-immune per-window capture; see the follow-up capture plan.)
 pub async fn focus_window(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    focus_runner_window(&state.app_handle);
+    focus_runner_window(&state.app_handle)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
     // Small delay to let the window manager finish the focus transition
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     Ok(Json(ApiResponse::success(())))

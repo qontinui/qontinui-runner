@@ -1547,8 +1547,14 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             get(ui_bridge_page_playbook_handler),
         )
         .route(
+            // GET + POST: page-summary is a pure read, so verification drivers
+            // reach it with GET. Without the GET method axum returns a
+            // framework 405 (no `text/plain` body), which slips past
+            // `envelope_rewrite_middleware` and trips the debug-only
+            // `envelope_audit` panic. See plan
+            // 2026-06-05-ui-bridge-verification-read-freshness.
             "/ui-bridge/ai/page-summary",
-            post(ui_bridge_page_summary_handler),
+            get(ui_bridge_page_summary_handler).post(ui_bridge_page_summary_handler),
         )
 }
 
@@ -1757,6 +1763,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/control/navigate-and-wait"),
         ("POST", "/ui-bridge/control/page/summary"),
         ("GET", "/ui-bridge/control/page/playbook"),
+        ("GET", "/ui-bridge/ai/page-summary"),
         ("POST", "/ui-bridge/ai/page-summary"),
     ]
 }

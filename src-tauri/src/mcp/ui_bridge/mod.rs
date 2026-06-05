@@ -754,6 +754,12 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/ai/fill-form"),
             ("POST", "/ui-bridge/ai/image-diff"),
             ("POST", "/ui-bridge/ai/media/audit/{}"),
+            // page-summary is a runner-only `/ai/*` read extension (not in the
+            // SDK contract). It accepts GET as well as POST so verification
+            // drivers can read it with GET without tripping the auto-405 →
+            // envelope_audit panic (plan
+            // 2026-06-05-ui-bridge-verification-read-freshness).
+            ("GET", "/ui-bridge/ai/page-summary"),
             ("POST", "/ui-bridge/ai/page-summary"),
             ("POST", "/ui-bridge/ai/wait-for-idle"),
             ("POST", "/ui-bridge/ai/wait-for-navigation"),

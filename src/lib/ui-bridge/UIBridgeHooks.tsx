@@ -20,6 +20,8 @@ import {
   type ShortcutDef,
 } from "@qontinui/ui-bridge";
 
+import { useVisionCacheInvalidation } from "../../hooks/useVisionCacheInvalidation";
+
 // ---------------------------------------------------------------------------
 // Props — the host component (AppContent) passes live state so hooks can
 // reference real values without pulling in unrelated contexts.
@@ -121,6 +123,10 @@ export function UIBridgeHooks({
   // -------------------------------------------------------------------------
   // 0. Route Awareness (tab-based navigation — no React Router)
   // -------------------------------------------------------------------------
+
+  // Keep the runner's vision OCR read-cache fresh on event/poll-driven
+  // re-renders (not just control actions). See useVisionCacheInvalidation.
+  useVisionCacheInvalidation();
 
   const routeInfo = useMemo(() => {
     // Derive section from TAB_GROUPS
