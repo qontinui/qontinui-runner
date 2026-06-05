@@ -17,6 +17,7 @@ import {
 import type { UnifiedSession, SessionLiveStatus } from "./useSessionManager";
 import type { LockState } from "./useFileLockTracking";
 import type { CommandResponse } from "./types";
+import { isInjectedSession } from "./syntheticTabs";
 
 interface PromoteToWorktreeData {
   worktree_id: string;
@@ -187,6 +188,15 @@ export function SessionCard({
     async (e: React.MouseEvent) => {
       e.stopPropagation();
       if (!canPromote || promoteState.kind === "loading") return;
+      // F1 inertness: a debug-injected fake has no real ClaudeSession in the
+      // manager — `promote_session_to_worktree` would 404. No-op it (and don't
+      // flip the card into a misleading loading/error state).
+      if (isInjectedSession(session)) {
+        console.warn(
+          `[test-fixtures] ignoring promote on synthetic tab ${session.zoneTabId ?? session.sessionId}`,
+        );
+        return;
+      }
       setPromoteState({ kind: "loading" });
       try {
         const result = await invoke<CommandResponse>("promote_session_to_worktree", {
@@ -228,7 +238,7 @@ export function SessionCard({
         }, 8000);
       }
     },
-    [canPromote, promoteState.kind, session.sessionId, onAfterPromote],
+    [canPromote, promoteState.kind, session, onAfterPromote],
   );
 
   // ── Commit progress state ───────────────────────────────────────────────
@@ -255,6 +265,14 @@ export function SessionCard({
     async (e: React.MouseEvent) => {
       e.stopPropagation();
       if (!canCommit || commitState.kind === "loading") return;
+      // F1 inertness: a debug-injected fake has no real ClaudeSession —
+      // `commit_session_progress` would 404. No-op it.
+      if (isInjectedSession(session)) {
+        console.warn(
+          `[test-fixtures] ignoring commit on synthetic tab ${session.zoneTabId ?? session.sessionId}`,
+        );
+        return;
+      }
       setCommitState({ kind: "loading" });
       try {
         const result = await invoke<CommandResponse>("commit_session_progress", {
@@ -283,7 +301,7 @@ export function SessionCard({
         }, 8000);
       }
     },
-    [canCommit, commitState.kind, session.sessionId],
+    [canCommit, commitState.kind, session],
   );
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {

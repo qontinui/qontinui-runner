@@ -1765,6 +1765,13 @@ pub fn create_router(
     // the `mcp::test_fixtures` module declaration in `mcp/mod.rs`, so
     // production release builds without the `test-fixtures` feature compile
     // away both the module and the merge call entirely.
+    // Hand the seam an AppHandle so its mutating endpoints can emit
+    // `test-fixtures-injected-changed` — `useTranscriptSessions` refetches on
+    // that event instead of waiting for its 30s visibility-gated poll (a
+    // hidden window never ticks, which would leave a seeded/cleared scenario
+    // invisible to the acceptance driver until refocus).
+    #[cfg(any(debug_assertions, feature = "test-fixtures"))]
+    crate::mcp::test_fixtures::set_app_handle(app_handle.clone());
     #[cfg(any(debug_assertions, feature = "test-fixtures"))]
     let base_router = base_router.merge(crate::mcp::test_fixtures::routes());
 

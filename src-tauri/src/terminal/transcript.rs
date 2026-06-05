@@ -38,6 +38,38 @@ pub struct TranscriptSession {
     /// (`active-in-zone | needs-input | frozen | …`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injected_live_status: Option<String>,
+    /// Optional synthetic-tab spec, set only by the debug-gated test-fixtures
+    /// path (`mcp::test_fixtures`) for a *tab-backed* injected fake.
+    ///
+    /// `None` for real on-disk transcripts (omitted from the serialized JSON
+    /// via `skip_serializing_if`). When `Some(...)`, the frontend derives a
+    /// minimal `TerminalTab` from it (`syntheticTabs.ts`) and feeds it through
+    /// the REAL `useSessionManager` tab-correlation path so an injected fake
+    /// can land in the `idle` / tab-backed `error` / tab-backed `completed`
+    /// StatusStrip buckets that the `injected_live_status` short-circuit
+    /// cannot reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injected_tab: Option<InjectedTabSpec>,
+}
+
+/// Synthetic-tab spec carried on a *tab-backed* injected fake (see
+/// `TranscriptSession::injected_tab`). Defined here (an always-compiled
+/// module) rather than in the cfg-gated `mcp::test_fixtures` so the field type
+/// resolves in release builds without the `test-fixtures` feature. Only ever
+/// populated behind that gated seam; the frontend consumer is dead code in a
+/// release build.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InjectedTabSpec {
+    /// `true` → a live synthetic tab the staleness sweep can age into
+    /// `frozen` (idle bucket). `false` → a dead tab whose `exit_code` the
+    /// dead-tab sweep branch maps to `completed` / `error`.
+    pub is_alive: bool,
+    /// Exit code for a dead synthetic tab (`0` → completed, non-zero →
+    /// error). `None` for a live (idle) tab.
+    pub exit_code: Option<i32>,
+    /// Pre-age in ms for a live tab's `lastOutput` so the 60s staleness sweep
+    /// classifies it stale. `None` for dead tabs.
+    pub quiet_ms: Option<u64>,
 }
 
 /// A single parsed message from a Claude Code transcript.
@@ -294,6 +326,7 @@ pub fn list_sessions(
             // Real on-disk sessions never carry a status override; the
             // frontend computes `liveStatus` from tab/digest correlation.
             injected_live_status: None,
+            injected_tab: None,
         };
 
         if let Some(mt) = mtime {
@@ -792,6 +825,7 @@ pub fn get_latest_session_id(
                             display_name,
                             // Real on-disk session — no override.
                             injected_live_status: None,
+                            injected_tab: None,
                         });
                     }
                 }

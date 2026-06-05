@@ -87,6 +87,7 @@ import { useAnalysis } from "../useAnalysis";
 import { useFindingsActions } from "../useFindingsActions";
 import { useTranscriptSessions } from "../useTranscriptSessions";
 import { useSessionManager } from "../useSessionManager";
+import { deriveSyntheticTabs } from "../syntheticTabs";
 
 import { instanceStorage } from "@/lib/instance-storage";
 
@@ -299,13 +300,47 @@ export function TerminalSessionProvider({
     pendingProfileSessionsRef.current = remaining.length > 0 ? remaining : null;
   }, [zoneLayout.assignments, updateTab]);
 
+  // Transcripts are read up here (rather than in the AiFeatures block below)
+  // because the debug-gated synthetic-tab seam derives synthetic tabs from
+  // them and must feed those tabs into `useSessionStateTracking` /
+  // `useSessionManager`. Pure hook reordering — no behavioral change for the
+  // real path (transcripts with no `injected_tab` produce zero synthetic tabs).
+  const {
+    sessions: transcriptSessions,
+    loading: sessionsLoading,
+    refresh: refreshSessions,
+    loadMessages,
+  } = useTranscriptSessions();
+
+  // Synthetic tabs from tab-backed injected fakes (debug-gated test-fixtures
+  // seam). Only the MAIN window derives them — pop-out windows own a disjoint
+  // tab subset and the fakes correlate to the main window's session list.
+  // Real transcripts never carry `injected_tab`, so this is empty in
+  // production (and dead code in a release build without `test-fixtures`).
+  const { tabs: syntheticTabs, seedLastOutput: syntheticSeedLastOutput } = useMemo(
+    () =>
+      myWindowLabel === MAIN_WINDOW_LABEL
+        ? deriveSyntheticTabs(transcriptSessions)
+        : { tabs: [], seedLastOutput: {} },
+    [myWindowLabel, transcriptSessions],
+  );
+
+  // Real tabs PLUS synthetic tabs — fed ONLY to the two consumers that drive
+  // StatusStrip bucketing. Every other consumer keeps the real `tabs` so a
+  // synthetic tab never renders a terminal pane.
+  const tabsWithSynthetic = useMemo(
+    () => (syntheticTabs.length > 0 ? [...tabs, ...syntheticTabs] : tabs),
+    [tabs, syntheticTabs],
+  );
+
   // ---- SessionState ----
   const processOutputRef = useRef<((tabId: string, text: string) => void) | undefined>(
     undefined,
   );
 
   const stateTracking = useSessionStateTracking({
-    tabs,
+    tabs: tabsWithSynthetic,
+    seedLastOutput: syntheticSeedLastOutput,
     processOutput: (tabId, text) => processOutputRef.current?.(tabId, text),
     getBufferLines: (tabId, maxLines) => {
       const ref = terminalRefs.current.get(tabId);
@@ -390,13 +425,6 @@ export function TerminalSessionProvider({
     return ref?.current?.getSelection?.() ?? "";
   }, [activeId, terminalRefs]);
 
-  const {
-    sessions: transcriptSessions,
-    loading: sessionsLoading,
-    refresh: refreshSessions,
-    loadMessages,
-  } = useTranscriptSessions();
-
   // `desktopNotify` was previously read off TransitionEffectsContext
   // (which lived ABOVE AiFeaturesContext in the prior provider tree).
   // Post-collapse, TerminalSession is the OUTERMOST provider and
@@ -411,7 +439,10 @@ export function TerminalSessionProvider({
   const desktopNotifyFlag = instanceStorage.getItem("zone-desktop-notify") === "true";
 
   const sessionManager = useSessionManager({
-    tabs,
+    // Synthetic tabs included so `tabSessionMap` correlation places tab-backed
+    // injected fakes (idle / error / completed) in the right StatusStrip
+    // bucket. Empty in production (real transcripts carry no `injected_tab`).
+    tabs: tabsWithSynthetic,
     sessionStates: stateTracking.sessionStates,
     staleTabs: stateTracking.staleTabs,
     transcriptSessions,

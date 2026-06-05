@@ -33,6 +33,15 @@ export interface TerminalTab {
    * (`set_title_unless_worker`) on the frontend side.
    */
   taskRunId?: string;
+  /**
+   * Marks a tab synthesized from a debug-gated test-fixtures `injected_tab`
+   * spec (`syntheticTabs.ts`). Synthetic tabs are fed ONLY to
+   * `useSessionStateTracking` + `useSessionManager` for StatusStrip
+   * bucketing — they never back a real PTY and must never render a terminal
+   * pane. Phase 3 uses this flag for inertness guards. Absent/false on every
+   * real tab.
+   */
+  __synthetic?: boolean;
 }
 
 /** Tauri event payload from `commands::productivity::spawn_worker_session`. */
