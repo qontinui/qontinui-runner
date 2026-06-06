@@ -904,10 +904,10 @@ pub async fn ui_bridge_append_render_log_handler(
 ///
 /// Distinct from `/ui-bridge/control/windows`, which enumerates OS desktop
 /// windows (Chrome, VS Code, …) for desktop automation. This lists the
-/// webviews THIS runner process hosts — just the main window today, plus the
-/// pop-out terminal windows that Phase 1 of
-/// `plans/2026-06-03-runner-popout-terminal-windows.md` will add — so UI Bridge
-/// clients can discover and address them by `windowLabel`.
+/// webviews THIS runner process hosts — the main window plus any pop-out
+/// terminal windows (`plans/2026-06-03-runner-popout-terminal-windows.md`) — so
+/// UI Bridge clients can discover them and address requests with
+/// `?windowLabel=` / a `windowLabel` payload field (see `request.rs`).
 pub async fn ui_bridge_list_runner_windows_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {

@@ -114,6 +114,11 @@ pub async fn ui_bridge_get_elements_handler(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    // Optional `?windowLabel=term-1` scopes discovery to one pop-out terminal
+    // window (discoverable via `GET /ui-bridge/control/runner-windows`). Omitted
+    // → the main window, byte-identical to single-window behavior.
+    let window_label = query.get("windowLabel").map(String::as_str);
+
     // P3.2: opt-in legacy shape via `?v=1` query or `X-Api-Version: 1` header.
     // Default (no opt-in) returns the v2 wrapped object; the deprecation header
     // is attached only when v1 is in effect so v2 callers don't see noise.
@@ -140,7 +145,10 @@ pub async fn ui_bridge_get_elements_handler(
         if let Err(e) = ui_bridge_request_sync(
             &state,
             "discover",
-            serde_json::json!({ "options": { "interactiveOnly": false } }),
+            super::request::target_window_payload(
+                serde_json::json!({ "options": { "interactiveOnly": false } }),
+                window_label,
+            ),
         )
         .await
         {
@@ -161,7 +169,13 @@ pub async fn ui_bridge_get_elements_handler(
     // simple-glob match — see `reveals_entry_matches` for semantics.
     let filter_reveals_any = query.get("revealsAny").cloned();
 
-    match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
+    match ui_bridge_request_sync(
+        &state,
+        "get_elements",
+        super::request::target_window_payload(serde_json::json!({}), window_label),
+    )
+    .await
+    {
         Ok(data) => {
             let mut resp_headers = HeaderMap::new();
             // The IPC response is either a raw array or `{ elements: [...] }`.
@@ -481,6 +495,12 @@ pub struct ActionQueryParams {
     /// When provided, the action event is persisted to ui_bridge_events for cross-run analysis.
     #[serde(default)]
     pub task_run_id: Option<i64>,
+    /// Optional `?windowLabel=term-1` — target a pop-out terminal window
+    /// (discoverable via `GET /ui-bridge/control/runner-windows`). Omitted →
+    /// the main window. Scopes both the action and its pre/post detector
+    /// queries so the element id resolves in the right window's registry.
+    #[serde(default, rename = "windowLabel")]
+    pub window_label: Option<String>,
 }
 
 /// Execute multiple element actions in a single HTTP round-trip.
@@ -855,6 +875,12 @@ pub async fn ui_bridge_execute_action_handler(
         }
     };
 
+    // Target pop-out window (`?windowLabel=term-1`); scopes the action AND its
+    // detector/validation queries below so the element id resolves in the right
+    // window's registry. Owned so it survives the awaits without borrowing query.
+    let window_label = query.window_label.clone();
+    let window_label = window_label.as_deref();
+
     // ── Invalid-action gate ─────────────────────────────────────────────
     // Reject unknown action names BEFORE the registry lookup, the
     // stale-registry retry, and the Phase 5 RecoveryExecutor. Without this
@@ -931,7 +957,10 @@ pub async fn ui_bridge_execute_action_handler(
         let is_input = match ui_bridge_request_sync(
             &state,
             "get_element",
-            serde_json::json!({ "elementId": id }),
+            super::request::target_window_payload(
+                serde_json::json!({ "elementId": id }),
+                window_label,
+            ),
         )
         .await
         {
@@ -965,7 +994,10 @@ pub async fn ui_bridge_execute_action_handler(
         match ui_bridge_request_sync(
             &state,
             "discover",
-            serde_json::json!({ "options": { "interactiveOnly": false } }),
+            super::request::target_window_payload(
+                serde_json::json!({ "options": { "interactiveOnly": false } }),
+                window_label,
+            ),
         )
         .await
         {
@@ -1004,10 +1036,13 @@ pub async fn ui_bridge_execute_action_handler(
         "waitOptions": request.wait_options
     });
 
-    let payload = serde_json::json!({
-        "elementId": id,
-        "action": action_obj.clone()
-    });
+    let payload = super::request::target_window_payload(
+        serde_json::json!({
+            "elementId": id,
+            "action": action_obj.clone()
+        }),
+        window_label,
+    );
 
     // ── Issue 2: Disabled-state detection ──────────────────────────────
     // Before dispatching the action, fetch the element state and reject
@@ -1022,7 +1057,7 @@ pub async fn ui_bridge_execute_action_handler(
     let element_supported_actions: Option<Vec<String>> = match ui_bridge_request_sync(
         &state,
         "get_element",
-        serde_json::json!({ "elementId": id }),
+        super::request::target_window_payload(serde_json::json!({ "elementId": id }), window_label),
     )
     .await
     {
@@ -1187,7 +1222,10 @@ pub async fn ui_bridge_execute_action_handler(
             let _ = ui_bridge_request_sync(
                 &state,
                 "discover",
-                serde_json::json!({ "options": { "interactiveOnly": false } }),
+                super::request::target_window_payload(
+                    serde_json::json!({ "options": { "interactiveOnly": false } }),
+                    window_label,
+                ),
             )
             .await;
 
@@ -1249,9 +1287,10 @@ pub async fn ui_bridge_execute_action_handler(
                             "execute_action: attempting stable ref resolution for element {}",
                             id
                         );
-                        let resolve_payload = serde_json::json!({
-                            "stableRef": stable_ref_json
-                        });
+                        let resolve_payload = super::request::target_window_payload(
+                            serde_json::json!({ "stableRef": stable_ref_json }),
+                            window_label,
+                        );
                         if let Ok(resolve_result) =
                             ui_bridge_request_sync(&state, "resolve_stable_ref", resolve_payload)
                                 .await
@@ -1261,10 +1300,13 @@ pub async fn ui_bridge_execute_action_handler(
                             {
                                 info!("execute_action: stable ref resolved {} -> {}", id, new_id);
                                 // Retry with the resolved ID
-                                let retry_payload = serde_json::json!({
-                                    "elementId": new_id,
-                                    "action": action_obj
-                                });
+                                let retry_payload = super::request::target_window_payload(
+                                    serde_json::json!({
+                                        "elementId": new_id,
+                                        "action": action_obj
+                                    }),
+                                    window_label,
+                                );
                                 let retry_result = wrap_ipc_result(
                                     ui_bridge_request_sync(&state, "execute_action", retry_payload)
                                         .await,
@@ -1499,7 +1541,10 @@ pub async fn ui_bridge_execute_action_handler(
         let post_sig = match ui_bridge_request_sync(
             &state,
             "discover",
-            serde_json::json!({ "options": { "interactiveOnly": false } }),
+            super::request::target_window_payload(
+                serde_json::json!({ "options": { "interactiveOnly": false } }),
+                window_label,
+            ),
         )
         .await
         {
