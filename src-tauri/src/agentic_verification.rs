@@ -367,6 +367,7 @@ impl AgenticVerificationResult {
                     },
                     blame_json: None,
                     contingent_on: Vec::new(),
+                    node_rollups: Vec::new(),
                 })
                 .collect(),
             fix_attempts_exhausted: false,
@@ -375,6 +376,7 @@ impl AgenticVerificationResult {
             files_modified: Vec::new(),
             fix_attempts: 0,
             ci_auto_resumes: 0,
+            node_rollups: Vec::new(),
         }
     }
 
@@ -1183,6 +1185,7 @@ impl MultiAgentPipelineResult {
                             agentic_phase_success: Some(lr.passed),
                             blame_json: None,
                             contingent_on: Vec::new(),
+                            node_rollups: Vec::new(),
                         }
                     })
                 })
@@ -1218,6 +1221,7 @@ impl MultiAgentPipelineResult {
             fix_attempts_exhausted: false,
             fix_attempts: 0,
             ci_auto_resumes: 0,
+            node_rollups: Vec::new(),
         }
     }
 

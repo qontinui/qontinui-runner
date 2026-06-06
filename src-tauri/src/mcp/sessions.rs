@@ -165,6 +165,7 @@ async fn spawn_session(
             None,
             None,
             None,
+            None, // tool_policy
         ) {
             Ok(s) => Arc::new(s),
             Err(e) => return Err(format!("spawn failed: {}", e)),

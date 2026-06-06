@@ -28,7 +28,7 @@ use super::loop_state_machine::{CompletionReason, LoopContext, LoopState};
 use super::states::UnifiedWorkflowState;
 use super::types::{
     get_parent_task_id, step_execution_to_record, AgenticOutcome, IterationResult, LoopConfig,
-    LoopResult, PhaseResult, RollbackPolicy, StepResultRecord,
+    LoopResult, NodeTelemetry, PhaseResult, RollbackPolicy, StepResultRecord,
 };
 
 use super::loop_controller::{emit_and_persist_phase_result, LoopController};
@@ -1181,6 +1181,7 @@ impl LoopController {
                 agentic_phase_success: None,
                 blame_json: None,
                 contingent_on: Vec::new(),
+                node_rollups: Vec::new(),
             };
             ctx.iteration_results.push(iter_result);
 
@@ -1207,6 +1208,7 @@ impl LoopController {
                 agentic_phase_success: None,
                 blame_json: None,
                 contingent_on: Vec::new(),
+                node_rollups: Vec::new(),
             };
             ctx.iteration_results.push(iter_result);
 
@@ -1891,6 +1893,8 @@ impl LoopController {
                             parsed: None,
                             input_tokens: None,
                             output_tokens: None,
+                            tools_used: Vec::new(),
+                            tools_rejected: Vec::new(),
                         },
                         injected_steps: vec![],
                         failure_context: failure_context.to_string(),
@@ -2508,6 +2512,32 @@ impl LoopController {
             )
             .await;
 
+        // Blueprint telemetry (Phase 4 §3.3): attribute the agentic session's
+        // token cost / tool usage / rejections to the agentic node. Only build
+        // a rollup when the agentic phase actually ran.
+        let node_rollups: Vec<NodeTelemetry> =
+            if !matches!(agentic_outcome, AgenticOutcome::Skipped) {
+                let (tools_used, tools_rejected) = agentic_outcome.tools();
+                let (in_tok, out_tok) = agentic_outcome.token_usage();
+                let tokens = match (in_tok, out_tok) {
+                    (None, None) => None,
+                    (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+                };
+                let node_id = agentic_steps
+                    .first()
+                    .and_then(|s| s.id.clone())
+                    .unwrap_or_else(|| "agentic".into());
+                vec![NodeTelemetry {
+                    node_id,
+                    node_kind: "agentic".into(),
+                    tools_used,
+                    tools_rejected,
+                    tokens,
+                }]
+            } else {
+                Vec::new()
+            };
+
         let iter_result = IterationResult {
             iteration: ctx.iteration,
             verification_passed: false,
@@ -2519,6 +2549,7 @@ impl LoopController {
             agentic_phase_success: Some(agentic_outcome.is_success()),
             blame_json: ctx.blame_json.take(),
             contingent_on: ctx.active_contingencies.clone(),
+            node_rollups,
         };
         ctx.iteration_results.push(iter_result);
 
@@ -2936,6 +2967,7 @@ impl LoopController {
             agentic_phase_success: None,
             blame_json: None,
             contingent_on: ctx.active_contingencies.clone(),
+            node_rollups: Vec::new(),
         };
         ctx.iteration_results.push(iter_result);
 

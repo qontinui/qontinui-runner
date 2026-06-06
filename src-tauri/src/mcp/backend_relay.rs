@@ -1913,6 +1913,7 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
             None,
             None,
             None,
+            None, // tool_policy
         ) {
             Ok(session) => {
                 let session = Arc::new(session);

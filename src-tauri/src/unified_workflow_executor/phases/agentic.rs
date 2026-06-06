@@ -486,6 +486,10 @@ impl AgenticExecutor {
                                 parsed: None,
                                 input_tokens: resp.input_tokens,
                                 output_tokens: resp.output_tokens,
+                                // API-provider path does not surface per-tool
+                                // telemetry (Phase 4); CLI path does.
+                                tools_used: Vec::new(),
+                                tools_rejected: Vec::new(),
                             },
                             Vec::new(),
                         );
@@ -1027,10 +1031,15 @@ impl AgenticExecutor {
             .first()
             .and_then(|s| s.model.clone())
             .or_else(|| config.resolve_model_for_phase("agentic"));
+        // Blueprint tool policy: a DAG agentic node carries a resolved policy
+        // (per-node, falling back to workflow blueprint_defaults). Mirror the
+        // model-resolution idiom — read it off the first agentic step.
+        let agentic_tool_policy = agentic_steps.first().and_then(|s| s.tool_policy.clone());
         let mut ai_config =
             AiSessionConfig::agentic(&config.execution_id, &config.workflow_name, iteration)
                 .with_checkpoint_id(&checkpoint.id)
-                .with_model_override(agentic_model);
+                .with_model_override(agentic_model)
+                .with_tool_policy(agentic_tool_policy);
 
         // CLI session context for restart survival.
         // Check if there's an interrupted session we can resume via `--resume`.
@@ -1218,6 +1227,11 @@ impl AgenticExecutor {
             None
         };
 
+        // Blueprint telemetry (Phase 4): capture tool usage before `result` is
+        // partially moved into the outcome variant.
+        let session_tools_used = result.tools_used.clone();
+        let session_tools_rejected = result.tools_rejected.clone();
+
         let outcome = if result.success {
             completion_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
             AgenticOutcome::Success {
@@ -1225,6 +1239,8 @@ impl AgenticExecutor {
                 parsed: parsed_output,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                tools_used: session_tools_used,
+                tools_rejected: session_tools_rejected,
             }
         } else if result.output.is_empty() {
             let error_msg = if result.error.is_empty() {
@@ -1247,6 +1263,8 @@ impl AgenticExecutor {
                 parsed: parsed_output,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                tools_used: session_tools_used,
+                tools_rejected: session_tools_rejected,
             }
         };
 

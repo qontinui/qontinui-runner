@@ -256,3 +256,111 @@ impl Default for SecurityPolicy {
         Self::permissive()
     }
 }
+
+// ============================================================================
+// Blueprint tool-policy → ActionPolicy mirror (Phase 3b)
+// ============================================================================
+
+/// Overlay a node's command-arg-scoped denies onto a base [`ActionPolicy`] so
+/// the same forbidden command is also blocked if the node runs it through a
+/// runner-executed command/check step (not the CLI's `Bash` tool).
+///
+/// Synthesizes a minimal `ActionPolicy` when `base` is `None`, so the mirror is
+/// never silently absent. For each [`DenyEntry::CommandScoped`] the command
+/// prefix is appended to `blocked_commands` as a prefix-anchored regex
+/// (`^<escaped-prefix>`). Tool-name denies and the allow-list are NOT mirrored
+/// here — those are tool-layer concepts the CLI carrier owns; this builder only
+/// mirrors command-argument-scoped denies onto the command-execution layer.
+///
+/// An existing `base` policy's blocks/allows are preserved and extended.
+pub fn build_effective_action_policy(
+    base: Option<&ActionPolicy>,
+    policy: &crate::workflow::dag_schema::ToolPolicy,
+) -> ActionPolicy {
+    use crate::workflow::dag_schema::DenyEntry;
+
+    let mut effective = base.cloned().unwrap_or_default();
+
+    for entry in policy.classified_denies() {
+        if let DenyEntry::CommandScoped { command_prefix, .. } = entry {
+            let pattern = format!("^{}", regex::escape(&command_prefix));
+            if !effective.blocked_commands.contains(&pattern) {
+                effective.blocked_commands.push(pattern);
+            }
+        }
+    }
+
+    effective
+}
+
+#[cfg(test)]
+mod blueprint_action_policy_tests {
+    use super::*;
+    use crate::workflow::dag_schema::{ToolPolicy, ViolationAction};
+    use regex::Regex;
+
+    fn tool_policy(allow: Option<Vec<&str>>, deny: Option<Vec<&str>>) -> ToolPolicy {
+        ToolPolicy {
+            allow: allow.map(|v| v.into_iter().map(String::from).collect()),
+            deny: deny.map(|v| v.into_iter().map(String::from).collect()),
+            on_violation: ViolationAction::default(),
+        }
+    }
+
+    fn any_blocks(policy: &ActionPolicy, cmd: &str) -> bool {
+        policy
+            .blocked_commands
+            .iter()
+            .any(|p| Regex::new(p).map(|re| re.is_match(cmd)).unwrap_or(false))
+    }
+
+    // Plan-test (b): allow:[Bash] + deny:["Bash:git push --force"] ⇒
+    // blocked_commands gains a "git push --force" pattern; plain "git status"
+    // is NOT matched.
+    #[test]
+    fn command_scoped_deny_appends_prefix_anchored_block() {
+        let tp = tool_policy(Some(vec!["Bash"]), Some(vec!["Bash:git push --force"]));
+        let ap = build_effective_action_policy(None, &tp);
+        assert!(
+            any_blocks(&ap, "git push --force --tags"),
+            "the forbidden prefix should be blocked"
+        );
+        assert!(
+            !any_blocks(&ap, "git status"),
+            "an unrelated git command must NOT be blocked"
+        );
+    }
+
+    #[test]
+    fn base_blocks_are_preserved_and_extended() {
+        let base = ActionPolicy {
+            blocked_commands: vec!["^sudo ".to_string()],
+            ..ActionPolicy::default()
+        };
+        let tp = tool_policy(None, Some(vec!["Bash:rm -rf"]));
+        let ap = build_effective_action_policy(Some(&base), &tp);
+        assert!(any_blocks(&ap, "sudo reboot"), "base block preserved");
+        assert!(any_blocks(&ap, "rm -rf /tmp/x"), "node deny appended");
+        assert_eq!(ap.blocked_commands.len(), 2);
+    }
+
+    #[test]
+    fn tool_name_denies_are_not_mirrored_to_commands() {
+        // A bare tool-name deny (Write) has no command-prefix to mirror.
+        let tp = tool_policy(None, Some(vec!["Write"]));
+        let ap = build_effective_action_policy(None, &tp);
+        assert!(ap.blocked_commands.is_empty());
+    }
+
+    #[test]
+    fn regex_metachars_in_prefix_are_escaped() {
+        // A prefix with regex metacharacters must match literally, not as regex.
+        let tp = tool_policy(None, Some(vec!["Bash:echo a.b"]));
+        let ap = build_effective_action_policy(None, &tp);
+        assert!(any_blocks(&ap, "echo a.b"), "literal prefix matches");
+        assert!(
+            !any_blocks(&ap, "echo aXb"),
+            "the '.' must be escaped, not a wildcard"
+        );
+    }
+}

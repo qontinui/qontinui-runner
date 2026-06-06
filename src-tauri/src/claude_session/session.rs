@@ -160,6 +160,7 @@ impl ClaudeSession {
         pid_tracker: Option<Arc<Mutex<Vec<u32>>>>,
         model_override: Option<&str>,
         worktree: Option<WorktreeInfo>,
+        tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
     ) -> Result<Self, String> {
         info!(
             "Spawning interactive Claude session: {} in {}",
@@ -189,6 +190,41 @@ impl ClaudeSession {
                 session_id, model
             );
         }
+
+        // ── Blueprint tool policy (Phase 3) ───────────────────────────────
+        // Same carrier as the inline runner: allow/deny flags plus, for
+        // argument-scoped denies, an ephemeral --settings <file> JSON block.
+        // None ⇒ no-op (no extra args, no settings file), preserving today's
+        // interactive spawn byte-for-byte.
+        let tool_policy_settings_path: Option<std::path::PathBuf>;
+        if let Some(policy) = tool_policy {
+            let (extra_args, settings_json) =
+                crate::claude_session::tool_policy_args::build_tool_policy_cli(policy);
+            cli_args.extend(extra_args);
+            tool_policy_settings_path = if let Some(json) = settings_json {
+                let settings_file = std::env::temp_dir()
+                    .join(format!("claude_session_settings_{}.json", session_id));
+                std::fs::write(&settings_file, &json)
+                    .map_err(|e| format!("Failed to write tool-policy settings file: {}", e))?;
+                cli_args.push("--settings".to_string());
+                cli_args.push(settings_file.to_string_lossy().to_string());
+                info!(
+                    "Applied tool-policy settings for interactive session {} at {}",
+                    session_id,
+                    settings_file.display()
+                );
+                Some(settings_file)
+            } else {
+                None
+            };
+        } else {
+            tool_policy_settings_path = None;
+        }
+        // The settings file is consumed by the spawned CLI at startup; it is a
+        // best-effort temp artifact left in temp_dir (mirrors the inline runner
+        // when the path can't be tracked to session end). Bind to silence the
+        // unused warning when no policy is present.
+        let _ = &tool_policy_settings_path;
 
         let cli_arg_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
         cmd.args(&cli_arg_refs)
@@ -1549,6 +1585,7 @@ impl ClaudeSession {
             self.pid_tracker.clone(),
             None, // model_override
             Some(info.clone()),
+            None, // tool_policy — worktree promotion preserves the original spawn's policy state
         )
         .map_err(|e| format!("promote_to_worktree: respawn failed: {}", e))?;
 
@@ -1646,6 +1683,7 @@ impl ClaudeSession {
             None, // pid_tracker
             None, // model_override
             None, // worktree (rate-limit restart preserves the original cwd)
+            None, // tool_policy (rate-limit restart preserves the original policy-less spawn)
         ) {
             Ok(new_session) => {
                 let new_session = Arc::new(new_session);

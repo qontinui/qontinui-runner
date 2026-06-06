@@ -396,6 +396,7 @@ mod tests {
                 agentic_phase_success: Some(true),
                 blame_json: None,
                 contingent_on: Vec::new(),
+                node_rollups: Vec::new(),
             })
             .collect();
 
@@ -418,6 +419,7 @@ mod tests {
                 agentic_phase_success: Some(true),
                 blame_json: None,
                 contingent_on: Vec::new(),
+                node_rollups: Vec::new(),
             },
             super::super::types::IterationResult {
                 iteration: 2,
@@ -430,6 +432,7 @@ mod tests {
                 agentic_phase_success: Some(false),
                 blame_json: None,
                 contingent_on: Vec::new(),
+                node_rollups: Vec::new(),
             },
         ];
 
@@ -452,6 +455,7 @@ mod tests {
             agentic_phase_success: Some(true),
             blame_json: None,
             contingent_on: Vec::new(),
+            node_rollups: Vec::new(),
         }];
 
         let healthy = compute_decision_confidence(&results, true);

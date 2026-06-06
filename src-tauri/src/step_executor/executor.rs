@@ -522,6 +522,8 @@ impl StepExecutor {
             "step_name": step_name,
             "phase": step.phase,
             "iteration": iteration,
+            "node_id": step.id,
+            "node_kind": step.effective_node_kind().as_str(),
             "original_task_run_id": task_run_id,  // Keep original ID for debugging
             "command": step.shell_command.as_ref().or(step.check_command.as_ref()),
             "working_directory": step.shell_command_working_directory.as_ref().or(step.check_working_directory.as_ref()),
@@ -1412,6 +1414,28 @@ impl StepExecutor {
         Option<String>,
         Option<serde_json::Value>,
     ) {
+        // ── Blueprint deterministic guarantee (Phase 2) ──────────────────────────
+        // execute_single_step routes every step through the handler registry /
+        // deterministic fallback match; it NEVER constructs an AiSessionConfig
+        // (prompt steps are no-ops here — the AI session is spawned by the
+        // unified workflow executor, not this boundary). Make that an explicit,
+        // observable invariant rather than an accident.
+        let node_kind = step.effective_node_kind();
+        tracing::debug!(
+            node_id = ?step.id,
+            step_type = %step.step_type,
+            ?node_kind,
+            "execute_single_step dispatch (deterministic boundary — no AI session is created here)"
+        );
+        debug_assert!(
+            step.step_type != "prompt"
+                || node_kind == crate::workflow::dag_schema::NodeKind::Agentic,
+            "a step classified Deterministic reached execute_single_step with step_type=prompt \
+             (node_id={:?}); the deterministic guarantee would be violated if this path ever \
+             spawned an AI session",
+            step.id
+        );
+
         // Typed dispatch boundary (Session 2a).
         //
         // "test" is a backward-compat alias that predates the typed enum; it

@@ -2964,6 +2964,8 @@ impl LoopController {
                 parsed: None,
                 input_tokens: None,
                 output_tokens: None,
+                tools_used: Vec::new(),
+                tools_rejected: Vec::new(),
             }
         } else {
             super::types::AgenticOutcome::Error {

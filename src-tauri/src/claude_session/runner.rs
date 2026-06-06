@@ -41,6 +41,12 @@ pub struct CliSessionOutput {
     pub input_tokens: Option<u64>,
     /// Output tokens generated (extracted from stream-json result message).
     pub output_tokens: Option<u64>,
+    /// Blueprint telemetry (Phase 4): de-duplicated, order-preserving list of
+    /// tool names the agentic session actually used.
+    pub tools_used: Vec<String>,
+    /// Blueprint telemetry (Phase 4): tool names rejected by a FailNode
+    /// tool-policy (0 or 1 today; Vec keeps it future-proof).
+    pub tools_rejected: Vec<String>,
 }
 
 /// Output from a CLI session with retry, including token usage data.
@@ -53,6 +59,10 @@ pub struct CliSessionRetryOutput {
     pub input_tokens: Option<u64>,
     /// Output tokens generated (extracted from stream-json result message).
     pub output_tokens: Option<u64>,
+    /// Blueprint telemetry (Phase 4): de-duplicated tool names used.
+    pub tools_used: Vec<String>,
+    /// Blueprint telemetry (Phase 4): tool names rejected by a FailNode policy.
+    pub tools_rejected: Vec<String>,
 }
 
 /// Context for periodic flushing of AI output to the database during a session.
@@ -173,6 +183,16 @@ fn extract_tool_call_data(json_line: &str) -> Vec<(String, String)> {
         }
     }
     results
+}
+
+/// Push a tool name into an order-preserving, de-duplicated accumulator.
+/// Used by the agentic telemetry rollup (Phase 4 §3.3): the first
+/// occurrence of each tool name is kept in observation order; repeats are
+/// dropped. Pure helper so it can be unit-tested without the stream loop.
+fn push_tool_used(acc: &mut Vec<String>, tool_name: &str) {
+    if !acc.iter().any(|t| t == tool_name) {
+        acc.push(tool_name.to_string());
+    }
 }
 
 /// Extract token usage from a Claude CLI stream-json result message.
@@ -310,6 +330,7 @@ fn run_claude_session_inline(
     task_run_id: Option<&str>,
     cli_session_ctx: Option<&CliSessionContext>,
     db_flush_ctx: Option<&DbFlushContext>,
+    tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
 ) -> Result<CliSessionOutput, String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -383,6 +404,60 @@ fn run_claude_session_inline(
             );
         }
     }
+
+    // ── Blueprint tool policy (Phase 3) ───────────────────────────────────
+    // Translate the policy into CLI flags (--allowedTools/--disallowedTools)
+    // plus, for argument-scoped denies, an ephemeral --settings <file> JSON
+    // block (the carrier that works under bypassPermissions). When the policy
+    // is None this is a complete no-op: zero extra args, no settings file —
+    // byte-for-byte identical to the historical spawn.
+    let tool_policy_args: Vec<String>;
+    let tool_policy_settings_path: Option<std::path::PathBuf>;
+    if let Some(policy) = tool_policy {
+        let (extra_args, settings_json) =
+            crate::claude_session::tool_policy_args::build_tool_policy_cli(policy);
+        tool_policy_args = extra_args;
+        tool_policy_settings_path = if let Some(json) = settings_json {
+            let settings_file =
+                temp_dir.join(format!("claude_session_settings_{}.json", session_id));
+            match std::fs::write(&settings_file, &json) {
+                Ok(()) => {
+                    info!(
+                        "Wrote tool-policy settings for session {} to {}",
+                        session_id,
+                        settings_file.display()
+                    );
+                    Some(settings_file)
+                }
+                Err(e) => {
+                    // A settings-write failure must not silently drop the
+                    // argument-scoped deny — fail the spawn loudly.
+                    return Err(format!("Failed to write tool-policy settings file: {}", e));
+                }
+            }
+        } else {
+            None
+        };
+        for a in &tool_policy_args {
+            cli_args.push(a.as_str());
+        }
+        if let Some(ref path) = tool_policy_settings_path {
+            cli_args.push("--settings");
+            // path lives until cmd.spawn(); push its &str view.
+            cli_args.push(path.to_str().unwrap_or_default());
+        }
+        info!(
+            "Applied tool policy for session {}: {} extra arg(s), settings={}",
+            session_id,
+            tool_policy_args.len(),
+            tool_policy_settings_path.is_some()
+        );
+    } else {
+        tool_policy_args = Vec::new();
+        tool_policy_settings_path = None;
+    }
+    let _ = &tool_policy_settings_path; // keep path alive for cli_args borrow
+
     let mut cmd = crate::process_helpers::cmd_no_window();
     cmd.args(&cli_args)
         .current_dir(working_dir)
@@ -552,6 +627,26 @@ fn run_claude_session_inline(
     let session_done_finding = session_done.clone();
     let session_done_progress = session_done.clone();
     let session_done_reflection = session_done.clone();
+
+    // ── Blueprint FailNode detector (Phase 3 §3.2 point 2) ────────────────
+    // Defense-in-depth for the tool-NAME layer: under bypass the CLI already
+    // blocks denied/disallowed tools, so this is post-hoc and rarely fires.
+    // Only armed when a policy is present AND on_violation == FailNode. The
+    // first violating tool name is recorded; after the stream completes the
+    // session result is marked failed. We do NOT kill the child mid-stream.
+    let failnode_policy: Option<crate::workflow::dag_schema::ToolPolicy> = tool_policy
+        .filter(|p| p.on_violation == crate::workflow::dag_schema::ViolationAction::FailNode)
+        .cloned();
+    let failnode_violation: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let failnode_violation_stdout = failnode_violation.clone();
+
+    // Blueprint telemetry (Phase 4 §3.3): de-duplicated, order-preserving
+    // list of tool names observed during this session. Populated in the
+    // stdout stream thread, read after join to build `tools_used`.
+    let tools_used: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tools_used_stdout = tools_used.clone();
 
     // Heartbeat thread
     let app_handle_heartbeat = app_handle.clone();
@@ -736,12 +831,35 @@ fn run_claude_session_inline(
                 if let Some(activity) = extract_tool_activity_from_stream_json(&line) {
                     // Emit a tracing span for each tool call for observability
                     for (tool_name, _tool_id) in extract_tool_call_data(&line) {
+                        // Blueprint telemetry: accumulate de-duped tool names.
+                        if let Ok(mut used) = tools_used_stdout.lock() {
+                            push_tool_used(&mut used, &tool_name);
+                        }
                         let _tool_span = tracing::info_span!("qontinui.ai.tool_call",
                             ai.tool_name = %tool_name,
                         )
                         .entered();
                         // Span closes immediately — tool calls are point-in-time events
                         // since we can't track when the tool finishes from the stream
+
+                        // Blueprint FailNode detector: record the FIRST tool that
+                        // violates the policy (defense-in-depth; the CLI already
+                        // blocks it natively under bypass).
+                        if let Some(ref policy) = failnode_policy {
+                            if crate::claude_session::tool_policy_args::tool_violates_policy(
+                                policy, &tool_name,
+                            ) {
+                                if let Ok(mut slot) = failnode_violation_stdout.lock() {
+                                    if slot.is_none() {
+                                        warn!(
+                                            "Tool-policy FailNode violation: observed tool '{}'",
+                                            tool_name
+                                        );
+                                        *slot = Some(tool_name.clone());
+                                    }
+                                }
+                            }
+                        }
                     }
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         emit_ai_output(
@@ -1732,6 +1850,9 @@ fn run_claude_session_inline(
                 let _ = handle.join();
             }
             let _ = std::fs::remove_file(&prompt_file);
+            if let Some(ref p) = tool_policy_settings_path {
+                let _ = std::fs::remove_file(p);
+            }
             remove_pid(&pid_tracker);
             return Err(format!("Failed to wait for Claude: {}", e));
         }
@@ -1877,6 +1998,9 @@ fn run_claude_session_inline(
     }
 
     let _ = std::fs::remove_file(&prompt_file);
+    if let Some(ref p) = tool_policy_settings_path {
+        let _ = std::fs::remove_file(p);
+    }
 
     // Log summary of detected findings
     if !detected_findings.is_empty() {
@@ -1935,7 +2059,38 @@ fn run_claude_session_inline(
         }
     }
 
-    let success = status.success();
+    let mut success = status.success();
+
+    // ── Blueprint FailNode enforcement (Phase 3 §3.2 point 2) ─────────────
+    // If a FailNode-mode tool policy recorded a violation during the stream,
+    // mark the session failed so the caller treats the node as a
+    // critical_failure, and surface a [FINDING:error] line (which the UI and
+    // finding pipeline render) describing the violating tool + node.
+    let failnode_tool = failnode_violation.lock().ok().and_then(|s| s.clone());
+    // Blueprint telemetry (Phase 4): surface the rejected tool (if any).
+    let tools_rejected: Vec<String> = failnode_tool.iter().cloned().collect();
+    if let Some(tool) = failnode_tool {
+        success = false;
+        let finding_line = format!(
+            "[FINDING:error] Tool-policy violation in node '{}': the agentic step \
+             used the forbidden tool '{}', which the node's tool policy blocks \
+             (on_violation: fail_node).",
+            session_id, tool
+        );
+        warn!(
+            "Session {} failed by tool-policy FailNode: forbidden tool '{}' observed",
+            session_id, tool
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            emit_ai_output(
+                app_handle,
+                &finding_line,
+                "claude",
+                None,
+                session_ctx.as_ref(),
+            );
+        }));
+    }
 
     let (cli_input_tokens, cli_output_tokens) = match cli_token_usage {
         Some((input, output)) => {
@@ -1991,12 +2146,16 @@ fn run_claude_session_inline(
         }
     }
 
+    let tools_used_final: Vec<String> = tools_used.lock().map(|v| v.clone()).unwrap_or_default();
+
     Ok(CliSessionOutput {
         success,
         output: all_output,
         injected_steps,
         input_tokens: cli_input_tokens,
         output_tokens: cli_output_tokens,
+        tools_used: tools_used_final,
+        tools_rejected,
     })
 }
 
@@ -2030,6 +2189,7 @@ pub fn run_claude_session_with_retry(
     task_run_id: Option<&str>,
     cli_session_ctx: Option<&CliSessionContext>,
     db_flush_ctx: Option<&DbFlushContext>,
+    tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
 ) -> Result<CliSessionRetryOutput, String> {
     use std::thread;
     use std::time::Duration;
@@ -2055,6 +2215,7 @@ pub fn run_claude_session_with_retry(
                 task_run_id,
                 cli_session_ctx,
                 db_flush_ctx,
+                tool_policy,
             )?;
             return Ok(CliSessionRetryOutput {
                 success: result.success,
@@ -2063,6 +2224,8 @@ pub fn run_claude_session_with_retry(
                 injected_steps: result.injected_steps,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                tools_used: result.tools_used,
+                tools_rejected: result.tools_rejected,
             });
         }
     };
@@ -2108,6 +2271,7 @@ pub fn run_claude_session_with_retry(
             task_run_id,
             cli_session_ctx,
             db_flush_ctx,
+            tool_policy,
         );
 
         match result {
@@ -2126,6 +2290,8 @@ pub fn run_claude_session_with_retry(
                     injected_steps: cli_output.injected_steps,
                     input_tokens: cli_output.input_tokens,
                     output_tokens: cli_output.output_tokens,
+                    tools_used: cli_output.tools_used,
+                    tools_rejected: cli_output.tools_rejected,
                 });
             }
             Err(error) => {
@@ -2230,6 +2396,7 @@ pub fn run_claude_session_interactive(
     _reflection_fix_ctx: Option<ReflectionFixContext>,
     _step_injection_ctx: Option<StepInjectionContext>,
     model_override: Option<&str>,
+    tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
 ) -> Result<CliSessionOutput, String> {
     use crate::claude_session::ClaudeSession;
     use crate::commands::ai_session::emit_session_state;
@@ -2251,6 +2418,7 @@ pub fn run_claude_session_interactive(
         pid_tracker,
         model_override,
         None, // worktree — promoted later via ClaudeSession::promote_to_worktree
+        tool_policy,
     )?;
 
     // Register with Doctor health monitoring
@@ -2323,6 +2491,8 @@ pub fn run_claude_session_interactive(
         injected_steps: Vec::new(),
         input_tokens: None,
         output_tokens: None,
+        tools_used: Vec::new(),
+        tools_rejected: Vec::new(),
     })
 }
 
@@ -2347,6 +2517,7 @@ pub fn run_claude_session_interactive_with_retry(
     reflection_fix_ctx: Option<ReflectionFixContext>,
     step_injection_ctx: Option<StepInjectionContext>,
     model_override: Option<&str>,
+    tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
 ) -> Result<CliSessionRetryOutput, String> {
     use std::thread;
     use std::time::Duration;
@@ -2370,6 +2541,7 @@ pub fn run_claude_session_interactive_with_retry(
                 reflection_fix_ctx,
                 step_injection_ctx,
                 model_override,
+                tool_policy,
             )?;
             return Ok(CliSessionRetryOutput {
                 success: result.success,
@@ -2378,6 +2550,8 @@ pub fn run_claude_session_interactive_with_retry(
                 injected_steps: result.injected_steps,
                 input_tokens: result.input_tokens,
                 output_tokens: result.output_tokens,
+                tools_used: result.tools_used,
+                tools_rejected: result.tools_rejected,
             });
         }
     };
@@ -2417,6 +2591,7 @@ pub fn run_claude_session_interactive_with_retry(
             reflection_fix_ctx_clone,
             step_injection_ctx_clone,
             model_override,
+            tool_policy,
         );
 
         match result {
@@ -2434,6 +2609,8 @@ pub fn run_claude_session_interactive_with_retry(
                     injected_steps: cli_output.injected_steps,
                     input_tokens: cli_output.input_tokens,
                     output_tokens: cli_output.output_tokens,
+                    tools_used: cli_output.tools_used,
+                    tools_rejected: cli_output.tools_rejected,
                 });
             }
             Err(error) => {
@@ -2493,5 +2670,31 @@ pub fn run_claude_session_interactive_with_retry(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::push_tool_used;
+
+    #[test]
+    fn push_tool_used_dedups_preserving_order() {
+        let mut acc: Vec<String> = Vec::new();
+        push_tool_used(&mut acc, "A");
+        push_tool_used(&mut acc, "B");
+        push_tool_used(&mut acc, "A");
+        assert_eq!(acc, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn push_tool_used_keeps_first_occurrence_order() {
+        let mut acc: Vec<String> = Vec::new();
+        for t in ["Bash", "Edit", "Bash", "Read", "Edit"] {
+            push_tool_used(&mut acc, t);
+        }
+        assert_eq!(
+            acc,
+            vec!["Bash".to_string(), "Edit".to_string(), "Read".to_string()]
+        );
     }
 }

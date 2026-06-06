@@ -22,7 +22,7 @@ use super::compensation::CompensationManager;
 use super::convergence::{
     ConvergenceAction, ConvergenceConfig, ConvergenceDetector, ConvergenceReport,
 };
-use super::types::{AgenticOutcome, IterationResult, LoopConfig, LoopResult};
+use super::types::{AgenticOutcome, IterationResult, LoopConfig, LoopResult, NodeTelemetry};
 
 /// Drop-style worktree cleanup that runs AFTER the compensation stack.
 ///
@@ -318,6 +318,15 @@ impl CompletionReason {
 
         let fix_attempts_exhausted = matches!(&self, CompletionReason::FixAttemptsExhausted { .. });
 
+        // Blueprint telemetry (Phase 4): the loop-level union is the
+        // concatenation of every iteration's per-node rollups. Dedup is not
+        // required — the meta-optimizer groups by node_id downstream.
+        let node_rollups: Vec<NodeTelemetry> = ctx
+            .iteration_results
+            .iter()
+            .flat_map(|ir| ir.node_rollups.iter().cloned())
+            .collect();
+
         LoopResult {
             verification_passed,
             iterations_run: ctx.iteration,
@@ -332,6 +341,7 @@ impl CompletionReason {
             files_modified: ctx.resource_tracker.files_modified(),
             fix_attempts: ctx.fix_attempts,
             ci_auto_resumes: ctx.ci_auto_resumes,
+            node_rollups,
         }
     }
 }
@@ -597,6 +607,7 @@ mod tests {
             agentic_phase_success: Some(true),
             blame_json: None,
             contingent_on: Vec::new(),
+            node_rollups: Vec::new(),
         });
         ctx.iteration_results.push(IterationResult {
             iteration: 2,
@@ -609,6 +620,7 @@ mod tests {
             agentic_phase_success: Some(true),
             blame_json: None,
             contingent_on: Vec::new(),
+            node_rollups: Vec::new(),
         });
         ctx.iteration_results.push(IterationResult {
             iteration: 3,
@@ -621,6 +633,7 @@ mod tests {
             agentic_phase_success: None,
             blame_json: None,
             contingent_on: Vec::new(),
+            node_rollups: Vec::new(),
         });
 
         let result = CompletionReason::VerificationPassed.into_loop_result(&ctx);

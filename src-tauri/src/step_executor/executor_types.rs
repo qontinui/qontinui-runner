@@ -698,6 +698,17 @@ pub struct ExecutionStepConfig {
         alias = "fail_on_console_errors"
     )]
     pub fail_on_console_errors: bool,
+
+    /// Resolved blueprint node kind (Phase 2). `None` for non-DAG/legacy steps;
+    /// when absent it is inferred from `step_type` via `effective_node_kind()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<crate::workflow::dag_schema::NodeKind>,
+
+    /// Resolved blueprint tool policy (Phase 3). Set only for Agentic nodes
+    /// (per-node policy, falling back to the workflow's `blueprint_defaults`).
+    /// `None` ⇒ no restriction (today's behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<crate::workflow::dag_schema::ToolPolicy>,
 }
 
 impl ExecutionStepConfig {
@@ -793,6 +804,22 @@ impl ExecutionStepConfig {
         // Default: all steps run on each iteration for fresh data
         // Users can explicitly set run_on_subsequent_iterations: false to skip on subsequent iterations
         self.run_on_subsequent_iterations.unwrap_or(true)
+    }
+
+    /// Resolve the execution kind for this step. Prefers the explicitly-carried
+    /// `node_kind` (set from the DAG node's `effective_kind()`); otherwise infers
+    /// from `step_type` — only a "prompt" step is agentic, every other step type
+    /// runs deterministically (it never spawns an LLM session).
+    pub fn effective_node_kind(&self) -> crate::workflow::dag_schema::NodeKind {
+        use crate::workflow::dag_schema::NodeKind;
+        if let Some(k) = self.node_kind {
+            return k;
+        }
+        if self.step_type == "prompt" {
+            NodeKind::Agentic
+        } else {
+            NodeKind::Deterministic
+        }
     }
 }
 
@@ -1048,4 +1075,64 @@ pub struct CapturedRunnerLogs {
     pub actions: Vec<ActionEvent>,
     /// Image recognition events (from runner-image-recognition.jsonl)
     pub image_recognition: Vec<ImageRecognitionEvent>,
+}
+
+#[cfg(test)]
+mod node_kind_tests {
+    use super::*;
+    use crate::workflow::dag_schema::NodeKind;
+
+    fn step(step_type: &str, node_kind: Option<NodeKind>) -> ExecutionStepConfig {
+        ExecutionStepConfig {
+            step_type: step_type.to_string(),
+            node_kind,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn carried_node_kind_takes_precedence_deterministic() {
+        // Even a prompt step returns the carried kind when set.
+        let cfg = step("prompt", Some(NodeKind::Deterministic));
+        assert_eq!(cfg.effective_node_kind(), NodeKind::Deterministic);
+    }
+
+    #[test]
+    fn carried_node_kind_takes_precedence_agentic() {
+        let cfg = step("command", Some(NodeKind::Agentic));
+        assert_eq!(cfg.effective_node_kind(), NodeKind::Agentic);
+    }
+
+    #[test]
+    fn inferred_prompt_is_agentic() {
+        let cfg = step("prompt", None);
+        assert_eq!(cfg.effective_node_kind(), NodeKind::Agentic);
+    }
+
+    #[test]
+    fn inferred_non_prompt_is_deterministic() {
+        for st in ["command", "check", "ui_bridge", "shell_command"] {
+            let cfg = step(st, None);
+            assert_eq!(
+                cfg.effective_node_kind(),
+                NodeKind::Deterministic,
+                "step_type {st:?} should infer Deterministic"
+            );
+        }
+    }
+
+    /// Phase 4 telemetry: `log_step_event` stamps `node_id` and `node_kind`
+    /// onto the data JSON. The construction is a DB-side-effecting method, so
+    /// here we assert the exact values it will carry are correct on the step.
+    #[test]
+    fn step_carries_node_id_and_kind_for_telemetry_stamp() {
+        let cfg = ExecutionStepConfig {
+            id: Some("n1".to_string()),
+            step_type: "prompt".to_string(),
+            node_kind: Some(NodeKind::Agentic),
+            ..Default::default()
+        };
+        assert_eq!(cfg.id, Some("n1".to_string()));
+        assert_eq!(cfg.effective_node_kind().as_str(), "agentic");
+    }
 }

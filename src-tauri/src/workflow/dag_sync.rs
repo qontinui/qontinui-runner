@@ -274,6 +274,8 @@ pub async fn export_workflow_as_yaml(
         cancel_reason: None,
         inputs: None,
         extract: None,
+        kind: None,
+        tool_policy: None,
     };
 
     let mut nodes = HashMap::new();
@@ -289,6 +291,7 @@ pub async fn export_workflow_as_yaml(
             max_iterations: Some(max_iterations as u32),
             ..WorkflowSettings::default()
         },
+        blueprint_defaults: None,
     };
 
     // 4. Serialise to YAML
