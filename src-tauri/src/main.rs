@@ -2018,6 +2018,35 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0),
                 );
+                // Phase 2: drop any session→window owner whose target window no
+                // longer exists in the persisted set (e.g. a hand-edited or
+                // partially-written file), reverting those sessions to "main"
+                // so no tab is stranded on a window that will never be restored.
+                let reconciled = window_assignments.reconcile_orphans();
+                if !reconciled.is_empty() {
+                    info!(
+                        count = reconciled.len(),
+                        "window_assignments: reconciled orphaned session owners → main"
+                    );
+                }
+                // Phase 2: periodic geometry capture. The operator restarts the
+                // primary by rebuild-and-kill, which never runs the clean quit
+                // handler — so the only way a restored window lands at its last
+                // position/size is to snapshot geometry while running. Runs off
+                // the main thread; getters are Result-guarded (a busy/again
+                // window just skips that tick) and `update_geometry` persists
+                // only on change, so an idle window writes nothing.
+                let wa_for_geo_poll = window_assignments.clone();
+                let geo_poll_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        commands::terminal_windows::capture_open_geometry(
+                            &geo_poll_app,
+                            &wa_for_geo_poll,
+                        );
+                    }
+                });
                 app.manage(window_assignments);
 
                 // Durable, backend-owned terminal-session lifecycle registry,
@@ -2429,6 +2458,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             error!("Failed to create main window: {}", e);
                             return Err(Box::new(e));
                         }
+                    }
+
+                    // Phase 2: recreate persisted pop-out terminal windows now
+                    // that the main window is up. Best-effort by contract — never
+                    // blocks startup; a per-window build failure is logged and
+                    // skipped. Only runs in windowed mode (inside this `else`), so
+                    // server/headless instances never spawn pop-outs.
+                    let restored = commands::terminal_windows::restore_pop_out_windows(
+                        app.handle(),
+                        &app.state::<std::sync::Arc<window_assignments::WindowAssignments>>(),
+                    );
+                    if restored > 0 {
+                        info!(restored, "Recreated pop-out terminal windows on boot");
                     }
                 }
             }
@@ -3244,6 +3286,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
 
+                // Phase 2: the main window is closing → the app is going down.
+                // Flag the shutdown FIRST so any pop-out `CloseRequested` that
+                // fires during teardown PRESERVES its record (restored next
+                // boot) rather than removing it, then snapshot every open
+                // pop-out's final geometry while the windows still exist.
+                commands::terminal_windows::mark_app_quitting();
+                if let Some(wa) =
+                    window.try_state::<Arc<window_assignments::WindowAssignments>>()
+                {
+                    commands::terminal_windows::capture_open_geometry(window.app_handle(), &wa);
+                }
+
                 let app_state = window.state::<Arc<AppState>>();
 
                 // Intentional close — clear the session file so instances are NOT
@@ -3555,6 +3609,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     app.run(|_, event| {
         if let tauri::RunEvent::ExitRequested { .. } = event {
             info!("Application exit requested");
+            // Phase 2: ensure the shutdown flag is set on ANY exit path (incl.
+            // a programmatic `app.exit(0)` that didn't route through the main
+            // window's close handler), so pop-out teardown preserves records.
+            commands::terminal_windows::mark_app_quitting();
         }
     });
 

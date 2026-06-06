@@ -74,6 +74,35 @@ impl PaneKey {
         ))
     }
 
+    /// Window-aware key (Phase 2 of the pop-out-terminal-windows plan).
+    ///
+    /// For the `"main"` window — and the legacy single-window world where the
+    /// caller passes no label — this is **byte-identical** to [`from_create`],
+    /// so existing `pane-sessions.json` entries keep resolving and there is no
+    /// migration. For a `"term-N"` pop-out the window label is folded into the
+    /// key, so two windows showing the same `(page_id, title, working_dir)`
+    /// pane no longer collide on a single coord session (the bug called out in
+    /// the plan's "Relationship to pane_store").
+    pub fn from_create_in_window(
+        page_id: &str,
+        title: &str,
+        working_dir: &str,
+        window_label: &str,
+    ) -> Self {
+        let wl = window_label.trim();
+        if wl.is_empty() || wl == crate::window_assignments::MAIN_WINDOW_LABEL {
+            return Self::from_create(page_id, title, working_dir);
+        }
+        const SEP: char = '\u{1f}';
+        PaneKey(format!(
+            "{}{SEP}{}{SEP}{}{SEP}{}",
+            page_id.trim(),
+            title.trim(),
+            working_dir.trim(),
+            wl,
+        ))
+    }
+
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -201,6 +230,37 @@ mod tests {
         let a = PaneKey::from_create("default", "Terminal 1", "C:/repo");
         let b = PaneKey::from_create("default", "Terminal 1", "C:/repo");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn window_aware_key_is_backward_compatible_for_main() {
+        // "main", empty, and whitespace-only labels must yield the legacy
+        // 3-tuple key byte-for-byte (no migration of existing entries).
+        let legacy = PaneKey::from_create("default", "Terminal 1", "C:/repo");
+        for label in ["main", "", "   "] {
+            assert_eq!(
+                PaneKey::from_create_in_window("default", "Terminal 1", "C:/repo", label),
+                legacy,
+                "label {label:?} must not change the main/legacy key"
+            );
+        }
+    }
+
+    #[test]
+    fn window_aware_key_disambiguates_pop_outs() {
+        // Same (page, title, cwd) in two different pop-outs → distinct keys,
+        // and both distinct from the main-window key.
+        let main = PaneKey::from_create_in_window("default", "T", "C:/repo", "main");
+        let t1 = PaneKey::from_create_in_window("default", "T", "C:/repo", "term-1");
+        let t2 = PaneKey::from_create_in_window("default", "T", "C:/repo", "term-2");
+        assert_ne!(t1, t2);
+        assert_ne!(t1, main);
+        assert_ne!(t2, main);
+        // Stable for the same (triple, window).
+        assert_eq!(
+            t1,
+            PaneKey::from_create_in_window("default", "T", "C:/repo", "term-1")
+        );
     }
 
     #[test]
