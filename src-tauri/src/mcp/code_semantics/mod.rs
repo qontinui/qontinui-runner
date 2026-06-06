@@ -32,6 +32,7 @@ pub mod mypy_check;
 pub mod node_bridge;
 pub mod scope;
 pub mod syntactic;
+pub mod tsc_check;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -134,6 +135,12 @@ pub const PROV_CARGO: &str = "cargo-check";
 /// `coverage=0.5` and boundary `medium` (mirrors the resolved-import tier). coord
 /// routes this honestly to `Partial`.
 pub const PROV_CARGO_SYNTACTIC: &str = "cargo-syntactic";
+/// TypeScript `tsc --noEmit` observe provenance: real-compiler whole-project
+/// verdict with no LS warm-up dependency (coverage 1.0, boundary `high`, peer of
+/// `cargo-check`/`mypy`). Used for observe-mode `.ts`/`.tsx` (and JS-opted-in)
+/// typecheck when a repo-local `tsc` + `tsconfig` are discoverable; the LS path
+/// remains the predict/overlay and fallback engine.
+pub const PROV_TSC: &str = "tsc";
 
 impl Envelope {
     /// Warm, resolved answer: posterior=1, coverage=1, credibility=(high,high,high).
@@ -430,12 +437,20 @@ async fn health(State(_state): State<Arc<ApiState>>) -> Json<Value> {
     }
     drop(reg);
 
-    // Phase A: report engine availability for the Rust (`cargo check`) and Python
-    // (`mypy`) typecheck dispatchers alongside the TS scopes. These are *engine*
-    // availability probes, not per-scope index state.
+    // Report engine availability for the typecheck dispatchers alongside the TS
+    // scopes. These are *engine* availability probes, not per-scope index state.
+    // The `tsc` entry is the real-compiler TS observe engine (repo-local, distinct
+    // from the per-scope Language-Service index reported in `scopes[]`); it carries
+    // a `tool` discriminator + `version`.
     let engines = json!([
         { "language": "rust", "available": cargo_check::is_available() },
         { "language": "python", "available": mypy_check::is_available() },
+        {
+            "language": "typescript",
+            "tool": "tsc",
+            "available": tsc_check::is_available(),
+            "version": tsc_check::version(),
+        },
     ]);
 
     Json(json!({ "status": "ok", "scopes": scopes, "engines": engines }))
@@ -559,10 +574,13 @@ async fn find_references(
 
 /// POST /code-semantics/typecheck (with overlay_patch ⇒ 2b predict-effect).
 ///
-/// Dispatches by the target file's extension (Phase A): Rust (`.rs`) →
-/// `cargo check`; Python (`.py`/`.pyi`) → `mypy`; everything else → the TS
-/// Language-Service path (unchanged). All three lift `coverage` into the §A
-/// result body (coord reads coverage from the body).
+/// Dispatches by the target file's extension: Rust (`.rs`) → `cargo check`;
+/// Python (`.py`/`.pyi`) → `mypy`; everything else → TypeScript. The TS branch
+/// prefers the real compiler `tsc --noEmit` for **observe** mode (no
+/// `overlay_patch`) when a repo-local `tsc` + `tsconfig` are discoverable — a
+/// whole-project verdict with no LS warm-up — and otherwise (predict/overlay, or
+/// nothing discoverable) uses the TS Language-Service path. All checkers lift
+/// `coverage` into the §A result body (coord reads coverage from the body).
 async fn typecheck(
     State(_state): State<Arc<ApiState>>,
     Json(req): Json<TypecheckReq>,
@@ -577,6 +595,17 @@ async fn typecheck(
             Json(mypy_check::typecheck(file_path, req.overlay_patch.clone()).await)
         }
         lang::Lang::Ts => {
+            // Observe mode (no overlay): prefer the real compiler `tsc --noEmit`
+            // when a repo-local `tsc` + `tsconfig` are discoverable — a
+            // whole-project verdict with NO LS warm-up dependency. `tsc_check`
+            // returns `None` when nothing is discoverable, in which case we fall
+            // back to the existing LS path verbatim (never a regression). The
+            // predict/overlay path always stays on the LS (TRUE overlay).
+            if req.overlay_patch.is_none() {
+                if let Some(env) = tsc_check::observe(file_path).await {
+                    return Json(env);
+                }
+            }
             let scope = req.scope.clone();
             let file = req.file.clone();
             let mut env = resolution_query(q, scope.as_deref(), Some(&file), move |bridge| {

@@ -53,9 +53,25 @@ the code_graph fallback).
   **Language dispatch (Phase A).** `typecheck` dispatches by the target file's
   extension to one of three checkers; the result shape above is uniform across all
   three (the `code` field typing differs — see below):
-  - **TypeScript / JavaScript** (default, any non-`.rs`/`.py`/`.pyi` file) → the TS
-    **Language Service** with a **true in-memory overlay** (this §A stdio command).
-    `code` is the numeric TS diagnostic code (`<int>`).
+  - **TypeScript / JavaScript** (default, any non-`.rs`/`.py`/`.pyi` file) → two
+    engines by mode:
+    - **Observe** (no `overlay_patch`) → the real compiler **`tsc --noEmit -p
+      <tsconfig> --pretty false`** when a repo-local `tsc`
+      (`node_modules/.bin/tsc`, `tsc.cmd` on Windows; nearest-wins walk-up) and a
+      `tsconfig.json` are discoverable from the target file. This is a
+      **whole-project** verdict (errors anywhere in the project are returned, not
+      filtered to the queried file — a broken import elsewhere IS the signal
+      install/edit verify wants) with **no LS warm-up dependency** → `coverage:
+      1.0`, provenance **`tsc`**, boundary `high`. `code` is the TS diagnostic
+      code **string** (e.g. `"TS2322"`). `.js`/`.jsx`/`.cjs`/`.mjs` take this path
+      only when the tsconfig opts JS in (`allowJs`/`checkJs`) — otherwise `tsc -p`
+      would not include the file and would falsely report it clean, so it falls
+      back to the LS. If no `tsc`/`tsconfig` is discoverable → falls back to the LS
+      path verbatim (never a regression). A discoverable `tsc` that times out /
+      fails to run → `engine_unavailable` (never a fabricated clean, never a 500).
+    - **Predict** (with `overlay_patch`) → the TS **Language Service** with a
+      **true in-memory overlay** (this §A stdio command); `code` is the numeric TS
+      diagnostic code (`<int>`). The overlay path is unchanged.
   - **Python** (`.py`/`.pyi`) → **`mypy`**. Post-write observe runs mypy on the
     on-disk file; predict (`overlay_patch`) uses **`mypy --shadow-file`** — a TRUE
     overlay, the real file is never modified. `code` is the bracketed mypy error
@@ -95,16 +111,21 @@ a scope registry (map scope → helper child).
 
 - `GET  /code-semantics/health` →
   `{"status": "ok", "scopes": [ {"scope","language","indexed","file_count","provenance"} ],
-    "engines": [ {"language": "rust"|"python", "available": <bool>} ]}`
-  The `scopes[]` entries are the per-scope TS index state (unchanged). The new
-  `engines[]` array reports Phase-A *engine* availability for the Rust (`cargo
-  check`) and Python (`mypy`) typecheck dispatchers (not per-scope index state).
+    "engines": [ {"language": "rust"|"python", "available": <bool>},
+                 {"language": "typescript", "tool": "tsc", "available": <bool>, "version": <str|null>} ]}`
+  The `scopes[]` entries are the per-scope TS Language-Service index state
+  (unchanged). The `engines[]` array reports *engine* availability for the
+  typecheck dispatchers (not per-scope index state): Rust (`cargo check`), Python
+  (`mypy`), and the TypeScript real-compiler observe engine (`tsc`, repo-local —
+  carries a `tool` discriminator + resolved `version`; distinct from the LS index
+  in `scopes[]`).
 - `POST /code-semantics/symbol-lookup`  body `{"scope?","file?","name","kind?"}`
 - `POST /code-semantics/signature`      body `{"scope?","file","name?","kind?","line?","col?"}`
 - `POST /code-semantics/find-references` body `{"scope?","file","name?","line?","col?","cross_repo?": false}`
 - `POST /code-semantics/typecheck`      body `{"scope?","file","overlay_patch?": {"file","new_text"}}`
   — dispatches by `file` extension (§A): `.rs` → `cargo check`, `.py`/`.pyi` → `mypy`,
-  else the TS Language Service.
+  else TypeScript — observe (no overlay) → real-compiler `tsc --noEmit` when
+  discoverable (else the LS), predict (overlay) → the TS Language Service.
 
 ### Cold-index / coverage (D4) — load-bearing
 
@@ -114,8 +135,14 @@ a scope registry (map scope → helper child).
     but `credibility` reflects syntactic-only. If code_graph also finds nothing while
     cold → `coverage=0.0`, `provenance="indexing"`, **result MUST NOT assert
     `exists:false`** (honest "I can't see", not "absent").
-  - `signature` / `find-references` / `typecheck` (need resolution): if cold →
+  - `signature` / `find-references` (need resolution): if cold →
     `coverage=0.0`, `provenance="indexing"`, result flagged not-yet-available.
+  - `typecheck` **observe** (no overlay): the real-compiler `tsc` path has **no
+    cold state** — it answers `coverage=1.0` / `provenance="tsc"` immediately,
+    regardless of LS warm-up (this is the gap it closes). Only when no
+    `tsc`/`tsconfig` is discoverable does it fall back to the LS, where a cold
+    scope still returns `indexing`. `typecheck` **predict** (overlay) stays on the
+    LS and returns `indexing` while cold.
 - Scope **warm**: resolved answer → `posterior=1.0`, `coverage=1.0`,
   `provenance="ts-language-service"`, `credibility=(high,high,high)`.
 - Node/TS unavailable on the machine → permanent degrade to `code_graph_fallback`
@@ -147,7 +174,7 @@ a scope registry (map scope → helper child).
   "result": { ...query-specific payload (the §A result body, lifted) ... },
   "posterior": 1.0,
   "coverage": 1.0,
-  "provenance": "ts-language-service|code_graph_fallback|code_graph_resolved|indexing|engine_unavailable|mypy|cargo-check|cargo-syntactic",
+  "provenance": "ts-language-service|tsc|code_graph_fallback|code_graph_resolved|indexing|engine_unavailable|mypy|cargo-check|cargo-syntactic",
   "credibility": { "causal": "high", "authorial": "high", "boundary": "high" },
   "staleness_seconds": null,
   "kernel": false
@@ -165,9 +192,12 @@ a scope registry (map scope → helper child).
   resolver) is boundary **`medium`**; the LSP `ts-language-service` is boundary
   **`high`**. Reserving `medium` for the resolved tier keeps the low/medium/high
   triple unambiguously orderable across all three observers.
-- **Phase-A typecheck provenances** slot onto the same ladder: `mypy` and
-  `cargo-check` are full-fidelity type-checker observations → boundary **`high`** /
-  coverage 1.0 (peers of `ts-language-service`). `cargo-syntactic` (the Rust
+- **Typecheck provenances** slot onto the same ladder: `mypy`, `cargo-check`, and
+  `tsc` are full-fidelity type-checker observations → boundary **`high`** /
+  coverage 1.0 (peers of `ts-language-service`). `tsc` is the TS **observe**-mode
+  real compiler (`tsc --noEmit`, whole-project, no warm-up); the LS
+  `ts-language-service` remains the TS **predict**/overlay engine and the observe
+  fallback when no repo-local `tsc` is discoverable. `cargo-syntactic` (the Rust
   overlay-predict fallback, no compile) sits at boundary **`medium`** / coverage 0.5,
   alongside `code_graph_resolved` — above raw syntactic, below a real type-check — so
   coord's `classify_edit_outcome` honestly routes a Rust predict to **Partial** rather
@@ -195,6 +225,12 @@ Tools call the sidecar over HTTP at `$QONTINUI_LSP_SIDECAR_URL` (default
 - `coord_typecheck_file` with `overlay_patch` = D3 `predict-effect` (2b): never writes a
   file; returns would-typecheck + new errors + changed signatures + removed-referenced
   symbols.
+- **The `tsc` observe provenance needs zero coord-side changes.** The proxy forwards
+  `provenance` as an opaque string and `EditPrediction::from_typecheck_result` reads
+  `coverage` (1.0) + `errors[]` from the §A body language-agnostically — a `tsc`
+  observe verdict flows through to the five-outcome map exactly like `cargo-check` /
+  `mypy`. Install verify (`observed_typecheck`) likewise flips the types dimension on
+  any caller-supplied result with `typecheck_ran:true`, independent of provenance.
 
 ### Five-outcome verification map (2b, coord-side pure classifier)
 
