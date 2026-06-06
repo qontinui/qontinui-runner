@@ -13,9 +13,35 @@
  */
 import { useEffect, useState } from "react";
 
-let _apiPort: number = 9876;
-let _apiBase: string = "http://localhost:9876";
-let _wsBase: string = "ws://localhost:9876";
+/**
+ * Synchronous port-resolution fast-path. Every webview (the main window AND
+ * each pop-out terminal window) is launched with an init script that sets
+ * `window.__QONTINUI_PORT__` to the runner's bound API port *before* this
+ * bundle evaluates (`main.rs` for main, `commands/terminal_windows.rs` for
+ * pop-outs). Seeding `_apiPort` from it here means every realm addresses the
+ * correct port from its very first call.
+ *
+ * Why this matters: each webview is a separate JS realm with its own
+ * `_apiPort`. The main window also self-corrects via the `api-ready` Tauri
+ * event (it exists when that one-shot event fires at startup), but a pop-out
+ * window opened *later* misses that event — so without this seed it stayed on
+ * the `9876` default and sent its UI Bridge responses/pongs to the wrong
+ * runner (e.g. the primary on 9876 instead of a temp runner on 9877),
+ * silently breaking per-window targeting on any non-9876 runner.
+ * `useApiReady`/`get_api_port` still override this asynchronously.
+ */
+function injectedApiPort(): number {
+  if (typeof window !== "undefined") {
+    const injected = (window as unknown as Record<string, unknown>).__QONTINUI_PORT__;
+    const n = Number(injected);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 9876;
+}
+
+let _apiPort: number = injectedApiPort();
+let _apiBase: string = `http://localhost:${_apiPort}`;
+let _wsBase: string = `ws://localhost:${_apiPort}`;
 
 const portChangeListeners = new Set<() => void>();
 
