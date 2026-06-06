@@ -123,22 +123,30 @@ impl Drop for IsolatedEditContext {
         // Best-effort release of every active claim on the current Tokio
         // runtime. A failed release is observability-only — the session
         // that drops the context is shutting down anyway.
+        //
+        // Guard the spawn on a live runtime: outside one — a sync `#[test]`,
+        // or a Drop that runs while unwinding a panic — `tokio::spawn` itself
+        // panics ("no reactor running"), and a panic during unwind aborts the
+        // process (SIGABRT). Release is best-effort, so skipping it when no
+        // runtime is present is the safe degrade; coord's TTL reaps the claim.
         let claims = std::mem::take(&mut self.active_claims);
         if !claims.is_empty() {
-            let base = self.coord_http_base.clone();
-            let mid = self.device_id;
-            tokio::spawn(async move {
-                for claim in claims {
-                    release_claim_best_effort(
-                        &base,
-                        mid,
-                        claim.agent_session_id,
-                        &claim.kind,
-                        &claim.resource_key,
-                    )
-                    .await;
-                }
-            });
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let base = self.coord_http_base.clone();
+                let mid = self.device_id;
+                handle.spawn(async move {
+                    for claim in claims {
+                        release_claim_best_effort(
+                            &base,
+                            mid,
+                            claim.agent_session_id,
+                            &claim.kind,
+                            &claim.resource_key,
+                        )
+                        .await;
+                    }
+                });
+            }
         }
     }
 }
@@ -672,12 +680,19 @@ mod tests {
             .filter(|c| c.kind == "worktree")
             .collect();
         assert_eq!(worktree_claims.len(), 2, "one worktree claim per repo");
-        assert!(worktree_claims
-            .iter()
-            .any(|c| c.resource_key == "d:/qontinui-root/qontinui-runner"));
-        assert!(worktree_claims
-            .iter()
-            .any(|c| c.resource_key == "d:/qontinui-root/qontinui-coord"));
+        // Derive the expected keys from the SAME helpers the acquire side uses,
+        // so the assert is platform-portable: `default_canonical_path` resolves
+        // to `D:/qontinui-root/...` on Windows and `$HOME/qontinui-root/...` on
+        // POSIX, and `worktree_resource_key` normalizes both to the guard form.
+        for repo in ["qontinui-runner", "qontinui-coord"] {
+            let expected = super::super::worktree_resource_key(
+                &super::super::canonical_paths::default_canonical_path(repo).unwrap(),
+            );
+            assert!(
+                worktree_claims.iter().any(|c| c.resource_key == expected),
+                "missing worktree claim keyed on {expected}"
+            );
+        }
 
         // Drain before drop: this is a non-async test, and Drop's release
         // path `tokio::spawn`s — which panics outside a runtime. Clearing
@@ -702,10 +717,10 @@ mod tests {
         assert_eq!(ctx.active_claims.len(), 1, "one worktree claim remains");
         assert_eq!(ctx.worktrees.len(), 1);
         assert_eq!(ctx.worktrees[0].repo, "qontinui-coord");
-        assert_eq!(
-            ctx.active_claims[0].resource_key,
-            "d:/qontinui-root/qontinui-coord"
+        let expected_coord = super::super::worktree_resource_key(
+            &super::super::canonical_paths::default_canonical_path("qontinui-coord").unwrap(),
         );
+        assert_eq!(ctx.active_claims[0].resource_key, expected_coord);
 
         // Idempotent: releasing a repo that's no longer joined is a no-op.
         let again = ctx.release_repo("qontinui-runner").await;
