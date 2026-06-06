@@ -96,19 +96,24 @@ describe("fetchOpenRecords", () => {
     expect(out.map((r) => r.claudeSessionId)).toEqual(["A"]);
   });
 
-  it("excludes records that are not open", async () => {
+  it("passes through whatever the backend returns without re-filtering on state", async () => {
+    // The backend (terminal_session_list_open -> restorable_records) owns the
+    // state/reason/grace gating: it returns `open` records PLUS in-grace
+    // `closed`/`pty-exit` records (graceful-restart case). The client must NOT
+    // re-drop the non-open ones — doing so was the restore-on-graceful-restart
+    // bug. So a "closed" record the backend chose to return is kept.
     mockInvoke.mockResolvedValueOnce({
       success: true,
       message: null,
       data: {
         sessions: [
           rec({ claudeSessionId: "A", state: "open" }),
-          rec({ claudeSessionId: "B", state: "closed" }),
+          rec({ claudeSessionId: "B", state: "closed", closeReason: "pty-exit" }),
         ],
       },
     });
     const out = await fetchOpenRecords("default");
-    expect(out.map((r) => r.claudeSessionId)).toEqual(["A"]);
+    expect(out.map((r) => r.claudeSessionId).sort()).toEqual(["A", "B"]);
   });
 
   it("returns [] when the command throws", async () => {

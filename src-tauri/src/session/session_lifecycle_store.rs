@@ -40,6 +40,12 @@ use tracing::warn;
 const CLOSED_RETENTION_MS: i64 = 86_400_000;
 /// Open records not seen for this long are pruned (7d in millis).
 const OPEN_STALE_MS: i64 = 604_800_000;
+/// A record closed with reason `"pty-exit"` (its PTY died — e.g. a graceful
+/// runner restart firing `handleExit` on every live PTY) is still restorable
+/// for this long after the close. Beyond the window, or for any other close
+/// reason (explicit user close, `"poll-dead"`, …), it is NOT restorable.
+/// 10 minutes in millis.
+const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
 
 /// One persisted terminal-session lifecycle record, keyed by
 /// `claude_session_id`. Timestamps are unix epoch millis.
@@ -187,6 +193,44 @@ impl SessionLifecycleStore {
             Ok(m) => m.values().filter(|r| r.state == "open").cloned().collect(),
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on open_records");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Clone of every record that should be RESTORED on boot. This is the
+    /// superset of [`Self::open_records`] used by the restore path:
+    ///
+    /// - every `state == "open"` record (a hard crash leaves records open), PLUS
+    /// - every `state == "closed"` record whose `close_reason == "pty-exit"`
+    ///   (its PTY died — the case a GRACEFUL restart produces by firing
+    ///   `handleExit` on every live PTY) that closed within the
+    ///   [`RESTORABLE_PTY_EXIT_MS`] grace window.
+    ///
+    /// Records closed for any other reason (explicit user close, `"poll-dead"`,
+    /// …) or pty-exit closes older than the grace window are excluded — a user
+    /// who closes a tab does not want it resurrected, and a long-dead pty-exit
+    /// close is stale.
+    pub fn restorable_records(&self, now_ms: i64) -> Vec<TerminalSessionRecord> {
+        match self.map.lock() {
+            Ok(m) => m
+                .values()
+                .filter(|r| {
+                    if r.state == "open" {
+                        return true;
+                    }
+                    if r.state == "closed" && r.close_reason.as_deref() == Some("pty-exit") {
+                        return match r.closed_at {
+                            Some(closed_at) => now_ms - closed_at <= RESTORABLE_PTY_EXIT_MS,
+                            None => false,
+                        };
+                    }
+                    false
+                })
+                .cloned()
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on restorable_records");
                 Vec::new()
             }
         }
@@ -424,6 +468,59 @@ mod tests {
         // Reload and confirm the closed record persisted with its reason.
         let store = SessionLifecycleStore::open(&path).unwrap();
         assert!(store.open_records().is_empty());
+    }
+
+    #[test]
+    fn restorable_records_includes_open_and_in_grace_pty_exit_only() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // An open record (hard-crash case) — IS restorable.
+        store.record_open(rec("open-sess"));
+        // A pty-exit close (graceful-restart case) — IS restorable while in grace.
+        store.record_open(rec("pty-exit-sess"));
+        store.record_close("pty-exit-sess", "pty-exit");
+        // An explicit/user close — is NOT restorable.
+        store.record_open(rec("user-closed-sess"));
+        store.record_close("user-closed-sess", "explicit");
+        // A pty-exit close aged beyond the grace window — is NOT restorable.
+        store.record_open(rec("stale-pty-exit-sess"));
+        store.record_close("stale-pty-exit-sess", "pty-exit");
+
+        let now = Utc::now().timestamp_millis();
+
+        // Age the stale pty-exit record's closed_at past the grace window.
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
+            m.get_mut("stale-pty-exit-sess").unwrap().closed_at =
+                Some(now - RESTORABLE_PTY_EXIT_MS - 1000);
+            let bytes = serde_json::to_vec_pretty(&m).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let mut ids: Vec<String> = store
+            .restorable_records(now)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["open-sess".to_string(), "pty-exit-sess".to_string()],
+            "open + in-grace pty-exit restorable; explicit + stale-pty-exit excluded"
+        );
+
+        // open_records() keeps strict-open semantics (only the open one).
+        let open_ids: Vec<String> = store
+            .open_records()
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert_eq!(open_ids, vec!["open-sess".to_string()]);
     }
 
     #[test]
