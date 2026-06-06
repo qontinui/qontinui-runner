@@ -368,7 +368,13 @@ async fn post_observations(coord_http_base: &str, body: &FsObservationsRequest) 
             return;
         }
     };
-    match client.post(&url).json(body).send().await {
+    // Attach the device-JWT bearer when one is available (never fatal —
+    // unpaired / empty keychain collapses to the anonymous send coord accepts
+    // today). Same write-path attach the credential-helper uses, and it feeds
+    // the data-plane auth-coverage metric ahead of multiuser Phase-2
+    // enforcement on `/coord/fs/observations`.
+    let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
+    match req.json(body).send().await {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
