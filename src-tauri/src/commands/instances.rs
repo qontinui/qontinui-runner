@@ -332,7 +332,10 @@ pub async fn list_repo_worktrees(repo_root: String) -> Result<Vec<DevLoopWorktre
                  is_main: bool|
      -> Option<DevLoopWorktree> {
         let path = path?;
-        let buildable = Path::new(&path).join("src-tauri").join("Cargo.toml").exists();
+        let buildable = Path::new(&path)
+            .join("src-tauri")
+            .join("Cargo.toml")
+            .exists();
         Some(DevLoopWorktree {
             path,
             branch,
@@ -364,11 +367,7 @@ pub async fn list_repo_worktrees(repo_root: String) -> Result<Vec<DevLoopWorktre
         } else if let Some(rest) = line.strip_prefix("HEAD ") {
             current_head = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("branch ") {
-            current_branch = Some(
-                rest.strip_prefix("refs/heads/")
-                    .unwrap_or(rest)
-                    .to_string(),
-            );
+            current_branch = Some(rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string());
         } else if line == "detached" {
             current_detached = true;
         }
