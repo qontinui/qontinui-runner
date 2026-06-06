@@ -425,6 +425,28 @@ fn dedup_key(path: &Path) -> String {
     }
 }
 
+/// The emitted `path` field, separator-normalized to forward slashes. Worktrees
+/// found via the sibling-dir scan come back as `PathBuf::join` results (Windows
+/// `\`), while git-listed ones use `/`; without this a single worktree could be
+/// reported with mixed separators (`D:/qontinui-root\qontinui-runner-wt-x`),
+/// inflating the coord-side `DISTINCT ON (device, repo, path)` set and confusing
+/// path-string matching. Cosmetic on Windows (the APIs accept both) but keeps
+/// the twin's data clean + stable.
+fn normalize_path_str(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// True iff `name` is a CANONICAL repo checkout dir (a repo root), not a
+/// worktree of one. A worktree dir is named `<repo>-wt-<slug>` (infix `-wt-`)
+/// or carries a `-wt` suffix (e.g. a cross-repo `qontinui-runner-xrepo-wt`);
+/// excluding both prevents a stray worktree dir with its own `.git` from being
+/// mis-treated as a repo root and re-listing a shared worktree under a phantom
+/// repo (which the coord `DISTINCT ON (device, repo, path)` read then keeps as a
+/// duplicate row).
+fn is_canonical_repo_dir(name: &str) -> bool {
+    name.starts_with("qontinui-") && !name.contains("-wt-") && !name.ends_with("-wt")
+}
+
 /// Run `git -C <canonical> worktree list --porcelain` and return the
 /// `worktree <path>` lines as absolute paths. Best-effort: a non-git
 /// dir or git failure yields an empty list.
@@ -601,7 +623,7 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
 
     WorktreeCensus {
         repo: repo.to_string(),
-        path: worktree.to_string_lossy().to_string(),
+        path: normalize_path_str(worktree),
         branch,
         head_sha,
         head_age_secs,
@@ -637,13 +659,10 @@ fn enumerate_worktrees(root: &Path) -> Vec<WorktreeCensus> {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            // Canonical checkout: `qontinui-*` with a `.git`. Skip
-            // `<repo>-wt-*` sibling worktrees here — they're discovered
-            // as worktrees OF their repo, not as repos themselves.
-            if !name.starts_with("qontinui-") {
-                continue;
-            }
-            if name.contains("-wt-") {
+            // Canonical checkout: `qontinui-*` with a `.git`. Skip worktree
+            // dirs here — they're discovered as worktrees OF their repo, not
+            // as repos themselves.
+            if !is_canonical_repo_dir(&name) {
                 continue;
             }
             if path.join(".git").exists() {
@@ -813,6 +832,40 @@ pub fn spawn_census() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_repo_dir_excludes_worktree_dirs() {
+        // Real repo roots.
+        assert!(is_canonical_repo_dir("qontinui-runner"));
+        assert!(is_canonical_repo_dir("qontinui-coord"));
+        assert!(is_canonical_repo_dir("qontinui-supervisor"));
+        // `-wt-` infix worktrees.
+        assert!(!is_canonical_repo_dir("qontinui-runner-wt-pnpm"));
+        assert!(!is_canonical_repo_dir("qontinui-coord-wt-verify"));
+        // `-wt` SUFFIX dirs (the oddity: a stray cross-repo worktree dir with
+        // its own .git was mis-treated as a repo root → duplicate census rows).
+        assert!(!is_canonical_repo_dir("qontinui-runner-xrepo-wt"));
+        // Non-qontinui dirs.
+        assert!(!is_canonical_repo_dir("node_modules"));
+    }
+
+    #[test]
+    fn normalize_path_str_forces_forward_slashes() {
+        // A sibling-scan PathBuf can carry Windows backslashes; the emitted
+        // census path must be separator-stable so coord's DISTINCT ON
+        // (device, repo, path) doesn't keep `\` and `/` variants as two rows.
+        let p = Path::new(r"D:\qontinui-root\qontinui-runner-wt-verify");
+        assert_eq!(
+            normalize_path_str(p),
+            "D:/qontinui-root/qontinui-runner-wt-verify"
+        );
+        // Already-forward paths are unchanged.
+        let q = Path::new("D:/qontinui-root/qontinui-coord-wt-cpw");
+        assert_eq!(
+            normalize_path_str(q),
+            "D:/qontinui-root/qontinui-coord-wt-cpw"
+        );
+    }
 
     #[test]
     fn normal_dir_is_not_a_junction() {
