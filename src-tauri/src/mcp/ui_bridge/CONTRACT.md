@@ -225,6 +225,54 @@ The gating IDs do NOT have to share the gating button's naming convention,
 and a `reveals` glob authored to look like the gate's own id will silently
 match nothing.
 
+## Discoverability & ergonomics (driving the control API by hand)
+
+Friction captured while an agent drove the control API to verify a rendered
+page (plan `2026-06-06-ui-bridge-control-discoverability-friction`). Read this
+before reaching for a hand-rolled workaround — the affordance you want probably
+already exists.
+
+### Base path: `/control/*` redirects to `/ui-bridge/control/*`
+The control surface is mounted under the `/ui-bridge` prefix. A bare
+`/control/tabs` used to 404 with nothing naming the right prefix. It now
+**308-redirects** to `/ui-bridge/control/tabs` (`mod.rs::control_prefix_redirect`,
+registered as `.route("/control/{*path}", any(...))`). 308 preserves method +
+body, so `POST /control/page/evaluate` works through the redirect. The redirect
+route is deliberately NOT in `route_manifest()` — its path isn't under
+`/ui-bridge/`, so the drift-test regex never sees it; adding it would make the
+test flag an unregistered manifest entry.
+
+### `page/evaluate` 422 already names the expected field
+The body field is `expression`. Sending `script` / `code` / `js` deserializes
+to a `JsonDataError` (missing required `expression`) → **422 whose
+`suggestions` array literally names the field**: `"Required field: \`expression\`
+(JavaScript string). …"`. Read the `suggestions` array, not just `error`. This
+is wired via `PageEvaluateRequest`'s `RequestHints::shape_error_suggestions`
+(`page.rs:173`) surfaced by `envelope.rs::envelope_422_with_hints`. There is
+intentionally no `script` alias — the hint already closes the discoverability
+gap, and an alias would add a permanent special case to a typed request.
+
+### Reading visible page text (esp. unregistered plain-JSX)
+`GET /ui-bridge/control/snapshot` returns only **registered** UI Bridge
+components (`useUIComponent`), so a panel rendered as plain JSX shows nothing
+there. To answer "did my panel render?":
+- **`POST /ui-bridge/control/page/summary`** now returns a `bodyText` field —
+  the whole page's `document.body.innerText`, trimmed and capped at 8000 chars
+  (`page.rs::ui_bridge_page_summary_handler`) — alongside the structured
+  headings/buttons/inputs/links digest. One call, no hand-rolled evaluate.
+- **`POST /ui-bridge/control/page/read-value`** (`elements.rs:3336`) reads one
+  selector's `textContent`/`value`.
+- **`find-by-text`** (`elements.rs:3158`) locates elements by visible text.
+
+### `page/evaluate` result envelope: pass `unwrap: true` for a stable shape
+By default the result shape varies by type (scalars get wrapped as
+`{success, result:{value}}`; objects pass through bare), which breaks naive
+`data.result.value` parsing. Pass **`unwrap: true`** and the frontend returns a
+consistent discriminated `{value, type}` shape for every result type
+(`page.rs:159` field, applied at `page.rs:752`). The varying `unwrap:false`
+shape is the legacy default kept for back-compat — prefer `unwrap:true` for
+parse-without-try/except.
+
 ## Contract test surface
 
 - **Internal manifest drift** — `cargo test manifest_matches_route_calls`

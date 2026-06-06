@@ -380,8 +380,34 @@ fn local_route_entries() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// Redirect bare `/control/*` requests to the canonical
+/// `/ui-bridge/control/*` surface.
+///
+/// The control API is mounted under the `/ui-bridge` prefix, but an agent
+/// reaching for "control" routinely guesses `/control/tabs` first and gets an
+/// opaque 404 with nothing pointing at the right prefix. A **308 Permanent
+/// Redirect** preserves the method AND body, so `POST /control/page/evaluate`
+/// transparently lands on the real handler instead of forcing a retry.
+/// Nothing is mounted at top-level `/control/*`, so there is no collision.
+///
+/// NOTE: this route's path does NOT start with `/ui-bridge/`, so it is
+/// intentionally invisible to the `manifest_matches_route_calls` drift test
+/// (whose regex only scans `/ui-bridge/*` literals) — it must NOT be added to
+/// `route_manifest()`, which would otherwise flag it as an unregistered
+/// manifest entry.
+async fn control_prefix_redirect(uri: axum::http::Uri) -> axum::response::Redirect {
+    // `uri.path()` is e.g. `/control/tabs`; prefixing `/ui-bridge` yields the
+    // canonical `/ui-bridge/control/tabs`. `path_and_query()` preserves any
+    // query string (e.g. `/control/snapshot?visibleOnly=1`).
+    let tail = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    axum::response::Redirect::permanent(&format!("/ui-bridge{tail}"))
+}
+
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
-    use axum::routing::{get, post};
+    use axum::routing::{any, get, post};
     // Each `pub mod` listed at the top of this file owns a thematic slice of
     // the UI Bridge HTTP surface and exposes `routes()` + `route_entries()`.
     // Composition here is purely structural — every handler lives in a
@@ -426,6 +452,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/invoke/{command_name}",
             post(crate::mcp::ui_bridge_invoke_handlers::ui_bridge_invoke_handler),
         )
+        // Discoverability: 308-redirect bare `/control/*` → `/ui-bridge/control/*`
+        // so the control surface is reachable from the obvious path. See
+        // `control_prefix_redirect` for why this is NOT in `route_manifest()`.
+        .route("/control/{*path}", any(control_prefix_redirect))
 }
 
 #[cfg(test)]
