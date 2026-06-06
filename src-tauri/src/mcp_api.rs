@@ -1723,6 +1723,7 @@ pub fn create_router(
         .merge(crate::mcp::window_manager::routes())
         .merge(crate::mcp::worktrees::routes())
         .merge(crate::mcp::agent_worktrees::routes())
+        .merge(crate::install_effects_producer::routes())
         .merge(crate::mcp::token_analytics::routes())
         .merge(crate::mcp::otel_status::routes())
         .merge(crate::mcp::container_status::routes())

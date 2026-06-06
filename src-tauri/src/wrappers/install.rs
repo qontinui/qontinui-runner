@@ -14,7 +14,7 @@
 //! the manifest id, not the npm package name.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use super::credentials::CredentialStore;
 use super::manager::WrapperManager;
 use super::registry::{scan_one, WrapperRegistry};
+use crate::pm_detect::{detect_node_package_manager, pm_command};
 
 /// Body for `POST /wrappers/install`.
 ///
@@ -62,61 +63,6 @@ pub enum InstallError {
     InvalidSpec(String),
 }
 
-/// Pick the preferred Node package manager. Order: `pnpm`, then `npm`.
-/// Resolved at startup and at each install (cheap — `--version` is fast).
-///
-/// Windows note: package managers ship as `.cmd` shim batch files
-/// (`pnpm.cmd`, `npm.cmd`). Rust's `Command::new("pnpm")` does NOT walk
-/// `PATHEXT` to resolve extensions, so the bare-name probe fails even
-/// when the manager is installed and on PATH. We try the bare name first
-/// (works on macOS/Linux and on Windows when invoked from a shell), then
-/// fall back to `<name>.cmd` for Windows-shimmed installs.
-pub fn detect_package_manager() -> Option<&'static str> {
-    ["pnpm", "npm"].into_iter().find(|&pm| {
-        if probe_pm(pm) {
-            return true;
-        }
-        #[cfg(windows)]
-        {
-            // Try the .cmd shim explicitly. We still report the bare
-            // name to callers — `Command::new(pm)` later in this file
-            // is the install invocation and would hit the same failure
-            // mode, so we centralize the workaround in `pm_command`.
-            let shim = format!("{}.cmd", pm);
-            if probe_pm(&shim) {
-                return true;
-            }
-        }
-        false
-    })
-}
-
-fn probe_pm(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Build a `Command` for the given package manager that also works on
-/// Windows where the manager is shipped as a `.cmd` shim.
-fn pm_command(pm: &str) -> Command {
-    #[cfg(windows)]
-    {
-        // Try `<pm>.cmd` first; if it doesn't probe-clean, the bare
-        // name is the right thing to invoke (probably resolved via
-        // PowerShell's PATHEXT or a real .exe).
-        let shim = format!("{}.cmd", pm);
-        if probe_pm(&shim) {
-            return Command::new(shim);
-        }
-    }
-    Command::new(pm)
-}
-
 /// Install (or update) a wrapper. The flow:
 ///
 /// 1. Pick a temp directory under the wrappers root.
@@ -132,7 +78,7 @@ pub async fn install(
     version: Option<&str>,
 ) -> Result<InstallResponse, InstallError> {
     validate_package_spec(package)?;
-    let pm = detect_package_manager().ok_or(InstallError::NoPackageManager)?;
+    let pm = detect_node_package_manager().ok_or(InstallError::NoPackageManager)?;
     let root = registry.root().to_path_buf();
     std::fs::create_dir_all(&root)?;
 
@@ -531,6 +477,6 @@ mod tests {
         // We don't actually invoke `pnpm` in unit tests because not
         // every CI box has it; this stub just exercises the import
         // surface so refactors can't silently drop it.
-        let _ = detect_package_manager();
+        let _ = detect_node_package_manager();
     }
 }

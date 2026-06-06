@@ -194,7 +194,11 @@ pub fn blob_sha_for_bytes(content: &[u8]) -> Result<String, String> {
 
 /// Read a file and compute its blob sha. `Ok(None)` if the file doesn't exist
 /// (deleted in the worktree) — the caller decides how to treat a deletion.
-fn blob_sha_for_file(abs: &Path) -> Result<Option<String>, String> {
+///
+/// `pub(crate)` so the install-effects producer reuses this exact pre/post
+/// blob-sha capture for its manifest/lockfile FS observations (Phase 3) instead
+/// of copy-pasting the `git hash-object` semantics.
+pub(crate) fn blob_sha_for_file(abs: &Path) -> Result<Option<String>, String> {
     match std::fs::read(abs) {
         Ok(bytes) => Ok(Some(blob_sha_for_bytes(&bytes)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
