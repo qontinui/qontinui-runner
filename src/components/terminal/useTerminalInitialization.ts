@@ -10,12 +10,19 @@ import type { SaveSessionLayoutParams } from "./useSessionPersistence";
 import { rememberSessionId } from "./lastKnownSessionIds";
 
 /**
- * Fetch the durable OPEN session records for `pageId` from the backend
+ * Fetch the durable RESTORABLE session records for `pageId` from the backend
  * registry, filtered to this page and deduped by `claudeSessionId` (defensive
  * — the registry should already enforce one row per id, but a duplicate would
  * otherwise spawn two tabs for one session). This is the SOURCE OF TRUTH for
  * the zone↔session binding on restore, replacing the ephemeral-tabId
  * creation-order mapping the localStorage snapshot used to drive.
+ *
+ * `terminal_session_list_open` returns the restorable superset: `open` records
+ * (hard-crash case) PLUS in-grace `closed`/`pty-exit` records (graceful-restart
+ * case, where `handleExit` flipped every live PTY to `closed`). The backend
+ * owns the state/reason/grace gating, so we deliberately do NOT re-filter on
+ * `state === "open"` here — that would drop the pty-exit records the backend
+ * just decided are restorable.
  *
  * Exported for unit testing the restore-binding logic without booting React.
  */
@@ -33,7 +40,6 @@ export async function fetchOpenRecords(pageId: string): Promise<TerminalSessionR
   for (const rec of sessions) {
     if (!rec || typeof rec.claudeSessionId !== "string") continue;
     if ((rec.pageId ?? "default") !== pageId) continue;
-    if (rec.state && rec.state !== "open") continue;
     if (!byId.has(rec.claudeSessionId)) byId.set(rec.claudeSessionId, rec);
   }
   return [...byId.values()];

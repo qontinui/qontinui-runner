@@ -832,17 +832,24 @@ pub fn terminal_session_record_close(
     })
 }
 
-/// List every currently-open Claude terminal session from the lifecycle
-/// registry. The grid hydrates its session tiles from this instead of
+/// List every RESTORABLE Claude terminal session from the lifecycle registry.
+/// The grid hydrates its session tiles from this on boot instead of
 /// `localStorage`.
+///
+/// Returns the restorable superset (see `restorable_records`): all `open`
+/// records (hard-crash case) PLUS `closed`/`pty-exit` records still within the
+/// grace window (graceful-restart case, where `handleExit` flipped every live
+/// PTY to `closed`). User-closed and stale records are excluded so the restore
+/// path resurrects exactly the sessions that died with the runner.
 #[tauri::command]
 pub fn terminal_session_list_open(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
 ) -> Result<CommandResponse, String> {
+    let now = chrono::Utc::now().timestamp_millis();
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "sessions": store.open_records() })),
+        data: Some(serde_json::json!({ "sessions": store.restorable_records(now) })),
     })
 }
 
