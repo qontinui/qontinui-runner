@@ -1077,28 +1077,11 @@ async fn run_continuation_terminal(
         }
     };
 
-    // Open a fresh pop-out window so the continuation lands in its own visible
-    // surface (best-effort: if window creation fails we still create the session
-    // — it then renders in the MAIN window's terminal grid, which is acceptable
-    // and is exactly how an operator-opened terminal appears). `window_label`
-    // is `Some(label)` when the pop-out opened, so we can assign the new session
-    // to it below (otherwise the session stays on `main`).
-    let window_label = match crate::commands::terminal_windows::open_terminal_window(
-        app.clone(),
-        app.state::<Arc<crate::window_assignments::WindowAssignments>>(),
-        None,
-    )
-    .await
-    {
-        Ok(record) => Some(record.label),
-        Err(e) => {
-            warn!(
-                "agent_runtime: gate-continuation terminal: open_terminal_window failed \
-                 ({e}) — session will render in the main window"
-            );
-            None
-        }
-    };
+    // The continuation lands DOCKED in the MAIN window's terminal grid (a visible
+    // tab the operator actually sees) rather than an invisible pop-out window. The
+    // session create below does NOT assign a window, so it renders on `main`. We
+    // deliberately do not call `open_terminal_window` here — a pop-out is invisible
+    // to the operator and would otherwise require a reassignment step.
 
     // Title: prefer the anchor_key, else a generic gate-continuation label.
     let title = payload
@@ -1107,10 +1090,18 @@ async fn run_continuation_terminal(
         .unwrap_or_else(|| "Gate continuation".to_string());
 
     // Resolve the SAME `claude` binary the headless path uses (QONTINUI_CLAUDE_BIN
-    // override honored). The prompt is the single positional arg — interactive
-    // form, NOT `--print` (see the fn doc: interactivity is required).
+    // override honored). The prompt is the trailing positional arg — interactive
+    // form, NOT `--print` (see the fn doc: interactivity is required). Inject
+    // `--dangerously-skip-permissions` (same as the worker-tab spawn path) so the
+    // continuation /implement-plan session does not stall on interactive Bash
+    // permission prompts — an unattended gate continuation has no operator to
+    // answer them.
     let claude_bin = claude_bin_path();
-    let command = Some(vec![claude_bin, payload.initial_prompt.clone()]);
+    let command = Some(vec![
+        claude_bin,
+        "--dangerously-skip-permissions".to_string(),
+        payload.initial_prompt.clone(),
+    ]);
 
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
@@ -1130,25 +1121,8 @@ async fn run_continuation_terminal(
 
     match result {
         Ok((terminal_id, coord_session_id)) => {
-            // Move the new session into the pop-out window we opened so the
-            // window actually renders it (without this the pop-out is empty and
-            // the session shows in the main grid). Best-effort: a failure here
-            // just leaves the session on `main`, still visible.
-            if let Some(label) = window_label {
-                if let Err(e) = crate::commands::terminal_windows::assign_session_to_window(
-                    app.clone(),
-                    app.state::<Arc<crate::window_assignments::WindowAssignments>>(),
-                    terminal_id.clone(),
-                    label.clone(),
-                )
-                .await
-                {
-                    warn!(
-                        "agent_runtime: gate-continuation terminal: assign session {terminal_id} \
-                         to window {label} failed ({e}) — session stays in the main window"
-                    );
-                }
-            }
+            // The session is intentionally left on `main` (docked, visible) — no
+            // pop-out window was opened, so there is nothing to reassign it to.
             info!(
                 "agent_runtime: gate-continuation terminal session created \
                  terminal_id={terminal_id} coord_session={coord_session_id:?} \
