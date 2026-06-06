@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Plus, X, Shuffle } from "lucide-react";
+import { Plus, X, Shuffle, SquareArrowOutUpRight } from "lucide-react";
 import type { TerminalPageConfig } from "./useTerminalPages";
 
 interface TerminalPageTabBarProps {
@@ -10,6 +10,8 @@ interface TerminalPageTabBarProps {
   onRemovePage: (id: string) => void;
   onRenamePage: (id: string, name: string) => void;
   onReorganize?: () => void;
+  /** Open a new pop-out OS window (same process) hosting its own terminals. */
+  onPopOut?: () => void;
 }
 
 export function TerminalPageTabBar({
@@ -20,6 +22,7 @@ export function TerminalPageTabBar({
   onRemovePage,
   onRenamePage,
   onReorganize,
+  onPopOut,
 }: TerminalPageTabBarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -135,6 +138,16 @@ export function TerminalPageTabBar({
           title="Reorganize pages by topic (AI)"
         >
           <Shuffle className="w-3 h-3" />
+        </button>
+      )}
+      {onPopOut && (
+        <button
+          onClick={onPopOut}
+          aria-label="Open terminal in a new window"
+          className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10 transition-colors"
+          title="Open a new pop-out terminal window"
+        >
+          <SquareArrowOutUpRight className="w-3 h-3" />
         </button>
       )}
     </div>
