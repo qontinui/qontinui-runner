@@ -1460,6 +1460,7 @@ mod tests {
             agentic_phase_success: Some(true),
             blame_json: None,
             contingent_on: Vec::new(),
+            node_rollups: Vec::new(),
         }
     }
 }

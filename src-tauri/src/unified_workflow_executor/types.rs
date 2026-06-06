@@ -91,6 +91,20 @@ pub struct ReplayPoint {
     pub timestamp: String,
 }
 
+/// Per-node blueprint telemetry rollup (Phase 4). Lets the meta-optimizer
+/// attribute token cost / tool usage / rejections to a specific node.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NodeTelemetry {
+    pub node_id: String,
+    pub node_kind: String, // "agentic" | "deterministic"
+    #[serde(default)]
+    pub tools_used: Vec<String>,
+    #[serde(default)]
+    pub tools_rejected: Vec<String>,
+    #[serde(default)]
+    pub tokens: Option<u64>,
+}
+
 /// Result of a single iteration of the verification-agentic loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IterationResult {
@@ -118,6 +132,9 @@ pub struct IterationResult {
     /// Populated from `LoopContext.active_contingencies` at the end of each iteration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contingent_on: Vec<String>,
+    /// Per-node blueprint telemetry rollup for this iteration (Phase 4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_rollups: Vec<NodeTelemetry>,
 }
 
 /// Final result of the entire verification-agentic loop.
@@ -156,6 +173,11 @@ pub struct LoopResult {
     /// Number of CI auto-resumes consumed at loop exit.
     #[serde(default)]
     pub ci_auto_resumes: u32,
+    /// Per-node blueprint telemetry rollups, flattened across all iterations
+    /// (Phase 4). Union the meta-optimizer reads to attribute cost/tools/
+    /// rejections per node across the whole loop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_rollups: Vec<NodeTelemetry>,
 }
 
 impl LoopResult {
@@ -902,6 +924,10 @@ pub enum AgenticOutcome {
         input_tokens: Option<u64>,
         /// Output tokens generated (available for API providers only).
         output_tokens: Option<u64>,
+        /// Blueprint telemetry (Phase 4): de-duplicated tool names used.
+        tools_used: Vec<String>,
+        /// Blueprint telemetry (Phase 4): tool names rejected by a FailNode policy.
+        tools_rejected: Vec<String>,
     },
     /// AI ran but reported failure
     Failed {
@@ -912,6 +938,10 @@ pub enum AgenticOutcome {
         input_tokens: Option<u64>,
         /// Output tokens generated (available for API providers only).
         output_tokens: Option<u64>,
+        /// Blueprint telemetry (Phase 4): de-duplicated tool names used.
+        tools_used: Vec<String>,
+        /// Blueprint telemetry (Phase 4): tool names rejected by a FailNode policy.
+        tools_rejected: Vec<String>,
     },
     /// AI execution errored out
     Error { error: String },
@@ -953,6 +983,27 @@ impl AgenticOutcome {
             AgenticOutcome::Error { .. }
             | AgenticOutcome::BudgetExceeded { .. }
             | AgenticOutcome::Skipped => (None, None),
+        }
+    }
+
+    /// Blueprint telemetry (Phase 4): tools used / rejected by the AI session,
+    /// if available. Returns `(used, rejected)`, both empty for non-CLI or
+    /// non-running outcomes.
+    pub fn tools(&self) -> (Vec<String>, Vec<String>) {
+        match self {
+            AgenticOutcome::Success {
+                tools_used,
+                tools_rejected,
+                ..
+            }
+            | AgenticOutcome::Failed {
+                tools_used,
+                tools_rejected,
+                ..
+            } => (tools_used.clone(), tools_rejected.clone()),
+            AgenticOutcome::Error { .. }
+            | AgenticOutcome::BudgetExceeded { .. }
+            | AgenticOutcome::Skipped => (Vec::new(), Vec::new()),
         }
     }
 
@@ -1257,5 +1308,100 @@ mod tests {
         assert_eq!(back.phase, "setup");
         assert_eq!(back.step_results.len(), 1);
         assert_eq!(back.variables_set, None);
+    }
+
+    // ───────────────────────── Phase 4 telemetry rollups ─────────────────────
+
+    fn empty_iteration_result(iteration: u32) -> IterationResult {
+        IterationResult {
+            iteration,
+            verification_passed: false,
+            critical_failure: false,
+            passed_checks: 0,
+            failed_checks: 0,
+            failure_context: String::new(),
+            agentic_phase_ran: false,
+            agentic_phase_success: None,
+            blame_json: None,
+            contingent_on: Vec::new(),
+            node_rollups: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn node_telemetry_serde_round_trip() {
+        let nt = NodeTelemetry {
+            node_id: "agentic-1".into(),
+            node_kind: "agentic".into(),
+            tools_used: vec!["Bash".into(), "Edit".into()],
+            tools_rejected: vec!["Write".into()],
+            tokens: Some(1234),
+        };
+        let json = serde_json::to_string(&nt).unwrap();
+        let back: NodeTelemetry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.node_id, "agentic-1");
+        assert_eq!(back.node_kind, "agentic");
+        assert_eq!(back.tools_used, vec!["Bash", "Edit"]);
+        assert_eq!(back.tools_rejected, vec!["Write"]);
+        assert_eq!(back.tokens, Some(1234));
+    }
+
+    #[test]
+    fn node_telemetry_defaults_omit_empty_collections() {
+        // A minimal rollup deserializes from just node_id + node_kind.
+        let nt: NodeTelemetry =
+            serde_json::from_str(r#"{"node_id":"n","node_kind":"deterministic"}"#).unwrap();
+        assert!(nt.tools_used.is_empty());
+        assert!(nt.tools_rejected.is_empty());
+        assert_eq!(nt.tokens, None);
+    }
+
+    #[test]
+    fn iteration_result_omits_node_rollups_when_empty() {
+        let ir = empty_iteration_result(1);
+        let v = serde_json::to_value(&ir).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("node_rollups"),
+            "empty node_rollups must be skipped on serialize (back-compat)"
+        );
+    }
+
+    #[test]
+    fn iteration_result_includes_node_rollups_when_populated() {
+        let mut ir = empty_iteration_result(1);
+        ir.node_rollups.push(NodeTelemetry {
+            node_id: "a".into(),
+            node_kind: "agentic".into(),
+            tools_used: vec!["Bash".into()],
+            tools_rejected: Vec::new(),
+            tokens: Some(10),
+        });
+        let v = serde_json::to_value(&ir).unwrap();
+        assert!(v.as_object().unwrap().contains_key("node_rollups"));
+    }
+
+    #[test]
+    fn loop_result_omits_node_rollups_when_empty() {
+        let lr = LoopResult {
+            iterations_run: 1,
+            verification_passed: true,
+            max_iterations_reached: false,
+            critical_failure: false,
+            was_stopped: false,
+            unfixable_errors: false,
+            iteration_results: vec![],
+            total_tokens: None,
+            total_cost_usd: None,
+            fix_attempts_exhausted: false,
+            files_modified: Vec::new(),
+            fix_attempts: 0,
+            ci_auto_resumes: 0,
+            node_rollups: Vec::new(),
+        };
+        let v = serde_json::to_value(&lr).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("node_rollups"),
+            "empty LoopResult node_rollups must be skipped on serialize (back-compat)"
+        );
     }
 }

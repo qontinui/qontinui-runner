@@ -680,6 +680,7 @@ impl PromptStepHandler {
                 None, // task_run_id
                 None, // cli_session_ctx — not needed for step executor
                 None, // db_flush_ctx — not needed for step executor
+                None, // tool_policy — not applied for ai_review step executor
             )
         })
         .await;

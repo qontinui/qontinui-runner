@@ -93,6 +93,13 @@ pub struct AiSessionConfig {
     /// Optional DB flush context for periodic output persistence.
     /// When set, AI output is periodically flushed to the database during execution.
     pub db_flush_ctx: Option<crate::claude_session::runner::DbFlushContext>,
+    /// Optional blueprint tool policy (Phase 3). When `Some`, the Claude CLI is
+    /// spawned with allow/deny gating (and an ephemeral `--settings` block for
+    /// argument-scoped denies), a tool-policy preamble is prepended to the
+    /// prompt, and (when `on_violation == FailNode`) observed tool calls are
+    /// checked post-hoc as defense-in-depth. `None` ⇒ byte-for-byte identical
+    /// to today's spawn (back-compat).
+    pub tool_policy: Option<crate::workflow::dag_schema::ToolPolicy>,
 }
 
 impl AiSessionConfig {
@@ -120,6 +127,7 @@ impl AiSessionConfig {
             max_tokens_override: None,
             cli_session_ctx: None,
             db_flush_ctx: None,
+            tool_policy: None,
         }
     }
 
@@ -147,6 +155,7 @@ impl AiSessionConfig {
             max_tokens_override: None,
             cli_session_ctx: None,
             db_flush_ctx: None,
+            tool_policy: None,
         }
     }
 
@@ -175,6 +184,7 @@ impl AiSessionConfig {
             max_tokens_override: None,
             cli_session_ctx: None,
             db_flush_ctx: None,
+            tool_policy: None,
         }
     }
 
@@ -237,6 +247,16 @@ impl AiSessionConfig {
         self.max_tokens_override = max_tokens;
         self
     }
+
+    /// Set the blueprint tool policy for this AI session (Phase 3).
+    ///
+    /// When `Some`, the Claude CLI is spawned with allow/deny gating and a
+    /// tool-policy preamble is prepended to the prompt. `None` leaves the spawn
+    /// byte-for-byte identical to today.
+    pub fn with_tool_policy(mut self, p: Option<crate::workflow::dag_schema::ToolPolicy>) -> Self {
+        self.tool_policy = p;
+        self
+    }
 }
 
 /// Result of an AI session execution.
@@ -258,11 +278,61 @@ pub struct AiSessionResult {
     pub input_tokens: Option<u64>,
     /// Output tokens generated (available for API providers only, None for CLI).
     pub output_tokens: Option<u64>,
+    /// Blueprint telemetry (Phase 4): de-duplicated, order-preserving list of
+    /// tool names the agentic session actually used.
+    pub tools_used: Vec<String>,
+    /// Blueprint telemetry (Phase 4): tool names rejected by a FailNode policy.
+    pub tools_rejected: Vec<String>,
 }
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Build a concise tool-policy preamble for the prompt (Phase 3 §3.2 point 3).
+///
+/// Returns `Some(preamble)` when the policy has a non-empty allow or deny;
+/// `None` otherwise (so an empty policy adds nothing). The "only these" line is
+/// omitted when allow is None/empty; the "forbidden" line is omitted when deny
+/// is None/empty. This is belt-and-suspenders alongside the hard CLI flags.
+fn build_tool_policy_preamble(policy: &crate::workflow::dag_schema::ToolPolicy) -> Option<String> {
+    let allow: Vec<&str> = policy
+        .allow
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let deny: Vec<&str> = policy
+        .deny
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if allow.is_empty() && deny.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("## Tool policy for this step\n");
+    if !allow.is_empty() {
+        out.push_str(&format!(
+            "You may use ONLY these tools: {}.\n",
+            allow.join(", ")
+        ));
+    }
+    if !deny.is_empty() {
+        out.push_str(&format!(
+            "The following are forbidden and will be blocked: {}.\n",
+            deny.join(", ")
+        ));
+    }
+    out.push('\n');
+    Some(out)
+}
 
 /// Build context explaining that the AI is running autonomously without user interaction.
 ///
@@ -642,7 +712,18 @@ impl UnifiedAiSessionExecutor {
                 step_name = %config.step_name,
             )
             .entered();
-            self.transform_prompt(config, prompt)
+            let base = self.transform_prompt(config, prompt);
+            // Phase 3: belt-and-suspenders tool-policy preamble. Prepend a short
+            // generated section describing the allow/deny so the model is told
+            // the policy in-band, complementing the hard CLI flags.
+            match config
+                .tool_policy
+                .as_ref()
+                .and_then(build_tool_policy_preamble)
+            {
+                Some(preamble) => format!("{preamble}{base}"),
+                None => base,
+            }
         };
 
         // Determine whether to use interactive mode.
@@ -683,6 +764,7 @@ impl UnifiedAiSessionExecutor {
         let model_override = config.model_override.clone();
         let cli_session_ctx = config.cli_session_ctx.clone();
         let db_flush_ctx = config.db_flush_ctx.clone();
+        let tool_policy = config.tool_policy.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let doctor_ref = doctor_handle.as_ref();
@@ -704,6 +786,7 @@ impl UnifiedAiSessionExecutor {
                     reflection_fix_ctx,
                     step_injection_ctx,
                     model_override.as_deref(),
+                    tool_policy.as_ref(),
                 )
             } else {
                 // Inline mode: one-shot session (either no session manager or interactive disabled)
@@ -729,6 +812,7 @@ impl UnifiedAiSessionExecutor {
                     Some(&task_run_id_for_claude),
                     cli_session_ctx.as_ref(),
                     db_flush_ctx.as_ref(),
+                    tool_policy.as_ref(),
                 )
             }
         })
@@ -747,6 +831,8 @@ impl UnifiedAiSessionExecutor {
                 let injected_steps = cli_result.injected_steps;
                 let cli_input_tokens = cli_result.input_tokens;
                 let cli_output_tokens = cli_result.output_tokens;
+                let cli_tools_used = cli_result.tools_used;
+                let cli_tools_rejected = cli_result.tools_rejected;
                 info!(
                     "UNIFIED-AI-SESSION: {} completed (success={}, output={} chars, duration={}ms, injected_steps={}, tokens={:?}/{:?})",
                     config.phase.as_str(),
@@ -881,6 +967,8 @@ impl UnifiedAiSessionExecutor {
                     error: String::new(),
                     input_tokens: cli_input_tokens,
                     output_tokens: cli_output_tokens,
+                    tools_used: cli_tools_used,
+                    tools_rejected: cli_tools_rejected,
                 }
             }
             Ok(Err(e)) => {
@@ -906,6 +994,8 @@ impl UnifiedAiSessionExecutor {
                     error: e.to_string(),
                     input_tokens: None,
                     output_tokens: None,
+                    tools_used: Vec::new(),
+                    tools_rejected: Vec::new(),
                 }
             }
             Err(e) => {
@@ -932,6 +1022,8 @@ impl UnifiedAiSessionExecutor {
                     error: error_msg,
                     input_tokens: None,
                     output_tokens: None,
+                    tools_used: Vec::new(),
+                    tools_rejected: Vec::new(),
                 }
             }
         }

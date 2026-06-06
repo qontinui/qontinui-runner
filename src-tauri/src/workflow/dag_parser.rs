@@ -121,6 +121,36 @@ pub fn validate_dag(def: &DagWorkflowDef) -> Result<(), Vec<DagValidationError>>
             }
         }
 
+        // Rule 8 (Phase 3): tool_policy deny tokens on an Agentic node must be
+        // well-formed, so a policy never silently no-ops. A token that contains
+        // ':' but has an EMPTY tool part or EMPTY command-prefix part (e.g.
+        // "Bash:", ":foo", ":") is malformed and unenforceable as an
+        // argument-scoped deny. Well-formed tool-name denies ("Write") and
+        // well-formed "Tool:prefix" denies pass.
+        if node.effective_kind() == NodeKind::Agentic {
+            if let Some(ref policy) = node.tool_policy {
+                if let Some(ref denies) = policy.deny {
+                    for raw in denies {
+                        let tok = raw.trim();
+                        if tok.is_empty() {
+                            continue;
+                        }
+                        if let Some((tool, prefix)) = tok.split_once(':') {
+                            if tool.trim().is_empty() || prefix.trim().is_empty() {
+                                errors.push(DagValidationError {
+                                    node_id: Some(node_id.clone()),
+                                    message: format!(
+                                        "tool_policy deny '{}' is malformed (empty tool or command prefix) and cannot be enforced",
+                                        tok
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Rule 5: approval.on_reject must reference a valid node ID
         if let Some(ref approval) = node.approval {
             if let Some(ref on_reject) = approval.on_reject {
@@ -181,6 +211,18 @@ pub fn dag_to_step_configs(def: &DagWorkflowDef) -> Result<Vec<ExecutionStepConf
             Some(node.depends_on.clone())
         };
 
+        // Tool-policy inheritance resolves HERE (purely & testably): only
+        // Agentic nodes carry a policy. A per-node policy wins; otherwise the
+        // workflow's `blueprint_defaults` is the fallback. Deterministic nodes
+        // never carry a policy (they never spawn an LLM session).
+        let resolved_tool_policy = if node.effective_kind() == NodeKind::Agentic {
+            node.tool_policy
+                .clone()
+                .or_else(|| def.blueprint_defaults.clone())
+        } else {
+            None
+        };
+
         let mut cfg = ExecutionStepConfig {
             id: Some(node_id.clone()),
             name: Some(node_name),
@@ -192,6 +234,8 @@ pub fn dag_to_step_configs(def: &DagWorkflowDef) -> Result<Vec<ExecutionStepConf
             retry_delay_ms,
             provider: effective_provider,
             model: effective_model,
+            node_kind: Some(node.effective_kind()),
+            tool_policy: resolved_tool_policy,
             ..ExecutionStepConfig::default()
         };
 
@@ -321,4 +365,160 @@ fn dfs_cycle<'a>(
 
     color.insert(node, 2); // black — done
     Ok(())
+}
+
+#[cfg(test)]
+mod node_kind_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn workflow(value: serde_json::Value) -> DagWorkflowDef {
+        serde_json::from_value(value).expect("fixture workflow should deserialize")
+    }
+
+    fn config_for<'a>(configs: &'a [ExecutionStepConfig], id: &str) -> &'a ExecutionStepConfig {
+        configs
+            .iter()
+            .find(|c| c.id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("no config for node id {id:?}"))
+    }
+
+    #[test]
+    fn dag_to_step_configs_carries_inferred_node_kinds() {
+        let def = workflow(json!({
+            "name": "test-wf",
+            "nodes": {
+                "p": { "prompt": "do the thing" },
+                "c": { "command": "echo hi" }
+            }
+        }));
+        let configs = dag_to_step_configs(&def).expect("should build step configs");
+
+        assert_eq!(
+            config_for(&configs, "p").node_kind,
+            Some(NodeKind::Agentic),
+            "prompt node should carry Agentic"
+        );
+        assert_eq!(
+            config_for(&configs, "c").node_kind,
+            Some(NodeKind::Deterministic),
+            "command node should carry Deterministic"
+        );
+    }
+
+    // Plan-test (c): a malformed `Bash:` deny on an agentic node fails
+    // validate_dag with a named error (no silent no-op).
+    #[test]
+    fn validate_dag_rejects_malformed_deny_token_on_agentic_node() {
+        let def = workflow(json!({
+            "name": "test-wf",
+            "nodes": {
+                "p": {
+                    "prompt": "do the thing",
+                    "tool_policy": { "deny": ["Bash:"] }
+                }
+            }
+        }));
+        let errs = validate_dag(&def).expect_err("malformed deny must fail validation");
+        assert!(
+            errs.iter().any(|e| e.node_id.as_deref() == Some("p")
+                && e.message.contains("malformed")
+                && e.message.contains("Bash:")),
+            "expected a named malformed-deny error, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_dag_accepts_well_formed_denies_on_agentic_node() {
+        let def = workflow(json!({
+            "name": "test-wf",
+            "nodes": {
+                "p": {
+                    "prompt": "do the thing",
+                    "tool_policy": {
+                        "allow": ["Bash"],
+                        "deny": ["Write", "Bash:git push --force"]
+                    }
+                }
+            }
+        }));
+        assert!(validate_dag(&def).is_ok());
+    }
+
+    #[test]
+    fn validate_dag_ignores_tool_policy_on_deterministic_node() {
+        // A deterministic node carrying a malformed deny is not validated as a
+        // tool policy (it would never spawn an LLM session). The discriminator
+        // rule still applies — a command node with a tool_policy is fine.
+        let def = workflow(json!({
+            "name": "test-wf",
+            "nodes": {
+                "c": {
+                    "command": "echo hi",
+                    "tool_policy": { "deny": ["Bash:"] }
+                }
+            }
+        }));
+        assert!(
+            validate_dag(&def).is_ok(),
+            "tool_policy on a deterministic node should not trigger Rule 8"
+        );
+    }
+
+    #[test]
+    fn dag_to_step_configs_resolves_tool_policy_per_node_then_blueprint_default() {
+        use crate::workflow::dag_schema::ViolationAction;
+        let def = workflow(json!({
+            "name": "test-wf",
+            "blueprint_defaults": { "deny": ["Write"] },
+            "nodes": {
+                // inherits the workflow blueprint_defaults
+                "inherit": { "prompt": "a" },
+                // overrides with its own policy
+                "own": {
+                    "prompt": "b",
+                    "tool_policy": { "allow": ["Read"], "on_violation": "fail_node" }
+                },
+                // deterministic: never carries a policy
+                "det": { "command": "echo hi" }
+            }
+        }));
+        let configs = dag_to_step_configs(&def).expect("should build step configs");
+
+        let inherit = config_for(&configs, "inherit")
+            .tool_policy
+            .as_ref()
+            .expect("inherited policy");
+        assert_eq!(inherit.deny.as_deref(), Some(&["Write".to_string()][..]));
+
+        let own = config_for(&configs, "own")
+            .tool_policy
+            .as_ref()
+            .expect("own policy");
+        assert_eq!(own.allow.as_deref(), Some(&["Read".to_string()][..]));
+        assert_eq!(own.on_violation, ViolationAction::FailNode);
+
+        assert!(
+            config_for(&configs, "det").tool_policy.is_none(),
+            "deterministic node must not carry a tool policy"
+        );
+    }
+
+    #[test]
+    fn dag_to_step_configs_honors_explicit_kind_on_prompt_node() {
+        // A prompt node explicitly marked deterministic must carry Some(Deterministic).
+        let def = workflow(json!({
+            "name": "test-wf",
+            "nodes": {
+                "p": { "prompt": "do the thing", "kind": "deterministic" }
+            }
+        }));
+        let configs = dag_to_step_configs(&def).expect("should build step configs");
+
+        assert_eq!(
+            config_for(&configs, "p").node_kind,
+            Some(NodeKind::Deterministic),
+            "explicit deterministic kind should override the prompt inference"
+        );
+    }
 }

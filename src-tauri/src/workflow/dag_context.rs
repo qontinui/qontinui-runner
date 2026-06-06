@@ -157,6 +157,8 @@ mod tests {
             cancel_reason: None,
             inputs: None,
             extract: None,
+            kind: None,
+            tool_policy: None,
         }
     }
 

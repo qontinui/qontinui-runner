@@ -376,6 +376,7 @@ pub async fn create_ai_session(
             None,              // pid_tracker
             None,              // model_override
             None,              // worktree
+            None,              // tool_policy
         ) {
             Ok(session) => {
                 let session = Arc::new(session);
@@ -1360,6 +1361,7 @@ pub async fn resume_ai_sessions(
                 None, // pid_tracker
                 None, // model_override
                 None, // worktree
+                None, // tool_policy
             )
             .map_err(|e| format!("spawn failed: {}", e))?;
 

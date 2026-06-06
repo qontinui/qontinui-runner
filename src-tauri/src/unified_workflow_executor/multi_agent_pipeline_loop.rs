@@ -825,6 +825,7 @@ impl LoopController {
                 files_modified: Vec::new(),
                 fix_attempts: 0,
                 ci_auto_resumes: 0,
+                node_rollups: Vec::new(),
             };
         }
 
