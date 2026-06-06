@@ -274,6 +274,15 @@ const KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(20);
 /// false-positive observed in 2026-05-22.
 const STALE_INBOUND_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Hard ceiling on a single WS connect attempt (TCP + TLS + HTTP upgrade).
+/// `connect_async` has NO built-in timeout and is NOT interruptible by the
+/// relay's kick/shutdown signals while it's parked there, so a half-open or
+/// stalled socket would block the relay task indefinitely with no recovery
+/// (observed as `ws_connected:false` while kicks do nothing). Bounding the
+/// attempt turns an indefinite hang into a normal transport error that the
+/// reconnect-backoff path retries.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -329,12 +338,89 @@ impl BackendRelayState {
 /// so settings changes (new backend URL, fresh token) take effect on the
 /// next attempt without a runner restart.
 pub async fn start_relay(api_state: Arc<ApiState>) -> Arc<BackendRelayState> {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (kick_tx, kick_rx) = watch::channel(0u64);
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (kick_tx, mut kick_rx) = watch::channel(0u64);
     let state = api_state;
 
+    // SUPERVISOR. `relay_loop` owns the connection lifecycle and is only
+    // supposed to RETURN when a shutdown is signalled. Historically it was
+    // spawned bare — a single panic anywhere in its directly-awaited path
+    // (`send_runner_info`, the connect setup, the inbound/outbound/heartbeat/
+    // keepalive handlers) would unwind the task and PERMANENTLY kill the
+    // relay: the stored `JoinHandle` was never observed, so `kick_cloud_relay`
+    // sent to a dropped receiver (silent no-op) and only a full runner restart
+    // could revive the cloud connection. That manifested in the wild as
+    // `ws_connected:false` with every idle-gate green and kicks doing nothing
+    // (and a pile of CLOSE_WAIT sockets from the relay's last connections).
+    //
+    // This outer task supervises `relay_loop` and respawns it on a panic OR an
+    // unexpected (non-shutdown) return, with escalating backoff so a panic
+    // that reproduces immediately can't hot-spin. `catch_unwind` keeps a relay
+    // panic from escaping the supervisor (the crate builds panic=unwind;
+    // sentry still records the panic via its panic integration). A deliberate
+    // `stop()` (shutdown signal) is still the only clean exit.
     let task_handle = tokio::spawn(async move {
-        relay_loop(state, shutdown_rx, kick_rx).await;
+        use futures_util::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let mut respawn_backoff = Duration::from_secs(1);
+        const MAX_RESPAWN_BACKOFF: Duration = Duration::from_secs(30);
+
+        loop {
+            if *shutdown_rx.borrow() {
+                info!("Backend relay supervisor: shutdown observed, exiting");
+                return;
+            }
+
+            // Start each run level with the current kick version so a kick
+            // delivered between respawns doesn't make the fresh loop fire on
+            // an already-handled kick.
+            kick_rx.borrow_and_update();
+
+            let started = std::time::Instant::now();
+            let run = AssertUnwindSafe(relay_loop(
+                state.clone(),
+                shutdown_rx.clone(),
+                kick_rx.clone(),
+            ))
+            .catch_unwind()
+            .await;
+
+            // A shutdown is the ONLY clean reason for `relay_loop` to return.
+            if *shutdown_rx.borrow() {
+                info!("Backend relay supervisor: relay_loop exited on shutdown, exiting");
+                return;
+            }
+
+            match run {
+                Ok(()) => warn!(
+                    "Backend relay loop returned without a shutdown signal after {:.1}s \
+                     — respawning",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(_panic) => warn!(
+                    "Backend relay loop PANICKED after {:.1}s — respawning (the cloud relay \
+                     would otherwise stay dead until a runner restart)",
+                    started.elapsed().as_secs_f64()
+                ),
+            }
+
+            // A relay that ran a healthy while before dying resets the
+            // backoff; a quick re-death escalates it (capped).
+            if started.elapsed() >= Duration::from_secs(60) {
+                respawn_backoff = Duration::from_secs(1);
+            }
+            // Sleep before respawning, but wake immediately on shutdown so a
+            // `stop()` during the backoff window isn't delayed.
+            tokio::select! {
+                _ = tokio::time::sleep(respawn_backoff) => {}
+                _ = shutdown_rx.changed() => {
+                    info!("Backend relay supervisor: shutdown during respawn backoff, exiting");
+                    return;
+                }
+            }
+            respawn_backoff = (respawn_backoff * 2).min(MAX_RESPAWN_BACKOFF);
+        }
     });
 
     Arc::new(BackendRelayState {
@@ -483,7 +569,27 @@ async fn relay_loop(
             }
         };
 
-        match connect_async(request).await {
+        // Bound the connect attempt (see `CONNECT_TIMEOUT`): a timeout
+        // surfaces as an Io error so the `Err` arm below handles it exactly
+        // like any other transport failure (record + backoff + retry) instead
+        // of blocking the task forever on a stalled socket. `is_unauthorized`
+        // returns false for an Io error, so a timeout correctly does NOT kick
+        // the refresher (a hung connect is not a 401).
+        let connect_result =
+            match tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)).await {
+                Ok(inner) => inner,
+                Err(_elapsed) => Err(tokio_tungstenite::tungstenite::Error::Io(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "WS connect exceeded {}s with no handshake response",
+                            CONNECT_TIMEOUT.as_secs()
+                        ),
+                    ),
+                )),
+            };
+
+        match connect_result {
             Ok((ws_stream, _response)) => {
                 info!("Connected to runner WS at {}", ws_url);
                 let connected_at = std::time::Instant::now();
@@ -599,6 +705,24 @@ async fn relay_loop(
                 }
 
                 mark_disconnected(&api_state).await;
+
+                // If the socket died BEFORE the backend's `connected` ack, the
+                // usual cause is the device-JWT being rejected at the
+                // registration step — a post-upgrade `1008` close. Unlike a
+                // `401` on the WS *upgrade* (handled in the `Err` arm via
+                // `is_unauthorized`), that rejection arrives through
+                // `handle_inbound` reading a close frame and so never used to
+                // wake the refresher — the relay would sleep through the full
+                // backoff on a stale token. Kick the refresher here so a fresh
+                // JWT is minted before the next attempt. No-op when the token
+                // is actually fine (the refresher only re-mints near expiry).
+                if !connected_ack.load(Ordering::Relaxed) {
+                    info!(
+                        "Backend relay: connection ended before the `connected` ack \
+                         — kicking device-JWT refresher (registration likely rejected)"
+                    );
+                    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+                }
 
                 // Connection ended. Decide whether this was a "stable" run
                 // (≥10s) for backoff reset purposes.
@@ -2503,6 +2627,37 @@ mod tests {
             !is_unauthorized(&err),
             "I/O errors are NOT 401 — kicking the refresher on every \
              ECONNREFUSED would mask deeper transport problems"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_401_on_io_timeout() {
+        // The `CONNECT_TIMEOUT` path (start of the connect arm) synthesizes
+        // exactly this error when `connect_async` exceeds its budget. A hung
+        // connect is a transport problem, NOT an auth failure — re-minting the
+        // JWT won't make a stalled socket respond, so `is_unauthorized` MUST
+        // return false here or every slow/half-open connect would needlessly
+        // churn the device-JWT refresher.
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "WS connect exceeded 20s with no handshake response",
+        );
+        let err = Error::Io(io_err);
+        assert!(
+            !is_unauthorized(&err),
+            "a connect-timeout (Io::TimedOut) is a transport error, not a 401"
+        );
+    }
+
+    #[test]
+    fn connect_timeout_is_bounded() {
+        // Pin the connect-attempt ceiling so a future "tune" has to update
+        // this test (and justify it): an unbounded connect is what let the
+        // relay task wedge indefinitely on a stalled socket.
+        assert!(
+            CONNECT_TIMEOUT >= Duration::from_secs(5) && CONNECT_TIMEOUT <= Duration::from_secs(60),
+            "CONNECT_TIMEOUT should be a sane bound (5s..=60s), got {:?}",
+            CONNECT_TIMEOUT
         );
     }
 
