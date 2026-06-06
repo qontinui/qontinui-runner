@@ -455,7 +455,13 @@ fn strip_diff_prefix(s: &str) -> String {
 /// back to the runner's default TS frontend (the prior behavior, which made the
 /// surface single-repo). Only when no explicit selector resolves do we fall back
 /// to the file hint's nearest tsconfig and then the default scope.
-fn resolve_project_scope(scope: Option<&str>, hint_file: Option<&String>) -> Option<Scope> {
+///
+/// `pub(super)` so sibling observers on the same sidecar (e.g. `arch_observer`)
+/// reuse the one scope resolver rather than forking a second abstraction (vet Q7).
+pub(super) fn resolve_project_scope(
+    scope: Option<&str>,
+    hint_file: Option<&String>,
+) -> Option<Scope> {
     if let Some(s) = scope {
         // (a) Repo NAME / `owner/name` slug → local checkout dir (cross-repo
         //     Ξ_AST; CodeGraph::build walks TS/JS/Python/Rust under it).

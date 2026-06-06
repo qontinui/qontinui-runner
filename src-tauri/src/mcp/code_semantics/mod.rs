@@ -25,6 +25,7 @@
 //! - Node/TS permanently unavailable → degrade (symbol-lookup → code_graph_fallback;
 //!   resolution → `engine_unavailable`, coverage 0). Never 500 on a missing engine.
 
+pub mod arch_observer;
 pub mod cargo_check;
 pub mod code_graph_api;
 pub mod lang;
@@ -102,6 +103,19 @@ impl Credibility {
             boundary: "low".into(),
         }
     }
+
+    /// LLM-derived stochastic-kernel observer (`Ξ_Arch`/`Ξ_Domain`, Phase 3): the
+    /// model is producer-coupled (it read the same code) and authored nothing
+    /// independent, so authorial + boundary drop to `low` and causal to `medium`.
+    /// Paired with `kernel:true` + `posterior<1`, this is what marks the answer
+    /// advisory — a "model hint", never a parser fact.
+    pub fn kernel() -> Self {
+        Credibility {
+            causal: "medium".into(),
+            authorial: "low".into(),
+            boundary: "low".into(),
+        }
+    }
 }
 
 /// CONTRACT §C uniform envelope. `result` carries the §A query-specific body.
@@ -125,6 +139,9 @@ pub const PROV_INDEXING: &str = "indexing";
 pub const PROV_UNAVAILABLE: &str = "engine_unavailable";
 /// Resolved-import `Ξ_AST` provenance (Phase 1/2): deterministic file binding.
 pub const PROV_RESOLVED: &str = "code_graph_resolved";
+/// `Ξ_Arch` LLM layer-classifier provenance (Phase 3): a stochastic kernel run
+/// through the Claude-CLI path. Advisory, never gate-worthy.
+pub const PROV_KERNEL_ARCH: &str = "claude_cli_arch";
 /// Python `mypy` typecheck provenance (Phase A): full-fidelity, true overlay via
 /// `--shadow-file`. Boundary `high` (crosses the type checker).
 pub const PROV_MYPY: &str = "mypy";
@@ -205,6 +222,35 @@ impl Envelope {
             credibility: Credibility::resolved(),
             staleness_seconds: None,
             kernel: false,
+        }
+    }
+
+    /// Stochastic-kernel observer answer (`Ξ_Arch`/`Ξ_Domain`, Phase 3): an
+    /// LLM-derived observation. ALWAYS `kernel:true` with `posterior<1` and
+    /// `credibility=(medium,low,low)` — advisory, never gate-worthy. `observer` +
+    /// `provenance` identify the specific kernel (`arch` / `claude_cli_arch`).
+    /// `coverage` is the fraction of the target the pass actually classified
+    /// (cap-omitted / unparsed modules lower it honestly); `posterior` is the
+    /// uncalibrated model-hint confidence (vet Q5), or 0 when nothing was
+    /// classified — never a confident false answer.
+    pub fn kernel(
+        query: &str,
+        observer: &str,
+        provenance: &str,
+        result: Value,
+        posterior: f64,
+        coverage: f64,
+    ) -> Self {
+        Envelope {
+            observer: observer.into(),
+            query: query.into(),
+            result,
+            posterior,
+            coverage,
+            provenance: provenance.into(),
+            credibility: Credibility::kernel(),
+            staleness_seconds: None,
+            kernel: true,
         }
     }
 
@@ -399,8 +445,9 @@ pub struct TypecheckReq {
 // ===========================================================================
 
 /// Routes contributed to the runner's main router from `mcp_api.rs`. Includes
-/// the LSP `Ξ_Type` `/code-semantics/*` surface and the resolved-import `Ξ_AST`
-/// `/code-graph/*` diff blast-radius surface (Pillar 2).
+/// the LSP `Ξ_Type` `/code-semantics/*` surface, the resolved-import `Ξ_AST`
+/// `/code-graph/*` diff blast-radius surface (Pillar 2), and the `Ξ_Arch`
+/// `/code-graph/arch-layers` stochastic-kernel layer classifier (Phase 3).
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/code-semantics/health", get(health))
@@ -409,6 +456,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/code-semantics/find-references", post(find_references))
         .route("/code-semantics/typecheck", post(typecheck))
         .merge(code_graph_api::routes())
+        .merge(arch_observer::routes())
 }
 
 /// GET /code-semantics/health — per CONTRACT §B.
