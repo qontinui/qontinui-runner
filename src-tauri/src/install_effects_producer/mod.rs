@@ -610,9 +610,16 @@ struct InstallRaw {
 /// The `repo` slug coord keys on: the basename of `repo_path`. Trailing
 /// separators are stripped; an empty/`/`-only path degrades to the raw string.
 fn repo_basename(repo_path: &str) -> String {
-    let p = Path::new(repo_path.trim_end_matches(['/', '\\']));
-    p.file_name()
-        .map(|n| n.to_string_lossy().to_string())
+    // Split on both separators by hand rather than `Path::file_name` — the
+    // platform-native `Path` does not treat `\` as a separator on unix, so a
+    // Windows-style path would otherwise basename differently across OSes
+    // (caught by cross-OS CI). This pure helper stays deterministic.
+    let trimmed = repo_path.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
         .unwrap_or_else(|| repo_path.to_string())
 }
 
