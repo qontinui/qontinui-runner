@@ -73,6 +73,7 @@ const CODE_INVALID_JSON: &str = "INVALID_JSON";
 const CODE_INVALID_REQUEST: &str = "INVALID_REQUEST";
 const CODE_PAYLOAD_TOO_LARGE: &str = "PAYLOAD_TOO_LARGE";
 const CODE_BAD_REQUEST: &str = "BAD_REQUEST";
+const CODE_METHOD_NOT_ALLOWED: &str = "METHOD_NOT_ALLOWED";
 
 // ─── Envelope helpers ─────────────────────────────────────────────────────────
 
@@ -249,14 +250,22 @@ fn envelope_422_with_hints<T: RequestHints>(
 
 // ─── Global rewrite middleware ────────────────────────────────────────────────
 
-/// Axum middleware that rewrites `4xx text/plain` responses into the canonical
+/// Axum middleware that rewrites non-JSON `4xx` responses into the canonical
 /// JSON error envelope.
 ///
 /// ## Safety boundary
 ///
-/// Only `text/plain` 4xx responses are rewritten. `application/json` responses
-/// (including async-graphql errors) pass through untouched, as do 2xx/3xx/5xx
-/// responses.
+/// `4xx` responses with a `text/plain` Content-Type OR with an empty/missing
+/// Content-Type are rewritten. The empty/missing case is what axum's built-in
+/// method router emits for a **405 Method Not Allowed** (e.g. a `GET` against a
+/// POST-only route like `/ui-bridge/control/page/read-value`): a bare response
+/// with an `Allow` header and no body or Content-Type. Without this, such 405s
+/// escaped the rewrite and tripped the debug-only `envelope_audit` layer,
+/// surfacing as a panic / non-JSON 405 instead of a clean error envelope.
+///
+/// `application/json` responses (including async-graphql errors and handlers
+/// that already return `Json<ApiResponse<..>>`) pass through untouched, as do
+/// 2xx/3xx/5xx responses.
 ///
 /// ## Body size cap
 ///
@@ -273,14 +282,19 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
         return response;
     }
 
-    // Check Content-Type; only rewrite text/plain.
+    // Check Content-Type. Rewrite `text/plain` (axum extractor rejections) and
+    // also empty/missing Content-Type (axum's 405 Method-Not-Allowed and other
+    // bare router rejections produce no body and no Content-Type). Anything that
+    // already declares `application/json` is left untouched so we never
+    // double-wrap an existing envelope.
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !content_type.starts_with("text/plain") {
+    let should_rewrite = content_type.is_empty() || content_type.starts_with("text/plain");
+    if !should_rewrite {
         return response;
     }
 
@@ -321,6 +335,14 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
             CODE_INVALID_JSON,
             if original_msg.is_empty() {
                 "Bad request".to_string()
+            } else {
+                original_msg.into_owned()
+            },
+        ),
+        StatusCode::METHOD_NOT_ALLOWED => (
+            CODE_METHOD_NOT_ALLOWED,
+            if original_msg.is_empty() {
+                "HTTP method not allowed for this route (see the `Allow` response header for the supported method(s))".to_string()
             } else {
                 original_msg.into_owned()
             },
@@ -484,6 +506,42 @@ mod tests {
             "already-JSON 4xx must not be rewritten"
         );
         assert_eq!(body["error"], "explicit handler error");
+    }
+
+    /// 405 METHOD_NOT_ALLOWED — a wrong-method request against a method-scoped
+    /// route. Axum's built-in method router emits a bare 405 with an `Allow`
+    /// header and NO body / Content-Type. The rewrite middleware must turn this
+    /// into a clean JSON error envelope (regression guard for the
+    /// `read-value` panic: `GET /control/page/read-value` on a POST-only route
+    /// previously escaped the rewrite and tripped the envelope_audit panic).
+    #[tokio::test]
+    async fn wrong_method_gives_405_json_envelope() {
+        // `/probe` is POST-only; hit it with GET to trigger axum's 405.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/probe")
+            .body(Body::empty())
+            .unwrap();
+        let resp = test_router().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            content_type.starts_with("application/json"),
+            "405 must be rewritten to JSON, got Content-Type {content_type:?}"
+        );
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "METHOD_NOT_ALLOWED");
     }
 
     // ── Phase A3 tests: per-type hints on 422 ────────────────────────────────
