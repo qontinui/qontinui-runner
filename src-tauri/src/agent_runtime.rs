@@ -143,6 +143,17 @@ pub struct GateContinuationPayload {
     /// The gate anchor that cleared (for logging / correlation).
     #[serde(default)]
     pub anchor_key: Option<String>,
+    /// The gate row's id (added by the parallel coord phase). Used to (1) dedupe
+    /// a continuation delivered by BOTH the WS fast-path and the poll backstop
+    /// against the process-wide [`dispatched_gate_ids`] set, and (2) POST the
+    /// `continuation-consumed` ack so coord stops re-listing it.
+    ///
+    /// **Optional on purpose**: the coord on `origin/main` today does NOT stamp
+    /// `gate_id` on WS frames. An absent `gate_id` means we cannot ack (skip the
+    /// POST silently) and cannot dedupe by id — fully back-compatible with the
+    /// currently-deployed coord. The poll surface ALWAYS supplies it.
+    #[serde(default)]
+    pub gate_id: Option<uuid::Uuid>,
 }
 
 /// The `source` discriminator coord stamps on a gate-continuation spawn frame.
@@ -330,10 +341,54 @@ pub fn spawn_runtime() {
     });
 }
 
+/// The base (and reset) reconnect back-off, in milliseconds.
+const BACKOFF_BASE_MS: u64 = 2_000;
+
+/// The capped maximum reconnect back-off, in milliseconds.
+const BACKOFF_MAX_MS: u64 = 60_000;
+
+/// A pump that stayed connected at least this long was a HEALTHY connection
+/// that died — not a connect failure — so its disconnect must reset the
+/// back-off to [`BACKOFF_BASE_MS`] (Fix (a)). See [`reset_backoff_after_pump`].
+const HEALTHY_PUMP_THRESHOLD_SECS: u64 = 30;
+
+/// Decide whether a finished pump should RESET the reconnect back-off.
+///
+/// Fix (a): an abnormal TCP drop (ALB idle-kill with no Close frame) surfaces
+/// as `ws.next() → Some(Err)` → the `Err` arm of [`connect_and_pump`]'s caller.
+/// Without this, the `Err` arm never reset `backoff_ms`, so the back-off ratchets
+/// up to the [`BACKOFF_MAX_MS`] cap and PINS there forever — a 60s-connected /
+/// 60s-disconnected duty cycle that drops every frame published in the gap.
+///
+/// The fix: a pump that *ran for a while* before dying was a healthy connection,
+/// regardless of whether it returned `Ok` (clean Close) or `Err` (abnormal drop).
+/// Only a pump that died almost immediately (a genuine connect/handshake failure
+/// or an instant kick) should let the back-off keep climbing. This is a small
+/// pure function so the decision is unit-testable without a live socket.
+///
+/// Returns `true` when `elapsed >= HEALTHY_PUMP_THRESHOLD_SECS`.
+fn reset_backoff_after_pump(elapsed: Duration) -> bool {
+    elapsed.as_secs() >= HEALTHY_PUMP_THRESHOLD_SECS
+}
+
 /// Subscribe loop: connects to coord WS, filters for this device's
 /// spawn-request channel, dispatches each accepted payload to
 /// `run_agent_subprocess` in its own task. Reconnects with capped
 /// exponential backoff.
+///
+/// ## Back-off reset (Fix (a))
+///
+/// The back-off resets to [`BACKOFF_BASE_MS`] in TWO cases:
+/// 1. A clean pump return (`Ok`) — a graceful Close frame.
+/// 2. ANY pump (Ok OR Err) that stayed connected longer than
+///    [`HEALTHY_PUMP_THRESHOLD_SECS`] — a healthy connection that died, including
+///    the abnormal-drop case where the ALB idle-kills the socket and the pump
+///    surfaces a `ws.next() → Some(Err)`. Before this fix, the `Err` arm never
+///    reset, so a recurring idle-kill ratcheted the back-off to the 60s cap and
+///    pinned it there (a 60s-connected/60s-disconnected flap that dropped every
+///    frame in the gap). Fix (b)'s keepalive ping prevents the idle-kill in the
+///    first place; this reset is the belt-and-suspenders recovery if a drop still
+///    occurs for any other reason.
 async fn subscribe_to_spawn_requests(device_id: uuid::Uuid) -> anyhow::Result<()> {
     let ws_url = match coord_ws_url(device_id) {
         Some(u) => u,
@@ -342,24 +397,51 @@ async fn subscribe_to_spawn_requests(device_id: uuid::Uuid) -> anyhow::Result<()
             return Ok(());
         }
     };
-    let mut backoff_ms: u64 = 2_000;
+    let mut backoff_ms: u64 = BACKOFF_BASE_MS;
     loop {
-        match connect_and_pump(&ws_url, device_id).await {
+        let started = std::time::Instant::now();
+        let pump_result = connect_and_pump(&ws_url, device_id).await;
+        let elapsed = started.elapsed();
+        match pump_result {
             Ok(()) => {
                 debug!("agent_runtime: WS pump returned cleanly; reconnecting");
-                backoff_ms = 2_000;
+                backoff_ms = BACKOFF_BASE_MS;
             }
             Err(e) => {
-                warn!(
-                    "agent_runtime: WS pump error ({e:#}); retrying in {}s",
-                    backoff_ms / 1000
-                );
+                // A pump that ran long enough was a healthy connection that
+                // died abnormally (e.g. ALB idle-kill), NOT a connect failure —
+                // reset so we reconnect promptly instead of pinning at the cap.
+                if reset_backoff_after_pump(elapsed) {
+                    warn!(
+                        "agent_runtime: WS pump error after {}s of healthy uptime ({e:#}); \
+                         resetting back-off and reconnecting in {}s",
+                        elapsed.as_secs(),
+                        BACKOFF_BASE_MS / 1000
+                    );
+                    backoff_ms = BACKOFF_BASE_MS;
+                } else {
+                    warn!(
+                        "agent_runtime: WS pump error ({e:#}); retrying in {}s",
+                        backoff_ms / 1000
+                    );
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(60_000);
+        backoff_ms = (backoff_ms * 2).min(BACKOFF_MAX_MS);
     }
 }
+
+/// How often [`connect_and_pump`] sends an unsolicited WS Ping to keep the
+/// connection from being idle-reaped (Fix (b)).
+///
+/// Coord's `/ws` subscription is quiet between spawns; the ALB in front of coord
+/// has a ~60s idle timeout and silently kills any connection with no traffic for
+/// that long (no Close frame — the next `ws.next()` yields `Some(Err)`). A 20s
+/// keepalive keeps three pings inside every 60s window so the connection never
+/// looks idle. Coord's `/ws` explicitly answers a client Ping with a Pong
+/// (coord src/ws.rs), and this recv loop already swallows Pong frames.
+const KEEPALIVE_INTERVAL_SECS: u64 = 20;
 
 /// Single connect-and-pump iteration: opens the WS, listens for events,
 /// dispatches spawn-requests. Returns on disconnect.
@@ -368,38 +450,84 @@ async fn subscribe_to_spawn_requests(device_id: uuid::Uuid) -> anyhow::Result<()
 /// is set via the `?pattern=` query param at upgrade time (client-sent
 /// Text frames are silently ignored). The URL already carries the
 /// device-scoped pattern from [`coord_ws_url`].
+///
+/// ## Keepalive (Fix (b))
+///
+/// The recv loop `tokio::select!`s `ws.next()` against a
+/// [`KEEPALIVE_INTERVAL_SECS`] interval that sends a `Ping`. Without it the ALB
+/// idle-reaps the quiet subscription at ~60s, producing the connect/disconnect
+/// flap. The interval uses [`MissedTickBehavior::Delay`] so a long
+/// `handle_message` (a spawn dispatch) doesn't cause a burst of catch-up pings.
+///
+/// ## Poll-on-connect (Fix (c2))
+///
+/// Immediately after a successful connect we poll coord for any
+/// gate-continuation dispatches that landed in a disconnect GAP (frames the WS
+/// missed entirely). See [`poll_pending_continuations`]. This is the at-least-
+/// once replay backstop for Fix (c)'s lost-frame defect: the WS is the fast
+/// path, the poll is the catch-up. Dedup against the process-wide
+/// [`dispatched_gate_ids`] set keeps a frame delivered by BOTH paths from
+/// double-spawning.
 async fn connect_and_pump(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
-    use futures_util::StreamExt;
+    use bytes::Bytes;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::time::MissedTickBehavior;
+    use tokio_tungstenite::tungstenite::Message;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url).await?;
     info!("agent_runtime: WS connected for device_id={device_id}");
 
-    while let Some(msg) = ws.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("agent_runtime: WS recv error: {e:#}");
-                return Err(anyhow::anyhow!("WS recv: {e}"));
+    // Fix (c2): on every fresh connect, replay any gate-continuation dispatches
+    // coord persisted while we were disconnected. Best-effort — a poll failure
+    // must never abort the pump (the live WS subscription proceeds regardless).
+    poll_pending_continuations(device_id).await;
+
+    let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+    keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first immediate tick fires at once; skip it so we don't ping before
+    // the connection has even settled (the next tick is a full interval out).
+    keepalive.tick().await;
+
+    loop {
+        tokio::select! {
+            // Keepalive: send an unsolicited Ping so the ALB never sees the
+            // connection as idle. A send error means the socket is gone — surface
+            // it as a pump error so the caller reconnects.
+            _ = keepalive.tick() => {
+                if let Err(e) = ws.send(Message::Ping(Bytes::new())).await {
+                    warn!("agent_runtime: WS keepalive ping send failed: {e:#}");
+                    return Err(anyhow::anyhow!("WS keepalive send: {e}"));
+                }
             }
-        };
-        let txt = match msg {
-            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
-            tokio_tungstenite::tungstenite::Message::Binary(b) => {
-                String::from_utf8_lossy(&b).to_string()
+            // Inbound frame.
+            maybe_msg = ws.next() => {
+                let msg = match maybe_msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        warn!("agent_runtime: WS recv error: {e:#}");
+                        return Err(anyhow::anyhow!("WS recv: {e}"));
+                    }
+                    None => {
+                        // Stream ended (peer hung up without a Close frame).
+                        return Ok(());
+                    }
+                };
+                let txt = match msg {
+                    Message::Text(t) => t.to_string(),
+                    Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    Message::Close(_) => {
+                        info!("agent_runtime: WS closed by peer");
+                        return Ok(());
+                    }
+                    Message::Frame(_) => continue,
+                };
+                if let Err(e) = handle_message(&txt, device_id).await {
+                    warn!("agent_runtime: handle_message error (continuing): {e:#}");
+                }
             }
-            tokio_tungstenite::tungstenite::Message::Ping(_)
-            | tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
-            tokio_tungstenite::tungstenite::Message::Close(_) => {
-                info!("agent_runtime: WS closed by peer");
-                return Ok(());
-            }
-            tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
-        };
-        if let Err(e) = handle_message(&txt, device_id).await {
-            warn!("agent_runtime: handle_message error (continuing): {e:#}");
         }
     }
-    Ok(())
 }
 
 /// Parse a WS frame; if it's a spawn-request for this device, dispatch
@@ -430,7 +558,7 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
             // "dispatched but never consumed" drop.
             if envelope_is_gate_continuation(&value) {
                 match parse_gate_continuation_payload(&value) {
-                    Some(payload) => spawn_gate_continuation_task(payload, device_id),
+                    Some(payload) => dispatch_gate_continuation(payload, device_id),
                     None => warn!(
                         "agent_runtime: gate-continuation envelope on {channel} had no \
                          parseable payload/body"
@@ -596,20 +724,220 @@ fn spawn_run_task(payload: LaunchPayload) {
 }
 
 // =============================================================================
-// Gate-continuation path (Decision 6)
+// Gate-continuation path (Decision 6) + replay backstop (Fix (c2))
 // =============================================================================
+
+/// One row of coord's `GET /coord/agents/pending-continuations` response.
+///
+/// Wire contract (FIXED, coded against exactly):
+/// `{"pending": [{"gate_id", "payload": {…}, "dispatched_at"}], "total": N}`,
+/// where `payload` is the EXACT spawn-payload object coord publishes on the WS
+/// channel (same shape [`GateContinuationPayload`] parses, now carrying
+/// `gate_id`). Rows are dispatched-but-unconsumed within the last 24h.
+#[derive(Debug, Clone, Deserialize)]
+struct PendingContinuation {
+    gate_id: uuid::Uuid,
+    payload: GateContinuationPayload,
+    #[serde(default)]
+    #[allow(dead_code)]
+    dispatched_at: Option<String>,
+}
+
+/// The envelope of coord's `GET /coord/agents/pending-continuations` response.
+#[derive(Debug, Clone, Deserialize)]
+struct PendingContinuationsResponse {
+    #[serde(default)]
+    pending: Vec<PendingContinuation>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    total: i64,
+}
+
+/// Body for `POST /coord/gates/{gate_id}/continuation-consumed`.
+#[derive(Debug, Clone, Serialize)]
+struct ContinuationConsumedBody {
+    device_id: uuid::Uuid,
+}
+
+/// Process-wide set of gate_ids whose continuation we have ALREADY dispatched.
+///
+/// At-least-once delivery means a single continuation can arrive via BOTH the WS
+/// fast-path and the poll backstop (Fix (c2)) — or via two successive polls
+/// before the consumed-ack lands. This set is the dedupe guard: the FIRST
+/// dispatch of a given `gate_id` inserts it; subsequent attempts short-circuit.
+/// Continuations WITHOUT a `gate_id` (legacy coord) can't be deduped by id and
+/// always dispatch — accepted, because legacy coord also never re-lists them via
+/// the (new) poll surface, so the only delivery path is the single WS frame.
+fn dispatched_gate_ids() -> &'static std::sync::Mutex<std::collections::HashSet<uuid::Uuid>> {
+    static DISPATCHED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>,
+    > = std::sync::OnceLock::new();
+    DISPATCHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Atomically claim a `gate_id` for dispatch. Returns `true` if THIS call was
+/// the first to claim it (caller should dispatch); `false` if it was already
+/// claimed (caller must skip — a duplicate delivery). Insert-and-test under one
+/// lock so two concurrent deliveries can't both win.
+fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
+    dispatched_gate_ids().lock().unwrap().insert(gate_id)
+}
+
+/// Shared dispatch seam for BOTH the WS fast-path and the poll backstop.
+///
+/// 1. If the payload carries a `gate_id`, dedupe against [`dispatched_gate_ids`]:
+///    a duplicate (already-claimed id) is dropped here, so a continuation
+///    delivered by both transports spawns exactly once.
+/// 2. Spawn the continuation run task (the actual worktree-acquire + subprocess /
+///    terminal work in [`run_gate_continuation`]).
+/// 3. At-least-once ack: AFTER the spawn is in flight, POST
+///    `continuation-consumed` best-effort so coord stops re-listing it on the
+///    poll surface. Acking after (not before) dispatch means a crash between the
+///    two re-delivers the continuation on the next poll — a rare duplicate beats
+///    a silent drop. Absent `gate_id` (legacy coord) → skip the ack silently.
+///
+/// `spawn_gate_continuation_task` remains the low-level task spawner this calls.
+fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid::Uuid) {
+    if let Some(gate_id) = payload.gate_id {
+        if !claim_gate_dispatch(gate_id) {
+            debug!(
+                "agent_runtime: gate-continuation gate_id={gate_id} already dispatched; \
+                 skipping duplicate"
+            );
+            return;
+        }
+        // Spawn the run task, then ack consumed (best-effort, after dispatch).
+        spawn_gate_continuation_task(payload, device_id);
+        tokio::spawn(async move {
+            post_continuation_consumed(gate_id, device_id).await;
+        });
+    } else {
+        // Legacy coord: no gate_id → no dedupe-by-id and no ack. Dispatch once.
+        spawn_gate_continuation_task(payload, device_id);
+    }
+}
+
+/// Poll coord for gate-continuation dispatches that landed while this runner was
+/// disconnected, and replay any we haven't already dispatched (Fix (c2)).
+///
+/// `GET <coord_http_base>/coord/agents/pending-continuations?device_id=<uuid>`
+/// returns the dispatched-but-unconsumed rows from the last 24h. For each row we
+/// stamp the row's `gate_id` onto the parsed payload (so the shared dispatch
+/// seam can dedupe + ack it) and route it through [`dispatch_gate_continuation`],
+/// which dedupes against the in-process set, spawns the continuation, and acks
+/// `continuation-consumed`.
+///
+/// **Best-effort, warn-and-continue**: coord unreachable, a non-2xx status, or a
+/// parse error all `warn!` once and return — the live WS subscription proceeds
+/// regardless (a missed poll is retried on the next connect).
+async fn poll_pending_continuations(device_id: uuid::Uuid) {
+    let Some(base) = coord_http_base() else {
+        return;
+    };
+    let url = format!("{base}/coord/agents/pending-continuations?device_id={device_id}");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("agent_runtime: pending-continuations client build failed: {e:#}");
+            return;
+        }
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("agent_runtime: pending-continuations GET failed (continuing): {e:#}");
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(
+            "agent_runtime: pending-continuations GET returned {} (continuing)",
+            resp.status()
+        );
+        return;
+    }
+    let body: PendingContinuationsResponse = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("agent_runtime: pending-continuations parse failed (continuing): {e:#}");
+            return;
+        }
+    };
+    if body.pending.is_empty() {
+        debug!("agent_runtime: pending-continuations poll: none pending for device_id={device_id}");
+        return;
+    }
+    info!(
+        "agent_runtime: pending-continuations poll: {} pending for device_id={device_id} — replaying",
+        body.pending.len()
+    );
+    for row in body.pending {
+        // The row's gate_id is authoritative; stamp it onto the payload so the
+        // shared seam dedupes + acks even if coord omitted it inside `payload`.
+        let mut payload = row.payload;
+        payload.gate_id = Some(row.gate_id);
+        dispatch_gate_continuation(payload, device_id);
+    }
+}
+
+/// POST `continuation-consumed` for a dispatched gate continuation (the
+/// at-least-once ack). Idempotent on coord's side; best-effort here — a failure
+/// `warn!`s once and is swallowed (the continuation already dispatched; the only
+/// cost of a missed ack is coord re-listing it on the next poll, where the
+/// dedupe set drops the duplicate). NEVER crashes the caller.
+async fn post_continuation_consumed(gate_id: uuid::Uuid, device_id: uuid::Uuid) {
+    let Some(base) = coord_http_base() else {
+        return;
+    };
+    let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "agent_runtime: continuation-consumed client build failed gate_id={gate_id}: {e:#}"
+            );
+            return;
+        }
+    };
+    let body = ContinuationConsumedBody { device_id };
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("agent_runtime: continuation-consumed posted gate_id={gate_id}");
+        }
+        Ok(resp) => {
+            warn!(
+                "agent_runtime: continuation-consumed POST gate_id={gate_id} returned {} \
+                 (continuing)",
+                resp.status()
+            );
+        }
+        Err(e) => warn!(
+            "agent_runtime: continuation-consumed POST gate_id={gate_id} failed (continuing): {e:#}"
+        ),
+    }
+}
 
 /// Spawn the run task for a gate continuation. Unlike the agent-spawn path,
 /// the device-local resources (worktree, claim, JWT) are NOT supplied by coord
 /// — they are acquired inside [`run_gate_continuation`].
+///
+/// This is the low-level task spawner; callers reach it through
+/// [`dispatch_gate_continuation`], which adds the dedupe + consumed-ack seam.
 fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uuid::Uuid) {
     info!(
         "agent_runtime: gate-continuation received target_device_id={} presentation={:?} \
-         repos={} anchor_key={:?}",
+         repos={} anchor_key={:?} gate_id={:?}",
         payload.target_device_id,
         payload.presentation,
         payload.repos.len(),
         payload.anchor_key,
+        payload.gate_id,
     );
     tokio::spawn(async move {
         if let Err(e) = run_gate_continuation(payload, device_id).await {
@@ -2080,6 +2408,7 @@ mod tests {
             presentation: Presentation::Terminal,
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: Some("anchor-z".to_string()),
+            gate_id: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(uuid::Uuid::now_v7(), &workdir, &payload, None).await;
@@ -2132,5 +2461,199 @@ mod tests {
             Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
             None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
         }
+    }
+
+    // =========================================================================
+    // Fix (a): back-off reset decision
+    // =========================================================================
+
+    /// A pump that ran longer than [`HEALTHY_PUMP_THRESHOLD_SECS`] was a healthy
+    /// connection that died — it MUST reset the back-off (regardless of Ok/Err).
+    /// A pump that died almost immediately is a connect failure — it must NOT
+    /// reset, so the back-off keeps climbing toward the cap. This is the core of
+    /// Fix (a): before it, an abnormal-drop `Err` after 60s of healthy uptime
+    /// never reset and the back-off pinned at the 60s cap forever.
+    #[test]
+    fn backoff_resets_only_after_a_healthy_length_pump() {
+        // Below threshold → do NOT reset (genuine connect/handshake failure).
+        assert!(!reset_backoff_after_pump(Duration::from_secs(0)));
+        assert!(!reset_backoff_after_pump(Duration::from_secs(1)));
+        assert!(!reset_backoff_after_pump(Duration::from_secs(
+            HEALTHY_PUMP_THRESHOLD_SECS - 1
+        )));
+        // At/above threshold → reset (a healthy connection that dropped).
+        assert!(reset_backoff_after_pump(Duration::from_secs(
+            HEALTHY_PUMP_THRESHOLD_SECS
+        )));
+        assert!(reset_backoff_after_pump(Duration::from_secs(60)));
+        // The exact ALB idle-kill window (~60s) is well above threshold.
+        assert!(reset_backoff_after_pump(Duration::from_secs(61)));
+    }
+
+    /// Sub-millisecond / sub-second pumps round down to 0 whole seconds and must
+    /// NOT reset — a tight reconnect storm (instant kick) keeps backing off.
+    #[test]
+    fn backoff_does_not_reset_on_subsecond_pump() {
+        assert!(!reset_backoff_after_pump(Duration::from_millis(500)));
+        assert!(!reset_backoff_after_pump(Duration::from_millis(29_999)));
+    }
+
+    // =========================================================================
+    // Fix (c2): pending-continuations response parsing
+    // =========================================================================
+
+    /// Coord's `GET /coord/agents/pending-continuations` response parses into
+    /// dispatchable rows: each `payload` is the bare gate-continuation spawn
+    /// object (same shape the WS path parses) and each row's `gate_id` is the
+    /// authoritative dedupe/ack key.
+    #[test]
+    fn pending_continuations_response_parses_into_dispatchable_payloads() {
+        let device = uuid::Uuid::now_v7();
+        let gate_a = uuid::Uuid::now_v7();
+        let gate_b = uuid::Uuid::now_v7();
+        let body = serde_json::json!({
+            "pending": [
+                {
+                    "gate_id": gate_a,
+                    "dispatched_at": "2026-06-06T00:00:00Z",
+                    "payload": {
+                        "target_device_id": device,
+                        "initial_prompt": "resume phase 2",
+                        "repos": ["qontinui-runner"],
+                        "presentation": "headless",
+                        "source": "gate_continuation",
+                        "anchor_key": "plan:foo:phase:2",
+                        "gate_id": gate_a,
+                    }
+                },
+                {
+                    "gate_id": gate_b,
+                    "dispatched_at": "2026-06-06T00:01:00Z",
+                    // `payload` here OMITS gate_id (coord may not duplicate it
+                    // inside the payload object); the poll path stamps the row's
+                    // gate_id on before dispatch.
+                    "payload": {
+                        "target_device_id": device,
+                        "initial_prompt": "resume phase 3",
+                        "repos": [],
+                        "source": "gate_continuation",
+                    }
+                }
+            ],
+            "total": 2,
+        });
+        let parsed: PendingContinuationsResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.total, 2);
+        assert_eq!(parsed.pending.len(), 2);
+
+        let r0 = &parsed.pending[0];
+        assert_eq!(r0.gate_id, gate_a);
+        assert_eq!(r0.payload.target_device_id, device);
+        assert_eq!(r0.payload.initial_prompt, "resume phase 2");
+        assert_eq!(r0.payload.presentation, Presentation::Headless);
+        assert_eq!(r0.payload.gate_id, Some(gate_a));
+        assert_eq!(r0.dispatched_at.as_deref(), Some("2026-06-06T00:00:00Z"));
+
+        let r1 = &parsed.pending[1];
+        assert_eq!(r1.gate_id, gate_b);
+        // payload had no gate_id → None; the poll loop stamps row.gate_id on.
+        assert_eq!(r1.payload.gate_id, None);
+        assert_eq!(r1.payload.presentation, Presentation::Terminal); // default
+    }
+
+    /// An empty / absent `pending` array parses to zero rows (the common case),
+    /// and a totally empty object also parses (all fields `#[serde(default)]`).
+    #[test]
+    fn pending_continuations_empty_response_parses() {
+        let empty: PendingContinuationsResponse =
+            serde_json::from_value(serde_json::json!({ "pending": [], "total": 0 })).unwrap();
+        assert!(empty.pending.is_empty());
+        let bare: PendingContinuationsResponse =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(bare.pending.is_empty());
+        assert_eq!(bare.total, 0);
+    }
+
+    // =========================================================================
+    // Fix (c2): dedupe-set behavior
+    // =========================================================================
+
+    /// The process-wide dedupe set claims a gate_id exactly once: the first
+    /// claim wins (`true`), every subsequent claim of the same id loses
+    /// (`false`). This is what makes a continuation delivered by BOTH the WS
+    /// fast-path and the poll backstop spawn exactly once. Distinct ids never
+    /// collide.
+    #[test]
+    fn claim_gate_dispatch_is_once_per_gate_id() {
+        let gate = uuid::Uuid::now_v7();
+        let other = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate), "first claim of a gate_id wins");
+        assert!(
+            !claim_gate_dispatch(gate),
+            "second claim of the same gate_id loses (deduped)"
+        );
+        assert!(
+            !claim_gate_dispatch(gate),
+            "third claim still loses (idempotent skip)"
+        );
+        assert!(
+            claim_gate_dispatch(other),
+            "a different gate_id is unaffected"
+        );
+    }
+
+    // =========================================================================
+    // Fix (c2): WS payload with/without gate_id parses
+    // =========================================================================
+
+    /// A WS-delivered gate-continuation payload carrying the NEW `gate_id` field
+    /// parses and surfaces the id (so the dispatch seam can dedupe + ack it).
+    /// A payload WITHOUT `gate_id` (the currently-deployed coord) still parses,
+    /// with `gate_id == None` (back-compat: dispatch once, skip the ack). Covers
+    /// both the string-inner and object-inner envelope variants.
+    #[test]
+    fn gate_continuation_parses_with_and_without_gate_id() {
+        let device = uuid::Uuid::now_v7();
+        let gate = uuid::Uuid::now_v7();
+
+        // (a) WITH gate_id (new coord), string-inner envelope (real /ws shape).
+        let inner = serde_json::json!({
+            "target_device_id": device,
+            "initial_prompt": "go",
+            "repos": ["qontinui-runner"],
+            "source": "gate_continuation",
+            "anchor_key": "anchor-x",
+            "gate_id": gate,
+        });
+        let env = serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "payload": serde_json::to_string(&inner).unwrap(),
+        });
+        let p = parse_gate_continuation_payload(&env).expect("payload with gate_id must parse");
+        assert_eq!(p.gate_id, Some(gate), "gate_id must round-trip");
+        assert_eq!(p.target_device_id, device);
+
+        // (b) WITHOUT gate_id (deployed coord), object-inner envelope. Must
+        // still parse, gate_id == None (so the seam skips the ack silently).
+        let no_gate = serde_json::json!({
+            "body": {
+                "target_device_id": device,
+                "initial_prompt": "go",
+                "repos": [],
+                "source": "gate_continuation",
+            }
+        });
+        let p2 = parse_gate_continuation_payload(&no_gate)
+            .expect("payload without gate_id must still parse (back-compat)");
+        assert_eq!(p2.gate_id, None, "absent gate_id must be optional → None");
+    }
+
+    /// The continuation-consumed ack body serializes to the FIXED wire contract
+    /// coord expects: `{"device_id": "<uuid>"}`.
+    #[test]
+    fn continuation_consumed_body_wire_shape() {
+        let device = uuid::Uuid::now_v7();
+        let v = serde_json::to_value(ContinuationConsumedBody { device_id: device }).unwrap();
+        assert_eq!(v, serde_json::json!({ "device_id": device }));
     }
 }
