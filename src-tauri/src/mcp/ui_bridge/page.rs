@@ -1365,6 +1365,12 @@ pub async fn ui_bridge_page_summary_handler(
         return JSON.stringify({
             title: document.title,
             url: document.URL,
+            // Whole-page visible text (capped at 8000 chars). Lets a caller
+            // answer "did my plain-JSX panel render?" in one call without a
+            // hand-rolled page/evaluate `document.body.innerText` — the
+            // get_snapshot affordance surfaces only *registered* UI Bridge
+            // components, so unregistered JSX is invisible there.
+            bodyText: (document.body ? document.body.innerText : '').trim().slice(0, 8000),
             headings: vis('h1, h2, h3').map(function(el) { return { tag: el.tagName, text: el.textContent.trim().slice(0, 100) }; }).slice(0, 10),
             buttons: vis('button').filter(function(el) { return el.textContent.trim().length > 0; }).map(function(el) { return el.textContent.trim().slice(0, 40); }).filter(function(t) { return t.length < 30; }).slice(0, 20),
             inputs: vis('input, textarea, select').map(function(el) { return { tag: el.tagName, type: el.type || null, placeholder: (el.placeholder || '').slice(0, 40) || null, hasValue: (el.value || '').length > 0 }; }).slice(0, 15),
