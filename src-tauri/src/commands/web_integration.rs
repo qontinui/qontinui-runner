@@ -595,27 +595,35 @@ pub async fn redeem_pair_code(
     // must leave Tier Local for the WS relay to come online. Defensive:
     // the Settings UI also promotes after redeem, but a headless / UI-Bridge
     // caller that doesn't run the FE path still ends up online. Idempotent —
-    // a no-op when already at Tier 2. Kicks the relay + JWT refresher as a
-    // side effect of `set_runner_tier`.
+    // a no-op when already at Tier 2.
     {
         let mut s = settings::load_settings();
         if s.tier != settings::RunnerTier::QontinuiAccount {
             s.tier = settings::RunnerTier::QontinuiAccount;
             s.tier_initialized = true;
             if crate::instance::is_secondary() {
-                warn!("redeem_pair_code: secondary runner — applying in-memory only, skipping save_settings");
-                crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-                crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
-                info!("redeem_pair_code: promoted runner to Tier QontinuiAccount + kicked relay");
+                warn!("redeem_pair_code: secondary runner — applying tier in-memory only, skipping save_settings");
             } else if let Err(e) = settings::save_settings(&s) {
                 warn!("redeem_pair_code: tier promotion persist failed (continuing): {e}");
             } else {
-                crate::mcp::backend_relay::commands::kick_cloud_relay().await;
-                crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
-                info!("redeem_pair_code: promoted runner to Tier QontinuiAccount + kicked relay");
+                info!("redeem_pair_code: promoted runner to Tier QontinuiAccount");
             }
         }
     }
+
+    // ALWAYS kick the relay + JWT refresher after a successful redeem — NOT
+    // only when the tier changed. `persist_pairing` above just wrote a fresh
+    // device-JWT into the slot the relay reads, but a re-pair on a runner that
+    // is ALREADY Tier 2 (the common case: an idle runner whose 4h JWT expired)
+    // used to skip these kicks entirely — they lived inside the `tier !=
+    // QontinuiAccount` branch. The result was a fresh JWT staged on disk that
+    // nothing ever told the live relay/refresher to pick up, so the runner sat
+    // `ws_connected:false` until a full restart despite a valid pairing.
+    // Idempotent: the refresher no-ops when the JWT is still fresh, and a kick
+    // to a connected relay just re-evaluates its idle gate.
+    crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+    crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+    info!("redeem_pair_code: kicked relay + device-JWT refresher to pick up the fresh pairing");
 
     let response_device_id = resp.device_id.clone().unwrap_or_else(|| device_id.clone());
 
