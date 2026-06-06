@@ -90,7 +90,8 @@ pub struct ClaimConflict {
     pub intent: Option<String>,
 }
 
-/// Pre-allocate claim parameters passed into [`allocate_and_materialize`].
+/// Pre-allocate claim parameters passed into
+/// [`allocate_and_materialize_with_claim`].
 ///
 /// Constructed via [`ClaimSpawnContext::from_intent_and_paths`] and the
 /// callers' optional explicit plan-id / phase / file-glob hints.
@@ -166,6 +167,32 @@ enum AcquireOutcome {
     Other(String),
 }
 
+/// Build the JSON body shared by coord's
+/// `/claims/{acquire,heartbeat,release}` endpoints.
+///
+/// `agent_session_id` is ALWAYS emitted — as a JSON string when present,
+/// as `null` when absent. It is the per-session discriminator coord folds
+/// into the claim **owner token** (`machine:session`) so two agents on a
+/// single machine are distinct holders rather than silently renewing each
+/// other's claim (plan 2026-06-03-coord-session-scoped-claim-owner).
+/// Machine-level acquirers (daemons, the merge scheduler) pass `None`,
+/// which coord maps to the legacy bare-machine owner token.
+fn claim_request_body(
+    kind: &str,
+    resource_key: &str,
+    machine_id: &uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
+    metadata: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "resource_key": resource_key,
+        "machine_id": machine_id.to_string(),
+        "agent_session_id": agent_session_id,
+        "metadata": metadata,
+    })
+}
+
 async fn pre_allocate_claim(
     coord_http_base: &str,
     machine_id: &uuid::Uuid,
@@ -183,13 +210,13 @@ async fn pre_allocate_claim(
     if let Some(phase) = &ctx.phase {
         metadata["phase"] = serde_json::json!(phase);
     }
-    let body = serde_json::json!({
-        "kind": ctx.kind,
-        "resource_key": ctx.resource_key,
-        "machine_id": machine_id.to_string(),
-        "agent_session_id": agent_session_id,
-        "metadata": metadata,
-    });
+    let body = claim_request_body(
+        ctx.kind,
+        &ctx.resource_key,
+        machine_id,
+        agent_session_id,
+        metadata,
+    );
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -373,13 +400,13 @@ async fn heartbeat_once(
     resource_key: &str,
 ) -> Result<HeartbeatTickOutcome, String> {
     let url = format!("{}/claims/heartbeat", coord_http_base.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "kind": kind,
-        "resource_key": resource_key,
-        "machine_id": machine_id.to_string(),
-        "agent_session_id": agent_session_id,
-        "metadata": {},
-    });
+    let body = claim_request_body(
+        kind,
+        resource_key,
+        &machine_id,
+        agent_session_id,
+        serde_json::json!({}),
+    );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -423,13 +450,13 @@ pub async fn release_claim_best_effort(
     resource_key: &str,
 ) {
     let url = format!("{}/claims/release", coord_http_base.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "kind": kind,
-        "resource_key": resource_key,
-        "machine_id": machine_id.to_string(),
-        "agent_session_id": agent_session_id,
-        "metadata": {},
-    });
+    let body = claim_request_body(
+        kind,
+        resource_key,
+        &machine_id,
+        agent_session_id,
+        serde_json::json!({}),
+    );
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -476,7 +503,8 @@ pub struct RepoRequest {
     pub parent_sha: String,
 }
 
-/// A single materialized worktree as returned by `allocate_and_materialize`.
+/// A single materialized worktree as returned by
+/// `allocate_and_materialize_with_claim`.
 /// `worktree_path` is the actual on-disk path the runner created (matches
 /// coord's `suggested_path` in the happy path, but the runner is allowed
 /// to deviate — e.g. tighter disk).
@@ -721,7 +749,7 @@ struct CoordAllocatedWorktree {
     push_ref: String,
 }
 
-/// Error variants returned by [`allocate_and_materialize`]. Distinct
+/// Error variants returned by [`allocate_and_materialize_with_claim`]. Distinct
 /// from a plain `String` so the runner-side caller can pattern-match
 /// the spawn-time claim conflict and surface a structured Tauri event
 /// to the webview (per plan 2026-05-18-agent-spawn-coordination Phase 3).
@@ -769,6 +797,12 @@ impl From<String> for AllocateError {
 /// is the dependency injection point so tests can substitute scratch
 /// repos.
 ///
+/// `agent_session_id` is the per-session claim-owner discriminator
+/// threaded onto acquire/heartbeat/release (see [`claim_request_body`]).
+/// `plan_id` / `phase`, when both present, select `ClaimKind::Phase` with
+/// `resource_key = "plan:<plan>:phase:<phase>"`; when only
+/// `declared_overlap_paths` is present the claim kind is `FileGlob`.
+///
 /// Per plan 2026-05-18-agent-spawn-coordination Phase 3, when a
 /// `ClaimSpawnContext` can be derived from the inputs (either
 /// plan_id + phase, or non-empty `declared_overlap_paths`), this
@@ -787,32 +821,6 @@ impl From<String> for AllocateError {
 /// has minted rows, the partial materialization stops; coord's sweeper
 /// will eventually reclaim the unused rows once they age into
 /// `abandoned`.
-pub async fn allocate_and_materialize(
-    coord_http_base: &str,
-    machine_id: &uuid::Uuid,
-    repos: &[RepoRequest],
-    intent: Option<&str>,
-    declared_overlap_paths: Option<&[String]>,
-    repo_canonical_paths: &std::collections::HashMap<String, PathBuf>,
-) -> Result<MaterializeOutcome, AllocateError> {
-    allocate_and_materialize_with_claim(
-        coord_http_base,
-        machine_id,
-        None,
-        repos,
-        intent,
-        declared_overlap_paths,
-        repo_canonical_paths,
-        None,
-        None,
-    )
-    .await
-}
-
-/// Like [`allocate_and_materialize`] but accepts explicit `plan_id` /
-/// `phase` strings for `ClaimKind::Phase` pre-flight. When both are
-/// supplied, the claim shape is `phase / plan:<plan>:phase:<phase>`
-/// per plan 2026-05-18-agent-spawn-coordination Phase 3.
 pub async fn allocate_and_materialize_with_claim(
     coord_http_base: &str,
     machine_id: &uuid::Uuid,
@@ -1261,5 +1269,43 @@ mod tests {
         // Result is outside refs/heads/* — the whole Row 4 point.
         assert!(!remote_agent_ref("agent/x-y").starts_with("refs/heads/"));
         assert_eq!(remote_agent_ref("weird"), "refs/agent/weird");
+    }
+
+    #[test]
+    fn claim_body_sends_session_id_as_owner_discriminator() {
+        // The whole point of plan 2026-06-03-coord-session-scoped-claim-owner:
+        // when a session id is present it MUST reach coord on the wire so the
+        // owner token becomes `machine:session` and two same-machine agents
+        // are distinct holders. Asserts the wire contract of every
+        // acquire/heartbeat/release body the runner emits.
+        let machine = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let session = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let body = claim_request_body(
+            "phase",
+            "plan:p:phase:1",
+            &machine,
+            Some(session),
+            serde_json::json!({}),
+        );
+        assert_eq!(body["kind"], "phase");
+        assert_eq!(body["resource_key"], "plan:p:phase:1");
+        assert_eq!(body["machine_id"], machine.to_string());
+        // uuid serializes hyphenated-lowercase, matching to_string().
+        assert_eq!(body["agent_session_id"], session.to_string());
+    }
+
+    #[test]
+    fn claim_body_emits_null_session_id_for_machine_level_acquirers() {
+        // Daemons / merge-scheduler acquire at machine scope (no session).
+        // The field must still be PRESENT and explicitly null so coord
+        // falls back to the legacy bare-machine owner token rather than
+        // mis-parsing a missing key.
+        let machine = uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let body = claim_request_body("file_glob", "src/**", &machine, None, serde_json::json!({}));
+        assert!(
+            body.as_object().unwrap().contains_key("agent_session_id"),
+            "agent_session_id key must always be present on the wire"
+        );
+        assert!(body["agent_session_id"].is_null());
     }
 }

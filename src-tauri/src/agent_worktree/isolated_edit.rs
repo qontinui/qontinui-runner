@@ -8,9 +8,9 @@
 //!
 //! Phase 2 wires this into `terminal_create` and `spawn_worker_session`;
 //! Phase 3 wires the same shape into the skill orchestrators
-//! (`/manual-test-loop`, `/manual-test`, `/implement-plan`) via the
-//! existing HTTP face at
-//! [`crate::mcp::agent_worktrees::post_allocate_local`].
+//! (`/manual-test-loop`, `/manual-test`, `/implement-plan`) through this
+//! in-process facade directly (the former `/agents/allocate-local` HTTP
+//! wrapper was unused and has been removed).
 //!
 //! Gated behind [`super::worktree_mode_enabled`] — when the flag is off,
 //! [`acquire`] returns `Ok(None)` so callers fall back to the legacy

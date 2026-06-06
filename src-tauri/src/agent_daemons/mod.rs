@@ -8,9 +8,8 @@
 //!   had **no production call site** (coordination plan §3.0 step 3:
 //!   PTY/spawn wiring not yet on disk).
 //! - `dirty_poller` (Coordination Phase 6) — 5s `git status` →
-//!   `POST /agents/:id/dirty-state`. Self-registered at
-//!   `/agents/allocate-local` via its own `spawn_and_register` +
-//!   private handle registry.
+//!   `POST /agents/:id/dirty-state`. Self-registered on the spawn path
+//!   via its own `spawn_and_register` + private handle registry.
 //!
 //! Each carried its **own** `TokenSlot` and its **own** refresh loop,
 //! so an agent ran two independent refreshers hitting coord's

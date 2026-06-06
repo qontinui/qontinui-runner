@@ -246,9 +246,10 @@ pub fn emit_stolen_event_with_context(
 
 /// Emit the `agent-claim-conflict` Tauri event so the ConflictModal
 /// renders. Called by the Tauri command that drives the spawn flow
-/// from the webview — the HTTP `/agents/allocate-local` path returns
-/// the conflict as a structured 409 body, and the IPC translator
-/// surfaces it as an event here.
+/// from the webview — the in-process spawn path
+/// (`agent_worktree::isolated_edit::acquire`) surfaces a held claim as
+/// `AllocateError::ClaimConflict`, and the IPC translator surfaces it as
+/// an event here.
 ///
 /// Backward-compatible thin wrapper around
 /// [`emit_conflict_event_with_context`]; callers that have
