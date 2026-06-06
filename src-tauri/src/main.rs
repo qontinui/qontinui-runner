@@ -1241,6 +1241,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::instances::get_temp_spawn_placements,
             commands::instances::launch_runner_instance,
             commands::instances::list_monitors_for_placement,
+            commands::instances::list_repo_worktrees,
             commands::instances::preview_spawn_placement,
             commands::instances::save_runner_instance,
             commands::instances::set_temp_spawn_placements,

@@ -75,6 +75,7 @@ const TAB_GROUPS = {
   system: [
     "settings",
     "settings-account",
+    "settings-dev-loop",
     "settings-ai",
     "settings-agentic",
     "settings-self-healing",

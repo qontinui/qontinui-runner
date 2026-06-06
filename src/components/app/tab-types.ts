@@ -62,6 +62,7 @@ export type MainTabId =
   | "settings-mobile"
   | "settings-discovery"
   | "settings-backend-connection"
+  | "settings-dev-loop"
   | "settings-mcp"
   | "settings-log-sources"
   | "settings-execution-variables"
@@ -168,6 +169,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-mobile",
   "settings-discovery",
   "settings-backend-connection",
+  "settings-dev-loop",
   "settings-mcp",
   "settings-log-sources",
   "settings-execution-variables",
@@ -285,6 +287,7 @@ export const TAB_LABELS: Record<MainTabId, string> = {
   "settings-mobile": "Mobile Settings",
   "settings-discovery": "Discovery Settings",
   "settings-backend-connection": "Backend Connection Settings",
+  "settings-dev-loop": "Test My Change",
   "settings-mcp": "MCP Settings",
   "settings-log-sources": "Log Sources Settings",
   "settings-execution-variables": "Execution Variables",

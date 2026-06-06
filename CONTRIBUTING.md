@@ -164,6 +164,34 @@ qontinui-runner/
 
 ## Testing
 
+### Dev loop — test your change without restarting the primary
+
+**Never restart the primary runner to test a code change — build it into an
+isolated temp runner instead.** The supervisor (`:9875`) can compile any
+worktree or git ref into its own throwaway runner (own port 9877–9899, own UI
+Bridge) with **zero impact on the primary** (`:9876`), so a restart is never
+the way to see your change.
+
+The first-class way to do this from the runner UI: **Settings → "Test My
+Change"**. Pick a detected worktree / a git ref / a worktree path, click
+**Build & launch test runner**, then **Open** the spawned runner to verify.
+**Stop** it when done. Under the hood this is a single
+`POST /runners/spawn-test` with a provenance selector:
+
+```bash
+# build an isolated temp runner from a branch (clean checkout) and wait for health
+curl -X POST localhost:9875/runners/spawn-test \
+  -H 'content-type: application/json' \
+  -d '{"rebuild":true,"git_ref":"feat/my-change","wait":true}'
+# …or from an existing worktree (uncommitted edits included):
+#   -d '{"rebuild":true,"worktree_path":"D:/.../qontinui-runner","wait":true}'
+curl -X POST localhost:9875/runners/<id>/stop   # clean up when done
+```
+
+Always check the response `source` field (`worktree`/`worktree_path`/`git_ref`
+vs `live_tree`) and `git_sha` to confirm what actually got built. `git_ref`
+and `worktree_path` are mutually exclusive and both require `rebuild:true`.
+
 ### Frontend Tests
 
 ```bash

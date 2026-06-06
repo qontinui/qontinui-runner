@@ -967,6 +967,7 @@ export function TabContent({
 
     case "settings":
     case "settings-account":
+    case "settings-dev-loop":
     case "settings-ai":
     case "settings-agentic":
     case "settings-self-healing":
@@ -988,6 +989,7 @@ export function TabContent({
       const settingsTabMap: Record<string, string> = {
         settings: "backend-connection",
         "settings-account": "account",
+        "settings-dev-loop": "dev-loop",
         "settings-ai": "ai",
         "settings-agentic": "agentic",
         "settings-self-healing": "self-healing",

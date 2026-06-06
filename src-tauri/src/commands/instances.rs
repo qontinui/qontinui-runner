@@ -251,6 +251,143 @@ pub async fn set_temp_spawn_placements(
     Ok(placements)
 }
 
+/// One worktree discovered via `git worktree list --porcelain`, surfaced to
+/// the "Test My Change" dev-loop UI so a developer can pick the checkout to
+/// build into an isolated temp runner. Mirrors the TS `DevLoopWorktree`
+/// interface in `DevLoopSettings.tsx`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DevLoopWorktree {
+    /// Absolute path to the worktree root (the `worktree <path>` line).
+    pub path: String,
+    /// Branch short name (`refs/heads/<name>` → `<name>`), or `None` when
+    /// the worktree is detached / bare.
+    pub branch: Option<String>,
+    /// The checked-out HEAD sha, if reported.
+    pub head: Option<String>,
+    /// True for the first entry — the main worktree (the live tree). The
+    /// supervisor rejects the live tree as a `worktree_path`, so the UI
+    /// steers the user to a git ref for this one.
+    pub is_main: bool,
+    /// True when the worktree has no branch (`detached` line present).
+    pub is_detached: bool,
+    /// True when `<path>/src-tauri/Cargo.toml` exists on disk — i.e. this
+    /// checkout can actually be built by the supervisor's spawn-test.
+    pub buildable: bool,
+}
+
+/// Discover the git worktrees under `repo_root` for the "Test My Change"
+/// dev-loop UI. `repo_root` is typically the supervisor's `project_dir`
+/// (`.../qontinui-runner/src-tauri`); if it ends in `src-tauri` we walk up
+/// to the repo root before asking git.
+///
+/// Returns ALL worktrees (including main, flagged `is_main`). On any git
+/// failure (non-zero exit, git not on PATH) returns `Err(String)` — the
+/// frontend treats that as "discovery unavailable" and falls back to manual
+/// entry of a git ref or path.
+#[tauri::command]
+pub async fn list_repo_worktrees(repo_root: String) -> Result<Vec<DevLoopWorktree>, String> {
+    use std::path::Path;
+
+    // Normalize: if the final path component is `src-tauri` (case-insensitive)
+    // use the parent directory as the git repo root, otherwise use as-is.
+    let root_path = Path::new(&repo_root);
+    let git_root: &Path = match root_path.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.eq_ignore_ascii_case("src-tauri") => {
+            root_path.parent().unwrap_or(root_path)
+        }
+        _ => root_path,
+    };
+
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(git_root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|e| format!("failed to run git: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "git worktree list failed ({}): {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut worktrees: Vec<DevLoopWorktree> = Vec::new();
+
+    // Porcelain format: records separated by blank lines. Each record starts
+    // with `worktree <path>` and may carry `HEAD <sha>`, `branch refs/...`,
+    // `detached`, `bare`.
+    let mut current_path: Option<String> = None;
+    let mut current_head: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+    let mut current_detached = false;
+
+    let flush = |path: Option<String>,
+                 head: Option<String>,
+                 branch: Option<String>,
+                 detached: bool,
+                 is_main: bool|
+     -> Option<DevLoopWorktree> {
+        let path = path?;
+        let buildable = Path::new(&path)
+            .join("src-tauri")
+            .join("Cargo.toml")
+            .exists();
+        Some(DevLoopWorktree {
+            path,
+            branch,
+            head,
+            is_main,
+            is_detached: detached,
+            buildable,
+        })
+    };
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            // End of a record.
+            if let Some(wt) = flush(
+                current_path.take(),
+                current_head.take(),
+                current_branch.take(),
+                current_detached,
+                worktrees.is_empty(),
+            ) {
+                worktrees.push(wt);
+            }
+            current_detached = false;
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            current_path = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("HEAD ") {
+            current_head = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            current_branch = Some(rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string());
+        } else if line == "detached" {
+            current_detached = true;
+        }
+        // `bare` and any other lines are ignored.
+    }
+
+    // Flush a trailing record (porcelain output may not end with a blank line).
+    if let Some(wt) = flush(
+        current_path.take(),
+        current_head.take(),
+        current_branch.take(),
+        current_detached,
+        worktrees.is_empty(),
+    ) {
+        worktrees.push(wt);
+    }
+
+    Ok(worktrees)
+}
+
 /// Get identity info about this runner instance: whether it's secondary and what primary it proxies to.
 #[tauri::command]
 pub async fn get_runner_identity(
@@ -284,6 +421,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             launch_runner_instance,
             stop_runner_instance,
             get_runner_identity,
+            list_repo_worktrees,
             preview_spawn_placement,
             list_monitors_for_placement,
             get_temp_spawn_placements,
