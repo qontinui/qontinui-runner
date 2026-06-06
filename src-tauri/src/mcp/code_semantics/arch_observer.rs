@@ -104,19 +104,18 @@ async fn arch_layers(
 
     // Build the resolved graph + module summaries off the async runtime.
     let dir = project_dir.clone();
-    let (summaries, total_modules, fingerprint) =
-        match tokio::task::spawn_blocking(move || {
-            let graph = CodeGraph::build(&dir);
-            let mods = summarize_modules(&graph);
-            let total = mods.len();
-            let fp = fingerprint_modules(&mods);
-            (mods, total, fp)
-        })
-        .await
-        {
-            Ok(t) => t,
-            Err(_) => return Json(cold_envelope(q, "graph build failed")),
-        };
+    let (summaries, total_modules, fingerprint) = match tokio::task::spawn_blocking(move || {
+        let graph = CodeGraph::build(&dir);
+        let mods = summarize_modules(&graph);
+        let total = mods.len();
+        let fp = fingerprint_modules(&mods);
+        (mods, total, fp)
+    })
+    .await
+    {
+        Ok(t) => t,
+        Err(_) => return Json(cold_envelope(q, "graph build failed")),
+    };
 
     if total_modules == 0 {
         return Json(cold_envelope(q, "empty / cold graph (no modules)"));
@@ -348,7 +347,10 @@ fn build_prompt(modules: &[ModuleSummary]) -> String {
             s.push_str(&format!("   exports: {}\n", m.exports.join(", ")));
         }
         if !m.internal_deps.is_empty() {
-            s.push_str(&format!("   imports-from: {}\n", m.internal_deps.join(", ")));
+            s.push_str(&format!(
+                "   imports-from: {}\n",
+                m.internal_deps.join(", ")
+            ));
         }
         if !m.external_pkgs.is_empty() {
             s.push_str(&format!("   external: {}\n", m.external_pkgs.join(", ")));
@@ -487,7 +489,11 @@ fn assemble(parsed: &[LayerAssignment], total_modules: usize, cached: bool) -> (
     } else {
         (classified as f64 / total_modules as f64).min(1.0)
     };
-    let posterior = if classified == 0 { 0.0 } else { KERNEL_POSTERIOR };
+    let posterior = if classified == 0 {
+        0.0
+    } else {
+        KERNEL_POSTERIOR
+    };
     let modules: Vec<Value> = parsed
         .iter()
         .map(|a| json!({ "module": a.module, "layer": a.layer, "rationale": a.rationale }))
@@ -582,7 +588,12 @@ mod tests {
             line: 1,
         }
     }
-    fn import(from: &str, to_module: &str, target: Option<&str>, kind: ResolutionKind) -> ImportEdge {
+    fn import(
+        from: &str,
+        to_module: &str,
+        target: Option<&str>,
+        kind: ResolutionKind,
+    ) -> ImportEdge {
         ImportEdge {
             from_file: from.into(),
             to_module: to_module.into(),
@@ -620,9 +631,19 @@ mod tests {
                     ResolutionKind::Relative,
                 ),
                 // api → external package
-                import("src/api/routes.ts", "express", None, ResolutionKind::External),
+                import(
+                    "src/api/routes.ts",
+                    "express",
+                    None,
+                    ResolutionKind::External,
+                ),
                 // an unresolved internal-looking edge must NOT become an external pkg
-                import("src/api/routes.ts", "./missing", None, ResolutionKind::Unresolved),
+                import(
+                    "src/api/routes.ts",
+                    "./missing",
+                    None,
+                    ResolutionKind::Unresolved,
+                ),
             ],
             exports: vec![
                 export("registerRoutes", "src/api/routes.ts"),
@@ -637,9 +658,7 @@ mod tests {
         assert_eq!(mods[0].module, "src/api");
         assert_eq!(mods[0].export_count, 2);
         assert!(mods[0].files.contains(&"routes.ts".to_string()));
-        assert!(mods[0]
-            .internal_deps
-            .contains(&"src/services".to_string()));
+        assert!(mods[0].internal_deps.contains(&"src/services".to_string()));
         assert!(mods[0].external_pkgs.contains(&"express".to_string()));
         // The Unresolved edge is dropped from external packages (coverage hole, not a pkg).
         assert!(!mods[0].external_pkgs.contains(&"./missing".to_string()));
@@ -801,7 +820,10 @@ mod tests {
         // A distinctive fingerprint unlikely to collide with other tests.
         let fp = 0xA5A5_DEAD_BEEF_1234u64;
         cache_put(fp, Vec::new());
-        assert!(cache_get(fp).is_none(), "empty classification is not cached");
+        assert!(
+            cache_get(fp).is_none(),
+            "empty classification is not cached"
+        );
         let assignments = vec![LayerAssignment {
             module: "src/a".into(),
             layer: "api".into(),
