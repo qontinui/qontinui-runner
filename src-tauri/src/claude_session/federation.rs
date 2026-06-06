@@ -190,8 +190,18 @@ pub fn emit_federation_report(
 }
 
 /// Best-effort POST of the reconcile report to coord's federation reports
-/// endpoint. Runs in a detached `tokio::spawn` so the caller is never
-/// blocked. Errors are logged but never propagated.
+/// endpoint. Runs detached so the caller is never blocked. Errors are logged
+/// but never propagated.
+///
+/// Runtime-aware: `log_federation_report` is documented as reachable from
+/// "contexts that have a `tracing` logger but no Tauri AppHandle" — and in
+/// practice the memory-reconcile path runs on a `spawn_blocking` worker / plain
+/// `std::thread` with NO ambient Tokio runtime. A bare `tokio::spawn` there
+/// panics with "there is no reactor running, must be called from the context of
+/// a Tokio 1.x runtime", killing the reconcile thread. So: use the ambient
+/// runtime when one exists (the fast path), else run the post on a throwaway
+/// current-thread runtime in a detached `std::thread` — never panic, never
+/// block the caller.
 fn post_report_to_coord(ctx: &SessionContext, report: &ReconcileReport) {
     use qontinui_runner_lib::observable_bridge::memory_client;
 
@@ -233,13 +243,46 @@ fn post_report_to_coord(ctx: &SessionContext, report: &ReconcileReport) {
     };
 
     let tenant_id = ctx.tenant_id;
-    tokio::spawn(async move {
+    spawn_detached_best_effort(async move {
         if let Err(e) =
             memory_client::post_federation_report(&http, &base, &token, tenant_id, &body).await
         {
             debug!("federation report: coord POST failed: {e} (non-fatal)");
         }
     });
+}
+
+/// Spawn `fut` detached without ever panicking on the caller's runtime context.
+///
+/// `tokio::spawn` panics ("there is no reactor running") when invoked outside a
+/// Tokio runtime — which the federation-report callers can be (they run on a
+/// `spawn_blocking` worker / plain `std::thread`). This uses the ambient
+/// runtime when one exists (the fast path), else runs `fut` to completion on a
+/// throwaway current-thread runtime in a detached `std::thread`. Either way the
+/// caller is never blocked. Factored out (and `pub(crate)`) so the no-panic
+/// invariant is unit-testable without a real reconcile.
+pub(crate) fn spawn_detached_best_effort<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(fut);
+        }
+        Err(_) => {
+            std::thread::spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(fut),
+                    Err(e) => {
+                        debug!("federation report: fallback runtime build failed: {e} (non-fatal)")
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// Reachable from contexts that have a `tracing` logger but no Tauri
@@ -453,5 +496,27 @@ mod tests {
         let raw = "550e8400-e29b-41d4-a716-446655440000";
         let u = session_uuid(raw);
         assert_eq!(u.to_string(), raw);
+    }
+
+    #[test]
+    fn spawn_detached_runs_future_without_ambient_runtime() {
+        // REGRESSION: `post_report_to_coord` previously called `tokio::spawn`
+        // directly. The federation-report callers can run with NO ambient
+        // Tokio runtime (spawn_blocking worker / std::thread), where
+        // `tokio::spawn` panics "there is no reactor running" and kills the
+        // reconcile thread. This is a plain `#[test]` (NOT `#[tokio::test]`) so
+        // there is deliberately no ambient runtime — the helper MUST take its
+        // std::thread + throwaway-runtime fallback path, run the future to
+        // completion, and never panic.
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "test must run with no ambient Tokio runtime to exercise the fallback"
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        spawn_detached_best_effort(async move {
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("future must run to completion via the fallback runtime");
     }
 }
