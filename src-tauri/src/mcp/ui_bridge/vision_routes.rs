@@ -228,6 +228,11 @@ pub struct CaptureResponse {
     pub format: String,
     /// Name of the [`OutputContract`] used (`claude_vision_v1`, etc).
     pub contract: String,
+    /// Capture backend that produced the underlying frame, when known.
+    /// `"Webview2CapturePreview"` | `"MonitorCrop"`; `None` for device /
+    /// synthetic frames where no runner-window backend applies.
+    #[serde(rename = "captureBackend", skip_serializing_if = "Option::is_none")]
+    pub capture_backend: Option<String>,
 }
 
 /// Response envelope for `vision/capture` and `vision/annotate`. Single-output
@@ -343,7 +348,7 @@ pub struct ExtractRequest {
     pub target: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtractResponse {
     pub blocks: Vec<vision_ai::OcrBlock>,
@@ -354,6 +359,15 @@ pub struct ExtractResponse {
     pub model: String,
     /// True iff we read from cache instead of calling the model.
     pub cached: bool,
+    /// Capture backend that produced the underlying frame, when known.
+    /// `"Webview2CapturePreview"` | `"MonitorCrop"`; `None` for device /
+    /// synthetic frames where no runner-window backend applies.
+    #[serde(
+        rename = "captureBackend",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capture_backend: Option<String>,
 }
 
 /// `POST /ui-bridge/vision/describe` request shape (plan §3.2). VLM
@@ -429,6 +443,19 @@ pub struct HealthResponse {
     /// Current value of the monotonic mutation counter. Bumped by
     /// control/click, control/type, control/navigate.
     pub mutation_id: u64,
+    /// Cumulative runner-window frames served by the WebView2 CapturePreview
+    /// backend since process start.
+    pub vision_capture_preview_count: u64,
+    /// Cumulative runner-window frames served by the monitor-crop fallback
+    /// backend since process start.
+    pub vision_monitor_crop_count: u64,
+    /// Reason string for the most recent CapturePreview→monitor-crop fallback,
+    /// or `None` if no fallback has occurred this session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_last_fallback_reason: Option<String>,
+    /// RFC3339 timestamp of the most recent fallback, or `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_last_fallback_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -488,27 +515,29 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
             Ok(png) => match image::load_from_memory(&png) {
                 Ok(img) => {
                     let scale_factor = window.scale_factor().unwrap_or(scale);
+                    state
+                        .vision_capture_preview_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(Frame::from_rgba(
                         img.to_rgba8(),
                         FrameSource {
                             kind: qontinui_vision_core::FrameSourceKind::Window,
                             scale_factor,
                             captured_at: chrono::Utc::now(),
+                            capture_backend: Some(
+                                qontinui_vision_core::CaptureBackend::Webview2CapturePreview,
+                            ),
                         },
                     ));
                 }
                 Err(e) => {
-                    warn!(
-                        "CapturePreview PNG decode failed: {}; falling back to monitor-crop",
-                        e
-                    );
+                    let reason = format!("CapturePreview PNG decode failed: {}", e);
+                    record_capture_fallback(state, &reason);
                 }
             },
             Err(e) => {
-                warn!(
-                    "CapturePreview capture failed: {}; falling back to monitor-crop",
-                    e
-                );
+                let reason = format!("CapturePreview capture failed: {}", e);
+                record_capture_fallback(state, &reason);
             }
         }
     }
@@ -519,14 +548,40 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
     .await
     .map_err(|e| format!("capture task join error: {}", e))??;
 
+    state
+        .vision_monitor_crop_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(Frame::from_rgba(
         rgba,
         FrameSource {
             kind: qontinui_vision_core::FrameSourceKind::Window,
             scale_factor: monitor_scale,
             captured_at: chrono::Utc::now(),
+            capture_backend: Some(qontinui_vision_core::CaptureBackend::MonitorCrop),
         },
     ))
+}
+
+/// Record a CapturePreview→monitor-crop fallback: store the reason + timestamp
+/// for `vision/health`, and log it. The FIRST fallback this session is promoted
+/// to `info!` (so backend degradation reaches the supervisor stream without
+/// enabling debug logging); subsequent fallbacks stay `warn!`.
+fn record_capture_fallback(state: &Arc<ApiState>, reason: &str) {
+    let now = chrono::Utc::now();
+    if let Ok(mut guard) = state.vision_last_fallback.lock() {
+        *guard = Some((reason.to_string(), now));
+    }
+    let first = !state
+        .vision_capture_fallback_seen
+        .swap(true, std::sync::atomic::Ordering::Relaxed);
+    if first {
+        info!(
+            "{}; falling back to monitor-crop (first this session)",
+            reason
+        );
+    } else {
+        warn!("{}; falling back to monitor-crop", reason);
+    }
 }
 
 /// Compose the cache key for a capture request. Folds in the current
@@ -828,6 +883,9 @@ async fn do_capture(
                 bytes: bytes.len(),
                 format: ext.to_string(),
                 contract: contract.name.to_string(),
+                // Cache hit: the originating backend is not recorded with the
+                // cached image, so backend provenance is unavailable here.
+                capture_backend: None,
             });
         }
     }
@@ -839,6 +897,8 @@ async fn do_capture(
         .frame(state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    let capture_backend = capture_backend_label(&frame);
 
     let crop = resolve_crop_region(state, &req.region, &req.element, frame.width, frame.height)
         .await
@@ -904,6 +964,19 @@ async fn do_capture(
         bytes: bytes.len(),
         format: ext.to_string(),
         contract: contract.name.to_string(),
+        capture_backend,
+    })
+}
+
+/// Wire-string label for a frame's capture backend, for response echo.
+/// `Some("Webview2CapturePreview" | "MonitorCrop")` when the frame carries a
+/// runner-window backend; `None` for device / synthetic frames.
+fn capture_backend_label(frame: &Frame) -> Option<String> {
+    frame.source.capture_backend.map(|b| {
+        serde_json::to_value(b)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{:?}", b))
     })
 }
 
@@ -987,6 +1060,8 @@ async fn do_multi_capture(
                         bytes: bytes.len(),
                         format: ext.to_string(),
                         contract: contract.name.to_string(),
+                        // Cache hit: originating backend not recorded.
+                        capture_backend: None,
                     },
                 );
                 continue;
@@ -1021,6 +1096,7 @@ async fn do_multi_capture(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
     let frame_w = frame.width;
     let frame_h = frame.height;
+    let capture_backend = capture_backend_label(&frame);
 
     let mut runs: Vec<(
         String,
@@ -1095,6 +1171,7 @@ async fn do_multi_capture(
                 bytes: bytes.len(),
                 format: ext.to_string(),
                 contract: contract.name.to_string(),
+                capture_backend: capture_backend.clone(),
             },
         );
     }
@@ -1151,6 +1228,8 @@ async fn vision_diff_handler(
     }
 
     let (delta_image, ratio, bbox) = compute_pixel_delta(&baseline_frame, &comparison_frame);
+    // Echo the comparison frame's capture backend on the diff envelope.
+    let capture_backend = capture_backend_label(&comparison_frame);
 
     // Persist the delta PNG through a fresh pipeline so we get the standard
     // capture envelope back.
@@ -1165,6 +1244,7 @@ async fn vision_diff_handler(
             kind: qontinui_vision_core::FrameSourceKind::Synthetic,
             scale_factor: comparison_frame.source.scale_factor,
             captured_at: chrono::Utc::now(),
+            capture_backend: None,
         },
     );
 
@@ -1229,6 +1309,7 @@ async fn vision_diff_handler(
             bytes: bytes.len(),
             format: ext.to_string(),
             contract: contract.name.to_string(),
+            capture_backend,
         },
         pixel_delta_ratio: ratio,
         changed_regions,
@@ -1440,6 +1521,8 @@ async fn vision_raw_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
+    let capture_backend = capture_backend_label(&frame);
+
     let crop = resolve_crop_region(&state, &req.region, &req.element, frame.width, frame.height)
         .await
         .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
@@ -1485,6 +1568,7 @@ async fn vision_raw_handler(
         bytes: bytes.len(),
         format: "png".to_string(),
         contract: "raw".to_string(),
+        capture_backend,
     })))
 }
 
@@ -1538,9 +1622,10 @@ async fn vision_extract_handler(
     }
 
     // Miss → capture + encode + call OCR.
-    let png_bytes = capture_and_encode_png(&state, &req.region, &req.element, &req.target)
-        .await
-        .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+    let (png_bytes, capture_backend) =
+        capture_and_encode_png(&state, &req.region, &req.element, &req.target)
+            .await
+            .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
     let (blocks, aggregate_text) = client
         .extract(&png_bytes, "image/png", min_conf)
         .await
@@ -1555,9 +1640,15 @@ async fn vision_extract_handler(
         aggregate_text,
         model: model_name.clone(),
         cached: false,
+        capture_backend,
     };
-    // Cache the response as JSON for next lookup.
-    let resp_json = serde_json::to_vec(&resp).map_err(|e| {
+    // Cache the response as JSON for next lookup. Strip backend provenance from
+    // the cached copy — a future cache hit is not the live backend.
+    let resp_json = serde_json::to_vec(&ExtractResponse {
+        capture_backend: None,
+        ..resp.clone()
+    })
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("encode extract: {}", e))),
@@ -1623,9 +1714,12 @@ async fn vision_describe_handler(
         }
     }
 
-    let png_bytes = capture_and_encode_png(&state, &req.region, &req.element, &req.target)
-        .await
-        .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+    // describe/ has no captureBackend field in its response; the backend label
+    // is intentionally ignored here.
+    let (png_bytes, _capture_backend) =
+        capture_and_encode_png(&state, &req.region, &req.element, &req.target)
+            .await
+            .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
     let vlm = client
         .describe(&png_bytes, "image/png", req.prompt.as_deref(), max_tokens)
         .await
@@ -1667,7 +1761,7 @@ async fn capture_and_encode_png(
     region_req: &Option<RegionRequest>,
     element_id: &Option<String>,
     target: &Option<String>,
-) -> Result<Vec<u8>, (StatusCode, String)> {
+) -> Result<(Vec<u8>, Option<String>), (StatusCode, String)> {
     let provider = resolve_frame_provider(state, target)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -1675,6 +1769,7 @@ async fn capture_and_encode_png(
         .frame(state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let capture_backend = capture_backend_label(&frame);
     let crop =
         resolve_crop_region(state, region_req, element_id, frame.width, frame.height).await?;
     // PNG-only pipeline. No alpha policy here — we want lossless bytes to
@@ -1684,12 +1779,13 @@ async fn capture_and_encode_png(
         pipeline = pipeline.push(Stage::CropRegion(region));
     }
     pipeline = pipeline.push(Stage::Encode(EncodedFormat::Png));
-    pipeline.run(frame).map_err(|e| {
+    let bytes = pipeline.run(frame).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("pipeline: {}", e),
         )
-    })
+    })?;
+    Ok((bytes, capture_backend))
 }
 
 /// `GET /ui-bridge/vision/cache/{sha256}` — stream a cached image.
@@ -1778,6 +1874,19 @@ async fn vision_health_handler(
     let mutation_id = state
         .vision_mutation_id
         .load(std::sync::atomic::Ordering::Relaxed);
+    let vision_capture_preview_count = state
+        .vision_capture_preview_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let vision_monitor_crop_count = state
+        .vision_monitor_crop_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let (vision_last_fallback_reason, vision_last_fallback_at) = state
+        .vision_last_fallback
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .map(|(reason, at)| (Some(reason), Some(at.to_rfc3339())))
+        .unwrap_or((None, None));
 
     Json(ApiResponse::success(HealthResponse {
         pipeline_version: "0.1.1",
@@ -1789,6 +1898,10 @@ async fn vision_health_handler(
         cache_evictions: stats.evictions,
         cache_max_bytes: stats.max_bytes,
         mutation_id,
+        vision_capture_preview_count,
+        vision_monitor_crop_count,
+        vision_last_fallback_reason,
+        vision_last_fallback_at,
     }))
 }
 

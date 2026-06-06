@@ -553,6 +553,11 @@ pub fn create_router(
         // proj_supervisor_build_pool.md.
         vision_capture_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
         vision_mutation_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // Capture-backend telemetry — per-backend counters + last-fallback record.
+        vision_capture_preview_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        vision_monitor_crop_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        vision_capture_fallback_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        vision_last_fallback: Arc::new(std::sync::Mutex::new(None)),
         // Phase 6 baselines registry — in-process, non-persistent.
         vision_baselines: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
