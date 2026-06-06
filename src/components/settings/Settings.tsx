@@ -32,6 +32,7 @@ import { LockYieldPolicySettings } from "./LockYieldPolicySettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { AccountSettings } from "./AccountSettings";
 import { CiRunnerSettings } from "./CiRunnerSettings";
+import { DevLoopSettings } from "./DevLoopSettings";
 
 interface SettingsProps {
   /** Default tab to open. If provided, overrides instanceStorage persistence. */
@@ -42,6 +43,7 @@ interface SettingsProps {
 
 type SettingsTab =
   | "account"
+  | "dev-loop"
   | "ai"
   | "agentic"
   | "self-healing"
@@ -78,6 +80,7 @@ const STORAGE_KEY = "qontinui-settings-active-tab";
  */
 const SETTINGS_TABS = [
   { id: "account", label: "Account" },
+  { id: "dev-loop", label: "Test My Change" },
   { id: "backend-connection", label: "Backend Connection" },
   { id: "ai", label: "AI Providers" },
   { id: "agentic", label: "Advanced AI" },
@@ -122,6 +125,7 @@ const VALID_TABS = SETTINGS_TABS.map((t) => t.id);
  */
 const SUB_TAB_TO_MAIN_TAB: Record<SettingsTab, string> = {
   account: "settings-account",
+  "dev-loop": "settings-dev-loop",
   "backend-connection": "settings-backend-connection",
   ai: "settings-ai",
   agentic: "settings-agentic",
@@ -264,6 +268,8 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
     switch (activeTab) {
       case "account":
         return <AccountSettings onLog={onLog} />;
+      case "dev-loop":
+        return <DevLoopSettings onLog={onLog} />;
       case "backend-connection":
         return <WebIntegrationSettings onLog={onLog} />;
       case "ai":
