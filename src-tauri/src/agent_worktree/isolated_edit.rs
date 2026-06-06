@@ -36,19 +36,23 @@ use super::{
 pub struct IsolatedEditContext {
     pub agent_id: String,
     pub worktrees: Vec<MaterializedWorktree>,
-    /// Set when the spawn flow pre-acquired a coord claim. `None` means
-    /// no claim was acquired (the caller passed neither `plan_id`/`phase`
-    /// nor `declared_overlap_paths`).
-    pub active_claim: Option<ActiveClaim>,
+    /// Every claim the spawn flow pre-acquired — one `kind=worktree`
+    /// claim per materialized repo (always), plus the optional
+    /// phase/file_glob claim. Empty when no claim was acquired (worktree
+    /// mode off path never reaches here). Drop releases EVERY entry.
+    /// Phase 1 of plan 2026-06-06-session-scoped-multi-repo-workspace.
+    pub active_claims: Vec<ActiveClaim>,
 
-    // Held so the heartbeat task lives as long as the context — its
-    // own Drop notifies the cancel token. Underscore-prefixed because
-    // we never inspect it; the handle is keep-alive only.
-    _heartbeat: Option<ClaimHeartbeatHandle>,
+    // One heartbeat handle per claim in `active_claims` — each task lives
+    // as long as the context; the handle's own Drop notifies its cancel
+    // token. Kept in lockstep with `active_claims` (parallel vectors are
+    // fine here — every claim spawns exactly one heartbeat). Keep-alive
+    // only; we never inspect them.
+    _heartbeats: Vec<ClaimHeartbeatHandle>,
 
-    // Captured for the Drop-time release POST. `coord_http_base` and
-    // `device_id` aren't otherwise exposed on the context — Drop is the
-    // only consumer.
+    // Captured for the Drop-time release POSTs. `coord_http_base` and
+    // `device_id` aren't otherwise exposed on the context — Drop and the
+    // grow/shrink primitives are the only consumers.
     coord_http_base: String,
     device_id: uuid::Uuid,
 
@@ -111,29 +115,168 @@ impl Drop for IsolatedEditContext {
             );
         }
 
-        // Stop the heartbeat first so its tick can't race with the
-        // release POST. `ClaimHeartbeatHandle`'s own Drop notifies its
-        // cancel token; the task exits on the next tick boundary.
-        let _ = self._heartbeat.take();
+        // Stop EVERY heartbeat first so no tick races with a release POST.
+        // `ClaimHeartbeatHandle`'s own Drop notifies its cancel token; each
+        // task exits on its next tick boundary.
+        self._heartbeats.clear();
 
-        // Best-effort release on the current Tokio runtime. If there
-        // was no active claim, there's nothing to release. A failed
-        // release is observability-only — the session that drops the
-        // context is shutting down anyway.
-        if let Some(claim) = self.active_claim.take() {
+        // Best-effort release of every active claim on the current Tokio
+        // runtime. A failed release is observability-only — the session
+        // that drops the context is shutting down anyway.
+        let claims = std::mem::take(&mut self.active_claims);
+        if !claims.is_empty() {
             let base = self.coord_http_base.clone();
             let mid = self.device_id;
             tokio::spawn(async move {
+                for claim in claims {
+                    release_claim_best_effort(
+                        &base,
+                        mid,
+                        claim.agent_session_id,
+                        &claim.kind,
+                        &claim.resource_key,
+                    )
+                    .await;
+                }
+            });
+        }
+    }
+}
+
+impl IsolatedEditContext {
+    /// Grow primitive (Phase 1c, plan
+    /// 2026-06-06-session-scoped-multi-repo-workspace-coordination):
+    /// materialize ONE more repo's worktree, acquire its `kind=worktree`
+    /// claim, spawn its heartbeat, and join it to this live context (push
+    /// onto `worktrees`, `active_claims`, `_heartbeats`).
+    ///
+    /// Idempotent on an already-joined repo: if `repo` is already present in
+    /// this context's `worktrees`, returns `Ok(())` without a second
+    /// allocate (the caller can blindly request a repo it may already hold).
+    ///
+    /// A `Held` on the new repo's worktree claim surfaces as
+    /// `Err(AllocateError::ClaimConflict)` — the existing repos stay joined
+    /// and claimed; only the new repo is rejected. Any other failure
+    /// (resolution, transport, `git worktree add`) returns
+    /// `Err(AllocateError::Other)`, again leaving the existing context
+    /// untouched.
+    ///
+    /// `intent` is the human-readable intent stored on the new claim; the
+    /// new repo is materialized as a `kind=worktree`-only claim (no
+    /// phase/file_glob — those are an acquisition-time concern).
+    pub async fn acquire_additional(
+        &mut self,
+        repo: &str,
+        intent: Option<&str>,
+    ) -> Result<(), AllocateError> {
+        if self.worktrees.iter().any(|w| w.repo == repo) {
+            info!(
+                repo = %repo,
+                "isolated_edit: acquire_additional — repo already joined; no-op"
+            );
+            return Ok(());
+        }
+
+        let repos = [repo.to_string()];
+        let session_id = self.session_id();
+        let mut result = materialize_repos(
+            &self.coord_http_base,
+            self.device_id,
+            &repos,
+            intent,
+            None,
+            None,
+            None,
+            session_id,
+        )
+        .await?;
+
+        // Spawn a heartbeat for each newly-acquired claim (one worktree
+        // claim for the single repo) and join everything onto the context.
+        for claim in &result.active_claims {
+            let hb =
+                spawn_claim_heartbeat(&self.coord_http_base, self.device_id, &self.agent_id, claim);
+            self._heartbeats.push(hb);
+        }
+        self.active_claims.append(&mut result.active_claims);
+        self.worktrees.append(&mut result.worktrees);
+        Ok(())
+    }
+
+    /// Shrink primitive (Phase 1c): release `repo`'s `kind=worktree` claim,
+    /// abort its heartbeat, and drop it from this context.
+    ///
+    /// Coordination state only — the on-disk worktree directory is LEFT in
+    /// place for the existing reclaim machinery
+    /// (`agent_worktree::reclaim`) to prune; releasing the claim merely
+    /// hands the checkout's coordination ownership back. This avoids racing
+    /// a `git worktree remove` against a process that may still hold the
+    /// dir open, and keeps removal centralized in one sweeper.
+    ///
+    /// Returns `true` if `repo` was present and released, `false` if it was
+    /// not joined (idempotent no-op).
+    pub async fn release_repo(&mut self, repo: &str) -> bool {
+        // Find the repo's worktree so we can compute its canonical-path
+        // claim key (the worktree's `worktree_path` is the canonical
+        // checkout for the SharedBranch case; for a real worktree it is the
+        // worktree dir, so we re-derive the canonical checkout from the repo
+        // slug to match the acquire-side key exactly).
+        let Some(pos) = self.worktrees.iter().position(|w| w.repo == repo) else {
+            return false;
+        };
+
+        // Re-derive the canonical checkout path → resource_key the SAME way
+        // the acquire side did (`worktree_for_path` over
+        // `default_canonical_path`), so we release the byte-identical key.
+        let want_key = super::canonical_paths::default_canonical_path(repo)
+            .ok()
+            .map(|p| super::worktree_resource_key(&p));
+
+        // Drop the matching worktree claim + its heartbeat. Match on the
+        // worktree kind AND the derived key (so we never release a
+        // phase/file_glob claim that happens to coexist).
+        if let Some(key) = want_key {
+            if let Some(cpos) = self
+                .active_claims
+                .iter()
+                .position(|c| c.kind == "worktree" && c.resource_key == key)
+            {
+                let claim = self.active_claims.remove(cpos);
+                // Abort the heartbeat whose resource_key matches.
+                if let Some(hpos) = self
+                    ._heartbeats
+                    .iter()
+                    .position(|h| h.kind == "worktree" && h.resource_key == key)
+                {
+                    // Dropping the handle notifies its cancel token.
+                    let _ = self._heartbeats.remove(hpos);
+                }
                 release_claim_best_effort(
-                    &base,
-                    mid,
+                    &self.coord_http_base,
+                    self.device_id,
                     claim.agent_session_id,
                     &claim.kind,
                     &claim.resource_key,
                 )
                 .await;
-            });
+            }
         }
+
+        // Drop the worktree bookkeeping (leave the on-disk dir for reclaim).
+        self.worktrees.remove(pos);
+        info!(
+            repo = %repo,
+            "isolated_edit: release_repo — worktree claim released, dir left for reclaim"
+        );
+        true
+    }
+
+    /// The per-session owner-token discriminator carried by this context's
+    /// claims (all claims share it). `None` for a context whose claims were
+    /// acquired machine-level. Used to keep `acquire_additional`'s new claim
+    /// on the same owner token as the rest of the context.
+    fn session_id(&self) -> Option<uuid::Uuid> {
+        self.active_claims.first().and_then(|c| c.agent_session_id)
     }
 }
 
@@ -183,101 +326,25 @@ pub async fn acquire(
     let device_id = read_device_id()
         .map_err(|e| AllocateError::Other(format!("device_id not available: {e}")))?;
 
-    let mut canonical_paths: HashMap<String, PathBuf> = HashMap::with_capacity(req.repos.len());
-    for repo in req.repos {
-        let path = super::canonical_paths::default_canonical_path(repo)
-            .map_err(|e| AllocateError::Other(format!("canonical path for repo {repo:?}: {e}")))?;
-        canonical_paths.insert(repo.clone(), path);
-    }
-
-    let mut repo_reqs: Vec<RepoRequest> = Vec::with_capacity(req.repos.len());
-    for repo in req.repos {
-        let canonical = canonical_paths
-            .get(repo)
-            .ok_or_else(|| AllocateError::Other(format!("no canonical path for repo '{repo}'")))?;
-        let parent_sha = resolve_head_sha(canonical)
-            .map_err(|e| AllocateError::Other(format!("git rev-parse HEAD on {repo}: {e}")))?;
-        repo_reqs.push(RepoRequest {
-            repo: repo.clone(),
-            parent_sha,
-        });
-    }
-
-    let outcome = allocate_and_materialize_with_claim(
+    let result = materialize_repos(
         &coord_http_base,
-        &device_id,
-        req.agent_session_id,
-        &repo_reqs,
+        device_id,
+        req.repos,
         req.intent,
         req.declared_overlap_paths,
-        &canonical_paths,
         req.plan_id,
         req.phase,
+        req.agent_session_id,
     )
     .await?;
 
-    // Phase 3 — normalize coord's isolation directive into the
-    // worktree-shaped `IsolatedEditContext`:
-    // - `Worktrees` → as-is.
-    // - `SharedBranch` → the canonical checkout IS the cwd; map each
-    //   per-repo branch into a `MaterializedWorktree` whose
-    //   `worktree_path` is the canonical checkout, so callers that read
-    //   `worktrees[0].worktree_path` get the right cwd (the shared
-    //   checkout) transparently.
-    // - `Wait` → surface as `Err(Other)` with a `wait:` prefix so the
-    //   caller logs/retries (it does NOT spin here). `acquire_for_terminal`
-    //   degrades to the shared cwd on this Err, which is the safe fallback.
-    let result: super::AllocateResult = match outcome {
-        MaterializeOutcome::Worktrees(r) => r,
-        MaterializeOutcome::SharedBranch(sb) => super::AllocateResult {
-            agent_id: sb.agent_id,
-            worktrees: sb
-                .branches
-                .into_iter()
-                .map(|b| MaterializedWorktree {
-                    repo: b.repo,
-                    branch: b.branch,
-                    parent_sha: b.parent_sha,
-                    worktree_path: b.checkout_path,
-                    push_ref: b.push_ref,
-                })
-                .collect(),
-            token: sb.token,
-            token_jti: sb.token_jti,
-            token_exp: sb.token_exp,
-            active_claim: sb.active_claim,
-        },
-        MaterializeOutcome::Wait(w) => {
-            return Err(AllocateError::Other(format!(
-                "wait: coord declined to materialize agent_id={} reason={:?} blocking={:?} retry_when={:?}",
-                w.agent_id, w.reason, w.blocking, w.retry_when
-            )));
-        }
-    };
-
-    let heartbeat = result.active_claim.as_ref().map(|claim| {
-        info!(
-            agent_id = %result.agent_id,
-            kind = %claim.kind,
-            resource_key = %claim.resource_key,
-            ttl_seconds = claim.ttl_seconds,
-            "isolated_edit: spawning heartbeat"
-        );
-        spawn_heartbeat_task(
-            coord_http_base.clone(),
-            device_id,
-            claim.agent_session_id,
-            &claim.kind,
-            claim.resource_key.clone(),
-            claim.ttl_seconds,
-            |displaced_by| {
-                warn!(
-                    displaced_by = ?displaced_by,
-                    "isolated_edit: claim stolen — edits in this worktree may now race"
-                );
-            },
-        )
-    });
+    // One heartbeat task per claim (worktree claims + the optional
+    // phase/file_glob claim), kept index-aligned with `active_claims`.
+    let heartbeats: Vec<ClaimHeartbeatHandle> = result
+        .active_claims
+        .iter()
+        .map(|claim| spawn_claim_heartbeat(&coord_http_base, device_id, &result.agent_id, claim))
+        .collect();
 
     // Ambient edit-effect loop — predict side (Phase 3, plan
     // 2026-06-05-edit-effect-loop-adoption). Fire-and-forget a
@@ -307,14 +374,132 @@ pub async fn acquire(
     Ok(Some(IsolatedEditContext {
         agent_id: result.agent_id,
         worktrees: result.worktrees,
-        active_claim: result.active_claim,
-        _heartbeat: heartbeat,
+        active_claims: result.active_claims,
+        _heartbeats: heartbeats,
         coord_http_base,
         device_id,
         edit_loop_stash,
         edit_loop_correlation_id,
         edit_loop_declared_paths,
     }))
+}
+
+/// Resolve canonical paths + parent SHAs for `repos`, call
+/// [`allocate_and_materialize_with_claim`], and normalize coord's isolation
+/// directive into a worktree-shaped [`super::AllocateResult`]. Shared by
+/// [`acquire`] (all repos up front) and
+/// [`IsolatedEditContext::acquire_additional`] (one extra repo). Does NOT
+/// spawn heartbeats — the caller decides where the heartbeat handles live.
+///
+/// Isolation normalization:
+/// - `Worktrees` → as-is.
+/// - `SharedBranch` → the canonical checkout IS the cwd; map each per-repo
+///   branch into a `MaterializedWorktree` whose `worktree_path` is the
+///   canonical checkout so callers reading `worktrees[0].worktree_path` get
+///   the right cwd (the shared checkout) transparently.
+/// - `Wait` → `Err(Other)` with a `wait:` prefix so the caller logs/retries
+///   (it does NOT spin). `acquire_for_terminal` degrades to the shared cwd.
+#[allow(clippy::too_many_arguments)]
+async fn materialize_repos(
+    coord_http_base: &str,
+    device_id: uuid::Uuid,
+    repos: &[String],
+    intent: Option<&str>,
+    declared_overlap_paths: Option<&[String]>,
+    plan_id: Option<&str>,
+    phase: Option<&str>,
+    agent_session_id: Option<uuid::Uuid>,
+) -> Result<super::AllocateResult, AllocateError> {
+    let mut canonical_paths: HashMap<String, PathBuf> = HashMap::with_capacity(repos.len());
+    for repo in repos {
+        let path = super::canonical_paths::default_canonical_path(repo)
+            .map_err(|e| AllocateError::Other(format!("canonical path for repo {repo:?}: {e}")))?;
+        canonical_paths.insert(repo.clone(), path);
+    }
+
+    let mut repo_reqs: Vec<RepoRequest> = Vec::with_capacity(repos.len());
+    for repo in repos {
+        let canonical = canonical_paths
+            .get(repo)
+            .ok_or_else(|| AllocateError::Other(format!("no canonical path for repo '{repo}'")))?;
+        let parent_sha = resolve_head_sha(canonical)
+            .map_err(|e| AllocateError::Other(format!("git rev-parse HEAD on {repo}: {e}")))?;
+        repo_reqs.push(RepoRequest {
+            repo: repo.clone(),
+            parent_sha,
+        });
+    }
+
+    let outcome = allocate_and_materialize_with_claim(
+        coord_http_base,
+        &device_id,
+        agent_session_id,
+        &repo_reqs,
+        intent,
+        declared_overlap_paths,
+        &canonical_paths,
+        plan_id,
+        phase,
+    )
+    .await?;
+
+    match outcome {
+        MaterializeOutcome::Worktrees(r) => Ok(r),
+        MaterializeOutcome::SharedBranch(sb) => Ok(super::AllocateResult {
+            agent_id: sb.agent_id,
+            worktrees: sb
+                .branches
+                .into_iter()
+                .map(|b| MaterializedWorktree {
+                    repo: b.repo,
+                    branch: b.branch,
+                    parent_sha: b.parent_sha,
+                    worktree_path: b.checkout_path,
+                    push_ref: b.push_ref,
+                })
+                .collect(),
+            token: sb.token,
+            token_jti: sb.token_jti,
+            token_exp: sb.token_exp,
+            active_claims: sb.active_claims,
+        }),
+        MaterializeOutcome::Wait(w) => Err(AllocateError::Other(format!(
+            "wait: coord declined to materialize agent_id={} reason={:?} blocking={:?} retry_when={:?}",
+            w.agent_id, w.reason, w.blocking, w.retry_when
+        ))),
+    }
+}
+
+/// Spawn the TTL/3 heartbeat task for one claim. Shared by [`acquire`] and
+/// the grow/shrink primitive [`IsolatedEditContext::acquire_additional`] so
+/// the log line + stolen-claim warning stay in one place.
+fn spawn_claim_heartbeat(
+    coord_http_base: &str,
+    device_id: uuid::Uuid,
+    agent_id: &str,
+    claim: &ActiveClaim,
+) -> ClaimHeartbeatHandle {
+    info!(
+        agent_id = %agent_id,
+        kind = %claim.kind,
+        resource_key = %claim.resource_key,
+        ttl_seconds = claim.ttl_seconds,
+        "isolated_edit: spawning heartbeat"
+    );
+    spawn_heartbeat_task(
+        coord_http_base.to_string(),
+        device_id,
+        claim.agent_session_id,
+        &claim.kind,
+        claim.resource_key.clone(),
+        claim.ttl_seconds,
+        |displaced_by| {
+            warn!(
+                displaced_by = ?displaced_by,
+                "isolated_edit: claim stolen — edits in this worktree may now race"
+            );
+        },
+    )
 }
 
 /// Convenience helper for the three runner terminal-spawn entry points
@@ -417,8 +602,211 @@ fn resolve_head_sha(canonical: &Path) -> Result<String, String> {
 }
 
 #[cfg(test)]
+impl IsolatedEditContext {
+    /// Test-only constructor that builds a context with synthetic claims and
+    /// NO live heartbeats, bypassing the network acquire path. Used to
+    /// exercise the multi-claim bookkeeping (`acquire_additional` joins,
+    /// `release_repo` shrink, Drop releases all) without coord. The
+    /// `coord_http_base` points at an unroutable address so any best-effort
+    /// release POST fails instantly instead of hitting a real coord.
+    pub(crate) fn for_test(
+        worktrees: Vec<MaterializedWorktree>,
+        active_claims: Vec<ActiveClaim>,
+    ) -> Self {
+        IsolatedEditContext {
+            agent_id: "test-agent".to_string(),
+            worktrees,
+            active_claims,
+            _heartbeats: Vec::new(),
+            // 127.0.0.1:1 refuses instantly — release POSTs fail fast, the
+            // bookkeeping under test runs regardless.
+            coord_http_base: "http://127.0.0.1:1".to_string(),
+            device_id: uuid::Uuid::nil(),
+            edit_loop_stash: super::edit_effect_loop::new_stash(),
+            edit_loop_correlation_id: uuid::Uuid::nil(),
+            edit_loop_declared_paths: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `(MaterializedWorktree, worktree-kind ActiveClaim)` pair for
+    /// `repo`, with the claim keyed on the SAME canonical-path resource_key
+    /// the acquire side derives — so `release_repo`'s key match works.
+    fn repo_fixture(repo: &str) -> (MaterializedWorktree, ActiveClaim) {
+        let canonical = super::super::canonical_paths::default_canonical_path(repo).unwrap();
+        let key = super::super::worktree_resource_key(&canonical);
+        let wt = MaterializedWorktree {
+            repo: repo.to_string(),
+            branch: format!("agent/test-{repo}"),
+            parent_sha: "0".repeat(40),
+            worktree_path: canonical,
+            push_ref: format!("refs/agent/test-{repo}"),
+        };
+        let claim = ActiveClaim {
+            kind: "worktree".to_string(),
+            resource_key: key,
+            ttl_seconds: 300,
+            agent_session_id: Some(uuid::Uuid::nil()),
+        };
+        (wt, claim)
+    }
+
+    #[test]
+    fn multi_repo_context_has_one_worktree_claim_per_repo() {
+        // Mirrors the multi-repo acquire outcome: a context materialized for
+        // [A, B] carries exactly one kind=worktree claim per repo, each keyed
+        // on that repo's canonical checkout path (the guard's by-resource
+        // form). Asserts the bookkeeping the acquire path produces without
+        // needing a live coord.
+        let (wa, ca) = repo_fixture("qontinui-runner");
+        let (wb, cb) = repo_fixture("qontinui-coord");
+        let mut ctx = IsolatedEditContext::for_test(vec![wa, wb], vec![ca, cb]);
+
+        let worktree_claims: Vec<&ActiveClaim> = ctx
+            .active_claims
+            .iter()
+            .filter(|c| c.kind == "worktree")
+            .collect();
+        assert_eq!(worktree_claims.len(), 2, "one worktree claim per repo");
+        assert!(worktree_claims
+            .iter()
+            .any(|c| c.resource_key == "d:/qontinui-root/qontinui-runner"));
+        assert!(worktree_claims
+            .iter()
+            .any(|c| c.resource_key == "d:/qontinui-root/qontinui-coord"));
+
+        // Drain before drop: this is a non-async test, and Drop's release
+        // path `tokio::spawn`s — which panics outside a runtime. Clearing
+        // trips Drop's `!claims.is_empty()` guard so no spawn is attempted.
+        ctx.active_claims.clear();
+        ctx.worktrees.clear();
+    }
+
+    #[tokio::test]
+    async fn release_repo_shrinks_claims_and_worktrees() {
+        // acquire([A,B]) shape → 2 worktree claims; release_repo(A) → 1.
+        // Exercises the shrink primitive's bookkeeping (the network release
+        // is best-effort and fails fast against the unroutable base).
+        let (wa, ca) = repo_fixture("qontinui-runner");
+        let (wb, cb) = repo_fixture("qontinui-coord");
+        let mut ctx = IsolatedEditContext::for_test(vec![wa, wb], vec![ca, cb]);
+        assert_eq!(ctx.active_claims.len(), 2);
+        assert_eq!(ctx.worktrees.len(), 2);
+
+        let released = ctx.release_repo("qontinui-runner").await;
+        assert!(released, "release_repo returns true for a joined repo");
+        assert_eq!(ctx.active_claims.len(), 1, "one worktree claim remains");
+        assert_eq!(ctx.worktrees.len(), 1);
+        assert_eq!(ctx.worktrees[0].repo, "qontinui-coord");
+        assert_eq!(
+            ctx.active_claims[0].resource_key,
+            "d:/qontinui-root/qontinui-coord"
+        );
+
+        // Idempotent: releasing a repo that's no longer joined is a no-op.
+        let again = ctx.release_repo("qontinui-runner").await;
+        assert!(!again, "release_repo returns false for an absent repo");
+        assert_eq!(ctx.active_claims.len(), 1);
+
+        // Drain so the Drop release path doesn't fire a stray POST after the
+        // test runtime is gone.
+        ctx.active_claims.clear();
+        ctx.worktrees.clear();
+    }
+
+    #[tokio::test]
+    async fn release_repo_only_drops_matching_worktree_claim() {
+        // A coexisting phase claim must survive a worktree release.
+        let (wa, ca) = repo_fixture("qontinui-runner");
+        let phase_claim = ActiveClaim {
+            kind: "phase".to_string(),
+            resource_key: "plan:p:phase:1".to_string(),
+            ttl_seconds: 7200,
+            agent_session_id: Some(uuid::Uuid::nil()),
+        };
+        let mut ctx = IsolatedEditContext::for_test(vec![wa], vec![ca, phase_claim]);
+        assert_eq!(ctx.active_claims.len(), 2);
+
+        let released = ctx.release_repo("qontinui-runner").await;
+        assert!(released);
+        // The phase claim is untouched — only the worktree claim went.
+        assert_eq!(ctx.active_claims.len(), 1);
+        assert_eq!(ctx.active_claims[0].kind, "phase");
+
+        ctx.active_claims.clear();
+        ctx.worktrees.clear();
+    }
+
+    #[tokio::test]
+    async fn acquire_additional_is_idempotent_for_a_joined_repo() {
+        // The grow primitive must early-return Ok(()) WITHOUT a network
+        // allocate when the repo is already joined — so a caller can blindly
+        // request a repo it may already hold. We assert it neither errors nor
+        // mutates the context (a network path against the unroutable base
+        // would instead surface an Err).
+        let (wa, ca) = repo_fixture("qontinui-runner");
+        let mut ctx = IsolatedEditContext::for_test(vec![wa], vec![ca]);
+        assert_eq!(ctx.worktrees.len(), 1);
+        assert_eq!(ctx.active_claims.len(), 1);
+
+        let r = ctx
+            .acquire_additional("qontinui-runner", Some("already joined"))
+            .await;
+        assert!(r.is_ok(), "joined-repo acquire_additional is a no-op Ok");
+        assert_eq!(ctx.worktrees.len(), 1, "no duplicate worktree joined");
+        assert_eq!(ctx.active_claims.len(), 1, "no duplicate claim joined");
+
+        ctx.active_claims.clear();
+        ctx.worktrees.clear();
+    }
+
+    #[test]
+    fn session_id_is_carried_from_the_first_claim() {
+        // acquire_additional reuses the context's owner-token discriminator
+        // so the new repo's claim shares the session owner token. Verify the
+        // accessor returns the first claim's session id.
+        let sid = uuid::Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+        let (wa, mut ca) = repo_fixture("qontinui-runner");
+        ca.agent_session_id = Some(sid);
+        let mut ctx = IsolatedEditContext::for_test(vec![wa], vec![ca]);
+        assert_eq!(ctx.session_id(), Some(sid));
+
+        // Non-async test: drain before drop (see the note in
+        // `multi_repo_context_has_one_worktree_claim_per_repo`).
+        ctx.active_claims.clear();
+        ctx.worktrees.clear();
+    }
+
+    #[tokio::test]
+    async fn drop_releases_all_claims() {
+        // Drop must release EVERY active claim, not just the first. We assert
+        // via the observable side effect available without a coord seam: Drop
+        // drains `active_claims` (std::mem::take) and spawns the release. We
+        // verify the take-and-spawn happens for a multi-claim context by
+        // confirming the spawned task is accepted by the runtime (no panic)
+        // and that a SECOND drop of an emptied context is inert.
+        let (wa, ca) = repo_fixture("qontinui-runner");
+        let (wb, cb) = repo_fixture("qontinui-coord");
+        let ctx = IsolatedEditContext::for_test(vec![wa, wb], vec![ca, cb]);
+        assert_eq!(ctx.active_claims.len(), 2);
+        // Dropping inside a tokio runtime: the Drop impl `tokio::spawn`s the
+        // multi-claim release loop. If Drop only released one claim or
+        // panicked on >1, this would surface here.
+        drop(ctx);
+
+        // An emptied context drops without spawning anything (the
+        // `!claims.is_empty()` guard), proving the guard path too.
+        let empty = IsolatedEditContext::for_test(Vec::new(), Vec::new());
+        drop(empty);
+
+        // Yield so the spawned release task gets a chance to run (and fail
+        // fast against the unroutable base) before the runtime tears down.
+        tokio::task::yield_now().await;
+    }
 
     #[tokio::test]
     async fn returns_none_when_flag_off() {

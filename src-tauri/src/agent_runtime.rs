@@ -989,7 +989,24 @@ async fn run_gate_continuation(
         .map(|a| format!("gate-continuation:{a}"))
         .unwrap_or_else(|| "gate-continuation".to_string());
 
-    let (workdir, ctx, agent_id) = match acquire_continuation_workdir(&payload.repos, &intent).await
+    // Phase 1b (plan 2026-06-06-session-scoped-multi-repo-workspace-coordination):
+    // thread a stable per-session UUID discriminator so the worktree claims
+    // are session-keyed in the owner token (machine:session). The
+    // gate-continuation wire payload carries NO Claude session uuid (only
+    // `LaunchPayload` does); the next-best stable id is one DETERMINISTICALLY
+    // derived from the continuation's identity so a retry of the SAME gate
+    // continuation reuses the same owner token (a re-acquire renews rather
+    // than collides). We derive it from `(target_device_id, anchor_key)` via
+    // a UUIDv5 in the URL namespace; when `anchor_key` is absent we fall back
+    // to a fresh v4 (a one-shot continuation with no stable anchor).
+    let continuation_session_id = continuation_session_id(&payload);
+
+    let (workdir, ctx, agent_id) = match acquire_continuation_workdir(
+        &payload.repos,
+        &intent,
+        continuation_session_id,
+    )
+    .await
     {
         Ok(triple) => triple,
         Err(e) => {
@@ -1156,9 +1173,38 @@ async fn run_continuation_terminal(
 ///   fresh correlation UUID. The continuation still runs, just without
 ///   per-agent isolation — the same graceful degrade `acquire_for_terminal`
 ///   uses.
+/// Derive a stable per-session UUID discriminator for a gate continuation's
+/// worktree claims (Phase 1b, plan
+/// 2026-06-06-session-scoped-multi-repo-workspace-coordination).
+///
+/// The gate-continuation wire payload ([`GateContinuationPayload`]) carries
+/// NO Claude session uuid (unlike [`LaunchPayload::agent_session_id`]), so
+/// there is no upstream id to thread. We synthesize one that is STABLE
+/// across retries of the same continuation: a UUIDv5 over
+/// `"<target_device_id>:<anchor_key>"` in the URL namespace. Two spawns of
+/// the same gate continuation (same device, same anchor) therefore produce
+/// the same owner-token discriminator, so a re-acquire RENEWS the existing
+/// worktree claim instead of colliding with it. When `anchor_key` is absent
+/// (a one-shot continuation with no stable anchor) we fall back to a fresh
+/// v4 — distinctness is preserved, only cross-retry renewal is lost, which
+/// is acceptable for an anchor-less one-shot.
+fn continuation_session_id(payload: &GateContinuationPayload) -> Option<uuid::Uuid> {
+    match payload.anchor_key.as_deref() {
+        Some(anchor) if !anchor.is_empty() => {
+            let name = format!("{}:{anchor}", payload.target_device_id);
+            Some(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_URL,
+                name.as_bytes(),
+            ))
+        }
+        _ => Some(uuid::Uuid::new_v4()),
+    }
+}
+
 async fn acquire_continuation_workdir(
     repos: &[String],
     intent: &str,
+    agent_session_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<(
     String,
     Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
@@ -1173,7 +1219,9 @@ async fn acquire_continuation_workdir(
             declared_overlap_paths: None,
             plan_id: None,
             phase: None,
-            agent_session_id: None,
+            // Phase 1b: session-keyed worktree claims for the continuation —
+            // see `continuation_session_id` for how this stable id is derived.
+            agent_session_id,
         })
         .await
         {
@@ -2365,6 +2413,44 @@ mod tests {
             Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
             None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
         }
+    }
+
+    #[test]
+    fn continuation_session_id_is_stable_for_same_anchor_and_device() {
+        // Phase 1b: the synthesized owner-token discriminator must be STABLE
+        // across retries of the same continuation (same device + anchor) so a
+        // re-acquire renews rather than collides, and DISTINCT across anchors.
+        let device = uuid::Uuid::parse_str("55555555-5555-5555-5555-555555555555").unwrap();
+        let mk = |anchor: Option<&str>| GateContinuationPayload {
+            target_device_id: device,
+            initial_prompt: "p".to_string(),
+            repos: vec![],
+            presentation: Presentation::Headless,
+            source: GATE_CONTINUATION_SOURCE.to_string(),
+            anchor_key: anchor.map(|s| s.to_string()),
+        };
+
+        let a1 = continuation_session_id(&mk(Some("gate-7f2358d5")));
+        let a2 = continuation_session_id(&mk(Some("gate-7f2358d5")));
+        assert_eq!(a1, a2, "same (device, anchor) → same stable id");
+        assert!(a1.is_some());
+
+        let b = continuation_session_id(&mk(Some("gate-other")));
+        assert_ne!(a1, b, "different anchor → different id");
+
+        // A different device with the same anchor is also distinct.
+        let other_device = GateContinuationPayload {
+            target_device_id: uuid::Uuid::parse_str("66666666-6666-6666-6666-666666666666")
+                .unwrap(),
+            ..mk(Some("gate-7f2358d5"))
+        };
+        assert_ne!(a1, continuation_session_id(&other_device));
+
+        // Anchor-less → a fresh v4 each call (Some, but non-equal).
+        let n1 = continuation_session_id(&mk(None));
+        let n2 = continuation_session_id(&mk(None));
+        assert!(n1.is_some() && n2.is_some());
+        assert_ne!(n1, n2, "anchor-less continuations get a fresh id each time");
     }
 
     /// In a non-Tauri (unit-test) context there is no process-global AppHandle,

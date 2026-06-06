@@ -105,7 +105,45 @@ pub struct ClaimSpawnContext {
     pub phase: Option<String>,
 }
 
+/// Normalize a canonical checkout path into the exact `resource_key` form
+/// the coord-guard derives for a `kind=worktree` claim: forward slashes,
+/// lowercase (so a `D:/` drive letter and a `d:/` one collide), and no
+/// trailing slash. The guard observes the form `d:/qontinui-root/<repo>`.
+///
+/// This MUST stay byte-identical to whatever the guard produces when it
+/// looks up `GET /coord/claims/by-resource?kind=worktree&key=<path>`. The
+/// guard runs its own `realpath`-style resolution which can emit a
+/// `/d/qontinui-root/...` (MSYS) shape; the contract test below pins the
+/// Windows-native form so a guard-side divergence surfaces as a failing
+/// contract test rather than a silent never-matching claim in prod.
+pub fn worktree_resource_key(canonical: &std::path::Path) -> String {
+    canonical
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase()
+}
+
 impl ClaimSpawnContext {
+    /// Build a `kind=worktree` claim context for one canonical checkout
+    /// path. The `resource_key` is normalized via [`worktree_resource_key`]
+    /// so it matches the coord-guard's `by-resource` lookup byte-for-byte.
+    ///
+    /// Unlike [`Self::from_intent_and_paths`] this is unconditional — a
+    /// session always claims the worktree(s) it materializes regardless of
+    /// whether a plan_id/phase/file_glob was declared. This closes the
+    /// gate-continuation gap where worktrees materialized with NO claim at
+    /// all (intent/plan_id/phase/declared_overlap_paths all `None`).
+    pub fn worktree_for_path(canonical: &std::path::Path, intent: Option<&str>) -> Self {
+        Self {
+            kind: "worktree",
+            resource_key: worktree_resource_key(canonical),
+            intent: intent.map(|s| s.to_string()),
+            plan_id: None,
+            phase: None,
+        }
+    }
+
     /// Derive a claim context from the spawn payload's optional fields.
     ///
     /// Precedence (per plan Phase 3 spec):
@@ -266,6 +304,62 @@ async fn pre_allocate_claim(
         None => Ok(AcquireOutcome::Other(format!(
             "/claims/acquire body missing `result` discriminator: {body_text}"
         ))),
+    }
+}
+
+/// Acquire ONE claim from a [`ClaimSpawnContext`] and map the outcome into
+/// an [`ActiveClaim`] (on `Acquired`) or an [`AllocateError`] (on `Held` →
+/// `ClaimConflict`, on `Other`/transport → `Other`). Shared by both the
+/// pre-allocate phase/file_glob claim and the per-repo `kind=worktree`
+/// claims (Phase 1) so the acquire-and-map logic lives in one place.
+async fn acquire_one_claim(
+    coord_http_base: &str,
+    machine_id: &uuid::Uuid,
+    agent_session_id: Option<uuid::Uuid>,
+    ctx: &ClaimSpawnContext,
+) -> Result<ActiveClaim, AllocateError> {
+    match pre_allocate_claim(coord_http_base, machine_id, agent_session_id, ctx).await {
+        Ok(AcquireOutcome::Acquired { ttl_seconds }) => {
+            info!(
+                "claims/acquire ok kind={} key={} ttl={}s",
+                ctx.kind, ctx.resource_key, ttl_seconds
+            );
+            Ok(ActiveClaim {
+                kind: ctx.kind.to_string(),
+                resource_key: ctx.resource_key.clone(),
+                ttl_seconds,
+                agent_session_id,
+            })
+        }
+        Ok(AcquireOutcome::Held(conflict)) => {
+            warn!(
+                "claims/acquire held kind={} key={} current_holder={}",
+                conflict.kind, conflict.resource_key, conflict.current_holder
+            );
+            Err(AllocateError::ClaimConflict(conflict))
+        }
+        Ok(AcquireOutcome::Other(msg)) => Err(AllocateError::Other(msg)),
+        Err(e) => Err(AllocateError::Other(e)),
+    }
+}
+
+/// Release every claim in `claims` best-effort (used to unwind a partial
+/// multi-claim acquire when a later claim is `Held`, and on the `Wait`
+/// teardown path). Each release matches the owner token its acquire used.
+async fn release_all_claims_best_effort(
+    coord_http_base: &str,
+    machine_id: &uuid::Uuid,
+    claims: &[ActiveClaim],
+) {
+    for c in claims {
+        release_claim_best_effort(
+            coord_http_base,
+            *machine_id,
+            c.agent_session_id,
+            &c.kind,
+            &c.resource_key,
+        )
+        .await;
     }
 }
 
@@ -542,13 +636,16 @@ pub fn remote_agent_ref(branch: &str) -> String {
 /// not configured on coord) means "skip pusher spawn for this
 /// allocation."
 ///
-/// Plan 2026-05-18-agent-spawn-coordination Phase 3 added
-/// `active_claim`: when the spawn flow pre-acquired a coord claim via
-/// `POST /claims/acquire`, this carries the claim's `(kind,
-/// resource_key, ttl_seconds)` so callers can spawn the heartbeat
-/// task and release on agent completion. `None` when no claim was
-/// pre-acquired (legacy callers that don't pass plan_id/phase or
-/// `declared_overlap_paths`).
+/// Plan 2026-05-18-agent-spawn-coordination Phase 3 added the spawn-time
+/// claim; plan 2026-06-06-session-scoped-multi-repo-workspace-coordination
+/// Phase 1 widened it from a single claim to a collection:
+/// `active_claims` carries EVERY claim the spawn flow pre-acquired —
+/// one `kind=worktree` claim per materialized repo (always), plus the
+/// optional `phase`/`file_glob` claim as just one more entry when the
+/// caller declared a plan_id/phase or `declared_overlap_paths`. Callers
+/// spawn one heartbeat task per entry and release every entry on agent
+/// completion. Empty when no claim was acquired (worktree mode off, or
+/// the no-op test builders).
 #[derive(Debug, Clone, Serialize)]
 pub struct AllocateResult {
     pub agent_id: String,
@@ -556,8 +653,8 @@ pub struct AllocateResult {
     pub token: String,
     pub token_jti: uuid::Uuid,
     pub token_exp: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_claim: Option<ActiveClaim>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub active_claims: Vec<ActiveClaim>,
 }
 
 /// Per-spawn active claim — the resource_key / kind / TTL acquired
@@ -673,8 +770,13 @@ pub struct SharedBranchResult {
     pub token: String,
     pub token_jti: uuid::Uuid,
     pub token_exp: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_claim: Option<ActiveClaim>,
+    /// Every pre-acquired claim for this shared-branch allocation — one
+    /// `kind=worktree` claim per repo (keyed on the canonical checkout the
+    /// branch lives in) plus the optional phase/file_glob claim. Converted
+    /// in lockstep with [`AllocateResult::active_claims`] (Phase 1) so the
+    /// shared-branch path is never single-claim.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub active_claims: Vec<ActiveClaim>,
 }
 
 /// One repo's shared-branch checkout.
@@ -803,17 +905,21 @@ impl From<String> for AllocateError {
 /// `resource_key = "plan:<plan>:phase:<phase>"`; when only
 /// `declared_overlap_paths` is present the claim kind is `FileGlob`.
 ///
-/// Per plan 2026-05-18-agent-spawn-coordination Phase 3, when a
-/// `ClaimSpawnContext` can be derived from the inputs (either
-/// plan_id + phase, or non-empty `declared_overlap_paths`), this
-/// function first calls coord's `POST /claims/acquire` with the
-/// derived `(kind, resource_key)`. On `Held`, returns
-/// `Err(AllocateError::ClaimConflict)` WITHOUT touching
-/// `/agents/allocate`. On `Claimed`/`Renewed`, proceeds to allocate;
-/// the caller is responsible for spawning a heartbeat task and
-/// releasing the claim on agent completion (see [`spawn_heartbeat_task`]
-/// and [`release_claim_best_effort`]). The returned [`AllocateResult`]
-/// carries the active claim context for that purpose.
+/// Claim acquisition (Phase 1, plan
+/// 2026-06-06-session-scoped-multi-repo-workspace-coordination). BEFORE
+/// `/agents/allocate` and before any `git worktree add`, this acquires:
+///   1. One `kind=worktree` claim per repo, keyed on the canonical
+///      checkout path normalized to the guard's `by-resource` form
+///      (always — even when no plan_id/phase/paths were declared, which is
+///      the gate-continuation case the old code left unclaimed).
+///   2. The optional `phase`/`file_glob` claim (Phase 3 behavior) when a
+///      plan_id + phase or non-empty `declared_overlap_paths` was supplied.
+/// A `Held` on ANY claim unwinds the claims already acquired and returns
+/// `Err(AllocateError::ClaimConflict)` WITHOUT touching `/agents/allocate`.
+/// On full success it proceeds to allocate; the caller spawns one heartbeat
+/// task per claim and releases every claim on agent completion (see
+/// [`spawn_heartbeat_task`] and [`release_claim_best_effort`]). The returned
+/// [`AllocateResult::active_claims`] carries them all for that purpose.
 ///
 /// On success returns `AllocateResult`. On any non-claim error,
 /// returns `Err(AllocateError::Other(String))`. Partial failure is
@@ -842,44 +948,10 @@ pub async fn allocate_and_materialize_with_claim(
         return Err(AllocateError::Other("repos must not be empty".to_string()));
     }
 
-    // Phase 3: pre-allocate `/claims/acquire`. When a claim context can
-    // be derived from the inputs, call coord's atomic acquire-or-fail
-    // BEFORE `/agents/allocate`. On `Held`, return ClaimConflict.
-    let claim_ctx =
-        ClaimSpawnContext::from_intent_and_paths(intent, plan_id, phase, declared_overlap_paths);
-    let active_claim = if let Some(ref ctx) = claim_ctx {
-        match pre_allocate_claim(coord_http_base, machine_id, agent_session_id, ctx).await {
-            Ok(AcquireOutcome::Acquired { ttl_seconds }) => {
-                info!(
-                    "claims/acquire ok kind={} key={} ttl={}s",
-                    ctx.kind, ctx.resource_key, ttl_seconds
-                );
-                Some(ActiveClaim {
-                    kind: ctx.kind.to_string(),
-                    resource_key: ctx.resource_key.clone(),
-                    ttl_seconds,
-                    agent_session_id,
-                })
-            }
-            Ok(AcquireOutcome::Held(conflict)) => {
-                warn!(
-                    "claims/acquire held kind={} key={} current_holder={}",
-                    conflict.kind, conflict.resource_key, conflict.current_holder
-                );
-                return Err(AllocateError::ClaimConflict(conflict));
-            }
-            Ok(AcquireOutcome::Other(msg)) => {
-                return Err(AllocateError::Other(msg));
-            }
-            Err(e) => return Err(AllocateError::Other(e)),
-        }
-    } else {
-        None
-    };
-
     // Pre-flight: every requested repo must have a canonical path the
-    // runner can `git worktree add` from. Surface this before bothering
-    // coord with the request.
+    // runner can `git worktree add` from. Surface this BEFORE acquiring any
+    // claim (canonical paths are also the source of the worktree claim
+    // keys, so they must resolve first).
     for r in repos {
         if !repo_canonical_paths.contains_key(&r.repo) {
             return Err(AllocateError::Other(format!(
@@ -887,6 +959,48 @@ pub async fn allocate_and_materialize_with_claim(
                  repo_canonical_paths",
                 r.repo
             )));
+        }
+    }
+
+    // Phase 1 (plan 2026-06-06-session-scoped-multi-repo-workspace-coordination):
+    // acquire the per-repo `kind=worktree` claims BEFORE materializing any
+    // worktree — fail-fast, mirroring the original `pre_allocate_claim`
+    // placement. The claim key is the canonical checkout path normalized to
+    // the guard's `by-resource` form (see `worktree_resource_key`), so a
+    // gate-continuation (which declares no plan_id/phase/paths) still claims
+    // every checkout it touches. A `Held` on ANY repo means another session
+    // owns that checkout → unwind the claims already acquired and return the
+    // ClaimConflict so the caller surfaces it instead of clobbering.
+    //
+    // Then acquire the OPTIONAL phase/file_glob claim (when a plan_id/phase
+    // or `declared_overlap_paths` was declared) as just one more entry.
+    let mut active_claims: Vec<ActiveClaim> = Vec::with_capacity(repos.len() + 1);
+
+    for r in repos {
+        let canonical = repo_canonical_paths
+            .get(&r.repo)
+            .expect("canonical path presence checked above");
+        let ctx = ClaimSpawnContext::worktree_for_path(canonical, intent);
+        match acquire_one_claim(coord_http_base, machine_id, agent_session_id, &ctx).await {
+            Ok(claim) => active_claims.push(claim),
+            Err(e) => {
+                // Unwind every worktree claim we acquired before this one so
+                // a partial acquire doesn't strand held checkouts.
+                release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+                return Err(e);
+            }
+        }
+    }
+
+    let claim_ctx =
+        ClaimSpawnContext::from_intent_and_paths(intent, plan_id, phase, declared_overlap_paths);
+    if let Some(ref ctx) = claim_ctx {
+        match acquire_one_claim(coord_http_base, machine_id, agent_session_id, ctx).await {
+            Ok(claim) => active_claims.push(claim),
+            Err(e) => {
+                release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+                return Err(e);
+            }
         }
     }
 
@@ -951,19 +1065,10 @@ pub async fn allocate_and_materialize_with_claim(
             "allocate: coord returned wait agent_id={} reason={:?} blocking={:?} retry_when={:?}",
             coord_resp.agent_id, reason, blocking, retry_when
         );
-        // A pre-acquired claim must not linger while we wait — release it
-        // so the held resource isn't pinned by an agent that never
-        // materialized.
-        if let Some(claim) = &active_claim {
-            release_claim_best_effort(
-                coord_http_base,
-                *machine_id,
-                claim.agent_session_id,
-                &claim.kind,
-                &claim.resource_key,
-            )
-            .await;
-        }
+        // Pre-acquired claims must not linger while we wait — release every
+        // one so no held resource (worktree checkout or phase/file_glob) is
+        // pinned by an agent that never materialized.
+        release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
         return Ok(MaterializeOutcome::Wait(WaitOutcome {
             agent_id: coord_resp.agent_id,
             reason,
@@ -1007,7 +1112,7 @@ pub async fn allocate_and_materialize_with_claim(
             token: coord_resp.token,
             token_jti: coord_resp.token_jti.unwrap_or(uuid::Uuid::nil()),
             token_exp: coord_resp.token_exp.unwrap_or(0),
-            active_claim,
+            active_claims,
         }));
     }
 
@@ -1165,7 +1270,7 @@ pub async fn allocate_and_materialize_with_claim(
         token: coord_resp.token,
         token_jti: coord_resp.token_jti.unwrap_or(uuid::Uuid::nil()),
         token_exp: coord_resp.token_exp.unwrap_or(0),
-        active_claim,
+        active_claims,
     }))
 }
 
@@ -1292,6 +1397,41 @@ mod tests {
         assert_eq!(body["machine_id"], machine.to_string());
         // uuid serializes hyphenated-lowercase, matching to_string().
         assert_eq!(body["agent_session_id"], session.to_string());
+    }
+
+    #[test]
+    fn worktree_resource_key_normalizes_to_guard_form() {
+        // Pins the canonical worktree-claim resource_key form the
+        // coord-guard's `by-resource` lookup expects: forward slashes,
+        // lowercase drive letter, no trailing slash. A guard-side
+        // `realpath` (/d/… MSYS) divergence is caught by THIS contract.
+        let p = std::path::Path::new("D:\\qontinui-root\\qontinui-runner");
+        assert_eq!(worktree_resource_key(p), "d:/qontinui-root/qontinui-runner");
+
+        // Forward-slash input + uppercase drive collapses identically.
+        let p2 = std::path::Path::new("D:/qontinui-root/qontinui-runner");
+        assert_eq!(
+            worktree_resource_key(p2),
+            "d:/qontinui-root/qontinui-runner"
+        );
+
+        // Trailing slash is stripped so `<root>/<repo>` and `<root>/<repo>/`
+        // produce the same key.
+        let p3 = std::path::Path::new("D:/qontinui-root/qontinui-coord/");
+        assert_eq!(worktree_resource_key(p3), "d:/qontinui-root/qontinui-coord");
+    }
+
+    #[test]
+    fn worktree_for_path_builds_worktree_kind_claim_ctx() {
+        let p = std::path::Path::new("D:/qontinui-root/qontinui-runner");
+        let ctx = ClaimSpawnContext::worktree_for_path(p, Some("editing the runner"));
+        assert_eq!(ctx.kind, "worktree");
+        assert_eq!(ctx.resource_key, "d:/qontinui-root/qontinui-runner");
+        assert_eq!(ctx.intent.as_deref(), Some("editing the runner"));
+        assert!(ctx.plan_id.is_none());
+        assert!(ctx.phase.is_none());
+        // worktree claims use the coord-default 300s TTL.
+        assert_eq!(default_ttl_seconds_for(ctx.kind), 300);
     }
 
     #[test]
