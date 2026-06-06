@@ -173,7 +173,7 @@ export function BatchOperationsBar() {
   }
 
   return (
-    <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center gap-2">
+    <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-40 flex flex-col items-center gap-2">
       {/* Broadcast input row */}
       {showBroadcast && (
         <div className="flex items-center gap-2 px-3 py-2 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl">
