@@ -558,6 +558,15 @@ function AppContent() {
                   onRemovePage={terminalPages.removePage}
                   onRenamePage={terminalPages.renamePage}
                   onReorganize={() => setShowReorganize(true)}
+                  onPopOut={() => {
+                    // Open a new pop-out OS window (same process) that hosts its
+                    // own terminal tabs — the visible counterpart to the
+                    // `open-terminal-window` UI Bridge action. New terminals
+                    // created in that window belong to it (window_assignments).
+                    void invoke("open_terminal_window", { placement: null }).catch(
+                      (err) => console.error("Failed to open pop-out window:", err),
+                    );
+                  }}
                 />
                 {showReorganize && (
                   <ReorganizeDialog
