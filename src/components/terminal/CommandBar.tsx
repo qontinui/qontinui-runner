@@ -1,7 +1,7 @@
 /**
  * Phase 2 — CommandBar v1.
  *
- * Bottom-pinned slash-command input. Tier-1 resolver only (slash +
+ * Bottom-docked slash-command input. Tier-1 resolver only (slash +
  * fuzzy); no AI tier. The 10 actions registered by `useTerminalCommands`
  * drive every match shown here, so adding a future action is a single
  * `useCommandAction` call — no edits in this component.
@@ -26,9 +26,12 @@
  *     when the input is empty (passive learning surface per redesign
  *     plan §3 item 3).
  *
- * Mounts via `TerminalPage.tsx` next to the existing overlays
- * (`MidSessionToast`, `HoldingLockBanner`) — same `absolute`
- * positioning convention.
+ * Mounts via `TerminalPage.tsx` as the last in-flow child of the page's
+ * flex column, so it docks as a full-width footer below the zone grid
+ * (the grid's `flex-1` row shrinks to make room) rather than floating
+ * over a terminal. The transient status line + suggestion dropdown are
+ * the only absolutely-positioned parts — they overlay UPWARD from the
+ * footer (`bottom-full`) so they never change the docked bar's height.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
@@ -352,12 +355,7 @@ export function CommandBar() {
       if (e.key === "Enter") {
         e.preventDefault();
         if (selectedMatch) {
-          void execute(
-            selectedMatch.action,
-            query,
-            selectedMatch.presetArgs,
-            selectedMatch.tier,
-          );
+          void execute(selectedMatch.action, query, selectedMatch.presetArgs, selectedMatch.tier);
         }
         return;
       }
@@ -373,12 +371,7 @@ export function CommandBar() {
   );
 
   const handleSuggestionClick = useCallback(
-    (
-      action: CommandAction,
-      idx: number,
-      presetArgs?: Record<string, unknown>,
-      tier?: "ai",
-    ) => {
+    (action: CommandAction, idx: number, presetArgs?: Record<string, unknown>, tier?: "ai") => {
       // If the user clicks an action that takes args and they haven't typed
       // any AND we didn't pattern-match preset args, populate the input
       // rather than executing — they probably wanted to fill in the args.
@@ -426,122 +419,129 @@ export function CommandBar() {
   const dropdownVisible = (focused || query.trim().length > 0) && matches.length >= 0;
 
   return (
-    <div
-      data-page-element="command-bar"
-      className="absolute bottom-2 left-1/2 -translate-x-1/2 z-40 w-[420px] pointer-events-none"
-    >
-      {/* Status line — sits above the input, visible briefly after execute. */}
-      {status && !focused && (
-        <div className="mb-1 px-2 py-1 text-[10px] rounded bg-[#1a1b26]/90 border border-[#2a2d3d]/60 backdrop-blur-sm pointer-events-auto">
-          <span
-            className={
-              status.kind === "ok"
-                ? "text-[#9ece6a] font-mono"
-                : "text-[#f7768e] font-mono"
-            }
-          >
-            {status.text}
-          </span>
-        </div>
-      )}
+    <div data-page-element="command-bar" className="relative z-40 w-full shrink-0">
+      {/* Status line + suggestion dropdown float in an overlay anchored
+          ABOVE the docked footer (`bottom-full`) so they never change the
+          bar's own height or push the terminal grid while the operator
+          types. The wrapper is click-through; only the panels inside it
+          capture pointer events. */}
+      {((status && !focused) || dropdownVisible) && (
+        <div className="absolute bottom-full inset-x-0 z-40 flex justify-center px-3 pb-1 pointer-events-none">
+          <div className="w-[520px] max-w-full">
+            {/* Status line — visible briefly after execute. */}
+            {status && !focused && (
+              <div className="mb-1 px-2 py-1 text-[10px] rounded bg-[#1a1b26]/90 border border-[#2a2d3d]/60 backdrop-blur-sm pointer-events-auto">
+                <span
+                  className={
+                    status.kind === "ok" ? "text-[#9ece6a] font-mono" : "text-[#f7768e] font-mono"
+                  }
+                >
+                  {status.text}
+                </span>
+              </div>
+            )}
 
-      {/* Suggestion dropdown — drops UPWARD above the input since the
+            {/* Suggestion dropdown — drops UPWARD above the input since the
           input is bottom-pinned. Only renders when focused. */}
-      {dropdownVisible && (
-        <div className="mb-1 bg-[#1a1b26]/95 border border-[#2a2d3d] rounded-md shadow-xl backdrop-blur-sm overflow-hidden pointer-events-auto">
-          {/* Preview row — only shown when there's an exact match (operator
+            {dropdownVisible && (
+              <div className="mb-1 bg-[#1a1b26]/95 border border-[#2a2d3d] rounded-md shadow-xl backdrop-blur-sm overflow-hidden pointer-events-auto">
+                {/* Preview row — only shown when there's an exact match (operator
               has past the disambiguation point). For Tier-3 matches the
               row also surfaces the confidence so operators can sanity-
               check the AI's choice before pressing Enter. */}
-          {selectedMatch?.exact && (
-            <div className="px-3 py-1.5 border-b border-[#2a2d3d]/50 flex items-baseline gap-2 text-[11px]">
-              <span className="text-[#9ece6a]">⏎</span>
-              <span className="text-[#c0caf5] font-mono truncate">
-                {query.trim().length > 0 ? query.trim() : selectedMatch.action.slash}
-              </span>
-              {selectedMatch.tier === "ai" && selectedMatch.confidence !== undefined && (
-                <span
-                  className="text-[9px] font-mono px-1 rounded bg-[#bb9af7]/15 text-[#bb9af7] shrink-0"
-                  title={`AI Tier-3 match — model confidence ${Math.round(
-                    selectedMatch.confidence * 100,
-                  )}%`}
-                >
-                  AI {Math.round(selectedMatch.confidence * 100)}%
-                </span>
-              )}
-              <span className="text-[#565f89] ml-auto shrink-0">
-                {selectedMatch.action.label}
-              </span>
-            </div>
-          )}
+                {selectedMatch?.exact && (
+                  <div className="px-3 py-1.5 border-b border-[#2a2d3d]/50 flex items-baseline gap-2 text-[11px]">
+                    <span className="text-[#9ece6a]">⏎</span>
+                    <span className="text-[#c0caf5] font-mono truncate">
+                      {query.trim().length > 0 ? query.trim() : selectedMatch.action.slash}
+                    </span>
+                    {selectedMatch.tier === "ai" && selectedMatch.confidence !== undefined && (
+                      <span
+                        className="text-[9px] font-mono px-1 rounded bg-[#bb9af7]/15 text-[#bb9af7] shrink-0"
+                        title={`AI Tier-3 match — model confidence ${Math.round(
+                          selectedMatch.confidence * 100,
+                        )}%`}
+                      >
+                        AI {Math.round(selectedMatch.confidence * 100)}%
+                      </span>
+                    )}
+                    <span className="text-[#565f89] ml-auto shrink-0">
+                      {selectedMatch.action.label}
+                    </span>
+                  </div>
+                )}
 
-          {/* Tier-3 in-flight indicator. Sits above the match list so
+                {/* Tier-3 in-flight indicator. Sits above the match list so
               the dropdown shifts predictably as state changes. */}
-          {interpreting && (
-            <div
-              className="px-3 py-1 border-b border-[#2a2d3d]/50 flex items-center gap-2 text-[10px] text-[#bb9af7]"
-              data-page-element="status-indicator"
-              data-indicator="tier3-interpreting"
-            >
-              <span className="w-2 h-2 border-2 border-[#bb9af7] border-t-transparent rounded-full animate-spin" />
-              Interpreting…
-              <span className="ml-auto text-[#565f89]">Esc to cancel</span>
-            </div>
-          )}
-
-          {/* Match list */}
-          {matches.length === 0 ? (
-            <div className="px-3 py-2 text-[11px] text-[#565f89]">
-              No match — press{" "}
-              <span className="font-mono text-[#a9b1d6]">Ctrl+Shift+K</span> to browse.
-            </div>
-          ) : (
-            matches.map((m, idx) => (
-              <button
-                key={m.action.id}
-                type="button"
-                onMouseDown={(e) => e.preventDefault() /* keep input focus */}
-                onClick={() => handleSuggestionClick(m.action, idx, m.presetArgs, m.tier)}
-                onMouseEnter={() => setSelectedIdx(idx)}
-                className={`w-full flex items-center gap-2 px-3 py-1 text-[11px] text-left transition-colors ${
-                  idx === selectedIdx
-                    ? "bg-[#7aa2f7]/10 text-[#c0caf5]"
-                    : "text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
-                }`}
-              >
-                <span className="font-mono text-[#7aa2f7] shrink-0 w-24 truncate">
-                  {m.action.slash}
-                </span>
-                <span className="text-[#565f89] truncate flex-1">{m.action.label}</span>
-                {m.tier === "ai" && (
-                  <span
-                    className="ml-auto text-[8px] font-mono uppercase tracking-wider shrink-0 text-[#bb9af7]"
-                    title={
-                      m.confidence !== undefined
-                        ? `Tier-3 AI match — confidence ${Math.round(m.confidence * 100)}%`
-                        : "Tier-3 AI match"
-                    }
+                {interpreting && (
+                  <div
+                    className="px-3 py-1 border-b border-[#2a2d3d]/50 flex items-center gap-2 text-[10px] text-[#bb9af7]"
+                    data-page-element="status-indicator"
+                    data-indicator="tier3-interpreting"
                   >
-                    AI{m.confidence !== undefined ? ` ${Math.round(m.confidence * 100)}%` : ""}
-                  </span>
+                    <span className="w-2 h-2 border-2 border-[#bb9af7] border-t-transparent rounded-full animate-spin" />
+                    Interpreting…
+                    <span className="ml-auto text-[#565f89]">Esc to cancel</span>
+                  </div>
                 )}
-                {m.recent && m.tier !== "ai" && (
-                  <span className="ml-auto text-[8px] text-[#bb9af7] uppercase tracking-wider shrink-0">
-                    recent
-                  </span>
+
+                {/* Match list */}
+                {matches.length === 0 ? (
+                  <div className="px-3 py-2 text-[11px] text-[#565f89]">
+                    No match — press <span className="font-mono text-[#a9b1d6]">Ctrl+Shift+K</span>{" "}
+                    to browse.
+                  </div>
+                ) : (
+                  matches.map((m, idx) => (
+                    <button
+                      key={m.action.id}
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault() /* keep input focus */}
+                      onClick={() => handleSuggestionClick(m.action, idx, m.presetArgs, m.tier)}
+                      onMouseEnter={() => setSelectedIdx(idx)}
+                      className={`w-full flex items-center gap-2 px-3 py-1 text-[11px] text-left transition-colors ${
+                        idx === selectedIdx
+                          ? "bg-[#7aa2f7]/10 text-[#c0caf5]"
+                          : "text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+                      }`}
+                    >
+                      <span className="font-mono text-[#7aa2f7] shrink-0 w-24 truncate">
+                        {m.action.slash}
+                      </span>
+                      <span className="text-[#565f89] truncate flex-1">{m.action.label}</span>
+                      {m.tier === "ai" && (
+                        <span
+                          className="ml-auto text-[8px] font-mono uppercase tracking-wider shrink-0 text-[#bb9af7]"
+                          title={
+                            m.confidence !== undefined
+                              ? `Tier-3 AI match — confidence ${Math.round(m.confidence * 100)}%`
+                              : "Tier-3 AI match"
+                          }
+                        >
+                          AI
+                          {m.confidence !== undefined ? ` ${Math.round(m.confidence * 100)}%` : ""}
+                        </span>
+                      )}
+                      {m.recent && m.tier !== "ai" && (
+                        <span className="ml-auto text-[8px] text-[#bb9af7] uppercase tracking-wider shrink-0">
+                          recent
+                        </span>
+                      )}
+                    </button>
+                  ))
                 )}
-              </button>
-            ))
-          )}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
-      {/* The bar itself — bottom strip, 28px tall. */}
+      {/* The docked footer bar — full width, fixed height, top border so it
+          reads as page chrome (a minibuffer-style command line) rather than
+          a floating control overlapping the terminal grid. */}
       <div
-        className={`h-7 flex items-center gap-2 px-3 border rounded-md backdrop-blur-sm transition-colors pointer-events-auto ${
-          focused
-            ? "bg-[#13141f]/95 border-[#7aa2f7]/60"
-            : "bg-[#13141f]/70 border-[#2a2d3d]"
+        className={`h-7 flex items-center gap-2 px-3 border-t backdrop-blur-sm transition-colors ${
+          focused ? "bg-[#13141f]/95 border-[#7aa2f7]/40" : "bg-[#13141f]/80 border-[#2a2d3d]"
         }`}
       >
         <span className="text-[10px] text-[#565f89] font-mono select-none">›</span>
