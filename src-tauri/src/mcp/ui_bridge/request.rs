@@ -21,11 +21,70 @@ pub(super) fn get_ui_bridge_timeout_ms() -> u64 {
     Timeouts::ui_bridge_ipc().as_millis() as u64
 }
 
-/// Default window label for single-window operation. Phase 0 of the pop-out
-/// terminal-windows plan (`plans/2026-06-03-runner-popout-terminal-windows.md`):
-/// every request currently targets the main window; a windowed dispatch overload
-/// arrives with Phase 1's pop-out windows.
+/// Default window label for single-window operation
+/// (`plans/2026-06-03-runner-popout-terminal-windows.md`). A request with no
+/// explicit target routes here, keeping single-window behavior byte-identical.
 pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
+
+/// Reserved payload field that routes a request to a specific pop-out window.
+///
+/// A UI Bridge control endpoint addresses a pop-out window (discoverable via
+/// `GET /ui-bridge/control/runner-windows`) by including
+/// `{ "windowLabel": "term-1" }` in the request payload. `ui_bridge_request_sync`
+/// consumes the field via [`split_target_window`] so it never reaches the
+/// frontend handler as request *data*; [`ui_bridge_request_inner`] re-attaches it
+/// to the emitted envelope so the addressed window's listener can match it
+/// against its own `getCurrentWindow().label`. The name matches the routing field
+/// the frontend already echoes on responses, so request → emit → response use one
+/// field end-to-end.
+pub(crate) const TARGET_WINDOW_FIELD: &str = "windowLabel";
+
+/// Stamp a target window onto a request payload, for handlers that build a typed
+/// payload (so a client's `windowLabel` would otherwise be dropped by struct
+/// deserialization). No-op when `window_label` is `None`, empty, or
+/// [`MAIN_WINDOW_LABEL`], so the single-window default payload is unchanged. A
+/// `null` base is promoted to `{}` first; a non-object, non-null base is returned
+/// untouched (it can't carry a field). Centralizes the field name so endpoints
+/// don't hand-roll the routing convention.
+pub(crate) fn target_window_payload(
+    mut base: serde_json::Value,
+    window_label: Option<&str>,
+) -> serde_json::Value {
+    let label = match window_label {
+        Some(l) if !l.is_empty() && l != MAIN_WINDOW_LABEL => l,
+        _ => return base,
+    };
+    if base.is_null() {
+        base = serde_json::json!({});
+    }
+    if let Some(obj) = base.as_object_mut() {
+        obj.insert(
+            TARGET_WINDOW_FIELD.to_string(),
+            serde_json::Value::String(label.to_string()),
+        );
+    }
+    base
+}
+
+/// Split an optional `windowLabel` routing field out of a request payload.
+///
+/// Returns `(target_window, payload_without_label)`. Absent / empty / non-string
+/// `windowLabel` (and any non-object payload) yields [`MAIN_WINDOW_LABEL`], so the
+/// single-window default is unchanged. Consuming the field here is what lets every
+/// handler that forwards a JSON-object payload target a window with zero per-handler
+/// plumbing — the request funnels through one chokepoint.
+fn split_target_window(payload: serde_json::Value) -> (String, serde_json::Value) {
+    if let serde_json::Value::Object(mut map) = payload {
+        let label = map
+            .remove(TARGET_WINDOW_FIELD)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| MAIN_WINDOW_LABEL.to_string());
+        (label, serde_json::Value::Object(map))
+    } else {
+        (MAIN_WINDOW_LABEL.to_string(), payload)
+    }
+}
 
 /// Build the `ui_bridge_pending` map key.
 ///
@@ -157,15 +216,37 @@ pub(super) async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde
 
 /// Send a UI Bridge request and wait for the response synchronously.
 ///
-/// This creates a oneshot channel, stores the sender in the pending map,
-/// emits the request to the frontend, and waits for the response with a timeout.
-///
-/// Includes circuit breaker, concurrency limiting, frontend liveness check,
-/// and request deduplication for read-only operations.
+/// Derives the target window from an optional `windowLabel` field in
+/// `additional_payload` (see [`TARGET_WINDOW_FIELD`]) and delegates to
+/// [`ui_bridge_request_sync_in_window`]. With no `windowLabel` the request targets
+/// the main window, byte-identical to single-window behavior. This is the
+/// entrypoint every HTTP handler funnels through, so addressing a pop-out window
+/// needs no per-handler plumbing.
 pub async fn ui_bridge_request_sync(
     state: &Arc<ApiState>,
     request_type: &str,
     additional_payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (window_label, additional_payload) = split_target_window(additional_payload);
+    ui_bridge_request_sync_in_window(state, request_type, additional_payload, &window_label).await
+}
+
+/// Send a UI Bridge request to an explicit target window and wait for the
+/// response synchronously.
+///
+/// This creates a oneshot channel, stores the sender in the pending map keyed by
+/// `(window_label, request_id)`, emits the request to the frontend, and waits for
+/// the response with a timeout.
+///
+/// Includes circuit breaker, concurrency limiting, frontend liveness check, and
+/// request deduplication for read-only operations. Rust callers that already hold
+/// a target label (e.g. terminal-window commands) call this directly; the public
+/// [`ui_bridge_request_sync`] derives the label from the payload.
+pub async fn ui_bridge_request_sync_in_window(
+    state: &Arc<ApiState>,
+    request_type: &str,
+    additional_payload: serde_json::Value,
+    window_label: &str,
 ) -> Result<serde_json::Value, String> {
     // 1. Check circuit breaker
     state.ui_bridge_circuit_breaker.check().await?;
@@ -212,9 +293,14 @@ pub async fn ui_bridge_request_sync(
         }
     }
 
-    // 3. Check for dedup opportunity on read-only requests
+    // 3. Check for dedup opportunity on read-only requests. The key is scoped to
+    // the target window so a read for one pop-out window never collapses into an
+    // in-flight read for a different window (which would return the wrong window's
+    // elements). For the main window this is just the legacy per-type dedup.
     let dedup_key = match request_type {
-        "get_elements" | "get_snapshot" | "get_components" => Some(request_type.to_string()),
+        "get_elements" | "get_snapshot" | "get_components" => {
+            Some(format!("{window_label}\u{1f}{request_type}"))
+        }
         _ => None,
     };
 
@@ -274,7 +360,8 @@ pub async fn ui_bridge_request_sync(
     };
 
     // 6. Execute the actual request
-    let result = ui_bridge_request_inner(state, request_type, additional_payload).await;
+    let result =
+        ui_bridge_request_inner(state, request_type, additional_payload, window_label).await;
 
     // 7. Update circuit breaker and attempt recovery if it opens
     match &result {
@@ -301,19 +388,34 @@ pub async fn ui_bridge_request_sync(
     result
 }
 
-/// Inner implementation of ui_bridge_request_sync (the actual IPC logic)
+/// Inner implementation of ui_bridge_request_sync (the actual IPC logic).
+///
+/// `window_label` is the resolved target window ([`MAIN_WINDOW_LABEL`] for the
+/// single-window default); the caller has already stripped any `windowLabel`
+/// routing field from `additional_payload`.
 async fn ui_bridge_request_inner(
     state: &Arc<ApiState>,
     request_type: &str,
     additional_payload: serde_json::Value,
+    window_label: &str,
 ) -> Result<serde_json::Value, String> {
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // Phase 0: every request targets the main window. A windowed dispatch
-    // overload (carrying an explicit target label) arrives with Phase 1's
-    // pop-out windows; until then this is always "main", so the wire shape and
-    // pending key are identical to pre-window-aware behavior.
-    let window_label = MAIN_WINDOW_LABEL.to_string();
+    // Fail fast for a non-existent target window. Without this, an unknown label
+    // would emit (or broadcast) an event every window's listener filters out by
+    // label, so the caller would wait the full IPC timeout for a request nothing
+    // can answer. A clear, immediate error naming the discovery route is the
+    // honest failure. The main window is always present (created at boot), so the
+    // default path skips the lookup entirely.
+    if window_label != MAIN_WINDOW_LABEL {
+        use tauri::Manager;
+        if state.app_handle.get_webview_window(window_label).is_none() {
+            return Err(format!(
+                "No runner window labeled '{window_label}'. Discover live windows via \
+                 GET /ui-bridge/control/runner-windows."
+            ));
+        }
+    }
 
     // Carry the target window in the (flattened) envelope payload ONLY when it
     // is non-default, so the default single-window request is byte-identical on
@@ -323,8 +425,8 @@ async fn ui_bridge_request_inner(
         let mut p = additional_payload;
         if let Some(obj) = p.as_object_mut() {
             obj.insert(
-                "windowLabel".to_string(),
-                serde_json::Value::String(window_label.clone()),
+                TARGET_WINDOW_FIELD.to_string(),
+                serde_json::Value::String(window_label.to_string()),
             );
         }
         p
@@ -357,7 +459,7 @@ async fn ui_bridge_request_inner(
     let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
 
     // Store the sender in the pending map under the composite (window, id) key.
-    let pkey = pending_key(&window_label, &request_id);
+    let pkey = pending_key(window_label, &request_id);
     {
         let mut pending = state.ui_bridge_pending.lock().await;
         pending.insert(pkey.clone(), tx);
@@ -372,7 +474,7 @@ async fn ui_bridge_request_inner(
     // teardown) so a request is never silently dropped.
     let emit_result = if multi_window_dispatch_enabled() {
         use tauri::Manager;
-        match state.app_handle.get_webview_window(&window_label) {
+        match state.app_handle.get_webview_window(window_label) {
             Some(win) => win.emit("ui-bridge-request", &event_payload),
             None => state.app_handle.emit("ui-bridge-request", &event_payload),
         }
@@ -542,7 +644,10 @@ mod wrap_ipc_result_tests {
     //! `wrap_ipc_result` helper. Lock down each decision point: inner
     //! success, inner failure (with/without error field), absent success
     //! field, and non-bool success values.
-    use super::{handle_ui_bridge_response, pending_key, wrap_ipc_result, MAIN_WINDOW_LABEL};
+    use super::{
+        handle_ui_bridge_response, pending_key, split_target_window, wrap_ipc_result,
+        MAIN_WINDOW_LABEL,
+    };
     use axum::http::StatusCode;
     use serde_json::json;
     use std::collections::HashMap;
@@ -552,6 +657,46 @@ mod wrap_ipc_result_tests {
     use tokio::sync::{oneshot, Mutex};
 
     // ── Window-aware dispatch (Phase 0) ─────────────────────────────────────
+
+    #[test]
+    fn split_target_window_defaults_to_main_when_absent() {
+        // No windowLabel → main, payload untouched (single-window default).
+        let (label, payload) = split_target_window(json!({ "selector": "#btn" }));
+        assert_eq!(label, MAIN_WINDOW_LABEL);
+        assert_eq!(payload, json!({ "selector": "#btn" }));
+    }
+
+    #[test]
+    fn split_target_window_extracts_and_strips_label() {
+        // windowLabel routes the request AND is consumed (not forwarded as data).
+        let (label, payload) =
+            split_target_window(json!({ "windowLabel": "term-1", "selector": "#btn" }));
+        assert_eq!(label, "term-1");
+        assert_eq!(payload, json!({ "selector": "#btn" }));
+    }
+
+    #[test]
+    fn split_target_window_empty_or_non_string_label_falls_back_to_main() {
+        let (label, payload) = split_target_window(json!({ "windowLabel": "", "x": 1 }));
+        assert_eq!(label, MAIN_WINDOW_LABEL);
+        assert_eq!(payload, json!({ "x": 1 }), "empty label still consumed");
+
+        let (label, payload) = split_target_window(json!({ "windowLabel": 7, "x": 1 }));
+        assert_eq!(label, MAIN_WINDOW_LABEL);
+        assert_eq!(
+            payload,
+            json!({ "x": 1 }),
+            "non-string label still consumed"
+        );
+    }
+
+    #[test]
+    fn split_target_window_non_object_payload_is_unchanged() {
+        // A non-object payload can't carry a routing field — pass it through as-is.
+        let (label, payload) = split_target_window(json!("raw"));
+        assert_eq!(label, MAIN_WINDOW_LABEL);
+        assert_eq!(payload, json!("raw"));
+    }
 
     #[test]
     fn pending_key_is_distinct_per_window_for_same_request_id() {

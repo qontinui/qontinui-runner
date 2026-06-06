@@ -161,6 +161,36 @@ An unknown/stale `tabId` is rejected by the relay with a structured
 `{success:false, code:"TAB_NOT_FOUND"|"TAB_STALE", ...}` envelope (NOT a silent
 fall-through to the primary tab); the runner forwards it verbatim.
 
+### Per-window routing (`?windowLabel=`) targets a pop-out runner window
+`tabId` (above) pins a command to a remote browser *tab* via the relay.
+`windowLabel` is the **local** analog: it targets one of THIS runner process's
+own Tauri webview windows — the main window or a pop-out terminal window
+(`plans/2026-06-03-runner-popout-terminal-windows.md`). Discover the live labels
+via `GET /ui-bridge/control/runner-windows` (each entry carries `label`, `kind`,
+`title`); omitting `windowLabel` targets `"main"`, byte-identical to single-window
+behavior.
+
+Mechanics (`mcp/ui_bridge/request.rs`): `ui_bridge_request_sync` is the single
+chokepoint — it pulls an optional `windowLabel` field out of the request payload
+(`split_target_window`), routes the emit to that window's webview, and the
+composite `(windowLabel, requestId)` pending key plus the frontend listener's
+own-label filter (`useUIBridgeEventHandler.ts`) keep the round-trip unambiguous.
+Two thread-through styles, mirroring the `tabId` split:
+- **Verbatim-`Value`-body handlers** need no change — a caller including
+  `{"windowLabel":"term-1"}` in the body flows straight to the chokepoint
+  (e.g. `assert_element`, `batch_actions`, the `ai.rs` handlers).
+- **Typed-struct handlers** drop unknown fields, so they read `windowLabel`
+  explicitly and re-stamp via `request::target_window_payload`. Wired today:
+  `get_elements` (`?windowLabel=`) and `execute_action`
+  (`ActionQueryParams.window_label`, which also scopes its pre/post detector and
+  disabled-state queries so the element id resolves in the right window's
+  registry). Rust callers holding a label call `ui_bridge_request_sync_in_window`.
+
+An unknown `windowLabel` (no such window — e.g. a pop-out that already closed)
+returns an immediate, structured error naming the missing window and the
+`runner-windows` discovery route, rather than emitting an event every window
+filters out by label and making the caller wait the full IPC timeout.
+
 ### Status-code mapping is explicit
 Default `Json` responses are 200. The SDK's `expect`-style endpoints return
 422 on predicate timeout — `ui_bridge_expect_element_handler` at
