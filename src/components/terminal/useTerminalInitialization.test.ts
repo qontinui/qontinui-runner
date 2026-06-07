@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
-import { fetchOpenRecords } from "./useTerminalInitialization";
+import { fetchOpenRecords, claimInitForPage } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 
 const rec = (overrides: Partial<TerminalSessionRecord>): TerminalSessionRecord => ({
@@ -87,9 +87,7 @@ describe("fetchOpenRecords", () => {
       success: true,
       message: null,
       data: {
-        sessions: [
-          { ...rec({ claudeSessionId: "A" }), pageId: undefined as unknown as string },
-        ],
+        sessions: [{ ...rec({ claudeSessionId: "A" }), pageId: undefined as unknown as string }],
       },
     });
     const out = await fetchOpenRecords("default");
@@ -124,5 +122,35 @@ describe("fetchOpenRecords", () => {
   it("returns [] when the payload has no sessions array", async () => {
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: {} });
     expect(await fetchOpenRecords("default")).toEqual([]);
+  });
+});
+
+// Phase 3 (mount-hydration lift): the convergence backstop must run once PER
+// PAGEID, not once per mount. The single TerminalPage instance now persists
+// across terminal-page switches (the session provider was lifted above it), so
+// the guard is keyed by pageId.
+describe("claimInitForPage (once-per-pageId guard)", () => {
+  it("runs init the first time a page is seen", () => {
+    const seen = new Set<string>();
+    expect(claimInitForPage(seen, "default")).toBe(true);
+  });
+
+  it("does NOT re-run init for a page already initialized", () => {
+    const seen = new Set<string>();
+    expect(claimInitForPage(seen, "default")).toBe(true);
+    expect(claimInitForPage(seen, "default")).toBe(false);
+    expect(claimInitForPage(seen, "default")).toBe(false);
+  });
+
+  it("runs init independently for each pageId (page switch ⇒ new page inits once)", () => {
+    const seen = new Set<string>();
+    // First visit to page A initializes it.
+    expect(claimInitForPage(seen, "page-a")).toBe(true);
+    // Switch to page B (no remount) — B initializes once.
+    expect(claimInitForPage(seen, "page-b")).toBe(true);
+    // Switching back to A does NOT re-init (state survived the switch).
+    expect(claimInitForPage(seen, "page-a")).toBe(false);
+    // ...and B is likewise already converged.
+    expect(claimInitForPage(seen, "page-b")).toBe(false);
   });
 });

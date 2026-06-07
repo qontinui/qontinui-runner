@@ -68,6 +68,57 @@ export function buildSessionCloseRecord(
 }
 
 /**
+ * Pure helper: decide whether a `terminal-created` event belongs to the page
+ * this manager instance is scoped to. With the session provider lifted above
+ * the page (so every page's manager is mounted simultaneously), each page's
+ * `terminal-created` listener must claim ONLY the terminals created for its own
+ * page — otherwise a terminal created for page B would be ingested into every
+ * page's tab slice.
+ *
+ * Older wire forms that omit `pageId` hydrate to `"default"` on the Rust side
+ * (`TerminalInfo`), so an undefined/empty value here is treated as "default".
+ *
+ * Exported so `useTerminalManager.test.ts` can drive the page-routing contract
+ * without booting React.
+ */
+export function shouldIngestCreatedTerminal(
+  eventPageId: string | undefined | null,
+  pageId: string,
+): boolean {
+  return (eventPageId || "default") === pageId;
+}
+
+/**
+ * Pure helper: fold a `terminal-created` payload into the existing tab list.
+ * Returns the next tabs array — the SAME identity when the terminal already
+ * exists (dedup), otherwise a new array with the tab appended. `pendingTaskRunId`
+ * is the worker mark drained from the race buffer by the caller (or `undefined`).
+ *
+ * Exported so `useTerminalManager.test.ts` can drive the ingest + dedup contract
+ * without booting React.
+ */
+export function reduceCreatedTerminal(
+  tabs: TerminalTab[],
+  info: TerminalInfo,
+  pendingTaskRunId: string | undefined,
+): TerminalTab[] {
+  if (tabs.some((t) => t.id === info.id)) return tabs;
+  return [
+    ...tabs,
+    {
+      id: info.id,
+      title: info.title,
+      pid: info.pid ?? null,
+      isAlive: info.isAlive,
+      exitCode: info.exitCode ?? null,
+      workingDir: info.workingDir || undefined,
+      createdAt: info.createdAt,
+      taskRunId: pendingTaskRunId,
+    },
+  ];
+}
+
+/**
  * Pure helper: decide whether `tabs` should be replaced when applying a
  * worker mark for `terminalId`. Returns the next tabs array (same identity
  * if no change), and a `buffered` flag the caller uses to record the mark
@@ -120,12 +171,21 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
     });
   }, []);
 
-  // Listen for terminals created externally (e.g. via HTTP API) and add them as tabs.
-  // Deduplicates by checking if the terminal ID already exists in state.
+  // Listen for terminals created externally (e.g. via HTTP API) and add them as
+  // tabs. This is the ONLY live-ingest path for externally-created terminals
+  // (e.g. a docked gate continuation). With the session provider lifted above
+  // TerminalPage (so every page's manager is mounted at once), the listener
+  // ALWAYS runs regardless of which page the operator is viewing — a
+  // `terminal-created` event is therefore never dropped by a page switch. Each
+  // page's listener claims ONLY the terminals tagged with its own `pageId`
+  // (`shouldIngestCreatedTerminal`), and dedups by id (`reduceCreatedTerminal`).
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     listen<TerminalInfo>("terminal-created", (event) => {
       const info = event.payload;
+      // Route the event to the page it belongs to. A terminal created for
+      // another page is ignored here — its own page's manager will claim it.
+      if (!shouldIngestCreatedTerminal(info.pageId, pageId)) return;
       // Drain the race buffer OUTSIDE the reducer so the `setTabs` updater
       // stays pure (React StrictMode double-invokes updaters in dev; a
       // delete-inside-reducer would miss on the second pass).
@@ -134,21 +194,11 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
         pendingWorkerMarks.current.delete(info.id);
       }
       setTabs((prev) => {
-        if (prev.some((t) => t.id === info.id)) return prev;
-        logger.info(`External terminal created: ${info.id} (${info.title})`);
-        return [
-          ...prev,
-          {
-            id: info.id,
-            title: info.title,
-            pid: info.pid ?? null,
-            isAlive: info.isAlive,
-            exitCode: info.exitCode ?? null,
-            workingDir: info.workingDir || undefined,
-            createdAt: info.createdAt,
-            taskRunId: pendingTaskRunId,
-          },
-        ];
+        const next = reduceCreatedTerminal(prev, info, pendingTaskRunId);
+        if (next !== prev) {
+          logger.info(`External terminal created: ${info.id} (${info.title}) [page ${pageId}]`);
+        }
+        return next;
       });
     }).then((fn) => {
       unlisten = fn;
@@ -156,7 +206,7 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
     return () => {
       unlisten?.();
     };
-  }, []);
+  }, [pageId]);
 
   // Mirror the Phase 1 backend worker gate on the frontend. The Rust side
   // emits `worker-registered` right after `SessionManager::register_worker`

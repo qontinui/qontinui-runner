@@ -8,7 +8,7 @@
 
 import { createContext, useMemo, type ReactNode } from "react";
 import { useTerminalSession } from "./TerminalSessionContext";
-import { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
+import type { useZoneLabelsAndTags } from "../useZoneLabelsAndTags";
 import { useEventHistory } from "../useEventHistory";
 import { useFocusHistory } from "../useFocusHistory";
 
@@ -32,10 +32,12 @@ interface ZoneMetadataProviderProps {
 }
 
 export function ZoneMetadataProvider({ children }: ZoneMetadataProviderProps) {
-  const { pageId, zoneLayout } = useTerminalSession();
+  const { zoneLayout, labelsAndTags } = useTerminalSession();
 
-  const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments, pageId);
-
+  // `labelsAndTags` now lives in the per-page `PageSessionScope` (so each page
+  // owns its own page-namespaced labels and the cold-start init backstop can
+  // apply restored cosmetics to the right page). Re-expose the exact reference
+  // here so every downstream `useZoneMetadata()` consumer is unchanged.
   const { eventHistory, addHistoryEvent, metrics, incrementMetric } = useEventHistory();
 
   const focusHistory = useFocusHistory(zoneLayout.focusedZone, zoneLayout.setFocusedZone);

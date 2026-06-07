@@ -55,6 +55,25 @@ function buildResumeCmd(sessionId: string, configDir: string | undefined): strin
     : `CLAUDE_CONFIG_DIR="${configDir}" ${base}\r`;
 }
 
+/**
+ * Pure guard for the once-per-pageId init backstop (Phase 3 mount-hydration
+ * lift). With the session provider lifted above the page, the single
+ * `useTerminalInitialization` instance persists across terminal-page switches,
+ * so the convergence backstop (reconnect + durable-record restore + resume
+ * drain) must run exactly ONCE per pageId — not once per mount. Returns `true`
+ * (and records `pageId` as seen) the FIRST time a page is initialized;
+ * `false` on every subsequent call for that page.
+ *
+ * Mutating the passed Set keeps the call-site a one-liner and lets the hook
+ * hold the Set in a ref. Exported so the per-pageId semantics can be unit-
+ * tested without booting React (vitest `environment: "node"`).
+ */
+export function claimInitForPage(seen: Set<string>, pageId: string): boolean {
+  if (seen.has(pageId)) return false;
+  seen.add(pageId);
+  return true;
+}
+
 /** Validate session IDs before interpolating into shell commands. */
 const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
 function isValidSessionId(id: string): boolean {
@@ -148,33 +167,31 @@ export function useTerminalInitialization({
   sessionPersistence,
   layoutState,
 }: UseTerminalInitializationParams) {
+  // Phase 3 (mount-hydration lift): with the session provider lifted above the
+  // page and per-page scopes always mounted, a terminal-PAGE switch no longer
+  // unmounts/remounts this hook — so the old "REMOUNTED … tabs were lost" /
+  // "UNMOUNTED … will be destroyed" warnings (which fired on every page
+  // switch) are gone. A genuine unmount of the whole tree (auth change) is
+  // still surfaced once.
   const mountCountRef = useRef(0);
   useEffect(() => {
     mountCountRef.current += 1;
     const mountNum = mountCountRef.current;
     if (mountNum > 1) {
       console.warn(
-        `[TerminalPage] REMOUNTED (mount #${mountNum}) — all terminal tabs were lost. ` +
-          `This usually means the parent component tree unmounted (e.g., auth state change).`,
+        `[TerminalPage] REMOUNTED (mount #${mountNum}) — the terminal page tree remounted. ` +
+          `Page state is preserved by the lifted session provider; this usually means the ` +
+          `parent app tree unmounted (e.g., auth state change).`,
       );
     }
-    return () => {
-      console.warn(
-        `[TerminalPage] UNMOUNTED (was mount #${mountNum}), ${tabs.length} tab(s) will be destroyed`,
-      );
-    };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
-  const didInit = useRef(false);
-  const pendingRestoresRef = useRef<
-    Array<{
-      tabId: string;
-      scrollbackPath?: string;
-      isClaudeSession?: boolean;
-      claudeSessionId?: string;
-      claudeConfigDir?: string;
-    }>
-  >([]);
+  // Init / restore guards are keyed by pageId, NOT per hook mount. The single
+  // TerminalPage instance now persists across terminal-page switches (no
+  // remount), so the convergence backstop (reconnect + durable-record restore
+  // + resume-drain) must run exactly ONCE per pageId — the first time each page
+  // becomes active — rather than once per mount.
+  const didInitPages = useRef<Set<string>>(new Set());
 
   // Gate for the debounced auto-save effect. The restore path recreates
   // plain shells and only *asynchronously* types `claude --resume <id>` /
@@ -186,17 +203,31 @@ export function useTerminalInitialization({
   // then open the gate exactly once. The flag is opened in a `finally` so
   // it ALWAYS flips — even when there were no saved sessions or restore
   // threw — so brand-new sessions still persist normally.
-  const restoreCompleteRef = useRef(false);
+  //
+  // Keyed per pageId (Phase 3): each page's restore drains independently, and
+  // auto-save runs in the single page instance for whichever page is active.
+  const restoreCompletePages = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    if (didInit.current) return;
-    didInit.current = true;
+    if (!claimInitForPage(didInitPages.current, pageId)) return;
+    const initPageId = pageId;
+
+    // Per-page restore queue (Phase 3): local to this page's init run so a
+    // second page initializing before this one's drain timer fires can't see
+    // (or clear) the other page's pending restores.
+    const pendingRestores: Array<{
+      tabId: string;
+      scrollbackPath?: string;
+      isClaudeSession?: boolean;
+      claudeSessionId?: string;
+      claudeConfigDir?: string;
+    }> = [];
 
     (async () => {
       // True once a deferred resume/scrollback drain timer is scheduled. When
-      // set, that timer owns flipping `restoreCompleteRef` (after it issues the
-      // resume commands); the `finally` below only opens the gate when NO drain
-      // was scheduled, so the flag always flips exactly once.
+      // set, that timer owns flipping the per-page restore-complete gate (after
+      // it issues the resume commands); the `finally` below only opens the gate
+      // when NO drain was scheduled, so the flag always flips exactly once.
       let drainScheduled = false;
       try {
         // 1) Reconnect to live PTYs that survived a React remount. These tabs
@@ -295,7 +326,7 @@ export function useTerminalInitialization({
           rememberSessionId(tabId, rec.claudeSessionId, safeConfigDir);
 
           if (validSessionId) {
-            pendingRestoresRef.current.push({
+            pendingRestores.push({
               tabId,
               scrollbackPath:
                 rec.zoneIndex >= 0 ? cosmeticsByZone.get(rec.zoneIndex)?.scrollbackPath : undefined,
@@ -344,12 +375,12 @@ export function useTerminalInitialization({
 
         // 6) Drain: restore scrollback then issue `claude --resume` for every
         //    cold-created Claude tab. Identical mechanism to the prior restore;
-        //    the gate (`restoreCompleteRef`) flips in the drain's finally.
-        if (pendingRestoresRef.current.length > 0) {
+        //    the per-page gate flips in the drain's finally.
+        if (pendingRestores.length > 0) {
           drainScheduled = true;
           setTimeout(async () => {
             try {
-              for (const restore of pendingRestoresRef.current) {
+              for (const restore of pendingRestores) {
                 const ref = terminalRefs.current.get(restore.tabId);
                 const handle = ref?.current;
 
@@ -412,11 +443,11 @@ export function useTerminalInitialization({
                 console.warn("[TerminalPage] Failed to cleanup scrollback files:", err);
               }
 
-              pendingRestoresRef.current = [];
+              pendingRestores.length = 0;
             } finally {
               // Restored tabs now carry their claudeSessionId / scrollback —
-              // safe to let the debounced auto-save persist the layout.
-              restoreCompleteRef.current = true;
+              // safe to let the debounced auto-save persist this page's layout.
+              restoreCompletePages.current.add(initPageId);
             }
           }, 1500);
         }
@@ -435,7 +466,7 @@ export function useTerminalInitialization({
         // so brand-new sessions still persist. Never leave it permanently
         // closed (that would silently disable persistence).
         if (!drainScheduled) {
-          restoreCompleteRef.current = true;
+          restoreCompletePages.current.add(initPageId);
         }
       }
     })();
@@ -455,12 +486,13 @@ export function useTerminalInitialization({
   // Auto-save session layout for persistence across app restarts
   useEffect(() => {
     if (tabs.length === 0) return;
-    // Suppress auto-save until restore has fully completed. Otherwise the
-    // debounced save can fire while the restore path still holds plain shells
-    // (no claudeSessionId yet) and clobber the good saved Claude layout. Once
-    // the gate opens, the `updateTab` calls that attach claudeSessionId mutate
-    // `tabs`, re-running this effect — so no save is permanently lost.
-    if (!restoreCompleteRef.current) return;
+    // Suppress auto-save until THIS page's restore has fully completed.
+    // Otherwise the debounced save can fire while the restore path still holds
+    // plain shells (no claudeSessionId yet) and clobber the good saved Claude
+    // layout. Once the gate opens, the `updateTab` calls that attach
+    // claudeSessionId mutate `tabs`, re-running this effect — so no save is
+    // permanently lost.
+    if (!restoreCompletePages.current.has(pageId)) return;
     sessionPersistence.saveSessionLayout({
       layoutId: layoutState.layoutId,
       tabs,
@@ -471,6 +503,7 @@ export function useTerminalInitialization({
       focusedZone: layoutState.focusedZone,
     });
   }, [
+    pageId,
     tabs,
     zoneLayout.assignments,
     layoutState.layoutId,

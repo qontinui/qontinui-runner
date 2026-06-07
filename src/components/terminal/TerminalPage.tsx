@@ -11,10 +11,7 @@ import { DocFinderModal } from "./DocFinderModal";
 import { BatchOperationsBar } from "./BatchOperationsBar";
 import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
-import { useTerminalPageId } from "./TerminalPageContext";
-import { WindowAssignmentsProvider } from "./contexts/WindowAssignmentsContext";
 import {
-  TerminalSessionProvider,
   useTerminalSession,
   ZoneMetadataProvider,
   useZoneMetadata,
@@ -62,30 +59,24 @@ interface TerminalPageProps {
 }
 
 export function TerminalPage(props: TerminalPageProps) {
-  const pageId = useTerminalPageId();
   return (
-    // Phase 1 (pop-out windows): WindowAssignmentsProvider sits above the
-    // session provider so tab-ownership filtering + owner-gated stdin can read
-    // "which window owns which session". A no-op in the single-window case.
-    <WindowAssignmentsProvider>
-      <TerminalSessionProvider
-        pageId={pageId}
-        onNavigateToBuilder={props.onNavigateToBuilder}
-        onNavigateToActive={props.onNavigateToActive}
-      >
-        <ZoneMetadataProvider>
-          <TransitionEffectsProvider>
-            <UIStateProvider>
-              <SuggestionsProvider>
-                <ResultCardProvider>
-                  <TerminalPageInner {...props} />
-                </ResultCardProvider>
-              </SuggestionsProvider>
-            </UIStateProvider>
-          </TransitionEffectsProvider>
-        </ZoneMetadataProvider>
-      </TerminalSessionProvider>
-    </WindowAssignmentsProvider>
+    // Phase 3 (mount-hydration lift): WindowAssignmentsProvider +
+    // TerminalSessionProvider were lifted to App.tsx so terminal session state
+    // survives page switches and the `terminal-created` listener stays live for
+    // every page. The remaining orthogonal UI providers stay here, scoped to
+    // the (single, active-page) page tree and reading the active page's slice
+    // off the lifted `useTerminalSession()`.
+    <ZoneMetadataProvider>
+      <TransitionEffectsProvider>
+        <UIStateProvider>
+          <SuggestionsProvider>
+            <ResultCardProvider>
+              <TerminalPageInner {...props} />
+            </ResultCardProvider>
+          </SuggestionsProvider>
+        </UIStateProvider>
+      </TransitionEffectsProvider>
+    </ZoneMetadataProvider>
   );
 }
 
