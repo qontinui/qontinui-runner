@@ -562,6 +562,17 @@ pub fn create_router(
         vision_baselines: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
+    // Publish the capture-backend telemetry handles so the device-scoped 30s
+    // fleet heartbeat (`fleet::heartbeat_to_coord`, on its own OS thread spawned
+    // before this `ApiState` exists) can report them to coord.devices. Shares
+    // the live `Arc`s the capture path bumps — see plan
+    // 2026-06-07-fleet-capture-backend-telemetry.md work item 1.
+    crate::fleet::publish_capture_telemetry_handles(crate::fleet::CaptureTelemetryHandles {
+        capture_preview_count: api_state.vision_capture_preview_count.clone(),
+        monitor_crop_count: api_state.vision_monitor_crop_count.clone(),
+        last_fallback: api_state.vision_last_fallback.clone(),
+    });
+
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
     // `State<'_, Arc<ApiState>>` can resolve it.
     app_handle.manage(api_state.clone());
