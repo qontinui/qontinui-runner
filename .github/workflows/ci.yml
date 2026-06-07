@@ -296,6 +296,118 @@ jobs:
         #      `--no-bundle` — compilation + link is the sanity gate we want.
         run: pnpm run tauri build --debug --no-bundle
 
+      # The contract smoke boots the runner exe directly, and the runner's
+      # boot path HARD-PANICS at main.rs:419 if it can't reach PostgreSQL
+      # ("PostgreSQL connection required"). There is no PG-less escape hatch:
+      # `profiles::load()` always resolves a `database_url` (active profile →
+      # RUNNER_DATABASE_URL → a localhost default) and `PgDb::new` connects +
+      # self-bootstraps its schema unconditionally. windows-latest ships PG
+      # 17.10 but with the service Stopped/Disabled, and the runner additionally
+      # requires the `vector` (pgvector) extension (CREATE EXTENSION IF NOT
+      # EXISTS vector is fatal in PgDb::new) which is NOT bundled. So before the
+      # smoke we (1) compile+install pgvector into the preinstalled PG, (2) init
+      # a fresh data dir + start the server, (3) create an empty db with the
+      # `vector` extension and the `project` schema the runner's self-heal CREATE
+      # TABLEs target (the runner makes `runner`/`vector`/its tables itself, but
+      # never `CREATE SCHEMA project`). The runner self-provisions every table it
+      # needs (all web/alembic-owned tables are guarded by IF EXISTS), so a bare
+      # empty db + project schema is sufficient — no qontinui-web migrator run.
+      #
+      # Data dir lives under RUNNER_TEMP, NOT the preinstalled PGDATA
+      # (C:\PostgreSQL\17\data), which has an ACL that makes pg_ctl -D PGDATA
+      # fail "could not open data dir" on hosted Windows runners
+      # (actions/runner-images#13040). Fail-loud: every command's exit code is
+      # checked and versions are echoed.
+      - name: Start local PostgreSQL + pgvector (Windows smoke prereq)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # PGROOT/PGBIN are preset on the image; assert and echo them loudly.
+          if (-not $env:PGROOT) { throw "PGROOT not set — preinstalled PostgreSQL missing from image" }
+          if (-not $env:PGBIN)  { throw "PGBIN not set — preinstalled PostgreSQL missing from image" }
+          Write-Host "PGROOT = $env:PGROOT"
+          Write-Host "PGBIN  = $env:PGBIN"
+          & "$env:PGBIN\postgres.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "postgres --version failed ($LASTEXITCODE)" }
+
+          # --- 1. Build + install pgvector into the preinstalled PG ---------
+          # pgvector ships no Windows binary; build from source with nmake under
+          # the VS C++ toolchain (preinstalled on windows-latest). Locate
+          # vcvars64.bat via vswhere rather than hardcoding the VS edition path.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio with VC++ tools not found via vswhere" }
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
+          Write-Host "vcvars64.bat = $vcvars"
+
+          $pgvDir = Join-Path $env:RUNNER_TEMP "pgvector"
+          git clone --branch v0.8.0 --depth 1 https://github.com/pgvector/pgvector.git $pgvDir
+          if ($LASTEXITCODE -ne 0) { throw "git clone pgvector failed ($LASTEXITCODE)" }
+
+          # nmake must run inside the vcvars64 environment. Shell out to cmd so
+          # vcvars64.bat exports the MSVC env into the same process that runs
+          # nmake. PGROOT tells the Makefile where to install the extension.
+          # Built as a string array (NOT a here-string — the closing "@ must sit
+          # at column 0, which a YAML block scalar can't contain).
+          $buildLines = @(
+            "call `"$vcvars`"",
+            "if errorlevel 1 exit /b 1",
+            "cd /d `"$pgvDir`"",
+            "set `"PGROOT=$env:PGROOT`"",
+            "nmake /NOLOGO /F Makefile.win",
+            "if errorlevel 1 exit /b 1",
+            "nmake /NOLOGO /F Makefile.win install",
+            "if errorlevel 1 exit /b 1"
+          )
+          $buildBat = Join-Path $env:RUNNER_TEMP "build-pgvector.bat"
+          Set-Content -Path $buildBat -Value $buildLines -Encoding ascii
+          cmd /c $buildBat
+          if ($LASTEXITCODE -ne 0) { throw "pgvector build/install failed ($LASTEXITCODE)" }
+          Write-Host "pgvector installed into $env:PGROOT"
+
+          # --- 2. Init a fresh data dir + start the server -----------------
+          $dataDir = Join-Path $env:RUNNER_TEMP "pgdata"
+          $pwFile  = Join-Path $env:RUNNER_TEMP "pgpw.txt"
+          Set-Content -Path $pwFile -Value "postgres" -Encoding ascii -NoNewline
+          & "$env:PGBIN\initdb.exe" -D $dataDir -U postgres -A md5 --pwfile=$pwFile -E UTF8
+          if ($LASTEXITCODE -ne 0) { throw "initdb failed ($LASTEXITCODE)" }
+
+          $logFile = Join-Path $env:RUNNER_TEMP "pg.log"
+          & "$env:PGBIN\pg_ctl.exe" -D $dataDir -l $logFile -o "-p 5432" start
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "=== pg.log ==="
+            if (Test-Path $logFile) { Get-Content $logFile }
+            throw "pg_ctl start failed ($LASTEXITCODE)"
+          }
+
+          # Wait for readiness (pg_isready), fail loud with the log on timeout.
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            & "$env:PGBIN\pg_isready.exe" -h localhost -p 5432 -U postgres | Out-Null
+            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) {
+            Write-Host "=== pg.log ==="
+            if (Test-Path $logFile) { Get-Content $logFile }
+            throw "PostgreSQL did not become ready within 30s"
+          }
+          Write-Host "PostgreSQL is ready on localhost:5432"
+
+          # --- 3. Create the empty db + extension + project schema ---------
+          $env:PGPASSWORD = "postgres"
+          & "$env:PGBIN\createdb.exe" -h localhost -p 5432 -U postgres qontinui_db
+          if ($LASTEXITCODE -ne 0) { throw "createdb qontinui_db failed ($LASTEXITCODE)" }
+          # Verify pgvector loads, then create the schema the runner self-heal
+          # writes into (the runner creates `runner` + its tables itself).
+          & "$env:PGBIN\psql.exe" -h localhost -p 5432 -U postgres -d qontinui_db -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE SCHEMA IF NOT EXISTS project;"
+          if ($LASTEXITCODE -ne 0) { throw "extension/schema bootstrap failed ($LASTEXITCODE)" }
+          & "$env:PGBIN\psql.exe" -h localhost -p 5432 -U postgres -d qontinui_db -c "SELECT extversion FROM pg_extension WHERE extname='vector';"
+          Write-Host "Local PostgreSQL + pgvector + project schema ready for the contract smoke."
+
       # SDK↔runner behavior-contract gate. Boots the just-built debug exe
       # supervisor-free (`-DirectExe`), walks every UI_BRIDGE_ROUTES entry from
       # the sibling ui-bridge clone, and asserts the shape contracts the offline
@@ -308,8 +420,16 @@ jobs:
       # llama-swap, absent in CI. This step doubles as the Phase-0 WebView2
       # probe: if it fails at WebView2 init, the fallback is a parallel hosted
       # windows job (per the plan), not a blocker for the script mode.
+      #
+      # RUNNER_DATABASE_URL points the runner's `profiles::load()` legacy-env
+      # fallback at the local PG started above (libpq keyword DSN — the format
+      # tokio_postgres::Config parses and the same shape as profiles.rs's
+      # localhost default). No ~/.qualified profiles.json exists in CI, so the
+      # loader takes the legacy-env path and uses this DSN.
       - name: SDK↔runner contract smoke (direct-exe)
         if: matrix.platform == 'windows-latest'
+        env:
+          RUNNER_DATABASE_URL: "host=localhost port=5432 user=postgres password=postgres dbname=qontinui_db"
         run: powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
         shell: bash
 
