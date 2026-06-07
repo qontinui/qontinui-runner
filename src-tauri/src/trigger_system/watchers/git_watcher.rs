@@ -187,8 +187,16 @@ pub fn start_git_watcher(
 /// trigger debounce window — events carried a phantom `<branch>.lock` branch
 /// and enrichment ran before the ref was updated. The rename-target event for
 /// the real ref follows immediately and is the one that drives the pipeline.
+///
+/// Directories are ignored too: creating a namespaced branch (`fix/<name>`)
+/// also creates the `refs/heads/fix/` directory, and that event used to
+/// classify as a commit on the phantom branch `fix` (enriched from HEAD —
+/// the wrong commit). A real loose ref is always a file, never a directory.
 fn classify_ref_path(path_normalized: &str, repo_path: &str) -> Option<(&'static str, String)> {
     if path_normalized.ends_with(".lock") {
+        return None;
+    }
+    if std::path::Path::new(path_normalized).is_dir() {
         return None;
     }
     if path_normalized.contains(".git/HEAD") || path_normalized.ends_with("HEAD") {
@@ -229,8 +237,9 @@ fn classify_ref_path(path_normalized: &str, repo_path: &str) -> Option<(&'static
 /// from `refs/heads/<branch>` rather than HEAD: linked-worktree commits update
 /// the shared branch ref while the main checkout's HEAD points elsewhere, so
 /// peeling HEAD mis-attributed them to whatever the main checkout had checked
-/// out. Falls back to HEAD when the branch is unknown or the ref lookup fails
-/// (e.g. the ref was deleted between the event and enrichment).
+/// out. HEAD is used only when no branch is known; a known-but-unresolvable
+/// ref (deleted between the event and enrichment) yields `None` rather than
+/// a HEAD mis-attribution.
 ///
 /// Returns `None` if the repository can't be opened, no commit can be
 /// resolved, or any other git2 error occurs. Callers should fall back
@@ -278,11 +287,14 @@ fn resolve_event_commit<'r>(
     branch: Option<&str>,
 ) -> Option<git2::Commit<'r>> {
     if let Some(branch) = branch {
-        if let Ok(oid) = repo.refname_to_id(&format!("refs/heads/{branch}")) {
-            if let Ok(commit) = repo.find_commit(oid) {
-                return Some(commit);
-            }
-        }
+        // The changed ref is known: resolve it or give up. Falling back to
+        // HEAD here would attribute the event to whatever the main checkout
+        // has checked out — a different commit entirely (observed live as
+        // wrong-sha rows in coord.commit_observations). An unresolvable
+        // known ref (deleted mid-race, or a phantom name) yields None and
+        // the event goes out un-enriched instead of mis-attributed.
+        let oid = repo.refname_to_id(&format!("refs/heads/{branch}")).ok()?;
+        return repo.find_commit(oid).ok();
     }
     repo.head().ok()?.peel_to_commit().ok()
 }
@@ -426,8 +438,35 @@ mod tests {
         let meta = enrich_commit_metadata(&path, None).expect("enrich head");
         assert_eq!(meta["sha"], second.to_string());
 
-        // Unresolvable branch → HEAD fallback, not None.
-        let meta = enrich_commit_metadata(&path, Some("does-not-exist")).expect("enrich fallback");
-        assert_eq!(meta["sha"], second.to_string());
+        // Known-but-unresolvable branch → None (un-enriched), NOT a HEAD
+        // mis-attribution. Phantom branch names from namespaced-dir events
+        // and mid-race ref deletions both land here.
+        assert!(enrich_commit_metadata(&path, Some("does-not-exist")).is_none());
+    }
+
+    #[test]
+    fn classify_ignores_ref_directories() {
+        // Creating a namespaced branch (fix/<name>) also creates the
+        // refs/heads/fix/ directory; that event must not classify as a
+        // commit on phantom branch "fix".
+        let dir = tempfile::tempdir().unwrap();
+        let ns = dir
+            .path()
+            .join(".git")
+            .join("refs")
+            .join("heads")
+            .join("fix");
+        std::fs::create_dir_all(&ns).unwrap();
+        let ns_norm = ns.to_string_lossy().replace('\\', "/");
+        assert!(classify_ref_path(&ns_norm, ".").is_none());
+
+        // A real loose-ref FILE at a namespaced path still classifies.
+        let leaf = ns.join("real-branch");
+        std::fs::write(&leaf, "0000000000000000000000000000000000000000\n").unwrap();
+        let leaf_norm = leaf.to_string_lossy().replace('\\', "/");
+        assert_eq!(
+            classify_ref_path(&leaf_norm, "."),
+            Some(("commit", "fix/real-branch".to_string()))
+        );
     }
 }
