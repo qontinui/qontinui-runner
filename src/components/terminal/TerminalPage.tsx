@@ -204,6 +204,16 @@ function TerminalPageInner({
           "Return this runner process's own windows [{ label, kind, title }] (main + pop-outs).",
         handler: async () => invoke("list_runner_windows"),
       },
+      // P2 (orphan sweep) — operator-initiated cleanup of empty pop-out windows
+      // (no live tab). Reuses the same backend sweep the boot-restore path uses.
+      // Returns the labels swept.
+      {
+        id: "close-empty-terminal-windows",
+        label: "Close Empty Terminal Windows",
+        description:
+          "Close every pop-out OS window that has no live terminal tab and prune its record. Returns the labels closed.",
+        handler: async () => invoke("close_empty_terminal_windows"),
+      },
     ],
   });
 

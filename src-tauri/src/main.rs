@@ -1644,6 +1644,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal_analysis::get_latest_plan_content,
             // Pop-out terminal windows (Phase 1)
             commands::terminal_windows::assign_session_to_window,
+            commands::terminal_windows::close_empty_terminal_windows,
             commands::terminal_windows::close_terminal_window,
             commands::terminal_windows::focus_runner_window,
             commands::terminal_windows::get_window_assignments,

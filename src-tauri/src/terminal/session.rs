@@ -535,6 +535,23 @@ impl TerminalSession {
                         }
                     }
                 }
+
+                // P1 (close-on-clean-exit): on a CLEAN exit only, close the
+                // owning `term-N` pop-out window iff this was its last live
+                // session. A non-zero / unknown exit stays visible (honesty).
+                // Docked sessions (owner "main") and the main window are never
+                // auto-closed. Best-effort + cheap; guarded inside the helper.
+                if let Some(assignments) = tauri::Manager::try_state::<
+                    std::sync::Arc<crate::window_assignments::WindowAssignments>,
+                >(&waiter_app)
+                {
+                    crate::commands::terminal_windows::auto_close_owner_window_if_empty(
+                        &waiter_app,
+                        assignments.inner(),
+                        &waiter_id,
+                        code,
+                    );
+                }
             })
             .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
 

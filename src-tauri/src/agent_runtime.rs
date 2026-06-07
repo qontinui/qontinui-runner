@@ -783,6 +783,151 @@ fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
     dispatched_gate_ids().lock().unwrap().insert(gate_id)
 }
 
+// =============================================================================
+// Continuation-session registry (P3 anchor_key dedup + P4 concurrency cap)
+// =============================================================================
+
+/// Default cap on concurrently-live *continuation-spawned* terminal sessions.
+/// Overridable via `QONTINUI_CONTINUATION_SESSION_CAP`. Operator-opened
+/// sessions are never counted (they are never registered here).
+const DEFAULT_CONTINUATION_SESSION_CAP: usize = 4;
+
+/// One registered continuation-spawned session.
+#[derive(Debug, Clone)]
+struct ContinuationSession {
+    /// The runner-local terminal id (`TerminalManager` key) — used to test
+    /// liveness against the manager.
+    terminal_id: String,
+    /// The gate `anchor_key` this continuation was spawned for, if any. The
+    /// dedup key: a second continuation with the same live `anchor_key` is a
+    /// re-cleared gate / duplicate and must not double-spawn.
+    anchor_key: Option<String>,
+}
+
+/// Process-wide registry of continuation-spawned terminal sessions, keyed by
+/// `terminal_id`. Distinct from [`dispatched_gate_ids`] (which dedupes a single
+/// `gate_id` delivered twice): this tracks LIVE sessions so a re-cleared gate
+/// (new `gate_id`, same `anchor_key`) is deduped (P3) and the live count is
+/// capped (P4).
+fn continuation_sessions(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, ContinuationSession>> {
+    static SESSIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ContinuationSession>>,
+    > = std::sync::OnceLock::new();
+    SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The configured continuation-session cap (env override, else the default).
+/// A non-numeric / empty env value falls back to the default.
+fn continuation_session_cap() -> usize {
+    std::env::var("QONTINUI_CONTINUATION_SESSION_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CONTINUATION_SESSION_CAP)
+}
+
+/// Drop registry entries whose terminal is no longer live, using `is_live`
+/// (`terminal_id -> bool`). Called under the registry lock by the guard below
+/// so the count and the anchor_key scan only ever see currently-running
+/// sessions. Returns the retained entries' count.
+fn prune_dead_continuations(
+    map: &mut std::collections::HashMap<String, ContinuationSession>,
+    is_live: &dyn Fn(&str) -> bool,
+) {
+    map.retain(|tid, _| is_live(tid));
+}
+
+/// Outcome of the pre-spawn continuation guard (P3 + P4).
+#[derive(Debug, PartialEq, Eq)]
+enum ContinuationGuard {
+    /// Clear to spawn — no live duplicate, under cap.
+    Proceed,
+    /// A live continuation already exists for this `anchor_key` (P3): skip the
+    /// spawn (re-cleared gate / duplicate). Carries the existing terminal_id.
+    DuplicateAnchor(String),
+    /// At the concurrency cap (P4): skip the spawn. Carries the cap for the log.
+    AtCap(usize),
+}
+
+/// Pre-spawn guard: prune dead sessions, then enforce P3 (anchor_key dedup) and
+/// P4 (concurrency cap). Pure over (`anchor_key`, `is_live`, env cap) so it is
+/// unit-testable without a live `TerminalManager`.
+///
+/// Order matters: dedup is checked BEFORE the cap so a duplicate of an
+/// already-running anchor is reported as a dedup (the honest reason) rather than
+/// "capped". Operator sessions never enter the registry, so they never count.
+fn evaluate_continuation_guard(
+    anchor_key: Option<&str>,
+    is_live: &dyn Fn(&str) -> bool,
+) -> ContinuationGuard {
+    let mut map = continuation_sessions().lock().unwrap();
+    prune_dead_continuations(&mut map, is_live);
+
+    // P3: a LIVE session already exists for this anchor_key → dedup.
+    if let Some(anchor) = anchor_key {
+        if let Some(existing) = map
+            .values()
+            .find(|s| s.anchor_key.as_deref() == Some(anchor))
+        {
+            return ContinuationGuard::DuplicateAnchor(existing.terminal_id.clone());
+        }
+    }
+
+    // P4: at the cap → refuse.
+    let cap = continuation_session_cap();
+    if map.len() >= cap {
+        return ContinuationGuard::AtCap(cap);
+    }
+
+    ContinuationGuard::Proceed
+}
+
+/// Register a freshly-spawned continuation session in the live registry (after
+/// `create_terminal_session_backend` succeeds). The entry is reaped lazily by
+/// [`prune_dead_continuations`] the next time the guard runs.
+fn register_continuation_session(terminal_id: String, anchor_key: Option<String>) {
+    continuation_sessions().lock().unwrap().insert(
+        terminal_id.clone(),
+        ContinuationSession {
+            terminal_id,
+            anchor_key,
+        },
+    );
+}
+
+/// Liveness predicate for the continuation guard, backed by the process-global
+/// `TerminalManager`. Returns `terminal_id -> still running?`. When there is no
+/// Tauri runtime / no managed `TerminalManager` (headless or unit-test context)
+/// every terminal id reads as NOT live — the registry is empty there anyway, so
+/// the guard is a no-op.
+fn live_terminal_predicate() -> impl Fn(&str) -> bool {
+    use std::sync::Arc;
+    let manager: Option<Arc<crate::terminal::TerminalManager>> = crate::tauri_app_handle::current()
+        .and_then(|app| {
+            tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)
+                .map(|s| s.inner().clone())
+        });
+    move |terminal_id: &str| {
+        manager
+            .as_ref()
+            .and_then(|m| m.get(terminal_id))
+            .map(|sess| sess.is_alive())
+            .unwrap_or(false)
+    }
+}
+
+/// Log the existing live continuation tab a duplicate-anchor dispatch was
+/// folded onto (P3). There is no runner-wired "focus this tab" event today
+/// (the tab strip listens to none), so this is a deliberate no-op-plus-log:
+/// the operator already has the live continuation docked in `main`, and the
+/// duplicate is dropped rather than opening a second identical session.
+fn focus_existing_continuation(terminal_id: &str) {
+    debug!(
+        "agent_runtime: duplicate continuation folded onto existing live \
+         terminal_id={terminal_id} (already docked in main)"
+    );
+}
+
 /// Shared dispatch seam for BOTH the WS fast-path and the poll backstop.
 ///
 /// 1. If the payload carries a `gate_id`, dedupe against [`dispatched_gate_ids`]:
@@ -975,6 +1120,45 @@ async fn run_gate_continuation(
         return Ok(());
     }
 
+    // P3 (anchor_key dedup) + P4 (concurrency cap): before acquiring any
+    // device-local resources, check the live continuation-session registry.
+    // `gate_id` dedup (#450, the `dispatched_gate_ids` set) already collapses a
+    // SAME gate delivered twice; this catches the residual cases it can't — a
+    // re-cleared gate (new `gate_id`, same `anchor_key`) and the cap — both
+    // evaluated against sessions that are STILL running. Liveness is tested
+    // against the `TerminalManager` (continuation TERMINAL sessions register
+    // there); with no Tauri runtime the registry is empty so the guard is a
+    // no-op (the unit-test / headless-only context).
+    match evaluate_continuation_guard(payload.anchor_key.as_deref(), &live_terminal_predicate()) {
+        ContinuationGuard::Proceed => {}
+        ContinuationGuard::DuplicateAnchor(existing_terminal_id) => {
+            info!(
+                "agent_runtime: gate-continuation deduped by anchor_key={:?} — a live \
+                 continuation session (terminal_id={existing_terminal_id}) already exists; \
+                 skipping double-spawn",
+                payload.anchor_key
+            );
+            // Best-effort: bring the existing docked tab to focus so the
+            // operator sees the live continuation rather than nothing happening.
+            focus_existing_continuation(&existing_terminal_id);
+            return Ok(());
+        }
+        ContinuationGuard::AtCap(cap) => {
+            let reason =
+                format!("continuation cap ({cap}) reached — operator must resume manually");
+            warn!(
+                "agent_runtime: gate-continuation refused: {reason} (anchor_key={:?})",
+                payload.anchor_key
+            );
+            // No coord "operator must resume" alert path is runner-wirable
+            // (`/coord/alerts` is read-only); `spawn-failed` is the honest,
+            // already-wired fallback. A fresh correlation id (no worktree/agent
+            // was acquired) carries the lifecycle post.
+            report_spawn_failed(uuid::Uuid::now_v7(), &reason, None, 0).await;
+            return Ok(());
+        }
+    }
+
     // Step 1: acquire a device-local worktree (+ claim heartbeat). The `ctx`
     // owns the claim heartbeat task. For the HEADLESS path it stays bound here
     // so its heartbeat runs for the whole subprocess and the claim releases on
@@ -1121,6 +1305,10 @@ async fn run_continuation_terminal(
 
     match result {
         Ok((terminal_id, coord_session_id)) => {
+            // Register in the live continuation-session registry so P3 (dedup by
+            // anchor_key) and P4 (concurrency cap) see this session as live until
+            // its PTY exits (reaped lazily by the guard's liveness prune).
+            register_continuation_session(terminal_id.clone(), payload.anchor_key.clone());
             // The session is intentionally left on `main` (docked, visible) — no
             // pop-out window was opened, so there is nothing to reassign it to.
             info!(
@@ -2574,6 +2762,181 @@ mod tests {
             claim_gate_dispatch(other),
             "a different gate_id is unaffected"
         );
+    }
+
+    // =========================================================================
+    // P3 (anchor_key dedup) + P4 (concurrency cap): continuation guard
+    // =========================================================================
+
+    /// Reset the process-wide continuation registry between guard tests (it is a
+    /// `OnceLock`-backed singleton). Tests that touch it run under a shared mutex
+    /// (`CONT_GUARD_LOCK`) so they don't race each other's registry state.
+    fn clear_continuation_registry() {
+        continuation_sessions().lock().unwrap().clear();
+    }
+
+    static CONT_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// REGRESSION (P3 must not regress #450): a SAME gate_id delivered twice is
+    /// still short-circuited by the `dispatched_gate_ids` set — the anchor_key
+    /// layer is additive, not a replacement. (Mirrors
+    /// `claim_gate_dispatch_is_once_per_gate_id` but named as the explicit
+    /// regression guard the plan asks for.)
+    #[test]
+    fn gate_id_dedup_still_holds_alongside_anchor_guard() {
+        let gate = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate), "first delivery of the gate wins");
+        assert!(
+            !claim_gate_dispatch(gate),
+            "second delivery of the SAME gate_id is still deduped (#450 intact)"
+        );
+    }
+
+    /// P3: a live continuation for an anchor_key dedups a second dispatch with
+    /// the SAME anchor_key (the re-cleared-gate / legacy-no-gate_id case the
+    /// gate_id set can't catch). A different anchor proceeds. The guard prunes
+    /// dead sessions first, so once the first session dies the anchor is free.
+    #[test]
+    fn anchor_key_guard_dedups_live_then_frees_on_death() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        clear_continuation_registry();
+        // Raise the cap out of the way so this test isolates the dedup path.
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+
+        // No session yet → proceed, then register it as live.
+        let live_all = |_id: &str| true;
+        assert_eq!(
+            evaluate_continuation_guard(Some("plan:foo:phase:1"), &live_all),
+            ContinuationGuard::Proceed
+        );
+        register_continuation_session("term-tid-1".to_string(), Some("plan:foo:phase:1".into()));
+
+        // Same anchor, still live → DuplicateAnchor (carries the existing tid).
+        assert_eq!(
+            evaluate_continuation_guard(Some("plan:foo:phase:1"), &live_all),
+            ContinuationGuard::DuplicateAnchor("term-tid-1".to_string())
+        );
+        // A different anchor is unaffected.
+        assert_eq!(
+            evaluate_continuation_guard(Some("plan:foo:phase:2"), &live_all),
+            ContinuationGuard::Proceed
+        );
+
+        // Now the first session is dead → the guard prunes it and the anchor is
+        // free to spawn again (the legitimate re-run after completion).
+        let dead_first = |id: &str| id != "term-tid-1";
+        assert_eq!(
+            evaluate_continuation_guard(Some("plan:foo:phase:1"), &dead_first),
+            ContinuationGuard::Proceed
+        );
+        // The registry no longer holds the dead session.
+        assert!(continuation_sessions()
+            .lock()
+            .unwrap()
+            .get("term-tid-1")
+            .is_none());
+
+        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+        clear_continuation_registry();
+    }
+
+    /// P3: a continuation with NO anchor_key (legacy frame) never dedups by
+    /// anchor — it always proceeds (the gate_id set is its only dedup).
+    #[test]
+    fn no_anchor_key_never_dedups() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+
+        register_continuation_session("tid-a".into(), None);
+        // Another anchor-less dispatch must NOT be deduped against the existing
+        // anchor-less session (we can't correlate them).
+        assert_eq!(
+            evaluate_continuation_guard(None, &live_all),
+            ContinuationGuard::Proceed
+        );
+
+        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+        clear_continuation_registry();
+    }
+
+    /// P4: at the configured cap, a fresh dispatch is refused (`AtCap`). Below
+    /// the cap it proceeds. Dead sessions are pruned before counting, so they
+    /// don't consume cap slots. Env override is honored.
+    #[test]
+    fn continuation_cap_refuses_at_limit() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
+        let live_all = |_id: &str| true;
+
+        // 0 live, cap 2 → proceed.
+        assert_eq!(
+            evaluate_continuation_guard(Some("a1"), &live_all),
+            ContinuationGuard::Proceed
+        );
+        register_continuation_session("t1".into(), Some("a1".into()));
+        register_continuation_session("t2".into(), Some("a2".into()));
+
+        // 2 live, cap 2 → AtCap (a NEW anchor, so not a dedup).
+        assert_eq!(
+            evaluate_continuation_guard(Some("a3"), &live_all),
+            ContinuationGuard::AtCap(2)
+        );
+
+        // One session dies → pruned → back under cap → proceed.
+        let t1_dead = |id: &str| id != "t1";
+        assert_eq!(
+            evaluate_continuation_guard(Some("a3"), &t1_dead),
+            ContinuationGuard::Proceed
+        );
+
+        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+        clear_continuation_registry();
+    }
+
+    /// P3 before P4: a duplicate of an already-LIVE anchor is reported as a
+    /// dedup even when the registry is at the cap — the honest reason is "this
+    /// is already running", not "capped".
+    #[test]
+    fn dedup_takes_precedence_over_cap() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
+        let live_all = |_id: &str| true;
+
+        register_continuation_session("t1".into(), Some("anchor-dup".into()));
+        // At cap (1) AND the anchor matches a live session → dedup wins.
+        assert_eq!(
+            evaluate_continuation_guard(Some("anchor-dup"), &live_all),
+            ContinuationGuard::DuplicateAnchor("t1".to_string())
+        );
+
+        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+        clear_continuation_registry();
+    }
+
+    /// The cap reads `QONTINUI_CONTINUATION_SESSION_CAP`, falling back to the
+    /// default for an unset / non-numeric value.
+    #[test]
+    fn continuation_session_cap_env_parsing() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        let prev = std::env::var("QONTINUI_CONTINUATION_SESSION_CAP").ok();
+
+        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+        assert_eq!(continuation_session_cap(), DEFAULT_CONTINUATION_SESSION_CAP);
+
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "7");
+        assert_eq!(continuation_session_cap(), 7);
+
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "not-a-number");
+        assert_eq!(continuation_session_cap(), DEFAULT_CONTINUATION_SESSION_CAP);
+
+        match prev {
+            Some(v) => std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", v),
+            None => std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP"),
+        }
     }
 
     // =========================================================================
