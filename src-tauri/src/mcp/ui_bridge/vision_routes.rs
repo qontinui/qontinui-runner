@@ -771,6 +771,25 @@ fn cache_dir() -> PathBuf {
     PathBuf::from("tmp_vision_cache")
 }
 
+/// Render a cache entry's on-disk path as the host-agnostic relative form
+/// `tmp_vision_cache/<sha256>.<ext>` for [`CaptureResponse::path`].
+///
+/// The `VisionCache` root is built **absolute** in `mcp_api::api_state_init`
+/// (`current_runner_path().join("tmp_vision_cache")`) so file IO is correct
+/// regardless of CWD. The response `path` is diagnostic-only — every consumer
+/// fetches bytes by `sha256` via `/vision/raw` (`fetchVisionCacheBytes`), never
+/// by `path` — so we strip the absolute prefix and emit the relative path the
+/// doc comment and `cache_dir()` already promise. Cache entries are always flat
+/// files directly under the root, so the file name plus the fixed
+/// `tmp_vision_cache/` prefix is sufficient; the smoke gate's
+/// `^tmp_vision_cache[\\/]` regex accepts either slash flavour.
+fn relative_cache_path(p: &StdPath) -> String {
+    match p.file_name() {
+        Some(name) => format!("tmp_vision_cache/{}", name.to_string_lossy()),
+        None => p.to_string_lossy().into_owned(),
+    }
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -876,7 +895,7 @@ async fn do_capture(
                 bytes.len()
             );
             return Ok(CaptureResponse {
-                path: hit.path.to_string_lossy().into_owned(),
+                path: relative_cache_path(&hit.path),
                 sha256: hit.sha256_hex,
                 width: decoded.width(),
                 height: decoded.height(),
@@ -957,7 +976,7 @@ async fn do_capture(
     );
 
     Ok(CaptureResponse {
-        path: hit.path.to_string_lossy().into_owned(),
+        path: relative_cache_path(&hit.path),
         sha256: hit.sha256_hex,
         width,
         height,
@@ -1053,7 +1072,7 @@ async fn do_multi_capture(
                 results.insert(
                     cap.name.clone(),
                     CaptureResponse {
-                        path: hit.path.to_string_lossy().into_owned(),
+                        path: relative_cache_path(&hit.path),
                         sha256: hit.sha256_hex,
                         width: decoded.width(),
                         height: decoded.height(),
@@ -1164,7 +1183,7 @@ async fn do_multi_capture(
         results.insert(
             name,
             CaptureResponse {
-                path: hit.path.to_string_lossy().into_owned(),
+                path: relative_cache_path(&hit.path),
                 sha256: hit.sha256_hex,
                 width,
                 height,
@@ -1302,7 +1321,7 @@ async fn vision_diff_handler(
 
     Ok(Json(ApiResponse::success(DiffResponse {
         capture: CaptureResponse {
-            path: hit.path.to_string_lossy().into_owned(),
+            path: relative_cache_path(&hit.path),
             sha256: hit.sha256_hex,
             width: decoded.width(),
             height: decoded.height(),
@@ -1561,7 +1580,7 @@ async fn vision_raw_handler(
         })?;
 
     Ok(Json(ApiResponse::success(CaptureResponse {
-        path: hit.path.to_string_lossy().into_owned(),
+        path: relative_cache_path(&hit.path),
         sha256: hit.sha256_hex,
         width: decoded.width(),
         height: decoded.height(),
