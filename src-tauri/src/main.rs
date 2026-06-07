@@ -565,6 +565,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS). Same machine-
                 // wide, anonymous, device-keyed posture as the census.
                 agent_worktree::reclaim::spawn_reclaim();
+                // Ξ_FS backstop (Phase 5) — a defense-in-depth DETECTOR for
+                // edits that leaked OUTSIDE any session worktree. Periodically
+                // scans the SHARED canonical checkouts; alarms (POST
+                // /coord/fs/observations with source=canonical_drift) on a
+                // checkout that is dirty AND not covered by any live
+                // kind=worktree claim. Tier-1 surface/attribute only — never
+                // mutates the working tree. Gated OFF by default
+                // (QONTINUI_FS_BACKSTOP_ENABLED); best-effort, never blocking.
+                // Default 300s cadence (QONTINUI_FS_BACKSTOP_INTERVAL_SECS).
+                agent_worktree::fs_backstop::spawn_backstop();
                 // Phase 4 — coord-driven Claude Code subprocess runtime.
                 // Subscribes to `events.agent.spawn_requested.<device_id>`
                 // on coord WS and supervises the resulting `claude` CLI
