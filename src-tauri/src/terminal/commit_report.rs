@@ -47,7 +47,10 @@ use tracing::debug;
 /// (including unset) leaves it ON.
 pub fn report_enabled() -> bool {
     match std::env::var("QONTINUI_COMMIT_LINEAGE_REPORT") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
         Err(_) => true,
     }
 }
@@ -262,7 +265,11 @@ pub fn parse_repo_full_name(remote_url: &str) -> Option<String> {
 
 /// Run a git subcommand in `dir`, returning trimmed stdout on success.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").current_dir(dir).args(args).output().ok()?;
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -299,11 +306,7 @@ pub fn resolve_push(working_dir: &str) -> Option<ResolvedPush> {
         return None;
     }
 
-    Some(ResolvedPush {
-        repo,
-        branch,
-        shas,
-    })
+    Some(ResolvedPush { repo, branch, shas })
 }
 
 /// Dedup gate: returns `true` (report) only if the branch's HEAD SHA has moved
@@ -324,7 +327,10 @@ pub fn should_report(repo: &str, branch: &str, head_sha: &str) -> bool {
 /// Test-only: clear the dedup cache so tests don't bleed into each other.
 #[cfg(test)]
 pub fn reset_dedup_for_test() {
-    LAST_REPORTED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    LAST_REPORTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Full pipeline for one push observation: resolve git facts, apply dedup, and
@@ -451,10 +457,9 @@ mod tests {
     #[test]
     fn parse_line_ignores_user_and_malformed() {
         assert!(parse_line_for_pushes("not json").is_empty());
-        assert!(parse_line_for_pushes(
-            r#"{"type":"user","message":{"content":"git push"}}"#
-        )
-        .is_empty());
+        assert!(
+            parse_line_for_pushes(r#"{"type":"user","message":{"content":"git push"}}"#).is_empty()
+        );
         assert!(parse_line_for_pushes("").is_empty());
     }
 
@@ -473,7 +478,10 @@ mod tests {
             Some("qontinui/qontinui-web")
         );
         assert_eq!(parse_repo_full_name("not-a-url").as_deref(), None);
-        assert_eq!(parse_repo_full_name("https://host/onlyone").as_deref(), None);
+        assert_eq!(
+            parse_repo_full_name("https://host/onlyone").as_deref(),
+            None
+        );
     }
 
     #[test]

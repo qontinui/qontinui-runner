@@ -251,10 +251,7 @@ impl AiCoordRegistrar {
         if !crate::terminal::commit_report::report_enabled() {
             return;
         }
-        let shas: Vec<String> = shas
-            .into_iter()
-            .filter(|s| !s.trim().is_empty())
-            .collect();
+        let shas: Vec<String> = shas.into_iter().filter(|s| !s.trim().is_empty()).collect();
         if shas.is_empty() {
             return;
         }

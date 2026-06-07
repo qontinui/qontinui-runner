@@ -655,8 +655,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // comes from the X-Qontinui-Tenant-Id header (post_device_register
             // posture) — mirror `rebuild_create_body`'s machine.json resolve.
             let url = format!("{base}/coord/commits/report");
-            let mut rb =
-                crate::auth::attach_device_auth(inner.http.post(&url).json(&rec.payload));
+            let mut rb = crate::auth::attach_device_auth(inner.http.post(&url).json(&rec.payload));
             if let Some(tid) = crate::session::dual_write::resolve_active_tenant_id() {
                 rb = rb.header("X-Qontinui-Tenant-Id", tid.to_string());
             }
