@@ -781,6 +781,14 @@ fn resolve_runner_repo_path() -> Option<String> {
 /// one short line that PowerShell parses cleanly, and `cd` is unneeded
 /// because `TerminalManager::create` already starts the pty in
 /// `working_dir = Some(repo_path)`.
+/// Phase 2a — resolve the edit-intent repo slug for a worker / coordinator
+/// launch: the caller's explicit `intent_repo` when present, else the
+/// historical `"qontinui-runner"` default. Shared by `spawn_worker_session`
+/// and `launch_coordinator_session` so both default identically.
+fn resolve_intent_repo(intent_repo: Option<String>) -> String {
+    intent_repo.unwrap_or_else(|| "qontinui-runner".to_string())
+}
+
 fn build_coordinator_initial_command(
     runner_port: u16,
     plan_path: Option<&str>,
@@ -841,6 +849,50 @@ fn next_worker_title(manager: &TerminalManager) -> String {
     format!("Worker {}", max_n + 1)
 }
 
+/// Phase 2c — splice `--add-dir <sibling>` flags into a `claude` command
+/// line built for the interactive shell (the worker/coordinator launch
+/// strings). The flags MUST land BEFORE any trailing positional prompt arg
+/// (claude treats the last positional as the prompt), so they are inserted
+/// immediately after the `--dangerously-skip-permissions` flag that both
+/// builders emit. When that anchor is absent (defensive) or there are no
+/// sibling dirs, the command is returned unchanged.
+///
+/// Each path is single-quoted PowerShell-style (with `'` doubled) so paths
+/// with spaces survive the shell — matching the coordinator builder's own
+/// quoting of the prompt-file path.
+fn append_claude_add_dir(command: String, add_dir_args: &[String]) -> String {
+    if add_dir_args.is_empty() {
+        return command;
+    }
+    // `add_dir_args` is a flat [--add-dir, <path>, --add-dir, <path>, …]
+    // vec (from `claude_add_dir_args`). Re-quote each path value.
+    let mut rendered = String::new();
+    let mut it = add_dir_args.iter();
+    while let (Some(flag), Some(path)) = (it.next(), it.next()) {
+        let quoted = path.replace('\'', "''");
+        rendered.push(' ');
+        rendered.push_str(flag);
+        rendered.push_str(" '");
+        rendered.push_str(&quoted);
+        rendered.push('\'');
+    }
+
+    const ANCHOR: &str = "--dangerously-skip-permissions";
+    match command.find(ANCHOR) {
+        Some(idx) => {
+            let insert_at = idx + ANCHOR.len();
+            let mut out = String::with_capacity(command.len() + rendered.len());
+            out.push_str(&command[..insert_at]);
+            out.push_str(&rendered);
+            out.push_str(&command[insert_at..]);
+            out
+        }
+        // No known flag anchor — append at the end (the worker builder has no
+        // trailing positional, so this is still correct for that shape).
+        None => format!("{}{}", command, rendered),
+    }
+}
+
 /// Spawn the post-init shell-line write that `terminal_create` doesn't
 /// do for us when invoked via Tauri (the HTTP path at
 /// `mcp/terminals.rs:115-126` does this; we replicate it here so the
@@ -893,9 +945,15 @@ pub async fn launch_coordinator_session(
     mode: Option<String>,
     plan_path: Option<String>,
     title_hint: Option<String>,
+    // Phase 2a — which repo the coordinator session intends to edit. Tauri/
+    // serde pass a missing arg as `None`; defaulted to "qontinui-runner"
+    // below to preserve the historical hardcode. Lets a caller root the
+    // coordinator in a different repo's worktree without a code change.
+    intent_repo: Option<String>,
 ) -> Result<LaunchResult, String> {
     let app_state = require_app_state(&app_handle)?;
     let mode = mode.unwrap_or_else(|| "rust".to_string());
+    let intent_repo = resolve_intent_repo(intent_repo);
 
     // Reject unknown modes early — keeps the surface small and surfaces
     // typos in callers/tests immediately.
@@ -957,13 +1015,13 @@ pub async fn launch_coordinator_session(
         .inner()
         .clone();
 
-    // Phase 2 round 2 — Coordinator sessions always edit qontinui-runner
-    // (same class as `spawn_worker_session`). Route through the shared
-    // facade so flag-on lands in a worktree, flag-off keeps the primary
-    // checkout.
+    // Phase 2 round 2 — Coordinator sessions default to editing
+    // qontinui-runner (same class as `spawn_worker_session`) but honor an
+    // explicit `intent_repo` (Phase 2a). Route through the shared facade so
+    // flag-on lands in a worktree, flag-off keeps the primary checkout.
     let (effective_repo_path, isolated_ctx) =
         crate::agent_worktree::isolated_edit::acquire_for_terminal(
-            Some("qontinui-runner"),
+            Some(&intent_repo),
             "Coordinator session",
             Some(primary_repo_path.clone()),
             // No stable per-session id exists yet at spawn time — the new
@@ -975,6 +1033,25 @@ pub async fn launch_coordinator_session(
         .await;
     let repo_path = effective_repo_path.unwrap_or(primary_repo_path);
 
+    // Phase 2c — `QONTINUI_SESSION_WORKTREES` (agent-agnostic, all sibling
+    // worktrees) onto the PTY + `--add-dir <sibling>` appended to the claude
+    // command (convenience for claude). Derived from the live context before
+    // it is parked on the session. Single-repo coordinator → no siblings, so
+    // both are no-ops (env carries just the cwd repo, no `--add-dir`).
+    let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
+        ctx.session_worktrees_env_value().map(|v| {
+            vec![(
+                crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
+                v,
+            )]
+        })
+    });
+    let add_dir_args = isolated_ctx
+        .as_ref()
+        .map(|ctx| ctx.claude_add_dir_args())
+        .unwrap_or_default();
+    let initial_command = append_claude_add_dir(initial_command, &add_dir_args);
+
     let info = terminal_manager.create(
         Some(title),
         Some(repo_path),
@@ -983,6 +1060,7 @@ pub async fn launch_coordinator_session(
         None,
         app_handle.clone(),
         None,
+        extra_env,
     )?;
 
     if let Some(ctx) = isolated_ctx {
@@ -1038,6 +1116,11 @@ pub async fn stop_coordinator_session(app_handle: tauri::AppHandle) -> Result<bo
 pub async fn spawn_worker_session(
     app_handle: tauri::AppHandle,
     title_hint: Option<String>,
+    // Phase 2a — which repo the worker intends to edit. Tauri/serde pass a
+    // missing arg as `None`; defaulted to "qontinui-runner" below to
+    // preserve the historical hardcode. Lets a coordinator dispatch a
+    // worker rooted in a different repo's worktree without a code change.
+    intent_repo: Option<String>,
 ) -> Result<LaunchResult, String> {
     let app_state = require_app_state(&app_handle)?;
 
@@ -1052,11 +1135,12 @@ pub async fn spawn_worker_session(
     // distinct claim holders.
     let task_run_id = Uuid::new_v4().to_string();
 
-    // Phase 2 — worker sessions always intend to edit qontinui-runner
-    // (the Coordinator's `assign-task` dispatch targets runner code).
-    // Route through `acquire_for_terminal` so this path stays in
-    // lockstep with the other three terminal-spawn entry points.
-    let intent_repo = "qontinui-runner".to_string();
+    // Phase 2 — worker sessions default to editing qontinui-runner (the
+    // Coordinator's `assign-task` dispatch targets runner code) but honor an
+    // explicit `intent_repo` (Phase 2a). Route through `acquire_for_terminal`
+    // so this path stays in lockstep with the other terminal-spawn entry
+    // points.
+    let intent_repo = resolve_intent_repo(intent_repo);
     let (effective_repo_path, isolated_ctx) =
         crate::agent_worktree::isolated_edit::acquire_for_terminal(
             Some(&intent_repo),
@@ -1101,6 +1185,25 @@ pub async fn spawn_worker_session(
     // Coordinator's flag for the same reason).
     let initial_command = "claude --dangerously-skip-permissions".to_string();
 
+    // Phase 2c — `QONTINUI_SESSION_WORKTREES` (agent-agnostic, all sibling
+    // worktrees) onto the PTY + `--add-dir <sibling>` appended to the claude
+    // command (convenience for claude). Derived from the live context before
+    // it is parked on the session. Single-repo worker → no siblings, so both
+    // are no-ops (env carries just the cwd repo, no `--add-dir`).
+    let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
+        ctx.session_worktrees_env_value().map(|v| {
+            vec![(
+                crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
+                v,
+            )]
+        })
+    });
+    let add_dir_args = isolated_ctx
+        .as_ref()
+        .map(|ctx| ctx.claude_add_dir_args())
+        .unwrap_or_default();
+    let initial_command = append_claude_add_dir(initial_command, &add_dir_args);
+
     // Phase 4: pre-size the worker PTY to match the dominant existing
     // zone so worker briefs land on a grid the same size the user will
     // eventually see (rather than the 120×30 default, which produces
@@ -1119,6 +1222,7 @@ pub async fn spawn_worker_session(
         Some(dom_rows),
         app_handle.clone(),
         None,
+        extra_env,
     )?;
 
     // Phase 2 — park the isolated edit context on the TerminalSession
@@ -2086,5 +2190,82 @@ mod overlap_tests {
     fn disjoint_empty() {
         let r = compute_overlap(&["a/b.rs".to_string()], &["x/y.rs".to_string()]);
         assert!(r.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod launch_intent_tests {
+    use super::*;
+
+    // ---- Phase 2a: intent_repo defaulting ----
+
+    #[test]
+    fn intent_repo_defaults_to_runner_when_none() {
+        // Tauri/serde pass a missing arg as `None`; both launch commands must
+        // preserve the historical hardcode.
+        assert_eq!(resolve_intent_repo(None), "qontinui-runner");
+    }
+
+    #[test]
+    fn intent_repo_honors_explicit_slug() {
+        assert_eq!(
+            resolve_intent_repo(Some("qontinui-coord".to_string())),
+            "qontinui-coord"
+        );
+        // An empty string is honored verbatim (not coerced to the default) —
+        // callers pass `None`, not `Some("")`, to request the default.
+        assert_eq!(resolve_intent_repo(Some(String::new())), "");
+    }
+
+    // ---- Phase 2c: --add-dir splicing into the claude launch line ----
+
+    #[test]
+    fn append_add_dir_inserts_after_skip_permissions_flag() {
+        // Coordinator-shape command: a trailing positional prompt arg
+        // (`(Get-Content ...)`) must stay LAST — the --add-dir flags land
+        // immediately after `--dangerously-skip-permissions`.
+        let cmd =
+            "claude --dangerously-skip-permissions (Get-Content -Raw 'C:\\tmp\\p.md')".to_string();
+        let args = vec!["--add-dir".to_string(), "/abs/qontinui-coord".to_string()];
+        let out = append_claude_add_dir(cmd, &args);
+        assert_eq!(
+            out,
+            "claude --dangerously-skip-permissions --add-dir '/abs/qontinui-coord' \
+             (Get-Content -Raw 'C:\\tmp\\p.md')"
+        );
+    }
+
+    #[test]
+    fn append_add_dir_handles_multiple_siblings() {
+        let cmd = "claude --dangerously-skip-permissions".to_string();
+        let args = vec![
+            "--add-dir".to_string(),
+            "/abs/repo-a".to_string(),
+            "--add-dir".to_string(),
+            "/abs/repo-b".to_string(),
+        ];
+        let out = append_claude_add_dir(cmd, &args);
+        assert_eq!(
+            out,
+            "claude --dangerously-skip-permissions --add-dir '/abs/repo-a' --add-dir '/abs/repo-b'"
+        );
+    }
+
+    #[test]
+    fn append_add_dir_quotes_paths_with_spaces_and_quotes() {
+        let cmd = "claude --dangerously-skip-permissions".to_string();
+        let args = vec!["--add-dir".to_string(), "/has space/o'brien".to_string()];
+        let out = append_claude_add_dir(cmd, &args);
+        // Single-quoted, with the embedded `'` doubled (PowerShell escape).
+        assert_eq!(
+            out,
+            "claude --dangerously-skip-permissions --add-dir '/has space/o''brien'"
+        );
+    }
+
+    #[test]
+    fn append_add_dir_no_args_returns_command_unchanged() {
+        let cmd = "claude --dangerously-skip-permissions".to_string();
+        assert_eq!(append_claude_add_dir(cmd.clone(), &[]), cmd);
     }
 }

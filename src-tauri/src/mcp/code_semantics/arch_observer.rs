@@ -35,12 +35,10 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::arch_classify::{self, LayerAssignment, LAYERS};
 use super::module_graph::{self, ModuleSummary};
 use super::{code_graph_api, scope_project_dir, Envelope};
 use crate::mcp::types::ApiState;
-
-/// The architectural-layer taxonomy (UA's architecture-analyzer set + `unknown`).
-const LAYERS: &[&str] = &["api", "service", "data", "ui", "utility", "unknown"];
 
 /// Observer name + provenance for the kernel envelope.
 const OBSERVER: &str = "arch";
@@ -103,123 +101,14 @@ async fn arch_layers(
     // Cap to the highest-signal modules (most exports first); coverage reflects
     // anything omitted.
     let capped: Vec<ModuleSummary> = summaries.into_iter().take(max_modules).collect();
-    let prompt = build_prompt(&capped);
 
-    // The single LLM call (forced Claude-CLI, no API key); honest degrade on
-    // failure → zero classified (coverage 0), never a confident false answer.
-    let parsed = match module_graph::run_cli_structured(prompt).await {
-        Some(output) => parse_layers(&output),
-        None => Vec::new(),
-    };
+    // The single LLM call (forced Claude-CLI, no API key) lives behind the shared
+    // classify seam; honest degrade on failure → zero classified (coverage 0),
+    // never a confident false answer.
+    let parsed = arch_classify::classify_layers(&capped).await;
 
     cache_put(fingerprint, parsed.clone());
     Json(make_envelope(q, &scope.key, &parsed, total_modules, false))
-}
-
-// ===========================================================================
-// Prompt construction (pure)
-// ===========================================================================
-
-/// Build the classification prompt: the arch-layer instruction header + the
-/// shared module-list block. The model sees only structure (no source) and must
-/// return strict JSON.
-fn build_prompt(modules: &[ModuleSummary]) -> String {
-    let mut s = String::from(
-        "You are classifying the ARCHITECTURAL LAYER of each MODULE in a codebase.\n\
-         A module is a directory. For each module you are given its files, its exported\n\
-         symbols, the other in-repo modules it imports from, and the external packages\n\
-         it uses. You do NOT see source code — classify from this structure alone.\n\n\
-         Assign each module EXACTLY ONE layer from this taxonomy:\n\
-         - api: HTTP/RPC route handlers, controllers, transport/request-response edges.\n\
-         - service: business logic, orchestration, use-cases, domain operations.\n\
-         - data: persistence, models, repositories, DB/ORM/migrations, schema.\n\
-         - ui: user-interface components, views, widgets, frontend rendering.\n\
-         - utility: cross-cutting helpers, shared types, config, logging, pure utils.\n\
-         - unknown: the structure is insufficient to decide.\n\n\
-         Return ONLY a JSON object, no prose, no code fences:\n\
-         {\"modules\":[{\"module\":\"<exact module key>\",\"layer\":\"<taxonomy value>\",\"rationale\":\"<=12 words\"}]}\n\n\
-         Modules:\n",
-    );
-    s.push_str(&module_graph::render_modules(modules));
-    s
-}
-
-// ===========================================================================
-// Response parsing (pure, tolerant)
-// ===========================================================================
-
-/// One module's layer assignment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LayerAssignment {
-    module: String,
-    layer: String,
-    rationale: String,
-}
-
-/// Parse `{"modules":[{module,layer,rationale}]}` (or a bare array) out of the
-/// model's output, tolerant of surrounding prose / ```json fences. An unknown or
-/// missing layer normalizes to `"unknown"`; entries without a `module` are
-/// dropped. Returns an empty vec on any failure (the honest "I couldn't read it"
-/// signal — the caller maps that to coverage 0, never a confident false answer).
-fn parse_layers(output: &str) -> Vec<LayerAssignment> {
-    let json_str = match module_graph::extract_json(output) {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
-    let value: Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    // Accept either `{"modules":[...]}` or a bare `[...]`.
-    let arr = match &value {
-        Value::Object(map) => map.get("modules").and_then(|v| v.as_array()).cloned(),
-        Value::Array(a) => Some(a.clone()),
-        _ => None,
-    };
-    let arr = match arr {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
-
-    let mut out = Vec::new();
-    for entry in arr {
-        let module = entry
-            .get("module")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string());
-        let module = match module {
-            Some(m) if !m.is_empty() => m,
-            _ => continue,
-        };
-        let layer = entry
-            .get("layer")
-            .and_then(|v| v.as_str())
-            .map(normalize_layer)
-            .unwrap_or_else(|| "unknown".to_string());
-        let rationale = entry
-            .get("rationale")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        out.push(LayerAssignment {
-            module,
-            layer,
-            rationale,
-        });
-    }
-    out
-}
-
-/// Normalize a model-supplied layer string to the taxonomy; anything off-taxonomy
-/// (or empty) becomes `"unknown"` rather than leaking an invented label.
-fn normalize_layer(raw: &str) -> String {
-    let l = raw.trim().to_lowercase();
-    if LAYERS.contains(&l.as_str()) {
-        l
-    } else {
-        "unknown".to_string()
-    }
 }
 
 // ===========================================================================
@@ -317,71 +206,6 @@ fn cache_put(fp: u64, assignments: Vec<LayerAssignment>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn prompt_contains_modules_taxonomy_and_json_instruction() {
-        let mods = vec![ModuleSummary {
-            module: "src/api".into(),
-            files: vec!["routes.ts".into()],
-            exports: vec!["registerRoutes".into()],
-            internal_deps: vec!["src/services".into()],
-            external_pkgs: vec!["express".into()],
-            export_count: 1,
-        }];
-        let p = build_prompt(&mods);
-        assert!(p.contains("src/api"));
-        assert!(p.contains("registerRoutes"));
-        assert!(p.contains("imports-from: src/services"));
-        assert!(p.contains("external: express"));
-        // taxonomy + strict-JSON instruction present
-        assert!(p.contains("service:"));
-        assert!(p.contains("\"modules\""));
-    }
-
-    #[test]
-    fn parse_clean_json_object() {
-        let out = r#"{"modules":[{"module":"src/api","layer":"api","rationale":"route handlers"},{"module":"src/db","layer":"data","rationale":"models"}]}"#;
-        let parsed = parse_layers(out);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].module, "src/api");
-        assert_eq!(parsed[0].layer, "api");
-        assert_eq!(parsed[1].layer, "data");
-    }
-
-    #[test]
-    fn parse_tolerates_prose_and_code_fences() {
-        let out = "Sure — here is the classification:\n```json\n{\"modules\":[{\"module\":\"src/ui\",\"layer\":\"UI\",\"rationale\":\"views\"}]}\n```\nLet me know if you need more.";
-        let parsed = parse_layers(out);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].module, "src/ui");
-        // layer is normalized to lowercase taxonomy.
-        assert_eq!(parsed[0].layer, "ui");
-    }
-
-    #[test]
-    fn parse_normalizes_offtaxonomy_layer_to_unknown() {
-        let out = r#"{"modules":[{"module":"src/x","layer":"controller","rationale":"?"}]}"#;
-        let parsed = parse_layers(out);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].layer, "unknown");
-    }
-
-    #[test]
-    fn parse_accepts_bare_array_and_drops_module_less_entries() {
-        let out = r#"[{"module":"src/a","layer":"service"},{"layer":"data"}]"#;
-        let parsed = parse_layers(out);
-        assert_eq!(parsed.len(), 1, "entry without a module is dropped");
-        assert_eq!(parsed[0].module, "src/a");
-        // missing rationale defaults to empty.
-        assert_eq!(parsed[0].rationale, "");
-    }
-
-    #[test]
-    fn parse_garbage_returns_empty() {
-        assert!(parse_layers("I cannot help with that.").is_empty());
-        assert!(parse_layers("").is_empty());
-        assert!(parse_layers("{not json").is_empty());
-    }
 
     #[test]
     fn assemble_coverage_and_kernel_discipline() {

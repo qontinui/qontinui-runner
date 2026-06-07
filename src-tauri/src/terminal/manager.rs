@@ -35,6 +35,11 @@ impl TerminalManager {
     /// the PTY child (the gate-continuation terminal branch launches `claude`
     /// this way); `None` keeps the interactive-shell behavior every
     /// operator-opened terminal uses.
+    ///
+    /// `extra_env` (Phase 2c) is an optional set of `(key, value)` env vars
+    /// exported onto the PTY child in addition to the built-in runner vars —
+    /// the launch surfaces use it to carry `QONTINUI_SESSION_WORKTREES` (the
+    /// agent-agnostic pointer to every materialized sibling worktree).
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
@@ -45,6 +50,7 @@ impl TerminalManager {
         rows: Option<u16>,
         app_handle: AppHandle,
         command: Option<Vec<String>>,
+        extra_env: Option<Vec<(String, String)>>,
     ) -> Result<TerminalInfo, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
@@ -70,6 +76,7 @@ impl TerminalManager {
             app_handle,
             self.interceptor.clone(),
             command,
+            extra_env,
         )?;
 
         let info = session.info();

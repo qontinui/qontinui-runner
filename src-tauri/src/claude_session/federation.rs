@@ -36,6 +36,91 @@ use qontinui_runner_lib::observable_bridge::{ReconcileReport, SessionContext};
 /// M pulled, K failed" banner described in plan Phase 5.
 pub const RECONCILE_EVENT: &str = "memory-federation:reconcile";
 
+/// Tauri event channel for federation-skipped broadcasts. Mirrors
+/// [`RECONCILE_EVENT`]: when federation is skipped for a session the
+/// spawn site emits a one-line `{ session_id, reason, detail }` payload
+/// here so the React frontend can surface a "federation: skipped
+/// (<reason>)" notice instead of the old silent warn-only behavior.
+pub const SKIP_EVENT: &str = "memory-federation:skipped";
+
+/// Why memory federation was skipped for a session. Returned by
+/// [`build_federation_ctx`] (as the `Err` arm) so the spawn site can
+/// surface the reason to the UI via [`SKIP_EVENT`] instead of silently
+/// dropping a bare `None`. The `disabled` (kill-switch) case is not part
+/// of this enum because it short-circuits before `build_federation_ctx`
+/// is ever called — the call site emits `reason = "disabled"` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FederationSkipReason {
+    /// No `paired_user.json::tenant_id` and no claim in the cached
+    /// device-token JWT — the runner isn't paired to a tenant.
+    TenantUnresolved,
+    /// `~/.qontinui/machine.json` is missing or unparseable.
+    DeviceIdMissing,
+    /// No effective Claude config dir could be resolved.
+    NoConfigDir,
+}
+
+impl FederationSkipReason {
+    /// Stable machine-readable reason token, mirrored by the frontend
+    /// skip-notice copy. Kept in sync with `MemoryFederationBanner.tsx`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FederationSkipReason::TenantUnresolved => "tenant-unresolved",
+            FederationSkipReason::DeviceIdMissing => "device-id-missing",
+            FederationSkipReason::NoConfigDir => "no-config-dir",
+        }
+    }
+
+    /// Short human-readable explanation for the UI skip notice. Kept
+    /// concise (one short clause) since the frontend renders it inline.
+    pub fn detail(&self) -> &'static str {
+        match self {
+            FederationSkipReason::TenantUnresolved => "Runner not paired to a tenant.",
+            FederationSkipReason::DeviceIdMissing => {
+                "Device identity (~/.qontinui/machine.json) is missing."
+            }
+            FederationSkipReason::NoConfigDir => "No effective Claude config directory.",
+        }
+    }
+}
+
+impl std::fmt::Display for FederationSkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Tauri event payload for [`SKIP_EVENT`]. `reason` is a stable token
+/// (see [`FederationSkipReason::as_str`] plus the `"disabled"`
+/// kill-switch case); `detail` is a short human-readable explanation.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkipPayload {
+    pub session_id: String,
+    pub reason: String,
+    pub detail: String,
+}
+
+/// Emit a [`SKIP_EVENT`] for `session_id` with the given reason token and
+/// detail. Best-effort: an emit failure is logged at `debug` and never
+/// propagated, mirroring [`emit_federation_report`]'s emit handling. The
+/// caller is responsible for the accompanying `warn!` (preserved at each
+/// skip site).
+pub fn emit_federation_skip(
+    app_handle: &tauri::AppHandle,
+    session_id: &str,
+    reason: &str,
+    detail: &str,
+) {
+    let payload = SkipPayload {
+        session_id: session_id.to_string(),
+        reason: reason.to_string(),
+        detail: detail.to_string(),
+    };
+    if let Err(e) = app_handle.emit(SKIP_EVENT, &payload) {
+        debug!("claude_session::federation: emit {SKIP_EVENT} failed: {e} (non-fatal)");
+    }
+}
+
 /// Cross-account memory federation kill switch — reads from
 /// `AiSettings::memory_federation_enabled`. Default ON; the field is
 /// `#[serde(default = "default_memory_federation_enabled")]` so the
@@ -65,8 +150,9 @@ pub fn session_uuid(session_id: &str) -> Uuid {
 }
 
 /// Build a `SessionContext` for the about-to-spawn Claude subprocess.
-/// Returns `None` (with a warn log) when any required identity field is
-/// missing — that signals the spawn site to skip federation.
+/// Returns `Err(FederationSkipReason)` (with a warn log) when any required
+/// identity field is missing — that signals the spawn site to skip
+/// federation (and surface the reason to the UI via [`SKIP_EVENT`]).
 ///
 /// Resolution sources:
 ///
@@ -83,7 +169,7 @@ pub fn build_federation_ctx(
     session_id: &str,
     working_dir: &str,
     cli_settings: &ClaudeCliSettings,
-) -> Option<SessionContext> {
+) -> Result<SessionContext, FederationSkipReason> {
     let tenant_id = match resolve_tenant_id() {
         Some(t) => t,
         None => {
@@ -92,7 +178,7 @@ pub fn build_federation_ctx(
                  (no paired_user.json::tenant_id, no claim in cached device-token JWT); \
                  skipping memory federation for session {session_id}"
             );
-            return None;
+            return Err(FederationSkipReason::TenantUnresolved);
         }
     };
 
@@ -103,7 +189,7 @@ pub fn build_federation_ctx(
                 "claude_session::federation: ~/.qontinui/machine.json missing or unparseable; \
                  skipping memory federation for session {session_id}"
             );
-            return None;
+            return Err(FederationSkipReason::DeviceIdMissing);
         }
     };
 
@@ -115,14 +201,14 @@ pub fn build_federation_ctx(
                 "claude_session::federation: no effective claude config_dir; \
                  skipping memory federation for session {session_id}"
             );
-            return None;
+            return Err(FederationSkipReason::NoConfigDir);
         }
     };
 
     let memory_dir = derive_memory_dir(&config_dir_str, working_dir);
     let account_name = derive_account_name(&config_dir_str);
 
-    Some(SessionContext {
+    Ok(SessionContext {
         tenant_id,
         device_id,
         account_name,

@@ -263,15 +263,34 @@ impl ClaudeSession {
         // identity / toggle short-circuits return `None` so federation
         // never blocks the spawn.
         let federation_ctx = if crate::claude_session::federation::federation_enabled() {
-            super::federation::build_federation_ctx(
+            match super::federation::build_federation_ctx(
                 session_id,
                 working_dir,
                 &ai_settings.claude_cli,
-            )
+            ) {
+                Ok(ctx) => Some(ctx),
+                Err(reason) => {
+                    // Surface the skip reason to the UI (warn! already
+                    // logged inside build_federation_ctx); proceed locally.
+                    super::federation::emit_federation_skip(
+                        app_handle,
+                        session_id,
+                        reason.as_str(),
+                        reason.detail(),
+                    );
+                    None
+                }
+            }
         } else {
             debug!(
                 "memory federation disabled via settings; skipping pull/watch for session {}",
                 session_id
+            );
+            super::federation::emit_federation_skip(
+                app_handle,
+                session_id,
+                "disabled",
+                "Memory federation disabled via settings kill-switch.",
             );
             None
         };

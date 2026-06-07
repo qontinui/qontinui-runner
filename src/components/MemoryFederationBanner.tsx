@@ -14,6 +14,12 @@
  * across many short sessions. Reports with `report.failed > 0` are
  * persistent and styled with a destructive border so the operator
  * notices.
+ *
+ * Also listens for `memory-federation:skipped` (emitted from
+ * `claude_session::federation::emit_federation_skip` whenever federation
+ * is skipped for a session — missing identity or the settings
+ * kill-switch). These render a single-line informational notice that
+ * auto-dismisses, so the previously-silent skip becomes visible.
  */
 
 import { useEffect, useState } from "react";
@@ -32,50 +38,97 @@ interface ReconcileEvent {
   report: ReconcileReport;
 }
 
-interface ActiveNotice extends ReconcileEvent {
-  id: number;
-  receivedAt: number;
+interface SkipEvent {
+  session_id: string;
+  reason: string;
+  detail: string;
 }
 
+type ActiveNotice =
+  | ({ kind: "reconcile"; id: number; receivedAt: number } & ReconcileEvent)
+  | ({ kind: "skip"; id: number; receivedAt: number } & SkipEvent);
+
 const SUCCESS_TTL_MS = 6000;
+const SKIP_TTL_MS = 8000;
+
+/** Map a stable skip-reason token to a concise human label. Kept in sync
+ *  with `FederationSkipReason::as_str` (Rust) plus the `"disabled"`
+ *  kill-switch case. */
+function skipReasonLabel(reason: string): string {
+  switch (reason) {
+    case "tenant-unresolved":
+      return "not paired (no tenant id)";
+    case "device-id-missing":
+      return "no device identity";
+    case "no-config-dir":
+      return "no Claude config dir";
+    case "disabled":
+      return "disabled in settings";
+    default:
+      return reason;
+  }
+}
 
 export function MemoryFederationBanner() {
   const [notices, setNotices] = useState<ActiveNotice[]>([]);
 
   useEffect(() => {
-    let unlisten: UnlistenFn | undefined;
+    const unlisteners: UnlistenFn[] = [];
     let counter = 0;
     (async () => {
       try {
-        unlisten = await listen<ReconcileEvent>(
-          "memory-federation:reconcile",
-          (event) => {
+        unlisteners.push(
+          await listen<ReconcileEvent>(
+            "memory-federation:reconcile",
+            (event) => {
+              counter += 1;
+              const notice: ActiveNotice = {
+                kind: "reconcile",
+                ...event.payload,
+                id: counter,
+                receivedAt: Date.now(),
+              };
+              setNotices((prev) => [...prev, notice]);
+            },
+          ),
+        );
+        unlisteners.push(
+          await listen<SkipEvent>("memory-federation:skipped", (event) => {
             counter += 1;
             const notice: ActiveNotice = {
+              kind: "skip",
               ...event.payload,
               id: counter,
               receivedAt: Date.now(),
             };
             setNotices((prev) => [...prev, notice]);
-          },
+          }),
         );
       } catch (e) {
         console.error("MemoryFederationBanner: listen failed", e);
       }
     })();
     return () => {
-      if (unlisten) unlisten();
+      for (const unlisten of unlisteners) unlisten();
     };
   }, []);
 
   useEffect(() => {
     if (notices.length === 0) return;
-    const earliestSuccess = notices.find((n) => n.report.failed === 0);
-    if (!earliestSuccess) return;
-    const elapsed = Date.now() - earliestSuccess.receivedAt;
-    const remaining = Math.max(0, SUCCESS_TTL_MS - elapsed);
+    // Auto-dismiss the earliest transient notice: reconcile successes
+    // (no failures) and all skip notices are informational and shouldn't
+    // accumulate. Reconcile reports with failures stay until dismissed.
+    const earliestTransient = notices.find(
+      (n) =>
+        n.kind === "skip" || (n.kind === "reconcile" && n.report.failed === 0),
+    );
+    if (!earliestTransient) return;
+    const ttl =
+      earliestTransient.kind === "skip" ? SKIP_TTL_MS : SUCCESS_TTL_MS;
+    const elapsed = Date.now() - earliestTransient.receivedAt;
+    const remaining = Math.max(0, ttl - elapsed);
     const timeout = window.setTimeout(() => {
-      setNotices((prev) => prev.filter((n) => n.id !== earliestSuccess.id));
+      setNotices((prev) => prev.filter((n) => n.id !== earliestTransient.id));
     }, remaining);
     return () => window.clearTimeout(timeout);
   }, [notices]);
@@ -93,6 +146,35 @@ export function MemoryFederationBanner() {
       style={containerStyle}
     >
       {notices.map((n) => {
+        if (n.kind === "skip") {
+          return (
+            <div
+              key={n.id}
+              role="status"
+              aria-live="polite"
+              style={bannerStyleSuccess}
+            >
+              <div style={{ flex: 1 }}>
+                <p style={titleStyleSuccess}>Memory federation</p>
+                <p style={messageStyle}>
+                  skipped — {skipReasonLabel(n.reason)}
+                  {" — session "}
+                  <code style={codeStyle}>{n.session_id.slice(0, 8)}</code>
+                </p>
+              </div>
+              <div style={actionsColumnStyle}>
+                <button
+                  type="button"
+                  onClick={() => dismiss(n.id)}
+                  style={dismissBtn}
+                  aria-label="Dismiss"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          );
+        }
         const hasFailures = n.report.failed > 0;
         return (
           <div
