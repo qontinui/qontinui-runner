@@ -1970,6 +1970,13 @@ pub async fn start_server(
                 // Store the actual bound port in AppState
                 api_ready_flag.api_port.store(try_port, Ordering::Relaxed);
 
+                // Mirror the bound port into the install-interception shim's
+                // process-global so the terminal env-seam (which has no
+                // `app_state`) injects the CORRECT loopback port for
+                // secondary/temp runners — plan §6's #1 live-verification
+                // footgun. Set HERE, the same place app_state.api_port lands.
+                crate::install_effects_producer::intercept::set_bound_port(try_port);
+
                 // Port stored in api_ready_flag.api_port above; PG queries accept runner_port as parameter.
 
                 // Signal that the API is ready for requests

@@ -47,6 +47,7 @@
 mod coord_client;
 mod dry_run_invoke;
 mod importer_scan;
+pub mod intercept;
 mod observe;
 pub mod parsers;
 mod pm;
@@ -69,11 +70,12 @@ use uuid::Uuid;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use coord_client::{CoordError, CoordInstallClient};
+use intercept::precontext::{self, PreContext};
 use pm::PmError;
 use registry_creds::{RegistryCredentialStore, RegistryEnv, RegistryTokenLookup};
 use types::{
-    DeclareRequest, FsObservationsRequest, GateOutcome, InstallOutcome, PackageManager,
-    PackageSpec, RunRequest, RunResponse, VerifyOutcome, VerifyRequest,
+    DeclareRequest, FsObservationsRequest, GateOutcome, InstallOutcome, ObserveVerifyRequest,
+    PackageManager, PackageSpec, RunMode, RunRequest, RunResponse, VerifyOutcome, VerifyRequest,
 };
 
 /// Bounded wall-clock budget for the install subprocess. A dependency install
@@ -113,6 +115,10 @@ pub struct RunContext {
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/install-effects/run", post(post_run))
+        // Interception POST-call (plan §3 A3): the shim calls this after it runs
+        // the real install, to close the declare→observe→verify loop for an
+        // install that was declared+gated via `mode:"intercept"` on /run.
+        .route("/install-effects/observe-verify", post(post_observe_verify))
         // Phase 4: private-registry credential CRUD. Mounted alongside the
         // Phase-1 run route so a single `install_effects_producer::routes()`
         // merge in `mcp_api.rs` covers the whole producer surface.
@@ -141,6 +147,120 @@ async fn post_run(
         .await
         .map(Json)
         .map_err(|e| e.into_response())
+}
+
+/// `POST /install-effects/observe-verify` — the interception POST-call (plan §3
+/// A3). Looks up + removes the stashed [`PreContext`] for the shim's
+/// `correlation_id`, synthesizes an [`InstallOutcome`] from the reported exit
+/// code, and runs the SHARED [`observe_and_verify`] body against the now-mutated
+/// worktree. An expired/missing id degrades to a best-effort verify with no
+/// pre-shas (honest Partial) — never an error to the shim.
+async fn post_observe_verify(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<ObserveVerifyRequest>,
+) -> Result<Json<ApiResponse<VerifyOutcome>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let base = coord_base().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("coord URL not configured: {e}"))),
+        )
+    })?;
+    let loopback_base = crate::mcp::types::get_self_base_url(&state.app_state);
+    let store = RegistryCredentialStore;
+    observe_verify_with_base(req, &base, &loopback_base, &store)
+        .await
+        .map(Json)
+        .map_err(|e| e.into_response())
+}
+
+/// Orchestration body for the interception POST-call, coord-base + loopback +
+/// cred-store injected (tests pass a mock for each). Reconstructs a
+/// [`RunContext`] from the stashed [`PreContext`] (or an honest pre-sha-less
+/// degraded context when the id expired/missing) and shares
+/// [`observe_and_verify`] with the `Full` route — no duplicated observe logic.
+async fn observe_verify_with_base<L: RegistryTokenLookup + ?Sized>(
+    req: ObserveVerifyRequest,
+    coord_base: &str,
+    loopback_base: &str,
+    cred_store: &L,
+) -> Result<ApiResponse<VerifyOutcome>, RunError> {
+    let correlation_id = req.correlation_id;
+    let pre = precontext::take(&correlation_id);
+
+    // Resolve the context: a found PreContext carries the pre-shas + predicted
+    // echoes from the pre-call; a missing/expired one degrades to an honest
+    // empty context (no pre-shas ⇒ coord composes a Partial, never an error).
+    let (ctx, repo_path) = match pre {
+        Some(p) => {
+            let repo_path = std::path::PathBuf::from(&p.repo_path);
+            (
+                RunContext {
+                    correlation_id,
+                    repo: p.repo,
+                    package_manager: p.package_manager,
+                    escalation_overridden: p.escalation_overridden,
+                    affected_files: p.affected_files,
+                    predicted_pinned: p.predicted_pinned,
+                    predicted_cves: p.predicted_cves,
+                    pre_shas: p.pre_shas,
+                },
+                repo_path,
+            )
+        }
+        None => {
+            warn!(
+                "install-effects: observe-verify for unknown/expired correlation_id={correlation_id} \
+                 — degrading to a best-effort verify with no pre-shas (honest Partial)"
+            );
+            // We have no repo_path for a degraded context; coord still records a
+            // verify keyed on the correlation_id (the FS push is skipped because
+            // build_fs_observations over an empty/unknown path yields nothing).
+            (
+                RunContext {
+                    correlation_id,
+                    repo: String::new(),
+                    package_manager: PackageManager::Npm,
+                    escalation_overridden: false,
+                    affected_files: Vec::new(),
+                    predicted_pinned: std::collections::BTreeMap::new(),
+                    predicted_cves: Vec::new(),
+                    pre_shas: std::collections::BTreeMap::new(),
+                },
+                std::path::PathBuf::new(),
+            )
+        }
+    };
+
+    // Synthesize the InstallOutcome from the shim-reported exit code. The shim
+    // already ran the real tool; we don't have its stdout/stderr (it streamed to
+    // the agent's TTY) — only the exit code, which is the load-bearing signal.
+    let exit_code = req.install_exit_code;
+    let success = exit_code == Some(0);
+    let outcome = InstallOutcome {
+        command: vec![format!("<intercepted:{}>", ctx.package_manager.as_str())],
+        exit_code,
+        success,
+        timed_out: false,
+        stdout: String::new(),
+        stderr: String::new(),
+    };
+
+    let client = CoordInstallClient::new(coord_base.to_string())?;
+    // No registry creds are injected for the observe probes here — interception
+    // observes the agent's already-authed install; the agent's shell owns its
+    // registry config (plan §4 Phase-4 note). An empty env is correct.
+    let registry_env = RegistryEnv::default();
+    let verify = observe_and_verify(
+        &client,
+        &ctx,
+        &repo_path,
+        loopback_base,
+        &outcome,
+        &registry_env,
+    )
+    .await?;
+
+    Ok(ApiResponse::success(verify))
 }
 
 /// Resolve the coord base URL (reuses the runner's existing source-of-truth
@@ -320,6 +440,50 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
              but override_escalation=true — proceeding; risks: {}",
             risk_factors.join("; ")
         );
+    }
+
+    // ---- INTERCEPT mode (plan §3 A2/A3) -------------------------------------
+    // The shim's pre-call: declare + predict-and-check already ran above. We do
+    // NOT run the install (the agent's own shell does). Capture pre-shas now
+    // (worktree still un-mutated), stash the PreContext under the correlation_id
+    // for the matching `/install-effects/observe-verify` post-call, and return
+    // the gate verdict so the shim can branch (observe mode always proceeds;
+    // gate mode — Phase 3 — honors Escalate). This branch is BEFORE the
+    // dry_run_only/blocked early-return so an intercept run ALWAYS hands back a
+    // correlation_id regardless of the gate (the shim, not the producer, owns
+    // the block decision).
+    if req.mode == RunMode::Intercept {
+        let pre_shas = observe::capture_pre_shas(pm, repo_path);
+        precontext::put(
+            correlation_id,
+            PreContext {
+                repo: repo.clone(),
+                repo_path: req.repo_path.clone(),
+                package_manager: pm,
+                escalation_overridden: ctx.escalation_overridden,
+                affected_files: ctx.affected_files.clone(),
+                predicted_pinned: ctx.predicted_pinned.clone(),
+                predicted_cves: ctx.predicted_cves.clone(),
+                pre_shas,
+            },
+        );
+        info!(
+            "install-effects: INTERCEPT pre-call (corr={correlation_id}, repo={repo}, pm={}) \
+             — declared+gated, install deferred to the agent shell; gate={gate:?}",
+            pm.as_str()
+        );
+        return Ok(ApiResponse::success(RunResponse {
+            correlation_id,
+            repo,
+            package_manager: pm.as_str().to_string(),
+            gate,
+            risk_factors,
+            escalation_overridden: ctx.escalation_overridden,
+            install: None,
+            dry_run_only: false,
+            resolution: pac.resolution,
+            verify: None,
+        }));
     }
 
     if req.dry_run_only || blocked_by_escalation {
@@ -921,6 +1085,7 @@ mod tests {
             override_escalation,
             dry_run_only: true,
             registry_env: vec![],
+            mode: RunMode::Full,
         }
     }
 
@@ -978,6 +1143,7 @@ mod tests {
             override_escalation: true,
             dry_run_only: false,
             registry_env: vec![],
+            mode: RunMode::Full,
         };
         let resp = run(req, &base).unwrap();
         let data = resp.data.unwrap();
@@ -1022,6 +1188,7 @@ mod tests {
             override_escalation: false,
             dry_run_only: false,
             registry_env: vec![],
+            mode: RunMode::Full,
         };
         let resp = run(req, &base).unwrap();
         let data = resp.data.unwrap();
@@ -1055,6 +1222,7 @@ mod tests {
             override_escalation: false,
             dry_run_only: false,
             registry_env: vec![],
+            mode: RunMode::Full,
         }
     }
 
@@ -1396,6 +1564,7 @@ mod tests {
             override_escalation: false,
             dry_run_only: false,
             registry_env: vec![],
+            mode: RunMode::Full,
         };
         let resp = run(req, &base).unwrap();
         let data = resp.data.unwrap();
@@ -1407,5 +1576,287 @@ mod tests {
         if data.install.as_ref().unwrap().success {
             assert_eq!(body["observed_pinned"]["left-pad"], "1.3.0");
         }
+    }
+
+    // ===================================================================
+    // Interception — `mode:"intercept"` pre-call + `/observe-verify` post
+    // ===================================================================
+
+    /// Build an intercept-mode pre-call request for a real `repo_path`.
+    fn intercept_req(repo_path: &str, packages: Vec<&str>) -> RunRequest {
+        RunRequest {
+            repo_path: repo_path.to_string(),
+            package_manager: Some("npm".to_string()),
+            packages: packages
+                .into_iter()
+                .map(|n| types::PackageSpecInput {
+                    name: n.to_string(),
+                    version_req: None,
+                })
+                .collect(),
+            dev: false,
+            override_escalation: false,
+            dry_run_only: false,
+            registry_env: vec![],
+            mode: RunMode::Intercept,
+        }
+    }
+
+    /// Drive the observe-verify post-call body on a current-thread runtime.
+    fn observe_verify(
+        req: ObserveVerifyRequest,
+        base: &str,
+        loopback: &str,
+    ) -> Result<ApiResponse<VerifyOutcome>, RunError> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(observe_verify_with_base(
+            req,
+            base,
+            loopback,
+            &FakeCredStore::empty(),
+        ))
+    }
+
+    #[test]
+    fn intercept_mode_returns_correlation_id_and_runs_no_subprocess() {
+        // A package.json so npm autodetect/pre-sha capture has something to read.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("package.json"),
+            "{\"name\":\"x\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
+        let resp = run(
+            intercept_req(&d.path().display().to_string(), vec!["left-pad"]),
+            &base,
+        )
+        .unwrap();
+        let data = resp.data.unwrap();
+
+        // Declared + gated, but NO install ran and NO verify fired on the pre-call.
+        assert_eq!(data.gate, GateOutcome::Proceed);
+        assert!(
+            data.install.is_none(),
+            "intercept pre-call runs no subprocess"
+        );
+        assert!(data.verify.is_none(), "verify is deferred to the post-call");
+        assert_eq!(hits.declare.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.predict.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            hits.verify.load(Ordering::SeqCst),
+            0,
+            "no verify on pre-call"
+        );
+
+        // A PreContext was stashed under the returned correlation_id.
+        let ctx = precontext::take(&data.correlation_id).expect("PreContext stashed");
+        assert_eq!(ctx.package_manager, PackageManager::Npm);
+        // pre_shas captured package.json's blob (it existed pre-install).
+        assert!(
+            ctx.pre_shas.get("package.json").map(|o| o.is_some()) == Some(true),
+            "pre-sha for package.json should be captured: {:?}",
+            ctx.pre_shas
+        );
+    }
+
+    #[test]
+    fn observe_verify_with_stashed_id_completes_verify_with_pre_sha_continuity() {
+        let d = tempfile::tempdir().unwrap();
+        // A lockfile so the post-call's observe_pinned + FS push have content.
+        std::fs::write(
+            d.path().join("package.json"),
+            "{\"name\":\"x\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
+
+        // Pre-call.
+        let resp = run(
+            intercept_req(&d.path().display().to_string(), vec!["left-pad"]),
+            &base,
+        )
+        .unwrap();
+        let corr = resp.data.unwrap().correlation_id;
+
+        // Simulate the shim having run the real install: write a lockfile so the
+        // post-sha differs from the (absent) pre-sha.
+        std::fs::write(
+            d.path().join("package-lock.json"),
+            "{\"name\":\"x\",\"lockfileVersion\":3}",
+        )
+        .unwrap();
+
+        // Post-call.
+        let vresp = observe_verify(
+            ObserveVerifyRequest {
+                correlation_id: corr,
+                install_exit_code: Some(0),
+            },
+            &base,
+            DEAD_LOOPBACK,
+        )
+        .unwrap();
+        let verify = vresp.data.unwrap();
+        assert_eq!(verify.composed_outcome, "confirmed");
+        assert_eq!(verify.correlation_id, Some(corr));
+        assert_eq!(
+            hits.verify.load(Ordering::SeqCst),
+            1,
+            "post-call fires verify"
+        );
+
+        // The verify body carries the SAME correlation_id as the pre-call (pre↔
+        // post continuity) and the touched paths from the worktree.
+        let body = hits.verify_json();
+        assert_eq!(body["correlation_id"].as_str().unwrap(), corr.to_string());
+        let paths: Vec<&str> = body["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert!(
+            paths.contains(&"package-lock.json") || paths.contains(&"package.json"),
+            "touched paths from the mutated worktree: {paths:?}"
+        );
+
+        // The id was consumed (a second post-call finds nothing).
+        assert!(precontext::take(&corr).is_none());
+    }
+
+    #[test]
+    fn observe_verify_unknown_id_degrades_to_partial_not_error() {
+        // No pre-call ⇒ the correlation_id is unknown. The post-call must NOT
+        // error to the shim; it degrades to a best-effort verify (the mock coord
+        // still composes an outcome keyed on the id).
+        let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
+        let unknown = Uuid::new_v4();
+        let vresp = observe_verify(
+            ObserveVerifyRequest {
+                correlation_id: unknown,
+                install_exit_code: Some(0),
+            },
+            &base,
+            DEAD_LOOPBACK,
+        );
+        assert!(vresp.is_ok(), "unknown id must not error to the shim");
+        let verify = vresp.unwrap().data.unwrap();
+        assert_eq!(verify.correlation_id, Some(unknown));
+        // verify still fired (best-effort) — coord recorded the (degraded) signature.
+        assert_eq!(hits.verify.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn observe_verify_propagates_nonzero_install_exit_code() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
+        let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
+        let resp = run(
+            intercept_req(&d.path().display().to_string(), vec!["bad-pkg"]),
+            &base,
+        )
+        .unwrap();
+        let corr = resp.data.unwrap().correlation_id;
+
+        // The shim reports a FAILED install (exit 1).
+        let vresp = observe_verify(
+            ObserveVerifyRequest {
+                correlation_id: corr,
+                install_exit_code: Some(1),
+            },
+            &base,
+            DEAD_LOOPBACK,
+        )
+        .unwrap();
+        assert!(vresp.data.is_some());
+        // The §6 synthetic install-exit record carries the failing code.
+        let body = hits.verify_json();
+        let tcs = body["observed_typecheck"].as_array().unwrap();
+        let exit_rec = tcs
+            .iter()
+            .find(|t| t["file"] == "<install-subprocess>")
+            .expect("install-exit record present on failure");
+        assert_eq!(exit_rec["pass"], false);
+    }
+
+    #[test]
+    fn intercept_override_escalation_records_overridden_through_observe_verify() {
+        // Phase 3 (plan §4 Phase 3): an intercept PRE-call with
+        // override_escalation:true against an ESCALATE verdict must respond
+        // escalation_overridden:true, and the subsequent observe-verify POST-call
+        // must carry the `+overridden` provenance into the observed_typecheck
+        // records (the producer's shipped override path reached through the shim).
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
+        let (base, hits, _sd) = spawn_coord_mock(escalate_resolution(), vec!["major bump".into()]);
+
+        // PRE-call: intercept mode, override on, escalate verdict.
+        let mut pre = intercept_req(&d.path().display().to_string(), vec!["left-pad"]);
+        pre.override_escalation = true;
+        let resp = run(pre, &base).unwrap();
+        let data = resp.data.unwrap();
+        assert_eq!(data.gate, GateOutcome::Escalate, "verdict is escalate");
+        assert!(
+            data.escalation_overridden,
+            "override_escalation:true on the intercept pre-call ⇒ escalation_overridden:true"
+        );
+        let corr = data.correlation_id;
+
+        // POST-call: the shim reports a FAILED install (exit 1) so the synthetic
+        // <install-subprocess> typecheck record is emitted with the +overridden
+        // provenance suffix (the override flag rode through the PreContext).
+        let vresp = observe_verify(
+            ObserveVerifyRequest {
+                correlation_id: corr,
+                install_exit_code: Some(1),
+            },
+            &base,
+            DEAD_LOOPBACK,
+        )
+        .unwrap();
+        assert!(vresp.data.is_some());
+        let body = hits.verify_json();
+        let tcs = body["observed_typecheck"].as_array().unwrap();
+        let exit_rec = tcs
+            .iter()
+            .find(|t| t["file"] == "<install-subprocess>")
+            .expect("install-exit record present on failure");
+        assert_eq!(
+            exit_rec["provenance"].as_str(),
+            Some("install-exit+overridden"),
+            "+overridden provenance rides through the intercept observe-verify path"
+        );
+    }
+
+    #[test]
+    fn intercept_bare_install_stashes_empty_packages_lockfile_sync() {
+        // A bare `npm install` (no packages) is a lockfile sync — declare with
+        // packages:[] (A6). The pre-call still stashes a context.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
+        let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
+        let resp = run(
+            intercept_req(&d.path().display().to_string(), vec![]),
+            &base,
+        )
+        .unwrap();
+        let data = resp.data.unwrap();
+        assert_eq!(data.gate, GateOutcome::Proceed);
+        // declare body carries an empty package_specs (lockfile sync).
+        let dbody = hits.declare_body.lock().unwrap().clone().unwrap();
+        let specs = dbody["package_specs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            specs.is_empty(),
+            "bare install declares empty package_specs"
+        );
+        assert!(precontext::take(&data.correlation_id).is_some());
     }
 }

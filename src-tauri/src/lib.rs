@@ -4,6 +4,12 @@ use std::sync::OnceLock;
 use tauri::Manager;
 
 pub mod accessibility;
+// Pure install-interception core (classify + gate + wire types), shared by the
+// `qontinui-runner` bin (via `install_effects_producer::intercept`) AND the
+// standalone `qontinui-shim` Windows `.exe` shadow stub. Lifted into the lib
+// crate because a second bin cannot import from the runner bin's module tree.
+// Pure logic only — no async, no coord/keyring deps. See the module doc.
+pub mod intercept_core;
 pub mod observable_bridge;
 pub mod profiles;
 pub mod relay_envelopes;
