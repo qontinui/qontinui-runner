@@ -2428,6 +2428,7 @@ mod tests {
             presentation: Presentation::Headless,
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: anchor.map(|s| s.to_string()),
+            gate_id: None,
         };
 
         let a1 = continuation_session_id(&mk(Some("gate-7f2358d5")));
