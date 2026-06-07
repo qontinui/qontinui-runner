@@ -33,7 +33,6 @@
 //! secrets — the agent's shell already carries the operator's registry config.
 
 use std::env;
-use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -96,12 +95,15 @@ fn code_to_u8(code: Option<i32>) -> u8 {
 /// without running the exe.
 pub fn detect_tool(argv0: Option<&str>) -> Option<ShimTool> {
     let argv0 = argv0?;
-    let stem = Path::new(argv0)
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .unwrap_or(argv0)
-        .to_ascii_lowercase();
-    ShimTool::from_program(&stem)
+    // Hand-split on BOTH separators — `Path::file_stem` does not treat `\` as a
+    // separator on unix, so a Windows-style argv0 (`C:\…\Cargo.EXE`) would be
+    // read as one filename and the stem would carry the whole path. Cross-OS CI
+    // (the ubuntu leg) catches this; mirror the `repo_basename` fix.
+    let base = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
+    // Strip a trailing extension (`.exe`/`.cmd`/…) — everything before the last
+    // `.`, or the whole base if there is no `.`.
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    ShimTool::from_program(&stem.to_ascii_lowercase())
 }
 
 /// The full straddle, fail-open at every step. Returns the exit code the stub
