@@ -150,7 +150,16 @@ pub async fn ui_bridge_invoke_handler(
         timeout_ms,
         "ui_bridge_invoke: emitting ui-bridge:invoke-request"
     );
-    if let Err(e) = state.app_handle.emit("ui-bridge:invoke-request", &payload) {
+    // Target the canonical MAIN window only — see the matching emit in
+    // mcp/ui_bridge/page.rs. A global broadcast reaches every webview window
+    // (main + pop-out `term-N` terminals); each runs `invoke(command, args)`
+    // and emits a duplicate `ui-bridge:invoke-response` for the same
+    // request_id, fanning out side-effecting invokes and racing the oneshot.
+    if let Err(e) = state.app_handle.emit_to(
+        qontinui_runner_lib::get_main_window_label(),
+        "ui-bridge:invoke-request",
+        &payload,
+    ) {
         state.ui_bridge_invoke_store.cancel(&request_id).await;
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,

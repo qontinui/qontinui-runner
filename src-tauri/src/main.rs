@@ -1870,11 +1870,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let term_state: tauri::State<'_, std::sync::Arc<terminal::TerminalManager>> =
                     app.state();
                 let term_for_session = term_state.inner().clone();
-                let outbox_path = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".qontinui")
-                    .join("runner")
-                    .join("session-outbox.jsonl");
+                // Instance-scope the outbox dir so every spawn-test / named
+                // secondary runner gets its OWN `instance-<name>/` outbox file
+                // instead of racing the primary on a single shared
+                // `session-outbox.jsonl`. `scope_path` is a no-op for the
+                // primary (no `QONTINUI_INSTANCE_NAME`), so the primary keeps
+                // resolving to the legacy unscoped path — its pending outbox
+                // rows are never orphaned. `OutboxWriter::open` create_dir_all's
+                // the parent, so the scoped dir is created automatically.
+                let outbox_dir = instance::scope_path(
+                    &dirs::home_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join(".qontinui")
+                        .join("runner"),
+                );
+                let outbox_path = outbox_dir.join("session-outbox.jsonl");
+                tracing::info!(
+                    path = %outbox_path.display(),
+                    instance = ?instance::instance_name(),
+                    "session: resolved outbox path"
+                );
                 let outbox = match session::local_store::OutboxWriter::open(&outbox_path) {
                     Ok(o) => std::sync::Arc::new(o),
                     Err(e) => {
@@ -1957,11 +1972,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // store, so a restored terminal pane RESUMES its prior coord
                 // session instead of orphaning the row + minting a duplicate.
                 // Co-located with the session outbox under `.qontinui/runner`.
-                let pane_store_path = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".qontinui")
-                    .join("runner")
-                    .join("pane-sessions.json");
+                // Co-located with — and scoped identically to — the session
+                // outbox above, so a secondary instance's pane→coord-session
+                // map never collides with the primary's.
+                let pane_store_path = instance::scope_path(
+                    &dirs::home_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join(".qontinui")
+                        .join("runner"),
+                )
+                .join("pane-sessions.json");
                 let pane_store = std::sync::Arc::new(
                     match session::pane_store::PaneSessionStore::open(&pane_store_path) {
                         Ok(s) => s,
