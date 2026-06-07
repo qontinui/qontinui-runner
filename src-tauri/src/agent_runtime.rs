@@ -1314,6 +1314,21 @@ async fn run_continuation_terminal(
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
 
+    // Durable lifecycle capture: this backend path never fires the frontend
+    // `terminal_session_record_open`, so without a hint a restart loses the
+    // continuation. `config_dir: None` — the continuation runs under the
+    // runner's DEFAULT config dir (no `CLAUDE_CONFIG_DIR` is set above), which
+    // is self-consistent with restore (`buildResumeCmd` resumes with no prefix
+    // when configDir is absent → same default dir). RISK: the resolver scans
+    // ALL config dirs first-hit-wins, so two accounts touching the SAME
+    // worktree path could bind an id from the wrong dir; worktree paths are
+    // per-continuation-unique, so this is low-probability — accept + log.
+    let capture_hint = Some(crate::commands::terminal::SessionCaptureHint {
+        config_dir: None,
+        working_dir: workdir.to_string(),
+        title: title.clone(),
+    });
+
     let result = crate::commands::terminal::create_terminal_session_backend(
         &terminal_manager,
         &session_registry,
@@ -1325,6 +1340,7 @@ async fn run_continuation_terminal(
         intent_repo,
         command,
         ctx,
+        capture_hint,
     );
 
     match result {

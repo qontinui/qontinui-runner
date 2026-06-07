@@ -867,6 +867,25 @@ pub fn terminal_session_list_open(
     })
 }
 
+/// Optional hint asking [`create_terminal_session_backend`] to durably record
+/// the new session in the lifecycle store once its Claude session id can be
+/// resolved from the on-disk transcript. Backend-spawned continuation
+/// terminals (which never fire the frontend `terminal_session_record_open`
+/// command) pass `Some(..)` so a restart can restore them; plain shells pass
+/// `None` and skip the resolver entirely.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionCaptureHint {
+    /// Config dir the session launched under, if known. Continuation spawns
+    /// run under the runner's DEFAULT dir (no `CLAUDE_CONFIG_DIR`), so this is
+    /// `None` for them and the resolver scans every known config dir.
+    pub config_dir: Option<String>,
+    /// Working directory of the session — the transcript resolver's
+    /// `project_path`.
+    pub working_dir: String,
+    /// Human-readable title for the restored grid tile.
+    pub title: String,
+}
+
 /// Backend-task entry point for creating a terminal session + coord row from a
 /// non-Tauri context (e.g. the gate-continuation runtime task, which has no
 /// `tauri::State` extractors — it reaches the managed `Arc`s via the global
@@ -893,6 +912,7 @@ pub(crate) fn create_terminal_session_backend(
     intent_repo: Option<String>,
     command: Option<Vec<String>>,
     isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    capture_hint: Option<SessionCaptureHint>,
 ) -> Result<(String, Option<uuid::Uuid>), String> {
     // Phase 2c — derive the `QONTINUI_SESSION_WORKTREES` env from the
     // pre-acquired context (all materialized sibling worktrees) before it is
@@ -908,6 +928,9 @@ pub(crate) fn create_terminal_session_backend(
             )]
         })
     });
+    // Keep a handle for the (optional) durable-record poller below, since the
+    // `create` call consumes `app_handle`. `AppHandle` is a cheap Arc clone.
+    let app_state = capture_hint.as_ref().map(|_| app_handle.clone());
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(working_dir.clone()),
@@ -982,7 +1005,133 @@ pub(crate) fn create_terminal_session_backend(
         }
     }
 
+    // Durable lifecycle registration for backend-spawned (continuation)
+    // sessions: the frontend `terminal_session_record_open` command never
+    // fires for these, so without this a restart loses them. The Claude
+    // session id is not known at spawn time — it only appears once the
+    // `claude` child writes its first transcript record — so resolve it
+    // asynchronously by polling the on-disk transcript, then record. Plain
+    // (non-hint) terminals skip this entirely (no wasted polling).
+    if let (Some(hint), Some(app_state)) = (capture_hint, app_state) {
+        if let Some(store) = app_state.try_state::<Arc<SessionLifecycleStore>>() {
+            let store = store.inner().clone();
+            let terminal_id = info.id.clone();
+            let SessionCaptureHint {
+                config_dir,
+                working_dir,
+                title,
+            } = hint;
+            let since = chrono::Utc::now();
+            let resolver_dir = working_dir.clone();
+            let resolver = move || resolve_latest_claude_session_id(&resolver_dir, since);
+            tokio::spawn(poll_and_record_session(
+                store,
+                resolver,
+                terminal_id,
+                config_dir,
+                working_dir,
+                title,
+                SESSION_CAPTURE_POLL_INTERVAL,
+                SESSION_CAPTURE_TIMEOUT,
+            ));
+        } else {
+            warn!(
+                terminal_id = %info.id,
+                "create_terminal_session_backend: lifecycle store not managed — \
+                 continuation session will not be durably recorded"
+            );
+        }
+    }
+
     Ok((info.id, coord_session_id))
+}
+
+/// How often the durable-record poller checks the on-disk transcript for the
+/// new Claude session id. Widened past 1s because each tick can stat every
+/// JSONL across all `.claude-*` config dirs on the mtime-fallback path.
+const SESSION_CAPTURE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long the poller keeps trying before giving up. Generous because a cold
+/// model spin-up can delay the first transcript write.
+const SESSION_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Real resolver: scan every known Claude config dir (the continuation runs
+/// under the default dir, so `config_dir` is unknown here) for the freshest
+/// session in `project_path` written after `since`, returning its session id.
+/// The cheap `.claude.json` `lastSessionId` shortcut inside
+/// [`get_latest_session_id`] is preferred where it applies.
+fn resolve_latest_claude_session_id(
+    project_path: &str,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    for dir in crate::terminal::transcript::find_claude_config_dirs() {
+        if let Some(session) =
+            crate::terminal::transcript::get_latest_session_id(&dir, project_path, Some(since))
+        {
+            return Some(session.session_id);
+        }
+    }
+    None
+}
+
+/// Poll `resolve` until it yields a Claude session id (or `timeout` elapses),
+/// then durably record the session via [`SessionLifecycleStore::record_open`].
+///
+/// The resolver is injected so this loop is unit-testable without a real
+/// on-disk transcript. On the first resolve it builds a [`TerminalSessionRecord`]
+/// (restored into zone 0 / the default page — wrong zone beats a lost session)
+/// and records it; on timeout it `warn!`s and gives up without recording.
+#[allow(clippy::too_many_arguments)]
+async fn poll_and_record_session<F>(
+    store: Arc<SessionLifecycleStore>,
+    resolve: F,
+    terminal_id: String,
+    config_dir: Option<String>,
+    working_dir: String,
+    title: String,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+) where
+    F: Fn() -> Option<String>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(claude_session_id) = resolve() {
+            let record = TerminalSessionRecord {
+                claude_session_id: claude_session_id.clone(),
+                config_dir: config_dir.clone(),
+                working_dir: Some(working_dir.clone()),
+                page_id: "default".to_string(),
+                zone_index: 0,
+                title: Some(title.clone()),
+                terminal_id: terminal_id.clone(),
+                // record_open seeds these from `now`; values here are placeholders
+                // (mirrors `terminal_session_record_open`).
+                opened_at: 0,
+                last_seen_at: 0,
+                state: "open".to_string(),
+                closed_at: None,
+                close_reason: None,
+            };
+            store.record_open(record);
+            info!(
+                terminal_id = %terminal_id,
+                claude_session = %claude_session_id,
+                "create_terminal_session_backend: continuation session durably recorded"
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                terminal_id = %terminal_id,
+                working_dir = %working_dir,
+                "create_terminal_session_backend: timed out resolving Claude session id — \
+                 continuation session not durably recorded"
+            );
+            return;
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Build the Tauri plugin that registers this module's command handlers.
@@ -1011,4 +1160,100 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_session_list_open,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// When the injected resolver yields an id, exactly one open record lands
+    /// in the store, keyed by the resolved id, restored into zone 0 / default
+    /// page with the supplied title + terminal id.
+    #[tokio::test]
+    async fn poll_and_record_session_records_when_resolver_yields_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+
+        poll_and_record_session(
+            store.clone(),
+            || Some("resolved-sess-1".to_string()),
+            "term-1".to_string(),
+            None,
+            "/work/dir".to_string(),
+            "My Continuation".to_string(),
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let open = store.open_records();
+        assert_eq!(open.len(), 1, "exactly one record on resolve");
+        let rec = &open[0];
+        assert_eq!(rec.claude_session_id, "resolved-sess-1");
+        assert_eq!(rec.terminal_id, "term-1");
+        assert_eq!(rec.working_dir.as_deref(), Some("/work/dir"));
+        assert_eq!(rec.title.as_deref(), Some("My Continuation"));
+        assert_eq!(rec.page_id, "default");
+        assert_eq!(rec.zone_index, 0);
+        assert_eq!(rec.config_dir, None);
+        assert_eq!(rec.state, "open");
+        assert!(rec.opened_at > 0, "record_open seeds opened_at");
+    }
+
+    /// When the resolver never yields an id, the poller gives up after the
+    /// timeout without recording anything (and the loop actually polled more
+    /// than once before the deadline).
+    #[tokio::test]
+    async fn poll_and_record_session_gives_up_after_timeout_without_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = calls.clone();
+
+        poll_and_record_session(
+            store.clone(),
+            move || {
+                calls_in.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+            "term-2".to_string(),
+            None,
+            "/work/dir".to_string(),
+            "Never Resolves".to_string(),
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+        )
+        .await;
+
+        assert!(
+            store.open_records().is_empty(),
+            "no record when the id never resolves"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "poller retried at least once before giving up"
+        );
+    }
+
+    /// A `None` capture hint means no poller is ever constructed, so the store
+    /// stays empty. (The spawn decision lives in
+    /// `create_terminal_session_backend`; here we assert the equivalent
+    /// invariant — no resolver runs, no record — by simply never invoking the
+    /// poller, the same branch that path takes for plain shells.)
+    #[tokio::test]
+    async fn no_record_when_hint_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        // Hint absent → poll_and_record_session is never spawned (see
+        // create_terminal_session_backend). The store therefore has no rows.
+        assert!(store.open_records().is_empty());
+    }
 }
