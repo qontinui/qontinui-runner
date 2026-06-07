@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Env flag that turns the Ξ_FS observer producer on. Default off. Accepts
 /// the usual truthy values; anything else (including unset) is false. Matches
@@ -385,7 +385,7 @@ async fn post_observations(coord_http_base: &str, body: &FsObservationsRequest) 
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
-                debug!(
+                info!(
                     url = %url,
                     n = body.observations.len(),
                     status = status.as_u16(),
