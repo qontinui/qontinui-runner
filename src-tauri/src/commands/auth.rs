@@ -570,16 +570,16 @@ async fn cognito_sign_in_impl(
         qontinui_runner_lib::cognito::pkce_login(identity_provider.as_deref())
     })
     .await
-        .map_err(|e| {
-            error!("cognito_sign_in: PKCE login task panicked: {e}");
-            AppError::Raw(format!("PKCE login task panicked: {e}"))
-        })?
-        .map_err(|e| {
-            // Most common cause: a prior sign-in leaked the fixed loopback port
-            // (BUG 1, now fixed) so the bind fails with os error 10048.
-            error!("cognito_sign_in: PKCE login failed at step 1 (pkce_login): {e}");
-            AppError::Raw(e)
-        })?;
+    .map_err(|e| {
+        error!("cognito_sign_in: PKCE login task panicked: {e}");
+        AppError::Raw(format!("PKCE login task panicked: {e}"))
+    })?
+    .map_err(|e| {
+        // Most common cause: a prior sign-in leaked the fixed loopback port
+        // (BUG 1, now fixed) so the bind fails with os error 10048.
+        error!("cognito_sign_in: PKCE login failed at step 1 (pkce_login): {e}");
+        AppError::Raw(e)
+    })?;
 
     info!(
         "cognito_sign_in: PKCE login succeeded (sub={}) — binding device",
