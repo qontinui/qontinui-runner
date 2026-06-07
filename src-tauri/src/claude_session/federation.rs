@@ -43,6 +43,15 @@ pub const RECONCILE_EVENT: &str = "memory-federation:reconcile";
 /// (<reason>)" notice instead of the old silent warn-only behavior.
 pub const SKIP_EVENT: &str = "memory-federation:skipped";
 
+/// Tauri event channel for reconcile-LEVEL failure broadcasts. Distinct
+/// from per-file `failed_names` (which ride on [`RECONCILE_EVENT`]): this
+/// fires when the whole reconcile returns `Err` and no `ReconcileReport`
+/// is produced at all. Mirrors [`SKIP_EVENT`]: the spawn site emits a
+/// one-line `{ session_id, account, error }` payload here so the React
+/// frontend can surface a sticky "reconcile failed" notice instead of the
+/// old silent warn-only behavior.
+pub const ERROR_EVENT: &str = "memory-federation:error";
+
 /// Why memory federation was skipped for a session. Returned by
 /// [`build_federation_ctx`] (as the `Err` arm) so the spawn site can
 /// surface the reason to the UI via [`SKIP_EVENT`] instead of silently
@@ -118,6 +127,36 @@ pub fn emit_federation_skip(
     };
     if let Err(e) = app_handle.emit(SKIP_EVENT, &payload) {
         debug!("claude_session::federation: emit {SKIP_EVENT} failed: {e} (non-fatal)");
+    }
+}
+
+/// Tauri event payload for [`ERROR_EVENT`]. `error` is the
+/// `Display`-formatted reconcile-level error string.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorPayload {
+    pub session_id: String,
+    pub account: String,
+    pub error: String,
+}
+
+/// Emit an [`ERROR_EVENT`] for `session_id` carrying the reconcile-level
+/// failure. Best-effort: an emit failure is logged at `debug` and never
+/// propagated, mirroring [`emit_federation_skip`]'s emit handling. The
+/// caller is responsible for the accompanying `warn!` (preserved at the
+/// failure site).
+pub fn emit_federation_error(
+    app_handle: &tauri::AppHandle,
+    session_id: &str,
+    account: &str,
+    error: &str,
+) {
+    let payload = ErrorPayload {
+        session_id: session_id.to_string(),
+        account: account.to_string(),
+        error: error.to_string(),
+    };
+    if let Err(e) = app_handle.emit(ERROR_EVENT, &payload) {
+        debug!("claude_session::federation: emit {ERROR_EVENT} failed: {e} (non-fatal)");
     }
 }
 
@@ -270,6 +309,16 @@ pub fn emit_federation_report(
                 account = %ctx.account_name,
                 error = %e,
                 "memory federation reconcile failed"
+            );
+            // Surface the reconcile-LEVEL failure on the dashboard. Unlike
+            // per-file `failed_names` (which ride on RECONCILE_EVENT), a
+            // whole-reconcile `Err` produces no report at all, so without
+            // this the dashboard would show nothing.
+            emit_federation_error(
+                app_handle,
+                &ctx.session_id.to_string(),
+                &ctx.account_name,
+                &e.to_string(),
             );
         }
     }

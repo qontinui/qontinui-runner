@@ -233,6 +233,37 @@ export function MemoryFederationPage() {
   );
 
   // -----------------------------------------------------------------------
+  // Install shape — single-account (cross-device sync) vs multi-account
+  // (cross-account federation). Derived purely from the data already
+  // present: count DISTINCT account_name values across the merged reports.
+  // The literal "default" account is a single-account install (no per-
+  // account .claude-<name> dir), so it does not count toward distinctness.
+  // -----------------------------------------------------------------------
+  const mode = useMemo<"cross-device" | "cross-account">(() => {
+    const distinctAccounts = new Set<string>();
+    for (const r of allReports) {
+      if (r.account_name && r.account_name !== "default") {
+        distinctAccounts.add(r.account_name);
+      }
+    }
+    return distinctAccounts.size >= 2 ? "cross-account" : "cross-device";
+  }, [allReports]);
+
+  const copy =
+    mode === "cross-account"
+      ? {
+          subtitle:
+            "Cross-account federation — memories merged across this tenant's Claude accounts.",
+          empty:
+            "No cross-account federation reports in the selected time range.",
+        }
+      : {
+          subtitle:
+            "Cross-device sync — memories synced across this account's machines.",
+          empty: "No cross-device sync reports in the selected time range.",
+        };
+
+  // -----------------------------------------------------------------------
   // Summary
   // -----------------------------------------------------------------------
   const summary = useMemo(() => {
@@ -256,7 +287,10 @@ export function MemoryFederationPage() {
     <div style={pageStyle}>
       {/* Header */}
       <div style={headerStyle}>
-        <h2 style={titleStyle}>Memory Federation</h2>
+        <div>
+          <h2 style={titleStyle}>Memory Federation</h2>
+          <p style={subtitleStyle}>{copy.subtitle}</p>
+        </div>
         <div style={headerActionsStyle}>
           {/* Time range selector */}
           <div style={timeRangeSelectorStyle}>
@@ -307,9 +341,7 @@ export function MemoryFederationPage() {
       <div style={tableContainerStyle}>
         {sortedReports.length === 0 ? (
           <div style={emptyStyle}>
-            {coordLoading
-              ? "Loading reports..."
-              : "No federation reports in the selected time range."}
+            {coordLoading ? "Loading reports..." : copy.empty}
           </div>
         ) : (
           <table style={tableStyle}>
@@ -522,6 +554,12 @@ const titleStyle: React.CSSProperties = {
   fontSize: "1.25rem",
   fontWeight: 600,
   color: "var(--text-primary, #e4e4e7)",
+};
+
+const subtitleStyle: React.CSSProperties = {
+  margin: "4px 0 0 0",
+  fontSize: "0.8125rem",
+  color: "var(--text-secondary, #a1a1aa)",
 };
 
 const headerActionsStyle: React.CSSProperties = {
