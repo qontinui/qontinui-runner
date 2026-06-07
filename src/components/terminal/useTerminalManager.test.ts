@@ -20,6 +20,7 @@ import {
   applyBypassMark,
   reduceCreatedTerminal,
   shouldIngestCreatedTerminal,
+  nextActiveIdAfterIngest,
   type TerminalTab,
 } from "./useTerminalManager";
 
@@ -172,6 +173,41 @@ describe("reduceCreatedTerminal (ingest + dedup)", () => {
 
     expect(pageB.map((t) => t.id)).toEqual(["b1"]); // captured in B
     expect(pageA.map((t) => t.id)).toEqual(["a1"]); // A unchanged, not cleared
+  });
+});
+
+// Auto-surface (gate-continuation): a docked continuation tab must be SELECTED
+// the moment its `terminal-created` lands — matching the frontend-initiated
+// `createTerminal` path (which calls `setActiveId(info.id)`). The external-
+// listener path previously appended the tab un-selected, so the operator saw
+// nothing. `nextActiveIdAfterIngest` is the pure decision the listener consults
+// before `setActiveId`. (Plan: 2026-06-07-gate-continuation-auto-surface-and-focus.)
+describe("nextActiveIdAfterIngest (auto-select on ingest)", () => {
+  it("returns the new terminal id when this is a genuinely-new tab", () => {
+    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default"), true)).toBe("cont-1");
+  });
+
+  it("returns null for a dedup'd re-delivery so focus is never stolen", () => {
+    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default"), false)).toBeNull();
+  });
+
+  it("end-to-end: a fresh continuation ingest both appends AND selects the tab", () => {
+    // Mirror the listener: reduce (append) + decide selection from is-new.
+    const prev: TerminalTab[] = [];
+    const info = createdEvent("cont-2", "default");
+    const isNew = !prev.some((t) => t.id === info.id);
+    const next = reduceCreatedTerminal(prev, info, undefined);
+    expect(next).not.toBe(prev); // appended
+    expect(nextActiveIdAfterIngest(info, isNew)).toBe("cont-2"); // selected
+  });
+
+  it("end-to-end: a re-delivered continuation neither re-appends NOR re-selects", () => {
+    const prev: TerminalTab[] = [tab("cont-2")];
+    const info = createdEvent("cont-2", "default");
+    const isNew = !prev.some((t) => t.id === info.id);
+    const next = reduceCreatedTerminal(prev, info, undefined);
+    expect(next).toBe(prev); // dedup'd — same identity
+    expect(nextActiveIdAfterIngest(info, isNew)).toBeNull(); // no focus steal
   });
 });
 

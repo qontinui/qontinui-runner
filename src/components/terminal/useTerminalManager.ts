@@ -136,6 +136,23 @@ export function reduceCreatedTerminal(
 }
 
 /**
+ * Pure helper: resolve the `activeId` to set after a `terminal-created` ingest.
+ *
+ * Returns `info.id` when this is a genuinely-NEW tab (`isNewTab === true`) so a
+ * freshly-docked gate continuation is auto-selected the moment it lands —
+ * surfacing it the same way the frontend-initiated `createTerminal` path does
+ * (`setActiveId(info.id)`). Returns `null` (caller keeps the current selection)
+ * when the ingest is a dedup'd re-delivery so a re-delivered event never steals
+ * focus.
+ *
+ * Exported so `useTerminalManager.test.ts` can drive the auto-select contract
+ * without booting React (the listener is a thin `if (id) setActiveId(id)`).
+ */
+export function nextActiveIdAfterIngest(info: TerminalInfo, isNewTab: boolean): string | null {
+  return isNewTab ? info.id : null;
+}
+
+/**
  * Pure helper: decide whether `tabs` should be replaced when applying a
  * worker mark for `terminalId`. Returns the next tabs array (same identity
  * if no change), and a `buffered` flag the caller uses to record the mark
@@ -208,6 +225,14 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
    * strictly guaranteed (and reconnect rebuilds tabs without re-firing it).
    */
   const pendingBypassMarks = useRef<Set<string>>(new Set());
+  /**
+   * Ids this manager has already ingested via `terminal-created`. Drives the
+   * auto-select decision (`nextActiveIdAfterIngest`) OUTSIDE the `setTabs`
+   * updater so the updater stays pure under StrictMode double-invoke — a
+   * re-delivered `terminal-created` is a no-op here (already present) and never
+   * re-steals focus, mirroring `reduceCreatedTerminal`'s id-dedup.
+   */
+  const ingestedIds = useRef<Set<string>>(new Set());
 
   const markAsWorker = useCallback((terminalId: string, taskRunId: string) => {
     setTabs((prev) => {
@@ -255,13 +280,28 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
       if (pendingBypass) {
         pendingBypassMarks.current.delete(info.id);
       }
-      setTabs((prev) => {
-        const next = reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass);
-        if (next !== prev) {
-          logger.info(`External terminal created: ${info.id} (${info.title}) [page ${pageId}]`);
-        }
-        return next;
-      });
+      // Decide auto-select OUTSIDE the `setTabs` updater so the updater stays
+      // pure (StrictMode double-invokes updaters in dev). `ingestedIds` is a
+      // ref-backed dedup set so a re-delivered `terminal-created` is a no-op
+      // here just as `reduceCreatedTerminal` dedups it in the updater — only a
+      // genuinely-new tab triggers selection, so a re-delivery never steals
+      // focus. The pure decision lives in `nextActiveIdAfterIngest`, fed a
+      // synthetic prev/next pair reflecting whether this id is new.
+      const wasNew = !ingestedIds.current.has(info.id);
+      const selectId = nextActiveIdAfterIngest(info, wasNew);
+      setTabs((prev) => reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass));
+      if (selectId !== null) {
+        ingestedIds.current.add(info.id);
+        logger.info(`External terminal created: ${info.id} (${info.title}) [page ${pageId}]`);
+        // Auto-select the just-appended externally-created tab so a docked gate
+        // continuation is surfaced (selected) the moment it lands — matching
+        // `createTerminal`'s `setActiveId(info.id)` (the frontend-initiated
+        // path). Without this the continuation tab is appended un-selected and
+        // the operator sees nothing (the surfacing bug). The App-level
+        // `terminal-focus-request` listener handles the complementary main-view
+        // switch (`setActiveTab("terminal")`).
+        setActiveId(selectId);
+      }
     }).then((fn) => {
       unlisten = fn;
     });
