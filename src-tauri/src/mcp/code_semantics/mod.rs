@@ -31,6 +31,7 @@ pub mod cargo_check;
 pub mod code_graph_api;
 pub mod domain_observer;
 pub mod lang;
+pub mod layer_manifest;
 pub mod layer_observer;
 pub mod module_graph;
 pub mod mypy_check;
@@ -154,6 +155,10 @@ pub const PROV_KERNEL_DOMAIN: &str = "claude_cli_domain";
 /// the layering-allowed-edge relation Φ over the resolved dependency digraph.
 /// Advisory, never gate-worthy.
 pub const PROV_KERNEL_LAYER: &str = "claude_cli_layer";
+/// `Ξ_Layering` GATE-GRADE provenance (Phase 4b): the declared side is the authored
+/// `.qontinui/layers.toml`, so breach detection is deterministic over the resolved
+/// graph (not a kernel) — the verdict can recommend block/escalate.
+pub const PROV_LAYER_GATE: &str = "layer_drift_authored";
 /// Python `mypy` typecheck provenance (Phase A): full-fidelity, true overlay via
 /// `--shadow-file`. Boundary `high` (crosses the type checker).
 pub const PROV_MYPY: &str = "mypy";
@@ -263,6 +268,32 @@ impl Envelope {
             credibility: Credibility::kernel(),
             staleness_seconds: None,
             kernel: true,
+        }
+    }
+
+    /// GATE-GRADE answer for `Ξ_Layering` 4b: the declared side is the authored
+    /// `.qontinui/layers.toml` (the spec), so the breach check is deterministic over
+    /// the resolved graph — `kernel:false`, with the resolver's credibility
+    /// `(causal:high, authorial:high, boundary:medium)` rather than the model-hint
+    /// kernel. The `result` body carries the `gate` recommendation.
+    pub fn authored(
+        query: &str,
+        observer: &str,
+        provenance: &str,
+        result: Value,
+        posterior: f64,
+        coverage: f64,
+    ) -> Self {
+        Envelope {
+            observer: observer.into(),
+            query: query.into(),
+            result,
+            posterior,
+            coverage,
+            provenance: provenance.into(),
+            credibility: Credibility::resolved(),
+            staleness_seconds: None,
+            kernel: false,
         }
     }
 
