@@ -539,14 +539,25 @@ pub struct CognitoSignInResponse {
 /// `backend_url` is the web-backend base (e.g. `https://api.qontinui.io`). It
 /// is required and explicit (NOT `get_api_base_url()`) so a debug build can
 /// target prod — symmetric with [`pair_with_credentials`].
+///
+/// `identity_provider` optionally selects a federated IdP to jump straight into
+/// (Cognito provider name — `Google`, `MicrosoftEntra`, `GitHub`). When `None`
+/// the Hosted UI shows its native email/password + chooser screen (unchanged
+/// "Sign in with Qontinui" behaviour).
 #[tauri::command]
-pub async fn cognito_sign_in(backend_url: String) -> Result<CognitoSignInResponse, String> {
-    cognito_sign_in_impl(backend_url)
+pub async fn cognito_sign_in(
+    backend_url: String,
+    identity_provider: Option<String>,
+) -> Result<CognitoSignInResponse, String> {
+    cognito_sign_in_impl(backend_url, identity_provider)
         .await
         .map_err(String::from)
 }
 
-async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInResponse, AppError> {
+async fn cognito_sign_in_impl(
+    backend_url: String,
+    identity_provider: Option<String>,
+) -> Result<CognitoSignInResponse, AppError> {
     let base = backend_url.trim().trim_end_matches('/').to_string();
     if base.is_empty() {
         return Err(AppError::Raw("backend_url is required".to_string()));
@@ -555,8 +566,10 @@ async fn cognito_sign_in_impl(backend_url: String) -> Result<CognitoSignInRespon
     // 1. RFC-8252 PKCE login (blocking — browser + loopback). Run on a
     //    worker thread so it doesn't block the tokio runtime.
     info!("cognito_sign_in: starting RFC-8252 PKCE login");
-    let login = tokio::task::spawn_blocking(qontinui_runner_lib::cognito::pkce_login)
-        .await
+    let login = tokio::task::spawn_blocking(move || {
+        qontinui_runner_lib::cognito::pkce_login(identity_provider.as_deref())
+    })
+    .await
         .map_err(|e| {
             error!("cognito_sign_in: PKCE login task panicked: {e}");
             AppError::Raw(format!("PKCE login task panicked: {e}"))

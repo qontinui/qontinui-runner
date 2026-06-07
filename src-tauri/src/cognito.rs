@@ -127,8 +127,18 @@ pub fn generate_state() -> String {
 }
 
 /// Build the `/oauth2/authorize` URL for the PKCE flow.
-pub fn build_authorize_url(state: &str, code_challenge: &str) -> String {
-    format!(
+///
+/// When `identity_provider` is `Some`, an `&identity_provider=<Provider>` param
+/// is appended so the Cognito Hosted UI jumps straight into that federated IdP
+/// (e.g. `Google`, `MicrosoftEntra`, `GitHub`) rather than showing its own
+/// chooser. When `None`, the param is omitted and behaviour is unchanged (the
+/// native email/password + chooser screen).
+pub fn build_authorize_url(
+    state: &str,
+    code_challenge: &str,
+    identity_provider: Option<&str>,
+) -> String {
+    let mut url = format!(
         "{COGNITO_AUTHORIZE_URL}?response_type=code&client_id={client_id}\
          &redirect_uri={redirect}&scope={scope}&state={state}\
          &code_challenge={challenge}&code_challenge_method=S256",
@@ -137,7 +147,14 @@ pub fn build_authorize_url(state: &str, code_challenge: &str) -> String {
         scope = urlencoding::encode(COGNITO_SCOPE),
         state = urlencoding::encode(state),
         challenge = code_challenge,
-    )
+    );
+    if let Some(provider) = identity_provider {
+        if !provider.is_empty() {
+            url.push_str("&identity_provider=");
+            url.push_str(&urlencoding::encode(provider));
+        }
+    }
+    url
 }
 
 /// Decode an unverified string claim from a JWT payload (the id token). We do
@@ -196,7 +213,11 @@ fn bind_loopback_reuseaddr(port: u16) -> std::io::Result<std::net::TcpListener> 
 /// loopback redirect, validate `state`, and exchange the code at the token
 /// endpoint. Blocking (mirrors `pair::pair_via_browser`); call via
 /// `tokio::task::spawn_blocking` from async contexts.
-pub fn pkce_login() -> Result<CognitoLoginResult, String> {
+///
+/// `identity_provider` selects a federated IdP to jump straight into (one of
+/// the Cognito provider names — `Google`, `MicrosoftEntra`, `GitHub`); `None`
+/// preserves the existing native email/chooser screen.
+pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult, String> {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -338,7 +359,7 @@ pub fn pkce_login() -> Result<CognitoLoginResult, String> {
         })
     });
 
-    let authorize_url = build_authorize_url(&state, &code_challenge);
+    let authorize_url = build_authorize_url(&state, &code_challenge, identity_provider);
     tracing::info!("opening browser for Cognito sign-in (callback {COGNITO_REDIRECT_URI})");
     if let Err(e) = open::that(&authorize_url) {
         tracing::warn!(
@@ -663,7 +684,7 @@ mod tests {
 
     #[test]
     fn authorize_url_has_required_params() {
-        let url = build_authorize_url("st-ate", "chal-lenge");
+        let url = build_authorize_url("st-ate", "chal-lenge", None);
         assert!(url.starts_with(COGNITO_AUTHORIZE_URL));
         assert!(url.contains("response_type=code"));
         assert!(url.contains(&format!("client_id={COGNITO_CLIENT_ID}")));
@@ -674,6 +695,22 @@ mod tests {
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A53682%2Fauth%2Fcallback"));
         // scope is space-separated → encoded as %20.
         assert!(url.contains("scope=openid%20email%20profile"));
+        // No provider → no identity_provider param (native chooser path).
+        assert!(!url.contains("identity_provider"));
+    }
+
+    #[test]
+    fn authorize_url_appends_identity_provider_when_set() {
+        let url = build_authorize_url("st-ate", "chal-lenge", Some("Google"));
+        assert!(url.contains("&identity_provider=Google"));
+
+        // Microsoft Entra provider name is threaded verbatim.
+        let url = build_authorize_url("st-ate", "chal-lenge", Some("MicrosoftEntra"));
+        assert!(url.contains("&identity_provider=MicrosoftEntra"));
+
+        // An empty provider is treated as "unset" → param omitted.
+        let url = build_authorize_url("st-ate", "chal-lenge", Some(""));
+        assert!(!url.contains("identity_provider"));
     }
 
     #[test]

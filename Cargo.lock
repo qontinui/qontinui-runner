@@ -6328,6 +6328,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "qontinui-code-graph"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
 name = "qontinui-db"
 version = "0.1.0"
 dependencies = [
@@ -6401,6 +6415,7 @@ dependencies = [
  "petgraph",
  "portable-pty",
  "proc-macro2",
+ "qontinui-code-graph",
  "qontinui-db",
  "qontinui-spec-check",
  "qontinui-types",
