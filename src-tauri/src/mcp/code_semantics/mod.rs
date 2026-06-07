@@ -25,11 +25,13 @@
 //! - Node/TS permanently unavailable → degrade (symbol-lookup → code_graph_fallback;
 //!   resolution → `engine_unavailable`, coverage 0). Never 500 on a missing engine.
 
+pub mod arch_classify;
 pub mod arch_observer;
 pub mod cargo_check;
 pub mod code_graph_api;
 pub mod domain_observer;
 pub mod lang;
+pub mod layer_observer;
 pub mod module_graph;
 pub mod mypy_check;
 pub mod node_bridge;
@@ -147,6 +149,11 @@ pub const PROV_KERNEL_ARCH: &str = "claude_cli_arch";
 /// `Ξ_Domain` LLM business-domain mapper provenance (Phase 3): a stochastic
 /// kernel run through the Claude-CLI path. Advisory, never gate-worthy.
 pub const PROV_KERNEL_DOMAIN: &str = "claude_cli_domain";
+/// `Ξ_Layering` architecture-drift observer provenance (Phase 4a): a stochastic
+/// kernel that labels modules via the Claude-CLI path (`Ξ_Arch`), then evaluates
+/// the layering-allowed-edge relation Φ over the resolved dependency digraph.
+/// Advisory, never gate-worthy.
+pub const PROV_KERNEL_LAYER: &str = "claude_cli_layer";
 /// Python `mypy` typecheck provenance (Phase A): full-fidelity, true overlay via
 /// `--shadow-file`. Boundary `high` (crosses the type checker).
 pub const PROV_MYPY: &str = "mypy";
@@ -451,9 +458,10 @@ pub struct TypecheckReq {
 
 /// Routes contributed to the runner's main router from `mcp_api.rs`. Includes
 /// the LSP `Ξ_Type` `/code-semantics/*` surface, the resolved-import `Ξ_AST`
-/// `/code-graph/*` diff blast-radius surface (Pillar 2), and the Phase-3
+/// `/code-graph/*` diff blast-radius surface (Pillar 2), the Phase-3
 /// stochastic-kernel observers `Ξ_Arch` (`/code-graph/arch-layers`) and
-/// `Ξ_Domain` (`/code-graph/domains`).
+/// `Ξ_Domain` (`/code-graph/domains`), and the Phase-4a `Ξ_Layering`
+/// architecture-drift advisory observer (`/code-graph/layer-drift`).
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/code-semantics/health", get(health))
@@ -464,6 +472,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .merge(code_graph_api::routes())
         .merge(arch_observer::routes())
         .merge(domain_observer::routes())
+        .merge(layer_observer::routes())
 }
 
 /// GET /code-semantics/health — per CONTRACT §B.
