@@ -138,7 +138,11 @@ export function MemoryFederationPage() {
           reported_at: string;
           metadata?: Record<string, unknown>;
         }>;
-      }>("get_federation_reports", { since, limit: 200 });
+        // Tauri wraps the command's single struct parameter under its
+        // declared name (`args`); the payload must mirror that or Tauri
+        // rejects the call with "missing required key args" before any
+        // HTTP request to coord is made.
+      }>("get_federation_reports", { args: { since, limit: 200 } });
 
       const rows: FederationReportRow[] = (result?.items ?? []).map((item) => ({
         id: item.report_id,
@@ -163,6 +167,11 @@ export function MemoryFederationPage() {
           "Historical data unavailable (Tauri command not registered). " +
             "Showing live session reports only.",
         );
+      } else if (msg.includes("invalid args") || msg.includes("missing required key")) {
+        // Tauri rejected the IPC payload before any HTTP call — this is a
+        // client-side contract bug, not a coord-side failure. Don't blame
+        // coord.
+        setCoordError(`Internal error loading history (IPC contract): ${msg}`);
       } else {
         setCoordError(`Failed to fetch from coord: ${msg}`);
       }
