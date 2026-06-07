@@ -16,7 +16,12 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { awaitWithTimeout, isThenable, PAGE_EVALUATE_PROMISE_TIMEOUT_MS } from "./utils";
+import {
+  awaitWithTimeout,
+  isThenable,
+  isElementActionAllowed,
+  PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+} from "./utils";
 
 describe("isThenable", () => {
   it("accepts native Promise instances", () => {
@@ -134,4 +139,34 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe("isElementActionAllowed — execute_action per-element gate", () => {
+  it("permits any action when the element declares no action set", () => {
+    expect(isElementActionAllowed([], "hoverClick")).toBe(true);
+    expect(isElementActionAllowed([], "type")).toBe(true);
+  });
+
+  it("permits an action that is explicitly advertised", () => {
+    expect(isElementActionAllowed(["click", "focus"], "click")).toBe(true);
+  });
+
+  it("rejects an action not in a non-empty declared set", () => {
+    expect(isElementActionAllowed(["click", "focus"], "type")).toBe(false);
+    expect(isElementActionAllowed(["focus", "blur"], "click")).toBe(false);
+  });
+
+  it("exempts hoverClick wherever click is advertised (click-variant) — the regression", () => {
+    // A hover-gated toolbar button (e.g. ZoneHoverActions "Send to window")
+    // advertises click but not hoverClick; hoverClick must still be allowed so
+    // it reaches actionExecutor.performHoverClick instead of being rejected
+    // pre-dispatch (mirrors the runner Rust is_action_advertised exemption).
+    expect(isElementActionAllowed(["focus", "blur", "click", "hover", "middleClick"], "hoverClick")).toBe(
+      true,
+    );
+  });
+
+  it("does NOT exempt hoverClick when click is absent", () => {
+    expect(isElementActionAllowed(["focus", "blur", "hover"], "hoverClick")).toBe(false);
+  });
 });

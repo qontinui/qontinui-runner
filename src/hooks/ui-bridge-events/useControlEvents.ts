@@ -3,7 +3,12 @@ import { getApiPort } from "@/lib/runner-api";
 import type { MainTabId } from "@/components/app/tab-types";
 import { migrateTabId } from "@/components/app/tab-types";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
-import { closestElementIds, serializeElement, serializeComponent } from "./utils";
+import {
+  closestElementIds,
+  serializeElement,
+  serializeComponent,
+  isElementActionAllowed,
+} from "./utils";
 
 /**
  * Handles: get_elements, get_element, execute_action, get_components, get_component,
@@ -143,7 +148,10 @@ export function useControlEvents(
               ? Object.keys(targetElement.customActions)
               : [];
             const allowedActions = [...builtinActions, ...customActions];
-            if (allowedActions.length > 0 && !allowedActions.includes(actionObj.action)) {
+            // `isElementActionAllowed` exempts `hoverClick` (a click-variant)
+            // wherever `click` is advertised, mirroring the runner-side Rust
+            // `is_action_advertised` gate so the two layers can't disagree.
+            if (!isElementActionAllowed(allowedActions, actionObj.action)) {
               await sendResponse({
                 requestId,
                 type,
