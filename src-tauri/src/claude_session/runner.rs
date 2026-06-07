@@ -480,16 +480,35 @@ fn run_claude_session_inline(
     // bridge — federation is best-effort and never blocks the spawn.
     let federation_ctx_opt = if crate::claude_session::federation::federation_enabled() {
         let ai_settings = crate::settings::get_ai_settings();
-        crate::claude_session::federation::build_federation_ctx(
+        match crate::claude_session::federation::build_federation_ctx(
             session_id,
             working_dir,
             &ai_settings.claude_cli,
-        )
+        ) {
+            Ok(ctx) => Some(ctx),
+            Err(reason) => {
+                // Surface the skip reason to the UI (warn! already logged
+                // inside build_federation_ctx); proceed locally.
+                crate::claude_session::federation::emit_federation_skip(
+                    app_handle,
+                    session_id,
+                    reason.as_str(),
+                    reason.detail(),
+                );
+                None
+            }
+        }
     } else {
         debug!(
             "memory federation disabled via settings (memory_federation_enabled=false); \
              skipping pull/watch for session {}",
             session_id
+        );
+        crate::claude_session::federation::emit_federation_skip(
+            app_handle,
+            session_id,
+            "disabled",
+            "Memory federation disabled via settings kill-switch.",
         );
         None
     };
