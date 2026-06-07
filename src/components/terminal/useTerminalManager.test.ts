@@ -17,6 +17,7 @@ import { describe, it, expect } from "vitest";
 import type { TerminalInfo } from "@qontinui/shared-types/tauri-events";
 import {
   applyWorkerMark,
+  applyBypassMark,
   reduceCreatedTerminal,
   shouldIngestCreatedTerminal,
   type TerminalTab,
@@ -140,6 +141,16 @@ describe("reduceCreatedTerminal (ingest + dedup)", () => {
     expect(next[0].taskRunId).toBe("task-42");
   });
 
+  it("stamps the drained bypass mark onto the new tab", () => {
+    const next = reduceCreatedTerminal([], createdEvent("b1", "page-a"), undefined, true);
+    expect(next[0].bypassPermissions).toBe(true);
+  });
+
+  it("leaves bypassPermissions undefined when no bypass mark was drained", () => {
+    const next = reduceCreatedTerminal([], createdEvent("p1", "page-a"), undefined);
+    expect(next[0].bypassPermissions).toBeUndefined();
+  });
+
   it("end-to-end: an event for page B while page A is active lands in B's slice only", () => {
     // Two independent page slices (provider lifted ⇒ both mounted at once).
     let pageA: TerminalTab[] = [tab("a1")];
@@ -161,5 +172,36 @@ describe("reduceCreatedTerminal (ingest + dedup)", () => {
 
     expect(pageB.map((t) => t.id)).toEqual(["b1"]); // captured in B
     expect(pageA.map((t) => t.id)).toEqual(["a1"]); // A unchanged, not cleared
+  });
+});
+
+describe("applyBypassMark", () => {
+  it("buffers the mark when the tab record hasn't arrived yet", () => {
+    const tabs = [tab("a"), tab("b")];
+    const result = applyBypassMark(tabs, "ghost");
+    expect(result.buffered).toBe(true);
+    expect(result.tabs).toBe(tabs);
+  });
+
+  it("stamps bypassPermissions onto the matching tab and returns a fresh array", () => {
+    const tabs = [tab("a"), tab("bypass-tab")];
+    const result = applyBypassMark(tabs, "bypass-tab");
+    expect(result.buffered).toBe(false);
+    expect(result.tabs).not.toBe(tabs);
+    expect(result.tabs[1].bypassPermissions).toBe(true);
+    expect(result.tabs[0].bypassPermissions).toBeUndefined();
+  });
+
+  it("is idempotent: re-marking an already-bypass tab returns the same array identity", () => {
+    const tabs = [tab("bypass-tab", { bypassPermissions: true })];
+    const result = applyBypassMark(tabs, "bypass-tab");
+    expect(result.buffered).toBe(false);
+    expect(result.tabs).toBe(tabs);
+  });
+
+  it("does not mutate the input array", () => {
+    const tabs = [tab("bypass-tab")];
+    applyBypassMark(tabs, "bypass-tab");
+    expect(tabs[0].bypassPermissions).toBeUndefined();
   });
 });

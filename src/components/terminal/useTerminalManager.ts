@@ -34,6 +34,19 @@ export interface TerminalTab {
    */
   taskRunId?: string;
   /**
+   * True when the PTY child runs Claude with tool permissions bypassed
+   * (`--dangerously-skip-permissions` or `--permission-mode bypassPermissions`).
+   * Set from the Rust `terminal-bypass-permissions` event, which the runner
+   * emits (after `terminal-created`) when it command-sniffs a bypass flag on
+   * the spawn command. Threaded into `useSessionStateTracking` →
+   * `detectSessionState` so approval-shaped TTY patterns are suppressed for
+   * these sessions — a bypass session can never await tool approval, so any
+   * approval-shaped match is a phantom (the 12-min `rm -rf` misread,
+   * 2026-06-07; see `sessionStateDetector.ts`). Absent/false on every
+   * non-bypass tab.
+   */
+  bypassPermissions?: boolean;
+  /**
    * Marks a tab synthesized from a debug-gated test-fixtures `injected_tab`
    * spec (`syntheticTabs.ts`). Synthetic tabs are fed ONLY to
    * `useSessionStateTracking` + `useSessionManager` for StatusStrip
@@ -92,7 +105,9 @@ export function shouldIngestCreatedTerminal(
  * Pure helper: fold a `terminal-created` payload into the existing tab list.
  * Returns the next tabs array — the SAME identity when the terminal already
  * exists (dedup), otherwise a new array with the tab appended. `pendingTaskRunId`
- * is the worker mark drained from the race buffer by the caller (or `undefined`).
+ * is the worker mark drained from the race buffer by the caller (or `undefined`);
+ * `pendingBypass` is the bypass-permissions mark drained the same way (a
+ * `terminal-bypass-permissions` event that arrived before this `terminal-created`).
  *
  * Exported so `useTerminalManager.test.ts` can drive the ingest + dedup contract
  * without booting React.
@@ -101,6 +116,7 @@ export function reduceCreatedTerminal(
   tabs: TerminalTab[],
   info: TerminalInfo,
   pendingTaskRunId: string | undefined,
+  pendingBypass = false,
 ): TerminalTab[] {
   if (tabs.some((t) => t.id === info.id)) return tabs;
   return [
@@ -114,6 +130,7 @@ export function reduceCreatedTerminal(
       workingDir: info.workingDir || undefined,
       createdAt: info.createdAt,
       taskRunId: pendingTaskRunId,
+      bypassPermissions: pendingBypass || undefined,
     },
   ];
 }
@@ -140,6 +157,29 @@ export function applyWorkerMark(
   return { tabs: next, buffered: false };
 }
 
+/**
+ * Pure helper: decide whether `tabs` should be replaced when applying a
+ * bypass-permissions mark for `terminalId`. Returns the next tabs array (same
+ * identity if no change), and a `buffered` flag the caller uses to record the
+ * mark in `pendingBypassMarks` when the tab record hasn't arrived yet.
+ *
+ * Mirrors `applyWorkerMark` — the `terminal-bypass-permissions` event can
+ * arrive before OR after `terminal-created` lands the tab in React state.
+ * Exported so `useTerminalManager.test.ts` can drive the race-safety +
+ * idempotency contract without booting React.
+ */
+export function applyBypassMark(
+  tabs: TerminalTab[],
+  terminalId: string,
+): { tabs: TerminalTab[]; buffered: boolean } {
+  const idx = tabs.findIndex((t) => t.id === terminalId);
+  if (idx < 0) return { tabs, buffered: true };
+  if (tabs[idx].bypassPermissions === true) return { tabs, buffered: false };
+  const next = tabs.slice();
+  next[idx] = { ...tabs[idx], bypassPermissions: true };
+  return { tabs: next, buffered: false };
+}
+
 // `TerminalInfo` is imported from `@qontinui/shared-types/tauri-events` —
 // generated from the canonical Rust struct in
 // `qontinui-schemas/rust/src/terminal.rs`. Field names are camelCase via
@@ -160,12 +200,30 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
    * buffer is the simplest race-safe shape.
    */
   const pendingWorkerMarks = useRef<Map<string, string>>(new Map());
+  /**
+   * Bypass-permissions marks (`terminalId`) received from the Rust
+   * `terminal-bypass-permissions` event before their tab record exists in
+   * React state. Same race shape as `pendingWorkerMarks`: the event is emitted
+   * right after `terminal-created`, but arrival order at the webview is not
+   * strictly guaranteed (and reconnect rebuilds tabs without re-firing it).
+   */
+  const pendingBypassMarks = useRef<Set<string>>(new Set());
 
   const markAsWorker = useCallback((terminalId: string, taskRunId: string) => {
     setTabs((prev) => {
       const result = applyWorkerMark(prev, terminalId, taskRunId);
       if (result.buffered) {
         pendingWorkerMarks.current.set(terminalId, taskRunId);
+      }
+      return result.tabs;
+    });
+  }, []);
+
+  const markAsBypass = useCallback((terminalId: string) => {
+    setTabs((prev) => {
+      const result = applyBypassMark(prev, terminalId);
+      if (result.buffered) {
+        pendingBypassMarks.current.add(terminalId);
       }
       return result.tabs;
     });
@@ -193,8 +251,12 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
       if (pendingTaskRunId !== undefined) {
         pendingWorkerMarks.current.delete(info.id);
       }
+      const pendingBypass = pendingBypassMarks.current.has(info.id);
+      if (pendingBypass) {
+        pendingBypassMarks.current.delete(info.id);
+      }
       setTabs((prev) => {
-        const next = reduceCreatedTerminal(prev, info, pendingTaskRunId);
+        const next = reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass);
         if (next !== prev) {
           logger.info(`External terminal created: ${info.id} (${info.title}) [page ${pageId}]`);
         }
@@ -226,6 +288,27 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
       unlisten?.();
     };
   }, [markAsWorker]);
+
+  // Bypass-aware needs-input detection (plan
+  // `2026-06-07-runner-continuation-defer-and-phantom-needs-input.md`).
+  // The Rust `TerminalManager::create` emits `terminal-bypass-permissions`
+  // (after `terminal-created`) when the spawn command implies bypassed tool
+  // permissions; marking the tab here lets `useSessionStateTracking` skip
+  // approval-shaped TTY patterns for it (those can only ever be phantoms on a
+  // bypass session).
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    listen<{ id: string }>("terminal-bypass-permissions", (event) => {
+      const { id } = event.payload;
+      if (!id) return;
+      markAsBypass(id);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [markAsBypass]);
 
   /**
    * Reconnect to existing Rust PTY sessions that survived a React remount.
@@ -441,5 +524,6 @@ export function useTerminalManager(pageId: string = "default", windowLabel: stri
     reconnectToExistingSessions,
     markReconnected,
     markAsWorker,
+    markAsBypass,
   };
 }
