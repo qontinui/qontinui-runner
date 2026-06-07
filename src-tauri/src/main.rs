@@ -565,6 +565,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS). Same machine-
                 // wide, anonymous, device-keyed posture as the census.
                 agent_worktree::reclaim::spawn_reclaim();
+                // Scheduled-maintenance executor (Phase 1, plan
+                // 2026-06-08-coord-scheduled-maintenance-subsystem) — a
+                // sibling of the reclaim pull-loop. Periodically pulls
+                // coord's pending per-device maintenance instructions
+                // (GET /coord/maintenance/instructions/:device_id) and
+                // executes the `checkout_main_ff_pull` branch-reset action,
+                // re-checking the safety floor (clean + same branch +
+                // ancestor-of-origin-default) on the live disk first.
+                // Per-instruction `armed` defaults OFF → log-only dry-run
+                // ("[maintenance dry-run] would reset …"); coord arms it
+                // under COORD_MAINTENANCE_ENABLED. A real reset reports via
+                // the git_ops record path; ack is the next census. Default
+                // 300s cadence (env QONTINUI_MAINTENANCE_INTERVAL_SECS).
+                // Same machine-wide, anonymous, device-keyed identity as
+                // the reclaim poller (census::{load_device_id,coord_http_base}).
+                agent_worktree::maintenance_executor::spawn_maintenance();
                 // Ξ_FS backstop (Phase 5) — a defense-in-depth DETECTOR for
                 // edits that leaked OUTSIDE any session worktree. Periodically
                 // scans the SHARED canonical checkouts; alarms (POST

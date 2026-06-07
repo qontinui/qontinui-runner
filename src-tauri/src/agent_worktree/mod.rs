@@ -63,6 +63,7 @@ pub mod edit_effect_loop;
 pub mod fs_backstop;
 pub mod fs_observer;
 pub mod isolated_edit;
+pub mod maintenance_executor;
 pub mod reclaim;
 
 /// Env var that turns the new spawn path on. Default off — `feature
