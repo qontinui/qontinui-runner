@@ -647,6 +647,21 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "commit_report" => {
+            // Commit ↔ session lineage push-report (plan
+            // 2026-06-07-coord-commit-session-lineage.md, Population path 2).
+            // Body is the payload verbatim ({repo, branch, shas}); coord
+            // resolves the session server-side from (repo, branch). Tenant
+            // comes from the X-Qontinui-Tenant-Id header (post_device_register
+            // posture) — mirror `rebuild_create_body`'s machine.json resolve.
+            let url = format!("{base}/coord/commits/report");
+            let mut rb =
+                crate::auth::attach_device_auth(inner.http.post(&url).json(&rec.payload));
+            if let Some(tid) = crate::session::dual_write::resolve_active_tenant_id() {
+                rb = rb.header("X-Qontinui-Tenant-Id", tid.to_string());
+            }
+            rb.send().await
+        }
         other => {
             // OutputChunk + HandoffRequest are Phase 7/8 — defined now
             // for wire shape, not pushed yet. Quietly ACK so the file

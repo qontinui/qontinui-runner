@@ -4,6 +4,7 @@
 //! Each session spawns a native shell (PowerShell on Windows, $SHELL on Unix)
 //! with proper environment for running Claude CLI and other dev tools.
 
+pub mod commit_report;
 pub mod coord_warn;
 pub mod grid;
 pub mod interceptor;
