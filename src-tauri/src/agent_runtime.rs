@@ -1146,16 +1146,62 @@ fn live_terminal_predicate() -> impl Fn(&str) -> bool {
     }
 }
 
-/// Log the existing live continuation tab a duplicate-anchor dispatch was
-/// folded onto (P3). There is no runner-wired "focus this tab" event today
-/// (the tab strip listens to none), so this is a deliberate no-op-plus-log:
-/// the operator already has the live continuation docked in `main`, and the
-/// duplicate is dropped rather than opening a second identical session.
+/// Tauri event the frontend listens for to surface a continuation terminal:
+/// switch the main view to the Terminal panel and select the target tab.
+const EVENT_TERMINAL_FOCUS_REQUEST: &str = "terminal-focus-request";
+
+/// Payload for [`EVENT_TERMINAL_FOCUS_REQUEST`]. `terminal_id` is the session
+/// the frontend should select; the App-level listener also switches the main
+/// view to the Terminal panel.
+#[derive(Serialize)]
+struct TerminalFocusRequest<'a> {
+    terminal_id: &'a str,
+}
+
+/// Emit a `terminal-focus-request` to the MAIN window only.
+///
+/// Uses `emit_to(get_main_window_label(), …)` — NOT the bare global `emit`
+/// (the `terminal-created` broadcast pattern) — so a pop-out webview is not
+/// yanked to this tab. The canonical main-window-label accessor
+/// (`qontinui_runner_lib::get_main_window_label()`, returns `"main"`) matches
+/// the #473 `ui-bridge:invoke-request` scoping.
+fn emit_terminal_focus_request(app: &tauri::AppHandle, terminal_id: &str) {
+    use tauri::Emitter;
+    let payload = TerminalFocusRequest { terminal_id };
+    if let Err(e) = app.emit_to(
+        qontinui_runner_lib::get_main_window_label(),
+        EVENT_TERMINAL_FOCUS_REQUEST,
+        &payload,
+    ) {
+        warn!(
+            "agent_runtime: failed to emit {EVENT_TERMINAL_FOCUS_REQUEST} for \
+             terminal_id={terminal_id}: {e}"
+        );
+    }
+}
+
+/// Bring the existing live continuation tab a duplicate-anchor dispatch was
+/// folded onto (P3) to focus. Emits the SAME `terminal-focus-request` event as
+/// a fresh continuation so the operator sees the live session rather than
+/// nothing happening. Acquires the process-global `AppHandle`; in a headless /
+/// unit-test context (no Tauri runtime) it debug-logs and returns.
 fn focus_existing_continuation(terminal_id: &str) {
-    debug!(
-        "agent_runtime: duplicate continuation folded onto existing live \
-         terminal_id={terminal_id} (already docked in main)"
-    );
+    match crate::tauri_app_handle::current() {
+        Some(app) => {
+            debug!(
+                "agent_runtime: duplicate continuation folded onto existing live \
+                 terminal_id={terminal_id} — emitting focus-request"
+            );
+            emit_terminal_focus_request(&app, terminal_id);
+        }
+        None => {
+            debug!(
+                "agent_runtime: duplicate continuation folded onto existing live \
+                 terminal_id={terminal_id} but no Tauri AppHandle (headless) — \
+                 cannot emit focus-request"
+            );
+        }
+    }
 }
 
 /// Shared dispatch seam for BOTH the WS fast-path and the poll backstop.
@@ -1751,6 +1797,14 @@ async fn run_continuation_terminal(
                  terminal_id={terminal_id} coord_session={coord_session_id:?} \
                  agent_id={agent_id}"
             );
+            // Surface the freshly-created continuation to the operator: emit a
+            // `terminal-focus-request` so the frontend (a) switches the main view
+            // to the Terminal panel and (b) selects this tab. Without this the tab
+            // is appended off-screen / un-selected and the operator sees nothing.
+            // SCOPED to the MAIN window (`emit_to`, NOT bare `emit`) so a pop-out
+            // window is not yanked to this tab — `terminal-created` is a global
+            // broadcast, but a focus action must target only `main`.
+            emit_terminal_focus_request(&app, &terminal_id);
             report_spawn_complete(agent_id, None, Some("gate continuation (terminal)")).await;
             Ok(())
         }
@@ -2571,6 +2625,28 @@ mod tests {
         assert_eq!(round_tripped.worktrees.len(), 1);
         assert_eq!(round_tripped.worktrees[0].repo, "qontinui-runner");
         assert_eq!(round_tripped.plan_phase, Some(4));
+    }
+
+    #[test]
+    fn terminal_focus_request_serializes_with_terminal_id() {
+        // The frontend listens for `terminal-focus-request { terminal_id }`
+        // and selects that tab / switches the main view. Lock the wire shape
+        // (snake_case `terminal_id`) so a serde rename can't silently break the
+        // auto-surface contract.
+        let payload = TerminalFocusRequest {
+            terminal_id: "term-abc-123",
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(v, serde_json::json!({ "terminal_id": "term-abc-123" }));
+        assert_eq!(EVENT_TERMINAL_FOCUS_REQUEST, "terminal-focus-request");
+    }
+
+    #[test]
+    fn focus_existing_continuation_is_safe_headless() {
+        // In a headless/unit-test context there is no Tauri AppHandle, so
+        // `focus_existing_continuation` must debug-log and return rather than
+        // panic — the duplicate-anchor guard calls it unconditionally.
+        focus_existing_continuation("term-headless-noop");
     }
 
     #[test]

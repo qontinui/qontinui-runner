@@ -95,6 +95,7 @@ import { getGlobalRegistry } from "@qontinui/ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
 import { ACTIVE_TAB_STORAGE_KEY, TAB_LIST } from "@/components/app/tab-types";
 import { toTabCanonical } from "@/hooks/ui-bridge-events/utils";
+import { acquireSingletonListener } from "@/hooks/ui-bridge-events/singleton-listener";
 
 import {
   NavigationProvider,
@@ -370,6 +371,30 @@ function AppContent() {
     return cleanup;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- one-time setup; setters are stable useState dispatchers accessed via context object
   }, []);
+
+  // Auto-surface gate-continuation terminal sessions. The Rust side emits
+  // `terminal-focus-request { terminal_id }` (scoped to the MAIN window via
+  // `emit_to`) right after creating a docked continuation (or when a duplicate-
+  // anchor dispatch is folded onto a live tab). This App-level listener owns
+  // the MAIN-VIEW switch (`setActiveTab("terminal")`) — the only setter that
+  // brings the Terminal panel on-screen, and reachable only here. The
+  // complementary TAB SELECTION (`setActiveId(terminal_id)`) is driven inside
+  // the per-page `useTerminalManager` (it owns `activeId`) on the
+  // `terminal-created` event it already receives — so the two setters each stay
+  // at the level that owns them, no cross-level prop threading.
+  //
+  // Wired via the #482 `acquireSingletonListener` primitive (ref-counted,
+  // StrictMode-safe, race-safe teardown) — NOT a hand-rolled `useEffect` +
+  // `listen()`, which leaks listeners on StrictMode double-mount.
+  useEffect(() => {
+    const release = acquireSingletonListener<{ terminal_id: string }>(
+      "terminal-focus-request",
+      () => {
+        setActiveTab("terminal");
+      },
+    );
+    return release;
+  }, [setActiveTab]);
 
   useEffect(() => {
     if (activeTab === "logs" && activeLogSubTab === "actions") {
