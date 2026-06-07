@@ -70,11 +70,29 @@ pub struct EvaluateResponse {
     pub error: Option<String>,
 }
 
+/// Build the evaluate-store map key.
+///
+/// Keying by `(window_label, request_id)` rather than `request_id` alone makes a
+/// `ui-bridge:evaluate-response` from a window the request was NOT addressed to a
+/// no-op (its computed key can't match the stored one). This is what stops the
+/// process-global `ui-bridge:evaluate-request` broadcast race once multiple
+/// runner windows (main + `term-N` pop-outs) mount the SDK — without it, the
+/// first window to answer resolves the oneshot and every other window still runs
+/// the expression (so an evaluate that clicks a button fires N times).
+///
+/// `request_id` is a UUID, so the U+001F delimiter can never collide with a
+/// (simple `main` / `term-N`) window label. Mirrors
+/// [`crate::mcp::ui_bridge::request::pending_key`] so the two pending stores
+/// share one key shape.
+pub fn evaluate_pending_key(window_label: &str, request_id: &str) -> String {
+    format!("{window_label}\u{1f}{request_id}")
+}
+
 /// Keyed store of pending oneshot senders — one per in-flight evaluate.
 ///
-/// Multiple evaluates can be in-flight at once; the HashMap is keyed by a
-/// fresh uuid-v4 `request_id` so concurrent callers never observe each
-/// other's responses.
+/// Multiple evaluates can be in-flight at once; the HashMap is keyed by
+/// `(window_label, request_id)` (see [`evaluate_pending_key`]) so concurrent
+/// callers — and concurrent windows — never observe each other's responses.
 pub struct EvaluateRequestStore {
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<EvaluateResponse>>>>,
 }
@@ -92,28 +110,40 @@ impl EvaluateRequestStore {
         }
     }
 
-    /// Register a new pending evaluate.
+    /// Register a new pending evaluate, scoped to a target window.
     ///
     /// Takes ownership of the oneshot sender and stashes it under
-    /// `request_id`. If an entry for that id already exists (shouldn't
-    /// happen with uuid v4, but defensive), it is silently replaced —
-    /// the prior waiter will observe a dropped-sender error via
-    /// `Receiver::await`.
-    pub async fn register(&self, request_id: String, sender: oneshot::Sender<EvaluateResponse>) {
+    /// `(window_label, request_id)` (see [`evaluate_pending_key`]). If an entry
+    /// for that key already exists (shouldn't happen with uuid v4, but
+    /// defensive), it is silently replaced — the prior waiter will observe a
+    /// dropped-sender error via `Receiver::await`.
+    pub async fn register(
+        &self,
+        window_label: &str,
+        request_id: &str,
+        sender: oneshot::Sender<EvaluateResponse>,
+    ) {
         let mut guard = self.pending.lock().await;
-        guard.insert(request_id, sender);
+        guard.insert(evaluate_pending_key(window_label, request_id), sender);
     }
 
-    /// Deliver a response to a pending evaluate by id.
+    /// Deliver a response to a pending evaluate by `(window_label, request_id)`.
     ///
     /// Removes the entry from the map and sends the response through the
-    /// oneshot. If the receiver has already been dropped (e.g. the HTTP
-    /// handler timed out and bailed), the response is silently discarded —
-    /// this mirrors the "best effort" semantics of oneshot channels.
-    /// Returns `true` if a pending entry existed for this id.
-    pub async fn deliver(&self, request_id: &str, response: EvaluateResponse) -> bool {
+    /// oneshot. A response from a window the request was NOT addressed to
+    /// computes a key that isn't present, so it's a no-op — exactly what kills
+    /// the broadcast race. If the receiver has already been dropped (e.g. the
+    /// HTTP handler timed out and bailed), the response is silently discarded —
+    /// this mirrors the "best effort" semantics of oneshot channels. Returns
+    /// `true` if a pending entry existed for this key.
+    pub async fn deliver(
+        &self,
+        window_label: &str,
+        request_id: &str,
+        response: EvaluateResponse,
+    ) -> bool {
         let mut guard = self.pending.lock().await;
-        if let Some(sender) = guard.remove(request_id) {
+        if let Some(sender) = guard.remove(&evaluate_pending_key(window_label, request_id)) {
             let _ = sender.send(response);
             true
         } else {
@@ -125,9 +155,9 @@ impl EvaluateRequestStore {
     ///
     /// Called by the HTTP handler on timeout / emit failure so a subsequent
     /// late response doesn't linger in the map.
-    pub async fn cancel(&self, request_id: &str) {
+    pub async fn cancel(&self, window_label: &str, request_id: &str) {
         let mut guard = self.pending.lock().await;
-        guard.remove(request_id);
+        guard.remove(&evaluate_pending_key(window_label, request_id));
     }
 
     /// Snapshot of the pending entry count — useful for tests and for
@@ -143,18 +173,38 @@ impl EvaluateRequestStore {
 mod tests {
     use super::*;
 
+    // Default window label used by the single-window evaluate path. Kept
+    // local to the test module so the test file doesn't reach across crates
+    // for the `MAIN_WINDOW_LABEL` constant.
+    const MAIN: &str = "main";
+
+    #[test]
+    fn evaluate_pending_key_is_distinct_per_window_for_same_request_id() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        // Same request id in two windows must NOT collide on the store.
+        assert_ne!(
+            evaluate_pending_key("main", id),
+            evaluate_pending_key("term-1", id)
+        );
+        // Same (window, id) is stable so register and deliver agree.
+        assert_eq!(
+            evaluate_pending_key("main", id),
+            evaluate_pending_key("main", id)
+        );
+    }
+
     #[tokio::test]
     async fn register_and_deliver_round_trip() {
         let store = EvaluateRequestStore::new();
         let (tx, rx) = oneshot::channel();
-        store.register("req-1".to_string(), tx).await;
+        store.register(MAIN, "req-1", tx).await;
 
         let response = EvaluateResponse {
             ok: true,
             result: Some(serde_json::json!({ "result": { "value": 42 } })),
             error: None,
         };
-        assert!(store.deliver("req-1", response.clone()).await);
+        assert!(store.deliver(MAIN, "req-1", response.clone()).await);
 
         let received = rx.await.expect("receiver should observe sent value");
         assert!(received.ok);
@@ -167,6 +217,7 @@ mod tests {
         let store = EvaluateRequestStore::new();
         let delivered = store
             .deliver(
+                MAIN,
                 "does-not-exist",
                 EvaluateResponse {
                     ok: true,
@@ -179,17 +230,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deliver_to_wrong_window_is_noop_and_leaves_entry_pending() {
+        // The central multi-window regression: window A registers a request,
+        // and a response that echoes a DIFFERENT window label must NOT resolve
+        // it (that's the broadcast race — every window runs the same eval and
+        // the first reply wins). Only the addressed window's response resolves.
+        let store = EvaluateRequestStore::new();
+        let (tx, _rx) = oneshot::channel();
+        store.register("term-1", "req-w", tx).await;
+        assert_eq!(store.pending_len().await, 1);
+
+        // A reply tagged with the wrong window label must be a no-op...
+        let wrong = store
+            .deliver(
+                "main",
+                "req-w",
+                EvaluateResponse {
+                    ok: true,
+                    result: Some(serde_json::json!("from-main")),
+                    error: None,
+                },
+            )
+            .await;
+        assert!(!wrong, "wrong-window reply must not resolve the request");
+        assert_eq!(
+            store.pending_len().await,
+            1,
+            "entry must still be pending after a wrong-window reply"
+        );
+
+        // ...but the addressed window's reply resolves it.
+        let right = store
+            .deliver(
+                "term-1",
+                "req-w",
+                EvaluateResponse {
+                    ok: true,
+                    result: Some(serde_json::json!("from-term-1")),
+                    error: None,
+                },
+            )
+            .await;
+        assert!(right, "addressed-window reply must resolve the request");
+        assert_eq!(store.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn same_request_id_in_two_windows_is_independent() {
+        // Two windows can legitimately mint the same request id (the broadcast
+        // emit hands every window the same envelope). The composite key keeps
+        // their oneshots independent — each window's reply resolves only its own.
+        let store = EvaluateRequestStore::new();
+        let (tx_main, rx_main) = oneshot::channel();
+        let (tx_term, rx_term) = oneshot::channel();
+        store.register("main", "shared-id", tx_main).await;
+        store.register("term-1", "shared-id", tx_term).await;
+        assert_eq!(store.pending_len().await, 2);
+
+        assert!(
+            store
+                .deliver(
+                    "term-1",
+                    "shared-id",
+                    EvaluateResponse {
+                        ok: true,
+                        result: Some(serde_json::json!("term")),
+                        error: None,
+                    },
+                )
+                .await
+        );
+
+        // term-1's receiver resolved; main is still pending.
+        assert_eq!(
+            rx_term.await.expect("term receiver resolves").result,
+            Some(serde_json::json!("term"))
+        );
+        assert_eq!(store.pending_len().await, 1);
+
+        assert!(
+            store
+                .deliver(
+                    "main",
+                    "shared-id",
+                    EvaluateResponse {
+                        ok: true,
+                        result: Some(serde_json::json!("main")),
+                        error: None,
+                    },
+                )
+                .await
+        );
+        assert_eq!(
+            rx_main.await.expect("main receiver resolves").result,
+            Some(serde_json::json!("main"))
+        );
+        assert_eq!(store.pending_len().await, 0);
+    }
+
+    #[tokio::test]
     async fn cancel_removes_entry_so_late_deliver_is_noop() {
         let store = EvaluateRequestStore::new();
         let (tx, _rx) = oneshot::channel();
-        store.register("req-2".to_string(), tx).await;
+        store.register(MAIN, "req-2", tx).await;
         assert_eq!(store.pending_len().await, 1);
 
-        store.cancel("req-2").await;
+        store.cancel(MAIN, "req-2").await;
         assert_eq!(store.pending_len().await, 0);
 
         let delivered = store
             .deliver(
+                MAIN,
                 "req-2",
                 EvaluateResponse {
                     ok: false,
@@ -205,14 +356,14 @@ mod tests {
     async fn error_response_round_trip() {
         let store = EvaluateRequestStore::new();
         let (tx, rx) = oneshot::channel();
-        store.register("req-3".to_string(), tx).await;
+        store.register(MAIN, "req-3", tx).await;
 
         let response = EvaluateResponse {
             ok: false,
             result: None,
             error: Some("SyntaxError: Unexpected token".to_string()),
         };
-        assert!(store.deliver("req-3", response.clone()).await);
+        assert!(store.deliver(MAIN, "req-3", response.clone()).await);
         let received = rx.await.expect("receiver should observe error value");
         assert!(!received.ok);
         assert_eq!(received.error, response.error);
@@ -230,8 +381,8 @@ mod tests {
 
         let (tx_a, rx_a) = oneshot::channel();
         let (tx_b, rx_b) = oneshot::channel();
-        store.register("req-a".to_string(), tx_a).await;
-        store.register("req-b".to_string(), tx_b).await;
+        store.register(MAIN, "req-a", tx_a).await;
+        store.register(MAIN, "req-b", tx_b).await;
         assert_eq!(store.pending_len().await, 2);
 
         // Deliver B first, then A — exercises that arrival order doesn't
@@ -240,6 +391,7 @@ mod tests {
         let deliver_b = tokio::spawn(async move {
             store_b
                 .deliver(
+                    MAIN,
                     "req-b",
                     EvaluateResponse {
                         ok: true,
@@ -254,6 +406,7 @@ mod tests {
         let deliver_a = tokio::spawn(async move {
             store_a
                 .deliver(
+                    MAIN,
                     "req-a",
                     EvaluateResponse {
                         ok: true,

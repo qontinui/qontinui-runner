@@ -11,12 +11,12 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
+use tauri::{Emitter, EventTarget};
 use tracing::{debug, error, info};
 
 use super::types::UiBridgeError;
@@ -24,7 +24,10 @@ use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
 use super::helpers::{direct_webview_evaluate_with_result, evaluate_js_expression, safe_evaluate};
-use super::request::{ui_bridge_request_sync, wrap_ipc_result};
+use super::request::{
+    multi_window_dispatch_enabled, ui_bridge_request_sync, wrap_ipc_result, MAIN_WINDOW_LABEL,
+    TARGET_WINDOW_FIELD,
+};
 use super::{ipc_handler_get, ipc_handler_post};
 
 // Macro-generated IPC forwarders for SDK-relayed page-control routes.
@@ -168,6 +171,26 @@ pub struct PageEvaluateRequest {
     /// directly. Structural code-injection blocks stay in force regardless.
     #[serde(default)]
     pub allow_network_requests: Option<bool>,
+    /// Optional target pop-out window (`{ "windowLabel": "term-1" }`),
+    /// mirroring `execute_action` / `get_elements`. Absent / empty → the main
+    /// window. A `?windowLabel=` query param takes precedence over this body
+    /// field (see [`EvaluateQueryParams`]). Without this, `page/evaluate`
+    /// broadcasts the expression to every open runner window.
+    #[serde(default)]
+    pub window_label: Option<String>,
+}
+
+/// Optional query parameters for `page/evaluate`.
+///
+/// `?windowLabel=term-1` targets a pop-out terminal window (discoverable via
+/// `GET /ui-bridge/control/runner-windows`). Omitted → the main window. Mirrors
+/// [`super::elements::ActionQueryParams`] so the routing convention is identical
+/// across control routes. A query param takes precedence over the body's
+/// `windowLabel` so a caller can address a window without rewriting the body.
+#[derive(Debug, Deserialize, Default)]
+pub struct EvaluateQueryParams {
+    #[serde(default, rename = "windowLabel")]
+    pub window_label: Option<String>,
 }
 
 impl RequestHints for PageEvaluateRequest {
@@ -708,6 +731,17 @@ const DEFAULT_PAGE_EVALUATE_TIMEOUT_MS: u64 = 10_000;
 /// Dispatch a page/evaluate request over the tagged
 /// `ui-bridge:evaluate-request` / `ui-bridge:evaluate-response` event pair,
 /// correlating the response through [`EvaluateRequestStore`].
+///
+/// `window_label` is the resolved target window ([`MAIN_WINDOW_LABEL`] for the
+/// single-window default). The request is registered under
+/// `(window_label, request_id)` and the emit is scoped to that window only via
+/// `emit_to(EventTarget::labeled(window_label), …)` (so a `page/evaluate` no
+/// longer fires the expression in every open window). Delivery is authoritative
+/// on the Rust side: unlike the bare `Emitter::emit`, which broadcasts to ALL
+/// targets, `emit_to` is filtered down to the listener registered under that
+/// label. The emitted payload still carries `windowLabel` so the frontend
+/// evaluate listener can additionally ignore any event not addressed to its own
+/// `getCurrentWindow().label` (defense-in-depth, no longer load-bearing).
 async fn tagged_page_evaluate(
     state: &Arc<ApiState>,
     expression: &str,
@@ -715,17 +749,33 @@ async fn tagged_page_evaluate(
     timeout_ms: Option<u64>,
     unwrap: bool,
     allow_network_requests: bool,
+    window_label: &str,
 ) -> Result<serde_json::Value, String> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_PAGE_EVALUATE_TIMEOUT_MS);
     let request_id = uuid::Uuid::new_v4().to_string();
 
+    // Fail fast for a non-existent target window — mirrors the guard in
+    // `request::ui_bridge_request_inner`. Without it, the emit lands on a window
+    // every listener filters out by label, so the caller waits the full timeout
+    // for a request nothing can answer. The main window always exists, so the
+    // default path skips the lookup.
+    if window_label != MAIN_WINDOW_LABEL {
+        use tauri::Manager;
+        if state.app_handle.get_webview_window(window_label).is_none() {
+            return Err(format!(
+                "No runner window labeled '{window_label}'. Discover live windows via \
+                 GET /ui-bridge/control/runner-windows."
+            ));
+        }
+    }
+
     let (sender, receiver) = tokio::sync::oneshot::channel();
     state
         .ui_bridge_evaluate_store
-        .register(request_id.clone(), sender)
+        .register(window_label, &request_id, sender)
         .await;
 
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "request_id": request_id,
         "expression": expression,
         "await_promise": await_promise,
@@ -740,19 +790,55 @@ async fn tagged_page_evaluate(
         // convention (await_promise / timeout_ms / request_id).
         "allow_network_requests": allow_network_requests,
     });
+    // The frontend evaluate listener filters on `windowLabel` against its own
+    // `getCurrentWindow().label`; it also echoes it back on the
+    // `ui-bridge:evaluate-response` so the store delivers under the same
+    // `(window_label, request_id)` key it was registered with. Use the shared
+    // `TARGET_WINDOW_FIELD` constant (camelCase `windowLabel`) so the routing
+    // field name can't drift from the other control routes.
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            TARGET_WINDOW_FIELD.to_string(),
+            serde_json::Value::String(window_label.to_string()),
+        );
+    }
 
-    // Target the canonical MAIN window only. `AppHandle::emit` is a GLOBAL
-    // broadcast that reaches every webview (main + pop-out `term-N`
-    // terminals); each window's `useUIBridgeEvaluateHandler` would then run
-    // the expression independently, fanning out a single-consumer request to
-    // N windows (duplicate side-effecting invokes). `emit_to(<main label>)`
-    // routes it to exactly one deterministic consumer.
-    if let Err(e) = state.app_handle.emit_to(
-        qontinui_runner_lib::get_main_window_label(),
-        "ui-bridge:evaluate-request",
-        &payload,
-    ) {
-        state.ui_bridge_evaluate_store.cancel(&request_id).await;
+    // Route the emit to the target window ONLY (Phase 1 multi-window dispatch),
+    // honoring the same `QONTINUI_UI_BRIDGE_MULTI_WINDOW` flag as the main IPC
+    // path.
+    //
+    // ROOT-CAUSE NOTE: `WebviewWindow::emit` / `AppHandle::emit` (the `Emitter`
+    // trait's default `emit`) deliver to ALL targets — they are NOT scoped to
+    // the receiver. The previous `get_webview_window(label).emit(...)` therefore
+    // broadcast the expression to every open window, and single-window behavior
+    // depended entirely on each window's frontend own-label filter. That filter
+    // is kept as defense-in-depth, but it is no longer load-bearing: scope the
+    // delivery on the Rust side with `emit_to(EventTarget::labeled(label), …)`,
+    // which the runtime filters down to the listener registered under that label
+    // (a webview `listen()` registers as `WebviewWindow { label }`, matched by
+    // `AnyLabel`). Now an eval that clicks a button fires in ONE window only,
+    // even if a pop-out's frontend filter were ever wrong.
+    //
+    // When the flag is off we fall back to the legacy process-global broadcast
+    // (the frontend own-label filter is then the only scoping), preserving the
+    // documented escape hatch.
+    let emit_result = if multi_window_dispatch_enabled() {
+        state.app_handle.emit_to(
+            EventTarget::labeled(window_label),
+            "ui-bridge:evaluate-request",
+            &payload,
+        )
+    } else {
+        state
+            .app_handle
+            .emit("ui-bridge:evaluate-request", &payload)
+    };
+
+    if let Err(e) = emit_result {
+        state
+            .ui_bridge_evaluate_store
+            .cancel(window_label, &request_id)
+            .await;
         return Err(format!("Failed to emit ui-bridge:evaluate-request: {}", e));
     }
 
@@ -784,14 +870,20 @@ async fn tagged_page_evaluate(
             }
         }
         Ok(Err(_)) => {
-            state.ui_bridge_evaluate_store.cancel(&request_id).await;
+            state
+                .ui_bridge_evaluate_store
+                .cancel(window_label, &request_id)
+                .await;
             Err(format!(
                 "page/evaluate: response channel closed before delivery (request_id={})",
                 request_id
             ))
         }
         Err(_) => {
-            state.ui_bridge_evaluate_store.cancel(&request_id).await;
+            state
+                .ui_bridge_evaluate_store
+                .cancel(window_label, &request_id)
+                .await;
             Err(format!(
                 "UI Bridge page_evaluate timed out after {}ms",
                 timeout_ms
@@ -807,9 +899,13 @@ async fn page_evaluate_inner(
     await_promise: bool,
     unwrap: bool,
     allow_network_requests: bool,
+    window_label: &str,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let preview: String = expression.chars().take(80).collect();
-    info!("UI Bridge API: Page evaluate ({}...)", preview);
+    info!(
+        "UI Bridge API: Page evaluate (window={}, {}...)",
+        window_label, preview
+    );
 
     let ipc_result = tagged_page_evaluate(
         &state,
@@ -818,6 +914,7 @@ async fn page_evaluate_inner(
         timeout_ms,
         unwrap,
         allow_network_requests,
+        window_label,
     )
     .await;
     match ipc_result {
@@ -844,8 +941,32 @@ async fn page_evaluate_inner(
             Ok(Json(ApiResponse::success(data)))
         }
         Err(ipc_err) => {
+            // The `direct_webview_evaluate_with_result` fallback below targets
+            // the MAIN window only (see helpers.rs). Falling back to it for a
+            // request addressed to a *non-main* window is wrong on two counts:
+            //
+            //  1. An unknown-window fail-fast (e.g. `?windowLabel=ghost`, which
+            //     `tagged_page_evaluate` rejects before emitting) would be
+            //     silently "recovered" by running the expression in main —
+            //     turning a should-have-failed call into a false success. This
+            //     is exactly the `ghost → {success:true}` bug.
+            //  2. Even a genuine IPC/transport failure for a *real* pop-out
+            //     window must NOT be retried against main — that would run the
+            //     caller's expression in the wrong window.
+            //
+            // So the main-only fallback is permitted ONLY when the caller
+            // actually addressed the main window. Any error while addressing a
+            // non-main window propagates verbatim.
+            if window_label != MAIN_WINDOW_LABEL {
+                error!(
+                    "UI Bridge API: evaluate failed for window '{}' (no main-window fallback for a non-main target): {}",
+                    window_label, ipc_err
+                );
+                return Err((StatusCode::BAD_REQUEST, Json(api_error(ipc_err))));
+            }
+
             debug!(
-                "UI Bridge: IPC evaluate failed ({}), trying direct WebView eval",
+                "UI Bridge: IPC evaluate failed for main window ({}), trying direct WebView eval",
                 ipc_err
             );
 
@@ -991,14 +1112,77 @@ mod static_guard_hint_tests {
     }
 }
 
+/// Resolve the effective target window for an evaluate request.
+///
+/// Precedence: `?windowLabel=` query param → body `windowLabel` → the main
+/// window. Empty strings are treated as "not provided" (so `?windowLabel=`
+/// falls through to the body, and an empty body field falls through to main),
+/// matching how [`super::request::split_target_window`] normalizes the field.
+fn resolve_evaluate_window(query: Option<&str>, body: Option<&str>) -> String {
+    query
+        .filter(|s| !s.is_empty())
+        .or_else(|| body.filter(|s| !s.is_empty()))
+        .unwrap_or(MAIN_WINDOW_LABEL)
+        .to_string()
+}
+
+#[cfg(test)]
+mod resolve_evaluate_window_tests {
+    use super::{resolve_evaluate_window, MAIN_WINDOW_LABEL};
+
+    /// Goal behavior 1: with NO `windowLabel` anywhere, an evaluate targets the
+    /// MAIN window — so the dispatcher's `emit_to(EventTarget::labeled("main"))`
+    /// runs the expression in the main window only.
+    #[test]
+    fn no_label_anywhere_resolves_to_main() {
+        assert_eq!(resolve_evaluate_window(None, None), MAIN_WINDOW_LABEL);
+    }
+
+    /// Empty strings are "not provided" — `?windowLabel=` (and an empty body
+    /// field) fall through to main, matching `split_target_window`.
+    #[test]
+    fn empty_strings_fall_through_to_main() {
+        assert_eq!(resolve_evaluate_window(Some(""), None), MAIN_WINDOW_LABEL);
+        assert_eq!(
+            resolve_evaluate_window(Some(""), Some("")),
+            MAIN_WINDOW_LABEL
+        );
+        assert_eq!(resolve_evaluate_window(None, Some("")), MAIN_WINDOW_LABEL);
+    }
+
+    /// Goal behavior 2: `?windowLabel=term-1` targets `term-1` only. The query
+    /// param wins over the body.
+    #[test]
+    fn query_label_wins_and_is_used_verbatim() {
+        assert_eq!(resolve_evaluate_window(Some("term-1"), None), "term-1");
+        assert_eq!(
+            resolve_evaluate_window(Some("term-1"), Some("term-2")),
+            "term-1",
+            "query param must win over the body field"
+        );
+    }
+
+    /// Body `windowLabel` is the fallback when the query param is absent/empty.
+    #[test]
+    fn body_label_is_the_fallback() {
+        assert_eq!(resolve_evaluate_window(None, Some("term-3")), "term-3");
+        assert_eq!(resolve_evaluate_window(Some(""), Some("term-3")), "term-3");
+    }
+}
+
 /// Evaluate a JavaScript expression in the webview.
 pub async fn ui_bridge_page_evaluate_handler(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<EvaluateQueryParams>,
     UiBridgeJson(request): UiBridgeJson<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let timeout = request.timeout_ms.map(|ms| ms.clamp(1000, 600_000));
     let unwrap = request.unwrap.unwrap_or(false);
     let allow_network_requests = request.allow_network_requests.unwrap_or(false);
+    let window_label = resolve_evaluate_window(
+        query.window_label.as_deref(),
+        request.window_label.as_deref(),
+    );
     page_evaluate_inner(
         state,
         request.expression,
@@ -1006,13 +1190,19 @@ pub async fn ui_bridge_page_evaluate_handler(
         request.await_promise,
         unwrap,
         allow_network_requests,
+        &window_label,
     )
     .await
 }
 
 /// `POST /ui-bridge/control/page/evaluate-raw`
+///
+/// The whole body is the JS expression, so the only way to address a pop-out
+/// window here is the `?windowLabel=` query param (the body can't carry a
+/// routing field). Absent / empty → the main window.
 pub async fn ui_bridge_page_evaluate_raw_handler(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<EvaluateQueryParams>,
     body: String,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     if body.trim().is_empty() {
@@ -1021,7 +1211,8 @@ pub async fn ui_bridge_page_evaluate_raw_handler(
             Json(api_error("page/evaluate-raw: body is empty".to_string())),
         ));
     }
-    page_evaluate_inner(state, body, None, false, false, false).await
+    let window_label = resolve_evaluate_window(query.window_label.as_deref(), None);
+    page_evaluate_inner(state, body, None, false, false, false, &window_label).await
 }
 
 /// POST /ui-bridge/control/page/evaluate-safe
@@ -1900,12 +2091,12 @@ mod page_evaluate_tagging_tests {
         // Caller A: evaluates `document.title` → "Runner".
         let request_id_a = "evaluate-call-a".to_string();
         let (tx_a, rx_a) = oneshot::channel::<EvaluateResponse>();
-        store.register(request_id_a.clone(), tx_a).await;
+        store.register("main", &request_id_a, tx_a).await;
 
         // Caller B: evaluates `window.location.pathname` → "/dashboard".
         let request_id_b = "evaluate-call-b".to_string();
         let (tx_b, rx_b) = oneshot::channel::<EvaluateResponse>();
-        store.register(request_id_b.clone(), tx_b).await;
+        store.register("main", &request_id_b, tx_b).await;
 
         // Run both HTTP-handler-equivalent awaits concurrently. Each
         // simulates `tagged_page_evaluate`'s `tokio::time::timeout(..., rx)`.
@@ -1930,6 +2121,7 @@ mod page_evaluate_tagging_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             store_for_b
                 .deliver(
+                    "main",
                     "evaluate-call-b",
                     EvaluateResponse {
                         ok: true,
@@ -1947,6 +2139,7 @@ mod page_evaluate_tagging_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             store_for_a
                 .deliver(
+                    "main",
                     "evaluate-call-a",
                     EvaluateResponse {
                         ok: true,
@@ -2000,23 +2193,24 @@ mod page_evaluate_tagging_tests {
 
         let request_id_a = "evaluate-timeout".to_string();
         let (tx_a, rx_a) = oneshot::channel::<EvaluateResponse>();
-        store.register(request_id_a.clone(), tx_a).await;
+        store.register("main", &request_id_a, tx_a).await;
 
         let request_id_b = "evaluate-sibling".to_string();
         let (tx_b, rx_b) = oneshot::channel::<EvaluateResponse>();
-        store.register(request_id_b.clone(), tx_b).await;
+        store.register("main", &request_id_b, tx_b).await;
 
         // Caller A times out while waiting (mirrors the Elapsed branch of
         // tagged_page_evaluate). The handler cancels its slot.
         let wait_a = tokio::time::timeout(std::time::Duration::from_millis(50), rx_a).await;
         assert!(wait_a.is_err(), "caller A must time out");
-        store.cancel(&request_id_a).await;
+        store.cancel("main", &request_id_a).await;
 
         // Caller B still gets a clean delivery afterwards.
         let store_for_b = store.clone();
         tokio::spawn(async move {
             store_for_b
                 .deliver(
+                    "main",
                     "evaluate-sibling",
                     EvaluateResponse {
                         ok: true,
