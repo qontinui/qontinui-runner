@@ -135,6 +135,7 @@ pub mod task_run_queries;
 pub mod task_run_structured_output;
 pub mod task_run_workflow_state;
 pub mod task_runs;
+pub mod task_supervisor;
 pub mod tauri_proxy;
 pub mod terminals;
 pub mod testing;

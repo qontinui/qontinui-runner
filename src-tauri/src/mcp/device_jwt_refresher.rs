@@ -149,9 +149,32 @@ pub fn start_refresher(api_state: Arc<ApiState>) -> Arc<RefresherState> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (kick_tx, kick_rx) = watch::channel(0u64);
 
-    let task_handle = tokio::spawn(async move {
-        refresher_loop(api_state, shutdown_rx, kick_rx).await;
-    });
+    // SUPERVISOR. `refresher_loop` is a long-lived task that should only RETURN
+    // on a shutdown signal. Spawned bare it had the same fatal flaw the relay
+    // had: a single panic in its directly-awaited path would unwind the task
+    // and PERMANENTLY stop JWT refresh — and a dead refresher is especially
+    // pernicious because the device-JWT then silently expires, the relay starts
+    // getting 1008-rejected, and even with the relay's own respawn it can never
+    // recover (no fresh token to present). Supervise it with the shared respawn
+    // idiom so a panic/wedge self-heals instead of requiring a runner restart.
+    // The factory clones a fresh `kick_rx`/`shutdown_rx` per respawn so
+    // `kick_device_jwt_refresher` keeps working across respawns.
+    let mut kick_rx_loop = kick_rx;
+    let shutdown_rx_loop = shutdown_rx.clone();
+    let task_handle = crate::mcp::task_supervisor::spawn_supervised(
+        "Device-JWT refresher",
+        shutdown_rx,
+        move || {
+            // Consume any kick delivered between respawns so the fresh loop
+            // doesn't immediately fire on an already-handled kick.
+            kick_rx_loop.borrow_and_update();
+            refresher_loop(
+                api_state.clone(),
+                shutdown_rx_loop.clone(),
+                kick_rx_loop.clone(),
+            )
+        },
+    );
 
     Arc::new(RefresherState {
         shutdown_tx,
