@@ -96,7 +96,16 @@ pub async fn probe_allowlist_wire_contracts(
         });
 
         // Emit; if emit itself fails we can't probe this one and move on.
-        if let Err(e) = app_handle.emit("ui-bridge:invoke-request", &payload) {
+        // Target the canonical MAIN window only (same root cause as the live
+        // invoke proxy in mcp/ui_bridge_invoke_handlers.rs): a global
+        // broadcast would have every webview answer with a duplicate response
+        // for the same request_id, racing the probe oneshot and re-running the
+        // probed command in each pop-out window.
+        if let Err(e) = app_handle.emit_to(
+            qontinui_runner_lib::get_main_window_label(),
+            "ui-bridge:invoke-request",
+            &payload,
+        ) {
             store.cancel(&request_id).await;
             results.push(ProbeResult {
                 command: cmd.name.to_string(),
