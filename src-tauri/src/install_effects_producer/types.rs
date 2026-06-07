@@ -62,16 +62,55 @@ pub struct RunRequest {
     /// reads the secret from its OS keyring. Default empty.
     #[serde(default)]
     pub registry_env: Vec<String>,
+    /// Execution mode (interception support — plan §3 A2). Default [`RunMode::Full`]
+    /// (today's behavior: declare→gate→run→observe→verify). [`RunMode::Intercept`]
+    /// runs declare + predict-and-check + pre-sha capture and STOPS WITHOUT
+    /// running the install, returning a `correlation_id` and stashing a
+    /// `PreContext` for the matching `POST /install-effects/observe-verify` call;
+    /// the SHIM runs the real tool between the two calls. Omitting the field is a
+    /// `Full` run (backward-compatible).
+    #[serde(default)]
+    pub mode: RunMode,
+}
+
+/// Execution mode for `POST /install-effects/run` (plan §3 A2). Serde
+/// `snake_case`, default [`RunMode::Full`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    /// The shipped explicit route: declare → gate → run → observe → verify.
+    #[default]
+    Full,
+    /// Interception pre-call: declare + predict-and-check + pre-sha capture, NO
+    /// install. Returns `correlation_id`; the shim runs the real tool and then
+    /// calls `/install-effects/observe-verify`.
+    Intercept,
+}
+
+/// Body of `POST /install-effects/observe-verify` — the interception POST-call
+/// (plan §3 A3). The shim sends the `correlation_id` it received from the
+/// `mode:"intercept"` pre-call plus the real tool's exit code; the producer
+/// looks up the stashed `PreContext`, synthesizes an `InstallOutcome` from the
+/// exit code, and runs the shared `observe_and_verify` body against the now-
+/// mutated worktree.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObserveVerifyRequest {
+    /// The id minted by the matching `mode:"intercept"` pre-call. An expired /
+    /// unknown id degrades to a best-effort verify with no pre-shas (honest
+    /// Partial) — never an error to the shim.
+    pub correlation_id: Uuid,
+    /// The real install tool's exit code (`None` ⇒ killed by a signal). Folded
+    /// into the verify record so a partial install is never swallowed.
+    #[serde(default)]
+    pub install_exit_code: Option<i32>,
 }
 
 /// A requested spec on the route request (mirror of coord's [`PackageSpec`]
-/// with a friendlier route field name).
-#[derive(Debug, Clone, Deserialize)]
-pub struct PackageSpecInput {
-    pub name: String,
-    #[serde(default)]
-    pub version_req: Option<String>,
-}
+/// with a friendlier route field name). Defined in the lib crate
+/// ([`qontinui_runner_lib::intercept_core::types`]) so the standalone
+/// `qontinui-shim` stub shares the exact wire shape; re-exported here so the
+/// producer code reads it unchanged.
+pub use qontinui_runner_lib::intercept_core::types::PackageSpecInput;
 
 impl From<&PackageSpecInput> for PackageSpec {
     fn from(p: &PackageSpecInput) -> Self {
@@ -171,29 +210,10 @@ pub struct InstallOutcome {
 
 /// Mirror of coord `install_effects::PackageManager`
 /// (`#[serde(rename_all = "snake_case")]`). NO `pipenv` variant by design.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PackageManager {
-    Npm,
-    Yarn,
-    Pnpm,
-    Cargo,
-    Pip,
-    Poetry,
-}
-
-impl PackageManager {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PackageManager::Npm => "npm",
-            PackageManager::Yarn => "yarn",
-            PackageManager::Pnpm => "pnpm",
-            PackageManager::Cargo => "cargo",
-            PackageManager::Pip => "pip",
-            PackageManager::Poetry => "poetry",
-        }
-    }
-}
+/// Defined in the lib crate ([`qontinui_runner_lib::intercept_core::types`]) so
+/// the standalone `qontinui-shim` stub shares the exact wire shape; re-exported
+/// here so the producer code reads it unchanged.
+pub use qontinui_runner_lib::intercept_core::types::PackageManager;
 
 /// Mirror of coord `install_effects::PackageSpec`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

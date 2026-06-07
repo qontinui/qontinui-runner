@@ -269,6 +269,15 @@ path = "src/bin/qontinui_specs.rs"
 name = "qontinui-git-credential"
 path = "src/bin/qontinui_git_credential.rs"
 
+# Install-interception Windows `.exe` shadow stub (plan §6). The materializer
+# copies this binary into the per-terminal shim dir as cargo.exe/pip.exe/pip3.exe
+# so it can shadow the real `.exe` under PowerShell/cmd (a `.cmd` cannot — `.EXE`
+# precedes `.CMD` in PATHEXT). Pure + dependency-light: reuses the lib-crate
+# `intercept_core::{classify,gate}` and a minimal std::net HTTP POST.
+[[bin]]
+name = "qontinui-shim"
+path = "src/bin/qontinui_shim.rs"
+
 [lints.rust]
 dead_code = "allow"
 unused_variables = "allow"

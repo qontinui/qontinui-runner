@@ -278,6 +278,18 @@ impl TerminalSession {
             }
         }
 
+        // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
+        // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
+        // OFF — ships dark). When OFF this whole block is a no-op and the child
+        // env is byte-identical to before. When ON, materialize the per-terminal
+        // shim bin dir and prepend it to PATH + set the loopback port/mode so an
+        // agent that types `npm install …` is transparently declared/observed.
+        // The bound port comes from the process-global the server records at
+        // bind (NOT the bootstrap default — plan §6). Fail-open: any materialize
+        // failure injects nothing. Runs AFTER caller `extra_env` so the shim
+        // dir wins on PATH even if a caller also set PATH.
+        Self::apply_install_intercept_env(&mut cmd, &id);
+
         // Set CLAUDE_CONFIG_DIR so Claude Code uses the resolved account
         // (multi-account support with auto-rotation on rate-limit).
         let ai_settings = crate::settings::get_ai_settings();
@@ -684,6 +696,58 @@ impl TerminalSession {
         }
     }
 
+    /// Install-interception env-seam (plan §4 Phase 1). Behind the master flag
+    /// `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default OFF). When ON, materialize
+    /// the per-terminal PATH-shim bin dir and mutate the child `cmd`:
+    /// prepend the shim dir to `PATH`, set `QONTINUI_INSTALL_INTERCEPT_PORT`
+    /// (the BOUND runner port) + `QONTINUI_INSTALL_INTERCEPT_MODE` (the
+    /// runner-env-resolved `observe`/`gate` — plan §3 step 3; default observe).
+    ///
+    /// Fail-open: a materialize failure injects nothing (the terminal still
+    /// spawns, un-shimmed). When OFF, this is a pure no-op — the child env is
+    /// byte-identical to pre-interception.
+    ///
+    /// `cmd`'s PATH is the runner's own inherited `PATH` (CommandBuilder does
+    /// not override it), so we read `std::env::var("PATH")` to compute the
+    /// prepended value and set it explicitly on the child.
+    fn apply_install_intercept_env(cmd: &mut CommandBuilder, terminal_id: &str) {
+        use crate::install_effects_producer::intercept::shim_materializer;
+
+        if !shim_materializer::intercept_enabled() {
+            return; // ships dark — byte-identical child env
+        }
+        let base_dir = std::env::temp_dir();
+        let port = crate::install_effects_producer::intercept::bound_port();
+        // The MODE the terminal gets is resolved from the runner's OWN env
+        // (`QONTINUI_INSTALL_INTERCEPT_MODE`; default observe, `gate` enables
+        // Phase-3 gating, anything else fails open to observe — plan §3 step 3).
+        let mode = shim_materializer::resolve_mode();
+        let seam = match shim_materializer::materialize(&base_dir, terminal_id, port, mode) {
+            Some(s) => s,
+            None => return, // fail-open: couldn't write shims ⇒ inject nothing
+        };
+
+        let current_path = std::env::var("PATH").ok();
+        let new_path = shim_materializer::prepend_path(&seam.shim_dir, current_path.as_deref());
+        cmd.env("PATH", new_path);
+        cmd.env(shim_materializer::PORT_ENV, seam.port.to_string());
+        cmd.env(shim_materializer::MODE_ENV, &seam.mode);
+        // Tell the compiled `.exe` stub its own dir so its real-tool PATH scan
+        // can skip it even if `current_exe()` is unavailable (plan §6 / §4
+        // Phase 4 — the `qontinui-shim` stub reads this).
+        cmd.env(
+            "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR",
+            seam.shim_dir.to_string_lossy().as_ref(),
+        );
+        info!(
+            terminal_id = %terminal_id,
+            shim_dir = %seam.shim_dir.display(),
+            port = seam.port,
+            mode = %seam.mode,
+            "install-intercept: shim dir injected onto terminal PATH"
+        );
+    }
+
     /// Assign a process to the Windows Job Object for crash safety.
     #[cfg(target_os = "windows")]
     fn assign_to_job_object(pid: u32) {
@@ -1055,6 +1119,16 @@ impl TerminalSession {
                 join_with_timeout(h, "waiter", &self.id);
             }
         }
+
+        // Install-interception cleanup (plan §4 Phase 4): remove this terminal's
+        // per-terminal shim bin dir so it does not leak after the PTY child is
+        // reaped. Best-effort + no-op when interception was never enabled (the
+        // dir simply won't exist). The stale-sweep at the next materialize reaps
+        // anything a crash left behind.
+        crate::install_effects_producer::intercept::shim_materializer::cleanup(
+            &std::env::temp_dir(),
+            &self.id,
+        );
 
         info!(terminal_id = %self.id, "Terminal session closed");
     }
