@@ -1179,6 +1179,43 @@ fn checkout_shared_branch(
     branch: &str,
     parent_sha: &str,
 ) -> Result<(), String> {
+    // Ξ_Worktree Phase 7.1 — NEVER switch the branch of a checkout that carries
+    // uncommitted work. SharedBranch mutates the *canonical* checkout (the
+    // operator's primary), so a bare `git checkout` here would either carry
+    // dirty WIP onto the agent's branch or fail the switch. Fail CLOSED: if the
+    // tree is dirty — or we can't prove it clean — bail with a typed error
+    // (never `-f`, never stash). coord's allocate treats a materialize Err as a
+    // fall-back, so the request re-decides as an isolated worktree.
+    //
+    // Carve-out: if we're already ON the target branch, no switch happens and
+    // nothing can be clobbered — allow it (and skip the dirty check) so a
+    // re-allocate to an already-active shared branch doesn't spuriously fail.
+    // `symbolic-ref` yields empty on detached HEAD → treated as "not on branch"
+    // → dirty check applies (detached + dirty correctly bails).
+    let current = run_git_command(canonical, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if current != branch {
+        // A FAILED status command means we cannot prove the tree clean → unsafe
+        // → bail. (Distinct from the reclaim-side `worktree_is_dirty`, which
+        // fails OPEN because it's deciding whether to REMOVE, not to mutate.)
+        let porcelain = run_git_command(canonical, &["status", "--porcelain"]).map_err(|e| {
+            format!(
+                "refusing shared-branch switch to '{branch}' in {}: could not determine \
+                 working-tree state ({e})",
+                canonical.display()
+            )
+        })?;
+        if !porcelain.trim().is_empty() {
+            return Err(format!(
+                "refusing shared-branch switch to '{branch}' in {}: working tree has \
+                 uncommitted changes (would carry WIP across the switch). Commit, stash, \
+                 or isolate in a worktree instead.",
+                canonical.display()
+            ));
+        }
+    }
+
     // Does the branch already exist? `git rev-parse --verify --quiet
     // refs/heads/<branch>` exits non-zero when absent.
     let exists = run_git_command(
@@ -1307,5 +1344,59 @@ mod tests {
             "agent_session_id key must always be present on the wire"
         );
         assert!(body["agent_session_id"].is_null());
+    }
+
+    #[test]
+    fn checkout_shared_branch_bails_on_dirty_tree() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let p = path.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args([&["-C", p], args].concat())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), b"x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "c1"]);
+        let parent = String::from_utf8(
+            Command::new("git")
+                .args(["-C", p, "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let parent = parent.trim();
+
+        // Clean tree on `main`, switching to a NEW branch → allowed.
+        assert!(checkout_shared_branch(path, "agent/clean", parent).is_ok());
+        // Switch back to main so the next case starts off-target.
+        Command::new("git")
+            .args(["-C", p, "checkout", "-q", "main"])
+            .output()
+            .unwrap();
+
+        // Dirty the tree, then attempt a switch to a different branch → bail.
+        std::fs::write(path.join("a.txt"), b"dirty").unwrap();
+        let err = checkout_shared_branch(path, "agent/dirty", parent).unwrap_err();
+        assert!(
+            err.contains("uncommitted changes"),
+            "expected dirty bail, got: {err}"
+        );
+
+        // Carve-out: already ON the target branch + dirty → no switch, allowed.
+        git(&["checkout", "-q", "-b", "agent/oncurrent"]);
+        std::fs::write(path.join("a.txt"), b"still dirty").unwrap();
+        assert!(
+            checkout_shared_branch(path, "agent/oncurrent", parent).is_ok(),
+            "same-branch re-checkout must not bail on dirty"
+        );
     }
 }
