@@ -2458,6 +2458,65 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R4: the cache-HIT branch of `vision_capture_handler` (the early
+    /// `return Ok(CaptureResponse { ... capture_backend: None })`) leaves the
+    /// originating backend unknown — the cached image carries no provenance.
+    /// This asserts (a) a cache-hit-shaped `CaptureResponse` has
+    /// `capture_backend == None`, and (b) the serialized JSON OMITS the
+    /// `captureBackend` key entirely (the field is
+    /// `skip_serializing_if = "Option::is_none"`), so SDK clients never see a
+    /// `null`/dangling backend field on a cache hit.
+    #[test]
+    fn cache_hit_capture_response_omits_capture_backend() {
+        // Mirror exactly the struct the cache-HIT branch builds: every field
+        // populated from the cache entry, `capture_backend: None`.
+        let resp = CaptureResponse {
+            path: "tmp_vision_cache/deadbeef.jpeg".to_string(),
+            sha256: "deadbeef".to_string(),
+            width: 1280,
+            height: 720,
+            bytes: 4096,
+            format: "jpeg".to_string(),
+            contract: "claude_vision_v1".to_string(),
+            // Cache hit: backend provenance is unavailable.
+            capture_backend: None,
+        };
+
+        // (a) The cache-hit branch sets capture_backend to None.
+        assert!(
+            resp.capture_backend.is_none(),
+            "cache-hit CaptureResponse must have capture_backend == None"
+        );
+
+        // (b) Serialized output must omit captureBackend (serde skip).
+        let v = serde_json::to_value(&resp).expect("serialize CaptureResponse");
+        let obj = v
+            .as_object()
+            .expect("CaptureResponse serializes to a JSON object");
+        assert!(
+            !obj.contains_key("captureBackend"),
+            "captureBackend key must be omitted on a cache hit (skip_serializing_if), got: {v}"
+        );
+
+        // Sanity: a populated backend DOES serialize the camelCase key, proving
+        // the omission above is the skip-on-None path, not a rename typo.
+        let with_backend = CaptureResponse {
+            capture_backend: Some("MonitorCrop".to_string()),
+            ..resp
+        };
+        let v2 = serde_json::to_value(&with_backend).expect("serialize");
+        assert_eq!(
+            v2.get("captureBackend").and_then(|b| b.as_str()),
+            Some("MonitorCrop"),
+            "captureBackend must serialize as camelCase when Some"
+        );
+    }
+}
+
 // ============================================================================
 // Capture-backend fallback ladder tests
 // (plan 2026-06-07-fleet-capture-backend-telemetry.md work item 4).

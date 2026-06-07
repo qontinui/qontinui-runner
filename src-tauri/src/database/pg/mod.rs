@@ -247,81 +247,54 @@ impl PgDb {
         .await
         .map_err(|e| format!("CR-5 result_json text→jsonb self-heal failed: {}", e))?;
 
-        // Plan 06 Step 3 (G.3): expression indexes for the workflow-verification dashboard hot paths. Each runs at every PgDb::new() boot — IF NOT EXISTS makes them no-ops after the first run.
+        // Plan 06 Step 3 (G.3): expression indexes for the workflow-verification
+        // dashboard hot paths. Each runs at every PgDb::new() boot — IF NOT
+        // EXISTS makes them no-ops after the first run.
+        //
+        // `project.workflow_verification_phase_results` is alembic-owned
+        // (qontinui-web), so on a bare/fresh PG where the migrator hasn't run
+        // yet the table is absent. `CREATE INDEX IF NOT EXISTS` only skips when
+        // the *index* already exists — against a missing TABLE it still errors
+        // (`relation does not exist`), which previously hard-panicked the
+        // runner at boot. Wrap all six CREATE INDEX statements in one
+        // table-existence DO block (the same guard pattern the proposal_events
+        // self-heal below uses) so they run when the table is present and skip
+        // cleanly when it is not. IF NOT EXISTS keeps each individual index
+        // idempotent on warm boots.
         conn.batch_execute(
-            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_match_outcome \
-                 ON project.workflow_verification_phase_results \
-                 ((result_json->'summary'->>'match_outcome'));",
+            "DO $wfver$
+             BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = 'project'
+                   AND table_name = 'workflow_verification_phase_results'
+               ) THEN
+                 CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_match_outcome
+                     ON project.workflow_verification_phase_results
+                     ((result_json->'summary'->>'match_outcome'));
+                 CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_overall_match_rate
+                     ON project.workflow_verification_phase_results
+                     (((result_json->'summary'->>'overall_match_rate')::float));
+                 CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_spec_version
+                     ON project.workflow_verification_phase_results
+                     ((result_json->>'spec_version'));
+                 CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_recommendation_reason
+                     ON project.workflow_verification_phase_results
+                     ((result_json->'recommendation_recommended_state'->>'recommendation_reason'));
+                 CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_snapshot_id
+                     ON project.workflow_verification_phase_results
+                     ((result_json->>'snapshot_id'));
+                 CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_severity_gin
+                     ON project.workflow_verification_phase_results
+                     USING GIN ((result_json->'summary'->'assertions_failed_by_severity'));
+               END IF;
+             END
+             $wfver$;",
         )
         .await
         .map_err(|e| {
             format!(
-                "Plan 06 Step 3 idx_wf_ver_phase_match_outcome create failed: {}",
-                e
-            )
-        })?;
-
-        conn.batch_execute(
-            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_overall_match_rate \
-                 ON project.workflow_verification_phase_results \
-                 (((result_json->'summary'->>'overall_match_rate')::float));",
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "Plan 06 Step 3 idx_wf_ver_phase_overall_match_rate create failed: {}",
-                e
-            )
-        })?;
-
-        conn.batch_execute(
-            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_spec_version \
-                 ON project.workflow_verification_phase_results \
-                 ((result_json->>'spec_version'));",
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "Plan 06 Step 3 idx_wf_ver_phase_spec_version create failed: {}",
-                e
-            )
-        })?;
-
-        conn.batch_execute(
-            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_recommendation_reason \
-                 ON project.workflow_verification_phase_results \
-                 ((result_json->'recommendation_recommended_state'->>'recommendation_reason'));",
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "Plan 06 Step 3 idx_wf_ver_phase_recommendation_reason create failed: {}",
-                e
-            )
-        })?;
-
-        conn.batch_execute(
-            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_snapshot_id \
-                 ON project.workflow_verification_phase_results \
-                 ((result_json->>'snapshot_id'));",
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "Plan 06 Step 3 idx_wf_ver_phase_snapshot_id create failed: {}",
-                e
-            )
-        })?;
-
-        conn.batch_execute(
-            "CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_severity_gin \
-                 ON project.workflow_verification_phase_results \
-                 USING GIN ((result_json->'summary'->'assertions_failed_by_severity'));",
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "Plan 06 Step 3 idx_wf_ver_phase_severity_gin create failed: {}",
+                "Plan 06 Step 3 wf-ver expression indexes create failed: {}",
                 e
             )
         })?;
