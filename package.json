@@ -6,7 +6,7 @@
     "@qontinui/design-tokens": "^1.0.0",
     "@qontinui/navigation": "^0.1.0",
     "@qontinui/shared-types": "^0.6.0",
-    "@qontinui/ui-bridge": "^0.15.0",
+    "@qontinui/ui-bridge": "^0.17.0",
     "@qontinui/ui-bridge-auto": "^0.1.7",
     "@qontinui/workflow-ui": "^0.1.0",
     "@qontinui/workflow-utils": "^0.1.0",
@@ -120,7 +120,7 @@
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
     "graphql:codegen": "graphql-codegen",
-    "graphql:check": "graphql-codegen && git diff --exit-code src/generated/graphql.ts || (echo 'GraphQL codegen output is stale — run npm run graphql:codegen' && exit 1)",
+    "graphql:check": "graphql-codegen && git diff --exit-code src/generated/graphql.ts || (echo 'GraphQL codegen output is stale \u00e2\u20ac\u201d run npm run graphql:codegen' && exit 1)",
     "graphql:schema": "cd src-tauri && cargo test --bin qontinui-runner schema_exports_valid_sdl -- --nocapture",
     "typecheck": "tsc --noEmit"
   },

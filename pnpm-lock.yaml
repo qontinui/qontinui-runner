@@ -26,13 +26,13 @@ importers:
         version: 1.0.0(tailwindcss@4.2.4)
       '@qontinui/navigation':
         specifier: ^0.1.0
-        version: 0.1.1(@qontinui/ui-bridge@0.15.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react@19.2.5)
+        version: 0.1.1(@qontinui/ui-bridge@0.17.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react@19.2.5)
       '@qontinui/shared-types':
         specifier: ^0.6.0
         version: 0.6.0
       '@qontinui/ui-bridge':
-        specifier: ^0.15.0
-        version: 0.15.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
+        specifier: ^0.17.0
+        version: 0.17.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
       '@qontinui/ui-bridge-auto':
         specifier: ^0.1.7
         version: 0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
@@ -1150,8 +1150,8 @@ packages:
     peerDependencies:
       eslint: ^8.0.0 || ^9.0.0 || ^10.0.0
 
-  '@qontinui/ui-bridge@0.15.0':
-    resolution: {integrity: sha512-LS6ozdAn2x4fEqT7IBUNJbmXsc03DkzmDZAogJ8h8y7RfdjDODOrjd6UPf+COX+XcY8QpzohfZxAT1SFi3/gGg==}
+  '@qontinui/ui-bridge@0.17.0':
+    resolution: {integrity: sha512-yG2niZz6o9Yg+IjTk/gUbPi1u+QRCsvBZBrYYSaIgmOVe9dPCWKVhDK6jbhqTX7uUtxA0//IWmeWUnClkAieiQ==}
     hasBin: true
     peerDependencies:
       '@qontinui/ui-bridge-auto': '>=0.1.0'
@@ -6128,9 +6128,9 @@ snapshots:
     optionalDependencies:
       tailwindcss: 4.2.4
 
-  '@qontinui/navigation@0.1.1(@qontinui/ui-bridge@0.15.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react@19.2.5)':
+  '@qontinui/navigation@0.1.1(@qontinui/ui-bridge@0.17.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react@19.2.5)':
     optionalDependencies:
-      '@qontinui/ui-bridge': 0.15.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
+      '@qontinui/ui-bridge': 0.17.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)
       react: 19.2.5
 
   '@qontinui/shared-types@0.6.0': {}
@@ -6157,7 +6157,7 @@ snapshots:
       - supports-color
       - typescript
 
-  '@qontinui/ui-bridge@0.15.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)':
+  '@qontinui/ui-bridge@0.17.0(@qontinui/ui-bridge-auto@0.1.7(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0))(react-dom@19.2.5(react@19.2.5))(react@19.2.5)(ws@8.21.0)':
     dependencies:
       dom-accessibility-api: 0.5.16
       react: 19.2.5
