@@ -144,6 +144,26 @@ impl ClaimSpawnContext {
         }
     }
 
+    /// Ξ_Worktree Phase 7.5b — build a `kind=canonical_checkout` claim
+    /// context for one repo. coord's Rule-2 precondition P3 probe
+    /// (`load_canonical_lease_claim` in `agent_worktrees.rs`) looks up a
+    /// `ClaimKind::CanonicalCheckout` holder on `resource_key = "repo:<repo>"`
+    /// (the bare repo slug, NOT a filesystem path) and serializes the
+    /// shared-branch grant when a DIFFERENT machine holds it. coord's
+    /// `normalize_resource_key` is a PASS-THROUGH for non-`Worktree` kinds, so
+    /// the key must be the verbatim `repo:<repo>` form — no path canonicalization.
+    /// When the runner honors a `SharedBranch` decision it acquires this lease
+    /// per repo so the P3 probe observes the live holder on the next decision.
+    pub fn canonical_checkout_for_repo(repo: &str, intent: Option<&str>) -> Self {
+        Self {
+            kind: "canonical_checkout",
+            resource_key: format!("repo:{repo}"),
+            intent: intent.map(|s| s.to_string()),
+            plan_id: None,
+            phase: None,
+        }
+    }
+
     /// Derive a claim context from the spawn payload's optional fields.
     ///
     /// Precedence (per plan Phase 3 spec):
@@ -363,6 +383,53 @@ async fn release_all_claims_best_effort(
     }
 }
 
+/// Ξ_Worktree Phase 7.5b — outcome of planning the per-repo
+/// `canonical_checkout` lease acquire for a [`Isolation::SharedBranch`]
+/// honor. Pure decision logic, no I/O: given the acquire outcome for each
+/// repo in turn it decides whether the honor proceeds (all leases acquired,
+/// appended to the session's `active_claims`) or bails (a peer holds one →
+/// the partial set must be released and an [`AllocateError`] returned).
+///
+/// Extracted so the honor's serialize-or-bail contract is unit-testable
+/// WITHOUT a live coord: the production loop performs the same per-repo
+/// acquire and the same unwind-on-`Held`; this models that exact shape over
+/// pre-computed per-repo outcomes.
+#[derive(Debug)]
+enum CanonicalLeasePlan {
+    /// Every repo's lease acquired — append these to `active_claims` and
+    /// proceed with the branch switch.
+    Proceed { acquired: Vec<ActiveClaim> },
+    /// A repo's lease was `Held`/errored — release `to_release` (the leases
+    /// acquired BEFORE the failing repo) and bail with `error`.
+    Bail {
+        to_release: Vec<ActiveClaim>,
+        error: AllocateError,
+    },
+}
+
+/// Pure planner mirroring the production canonical-lease acquire loop: walk
+/// the per-repo acquire outcomes in order, accumulating successes; the first
+/// `Err` stops the walk and yields a [`CanonicalLeasePlan::Bail`] carrying the
+/// successes-so-far (to release) and the error. All-`Ok` yields
+/// [`CanonicalLeasePlan::Proceed`].
+fn plan_canonical_leases(
+    outcomes: Vec<Result<ActiveClaim, AllocateError>>,
+) -> CanonicalLeasePlan {
+    let mut acquired: Vec<ActiveClaim> = Vec::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        match outcome {
+            Ok(claim) => acquired.push(claim),
+            Err(error) => {
+                return CanonicalLeasePlan::Bail {
+                    to_release: acquired,
+                    error,
+                };
+            }
+        }
+    }
+    CanonicalLeasePlan::Proceed { acquired }
+}
+
 /// Per-kind default TTL — must stay in sync with coord's `default_ttl_for`
 /// at `claims.rs:119-128`. Used only as a fallback when coord's response
 /// omits `ttl_seconds` (shouldn't happen on success but be defensive).
@@ -371,6 +438,7 @@ fn default_ttl_seconds_for(kind: &str) -> i64 {
         "phase" => 7200,
         "file_glob" => 90,
         "worktree" => 300,
+        "canonical_checkout" => 300,
         "branch_name" => 1800,
         "alembic_revision" => 600,
         "ci_wait" => 1800,
@@ -1082,6 +1150,48 @@ pub async fn allocate_and_materialize_with_claim(
     // path as the materialized cwd. A real branch, never a silent
     // worktree fallthrough.
     if matches!(isolation, Isolation::SharedBranch) {
+        // Ξ_Worktree Phase 7.5b — BEFORE switching any canonical checkout's
+        // branch, acquire an exclusive `canonical_checkout` lease per repo so
+        // coord's already-deployed Rule-2 P3 probe (`load_canonical_lease_claim`,
+        // resource_key `repo:<repo>`, kind `canonical_checkout`, TTL 300s) sees a
+        // live holder on the next isolation decision and serializes any peer's
+        // shared-branch grant for the same canonical tree. The lease is pushed
+        // into `active_claims` so it RELEASES on the existing session-end drain
+        // (the caller spawns one heartbeat per entry and releases every entry on
+        // agent completion) — no separate release path. A `Held` by another owner
+        // means a peer already owns this canonical tree → unwind every claim
+        // acquired so far and bail with an AllocateError so coord re-decides as
+        // an isolated Worktree on retry; we never proceed to switch the branch.
+        let mut lease_outcomes: Vec<Result<ActiveClaim, AllocateError>> =
+            Vec::with_capacity(coord_resp.worktrees.len());
+        for w in &coord_resp.worktrees {
+            let ctx = ClaimSpawnContext::canonical_checkout_for_repo(&w.repo, intent);
+            let outcome =
+                acquire_one_claim(coord_http_base, machine_id, agent_session_id, &ctx).await;
+            // Stop at the first failure — never acquire a lease for a later repo
+            // once an earlier one is Held (it would leak past the unwind, which
+            // only releases up to the failing repo).
+            let failed = outcome.is_err();
+            lease_outcomes.push(outcome);
+            if failed {
+                break;
+            }
+        }
+        match plan_canonical_leases(lease_outcomes) {
+            CanonicalLeasePlan::Proceed { mut acquired } => {
+                // Append the leases to the session's release-tracked collection
+                // so they release on the existing session-end drain.
+                active_claims.append(&mut acquired);
+            }
+            CanonicalLeasePlan::Bail { to_release, error } => {
+                // Unwind the canonical leases acquired before the held repo,
+                // plus every worktree/phase claim already in `active_claims`,
+                // then bail so coord re-decides as an isolated Worktree on retry.
+                active_claims.extend(to_release);
+                release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+                return Err(error);
+            }
+        }
         let mut branches: Vec<SharedBranchRepo> = Vec::with_capacity(repos.len());
         for w in &coord_resp.worktrees {
             let canonical = repo_canonical_paths.get(&w.repo).ok_or_else(|| {
@@ -1538,5 +1648,111 @@ mod tests {
             checkout_shared_branch(path, "agent/oncurrent", parent).is_ok(),
             "same-branch re-checkout must not bail on dirty"
         );
+    }
+
+    // ----- Ξ_Worktree Phase 7.5b: canonical_checkout lease ---------------
+
+    #[test]
+    fn canonical_checkout_for_repo_builds_repo_scoped_lease_ctx() {
+        // The resource_key MUST be the verbatim `repo:<repo>` form coord's P3
+        // probe (`load_canonical_lease_claim`) looks up — coord's
+        // `normalize_resource_key` is a PASS-THROUGH for non-Worktree kinds, so
+        // NO path canonicalization is applied. A drift here = a lease the probe
+        // never sees → no serialization → the exact race 7.5b closes.
+        let ctx = ClaimSpawnContext::canonical_checkout_for_repo(
+            "qontinui-coord",
+            Some("shared-branch on coord"),
+        );
+        assert_eq!(ctx.kind, "canonical_checkout");
+        assert_eq!(ctx.resource_key, "repo:qontinui-coord");
+        assert_eq!(ctx.intent.as_deref(), Some("shared-branch on coord"));
+        assert!(ctx.plan_id.is_none());
+        assert!(ctx.phase.is_none());
+        // Kind wire-name + TTL match coord's enum (claims.rs:183 / 302).
+        assert_eq!(default_ttl_seconds_for(ctx.kind), 300);
+    }
+
+    #[test]
+    fn shared_branch_acquires_canonical_checkout_lease() {
+        // A SharedBranch honor acquires one canonical_checkout claim per repo
+        // with the correct kind + resource_key, and the lease lands in the
+        // release-tracked collection (`active_claims`) so it RELEASES on the
+        // existing session-end drain. Models the production per-repo acquire
+        // loop over an all-success outcome set.
+        let session = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let outcomes: Vec<Result<ActiveClaim, AllocateError>> = ["qontinui-coord", "qontinui-web"]
+            .iter()
+            .map(|repo| {
+                let ctx = ClaimSpawnContext::canonical_checkout_for_repo(repo, Some("sb"));
+                Ok(ActiveClaim {
+                    kind: ctx.kind.to_string(),
+                    resource_key: ctx.resource_key,
+                    ttl_seconds: default_ttl_seconds_for(ctx.kind),
+                    agent_session_id: Some(session),
+                })
+            })
+            .collect();
+
+        match plan_canonical_leases(outcomes) {
+            CanonicalLeasePlan::Proceed { acquired } => {
+                // One lease per repo, all in the release-tracked collection.
+                assert_eq!(acquired.len(), 2);
+                assert!(acquired
+                    .iter()
+                    .all(|c| c.kind == "canonical_checkout" && c.ttl_seconds == 300));
+                assert_eq!(acquired[0].resource_key, "repo:qontinui-coord");
+                assert_eq!(acquired[1].resource_key, "repo:qontinui-web");
+                // The same vec the session-end release path drains.
+                assert!(acquired
+                    .iter()
+                    .all(|c| c.agent_session_id == Some(session)));
+            }
+            CanonicalLeasePlan::Bail { .. } => panic!("expected Proceed on all-Ok outcomes"),
+        }
+    }
+
+    #[test]
+    fn shared_branch_bails_when_canonical_lease_held() {
+        // When a peer holds the canonical_checkout lease for a repo, the honor
+        // bails with an AllocateError and releases any partial leases acquired
+        // for the earlier repos (so a partial acquire never strands a held
+        // canonical tree). Models the production unwind-on-`Held`.
+        let session = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let first_ctx = ClaimSpawnContext::canonical_checkout_for_repo("qontinui-coord", None);
+        let first = ActiveClaim {
+            kind: first_ctx.kind.to_string(),
+            resource_key: first_ctx.resource_key,
+            ttl_seconds: default_ttl_seconds_for(first_ctx.kind),
+            agent_session_id: Some(session),
+        };
+        let conflict = ClaimConflict {
+            kind: "canonical_checkout".to_string(),
+            resource_key: "repo:qontinui-web".to_string(),
+            current_holder: "machine-b:session-x".to_string(),
+            intent: None,
+        };
+        // First repo acquires; second is Held by a peer.
+        let outcomes: Vec<Result<ActiveClaim, AllocateError>> = vec![
+            Ok(first),
+            Err(AllocateError::ClaimConflict(conflict)),
+        ];
+
+        match plan_canonical_leases(outcomes) {
+            CanonicalLeasePlan::Bail { to_release, error } => {
+                // The earlier-acquired lease is handed back for release.
+                assert_eq!(to_release.len(), 1);
+                assert_eq!(to_release[0].kind, "canonical_checkout");
+                assert_eq!(to_release[0].resource_key, "repo:qontinui-coord");
+                // Bails with a ClaimConflict so coord re-decides as Worktree.
+                match error {
+                    AllocateError::ClaimConflict(c) => {
+                        assert_eq!(c.resource_key, "repo:qontinui-web");
+                        assert_eq!(c.current_holder, "machine-b:session-x");
+                    }
+                    other => panic!("expected ClaimConflict, got {other:?}"),
+                }
+            }
+            CanonicalLeasePlan::Proceed { .. } => panic!("expected Bail when a lease is Held"),
+        }
     }
 }
