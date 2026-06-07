@@ -376,8 +376,11 @@ async fn post_observations(coord_http_base: &str, body: &FsObservationsRequest) 
     // unpaired / empty keychain collapses to the anonymous send coord accepts
     // today). Same write-path attach the credential-helper uses, and it feeds
     // the data-plane auth-coverage metric ahead of multiuser Phase-2
-    // enforcement on `/coord/fs/observations`.
-    let req = qontinui_runner_lib::auth::attach_device_auth(client.post(&url));
+    // enforcement on `/coord/fs/observations`. Must be `crate::auth`, not
+    // `qontinui_runner_lib::auth` — this module compiles into the bin target,
+    // and the lib path would bump the lib crate's separate counter statics,
+    // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
+    let req = crate::auth::attach_device_auth(client.post(&url));
     match req.json(body).send().await {
         Ok(resp) => {
             let status = resp.status();
