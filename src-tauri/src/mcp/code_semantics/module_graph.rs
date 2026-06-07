@@ -25,6 +25,10 @@ use std::path::PathBuf;
 use crate::ai_provider::{run_structured_prompt, StructuredPrompt};
 use crate::ai_router::TaskContext;
 use crate::workflow_generation::code_graph::CodeGraph;
+// The pure module-edge derivation now lives in the shared crate (coord needs it for
+// its merge gate). Re-exported here so existing `module_graph::{cross_module_edges,
+// module_dir}` references (incl. the bench) resolve unchanged.
+pub(crate) use qontinui_code_graph::layering::{cross_module_edges, module_dir};
 
 /// Default cap on modules sent to the model in one pass — bounds prompt size +
 /// token cost. Modules beyond the cap (lowest export-count first) are omitted and
@@ -61,15 +65,6 @@ pub(super) struct ModuleSummary {
     pub(super) external_pkgs: Vec<String>,
     /// Total exports before the cap — the ranking + tie-break signal.
     pub(super) export_count: usize,
-}
-
-/// The directory component of a repo-relative path (forward slashes). Files at
-/// the repo root map to `"."`.
-pub(super) fn module_dir(path: &str) -> String {
-    match path.rsplit_once('/') {
-        Some((dir, _)) if !dir.is_empty() => dir.to_string(),
-        _ => ".".to_string(),
-    }
 }
 
 /// The basename of a repo-relative path.
@@ -196,41 +191,6 @@ pub(super) async fn build_module_graph(dir: PathBuf) -> Option<(Vec<ModuleSummar
     })
     .await
     .ok()
-}
-
-/// The UNCAPPED cross-module (directory→directory) dependency digraph edges.
-///
-/// For every import that the resolver bound to an in-repo file (`resolved_target`
-/// set, `resolution` neither `External` nor `Unresolved`), map both endpoints to
-/// their module dir; keep the edge only when it crosses a module boundary
-/// (`from != to`). Unlike [`ModuleSummary::internal_deps`] (capped at
-/// `MAX_DEPS_PER_MODULE` for the prompt budget), this is the FULL edge set — the
-/// layering Φ predicate (`Ξ_Layering`) MUST use this, never the capped summaries,
-/// or a 9th cross-layer breach edge would be silently dropped. The `BTreeSet`
-/// de-duplicates + orders the edges deterministically.
-pub(super) fn cross_module_edges(graph: &CodeGraph) -> BTreeSet<(String, String)> {
-    use crate::workflow_generation::code_graph::ResolutionKind;
-    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
-    for imp in &graph.imports {
-        let target = match &imp.resolved_target {
-            Some(t) => t,
-            None => continue,
-        };
-        // Only honestly-resolved in-repo edges; External/Unresolved are not
-        // cross-module dependency edges.
-        if matches!(
-            imp.resolution,
-            ResolutionKind::External | ResolutionKind::Unresolved
-        ) {
-            continue;
-        }
-        let from = module_dir(&imp.from_file);
-        let to = module_dir(target);
-        if from != to {
-            edges.insert((from, to));
-        }
-    }
-    edges
 }
 
 /// Build the resolved `Ξ_AST` graph ONCE and derive everything `Ξ_Layering` needs
