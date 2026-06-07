@@ -58,6 +58,21 @@ $SKIP_ROUTES = @{
 }
 
 # ---------------------------------------------------------------------------
+# Routes whose handler can legitimately exceed the default 10s probe timeout.
+# vision/extract (PaddleOCR) and vision/describe (VLM) load a cold model via
+# llama-swap on first request — and llama-swap UNLOADS one model to load the
+# other, so describe can pay a full swap+load even right after extract ran;
+# 300s covers the worst observed cold swap. /control/specs is a disk scan
+# that can exceed 10s on a cold FS cache (fresh exe dir + Defender pass).
+# Keyed by "<METHOD> <PATH>" exactly as it appears in UI_BRIDGE_ROUTES.
+# ---------------------------------------------------------------------------
+$SLOW_ROUTES = @{
+    "POST /vision/extract"  = 300
+    "POST /vision/describe" = 300
+    "GET /control/specs"    = 60
+}
+
+# ---------------------------------------------------------------------------
 # Per-route fixture bodies. For routes with bodyRequired: true we send a
 # minimal valid-shape body where one is needed to exercise the parser; for
 # the rest, an empty {} is fine -- we only assert "route is registered" by
@@ -178,14 +193,15 @@ function Invoke-Probe {
     param(
         [string]$Method,
         [string]$Url,
-        [string]$Body = $null
+        [string]$Body = $null,
+        [int]$TimeoutSec = 10
     )
     try {
         $params = @{
             Uri             = $Url
             Method          = $Method
             UseBasicParsing = $true
-            TimeoutSec      = 10
+            TimeoutSec      = $TimeoutSec
             ErrorAction     = "Stop"
         }
         if ($Body) {
@@ -198,13 +214,24 @@ function Invoke-Probe {
         $resp = Invoke-WebRequest @params
         return @($resp.StatusCode, $resp.Content)
     } catch [System.Net.WebException] {
-        # Pull HTTP status off non-success responses.
+        # Pull HTTP status + body off non-success responses. PS 5.1 gotcha:
+        # Invoke-WebRequest has already consumed the error response stream,
+        # so GetResponseStream() reads back "" (position at END). The body
+        # lives in ErrorDetails.Message; rewinding the seekable stream is
+        # the fallback.
         $r = $_.Exception.Response
         if ($r) {
             $status = [int]$r.StatusCode
-            $stream = $r.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($stream)
-            $body   = $reader.ReadToEnd()
+            $body = $_.ErrorDetails.Message
+            if (-not $body) {
+                $stream = $r.GetResponseStream()
+                if ($stream -and $stream.CanSeek) {
+                    $stream.Position = 0
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $body = $reader.ReadToEnd()
+                }
+            }
+            if (-not $body) { $body = "" }
             return @($status, $body)
         }
         return @(0, $_.Exception.Message)
@@ -309,6 +336,18 @@ Write-Host ""
 # ---------------------------------------------------------------------------
 $exitCode = 0
 try {
+    # Warm-up: prime the cold OCR/VLM models so the first *measured* slow-route
+    # request is warm. Belt-and-suspenders — the per-route timeout bump alone
+    # makes the gate deterministic; warm-up failures are non-fatal.
+    Write-Host "Warming vision/extract + vision/describe (cold model load) ..."
+    foreach ($warmKey in @("POST /vision/extract", "POST /vision/describe")) {
+        $warmPath = $warmKey.Split(" ")[1]
+        try {
+            $null = Invoke-Probe -Method "POST" -Url ($runnerBase + $warmPath) -Body "{}" -TimeoutSec 120
+        } catch { }
+    }
+    Write-Host ""
+
     Write-Host ("{0}  {1}  {2}  {3}" -f "STAT".PadRight(4), "METHOD".PadRight(6), "PATH".PadRight(50), "DETAIL")
     Write-Host ("-" * 90)
 
@@ -329,14 +368,40 @@ try {
             $body = $BODY_FIXTURES[$r.Key]
         }
 
-        $res = Invoke-Probe -Method $r.Method -Url $url -Body $body
+        $probeTimeout = 10
+        if ($SLOW_ROUTES.ContainsKey($r.Key)) { $probeTimeout = $SLOW_ROUTES[$r.Key] }
+        $res = Invoke-Probe -Method $r.Method -Url $url -Body $body -TimeoutSec $probeTimeout
         $status = $res[0]
         if ($status -eq 0) {
             Record "FAIL" $r.Method $r.Path "connection error: $($res[1])"
             $exitCode = 1
         } elseif ($status -eq 404) {
-            Record "FAIL" $r.Method $r.Path "404 (route not registered)"
-            $exitCode = 1
+            # Body-aware 404 classifier: a route with a :param segment that
+            # returns a structured JSON error envelope (success:false / any
+            # non-empty JSON error) is route-matched-but-resource-not-found —
+            # the route IS registered, so PASS. A genuinely unregistered route
+            # falls through to axum's empty-body default 404 → keep FAIL.
+            $hasParam = $r.Path -match ":[A-Za-z]+"
+            $isStructuredErr = $false
+            $rawBody = $res[1]
+            if ($hasParam -and $rawBody -and ($rawBody.Trim().Length -gt 0)) {
+                try {
+                    $parsed = $rawBody | ConvertFrom-Json
+                    if ($null -ne $parsed) {
+                        $hasSuccessFalse = ($parsed.PSObject.Properties.Name -contains 'success') -and (-not $parsed.success)
+                        $hasErrorField = ($parsed.PSObject.Properties.Name -contains 'error') -and ($null -ne $parsed.error)
+                        if ($hasSuccessFalse -or $hasErrorField) { $isStructuredErr = $true }
+                    }
+                } catch {
+                    $isStructuredErr = $false
+                }
+            }
+            if ($isStructuredErr) {
+                Record "PASS" $r.Method $r.Path "404 unknown-id (route reachable)"
+            } else {
+                Record "FAIL" $r.Method $r.Path "404 (route not registered)"
+                $exitCode = 1
+            }
         } else {
             Record "PASS" $r.Method $r.Path "$status"
         }

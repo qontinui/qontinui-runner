@@ -904,10 +904,6 @@ mod manifest_drift_tests {
         // AND `route_entries()`, then delete the line below. The test
         // will then assert end-to-end wiring forever after.
         let sdk_only_baseline: HashSet<(&str, &str)> = [
-            // Intent name-in-URL execute — runner's /control/intents/execute
-            // takes the name in the JSON body (different shape from SDK's
-            // /control/intent/:name/execute).
-            ("POST", "/ui-bridge/control/intent/{}/execute"),
             // Cross-app analyze GET form — runner's analyze handlers are
             // POST-only (they accept a request body); SDK declares a GET
             // shape with query-string args. Different shape, not a simple alias.

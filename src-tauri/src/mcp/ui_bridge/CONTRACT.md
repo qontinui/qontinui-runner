@@ -199,6 +199,29 @@ map timeout → 422 itself; the framework will not derive this from the body
 shape. Any new SDK endpoint with a non-200 success status needs the same
 explicit `(StatusCode, Json<...>)` return tuple.
 
+### Vision capture `path` is relative
+`CaptureResponse.path` (returned by `/vision/capture`, `/vision/annotate`, and
+the other vision endpoints) is the **relative** form
+`tmp_vision_cache/<sha256>.<ext>`, not an absolute host path. The on-disk
+`VisionCache` root is built absolute in `mcp_api::api_state_init`
+(`current_runner_path().join("tmp_vision_cache")`) so file IO is CWD-independent,
+but the response strips that prefix at serialization time
+(`vision_routes::relative_cache_path`). `path` is **diagnostic-only**: every
+consumer fetches the actual bytes by `sha256` via `/vision/raw`
+(`fetchVisionCacheBytes(meta.sha256)`), never by `path`. Emitting a relative
+path keeps the response host-agnostic for cross-machine relay consumers.
+
+### 404 discriminator: empty body vs structured envelope
+A 404 from a route with a `:param`/`{name}` segment is ambiguous on its own, so
+the runner makes it discriminable by body: a **route-matched, resource-not-found**
+404 carries a **structured JSON error envelope** (`{success:false, error, …}` —
+e.g. `ELEMENT_NOT_FOUND`, "Component not found"), whereas a **genuinely
+unregistered** route falls through to **axum's default 404 with an empty body**.
+Consumers (and `scripts/contract-smoke.ps1`'s walk classifier) treat
+"`:param` route + structured envelope = route reachable" and "empty body =
+unregistered". New not-found handlers should always return a structured envelope
+so this stays a reliable signal.
+
 ## Element-id discovery
 
 Element ids are **auto-generated from text content**, not from a stable
