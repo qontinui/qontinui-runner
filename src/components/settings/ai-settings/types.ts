@@ -117,6 +117,7 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
   },
   auto_refine_video_after_iterations: 3,
   interactive_sessions_enabled: true,
+  memory_federation_enabled: true,
 };
 
 export const PROVIDER_OPTIONS: {

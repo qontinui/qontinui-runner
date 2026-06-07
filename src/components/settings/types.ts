@@ -176,6 +176,9 @@ export interface AiSettings {
    * When true, sessions use multi-turn interactive mode with message queuing.
    * When false, sessions use one-shot inline mode. */
   interactive_sessions_enabled: boolean;
+  /** Kill switch for memory federation. When true, Claude memories are synced
+   * across this account's machines via coord. Default on. */
+  memory_federation_enabled: boolean;
 }
 
 export interface AiConnectionTestResult {

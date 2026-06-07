@@ -145,6 +145,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           interactive_sessions_enabled:
             result.data.interactive_sessions_enabled ??
             DEFAULT_AI_SETTINGS.interactive_sessions_enabled,
+          memory_federation_enabled:
+            result.data.memory_federation_enabled ??
+            DEFAULT_AI_SETTINGS.memory_federation_enabled,
         });
         onLog("debug", "AI settings loaded");
       }
@@ -225,6 +228,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         maxTokens: settings.claude_api.max_tokens,
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,
         interactiveSessionsEnabled: settings.interactive_sessions_enabled,
+        memoryFederationEnabled: settings.memory_federation_enabled,
       });
 
       if (!result || !result.success) {
@@ -602,6 +606,36 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               <span
                 className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
                   settings.interactive_sessions_enabled ? "translate-x-4" : "translate-x-1"
+                }`}
+              />
+            </button>
+          </label>
+
+          <label
+            htmlFor="memory-federation-toggle"
+            className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors"
+          >
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Memory Federation</div>
+              <div className="text-xs text-muted-foreground">
+                Sync Claude memories across this account&apos;s machines via coord. Default on.
+              </div>
+            </div>
+            <button
+              id="memory-federation-toggle"
+              onClick={() =>
+                setSettings((prev) => ({
+                  ...prev,
+                  memory_federation_enabled: !prev.memory_federation_enabled,
+                }))
+              }
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-4 ${
+                settings.memory_federation_enabled ? "bg-primary" : "bg-muted"
+              }`}
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  settings.memory_federation_enabled ? "translate-x-4" : "translate-x-1"
                 }`}
               />
             </button>
