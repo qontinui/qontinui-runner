@@ -1761,10 +1761,14 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        // NULL-guard: bind Option<String> to avoid uncatchable panic if a row
-        // has result_json = NULL (schema declares NOT NULL, but local-PG drift
-        // has been observed in the wild — see commit log). The defensive WHERE
-        // is belt-and-braces; the Option bind is the primary fix.
+        // CR-5: `result_json` is `jsonb` (PgDb::new()'s self-heal in mod.rs
+        // ALTERs it to jsonb on every connect). Bind `serde_json::Value`
+        // directly — tokio-postgres maps jsonb <-> Value via `with-serde_json-1`
+        // (same as the write path at workflow_state.rs). Binding Option<String>
+        // here panicked the tokio worker ("error deserializing column 0").
+        // `try_get` so any future column-type drift (back to text) warns and
+        // skips the row instead of panicking the worker. The `IS NOT NULL` WHERE
+        // stays as belt-and-braces.
         let rows = conn.query(
             "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 AND result_json IS NOT NULL ORDER BY iteration ASC",
             &[&task_run_id],
@@ -1772,13 +1776,17 @@ impl PgDb {
 
         let mut results = Vec::new();
         for row in &rows {
-            let json_opt: Option<String> = row.get(0);
-            let Some(json_str) = json_opt else {
-                // Defensive: WHERE filter should have excluded these.
-                continue;
-            };
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                results.push(parsed);
+            match row.try_get::<_, Option<serde_json::Value>>(0) {
+                Ok(Some(value)) => results.push(value),
+                Ok(None) => {
+                    // Defensive: WHERE filter should have excluded these.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "get_all_verification_phase_results: skipping row with undecodable result_json (column drift?): {}",
+                        e
+                    );
+                }
             }
         }
         Ok(results)
@@ -1794,20 +1802,25 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        // NULL-guard: bind Option<String>. See get_all_verification_phase_results.
+        // CR-5: `result_json` is `jsonb`. Bind `serde_json::Value` directly
+        // (see get_all_verification_phase_results). `try_get` so column drift
+        // warns + returns None instead of panicking the tokio worker.
         let row = conn.query_opt(
             "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 AND result_json IS NOT NULL ORDER BY iteration DESC LIMIT 1",
             &[&task_run_id],
         ).await.map_err(|e| format!("PG get_latest_verification_results: {}", e))?;
 
         match row {
-            Some(r) => {
-                let json_opt: Option<String> = r.get(0);
-                let Some(json_str) = json_opt else {
-                    return Ok(None);
-                };
-                Ok(serde_json::from_str(&json_str).ok())
-            }
+            Some(r) => match r.try_get::<_, Option<serde_json::Value>>(0) {
+                Ok(value) => Ok(value),
+                Err(e) => {
+                    tracing::warn!(
+                        "get_latest_verification_results: undecodable result_json (column drift?): {}",
+                        e
+                    );
+                    Ok(None)
+                }
+            },
             None => Ok(None),
         }
     }
@@ -2204,5 +2217,73 @@ impl PgDb {
         .await
         .map_err(|e| format!("PG save_task_run_automation: {}", e))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the "error deserializing column 0" panic in the
+    /// verification-results read path. `result_json` is `jsonb` (PgDb::new()'s
+    /// CR-5 self-heal ALTERs it to jsonb), but the three read sites bound
+    /// `Option<String>` via panicking `row.get`, which unwound the tokio
+    /// worker. The fix binds `serde_json::Value` via `try_get`. This test
+    /// round-trips through the write path (store_verification_phase_result) and
+    /// all three read functions to prove the jsonb bind works end-to-end.
+    ///
+    /// `#[ignore]` because it needs a live PG fixture (a self-provisioned /
+    /// ephemeral PG via DATABASE_URL — NOT the canonical DB). Run manually:
+    /// `cargo test -p qontinui-runner database::pg::task_runs::tests::verification_result_json_round_trip_no_panic -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL with workflow_verification_phase_results)"]
+    async fn verification_result_json_round_trip_no_panic() {
+        let pg = PgDb::new_blocking_for_test();
+
+        let task_run_id = format!("test-vpr-{}", uuid::Uuid::new_v4());
+        let payload = serde_json::json!({
+            "all_passed": true,
+            "phases": [{ "name": "phase-a", "passed": true }],
+            "unicode": "naïve résumé",
+        });
+
+        // Write path: binds serde_json::Value into the jsonb column.
+        pg.store_verification_phase_result(&task_run_id, 0, &payload)
+            .await
+            .expect("store_verification_phase_result should round-trip jsonb");
+        pg.store_verification_phase_result(&task_run_id, 1, &payload)
+            .await
+            .expect("store second iteration");
+
+        // Read site (a): get_all_verification_phase_results — previously panicked.
+        let all = pg
+            .get_all_verification_phase_results(&task_run_id)
+            .await
+            .expect("get_all should not error");
+        assert_eq!(all.len(), 2, "both iterations returned");
+        assert_eq!(all[0], payload, "jsonb decoded back to the same Value");
+
+        // Read site (b): get_latest_verification_results.
+        let latest = pg
+            .get_latest_verification_results(&task_run_id)
+            .await
+            .expect("get_latest should not error");
+        assert_eq!(latest.as_ref(), Some(&payload), "latest iteration returned");
+
+        // Read site (c): get_verification_phase_result (workflow_state.rs).
+        let one = pg
+            .get_verification_phase_result(&task_run_id, 1)
+            .await
+            .expect("get_verification_phase_result should not error");
+        assert_eq!(one.as_ref(), Some(&payload));
+
+        // Cleanup the synthetic rows.
+        let conn = pg.pool().get().await.expect("conn for cleanup");
+        conn.execute(
+            "DELETE FROM workflow_verification_phase_results WHERE task_run_id = $1",
+            &[&task_run_id],
+        )
+        .await
+        .expect("cleanup");
     }
 }
