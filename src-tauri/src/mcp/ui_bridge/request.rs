@@ -102,15 +102,18 @@ pub(crate) fn pending_key(window_label: &str, request_id: &str) -> String {
 
 /// Whether targeted per-window `ui-bridge-request` emit is enabled.
 ///
-/// Default OFF — the shipping single-window behavior broadcasts the event to all
-/// windows exactly as before (`app_handle.emit`), so Phase 0 is byte-identical to
-/// pre-window-aware behavior. Phase 1 flips this on (env `QONTINUI_UI_BRIDGE_MULTI_WINDOW=1`)
-/// once pop-out windows mount the SDK, so each request reaches only its target
-/// window. Read per-call so it can be toggled without a restart during rollout.
+/// Default ON now that pop-out windows answer the bridge (capabilities + per-realm
+/// port seed shipped). Each request is emitted only to its target window
+/// (`app.get_webview_window(label).emit(...)`), falling back to broadcast if the
+/// webview can't be resolved (mid-teardown) so a request is never dropped. For the
+/// single-window case this targets "main" only — functionally identical to the old
+/// broadcast, minus the cross-window noise. Set `QONTINUI_UI_BRIDGE_MULTI_WINDOW=0`
+/// (or `false`/`off`) to revert to unconditional broadcast. Read per-call so it can
+/// be toggled without a restart.
 fn multi_window_dispatch_enabled() -> bool {
     std::env::var("QONTINUI_UI_BRIDGE_MULTI_WINDOW")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+        .unwrap_or(true)
 }
 
 /// Gather structured readiness diagnostics when the frontend readiness gate
