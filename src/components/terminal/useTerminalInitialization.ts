@@ -87,7 +87,7 @@ interface UseTerminalInitializationParams {
   ) => void;
   zoneLayout: {
     layoutId: string;
-    setLayoutId: (id: string) => void;
+    setLayoutId: (id: string, opts?: { pinned?: boolean }) => void;
     assignTabToZone: (zoneIdx: number, tabId: string) => void;
     setFocusedZone: (zoneIdx: number) => void;
     assignments: Record<number, string>;
@@ -243,9 +243,11 @@ export function useTerminalInitialization({
         };
 
         // Restore the layout preset from the cosmetic snapshot if it differs.
+        // A saved snapshot is the operator's deliberate arrangement, so pin it
+        // — auto-grow must not override a restored layout.
         if (saved && saved.layoutId !== zoneLayout.layoutId) {
           const preset = LAYOUT_PRESETS.find((p) => p.id === saved.layoutId);
-          if (preset) zoneLayout.setLayoutId(preset.id);
+          if (preset) zoneLayout.setLayoutId(preset.id, { pinned: true });
         }
 
         // 3) Bind every open Claude record to its RECORDED zone — Claude zones
@@ -295,7 +297,8 @@ export function useTerminalInitialization({
           if (validSessionId) {
             pendingRestoresRef.current.push({
               tabId,
-              scrollbackPath: rec.zoneIndex >= 0 ? cosmeticsByZone.get(rec.zoneIndex)?.scrollbackPath : undefined,
+              scrollbackPath:
+                rec.zoneIndex >= 0 ? cosmeticsByZone.get(rec.zoneIndex)?.scrollbackPath : undefined,
               isClaudeSession: true,
               claudeSessionId: rec.claudeSessionId,
               claudeConfigDir: safeConfigDir,
@@ -314,10 +317,7 @@ export function useTerminalInitialization({
             title: rec.title,
             terminalId: tabId,
           }).catch((err) => {
-            console.warn(
-              `[TerminalPage] re-record open failed for ${rec.claudeSessionId}:`,
-              err,
-            );
+            console.warn(`[TerminalPage] re-record open failed for ${rec.claudeSessionId}:`, err);
           });
         }
 
@@ -355,12 +355,9 @@ export function useTerminalInitialization({
 
                 if (restore.scrollbackPath && handle) {
                   try {
-                    const result = await invoke<CommandResponse>(
-                      "terminal_get_saved_scrollback",
-                      {
-                        filePath: restore.scrollbackPath,
-                      },
-                    );
+                    const result = await invoke<CommandResponse>("terminal_get_saved_scrollback", {
+                      filePath: restore.scrollbackPath,
+                    });
                     if (result.success && result.data) {
                       const encoded = (result.data as { data: string }).data;
                       if (encoded) {

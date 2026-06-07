@@ -31,6 +31,8 @@ import { TerminalOverlays } from "./TerminalOverlays";
 import { CommandBar } from "./CommandBar";
 import { SuggestionsProvider } from "./suggestions";
 import { StatusStrip } from "./StatusStrip";
+import { UnzonedChip } from "./UnzonedChip";
+import { pickLayout } from "./useZoneLayout";
 import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
@@ -38,10 +40,7 @@ import { callRegistry, useTerminalCommands } from "./commands";
 import { useTerminalInitialization } from "./useTerminalInitialization";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
-import {
-  setTerminalSessions,
-  type TerminalSessionEntry,
-} from "@/lib/terminal-sessions-registry";
+import { setTerminalSessions, type TerminalSessionEntry } from "@/lib/terminal-sessions-registry";
 import { UIBridgeComponentScope } from "@qontinui/ui-bridge";
 import { useCommitState } from "./useCommitState";
 import { useTabSessionIdCapture } from "./useTabSessionIdCapture";
@@ -69,23 +68,23 @@ export function TerminalPage(props: TerminalPageProps) {
     // session provider so tab-ownership filtering + owner-gated stdin can read
     // "which window owns which session". A no-op in the single-window case.
     <WindowAssignmentsProvider>
-    <TerminalSessionProvider
-      pageId={pageId}
-      onNavigateToBuilder={props.onNavigateToBuilder}
-      onNavigateToActive={props.onNavigateToActive}
-    >
-      <ZoneMetadataProvider>
-        <TransitionEffectsProvider>
-          <UIStateProvider>
-            <SuggestionsProvider>
-              <ResultCardProvider>
-                <TerminalPageInner {...props} />
-              </ResultCardProvider>
-            </SuggestionsProvider>
-          </UIStateProvider>
-        </TransitionEffectsProvider>
-      </ZoneMetadataProvider>
-    </TerminalSessionProvider>
+      <TerminalSessionProvider
+        pageId={pageId}
+        onNavigateToBuilder={props.onNavigateToBuilder}
+        onNavigateToActive={props.onNavigateToActive}
+      >
+        <ZoneMetadataProvider>
+          <TransitionEffectsProvider>
+            <UIStateProvider>
+              <SuggestionsProvider>
+                <ResultCardProvider>
+                  <TerminalPageInner {...props} />
+                </ResultCardProvider>
+              </SuggestionsProvider>
+            </UIStateProvider>
+          </TransitionEffectsProvider>
+        </ZoneMetadataProvider>
+      </TerminalSessionProvider>
     </WindowAssignmentsProvider>
   );
 }
@@ -447,10 +446,7 @@ function TerminalPageInner({
     });
   }, [fileLockStates]);
 
-  const activeTab = useMemo(
-    () => tabs.find((t) => t.id === activeId),
-    [tabs, activeId],
-  );
+  const activeTab = useMemo(() => tabs.find((t) => t.id === activeId), [tabs, activeId]);
   const activeLockState = activeId ? fileLockStates?.[activeId] : undefined;
   // Phase 3 — pull per-tab incoming yield requests so the holding
   // banner can shift into request-mode and we can surface the request
@@ -725,15 +721,15 @@ function TerminalPageInner({
     (terminalId: string, exitCode: number | null) => {
       // Record the durable session CLOSE when a pty backing a Claude session
       // exits. Read the latest tab from the ref so this stays identity-stable.
-      const claudeSessionId = tabsRef.current.find(
-        (t) => t.id === terminalId,
-      )?.claudeSessionId;
+      const claudeSessionId = tabsRef.current.find((t) => t.id === terminalId)?.claudeSessionId;
       if (claudeSessionId) {
         invoke("terminal_session_record_close", {
           claudeSessionId,
           reason: "pty-exit",
         }).catch((err) => {
-          logger.warn(`terminal_session_record_close (pty-exit) failed for ${claudeSessionId}: ${err}`);
+          logger.warn(
+            `terminal_session_record_close (pty-exit) failed for ${claudeSessionId}: ${err}`,
+          );
         });
       }
       updateTab(terminalId, { isAlive: false, exitCode });
@@ -790,15 +786,6 @@ function TerminalPageInner({
       resumeSession: sessionManager.resumeSession,
     },
   });
-
-  /** Pick the smallest layout preset that fits `totalTabs` tabs. */
-  const pickLayout = (totalTabs: number): string => {
-    if (totalTabs >= 7) return "full-grid";
-    if (totalTabs >= 5) return "six-pack";
-    if (totalTabs >= 3) return "quad";
-    if (totalTabs >= 2) return "split";
-    return "single";
-  };
 
   const writeWhenReady = (tabId: string, text: string, maxWaitMs = 5000) =>
     writeWhenReadyHelper(terminalRefs.current, tabId, text, {
@@ -940,6 +927,14 @@ function TerminalPageInner({
         >
           {terminalSessionRoster}
         </span>
+        {/* Phase 2 — honesty backstop for sessions past the zone ceiling.
+            Renders nothing when every tab is visible; otherwise a "N more"
+            chip that opens the ZoneControlPanel's Unassigned (N) list. */}
+        <UnzonedChip
+          unassignedCount={zoneLayout.unassignedTabIds.length}
+          onOpen={() => dispatch({ type: "SET_SHOW_CONTROL_PANEL", payload: true })}
+        />
+
         {showDocFinder && (
           <DocFinderModal
             onSelect={(filePath) => {
@@ -1106,11 +1101,8 @@ function TerminalPageInner({
                     // first-arrived entry, but for the banner copy any
                     // matching entry is acceptable since a new signal
                     // for the same pair replaces in place.
-                    const signals =
-                      (activeId && pendingLongWaitSignals?.[activeId]) || [];
-                    const match = signals.find(
-                      (s) => s.filePath === activeLockState.filePath,
-                    );
+                    const signals = (activeId && pendingLongWaitSignals?.[activeId]) || [];
+                    const match = signals.find((s) => s.filePath === activeLockState.filePath);
                     if (!match) return undefined;
                     return {
                       holderName: match.holderName,
@@ -1145,7 +1137,11 @@ function TerminalPageInner({
             <CoordWarningBanner activeTerminalId={activeId ?? undefined} />
           </div>
 
-          {uiState.showControlPanel && zoneLayout.isMultiZone && (
+          {/* Phase 2 — `isMultiZone` gate dropped so the Unassigned (N) list
+              shows in `single` layout too. Past the 9-zone `full-grid` ceiling
+              the only honest surface for hidden sessions is this panel's
+              Unassigned list; the UnzonedChip near the StatusStrip opens it. */}
+          {uiState.showControlPanel && (
             <ZoneControlPanel onCreateTerminal={() => createAndAssignTerminal()} />
           )}
 
@@ -1175,7 +1171,9 @@ function TerminalPageInner({
         <div style={{ display: "none" }} aria-hidden>
           <ZoneLayoutPicker
             currentLayoutId={zoneLayout.layoutId}
-            onSelectLayout={zoneLayout.setLayoutId}
+            // Picking a layout from the picker UI is an explicit operator
+            // choice — pin it so auto-grow stops overriding it.
+            onSelectLayout={(id) => zoneLayout.setLayoutId(id, { pinned: true })}
             tabCount={tabs.length}
           />
           <ZoneProfilePicker
@@ -1189,7 +1187,9 @@ function TerminalPageInner({
             tabs={tabs}
             initialized={initialized}
             onLoadProfile={async (profile) => {
-              zoneLayout.setLayoutId(profile.layoutId);
+              // Loading a saved profile is a deliberate operator layout choice —
+              // pin it so auto-grow doesn't override the restored arrangement.
+              zoneLayout.setLayoutId(profile.layoutId, { pinned: true });
               labelsAndTags.setZoneLabels(profile.labels);
               labelsAndTags.setZoneNotes(profile.notes);
               labelsAndTags.setPinnedZones(new Set(profile.pins));
