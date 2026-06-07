@@ -170,6 +170,12 @@ pub enum SessionEventKind {
     OutputChunk,
     /// Phase 7 — defined now, published when handoff lands.
     HandoffRequest,
+    /// Commit ↔ session lineage push-report (plan
+    /// `2026-06-07-coord-commit-session-lineage.md`, Population path 2).
+    /// Drained to `POST /coord/commits/report {repo, branch, shas[]}`; the
+    /// payload carries `{repo, branch, shas}` and NO session id (coord resolves
+    /// the session server-side from `(repo, branch)`).
+    CommitReport,
 }
 
 impl SessionEventKind {
@@ -182,6 +188,7 @@ impl SessionEventKind {
             SessionEventKind::ClaimStolen => "claim_stolen",
             SessionEventKind::OutputChunk => "output_chunk",
             SessionEventKind::HandoffRequest => "handoff_request",
+            SessionEventKind::CommitReport => "commit_report",
         }
     }
 }
@@ -1198,6 +1205,7 @@ mod tests {
             SessionEventKind::ClaimStolen,
             SessionEventKind::OutputChunk,
             SessionEventKind::HandoffRequest,
+            SessionEventKind::CommitReport,
         ];
         for k in kinds {
             let json = serde_json::to_string(&k).unwrap();

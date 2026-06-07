@@ -38,6 +38,7 @@ use super::transcript::{
     find_claude_config_dirs, is_workflow_session_marker, list_sessions,
     parse_line_for_touched_files,
 };
+use crate::claude_session::coord_register::AiCoordRegistrar;
 
 /// Ceiling for "recent enough to schedule a tail task on startup". Older
 /// JSONLs are skipped — they belong to closed sessions whose tabs the user
@@ -83,6 +84,7 @@ pub fn start_transcript_watcher(
     app_handle: tauri::AppHandle,
     pg: Arc<crate::database::pg::PgDb>,
     workspace_paths: Vec<String>,
+    registrar: Option<Arc<AiCoordRegistrar>>,
 ) -> Result<(), String> {
     if WATCHER.get().is_some() {
         return Err("transcript watcher already started".to_string());
@@ -96,7 +98,7 @@ pub fn start_transcript_watcher(
     // Spawn the orchestrator on the tokio runtime. It owns the channel, the
     // watcher, and the per-session task map.
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_orchestrator(app_handle, pg, workspace_paths).await {
+        if let Err(e) = run_orchestrator(app_handle, pg, workspace_paths, registrar).await {
             warn!("transcript_watcher: orchestrator exited with error: {}", e);
         }
     });
@@ -111,6 +113,7 @@ async fn run_orchestrator(
     app_handle: tauri::AppHandle,
     pg: Arc<crate::database::pg::PgDb>,
     workspace_paths: Vec<String>,
+    registrar: Option<Arc<AiCoordRegistrar>>,
 ) -> Result<(), String> {
     let config_dirs = find_claude_config_dirs();
     if config_dirs.is_empty() {
@@ -162,6 +165,7 @@ async fn run_orchestrator(
                     jsonl,
                     pg.clone(),
                     app_handle.clone(),
+                    registrar.clone(),
                     /* start_at_eof */ true,
                 )
                 .await;
@@ -243,6 +247,7 @@ async fn run_orchestrator(
                         path.clone(),
                         pg.clone(),
                         app_handle.clone(),
+                        registrar.clone(),
                         /* start_at_eof */ false,
                     )
                     .await;
@@ -264,6 +269,7 @@ async fn run_orchestrator(
                             path.clone(),
                             pg.clone(),
                             app_handle.clone(),
+                            registrar.clone(),
                             /* start_at_eof */ true,
                         )
                         .await;
@@ -322,6 +328,7 @@ async fn schedule_tail(
     path: PathBuf,
     pg: Arc<crate::database::pg::PgDb>,
     app_handle: tauri::AppHandle,
+    registrar: Option<Arc<AiCoordRegistrar>>,
     start_at_eof: bool,
 ) {
     let mut map = tasks.lock().await;
@@ -349,6 +356,7 @@ async fn schedule_tail(
             path,
             pg,
             app_handle,
+            registrar,
             wake,
             cancel,
             start_at_eof,
@@ -374,6 +382,7 @@ async fn tail_session(
     path: PathBuf,
     pg: Arc<crate::database::pg::PgDb>,
     app_handle: tauri::AppHandle,
+    registrar: Option<Arc<AiCoordRegistrar>>,
     wake: Arc<Notify>,
     cancel: Arc<Notify>,
     start_at_eof: bool,
@@ -487,6 +496,23 @@ async fn tail_session(
                         "transcript_watcher: malformed JSON line in {}: {}",
                         session_id, e
                     );
+                }
+            }
+
+            // ── Commit ↔ session lineage push-report (Population path 2) ──
+            //
+            // Detect `git push` Bash tool_use blocks on this line and, for
+            // each, resolve repo/branch/SHAs and enqueue a coord outbox
+            // report. Best-effort; the git enumeration runs on a blocking
+            // pool so it never stalls the tail loop. Skipped entirely when no
+            // registrar (outbox) is wired.
+            if let Some(reg) = registrar.as_ref() {
+                let pushes = super::commit_report::parse_line_for_pushes(&line);
+                for obs in pushes {
+                    let reg = reg.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        super::commit_report::handle_push_observation(&obs, &reg);
+                    });
                 }
             }
         }

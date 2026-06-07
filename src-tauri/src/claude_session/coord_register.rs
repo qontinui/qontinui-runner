@@ -231,6 +231,62 @@ impl AiCoordRegistrar {
         Some(session_id)
     }
 
+    /// Commit ↔ session lineage push-report (plan
+    /// `2026-06-07-coord-commit-session-lineage.md`, Population path 2). Enqueue
+    /// a `commit_report` outbox row carrying `{repo, branch, shas}`. The drain
+    /// loop POSTs it to `POST /coord/commits/report`; coord resolves the
+    /// session server-side from `(repo, branch)`, so the body carries NO session
+    /// id.
+    ///
+    /// The outbox keys its monotonic `seq` on `(machine_id, session_id)`, but
+    /// commit reports have no real session — we mint a **deterministic** UUIDv5
+    /// from `(repo, branch)` so all reports for one branch share a seq lane
+    /// (stable ordering, idempotent replay) without colliding across branches.
+    /// Coord never reads this id.
+    ///
+    /// Best-effort and gated on `QONTINUI_COMMIT_LINEAGE_REPORT` (default ON);
+    /// a disabled gate, empty `shas`, or an outbox write error is a silent
+    /// no-op that never disturbs the live session.
+    pub fn report_commits(&self, repo: &str, branch: &str, shas: Vec<String>) {
+        if !crate::terminal::commit_report::report_enabled() {
+            return;
+        }
+        let shas: Vec<String> = shas.into_iter().filter(|s| !s.trim().is_empty()).collect();
+        if shas.is_empty() {
+            return;
+        }
+
+        // Deterministic per-(repo, branch) synthetic session id for the outbox
+        // seq lane. URL namespace + "repo/branch" key.
+        let session_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("commit-report:{repo}:{branch}").as_bytes(),
+        );
+        let payload = json!({
+            "repo": repo,
+            "branch": branch,
+            "shas": shas,
+        });
+
+        match self.inner.outbox.record(
+            self.inner.machine_id,
+            session_id,
+            SessionEventKind::CommitReport,
+            payload,
+        ) {
+            Ok(_) => info!(
+                "ai_coord_register: enqueued commit report for {}@{} ({} sha(s))",
+                repo,
+                branch,
+                shas.len()
+            ),
+            Err(e) => warn!(
+                "ai_coord_register: outbox CommitReport write failed for {}@{} (best-effort): {}",
+                repo, branch, e
+            ),
+        }
+    }
+
     /// R3 — emit a coord heartbeat for the AI session backing `task_run_id`,
     /// driven by **operator interaction** (called from `send_user_message`).
     /// This is the ONLY heartbeat these sessions ever get, so an idle session
@@ -430,6 +486,66 @@ mod tests {
                 r.event_kind == SessionEventKind::Closed.as_str() && r.session_id == coord_id
             });
         assert!(closed, "a Closed outbox row must be emitted on close");
+    }
+
+    #[test]
+    fn report_commits_enqueues_commit_report_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let (reg, _dir) = registrar();
+
+        reg.report_commits(
+            "qontinui/qontinui-runner",
+            "feat/x",
+            vec!["sha1".into(), "sha2".into()],
+        );
+
+        let pending = reg.inner.outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(row.event_kind, SessionEventKind::CommitReport.as_str());
+        assert_eq!(row.payload["repo"], json!("qontinui/qontinui-runner"));
+        assert_eq!(row.payload["branch"], json!("feat/x"));
+        assert_eq!(row.payload["shas"], json!(["sha1", "sha2"]));
+        // No session id is carried in the body — coord resolves it server-side.
+        assert!(row.payload.get("agent_session_id").is_none());
+    }
+
+    #[test]
+    fn report_commits_per_branch_seq_lane_is_deterministic() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let (reg, _dir) = registrar();
+
+        reg.report_commits("o/r", "main", vec!["a".into()]);
+        reg.report_commits("o/r", "main", vec!["b".into()]);
+        let pending = reg.inner.outbox.pending().unwrap();
+        // Both reports for the same (repo, branch) share one seq lane (same
+        // synthetic session id), so seqs are 1 then 2.
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].session_id, pending[1].session_id);
+        assert_eq!(pending[0].seq, 1);
+        assert_eq!(pending[1].seq, 2);
+    }
+
+    #[test]
+    fn report_commits_skips_empty_shas() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+        let (reg, _dir) = registrar();
+        reg.report_commits("o/r", "main", vec![]);
+        reg.report_commits("o/r", "main", vec!["   ".into()]);
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn report_commits_disabled_gate_is_noop() {
+        let _env = env_lock();
+        std::env::set_var("QONTINUI_COMMIT_LINEAGE_REPORT", "0");
+        let (reg, _dir) = registrar();
+        reg.report_commits("o/r", "main", vec!["a".into()]);
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+        std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
     }
 
     #[test]

@@ -2724,10 +2724,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             Vec::new()
                         }
                     };
+                // Commit ↔ session lineage push-report (Population path 2): the
+                // watcher reuses the AiCoordRegistrar's outbox to enqueue
+                // `commit_report` rows on observed `git push`es.
+                let tw_registrar = app
+                    .try_state::<Arc<claude_session::coord_register::AiCoordRegistrar>>()
+                    .map(|s| s.inner().clone());
                 if let Err(e) = crate::terminal::transcript_watcher::start_transcript_watcher(
                     tw_app_handle,
                     tw_pg,
                     workspace_paths,
+                    tw_registrar,
                 ) {
                     tracing::warn!("transcript watcher failed to start: {}", e);
                 }
