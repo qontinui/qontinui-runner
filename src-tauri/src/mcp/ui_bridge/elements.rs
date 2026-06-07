@@ -878,8 +878,29 @@ pub async fn ui_bridge_execute_action_handler(
     // Target pop-out window (`?windowLabel=term-1`); scopes the action AND its
     // detector/validation queries below so the element id resolves in the right
     // window's registry. Owned so it survives the awaits without borrowing query.
+    // Empty string is treated as "no target" (main).
     let window_label = query.window_label.clone();
-    let window_label = window_label.as_deref();
+    let window_label = window_label.as_deref().filter(|s| !s.is_empty());
+
+    // ── Unknown-window gate ─────────────────────────────────────────────
+    // Fail fast with a clear error if a non-existent target window was named.
+    // Without this, the pre-flight element probes below (is-input / supported-
+    // actions `get_element`) hit the missing window, swallow the "no window"
+    // error as an empty supported-actions list, and the action is rejected with
+    // a misleading "action not supported ... advertises []" instead of naming
+    // the real problem. Mirrors the guard in `request::ui_bridge_request_inner`.
+    if let Some(target) = window_label {
+        use tauri::Manager;
+        if state.app_handle.get_webview_window(target).is_none() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!(
+                    "No runner window labeled '{target}'. Discover live windows via \
+                     GET /ui-bridge/control/runner-windows."
+                ))),
+            ));
+        }
+    }
 
     // ── Invalid-action gate ─────────────────────────────────────────────
     // Reject unknown action names BEFORE the registry lookup, the
