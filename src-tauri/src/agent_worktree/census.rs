@@ -144,6 +144,36 @@ pub struct WorktreeCensus {
     /// `Some(_)` is the live probe result; old runners omit the field and
     /// coord reads NULL (honest unknown).
     pub building: Option<bool>,
+
+    /// Ξ_Worktree Phase 7.3 — canonical-checkout state, the input coord
+    /// needs to prove SharedBranch's P1/P2 preconditions safe (§3.2/§3.3).
+    ///
+    /// These describe the **canonical repo checkout** (`<root>/<repo>/`),
+    /// not this worktree row's path — canonical state is per-repo, so every
+    /// worktree row of a repo carries the same values (coord reads one row
+    /// per repo). All three are `None` when the canonical path can't be
+    /// resolved or git fails; coord treats `None` as unsafe → falls through
+    /// to an isolated Worktree (the fail-safe staging idiom). Inert until
+    /// coord ingests them (7.3 consumer) and Rule 2 reads them (7.2).
+    ///
+    /// Current branch of the canonical checkout
+    /// (`git symbolic-ref --short HEAD`). `None` on detached HEAD or git
+    /// failure.
+    pub canonical_current_branch: Option<String>,
+
+    /// Whether the canonical checkout has uncommitted changes
+    /// (`git status --porcelain` non-empty). `Some(true)` dirty,
+    /// `Some(false)` clean, `None` on git failure (coord treats as unsafe).
+    /// This is the P1-clean precondition input for SharedBranch.
+    pub canonical_is_dirty: Option<bool>,
+
+    /// Advisory base-divergence summary for the canonical checkout, e.g.
+    /// `"on:main"` when parked on main, else
+    /// `"on:<branch>;<behind>\t<ahead>"` from
+    /// `git rev-list --count --left-right origin/main...HEAD`. Best-effort:
+    /// tolerates a missing `origin/main` (just the branch name) and never
+    /// errors the census. Human-readable context for the P2 base check.
+    pub canonical_base_divergence: Option<String>,
 }
 
 /// Full census body POSTed to coord.
@@ -588,6 +618,49 @@ fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
     Some(false)
 }
 
+/// Ξ_Worktree P7.3 — current branch of the canonical checkout
+/// (`git symbolic-ref --short HEAD`). `None` on detached HEAD (the command
+/// errors), an empty result, or any git failure.
+fn compute_canonical_branch(canonical: &Path) -> Option<String> {
+    git_capture(canonical, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty())
+}
+
+/// Ξ_Worktree P7.3 — dirty bit of the canonical checkout
+/// (`git status --porcelain` non-empty). `Some(true)` when there are
+/// uncommitted changes, `Some(false)` when clean, `None` on a git failure
+/// (fail-OPEN to `None` is fine: coord reads `None` as unsafe). This is the
+/// P1-clean precondition input for SharedBranch.
+fn compute_canonical_is_dirty(canonical: &Path) -> Option<bool> {
+    git_capture(canonical, &["status", "--porcelain"]).map(|s| !s.trim().is_empty())
+}
+
+/// Ξ_Worktree P7.3 — advisory base-divergence summary for the canonical
+/// checkout. Never errors the census; falls back gracefully:
+///
+/// * On `main` → `Some("on:main")`.
+/// * Otherwise, with `origin/main` resolvable →
+///   `Some("on:<branch>;<behind>\t<ahead>")` from
+///   `git rev-list --count --left-right origin/main...HEAD`.
+/// * Otherwise (missing `origin/main`, detached HEAD, git failure) → just
+///   the branch name `Some("on:<branch>")`, or `None` if even the branch is
+///   unresolvable.
+fn compute_canonical_base_divergence(canonical: &Path) -> Option<String> {
+    let branch = compute_canonical_branch(canonical)?;
+    if branch == "main" {
+        return Some("on:main".to_string());
+    }
+    // Best-effort ahead/behind vs origin/main. `--left-right` on the
+    // symmetric-difference `A...B` prints `<behind>\t<ahead>`. A missing
+    // origin/main makes this fail → fall back to just the branch name.
+    match git_capture(
+        canonical,
+        &["rev-list", "--count", "--left-right", "origin/main...HEAD"],
+    ) {
+        Some(lr) if !lr.is_empty() => Some(format!("on:{branch};{lr}")),
+        _ => Some(format!("on:{branch}")),
+    }
+}
+
 /// Build the census row for a single worktree dir.
 fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     let branch =
@@ -621,6 +694,18 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     // reported every tick regardless of arming (the passive prove-out feed).
     let building = Some(super::reclaim::probe_building(worktree));
 
+    // Ξ_Worktree P7.3 — canonical-checkout state (per-REPO, not per-worktree;
+    // it's fine that every worktree row of a repo carries the same values —
+    // coord reads one row per repo). Resolve the canonical path for this
+    // repo; a missing/unresolvable canonical → all three facts are None
+    // (`.and_then` off the canonical Option), which coord reads as unsafe.
+    let canonical = super::canonical_paths::default_canonical_path(repo).ok();
+    let canonical_current_branch = canonical.as_deref().and_then(compute_canonical_branch);
+    let canonical_is_dirty = canonical.as_deref().and_then(compute_canonical_is_dirty);
+    let canonical_base_divergence = canonical
+        .as_deref()
+        .and_then(compute_canonical_base_divergence);
+
     WorktreeCensus {
         repo: repo.to_string(),
         path: normalize_path_str(worktree),
@@ -638,6 +723,9 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         attributable_bytes,
         landed_in_main,
         building,
+        canonical_current_branch,
+        canonical_is_dirty,
+        canonical_base_divergence,
     }
 }
 
@@ -1020,6 +1108,94 @@ mod tests {
         git(&["add", "b.txt"]);
         git(&["commit", "-q", "-m", "c2"]);
         assert_eq!(compute_landed_in_main(path), Some(false));
+    }
+
+    /// Ξ_Worktree P7.3 — canonical-checkout facts on a real temp git repo.
+    /// Mirrors the git-tempdir idiom above. Drives the three compute helpers
+    /// directly (a tempdir is not a canonical `<root>/<repo>/` checkout, so
+    /// `capture_worktree` would resolve canonical to a real on-disk repo or
+    /// None — we exercise the helpers against a controlled repo instead).
+    #[test]
+    fn canonical_checkout_facts_branch_dirty_and_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let wt = path.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args([&["-C", wt], args].concat())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        // Name the initial branch deterministically (default may be main or
+        // master depending on git config) so the assertions are stable.
+        git(&["checkout", "-q", "-b", "feature-x"]);
+        std::fs::write(path.join("a.txt"), b"x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "c1"]);
+
+        // Branch resolves to the current branch.
+        assert_eq!(
+            compute_canonical_branch(path),
+            Some("feature-x".to_string())
+        );
+
+        // Clean tree → Some(false); flips to Some(true) after an uncommitted
+        // write.
+        assert_eq!(compute_canonical_is_dirty(path), Some(false));
+        std::fs::write(path.join("b.txt"), b"y").unwrap();
+        assert_eq!(compute_canonical_is_dirty(path), Some(true));
+
+        // Divergence string is non-empty (no origin/main here → falls back to
+        // just the branch name, which is still a non-empty advisory string).
+        let div = compute_canonical_base_divergence(path).expect("divergence Some");
+        assert!(!div.is_empty(), "divergence string should be non-empty");
+        assert!(div.starts_with("on:feature-x"), "got: {div}");
+    }
+
+    /// Ξ_Worktree P7.3 — `on:main` carve-out + ahead/behind formatting when
+    /// `origin/main` resolves.
+    #[test]
+    fn canonical_checkout_facts_on_main_and_divergence_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let wt = path.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args([&["-C", wt], args].concat())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["checkout", "-q", "-b", "main"]);
+        std::fs::write(path.join("a.txt"), b"x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "c1"]);
+
+        // On main → exact "on:main" carve-out (no rev-list needed).
+        assert_eq!(
+            compute_canonical_base_divergence(path),
+            Some("on:main".to_string())
+        );
+
+        // Point a local origin/main at HEAD, branch off, add one ahead commit
+        // → divergence string carries the rev-list left-right counts.
+        let head = git_capture(path, &["rev-parse", "HEAD"]).unwrap();
+        git(&["update-ref", "refs/remotes/origin/main", &head]);
+        git(&["checkout", "-q", "-b", "topic"]);
+        std::fs::write(path.join("c.txt"), b"z").unwrap();
+        git(&["add", "c.txt"]);
+        git(&["commit", "-q", "-m", "c2"]);
+        let div = compute_canonical_base_divergence(path).expect("divergence Some");
+        // origin/main...HEAD: 0 behind, 1 ahead → "on:topic;0\t1".
+        assert!(div.starts_with("on:topic;"), "got: {div}");
+        assert!(div.contains('1'), "should report the 1 ahead commit: {div}");
     }
 
     #[test]
