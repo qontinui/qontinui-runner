@@ -151,6 +151,25 @@ pub fn restore_pop_out_windows(
     app: &tauri::AppHandle,
     assignments: &Arc<WindowAssignments>,
 ) -> usize {
+    // P2 (orphan sweep): a persisted pop-out's PTYs never survive the process
+    // restart — terminal ids are a fresh uuid per launch and are never
+    // recreated — so EVERY persisted `session_owner` entry is stale on boot and
+    // every `term-N` record is genuinely empty (no live tab can claim it).
+    // Restoring them just produces empty, un-closable windows whose monotonic
+    // `term-N` counter keeps climbing (the observed orphan-accumulation loop,
+    // `term-19`). So FIRST clear the stale owner map, THEN prune the now-empty
+    // pop-out records, so we neither restore them nor resurrect them next boot.
+    let cleared = assignments.clear_session_owners();
+    let pruned = assignments.prune_empty_pop_outs();
+    if cleared > 0 || !pruned.is_empty() {
+        tracing::info!(
+            cleared_owners = cleared,
+            pruned = pruned.len(),
+            labels = ?pruned,
+            "restore_pop_out_windows: cleared stale owners + pruned empty pop-out records (boot orphan sweep)"
+        );
+    }
+
     let mut restored = 0usize;
     for record in assignments.pop_out_records() {
         let label = record.label.clone();
@@ -182,6 +201,130 @@ pub fn restore_pop_out_windows(
     restored
 }
 
+/// P2 (orphan sweep) — close every OPEN pop-out (`term-N`) window that owns no
+/// assigned session, and prune any session-less pop-out records. Shared by the
+/// boot path's intent and the operator-initiated "close empty terminal windows"
+/// affordance ([`close_empty_terminal_windows`]) so both behave identically.
+///
+/// A pop-out is "empty" when [`WindowAssignments::has_assigned_sessions`] is
+/// false for its label — no tab renders there. Programmatic teardown routes
+/// through `WebviewWindow::destroy()` (NOT `close()`): on Windows/WebView2 a
+/// `close()` only requests a close that the event loop may never finish
+/// destroying, leaving the OS window VISIBLE (observed live — `EnumWindows`
+/// still reports the window `[vis]` after `close()` returned `ok`). `destroy()`
+/// forces the teardown synchronously. The central `CloseRequested` handler still
+/// fires (so the usual reassign-to-main + `window-closed` path runs — a no-op
+/// reassign when empty), then we prune the now-dead records. Returns the labels
+/// closed/pruned. Never touches `"main"`.
+pub fn sweep_empty_pop_out_windows(
+    app: &tauri::AppHandle,
+    assignments: &Arc<WindowAssignments>,
+) -> Vec<String> {
+    let mut swept: Vec<String> = Vec::new();
+    for record in assignments.pop_out_records() {
+        let label = &record.label;
+        if assignments.has_assigned_sessions(label) {
+            continue; // still hosts a tab — leave it
+        }
+        // Destroy (not close) the live OS window if one is open (best-effort):
+        // close() leaves WebView2 pop-outs visible; destroy() forces teardown.
+        // The record is pruned below regardless, so a record with no live
+        // window is still cleaned up.
+        if let Some(win) = app.get_webview_window(label) {
+            if let Err(e) = win.destroy() {
+                tracing::warn!(window = %label, error = %e, "sweep_empty_pop_out_windows: destroy failed");
+            }
+        }
+        swept.push(label.clone());
+    }
+    let pruned = assignments.prune_empty_pop_outs();
+    if !pruned.is_empty() {
+        tracing::info!(count = pruned.len(), labels = ?pruned, "sweep_empty_pop_out_windows: pruned empty pop-out records");
+    }
+    // Union (a record may be pruned without a live window, or closed without
+    // having been in pop_out_records by the time prune ran) — de-dup by set.
+    let mut set: std::collections::BTreeSet<String> = swept.into_iter().collect();
+    set.extend(pruned);
+    set.into_iter().collect()
+}
+
+/// Operator-initiated "close empty terminal windows" affordance (P2). Reuses
+/// [`sweep_empty_pop_out_windows`] — closes every pop-out that owns no live tab
+/// and prunes its record. Returns the labels swept (for an optional toast).
+#[tauri::command]
+pub async fn close_empty_terminal_windows(
+    app: tauri::AppHandle,
+    assignments: tauri::State<'_, Arc<WindowAssignments>>,
+) -> Result<Vec<String>, String> {
+    Ok(sweep_empty_pop_out_windows(&app, assignments.inner()))
+}
+
+/// P1 (close-on-clean-exit) — invoked from the terminal session's PTY-exit
+/// waiter the instant a session's child exits. On a CLEAN exit (`Some(0)`)
+/// only, if the session's owning window is a `term-N` pop-out that now hosts NO
+/// other live session, close that window (the predictable terminal-emulator
+/// close-on-exit behaviour) and prune its record so boot-restore won't
+/// resurrect it. A non-zero / unknown exit NEVER auto-closes (honesty: a failed
+/// session stays visible). `"main"` is never auto-closed. Multi-tab pop-outs are
+/// never closed by one tab's exit (the emptiness check sees the sibling tabs).
+///
+/// `terminal_id` is the session id used as the `window_assignments` owner key
+/// (the same id the frontend passes to `assign_session_to_window`).
+///
+/// Best-effort + cheap: a non-clean exit returns immediately; an owner of
+/// `"main"` (the common case — most sessions are docked) returns immediately.
+pub fn auto_close_owner_window_if_empty(
+    app: &tauri::AppHandle,
+    assignments: &Arc<WindowAssignments>,
+    terminal_id: &str,
+    exit_code: Option<i32>,
+) {
+    // Honesty: only a clean exit auto-closes. Non-zero / None stays open.
+    if exit_code != Some(0) {
+        return;
+    }
+    let owner = assignments.owner_of(terminal_id);
+    if owner == MAIN_WINDOW_LABEL {
+        return; // docked session, or main — never auto-close
+    }
+    // Drop this session's ownership first (its PTY just died), then test the
+    // window for remaining tabs. `assign_session(.., "main")` removes the
+    // explicit entry; emit the reassignment so any window views stay in sync.
+    if let Some(from) = assignments.assign_session(terminal_id, MAIN_WINDOW_LABEL) {
+        let payload = SessionAssignmentChanged {
+            session_id: terminal_id.to_string(),
+            from: Some(from),
+            to: MAIN_WINDOW_LABEL.to_string(),
+        };
+        if let Err(e) = app.emit("session-assignment-changed", &payload) {
+            tracing::warn!(error = %e, "auto_close_owner_window_if_empty: failed to emit reassignment");
+        }
+    }
+    if assignments.has_assigned_sessions(&owner) {
+        // Another live tab remains in the pop-out — leave it open.
+        return;
+    }
+    // The owner pop-out is now empty: destroy the OS window and prune the
+    // record so the boot-restore loop won't resurrect it. We destroy() rather
+    // than close() because close() only REQUESTS a close that WebView2 may never
+    // finish, leaving the pop-out visible on screen (observed live: `EnumWindows`
+    // still reported it `[vis]` after a successful close()). destroy() forces the
+    // teardown; the central `CloseRequested` handler still fires (and emits
+    // `window-closed`) before the window is gone.
+    if let Some(win) = app.get_webview_window(&owner) {
+        if let Err(e) = win.destroy() {
+            tracing::warn!(window = %owner, error = %e, "auto_close_owner_window_if_empty: destroy failed");
+        }
+    }
+    let pruned = assignments.prune_empty_pop_outs();
+    tracing::info!(
+        window = %owner,
+        terminal_id = %terminal_id,
+        pruned = ?pruned,
+        "auto-closed empty pop-out on clean session exit"
+    );
+}
+
 /// Snapshot every open pop-out window's current geometry into the registry
 /// (persist-on-change). Called periodically and at shutdown so a restart —
 /// including the operator's rebuild-and-kill path, which never runs the clean
@@ -211,8 +354,12 @@ pub fn capture_open_geometry(app: &tauri::AppHandle, assignments: &Arc<WindowAss
 
 /// Close a pop-out terminal window. The actual reassignment + events happen in
 /// the central `on_window_event` `CloseRequested` handler (so the OS close
-/// button takes the same path); here we just request the close. Closing
-/// `"main"` is rejected.
+/// button takes the same path); here we force the teardown. We use `destroy()`
+/// rather than `close()` because `close()` only requests a close that WebView2
+/// may never finish, leaving the pop-out visible on screen (observed live:
+/// `EnumWindows` still reported it `[vis]` after a successful `close()`).
+/// `destroy()` forces the teardown while still firing `CloseRequested` (so the
+/// central handler emits `window-closed`). Closing `"main"` is rejected.
 #[tauri::command]
 pub async fn close_terminal_window(app: tauri::AppHandle, label: String) -> Result<(), String> {
     if label == MAIN_WINDOW_LABEL {
@@ -220,8 +367,8 @@ pub async fn close_terminal_window(app: tauri::AppHandle, label: String) -> Resu
     }
     match app.get_webview_window(&label) {
         Some(win) => win
-            .close()
-            .map_err(|e| format!("Failed to close window {}: {}", label, e)),
+            .destroy()
+            .map_err(|e| format!("Failed to destroy window {}: {}", label, e)),
         None => Ok(()), // already gone — idempotent
     }
 }

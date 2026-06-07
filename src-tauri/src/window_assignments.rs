@@ -326,6 +326,92 @@ impl WindowAssignments {
             .unwrap_or_default()
     }
 
+    /// Whether a window currently owns at least one assigned session. `"main"`
+    /// is the default owner for every unmapped session, so it is reported as
+    /// non-empty whenever ANY session exists (it always "could" host one) — but
+    /// callers only ever ask this about `term-N` pop-outs, where an empty answer
+    /// means "no tab renders here". Unknown labels are empty.
+    pub fn has_assigned_sessions(&self, label: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|s| s.session_owner.values().any(|owner| owner == label))
+            .unwrap_or(false)
+    }
+
+    /// Clear the entire `session_owner` map (reverting every session to the
+    /// default `"main"`), persisting on change. Returns the number of entries
+    /// dropped.
+    ///
+    /// **Boot-only.** Terminal ids are a fresh `uuid_v4` per launch and do NOT
+    /// survive a process restart (`terminal::manager::create`), so EVERY
+    /// persisted owner entry references a terminal that will never reappear —
+    /// the map is entirely stale on boot. Clearing it before
+    /// [`Self::prune_empty_pop_outs`] makes every persisted pop-out correctly
+    /// register as empty (no live tab can ever claim it) so the boot orphan
+    /// sweep prunes them all, instead of a stale entry wrongly pinning a dead
+    /// pop-out open forever. Mid-session callers must NOT use this (it would
+    /// strand live tabs back on `main`).
+    pub fn clear_session_owners(&self) -> usize {
+        let (count, snapshot) = {
+            let mut s = match self.inner.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "window_assignments: lock poisoned on clear_session_owners");
+                    return 0;
+                }
+            };
+            if s.session_owner.is_empty() {
+                return 0;
+            }
+            let count = s.session_owner.len();
+            s.session_owner.clear();
+            (count, s.clone())
+        };
+        self.persist(&snapshot);
+        count
+    }
+
+    /// Prune every pop-out (`term-N`) record that currently owns NO assigned
+    /// session, removing it from the registry so the boot-restore loop stops
+    /// resurrecting it and the monotonic `term-N` counter stops climbing on
+    /// dead records. Returns the labels pruned. Never touches `"main"` or a
+    /// pop-out that still owns a session. Persists on change.
+    ///
+    /// **Why this is the boot-orphan fix:** PTYs do not survive a process
+    /// restart, so a persisted pop-out's sessions are always gone on the next
+    /// boot — `restore_pop_out_windows` would otherwise recreate an empty,
+    /// purposeless window every time. Pruning the empties on boot breaks that
+    /// loop. (A pop-out whose tabs were reassigned to `main` before shutdown is
+    /// likewise empty here and correctly pruned — its tabs render on `main`.)
+    pub fn prune_empty_pop_outs(&self) -> Vec<WindowLabel> {
+        let (pruned, snapshot) = {
+            let mut s = match self.inner.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "window_assignments: lock poisoned on prune_empty_pop_outs");
+                    return Vec::new();
+                }
+            };
+            let owned: std::collections::HashSet<&str> =
+                s.session_owner.values().map(|v| v.as_str()).collect();
+            let empties: Vec<WindowLabel> = s
+                .windows
+                .values()
+                .filter(|r| r.kind == WindowKind::PopOut && !owned.contains(r.label.as_str()))
+                .map(|r| r.label.clone())
+                .collect();
+            if empties.is_empty() {
+                return Vec::new();
+            }
+            for label in &empties {
+                s.windows.remove(label);
+            }
+            (empties, s.clone())
+        };
+        self.persist(&snapshot);
+        pruned
+    }
+
     /// Record a window's last-known geometry (for Phase-2 restore). Persists
     /// only when the geometry actually changed (so the periodic capture poll
     /// is a no-op while a window sits still — no disk churn). Returns `true`
@@ -583,6 +669,93 @@ mod tests {
         assert_eq!(wa.owner_of("sess-live"), "term-1"); // untouched
                                                         // Idempotent: a second pass finds nothing.
         assert!(wa.reconcile_orphans().is_empty());
+    }
+
+    #[test]
+    fn has_assigned_sessions_reflects_owner_map() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let w = wa.create_window(None, None, 10); // term-1, no sessions yet
+        assert!(
+            !wa.has_assigned_sessions(&w.label),
+            "a freshly-created pop-out owns no sessions"
+        );
+        wa.assign_session("sess-A", &w.label);
+        assert!(wa.has_assigned_sessions(&w.label), "now owns sess-A");
+        // Moving the only session away empties it again.
+        wa.assign_session("sess-A", "main");
+        assert!(
+            !wa.has_assigned_sessions(&w.label),
+            "empty again after the tab moved to main"
+        );
+        assert!(
+            !wa.has_assigned_sessions("term-999"),
+            "unknown label is empty"
+        );
+    }
+
+    #[test]
+    fn prune_empty_pop_outs_removes_only_session_less_popouts() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let empty1 = wa.create_window(None, None, 10); // term-1, empty
+        let live = wa.create_window(None, None, 20); // term-2, will hold a session
+        let empty2 = wa.create_window(None, None, 30); // term-3, empty
+        wa.assign_session("sess-live", &live.label);
+
+        let mut pruned = wa.prune_empty_pop_outs();
+        pruned.sort();
+        assert_eq!(pruned, vec![empty1.label.clone(), empty2.label.clone()]);
+
+        let remaining: std::collections::HashSet<String> =
+            wa.pop_out_records().into_iter().map(|r| r.label).collect();
+        assert_eq!(remaining, [live.label.clone()].into());
+        // main is never pruned.
+        assert!(wa.snapshot().windows.contains_key("main"));
+        // The live window's session is untouched.
+        assert_eq!(wa.owner_of("sess-live"), live.label);
+        // Idempotent: a second pass finds nothing new.
+        assert!(wa.prune_empty_pop_outs().is_empty());
+    }
+
+    #[test]
+    fn clear_session_owners_then_prune_removes_all_popouts_on_boot() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let a = wa.create_window(None, None, 10);
+        let b = wa.create_window(None, None, 20);
+        // Simulate the persisted (now-stale) owner map from a prior session.
+        wa.assign_session("dead-tid-1", &a.label);
+        wa.assign_session("dead-tid-2", &b.label);
+        assert!(wa.has_assigned_sessions(&a.label));
+
+        // Boot sweep: clear stale owners → every pop-out becomes empty → pruned.
+        let cleared = wa.clear_session_owners();
+        assert_eq!(cleared, 2);
+        let pruned = wa.prune_empty_pop_outs();
+        assert_eq!(
+            pruned.len(),
+            2,
+            "both pop-outs are empty after clear → pruned"
+        );
+        assert!(wa.pop_out_records().is_empty());
+        // main survives; owner map is empty.
+        assert!(wa.snapshot().windows.contains_key("main"));
+        assert!(wa.snapshot().session_owner.is_empty());
+        // Idempotent.
+        assert_eq!(wa.clear_session_owners(), 0);
+    }
+
+    #[test]
+    fn prune_empty_pop_outs_noop_when_all_have_sessions() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let a = wa.create_window(None, None, 10);
+        let b = wa.create_window(None, None, 20);
+        wa.assign_session("s1", &a.label);
+        wa.assign_session("s2", &b.label);
+        assert!(wa.prune_empty_pop_outs().is_empty());
+        assert_eq!(wa.pop_out_records().len(), 2);
     }
 
     #[test]
