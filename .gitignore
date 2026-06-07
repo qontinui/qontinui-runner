@@ -135,6 +135,7 @@ target-check/
 target-fix-test/
 target-validate/
 target-run/
+target-fixcheck/
 .build-state/
 target-rebuild/
 target-types-task/
