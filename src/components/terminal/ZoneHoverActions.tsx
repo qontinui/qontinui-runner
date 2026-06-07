@@ -31,6 +31,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  AppWindow,
   Download,
   Maximize2,
   Minimize2,
@@ -40,6 +41,8 @@ import {
 } from "lucide-react";
 
 import { useTerminalSession, useTransitionEffects, useZoneMetadata } from "./contexts";
+import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
+import { useTerminalWindowActions, type RunnerWindowRecord } from "./useTerminalWindowActions";
 
 interface ZoneHoverActionsProps {
   zoneIdx: number;
@@ -57,6 +60,8 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
   const { zoneLayout, closeTerminal, sessionStates } = session;
   const transitionEffects = useTransitionEffects();
   const { labelsAndTags } = useZoneMetadata();
+  const { ownerOf } = useWindowAssignments();
+  const { popOutTab, moveTabToWindow, listWindows } = useTerminalWindowActions();
 
   const tabId = zoneLayout.assignments[zoneIdx];
   const isMaximized = zoneLayout.maximizedZone === zoneIdx;
@@ -67,14 +72,17 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showLabelInput, setShowLabelInput] = useState(false);
   const [labelDraft, setLabelDraft] = useState("");
+  const [showWindowMenu, setShowWindowMenu] = useState(false);
+  const [windowList, setWindowList] = useState<RunnerWindowRecord[]>([]);
 
   const exportRef = useRef<HTMLDivElement>(null);
   const labelPopoverRef = useRef<HTMLDivElement>(null);
   const labelInputRef = useRef<HTMLInputElement>(null);
+  const windowMenuRef = useRef<HTMLDivElement>(null);
 
   // Outside-click close for both popovers.
   useEffect(() => {
-    if (!showExportMenu && !showLabelInput) return;
+    if (!showExportMenu && !showLabelInput && !showWindowMenu) return;
     const handler = (e: MouseEvent) => {
       const target = e.target as Node;
       if (showExportMenu && exportRef.current && !exportRef.current.contains(target)) {
@@ -86,10 +94,13 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
         labelsAndTags.setZoneLabel(zoneIdx, labelDraft.trim());
         setShowLabelInput(false);
       }
+      if (showWindowMenu && windowMenuRef.current && !windowMenuRef.current.contains(target)) {
+        setShowWindowMenu(false);
+      }
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
-  }, [showExportMenu, showLabelInput, labelDraft, labelsAndTags, zoneIdx]);
+  }, [showExportMenu, showLabelInput, showWindowMenu, labelDraft, labelsAndTags, zoneIdx]);
 
   useEffect(() => {
     if (showLabelInput) {
@@ -156,6 +167,50 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
       closeTerminal(tabId);
     },
     [tabId, closeTerminal],
+  );
+
+  const openWindowMenu = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (!tabId) return;
+      setShowExportMenu(false);
+      setShowLabelInput(false);
+      setShowWindowMenu((prev) => {
+        const next = !prev;
+        if (next) {
+          // Refresh the target list each open — pop-outs may have come/gone.
+          listWindows()
+            .then(setWindowList)
+            .catch((err) => console.error("list_runner_windows failed:", err));
+        }
+        return next;
+      });
+    },
+    [tabId, listWindows],
+  );
+
+  const handlePopOutNew = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (!tabId) return;
+      setShowWindowMenu(false);
+      void popOutTab(tabId).catch((err) =>
+        console.error("Failed to pop out terminal to a new window:", err),
+      );
+    },
+    [tabId, popOutTab],
+  );
+
+  const handleMoveTo = useCallback(
+    (e: React.MouseEvent, target: string) => {
+      e.stopPropagation();
+      if (!tabId) return;
+      setShowWindowMenu(false);
+      void moveTabToWindow(tabId, target).catch((err) =>
+        console.error(`Failed to move terminal to ${target}:`, err),
+      );
+    },
+    [tabId, moveTabToWindow],
   );
 
   return (
@@ -249,6 +304,48 @@ export function ZoneHoverActions({ zoneIdx, onExportZone }: ZoneHoverActionsProp
                   {format}
                 </button>
               ))}
+            </div>
+          )}
+        </div>
+
+        {/* Send to window (pop out to a new window / move to an existing one) */}
+        <div className="relative" ref={windowMenuRef}>
+          <button
+            type="button"
+            onClick={openWindowMenu}
+            disabled={!hasTab}
+            className={`p-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+              showWindowMenu
+                ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
+                : "text-[#565f89] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10"
+            }`}
+            title="Send this terminal to a window (or drag its header out)"
+            aria-label="Send terminal to a window"
+            aria-expanded={showWindowMenu}
+          >
+            <AppWindow className="w-3 h-3" />
+          </button>
+          {showWindowMenu && (
+            <div className="absolute top-full right-0 mt-1 w-40 bg-[#1a1b26] border border-[#2a2d3d] rounded shadow-xl z-50 overflow-hidden">
+              <button
+                type="button"
+                onClick={handlePopOutNew}
+                className="block w-full text-left px-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] transition-colors"
+              >
+                New window
+              </button>
+              {windowList
+                .filter((w) => w.label !== ownerOf(tabId ?? ""))
+                .map((w) => (
+                  <button
+                    key={w.label}
+                    type="button"
+                    onClick={(e) => handleMoveTo(e, w.label)}
+                    className="block w-full text-left px-2 py-1 text-[10px] text-[#a9b1d6] hover:bg-[#2a2d3d] hover:text-[#c0caf5] transition-colors"
+                  >
+                    {w.label === "main" ? "Main window" : w.label}
+                  </button>
+                ))}
             </div>
           )}
         </div>
