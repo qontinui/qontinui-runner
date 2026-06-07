@@ -28,7 +28,9 @@
 pub mod arch_observer;
 pub mod cargo_check;
 pub mod code_graph_api;
+pub mod domain_observer;
 pub mod lang;
+pub mod module_graph;
 pub mod mypy_check;
 pub mod node_bridge;
 pub mod scope;
@@ -142,6 +144,9 @@ pub const PROV_RESOLVED: &str = "code_graph_resolved";
 /// `Ξ_Arch` LLM layer-classifier provenance (Phase 3): a stochastic kernel run
 /// through the Claude-CLI path. Advisory, never gate-worthy.
 pub const PROV_KERNEL_ARCH: &str = "claude_cli_arch";
+/// `Ξ_Domain` LLM business-domain mapper provenance (Phase 3): a stochastic
+/// kernel run through the Claude-CLI path. Advisory, never gate-worthy.
+pub const PROV_KERNEL_DOMAIN: &str = "claude_cli_domain";
 /// Python `mypy` typecheck provenance (Phase A): full-fidelity, true overlay via
 /// `--shadow-file`. Boundary `high` (crosses the type checker).
 pub const PROV_MYPY: &str = "mypy";
@@ -446,8 +451,9 @@ pub struct TypecheckReq {
 
 /// Routes contributed to the runner's main router from `mcp_api.rs`. Includes
 /// the LSP `Ξ_Type` `/code-semantics/*` surface, the resolved-import `Ξ_AST`
-/// `/code-graph/*` diff blast-radius surface (Pillar 2), and the `Ξ_Arch`
-/// `/code-graph/arch-layers` stochastic-kernel layer classifier (Phase 3).
+/// `/code-graph/*` diff blast-radius surface (Pillar 2), and the Phase-3
+/// stochastic-kernel observers `Ξ_Arch` (`/code-graph/arch-layers`) and
+/// `Ξ_Domain` (`/code-graph/domains`).
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/code-semantics/health", get(health))
@@ -457,6 +463,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/code-semantics/typecheck", post(typecheck))
         .merge(code_graph_api::routes())
         .merge(arch_observer::routes())
+        .merge(domain_observer::routes())
 }
 
 /// GET /code-semantics/health — per CONTRACT §B.
