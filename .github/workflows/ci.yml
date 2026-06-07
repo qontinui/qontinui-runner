@@ -296,6 +296,23 @@ jobs:
         #      `--no-bundle` — compilation + link is the sanity gate we want.
         run: pnpm run tauri build --debug --no-bundle
 
+      # SDK↔runner behavior-contract gate. Boots the just-built debug exe
+      # supervisor-free (`-DirectExe`), walks every UI_BRIDGE_ROUTES entry from
+      # the sibling ui-bridge clone, and asserts the shape contracts the offline
+      # manifest tests can't see. Windows-only: the runner is Windows-primary
+      # and the WebView2 render `frontendReady:true` needs is a Windows surface.
+      # Reuses `src-tauri/target/debug/qontinui-runner.exe` from the step above
+      # (built from src-tauri, so `.cargo/config.toml`'s /STACK:8388608 applies
+      # — no separate cargo build, no 0xc00000fd stack-overflow). `-Profile ci`
+      # skips the two model-loading routes (extract/describe) that need
+      # llama-swap, absent in CI. This step doubles as the Phase-0 WebView2
+      # probe: if it fails at WebView2 init, the fallback is a parallel hosted
+      # windows job (per the plan), not a blocker for the script mode.
+      - name: SDK↔runner contract smoke (direct-exe)
+        if: matrix.platform == 'windows-latest'
+        run: powershell -File scripts/contract-smoke.ps1 -DirectExe src-tauri/target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
+        shell: bash
+
   # Gating frontend unit-test lane (vitest).
   #
   # The matrix `test` job above also runs `pnpm test`, but it is wedged between

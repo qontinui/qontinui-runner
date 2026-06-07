@@ -11,15 +11,30 @@
 #   2. scope field round-trips through /control/component/:id
 #   3. /control/element/:id/expect returns 422 on timeout
 #
-# Prerequisite: supervisor running on http://localhost:9875.
-#   Check with: Invoke-WebRequest http://localhost:9875/health -UseBasicParsing
-#   This script does NOT start the supervisor itself -- the supervisor lives
-#   as a long-running service the user manages outside the smoke harness.
+# Two launch modes:
+#
+#   1. Supervisor mode (DEFAULT, dev). Spawns a temp runner via the supervisor
+#      on http://localhost:9875. Prerequisite: supervisor running.
+#        Check with: Invoke-WebRequest http://localhost:9875/health -UseBasicParsing
+#      This script does NOT start the supervisor itself -- the supervisor lives
+#      as a long-running service the user manages outside the smoke harness.
+#
+#   2. -DirectExe <path> mode (CI / supervisor-free). Boots the given
+#      qontinui-runner.exe directly via Start-Process with an isolated
+#      secondary-instance env (config / secure-storage / WebView2 dirs all in
+#      fresh temp dirs, keychain disabled, CLAUDECODE removed), on a free port
+#      >= 9877 the script chooses. No supervisor required. The runner is
+#      Stop-Process'd in a finally. This is what the CI gate uses.
 #
 # Usage:
-#   powershell -File scripts/contract-smoke.ps1            # fast run, no rebuild
-#   powershell -File scripts/contract-smoke.ps1 -Rebuild   # force fresh build
+#   powershell -File scripts/contract-smoke.ps1            # fast run, supervisor, no rebuild
+#   powershell -File scripts/contract-smoke.ps1 -Rebuild   # force fresh build (supervisor)
 #   powershell -File scripts/contract-smoke.ps1 -DryRun    # parse routes & exit
+#   powershell -File scripts/contract-smoke.ps1 -DirectExe path\to\qontinui-runner.exe
+#   powershell -File scripts/contract-smoke.ps1 -DirectExe <exe> -Profile ci -SdkTypesPath ../ui-bridge/...
+#
+# -Profile ci: skips the two model-loading routes (POST /vision/extract,
+#   POST /vision/describe) that need llama-swap (absent in CI).
 #
 # Exit code: 0 on all-pass, 1 on any FAIL.
 
@@ -28,7 +43,10 @@ param(
     [switch]$DryRun,
     [int]$WaitTimeoutSecs = 180,
     [string]$SdkTypesPath = "D:/qontinui-root/ui-bridge/packages/ui-bridge/src/server/types.ts",
-    [string]$SupervisorBase = "http://localhost:9875"
+    [string]$SupervisorBase = "http://localhost:9875",
+    [string]$DirectExe = $null,
+    [ValidateSet("dev", "ci")]
+    [string]$Profile = "dev"
 )
 
 $ErrorActionPreference = "Stop"
@@ -70,6 +88,22 @@ $SLOW_ROUTES = @{
     "POST /vision/extract"  = 300
     "POST /vision/describe" = 300
     "GET /control/specs"    = 60
+}
+
+# ---------------------------------------------------------------------------
+# -Profile ci skip set. EXACTLY the two model-loading routes: extract loads
+# PaddleOCR and describe loads a VLM, both via llama-swap — which does not run
+# in CI. Their shape contracts are covered by the non-model probes; the model
+# paths stay in the dev profile. Skipped loudly (no silent caps).
+# ---------------------------------------------------------------------------
+$CI_PROFILE_SKIP = @{
+    "POST /vision/extract"  = "model routes - no llama-swap in CI"
+    "POST /vision/describe" = "model routes - no llama-swap in CI"
+}
+if ($Profile -eq "ci") {
+    foreach ($k in $CI_PROFILE_SKIP.Keys) {
+        $SKIP_ROUTES[$k] = $CI_PROFILE_SKIP[$k]
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -267,6 +301,143 @@ function Record {
 }
 
 # ---------------------------------------------------------------------------
+# -DirectExe helpers: free-port picker + isolated secondary-instance launch.
+# Env surface mirrors instance_manager.rs:351-357 + the supervisor's exe-mode
+# spawn (process/manager.rs:1459-1546): QONTINUI_PORT, QONTINUI_INSTANCE_NAME,
+# QONTINUI_PRIMARY_PORT, isolated config/secure-storage/WebView2 temp dirs,
+# keychain disabled, CLAUDECODE removed.
+# ---------------------------------------------------------------------------
+function Get-FreePort {
+    param([int]$Start = 9877)
+    for ($p = $Start; $p -lt ($Start + 200); $p++) {
+        $inUse = $false
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $p)
+            $listener.Start()
+            $listener.Stop()
+        } catch {
+            $inUse = $true
+        }
+        if (-not $inUse) { return $p }
+    }
+    throw "Could not find a free port in [$Start, $($Start + 200))"
+}
+
+function Start-DirectRunner {
+    param([string]$ExePath, [int]$Port)
+
+    $resolved = (Resolve-Path -Path $ExePath -ErrorAction Stop).Path
+    $instanceName = "test-$Port"
+
+    # Fresh temp dirs so CI never touches %APPDATA% / a real WebView2 profile.
+    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("contract-smoke-" + $instanceName + "-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+    $configDir = Join-Path $tmpRoot "config"
+    $webviewDir = Join-Path $tmpRoot "webview2"
+    New-Item -ItemType Directory -Force -Path $configDir  | Out-Null
+    New-Item -ItemType Directory -Force -Path $webviewDir | Out-Null
+
+    # Env table (verified against the two authoritative spawners). Set on the
+    # current process env so Start-Process inherits it, snapshot+restore around
+    # the launch so we don't pollute the rest of the script's env.
+    $prev = @{}
+    $toSet = @{
+        "QONTINUI_PORT"               = "$Port"
+        "QONTINUI_INSTANCE_NAME"      = $instanceName
+        "QONTINUI_PRIMARY_PORT"       = "$Port"   # self — no primary in CI
+        "QONTINUI_CONFIG_DIR"         = $configDir
+        "QONTINUI_SECURE_STORAGE_DIR" = $configDir
+        "WEBVIEW2_USER_DATA_FOLDER"   = $webviewDir
+        "QONTINUI_DISABLE_KEYCHAIN"   = "1"
+    }
+    foreach ($k in $toSet.Keys) {
+        $prev[$k] = [System.Environment]::GetEnvironmentVariable($k, "Process")
+        [System.Environment]::SetEnvironmentVariable($k, $toSet[$k], "Process")
+    }
+    # CLAUDECODE removed — both spawners strip it so the embedded Claude CLI can start.
+    $prev["CLAUDECODE"] = [System.Environment]::GetEnvironmentVariable("CLAUDECODE", "Process")
+    [System.Environment]::SetEnvironmentVariable("CLAUDECODE", $null, "Process")
+
+    Write-Host "Launching direct-exe runner '$instanceName' on port $Port"
+    Write-Host "  exe:     $resolved"
+    Write-Host "  config:  $configDir"
+    Write-Host "  webview: $webviewDir"
+    try {
+        $proc = Start-Process -FilePath $resolved -PassThru -WorkingDirectory $tmpRoot
+    } finally {
+        # Restore env regardless of launch outcome.
+        foreach ($k in $prev.Keys) {
+            [System.Environment]::SetEnvironmentVariable($k, $prev[$k], "Process")
+        }
+    }
+
+    return [PSCustomObject]@{
+        Process     = $proc
+        Port        = $Port
+        Id          = $instanceName
+        TmpRoot     = $tmpRoot
+    }
+}
+
+function Wait-DirectRunnerReady {
+    param([int]$Port, [int]$TimeoutSecs = 180, $Process)
+    $healthUrl = "http://localhost:$Port/health"
+    # `frontendReady` is a one-way flag flipped ONLY by the runner's first
+    # successful UI Bridge IPC round-trip (request.rs:505-512). A passive
+    # /health poll never triggers that round-trip, so the flag stays false
+    # forever even though the WebView2 React app has mounted and the IPC
+    # listener is live. So once the HTTP shell is responsive we actively poke
+    # a cheap UI Bridge route (GET /ui-bridge/control/elements) to drive the
+    # IPC round-trip, then re-check the flag. `frontendReady` lives under the
+    # `data` envelope in /health.
+    $pokeUrl = "http://localhost:$Port/ui-bridge/control/elements"
+    $deadline = (Get-Date).AddSeconds($TimeoutSecs)
+    Write-Host "Polling $healthUrl for frontendReady:true (timeout ${TimeoutSecs}s) ..."
+    while ((Get-Date) -lt $deadline) {
+        if ($Process -and $Process.HasExited) {
+            throw "direct-exe runner exited early with code $($Process.ExitCode) before becoming ready"
+        }
+        $responsive = $false
+        try {
+            $resp = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            if ($resp.StatusCode -eq 200) {
+                $h = $null
+                try { $h = $resp.Content | ConvertFrom-Json } catch { $h = $null }
+                # frontendReady is nested under data (and mirrored at top level
+                # on some builds); accept either.
+                $fr = $null
+                if ($h) {
+                    if ($h.PSObject.Properties.Name -contains 'data' -and $h.data -and ($h.data.PSObject.Properties.Name -contains 'frontendReady')) {
+                        $fr = $h.data.frontendReady
+                    } elseif ($h.PSObject.Properties.Name -contains 'frontendReady') {
+                        $fr = $h.frontendReady
+                    }
+                    $respObj = if ($h.PSObject.Properties.Name -contains 'data' -and $h.data) { $h.data } else { $h }
+                    if ($respObj.PSObject.Properties.Name -contains 'responsive') { $responsive = [bool]$respObj.responsive }
+                }
+                if ($fr -eq $true) {
+                    Write-Host "Runner is ready (frontendReady:true)."
+                    return
+                }
+            }
+        } catch {
+            # connection refused / not-yet-listening — keep polling.
+        }
+        # Shell is up but frontendReady is still false: poke the UI Bridge to
+        # force the first IPC round-trip that flips the flag.
+        if ($responsive) {
+            try {
+                $null = Invoke-WebRequest -Uri $pokeUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            } catch {
+                # A non-200 (or even an error envelope) still drove an IPC
+                # round-trip, which is all we need; ignore.
+            }
+        }
+        Start-Sleep -Milliseconds 1000
+    }
+    throw "direct-exe runner did not report frontendReady:true within ${TimeoutSecs}s"
+}
+
+# ---------------------------------------------------------------------------
 # Parse routes (always -- needed for both DryRun and live).
 # ---------------------------------------------------------------------------
 Write-Host "Parsing UI_BRIDGE_ROUTES from $SdkTypesPath ..."
@@ -285,51 +456,81 @@ if ($DryRun) {
 }
 
 # ---------------------------------------------------------------------------
-# Verify supervisor is up.
+# Bring up a runner. Two modes:
+#   -DirectExe : Start-Process the exe directly (supervisor-free, CI).
+#   default    : spawn via the supervisor (dev).
+# Both yield $runnerId / $runnerPort / $runnerBase; DirectExe also sets
+# $directRunner (Stop-Process'd in the finally below).
 # ---------------------------------------------------------------------------
-try {
-    $h = Invoke-WebRequest "$SupervisorBase/health" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-    if ($h.StatusCode -ne 200) {
-        Write-Host "ERROR: supervisor /health returned $($h.StatusCode)" -ForegroundColor Red
+$directRunner = $null
+if ($DirectExe) {
+    if (-not (Test-Path $DirectExe)) {
+        Write-Host "ERROR: -DirectExe path not found: $DirectExe" -ForegroundColor Red
         exit 1
     }
-} catch {
-    Write-Host "ERROR: supervisor not reachable at $SupervisorBase. Start it before running this script." -ForegroundColor Red
-    Write-Host "       $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
-}
+    $runnerPort = Get-FreePort -Start 9877
+    $directRunner = Start-DirectRunner -ExePath $DirectExe -Port $runnerPort
+    $runnerId = $directRunner.Id
+    try {
+        Wait-DirectRunnerReady -Port $runnerPort -TimeoutSecs $WaitTimeoutSecs -Process $directRunner.Process
+    } catch {
+        Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        if ($directRunner.Process -and -not $directRunner.Process.HasExited) {
+            try { Stop-Process -Id $directRunner.Process.Id -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        exit 1
+    }
+    $runnerBase = "http://localhost:$runnerPort/ui-bridge"
+    Write-Host "Direct-exe runner $runnerId on port $runnerPort. Base: $runnerBase"
+    Write-Host ""
+} else {
+    # -----------------------------------------------------------------------
+    # Verify supervisor is up.
+    # -----------------------------------------------------------------------
+    try {
+        $h = Invoke-WebRequest "$SupervisorBase/health" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        if ($h.StatusCode -ne 200) {
+            Write-Host "ERROR: supervisor /health returned $($h.StatusCode)" -ForegroundColor Red
+            exit 1
+        }
+    } catch {
+        Write-Host "ERROR: supervisor not reachable at $SupervisorBase. Start it before running this script." -ForegroundColor Red
+        Write-Host "       $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
 
-# ---------------------------------------------------------------------------
-# Spawn temp runner.
-# ---------------------------------------------------------------------------
-$spawnBody = @{
-    requester_id      = "contract-smoke"
-    wait              = $true
-    wait_timeout_secs = $WaitTimeoutSecs
-    rebuild           = [bool]$Rebuild
-} | ConvertTo-Json -Compress
+    # -----------------------------------------------------------------------
+    # Spawn temp runner.
+    # -----------------------------------------------------------------------
+    $spawnBody = @{
+        requester_id      = "contract-smoke"
+        wait              = $true
+        wait_timeout_secs = $WaitTimeoutSecs
+        rebuild           = [bool]$Rebuild
+    } | ConvertTo-Json -Compress
 
-Write-Host "Spawning temp runner (rebuild=$([bool]$Rebuild)) ..."
-try {
-    $spawnResp = Invoke-WebRequest -Uri "$SupervisorBase/runners/spawn-test" `
-        -Method POST -ContentType "application/json" -Body $spawnBody `
-        -UseBasicParsing -TimeoutSec ($WaitTimeoutSecs + 60) -ErrorAction Stop
-} catch {
-    Write-Host "ERROR: spawn-test failed: $($_.Exception.Message)" -ForegroundColor Red
-    if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message -ForegroundColor Red }
-    exit 1
-}
+    Write-Host "Spawning temp runner (rebuild=$([bool]$Rebuild)) ..."
+    try {
+        $spawnResp = Invoke-WebRequest -Uri "$SupervisorBase/runners/spawn-test" `
+            -Method POST -ContentType "application/json" -Body $spawnBody `
+            -UseBasicParsing -TimeoutSec ($WaitTimeoutSecs + 60) -ErrorAction Stop
+    } catch {
+        Write-Host "ERROR: spawn-test failed: $($_.Exception.Message)" -ForegroundColor Red
+        if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message -ForegroundColor Red }
+        exit 1
+    }
 
-$spawn = $spawnResp.Content | ConvertFrom-Json
-$runnerId = $spawn.id
-$runnerPort = $spawn.port
-if (-not $runnerId -or -not $runnerPort) {
-    Write-Host "ERROR: spawn-test response missing id/port: $($spawnResp.Content)" -ForegroundColor Red
-    exit 1
+    $spawn = $spawnResp.Content | ConvertFrom-Json
+    $runnerId = $spawn.id
+    $runnerPort = $spawn.port
+    if (-not $runnerId -or -not $runnerPort) {
+        Write-Host "ERROR: spawn-test response missing id/port: $($spawnResp.Content)" -ForegroundColor Red
+        exit 1
+    }
+    $runnerBase = "http://localhost:$runnerPort/ui-bridge"
+    Write-Host "Spawned runner $runnerId on port $runnerPort. Base: $runnerBase"
+    Write-Host ""
 }
-$runnerBase = "http://localhost:$runnerPort/ui-bridge"
-Write-Host "Spawned runner $runnerId on port $runnerPort. Base: $runnerBase"
-Write-Host ""
 
 # ---------------------------------------------------------------------------
 # Run all probes inside try/finally so we always stop the runner.
@@ -338,15 +539,21 @@ $exitCode = 0
 try {
     # Warm-up: prime the cold OCR/VLM models so the first *measured* slow-route
     # request is warm. Belt-and-suspenders — the per-route timeout bump alone
-    # makes the gate deterministic; warm-up failures are non-fatal.
-    Write-Host "Warming vision/extract + vision/describe (cold model load) ..."
-    foreach ($warmKey in @("POST /vision/extract", "POST /vision/describe")) {
-        $warmPath = $warmKey.Split(" ")[1]
-        try {
-            $null = Invoke-Probe -Method "POST" -Url ($runnerBase + $warmPath) -Body "{}" -TimeoutSec 120
-        } catch { }
+    # makes the gate deterministic; warm-up failures are non-fatal. Skipped for
+    # any model route that's in SKIP_ROUTES (e.g. both under -Profile ci, where
+    # there's no llama-swap to warm).
+    $warmTargets = @("POST /vision/extract", "POST /vision/describe") |
+        Where-Object { -not $SKIP_ROUTES.ContainsKey($_) }
+    if ($warmTargets.Count -gt 0) {
+        Write-Host "Warming $($warmTargets -join ' + ') (cold model load) ..."
+        foreach ($warmKey in $warmTargets) {
+            $warmPath = $warmKey.Split(" ")[1]
+            try {
+                $null = Invoke-Probe -Method "POST" -Url ($runnerBase + $warmPath) -Body "{}" -TimeoutSec 120
+            } catch { }
+        }
+        Write-Host ""
     }
-    Write-Host ""
 
     Write-Host ("{0}  {1}  {2}  {3}" -f "STAT".PadRight(4), "METHOD".PadRight(6), "PATH".PadRight(50), "DETAIL")
     Write-Host ("-" * 90)
@@ -595,15 +802,28 @@ try {
     # Always stop the temp runner so a probe failure doesn't leak it.
     Write-Host ""
     Write-Host "Stopping runner $runnerId ..."
-    try {
-        # Supervisor's stop_runner takes Option<Json<StopRunnerRequest>>;
-        # an empty {} satisfies axum's Json extractor (no body returns 415).
-        $null = Invoke-WebRequest -Uri "$SupervisorBase/runners/$runnerId/stop" `
-            -Method POST -ContentType "application/json" -Body "{}" `
-            -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-        Write-Host "Runner stopped."
-    } catch {
-        Write-Host "WARNING: stop failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    if ($directRunner) {
+        # DirectExe mode: Stop-Process the launched exe (and any children it
+        # spawned, e.g. the embedded webview / Claude CLI).
+        try {
+            if ($directRunner.Process -and -not $directRunner.Process.HasExited) {
+                Stop-Process -Id $directRunner.Process.Id -Force -ErrorAction Stop
+            }
+            Write-Host "Runner stopped."
+        } catch {
+            Write-Host "WARNING: Stop-Process failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } else {
+        try {
+            # Supervisor's stop_runner takes Option<Json<StopRunnerRequest>>;
+            # an empty {} satisfies axum's Json extractor (no body returns 415).
+            $null = Invoke-WebRequest -Uri "$SupervisorBase/runners/$runnerId/stop" `
+                -Method POST -ContentType "application/json" -Body "{}" `
+                -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+            Write-Host "Runner stopped."
+        } catch {
+            Write-Host "WARNING: stop failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 }
 
