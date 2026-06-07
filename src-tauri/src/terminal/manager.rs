@@ -65,6 +65,25 @@ impl TerminalManager {
         let cols = cols.unwrap_or(120);
         let rows = rows.unwrap_or(30);
 
+        // Bypass-aware needs-input detection (plan
+        // `2026-06-07-runner-continuation-defer-and-phantom-needs-input.md`,
+        // Defect B): command-sniff whether this PTY child is a Claude session
+        // launched with permissions bypassed. The runner-spawned gate
+        // continuation injects `--dangerously-skip-permissions`
+        // (`agent_runtime.rs:1309`); operator resumes use
+        // `--permission-mode bypassPermissions`. A bypass session can never
+        // await *tool* approval, so the frontend must skip approval-shaped
+        // patterns for it (the 12-min `rm -rf` phantom, 2026-06-07). We carry
+        // this as a dedicated `terminal-bypass-permissions` Tauri event keyed
+        // by terminal id rather than a new `TerminalInfo` field, because
+        // `TerminalInfo` is the cross-repo wire schema
+        // (`qontinui-schemas`, `#[schemars(deny_unknown_fields)]`, published
+        // `@qontinui/shared-types`) and a runner-local UI hint does not belong
+        // on the wire contract.
+        let bypass_permissions = command
+            .as_deref()
+            .is_some_and(command_implies_bypass_permissions);
+
         let emitter = app_handle.clone();
         let session = TerminalSession::spawn(
             id.clone(),
@@ -91,6 +110,20 @@ impl TerminalManager {
         // Notify frontend so externally-created terminals get a UI tab
         if let Err(e) = emitter.emit("terminal-created", &info) {
             error!("Failed to emit terminal-created: {}", e);
+        }
+
+        // Bypass-aware needs-input hint — emitted only when the spawn command
+        // implies bypassed permissions. Emitted AFTER `terminal-created`; the
+        // frontend listener buffers a bypass mark whose tab record hasn't
+        // landed yet (mirrors the existing worker-registered race buffer), so
+        // either delivery order is safe.
+        if bypass_permissions {
+            if let Err(e) = emitter.emit(
+                "terminal-bypass-permissions",
+                serde_json::json!({ "id": info.id }),
+            ) {
+                error!("Failed to emit terminal-bypass-permissions: {}", e);
+            }
         }
 
         Ok(info)
@@ -293,5 +326,95 @@ impl TerminalManager {
     #[allow(dead_code)]
     pub fn interceptor(&self) -> &Arc<OutputInterceptor> {
         &self.interceptor
+    }
+}
+
+/// Whether a spawn command line implies a Claude session running with tool
+/// permissions bypassed — i.e. one that can never legitimately stall on a
+/// tool-approval prompt.
+///
+/// True iff the argv contains either:
+/// - `--dangerously-skip-permissions` (the runner-spawned gate-continuation
+///   form, `agent_runtime.rs`), or
+/// - `--permission-mode bypassPermissions` (the operator-resume form). The two
+///   tokens may be a single joined arg (`--permission-mode=bypassPermissions`)
+///   or two adjacent args (`--permission-mode`, `bypassPermissions`); both are
+///   handled. The whole command is joined and substring-matched so a flag
+///   embedded inside a shell wrapper string (e.g.
+///   `CLAUDE_CONFIG_DIR=… claude --permission-mode bypassPermissions`) is still
+///   caught.
+fn command_implies_bypass_permissions(argv: &[String]) -> bool {
+    let joined = argv.join(" ");
+    joined.contains("--dangerously-skip-permissions")
+        || joined.contains("--permission-mode bypassPermissions")
+        || joined.contains("--permission-mode=bypassPermissions")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_implies_bypass_permissions;
+
+    fn argv(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn dangerously_skip_permissions_implies_bypass() {
+        // Runner-spawned gate continuation (agent_runtime.rs:1309).
+        assert!(command_implies_bypass_permissions(&argv(&[
+            "claude",
+            "--dangerously-skip-permissions",
+            "--add-dir",
+            "/some/worktree",
+            "run /implement-plan",
+        ])));
+    }
+
+    #[test]
+    fn permission_mode_bypass_two_args_implies_bypass() {
+        // Operator resume — two adjacent args.
+        assert!(command_implies_bypass_permissions(&argv(&[
+            "claude",
+            "--permission-mode",
+            "bypassPermissions",
+            "--resume",
+            "abc123",
+        ])));
+    }
+
+    #[test]
+    fn permission_mode_bypass_joined_arg_implies_bypass() {
+        // Operator resume threaded through a shell-string command (the form
+        // the frontend injects: `CLAUDE_CONFIG_DIR=… claude --permission-mode
+        // bypassPermissions …`) lands as one arg.
+        assert!(command_implies_bypass_permissions(&argv(&[
+            "CLAUDE_CONFIG_DIR=/cfg claude --permission-mode bypassPermissions --resume abc",
+        ])));
+        // …and the `=`-joined variant.
+        assert!(command_implies_bypass_permissions(&argv(&[
+            "claude",
+            "--permission-mode=bypassPermissions",
+        ])));
+    }
+
+    #[test]
+    fn plain_shell_or_default_claude_is_not_bypass() {
+        // Interactive shell — no flag.
+        assert!(!command_implies_bypass_permissions(&argv(&["bash", "-l"])));
+        // A Claude resume WITHOUT bypass (e.g. default/ask mode) must not be
+        // treated as bypass — approval prompts there are real.
+        assert!(!command_implies_bypass_permissions(&argv(&[
+            "claude",
+            "--permission-mode",
+            "default",
+            "--resume",
+            "abc",
+        ])));
+        // The substring "bypassPermissions" alone (without the flag) does not
+        // count — guards against a worktree path or prompt mentioning it.
+        assert!(!command_implies_bypass_permissions(&argv(&[
+            "claude",
+            "echo bypassPermissions is a mode",
+        ])));
     }
 }

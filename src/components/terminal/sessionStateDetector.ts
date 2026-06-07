@@ -1,23 +1,42 @@
 import type { SessionState } from "./useZoneLayout";
 
 /**
- * Patterns that indicate Claude Code is waiting for user input.
- * These are checked against raw terminal output (may include ANSI sequences).
+ * Tool-approval-shaped patterns — Claude asking the operator to authorize a
+ * *tool* (Bash/Read/Write/…). These are Claude-specific framings
+ * ("Allow X? (y/n)", "Do you want to proceed?") rather than the bare
+ * `(Y/n)` / `[y/N]` tokens that ordinary shell tooling (git, apt, package
+ * managers, npm) prints in non-blocking informational output — matching
+ * those latched plain *and* Claude sessions to `needs-input` when nothing
+ * was actually awaiting input (the "N need input" phantom). See the
+ * StatusStrip session-count plan, Bug 2.
+ *
+ * PHANTOM EVIDENCE (2026-06-07): a retry-snapshot continuation session running
+ * with `--dangerously-skip-permissions` (`permission-mode: bypassPermissions`
+ * in all 11 transcript records) ran a 12-minute Bash `rm -rf`. During the
+ * stall the Terminal page latched `needs-input` off a Bash *approval-shaped*
+ * line in Claude's own tool-preview scrollback — yet the transcript proves no
+ * permission ask ever existed (no hook `ask`, no sandbox flag,
+ * `interrupted: false`, zero user-input events in the gap; the command simply
+ * finished). A bypass session can NEVER await tool approval, so for those
+ * sessions these patterns are skipped entirely (see `detectSessionState`).
  */
-const NEEDS_INPUT_PATTERNS = [
-  // Claude Code tool approval prompts. These are Claude-specific framings
-  // ("Allow X? (y/n)", "Do you want to proceed?") rather than the bare
-  // `(Y/n)` / `[y/N]` tokens that ordinary shell tooling (git, apt, package
-  // managers, npm) prints in non-blocking informational output — matching
-  // those latched plain *and* Claude sessions to `needs-input` when nothing
-  // was actually awaiting input (the "N need input" phantom). See the
-  // StatusStrip session-count plan, Bug 2.
+const APPROVAL_SHAPED_PATTERNS = [
   /\? \(y\/n\)/i,
   /\? \(yes\/no\)/i,
   /Allow .+\? \(/, // "Allow Read tool? (y/n)"
   /Do you want to proceed/i,
+];
 
-  // Claude Code interactive prompts
+/**
+ * Question-shaped patterns — Claude asking the operator a *question*
+ * (`AskUserQuestion` / `ExitPlanMode` / free-form prompt). These are real
+ * needs-input even for bypass sessions: `--dangerously-skip-permissions`
+ * suppresses tool-approval prompts but NOT `AskUserQuestion` stops (verified
+ * live: a "want me to move it?" question in the same bypass session above was
+ * genuine and needed the operator). So these are ALWAYS checked, regardless
+ * of bypass.
+ */
+const QUESTION_SHAPED_PATTERNS = [
   /\? >/, // Claude input prompt
   /waiting for your (?:input|response)/i,
   /What would you like/i,
@@ -86,14 +105,31 @@ const ERROR_PATTERNS = [
 /**
  * Analyze terminal output text and determine what session state it indicates.
  * Returns the detected state, or null if no state change is warranted.
+ *
+ * `opts.bypassPermissions` — when the session was spawned with
+ * `--dangerously-skip-permissions` / `--permission-mode bypassPermissions`,
+ * skip the approval-shaped subset entirely (a bypass session can never be
+ * awaiting tool approval — see the phantom evidence on
+ * `APPROVAL_SHAPED_PATTERNS`). Question-shaped prompts (`AskUserQuestion`,
+ * etc.) are still honored because bypass sessions legitimately stop on them.
  */
-export function detectSessionState(text: string, currentState: SessionState): SessionState | null {
+export function detectSessionState(
+  text: string,
+  currentState: SessionState,
+  opts?: { bypassPermissions?: boolean },
+): SessionState | null {
   // Strip ANSI for pattern matching but check against raw text too
   // eslint-disable-next-line no-control-regex
   const stripped = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
 
-  // Needs-input has highest priority — check both raw and stripped
-  if (NEEDS_INPUT_PATTERNS.some((p) => p.test(text) || p.test(stripped))) {
+  // Needs-input has highest priority — check both raw and stripped.
+  // For bypass sessions, the approval-shaped subset is suppressed (it can
+  // only ever be a phantom: tool approval is impossible under bypass);
+  // question-shaped prompts are always checked.
+  const needsInputPatterns = opts?.bypassPermissions
+    ? QUESTION_SHAPED_PATTERNS
+    : [...APPROVAL_SHAPED_PATTERNS, ...QUESTION_SHAPED_PATTERNS];
+  if (needsInputPatterns.some((p) => p.test(text) || p.test(stripped))) {
     return "needs-input";
   }
 

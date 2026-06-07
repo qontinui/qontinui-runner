@@ -3,7 +3,20 @@ import type { SessionState } from "./useZoneLayout";
 import { detectSessionState } from "./sessionStateDetector";
 
 export interface UseSessionStateTrackingParams {
-  tabs: Array<{ id: string; isAlive: boolean; exitCode: number | null }>;
+  tabs: Array<{
+    id: string;
+    isAlive: boolean;
+    exitCode: number | null;
+    /**
+     * True when the tab's PTY child runs Claude with tool permissions bypassed
+     * (`--dangerously-skip-permissions` / `--permission-mode bypassPermissions`).
+     * Forwarded to `detectSessionState` so approval-shaped TTY patterns are
+     * suppressed for it — a bypass session can never await tool approval, so
+     * any such match is a phantom (plan
+     * `2026-06-07-runner-continuation-defer-and-phantom-needs-input.md`).
+     */
+    bypassPermissions?: boolean;
+  }>;
   processOutput?: (tabId: string, text: string) => void;
   /** Read rendered lines from the xterm buffer (handles cursor movements correctly). */
   getBufferLines?: (tabId: string, maxLines: number) => string[];
@@ -235,10 +248,15 @@ export function useSessionStateTracking(
       if (buf.length === 0) buf.push(0);
       buf[buf.length - 1] += text.length;
 
-      // Use the session state detector for pattern matching
+      // Use the session state detector for pattern matching. Look up the
+      // tab's bypass flag (via the stable `tabsRef`, so this callback need not
+      // re-create when tabs change) so the detector can suppress approval-
+      // shaped patterns for bypass sessions.
+      const bypassPermissions =
+        tabsRef.current.find((t) => t.id === tabId)?.bypassPermissions === true;
       setSessionStates((prev) => {
         const current = prev[tabId] ?? "idle";
-        const detected = detectSessionState(text, current);
+        const detected = detectSessionState(text, current, { bypassPermissions });
         if (detected && detected !== current) {
           return { ...prev, [tabId]: detected };
         }

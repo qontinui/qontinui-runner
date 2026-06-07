@@ -43,6 +43,50 @@ describe("detectSessionState — genuine Claude prompts DO flag needs-input", ()
   }
 });
 
+describe("detectSessionState — bypass-aware approval suppression", () => {
+  // PHANTOM EVIDENCE (2026-06-07): a `--dangerously-skip-permissions`
+  // continuation latched needs-input off Bash approval-shaped scrollback during
+  // a 12-min `rm -rf`, despite no permission ask ever existing. A bypass
+  // session can never await tool approval — these must NOT latch.
+  const approvalShaped = [
+    "Allow Read tool? (y/n)",
+    "Proceed? (yes/no)",
+    "Do you want to proceed?",
+  ];
+
+  for (const text of approvalShaped) {
+    it(`"${text}" + bypass → does NOT flag needs-input`, () => {
+      expect(detectSessionState(text, "idle", { bypassPermissions: true })).not.toBe("needs-input");
+    });
+
+    it(`"${text}" + non-bypass → flags needs-input (no regression)`, () => {
+      expect(detectSessionState(text, "idle", { bypassPermissions: false })).toBe("needs-input");
+      // Omitting opts entirely must behave as non-bypass (default false).
+      expect(detectSessionState(text, "idle")).toBe("needs-input");
+    });
+  }
+
+  // Question-shaped prompts (AskUserQuestion / free-form) are REAL even under
+  // bypass — bypass suppresses only tool approvals, not questions.
+  const questionShaped = [
+    "Please provide the file path",
+    "waiting for your input",
+    "What would you like me to do?",
+  ];
+
+  for (const text of questionShaped) {
+    it(`"${text}" + bypass → still flags needs-input`, () => {
+      expect(detectSessionState(text, "idle", { bypassPermissions: true })).toBe("needs-input");
+    });
+  }
+
+  it("resumed-pattern still breaks the latch for a bypass session", () => {
+    expect(
+      detectSessionState("Reading src/main.rs", "needs-input", { bypassPermissions: true }),
+    ).toBe("working");
+  });
+});
+
 describe("detectSessionState — needs-input latch-breaker", () => {
   it("transitions needs-input → working when resumed Claude tool output arrives", () => {
     expect(detectSessionState("Reading src/main.rs", "needs-input")).toBe("working");
