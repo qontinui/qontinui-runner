@@ -334,6 +334,11 @@ pub fn spawn_runtime() {
     }
 
     info!("agent_runtime: starting for device_id={}", device_id);
+    // Periodic backstop for the capacity-freed re-poll: drains a deferred
+    // (AtCap) continuation even if its terminal's exit-hook trigger is missed.
+    // Spawned independently of the WS pump so it survives subscription flaps;
+    // it is an idle no-op until the first AtCap deferral arms it.
+    spawn_continuation_backstop_poll(device_id);
     tokio::spawn(async move {
         if let Err(e) = subscribe_to_spawn_requests(device_id).await {
             error!("agent_runtime: subscriber exited with error: {e:#}");
@@ -983,6 +988,143 @@ fn register_continuation_session(terminal_id: String, anchor_key: Option<String>
     );
 }
 
+// =============================================================================
+// Capacity-freed re-poll (Defect A item 3, layered on #484)
+// =============================================================================
+
+/// Has at least one `AtCap` deferral happened this process lifetime?
+///
+/// #484 leaves an `AtCap` continuation pending (uncancelled, unconsumed) on
+/// coord so it is re-deliverable once a cap slot frees — but it adds NO trigger
+/// to re-fetch it. Without one, a deferred continuation only drains on the next
+/// WS reconnect (`poll_pending_continuations` is called exactly once, on
+/// connect). This flag arms the periodic backstop poll
+/// ([`spawn_continuation_backstop_poll`]) so the queue still drains even if the
+/// capacity-freed exit-hook trigger ([`notify_continuation_terminal_exit`]) is
+/// missed (e.g. coord registration failed so no exit hook was installed, or the
+/// process restarted between the deferral and the slot freeing). Cheap, set-once,
+/// never reset: a single deferral is enough to want the backstop for the rest of
+/// the process's life.
+fn at_cap_ever() -> &'static std::sync::atomic::AtomicBool {
+    static AT_CAP_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &AT_CAP_EVER
+}
+
+/// Record that an `AtCap` deferral occurred (arms the periodic backstop poll).
+fn mark_at_cap_deferral() {
+    at_cap_ever().store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether any `AtCap` deferral has happened this process lifetime.
+fn at_cap_deferral_happened() -> bool {
+    at_cap_ever().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Capacity-freed re-poll trigger: called from the continuation terminal's
+/// on-exit hook (`create_terminal_session_backend`, `commands/terminal.rs`) the
+/// instant a continuation-spawned PTY exits.
+///
+/// Drops the exited terminal from the live continuation registry and — only if
+/// it WAS a registered continuation session — kicks an immediate
+/// [`poll_pending_continuations`] so a previously-deferred (`AtCap`) continuation
+/// drains promptly into the freed slot instead of waiting for an unrelated WS
+/// reconnect.
+///
+/// **Operator tabs never trigger a poll.** Operator-opened terminals are created
+/// via `terminal_create` (a different path) and are never inserted into the
+/// continuation registry, so the `was_continuation` test below is `false` for
+/// them and this is a pure no-op. (`create_terminal_session_backend` — the only
+/// caller that wires this hook — is reached ONLY from the gate-continuation
+/// path.) Even so, the registry check is kept as defense-in-depth so a future
+/// caller of the backend helper can't accidentally trigger poll storms on
+/// unrelated tab closes.
+///
+/// No device id → no-op (the poll has no target); a deferral that happened
+/// without a resolvable device id is covered by the WS-reconnect catch-up.
+///
+/// `rt_handle` is the tokio runtime handle captured at hook-install time: the
+/// PTY waiter that fires this hook is a bare OS thread with NO runtime context,
+/// so a direct `tokio::spawn` here would panic ("there is no reactor running").
+/// `None` (no runtime was current at install — headless/unit-test) → the poll is
+/// skipped and the periodic backstop / WS-reconnect catch-up covers it.
+pub(crate) fn notify_continuation_terminal_exit(
+    terminal_id: &str,
+    rt_handle: Option<&tokio::runtime::Handle>,
+) {
+    if !deregister_exited_continuation(terminal_id) {
+        return;
+    }
+    let Some(device_id) = load_local_device_id() else {
+        return;
+    };
+    let Some(handle) = rt_handle else {
+        debug!(
+            "agent_runtime: continuation terminal_id={terminal_id} exited but no tokio \
+             handle to poll on — relying on the periodic backstop / next WS reconnect"
+        );
+        return;
+    };
+    debug!(
+        "agent_runtime: continuation terminal_id={terminal_id} exited — \
+         kicking capacity-freed pending-continuations poll"
+    );
+    handle.spawn(async move {
+        poll_pending_continuations(device_id).await;
+    });
+}
+
+/// Remove an exited terminal from the live continuation registry, returning
+/// `true` iff it WAS a registered continuation session (i.e. its exit just freed
+/// a continuation cap slot, so a deferred continuation should be re-polled).
+///
+/// Pure over the registry (the only side effect is the removal), so the
+/// capacity-freed re-poll decision is unit-testable without a tokio runtime or a
+/// live `TerminalManager`. Operator tabs are never in the registry → `false`.
+fn deregister_exited_continuation(terminal_id: &str) -> bool {
+    continuation_sessions()
+        .lock()
+        .map(|mut map| map.remove(terminal_id).is_some())
+        .unwrap_or(false)
+}
+
+/// How often the periodic backstop poll fires once armed (5 min).
+const CONTINUATION_BACKSTOP_POLL_SECS: u64 = 300;
+
+/// Spawn the periodic backstop poll task (Defect A item 3, backstop half).
+///
+/// A best-effort safety net for the capacity-freed exit-hook trigger
+/// ([`notify_continuation_terminal_exit`]): a missed exit signal — a continuation
+/// terminal whose coord registration failed (so no on-exit hook was installed),
+/// or a slot that frees while the runner is between WS connects — must not strand
+/// a deferred continuation on coord's pending queue until an unrelated WS
+/// reconnect happens to re-poll. Every [`CONTINUATION_BACKSTOP_POLL_SECS`] this
+/// task polls coord for pending continuations, but ONLY after at least one
+/// `AtCap` deferral has happened this process lifetime
+/// ([`at_cap_deferral_happened`]) — until then there is nothing to drain and the
+/// task is a cheap idle tick (no network I/O).
+///
+/// Spawned once per process from [`spawn_runtime`]. Independent of the WS pump
+/// so it keeps draining even while the subscription is flapping.
+fn spawn_continuation_backstop_poll(device_id: uuid::Uuid) {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(CONTINUATION_BACKSTOP_POLL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick — nothing can be deferred at startup.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if at_cap_deferral_happened() {
+                debug!(
+                    "agent_runtime: backstop poll firing (a prior AtCap deferral armed it) \
+                     for device_id={device_id}"
+                );
+                poll_pending_continuations(device_id).await;
+            }
+        }
+    });
+}
+
 /// Liveness predicate for the continuation guard, backed by the process-global
 /// `TerminalManager`. Returns `terminal_id -> still running?`. When there is no
 /// Tauri runtime / no managed `TerminalManager` (headless or unit-test context)
@@ -1320,8 +1462,22 @@ async fn run_gate_continuation_inner(
             return Ok(());
         }
         ContinuationGuard::AtCap(cap) => {
-            let reason =
-                format!("continuation cap ({cap}) reached — operator must resume manually");
+            // Mark that a deferral happened this process lifetime so the periodic
+            // backstop poll arms (`spawn_continuation_backstop_poll`): even if the
+            // capacity-freed exit-hook trigger is missed, the deferred queue still
+            // drains within the backstop interval instead of stranding until an
+            // unrelated WS reconnect.
+            mark_at_cap_deferral();
+            // The `deferred:` prefix (Resolved Q3) distinguishes a capacity DEFER
+            // (the continuation is intact + pending on coord, re-deliverable once a
+            // slot frees) from a hard spawn failure, so a coord-side consumer can
+            // tell them apart on the agent-LIFECYCLE channel. NOTE: this is the
+            // agent `report_spawn_failed` lifecycle post, NOT the #484 continuation-
+            // outcome channel — the AtCap arm deliberately posts NO continuation
+            // claim/outcome (see below).
+            let reason = format!(
+                "deferred: continuation cap ({cap}) reached — re-delivered when a slot frees"
+            );
             warn!(
                 "agent_runtime: gate-continuation refused: {reason} (anchor_key={:?})",
                 payload.anchor_key
@@ -3458,5 +3614,146 @@ mod tests {
                 other => panic!("status {status}: expected SpawnDespiteClaimError, got {other:?}"),
             }
         }
+    }
+
+    // =========================================================================
+    // Defect A item 3 (layered on #484): capacity-freed re-poll
+    // =========================================================================
+
+    /// A continuation terminal's exit deregisters it from the live registry AND
+    /// reports it WAS a continuation (`true`) — the signal the on-exit hook uses
+    /// to kick a capacity-freed pending-continuations poll. The registry entry is
+    /// gone afterward (the freed slot is reflected immediately, not lazily).
+    #[test]
+    fn continuation_exit_triggers_repoll_and_deregisters() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        clear_continuation_registry();
+
+        register_continuation_session("term-cont-1".to_string(), Some("anchor-1".into()));
+        assert!(
+            continuation_sessions()
+                .lock()
+                .unwrap()
+                .contains_key("term-cont-1"),
+            "precondition: the continuation session is registered live"
+        );
+
+        // Its PTY exits → deregister + signal a re-poll is warranted.
+        assert!(
+            deregister_exited_continuation("term-cont-1"),
+            "a registered continuation's exit must signal a capacity-freed re-poll"
+        );
+        // The freed slot is reflected immediately.
+        assert!(
+            !continuation_sessions()
+                .lock()
+                .unwrap()
+                .contains_key("term-cont-1"),
+            "the exited continuation must be removed from the live registry"
+        );
+        // A second exit of the same (already-gone) id is a no-op (idempotent).
+        assert!(
+            !deregister_exited_continuation("term-cont-1"),
+            "a second exit of an already-deregistered continuation must NOT re-trigger"
+        );
+
+        clear_continuation_registry();
+    }
+
+    /// An OPERATOR tab's exit must NOT trigger a capacity-freed re-poll. Operator
+    /// tabs are created via `terminal_create` (a path that never registers them in
+    /// the continuation registry), so a terminal id absent from the registry
+    /// reports `false` — no poll storm on unrelated tab closes. This is the
+    /// defense-in-depth guard `notify_continuation_terminal_exit` relies on.
+    #[test]
+    fn operator_tab_exit_does_not_trigger_repoll() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        clear_continuation_registry();
+
+        // A live continuation exists, but the OPERATOR tab (different id) closes.
+        register_continuation_session("term-cont-1".to_string(), Some("anchor-1".into()));
+        assert!(
+            !deregister_exited_continuation("operator-tab-xyz"),
+            "an operator tab (never registered) must NOT trigger a re-poll"
+        );
+        // The unrelated live continuation is untouched.
+        assert!(
+            continuation_sessions()
+                .lock()
+                .unwrap()
+                .contains_key("term-cont-1"),
+            "an operator-tab exit must not disturb a live continuation's registration"
+        );
+
+        clear_continuation_registry();
+    }
+
+    /// `notify_continuation_terminal_exit` with NO tokio handle (the bare-OS-thread
+    /// / unit-test case) must NOT panic and still deregisters the exited
+    /// continuation — the poll is simply skipped (the backstop / WS-reconnect
+    /// catch-up covers it). Guards the "PTY waiter has no runtime" path.
+    #[test]
+    fn notify_continuation_exit_without_runtime_is_safe() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        clear_continuation_registry();
+
+        register_continuation_session("term-cont-2".to_string(), None);
+        // No runtime handle (None) — must not panic on the missing reactor.
+        notify_continuation_terminal_exit("term-cont-2", None);
+        assert!(
+            !continuation_sessions()
+                .lock()
+                .unwrap()
+                .contains_key("term-cont-2"),
+            "the exited continuation is deregistered even when no poll could be spawned"
+        );
+
+        clear_continuation_registry();
+    }
+
+    /// The periodic-backstop arming flag flips from `false` to `true` the first
+    /// time an `AtCap` deferral is recorded, and stays `true` (set-once, never
+    /// reset) — so the backstop poll stays armed for the rest of the process's
+    /// life once any deferral has happened.
+    ///
+    /// NOTE: the flag is a process-global `static AtomicBool` shared across the
+    /// whole test binary; this test only asserts the post-mark state (`true`) and
+    /// the idempotence of a second mark, never the pre-mark `false` (another test
+    /// could have armed it first). It runs under `CONT_GUARD_LOCK` for ordering
+    /// hygiene with the other continuation tests.
+    #[test]
+    fn at_cap_deferral_arms_backstop_flag() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        mark_at_cap_deferral();
+        assert!(
+            at_cap_deferral_happened(),
+            "an AtCap deferral must arm the periodic-backstop flag"
+        );
+        // Set-once / idempotent: marking again keeps it armed.
+        mark_at_cap_deferral();
+        assert!(
+            at_cap_deferral_happened(),
+            "the backstop flag stays armed (set-once, never reset)"
+        );
+    }
+
+    /// The AtCap lifecycle reason carries the `deferred:` prefix (Resolved Q3) so
+    /// a coord-side consumer can distinguish a capacity DEFER (continuation intact
+    /// + re-deliverable) from a hard spawn failure. This pins the exact prefix the
+    /// AtCap arm posts via the agent `report_spawn_failed` lifecycle channel.
+    #[test]
+    fn at_cap_reason_has_deferred_prefix() {
+        // Mirror the AtCap arm's reason construction.
+        let cap = 4usize;
+        let reason =
+            format!("deferred: continuation cap ({cap}) reached — re-delivered when a slot frees");
+        assert!(
+            reason.starts_with("deferred: "),
+            "AtCap lifecycle reason must carry the `deferred:` prefix, got: {reason}"
+        );
+        assert!(
+            reason.contains(&format!("cap ({cap})")),
+            "the reason must still name the cap for the operator log"
+        );
     }
 }

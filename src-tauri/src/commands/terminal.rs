@@ -978,6 +978,17 @@ pub(crate) fn create_terminal_session_backend(
             if let Some(session) = terminal_manager.get(&info.id) {
                 session.set_coord_session_id(coord_id);
                 let close_registry = session_registry.clone();
+                // Capacity-freed re-poll: capture this terminal's id so the exit
+                // hook can tell `agent_runtime` a continuation slot just freed and
+                // a deferred (AtCap) continuation can be re-polled promptly. The
+                // notify is a no-op unless this terminal is a registered
+                // continuation session, so operator tabs (a different create path)
+                // never trigger a poll. The PTY waiter that fires this hook is a
+                // bare OS thread with no tokio runtime, so capture the current
+                // runtime handle HERE (this fn runs under tokio) for the poll to
+                // spawn on.
+                let exited_terminal_id = info.id.clone();
+                let exit_rt_handle = tokio::runtime::Handle::try_current().ok();
                 session.set_on_exit(Box::new(move |coord_id| {
                     if let Err(e) = close_registry.close_by_id(coord_id) {
                         warn!(
@@ -986,6 +997,10 @@ pub(crate) fn create_terminal_session_backend(
                             "gate-continuation terminal exit hook: coord session close failed"
                         );
                     }
+                    crate::agent_runtime::notify_continuation_terminal_exit(
+                        &exited_terminal_id,
+                        exit_rt_handle.as_ref(),
+                    );
                 }));
                 let rx = session.subscribe_output();
                 session_registry.attach_output_pipe(coord_id, rx, true);
