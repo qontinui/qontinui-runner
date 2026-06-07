@@ -26,7 +26,7 @@ interface UseKeyboardShortcutsParams {
     focusNextNeedsInput: (states: Record<string, SessionState>) => void;
     toggleMaximize: (idx: number) => void;
     setMaximizedZone: (idx: number | null) => void;
-    setLayoutId: (id: string) => void;
+    setLayoutId: (id: string, opts?: { pinned?: boolean }) => void;
     assignTabToZone: (idx: number, tabId: string) => void;
   };
   sessionStates: Record<string, SessionState>;
@@ -53,7 +53,9 @@ interface UseKeyboardShortcutsParams {
     showSidebar: boolean;
     setShowSidebar: React.Dispatch<React.SetStateAction<boolean>>;
     setRightPanelMode: React.Dispatch<
-      React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null>
+      React.SetStateAction<
+        "transcript" | "workflow" | "analysis" | "findings" | "file-ownership" | null
+      >
     >;
     setSelectedTranscriptSessionId: React.Dispatch<React.SetStateAction<string | null>>;
   };
@@ -155,7 +157,8 @@ export function useKeyboardShortcuts({
         const num = parseInt(e.key, 10);
         const preset = LAYOUT_PRESETS.find((l) => l.shortcutKey === num);
         if (preset) {
-          zoneLayout.setLayoutId(preset.id);
+          // Keyboard shortcut is an explicit operator choice — pin it.
+          zoneLayout.setLayoutId(preset.id, { pinned: true });
         }
         return;
       }
@@ -208,7 +211,8 @@ export function useKeyboardShortcuts({
         e.preventDefault();
         const currentIdx = LAYOUT_PRESETS.findIndex((l) => l.id === zoneLayout.layoutId);
         const nextIdx = (currentIdx + 1) % LAYOUT_PRESETS.length;
-        zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id);
+        // Cycle-layout shortcut is an explicit operator choice — pin it.
+        zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id, { pinned: true });
         return;
       }
       if (e.ctrlKey && e.shiftKey && e.key === "K") {
