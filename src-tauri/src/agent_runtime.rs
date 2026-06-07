@@ -754,9 +754,97 @@ struct PendingContinuationsResponse {
 }
 
 /// Body for `POST /coord/gates/{gate_id}/continuation-consumed`.
+///
+/// Two shapes over the SAME route (coord's claim-then-outcome contract):
+/// - `{device_id}` (no outcome) = the CLAIM, posted BEFORE spawning.
+/// - `{device_id, outcome, detail?}` = the OUTCOME, posted AFTER the spawn
+///   attempt resolves (`spawned` / `spawn_failed`).
+///
+/// `outcome`/`detail` are `skip_serializing_if = Option::is_none` so the claim
+/// post serializes to exactly `{device_id}` (byte-identical to the pre-restructure
+/// body coord already accepts as the claim).
 #[derive(Debug, Clone, Serialize)]
 struct ContinuationConsumedBody {
     device_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+impl ContinuationConsumedBody {
+    /// The CLAIM body — no outcome. Posted before spawning.
+    fn claim(device_id: uuid::Uuid) -> Self {
+        Self {
+            device_id,
+            outcome: None,
+            detail: None,
+        }
+    }
+
+    /// The OUTCOME body — `spawned` (success) or `spawn_failed` + first-line
+    /// detail (failure). Posted after the spawn attempt resolves.
+    fn outcome(device_id: uuid::Uuid, spawned: bool, detail: Option<String>) -> Self {
+        Self {
+            device_id,
+            outcome: Some(if spawned { "spawned" } else { "spawn_failed" }),
+            detail,
+        }
+    }
+}
+
+/// The runner's decision after POSTing the consume CLAIM, derived purely from
+/// the claim response (status + body). Factored out as a pure fn
+/// ([`decide_spawn`]) so the 200 / 409-cancelled / error branches are
+/// unit-testable without a live coord.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpawnDecision {
+    /// Claim accepted (HTTP 200) → proceed to spawn.
+    Spawn,
+    /// Claim rejected (HTTP 409 `{"error":"cancelled", ...}`) → the continuation
+    /// was withdrawn upstream; SKIP the spawn. Carries the cancel reason (if any)
+    /// for the INFO log.
+    SkipCancelled { reason: Option<String> },
+    /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
+    /// (availability over consistency; the in-process dedupe still guards).
+    /// Carries a human-readable cause for the WARN log.
+    SpawnDespiteClaimError { cause: String },
+}
+
+/// Decode coord's claim response into a [`SpawnDecision`] (pure — no I/O).
+///
+/// - 2xx → [`SpawnDecision::Spawn`].
+/// - 409 with a JSON body whose `error == "cancelled"` →
+///   [`SpawnDecision::SkipCancelled`] (reason from `cancel_reason`).
+/// - any other status (incl. a 409 that ISN'T the cancelled shape) →
+///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency).
+///
+/// `status` is the HTTP status code; `body` is the response body text (may be
+/// empty / non-JSON — handled gracefully).
+fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
+    if (200..300).contains(&status) {
+        return SpawnDecision::Spawn;
+    }
+    if status == 409 {
+        // Parse the cancelled shape: `{"error":"cancelled","cancel_reason":...}`.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+            if v.get("error").and_then(|e| e.as_str()) == Some("cancelled") {
+                let reason = v
+                    .get("cancel_reason")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string());
+                return SpawnDecision::SkipCancelled { reason };
+            }
+        }
+        // A 409 that is NOT the cancelled contract (e.g. some other conflict):
+        // proceed rather than silently drop the continuation.
+        return SpawnDecision::SpawnDespiteClaimError {
+            cause: format!("claim returned 409 without a cancelled body: {body}"),
+        };
+    }
+    SpawnDecision::SpawnDespiteClaimError {
+        cause: format!("claim returned status {status}"),
+    }
 }
 
 /// Process-wide set of gate_ids whose continuation we have ALREADY dispatched.
@@ -930,20 +1018,26 @@ fn focus_existing_continuation(terminal_id: &str) {
 
 /// Shared dispatch seam for BOTH the WS fast-path and the poll backstop.
 ///
-/// 1. If the payload carries a `gate_id`, dedupe against [`dispatched_gate_ids`]:
-///    a duplicate (already-claimed id) is dropped here, so a continuation
-///    delivered by both transports spawns exactly once.
-/// 2. Spawn the continuation run task (the actual worktree-acquire + subprocess /
-///    terminal work in [`run_gate_continuation`]).
-/// 3. At-least-once ack: AFTER the spawn is in flight, POST
-///    `continuation-consumed` best-effort so coord stops re-listing it on the
-///    poll surface. Acking after (not before) dispatch means a crash between the
-///    two re-delivers the continuation on the next poll — a rare duplicate beats
-///    a silent drop. Absent `gate_id` (legacy coord) → skip the ack silently.
+/// **Claim-then-spawn-then-outcome** (the coord continuation contract). For a
+/// payload carrying a `gate_id` the whole dispatch is one async task that:
 ///
-/// `spawn_gate_continuation_task` remains the low-level task spawner this calls.
+/// 1. **Fast-path dedupe** (synchronous, before any I/O): [`claim_gate_dispatch`]
+///    against the in-process set — a duplicate delivery (same `gate_id`) is
+///    dropped here so a continuation delivered by both transports never even
+///    starts a second task. This is the in-process guard; the network claim
+///    below is the durable cross-restart one.
+/// 2. **CLAIM, then SPAWN, then OUTCOME** inside one async task
+///    ([`run_gate_continuation_owned`]): the #469 local guards run, then the
+///    consume-CLAIM is POSTed and awaited BEFORE spawning — a `409 cancelled`
+///    SKIPS the spawn (closes the poll→cancel→spawn race); a network/other
+///    error PROCEEDS (availability over consistency). After the spawn attempt
+///    resolves, the honest OUTCOME (`spawned` / `spawn_failed`) is POSTed.
+///
+/// Absent `gate_id` (legacy coord) → no dedupe-by-id, no claim, no outcome:
+/// dispatch exactly once via [`spawn_gate_continuation_task`] (unchanged).
 fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid::Uuid) {
     if let Some(gate_id) = payload.gate_id {
+        // Synchronous fast-path: drop an in-process duplicate before any I/O.
         if !claim_gate_dispatch(gate_id) {
             debug!(
                 "agent_runtime: gate-continuation gate_id={gate_id} already dispatched; \
@@ -951,13 +1045,18 @@ fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid:
             );
             return;
         }
-        // Spawn the run task, then ack consumed (best-effort, after dispatch).
-        spawn_gate_continuation_task(payload, device_id);
+        // One task owns the whole claim → spawn → outcome handshake. The #469
+        // local guards run FIRST inside `run_gate_continuation_inner`, then the
+        // consume-CLAIM is awaited (contract item 4: claim only after the local
+        // cap passes), then spawn-or-skip, then the outcome POST.
         tokio::spawn(async move {
-            post_continuation_consumed(gate_id, device_id).await;
+            if let Err(e) = run_gate_continuation_inner(payload, device_id, Some(gate_id)).await {
+                error!("agent_runtime: run_gate_continuation (gate_id={gate_id}) failed: {e:#}");
+            }
         });
     } else {
-        // Legacy coord: no gate_id → no dedupe-by-id and no ack. Dispatch once.
+        // Legacy coord: no gate_id → no dedupe-by-id and no claim/outcome.
+        // Dispatch once with no coord handshake (unchanged behavior).
         spawn_gate_continuation_task(payload, device_id);
     }
 }
@@ -1028,12 +1127,61 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
     }
 }
 
-/// POST `continuation-consumed` for a dispatched gate continuation (the
-/// at-least-once ack). Idempotent on coord's side; best-effort here — a failure
-/// `warn!`s once and is swallowed (the continuation already dispatched; the only
-/// cost of a missed ack is coord re-listing it on the next poll, where the
-/// dedupe set drops the duplicate). NEVER crashes the caller.
-async fn post_continuation_consumed(gate_id: uuid::Uuid, device_id: uuid::Uuid) {
+/// POST the consume CLAIM (`{device_id}`, no outcome) for a dispatched gate
+/// continuation and decode the response into a [`SpawnDecision`]. This is the
+/// claim-BEFORE-spawn gate: it is AWAITED, and its result decides whether the
+/// runner spawns.
+///
+/// - 200 → [`SpawnDecision::Spawn`].
+/// - 409 `{"error":"cancelled", cancel_reason}` → [`SpawnDecision::SkipCancelled`].
+/// - 5s timeout / network failure / any other non-2xx →
+///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency —
+///   preserves the pre-restructure behavior; the in-process dedupe still guards).
+///
+/// No `coord_http_base` (legacy / no coord configured) → proceed: there is no
+/// claim surface to consult, so the in-process dedupe is the only guard, as
+/// before.
+async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> SpawnDecision {
+    let Some(base) = coord_http_base() else {
+        return SpawnDecision::Spawn;
+    };
+    let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return SpawnDecision::SpawnDespiteClaimError {
+                cause: format!("claim client build failed: {e:#}"),
+            };
+        }
+    };
+    let body = ContinuationConsumedBody::claim(device_id);
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            // Body is needed only to distinguish the 409 cancelled shape; read
+            // it unconditionally (small) and tolerate a read error.
+            let text = resp.text().await.unwrap_or_default();
+            decide_spawn(status, &text)
+        }
+        Err(e) => SpawnDecision::SpawnDespiteClaimError {
+            cause: format!("claim POST failed: {e:#}"),
+        },
+    }
+}
+
+/// POST the consume OUTCOME (`{device_id, outcome, detail?}`) after the spawn
+/// attempt resolves. Best-effort, 5s timeout — a failure `warn!`s once and is
+/// swallowed (coord already recorded the claim; a missed outcome only leaves
+/// `continuation_consumed_outcome` NULL). NEVER crashes the caller.
+async fn post_continuation_outcome(
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    spawned: bool,
+    detail: Option<String>,
+) {
     let Some(base) = coord_http_base() else {
         return;
     };
@@ -1045,71 +1193,91 @@ async fn post_continuation_consumed(gate_id: uuid::Uuid, device_id: uuid::Uuid) 
         Ok(c) => c,
         Err(e) => {
             warn!(
-                "agent_runtime: continuation-consumed client build failed gate_id={gate_id}: {e:#}"
+                "agent_runtime: continuation-outcome client build failed gate_id={gate_id}: {e:#}"
             );
             return;
         }
     };
-    let body = ContinuationConsumedBody { device_id };
+    let body = ContinuationConsumedBody::outcome(device_id, spawned, detail);
     match client.post(&url).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
-            debug!("agent_runtime: continuation-consumed posted gate_id={gate_id}");
+            debug!(
+                "agent_runtime: continuation-outcome posted gate_id={gate_id} spawned={spawned}"
+            );
         }
         Ok(resp) => {
             warn!(
-                "agent_runtime: continuation-consumed POST gate_id={gate_id} returned {} \
+                "agent_runtime: continuation-outcome POST gate_id={gate_id} returned {} \
                  (continuing)",
                 resp.status()
             );
         }
         Err(e) => warn!(
-            "agent_runtime: continuation-consumed POST gate_id={gate_id} failed (continuing): {e:#}"
+            "agent_runtime: continuation-outcome POST gate_id={gate_id} failed (continuing): {e:#}"
         ),
     }
 }
 
-/// Spawn the run task for a gate continuation. Unlike the agent-spawn path,
-/// the device-local resources (worktree, claim, JWT) are NOT supplied by coord
-/// — they are acquired inside [`run_gate_continuation`].
+/// First line of an error message (for the `spawn_failed` outcome `detail`).
+fn first_line(msg: &str) -> String {
+    msg.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Spawn the run task for a gate continuation WITHOUT the coord claim/outcome
+/// handshake (the legacy no-`gate_id` path). Unlike the agent-spawn path, the
+/// device-local resources (worktree, claim, JWT) are NOT supplied by coord —
+/// they are acquired inside [`run_gate_continuation_inner`].
 ///
-/// This is the low-level task spawner; callers reach it through
-/// [`dispatch_gate_continuation`], which adds the dedupe + consumed-ack seam.
+/// Reached only from [`dispatch_gate_continuation`]'s legacy branch (a coord
+/// that omits `gate_id`): no `dispatched_gate_ids` dedupe-by-id, no claim, no
+/// outcome. The #469 local guards still run inside the run fn.
 fn spawn_gate_continuation_task(payload: GateContinuationPayload, device_id: uuid::Uuid) {
     info!(
-        "agent_runtime: gate-continuation received target_device_id={} presentation={:?} \
+        "agent_runtime: gate-continuation received (legacy, no gate_id) target_device_id={} \
+         presentation={:?} repos={} anchor_key={:?}",
+        payload.target_device_id,
+        payload.presentation,
+        payload.repos.len(),
+        payload.anchor_key,
+    );
+    tokio::spawn(async move {
+        if let Err(e) = run_gate_continuation_inner(payload, device_id, None).await {
+            error!("agent_runtime: run_gate_continuation (legacy) failed: {e:#}");
+        }
+    });
+}
+
+/// End-to-end run of one gate continuation, with the claim→spawn→outcome
+/// handshake gated on `claim_gate_id`:
+///
+/// 0. `target_device_id` sanity check.
+/// 1. #469 local guards (anchor_key dedup, concurrency cap) — run FIRST so a
+///    locally-rejected dispatch never burns a coord-side claim (contract item 4).
+/// 2. **CLAIM** (only when `claim_gate_id` is `Some`): POST the consume CLAIM
+///    and AWAIT it. `409 cancelled` → log INFO + SKIP the spawn entirely;
+///    network/other error → WARN + PROCEED (availability over consistency).
+/// 3. Acquire a device-local worktree (+ claim heartbeat) and dispatch on
+///    `presentation` (terminal / headless) to produce the REAL spawn result.
+/// 4. **OUTCOME** (only when `claim_gate_id` is `Some`): POST `spawned` /
+///    `spawn_failed` (first-line detail) sourced from step 3's result —
+///    best-effort, 5s timeout.
+///
+/// `claim_gate_id == None` is the legacy path: steps 2 and 4 are skipped.
+async fn run_gate_continuation_inner(
+    payload: GateContinuationPayload,
+    device_id: uuid::Uuid,
+    claim_gate_id: Option<uuid::Uuid>,
+) -> anyhow::Result<()> {
+    info!(
+        "agent_runtime: gate-continuation dispatch target_device_id={} presentation={:?} \
          repos={} anchor_key={:?} gate_id={:?}",
         payload.target_device_id,
         payload.presentation,
         payload.repos.len(),
         payload.anchor_key,
-        payload.gate_id,
+        claim_gate_id,
     );
-    tokio::spawn(async move {
-        if let Err(e) = run_gate_continuation(payload, device_id).await {
-            error!("agent_runtime: run_gate_continuation failed: {e:#}");
-        }
-    });
-}
 
-/// End-to-end run of one gate continuation:
-/// 1. Acquire a device-local worktree (+ claim heartbeat) from `repos` via the
-///    same `isolated_edit::acquire` machinery the agent-spawn path uses. When
-///    `QONTINUI_AGENT_WORKTREE_MODE` is off, fall back to the canonical
-///    checkout of the first repo (no isolation) so the continuation still runs.
-/// 2. Dispatch on `presentation`:
-///    - `Headless` → spawn the `claude` CLI as a tokio child (existing flow),
-///      posting `spawn-complete`/`spawn-failed` lifecycle to coord.
-///    - `Terminal` → **P2** opens a visible terminal session here; for THIS
-///      phase, log a warning and fall through to the headless flow so the
-///      continuation is still consumed end-to-end.
-///
-/// The claim heartbeat is owned by the returned `IsolatedEditContext`, held
-/// alive for the whole subprocess lifetime and released on drop (matching the
-/// agent-spawn path's 30s heartbeat + release lifecycle).
-async fn run_gate_continuation(
-    payload: GateContinuationPayload,
-    device_id: uuid::Uuid,
-) -> anyhow::Result<()> {
     // Defensive: coord's WS pattern filter is device-scoped, but a frame that
     // somehow targets another device must not run here.
     if payload.target_device_id != device_id {
@@ -1120,15 +1288,15 @@ async fn run_gate_continuation(
         return Ok(());
     }
 
-    // P3 (anchor_key dedup) + P4 (concurrency cap): before acquiring any
-    // device-local resources, check the live continuation-session registry.
-    // `gate_id` dedup (#450, the `dispatched_gate_ids` set) already collapses a
-    // SAME gate delivered twice; this catches the residual cases it can't — a
+    // Step 1: #469 local guards (P3 anchor_key dedup + P4 concurrency cap) BEFORE
+    // any coord claim or worktree acquire — a dispatch the local cap would reject
+    // must NOT burn a coord-side claim (contract item 4). `gate_id` dedup (#450,
+    // the `dispatched_gate_ids` set, already applied in the dispatcher) collapses
+    // a SAME gate delivered twice; this catches the residual cases it can't — a
     // re-cleared gate (new `gate_id`, same `anchor_key`) and the cap — both
     // evaluated against sessions that are STILL running. Liveness is tested
-    // against the `TerminalManager` (continuation TERMINAL sessions register
-    // there); with no Tauri runtime the registry is empty so the guard is a
-    // no-op (the unit-test / headless-only context).
+    // against the `TerminalManager`; with no Tauri runtime the registry is empty
+    // so the guard is a no-op (the unit-test / headless-only context).
     match evaluate_continuation_guard(payload.anchor_key.as_deref(), &live_terminal_predicate()) {
         ContinuationGuard::Proceed => {}
         ContinuationGuard::DuplicateAnchor(existing_terminal_id) => {
@@ -1141,6 +1309,14 @@ async fn run_gate_continuation(
             // Best-effort: bring the existing docked tab to focus so the
             // operator sees the live continuation rather than nothing happening.
             focus_existing_continuation(&existing_terminal_id);
+            // Deliberately NO continuation claim/outcome here (contract item 4):
+            // the anchor_key dedup is a LOCAL guard that fires BEFORE step 2's
+            // claim, so we must not burn a coord-side claim on a dispatch the
+            // local guard rejected. The ALREADY-LIVE continuation (the one that
+            // won the anchor) owns its own claim+outcome; this re-cleared/dup
+            // gate_id is simply dropped, and the in-process dedupe absorbs any
+            // re-delivery. The deduped gate stays pending on coord (harmless —
+            // its work is the live session) until cancelled or it expires.
             return Ok(());
         }
         ContinuationGuard::AtCap(cap) => {
@@ -1154,12 +1330,44 @@ async fn run_gate_continuation(
             // (`/coord/alerts` is read-only); `spawn-failed` is the honest,
             // already-wired fallback. A fresh correlation id (no worktree/agent
             // was acquired) carries the lifecycle post.
+            //
+            // Deliberately NO continuation claim/outcome here (contract item 4):
+            // the local cap rejected BEFORE the claim, so we must NOT burn a
+            // coord-side claim on a dispatch the cap refused. The continuation
+            // stays pending (uncancelled, unconsumed) on coord so it can be
+            // re-delivered once a cap slot frees, OR cancelled by the operator /
+            // takeover path. The `spawn-failed` agent post above is the operator
+            // signal; the gate's continuation lifecycle is intentionally untouched.
             report_spawn_failed(uuid::Uuid::now_v7(), &reason, None, 0).await;
             return Ok(());
         }
     }
 
-    // Step 1: acquire a device-local worktree (+ claim heartbeat). The `ctx`
+    // Step 2: CLAIM-before-spawn (only with a gate_id / coord configured). Posted
+    // AFTER the #469 guards pass and AWAITED — its result decides whether to
+    // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
+    // the poll and now, coord returns 409 cancelled and we skip the spawn.
+    if let Some(gate_id) = claim_gate_id {
+        match post_continuation_claim(gate_id, device_id).await {
+            SpawnDecision::Spawn => {}
+            SpawnDecision::SkipCancelled { reason } => {
+                info!(
+                    "agent_runtime: continuation cancelled upstream: {} — skipping spawn \
+                     (gate_id={gate_id})",
+                    reason.as_deref().unwrap_or("(no reason given)")
+                );
+                return Ok(());
+            }
+            SpawnDecision::SpawnDespiteClaimError { cause } => {
+                warn!(
+                    "agent_runtime: continuation claim error (proceeding, in-process dedupe \
+                     guards): {cause} (gate_id={gate_id})"
+                );
+            }
+        }
+    }
+
+    // Step 3: acquire a device-local worktree (+ claim heartbeat). The `ctx`
     // owns the claim heartbeat task. For the HEADLESS path it stays bound here
     // so its heartbeat runs for the whole subprocess and the claim releases on
     // drop at function exit. For the TERMINAL path ownership is MOVED into the
@@ -1195,12 +1403,26 @@ async fn run_gate_continuation(
         Ok(triple) => triple,
         Err(e) => {
             warn!("agent_runtime: gate-continuation worktree acquisition failed: {e:#}");
+            // The claim was already posted (step 2): record the honest outcome so
+            // coord doesn't show a perpetually-pending continuation.
+            if let Some(gate_id) = claim_gate_id {
+                post_continuation_outcome(
+                    gate_id,
+                    device_id,
+                    false,
+                    Some(first_line(&format!("worktree acquisition failed: {e}"))),
+                )
+                .await;
+            }
             return Err(e);
         }
     };
 
-    // Step 2: dispatch on presentation.
-    match payload.presentation {
+    // Step 3 (dispatch) + Step 4 (outcome): dispatch on presentation, then POST
+    // the honest outcome sourced from the REAL spawn result. The presentation
+    // fns return `Ok(())` once the terminal/subprocess is actually created and
+    // running (`spawned`) and `Err(_)` on a spawn failure (`spawn_failed`).
+    let result = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
             run_continuation_terminal(agent_id, &workdir, &payload, ctx).await
@@ -1213,7 +1435,24 @@ async fn run_gate_continuation(
             drop(ctx);
             res
         }
+    };
+
+    // Step 4: outcome ack (best-effort) from the actual result.
+    if let Some(gate_id) = claim_gate_id {
+        match &result {
+            Ok(()) => post_continuation_outcome(gate_id, device_id, true, None).await,
+            Err(e) => {
+                post_continuation_outcome(
+                    gate_id,
+                    device_id,
+                    false,
+                    Some(first_line(&e.to_string())),
+                )
+                .await
+            }
+        }
     }
+    result
 }
 
 /// Run a gate continuation as a VISIBLE terminal session (Decision 1/2/3).
@@ -3072,12 +3311,120 @@ mod tests {
         assert_eq!(p2.gate_id, None, "absent gate_id must be optional → None");
     }
 
-    /// The continuation-consumed ack body serializes to the FIXED wire contract
-    /// coord expects: `{"device_id": "<uuid>"}`.
+    /// The CLAIM body serializes to the FIXED wire contract coord accepts as a
+    /// claim: EXACTLY `{"device_id": "<uuid>"}` (no `outcome`/`detail` keys —
+    /// `skip_serializing_if` must elide them so the claim is byte-identical to
+    /// the pre-restructure ack body).
     #[test]
-    fn continuation_consumed_body_wire_shape() {
+    fn continuation_claim_body_wire_shape() {
         let device = uuid::Uuid::now_v7();
-        let v = serde_json::to_value(ContinuationConsumedBody { device_id: device }).unwrap();
+        let v = serde_json::to_value(ContinuationConsumedBody::claim(device)).unwrap();
         assert_eq!(v, serde_json::json!({ "device_id": device }));
+    }
+
+    /// The OUTCOME body serializes with `outcome` ("spawned"/"spawn_failed") and
+    /// `detail` only when present.
+    #[test]
+    fn continuation_outcome_body_wire_shape() {
+        let device = uuid::Uuid::now_v7();
+        // spawned → no detail key.
+        let spawned =
+            serde_json::to_value(ContinuationConsumedBody::outcome(device, true, None)).unwrap();
+        assert_eq!(
+            spawned,
+            serde_json::json!({ "device_id": device, "outcome": "spawned" })
+        );
+        // spawn_failed → carries the first-line detail.
+        let failed = serde_json::to_value(ContinuationConsumedBody::outcome(
+            device,
+            false,
+            Some("terminal session create failed".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(
+            failed,
+            serde_json::json!({
+                "device_id": device,
+                "outcome": "spawn_failed",
+                "detail": "terminal session create failed"
+            })
+        );
+    }
+
+    /// `first_line` extracts the first non-empty line, trimmed (the `spawn_failed`
+    /// detail must be a single tidy line, not a multi-line `anyhow` chain).
+    #[test]
+    fn first_line_takes_only_the_first_line() {
+        assert_eq!(first_line("boom\n\ncaused by: x\ny"), "boom");
+        assert_eq!(first_line("  spaced  "), "spaced");
+        assert_eq!(first_line(""), "");
+        assert_eq!(first_line("single"), "single");
+    }
+
+    // =========================================================================
+    // SpawnDecision: the claim-response → spawn/skip decision (pure, no I/O)
+    // =========================================================================
+
+    /// 200 (or any 2xx) → Spawn.
+    #[test]
+    fn decide_spawn_on_200_spawns() {
+        assert_eq!(
+            decide_spawn(200, r#"{"consumed":true}"#),
+            SpawnDecision::Spawn
+        );
+        assert_eq!(decide_spawn(204, ""), SpawnDecision::Spawn);
+    }
+
+    /// 409 with the cancelled contract → SkipCancelled, carrying the reason.
+    #[test]
+    fn decide_spawn_on_409_cancelled_skips_with_reason() {
+        let body = r#"{"error":"cancelled","cancelled_at":"2026-06-07T00:00:00Z","cancel_reason":"taken over by session abc"}"#;
+        assert_eq!(
+            decide_spawn(409, body),
+            SpawnDecision::SkipCancelled {
+                reason: Some("taken over by session abc".to_string())
+            }
+        );
+    }
+
+    /// 409 cancelled with no `cancel_reason` → SkipCancelled with `None` reason
+    /// (still skips — the cancel is authoritative even without a reason string).
+    #[test]
+    fn decide_spawn_on_409_cancelled_no_reason_still_skips() {
+        assert_eq!(
+            decide_spawn(409, r#"{"error":"cancelled"}"#),
+            SpawnDecision::SkipCancelled { reason: None }
+        );
+    }
+
+    /// 409 that is NOT the cancelled contract (e.g. `already_consumed`) →
+    /// proceed rather than silently drop (availability over consistency).
+    #[test]
+    fn decide_spawn_on_409_non_cancelled_proceeds() {
+        match decide_spawn(409, r#"{"error":"already_consumed"}"#) {
+            SpawnDecision::SpawnDespiteClaimError { .. } => {}
+            other => panic!("expected SpawnDespiteClaimError, got {other:?}"),
+        }
+    }
+
+    /// 409 with an empty / non-JSON body → proceed (can't confirm cancellation).
+    #[test]
+    fn decide_spawn_on_409_unparseable_proceeds() {
+        match decide_spawn(409, "") {
+            SpawnDecision::SpawnDespiteClaimError { .. } => {}
+            other => panic!("expected SpawnDespiteClaimError, got {other:?}"),
+        }
+    }
+
+    /// Any other non-2xx (404, 500, …) → proceed (availability over consistency;
+    /// the in-process dedupe is the remaining guard).
+    #[test]
+    fn decide_spawn_on_other_status_proceeds() {
+        for status in [404u16, 500, 503, 401] {
+            match decide_spawn(status, "whatever") {
+                SpawnDecision::SpawnDespiteClaimError { .. } => {}
+                other => panic!("status {status}: expected SpawnDespiteClaimError, got {other:?}"),
+            }
+        }
     }
 }
