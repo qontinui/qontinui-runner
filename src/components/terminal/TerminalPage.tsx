@@ -641,6 +641,40 @@ function TerminalPageInner({
     };
   }, [tabs, stateTracking.sessionStates]);
 
+  // ── Terminal-session roster (UI Bridge ground truth) ────────────────
+  //
+  // A single layout-independent DOM marker carrying the full set of
+  // terminal sessions the page is tracking, keyed for verification by
+  // stable `claudeSessionId`. Sourced from `tabs` (which holds EVERY
+  // session regardless of which zone is currently mounted — unlike the
+  // `terminal-input-*` interactive elements, which only mount for visible
+  // zones) cross-referenced against the live `zoneLayout.assignments` for
+  // each session's zone index.
+  //
+  // Reading this via `POST /ui-bridge/control/page/read-value
+  // {"selector":"[data-page-element=terminal-session-roster]"}` returns the
+  // roster JSON directly — no snapshot scraping of element ids and no
+  // dependence on the active layout preset (Issues 2 + 3 of the
+  // poll-dead-race remediation plan). Plain (non-Claude) shells have no
+  // `claudeSessionId`; they are still listed (with `claudeSessionId: null`)
+  // so the roster is a faithful census of all tracked terminals.
+  const terminalSessionRoster = useMemo(() => {
+    const assignments = zoneLayout.assignments;
+    const roster = tabs.map((t) => {
+      const zoneIndex = Number(
+        Object.entries(assignments).find(([, id]) => id === t.id)?.[0] ?? -1,
+      );
+      return {
+        claudeSessionId: t.claudeSessionId ?? null,
+        terminalId: t.id,
+        zoneIndex,
+        title: t.title,
+        isReconnecting: Boolean(t.isReconnecting),
+      };
+    });
+    return JSON.stringify(roster);
+  }, [tabs, zoneLayout.assignments]);
+
   const transitionEffects = useTransitionEffects();
   const { handleRestartInZone } = transitionEffects;
 
@@ -881,6 +915,21 @@ function TerminalPageInner({
             mounted directly below this); the registry + CommandBar +
             ZoneHoverActions + StatusStrip now cover its surface. */}
         <StatusStrip />
+        {/* Layout-independent terminal-session roster marker (UI Bridge
+            ground truth). Its textContent is the JSON census of every
+            tracked session — read via `POST
+            /ui-bridge/control/page/read-value
+            {"selector":"[data-page-element=terminal-session-roster]"}`.
+            Visually hidden; not interactive. Lists ALL sessions regardless
+            of which zones are currently mounted, so verification never
+            depends on the active layout preset. */}
+        <span
+          data-page-element="terminal-session-roster"
+          style={{ display: "none" }}
+          aria-hidden
+        >
+          {terminalSessionRoster}
+        </span>
         {showDocFinder && (
           <DocFinderModal
             onSelect={(filePath) => {

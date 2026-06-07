@@ -43,9 +43,27 @@ const OPEN_STALE_MS: i64 = 604_800_000;
 /// A record closed with reason `"pty-exit"` (its PTY died — e.g. a graceful
 /// runner restart firing `handleExit` on every live PTY) is still restorable
 /// for this long after the close. Beyond the window, or for any other close
-/// reason (explicit user close, `"poll-dead"`, …), it is NOT restorable.
-/// 10 minutes in millis.
+/// reason (explicit user close), it is NOT restorable. 10 minutes in millis.
 const RESTORABLE_PTY_EXIT_MS: i64 = 600_000;
+/// A record closed with reason `"poll-dead"` (the liveness poll saw a live
+/// shell with zero descendants for several consecutive idle ticks) is still
+/// restorable for this long after the close. A `poll-dead` close is far less
+/// certain than a `pty-exit` (the shell pty is, by definition, still alive —
+/// the session was merely idle between tool calls), so an immediate restart
+/// should bring it back rather than silently drop it. Beyond the window it is
+/// NOT restorable (a genuinely abandoned session should not resurrect days
+/// later). 10 minutes in millis.
+const RESTORABLE_POLL_DEAD_MS: i64 = 600_000;
+/// Number of consecutive zero-descendant ticks a *live* shell (`Some(true)`)
+/// must accumulate before the poll closes it `poll-dead`. A live Claude
+/// session routinely idles with zero descendants between tool calls / while
+/// waiting on the user, so closing on a single confirm tick (~90s) races a
+/// restart into dropping a still-live session. Requiring several ticks
+/// (≈ N × 45s poll interval) only closes shells that are idle-with-no-children
+/// for an extended, unambiguous stretch. A `Some(false)` (pty actually dead)
+/// shell still closes immediately — that path is unambiguous and bypasses
+/// this debounce entirely.
+const LIVE_SHELL_DEAD_TICKS: u32 = 3;
 
 /// One persisted terminal-session lifecycle record, keyed by
 /// `claude_session_id`. Timestamps are unix epoch millis.
@@ -205,11 +223,16 @@ impl SessionLifecycleStore {
     /// - every `state == "closed"` record whose `close_reason == "pty-exit"`
     ///   (its PTY died — the case a GRACEFUL restart produces by firing
     ///   `handleExit` on every live PTY) that closed within the
-    ///   [`RESTORABLE_PTY_EXIT_MS`] grace window.
+    ///   [`RESTORABLE_PTY_EXIT_MS`] grace window, PLUS
+    /// - every `state == "closed"` record whose `close_reason == "poll-dead"`
+    ///   (the liveness poll closed an idle-but-live shell) that closed within
+    ///   the [`RESTORABLE_POLL_DEAD_MS`] grace window — a poll-dead close is
+    ///   uncertain (the shell pty was still alive), so an immediate restart
+    ///   should bring the session back rather than silently drop it.
     ///
-    /// Records closed for any other reason (explicit user close, `"poll-dead"`,
-    /// …) or pty-exit closes older than the grace window are excluded — a user
-    /// who closes a tab does not want it resurrected, and a long-dead pty-exit
+    /// Records closed for any other reason (explicit user close), or `pty-exit`
+    /// / `poll-dead` closes older than their grace windows, are excluded — a
+    /// user who closes a tab does not want it resurrected, and a long-dead
     /// close is stale.
     pub fn restorable_records(&self, now_ms: i64) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
@@ -219,11 +242,18 @@ impl SessionLifecycleStore {
                     if r.state == "open" {
                         return true;
                     }
-                    if r.state == "closed" && r.close_reason.as_deref() == Some("pty-exit") {
-                        return match r.closed_at {
-                            Some(closed_at) => now_ms - closed_at <= RESTORABLE_PTY_EXIT_MS,
-                            None => false,
+                    if r.state == "closed" {
+                        let grace = match r.close_reason.as_deref() {
+                            Some("pty-exit") => Some(RESTORABLE_PTY_EXIT_MS),
+                            Some("poll-dead") => Some(RESTORABLE_POLL_DEAD_MS),
+                            _ => None,
                         };
+                        if let Some(grace_ms) = grace {
+                            return match r.closed_at {
+                                Some(closed_at) => now_ms - closed_at <= grace_ms,
+                                None => false,
+                            };
+                        }
                     }
                     false
                 })
@@ -321,8 +351,9 @@ fn write_map(path: &Path, map: &HashMap<String, TerminalSessionRecord>) -> std::
 pub enum PollAction {
     /// The session is alive and busy — refresh its `last_seen_at`.
     KeepAlive,
-    /// The session's shell is alive but has zero descendants for the first
-    /// time — wait one more tick before closing (debounce a momentary lull).
+    /// The session's shell is alive but has zero descendants and has not yet
+    /// reached [`LIVE_SHELL_DEAD_TICKS`] consecutive zero-descendant ticks —
+    /// wait more ticks before closing (debounce idle lulls between tool calls).
     NeedsConfirm,
     /// The session is dead — flip it to `closed`.
     Close,
@@ -354,7 +385,11 @@ pub fn classify(
         Some(true) => {
             if descendant_count > 0 {
                 PollAction::KeepAlive
-            } else if consecutive_dead < 1 {
+            } else if consecutive_dead < LIVE_SHELL_DEAD_TICKS {
+                // A live shell idling with no children is the normal between-
+                // tool-calls state of a Claude session — debounce several
+                // ticks before treating it as dead, so a restart in this
+                // window does not drop a still-live session.
                 PollAction::NeedsConfirm
             } else {
                 PollAction::Close
@@ -636,13 +671,78 @@ mod tests {
     }
 
     #[test]
-    fn classify_needs_confirm_on_first_zero_descendant_tick() {
-        assert_eq!(classify(Some(true), 0, 0, true), PollAction::NeedsConfirm);
+    fn classify_needs_confirm_while_below_live_shell_dead_ticks() {
+        // A live shell with zero descendants stays in NeedsConfirm for every
+        // tick strictly below LIVE_SHELL_DEAD_TICKS — it must NOT close on a
+        // brief idle lull (the poll-dead race this fix closes).
+        for prior in 0..LIVE_SHELL_DEAD_TICKS {
+            assert_eq!(
+                classify(Some(true), 0, prior, true),
+                PollAction::NeedsConfirm,
+                "live shell, 0 descendants, {prior} prior ticks must NeedsConfirm"
+            );
+        }
+        // Specifically: the second tick (prior == 1) no longer closes.
+        assert_eq!(classify(Some(true), 0, 1, true), PollAction::NeedsConfirm);
     }
 
     #[test]
-    fn classify_close_on_second_zero_descendant_tick() {
-        assert_eq!(classify(Some(true), 0, 1, true), PollAction::Close);
-        assert_eq!(classify(Some(true), 0, 5, true), PollAction::Close);
+    fn classify_close_only_after_live_shell_dead_ticks_reached() {
+        // Only once we've accumulated LIVE_SHELL_DEAD_TICKS consecutive
+        // zero-descendant ticks does a live shell finally close.
+        assert_eq!(
+            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS, true),
+            PollAction::Close
+        );
+        assert_eq!(
+            classify(Some(true), 0, LIVE_SHELL_DEAD_TICKS + 5, true),
+            PollAction::Close
+        );
+    }
+
+    #[test]
+    fn restorable_records_includes_in_grace_poll_dead() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // A poll-dead close inside the grace window IS restorable — the
+        // shell was still alive when the poll fired, so an immediate restart
+        // must bring it back rather than silently drop it.
+        store.record_open(rec("poll-dead-fresh"));
+        store.record_close("poll-dead-fresh", "poll-dead");
+        // A poll-dead close aged beyond the grace window is NOT restorable.
+        store.record_open(rec("poll-dead-stale"));
+        store.record_close("poll-dead-stale", "poll-dead");
+
+        let now = Utc::now().timestamp_millis();
+
+        // Age `poll-dead-fresh` to now-30s (well inside grace) and
+        // `poll-dead-stale` past the grace window.
+        {
+            let raw = std::fs::read(&path).unwrap();
+            let mut m: HashMap<String, TerminalSessionRecord> =
+                serde_json::from_slice(&raw).unwrap();
+            m.get_mut("poll-dead-fresh").unwrap().closed_at = Some(now - 30_000);
+            m.get_mut("poll-dead-stale").unwrap().closed_at =
+                Some(now - RESTORABLE_POLL_DEAD_MS - 1000);
+            let bytes = serde_json::to_vec_pretty(&m).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let ids: Vec<String> = store
+            .restorable_records(now)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+        assert!(
+            ids.contains(&"poll-dead-fresh".to_string()),
+            "poll-dead closed 30s ago must be restorable; got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"poll-dead-stale".to_string()),
+            "poll-dead aged past grace must NOT be restorable; got {ids:?}"
+        );
     }
 }
