@@ -333,8 +333,15 @@ function Start-DirectRunner {
     $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("contract-smoke-" + $instanceName + "-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
     $configDir = Join-Path $tmpRoot "config"
     $webviewDir = Join-Path $tmpRoot "webview2"
+    $logDir = Join-Path $tmpRoot "logs"
     New-Item -ItemType Directory -Force -Path $configDir  | Out-Null
     New-Item -ItemType Directory -Force -Path $webviewDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $logDir     | Out-Null
+
+    # Capture the runner's own stdout/stderr so an early hard-exit isn't a
+    # black box. Start-Process needs distinct files for each stream.
+    $stdoutFile = Join-Path $tmpRoot "runner-stdout.log"
+    $stderrFile = Join-Path $tmpRoot "runner-stderr.log"
 
     # Env table (verified against the two authoritative spawners). Set on the
     # current process env so Start-Process inherits it, snapshot+restore around
@@ -348,6 +355,13 @@ function Start-DirectRunner {
         "QONTINUI_SECURE_STORAGE_DIR" = $configDir
         "WEBVIEW2_USER_DATA_FOLDER"   = $webviewDir
         "QONTINUI_DISABLE_KEYCHAIN"   = "1"
+        # Pin the runner's startup-panic log into our temp tree. The runner
+        # writes <QONTINUI_RUNNER_LOG_DIR>/runner-panic.log on any early-init
+        # panic (startup_panic.rs); an exit code 2 is *defined* as a panic
+        # caught by main()'s catch_unwind (main.rs:272-276). Without this the
+        # log lands in %LOCALAPPDATA%\qontinui-runner\dev-logs — outside the
+        # temp dir we dump on failure — so the crash cause stays invisible.
+        "QONTINUI_RUNNER_LOG_DIR"     = $logDir
     }
     foreach ($k in $toSet.Keys) {
         $prev[$k] = [System.Environment]::GetEnvironmentVariable($k, "Process")
@@ -361,8 +375,12 @@ function Start-DirectRunner {
     Write-Host "  exe:     $resolved"
     Write-Host "  config:  $configDir"
     Write-Host "  webview: $webviewDir"
+    Write-Host "  logs:    $logDir"
+    Write-Host "  stdout:  $stdoutFile"
+    Write-Host "  stderr:  $stderrFile"
     try {
-        $proc = Start-Process -FilePath $resolved -PassThru -WorkingDirectory $tmpRoot
+        $proc = Start-Process -FilePath $resolved -PassThru -WorkingDirectory $tmpRoot `
+            -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
     } finally {
         # Restore env regardless of launch outcome.
         foreach ($k in $prev.Keys) {
@@ -375,7 +393,66 @@ function Start-DirectRunner {
         Port        = $Port
         Id          = $instanceName
         TmpRoot     = $tmpRoot
+        LogDir      = $logDir
+        StdoutFile  = $stdoutFile
+        StderrFile  = $stderrFile
     }
+}
+
+# ---------------------------------------------------------------------------
+# Dump everything we captured from a direct-exe runner — its redirected
+# stdout/stderr plus any *.log files the runner wrote under its temp tree
+# (notably runner-panic.log, written on an early-init panic / exit code 2).
+# Called on early-exit AND on ready-timeout so a CI failure is diagnosable.
+# PS 5.1-compatible (no ?., no ternary).
+# ---------------------------------------------------------------------------
+function Dump-DirectRunnerDiagnostics {
+    param($DirectRunner)
+    if (-not $DirectRunner) { return }
+
+    Write-Host ""
+    Write-Host ("=" * 90)
+    Write-Host "DIRECT-EXE RUNNER DIAGNOSTICS"
+    Write-Host ("=" * 90)
+
+    function _dumpFile([string]$label, [string]$path) {
+        Write-Host ""
+        Write-Host "=== $label ($path) ==="
+        if ($path -and (Test-Path $path)) {
+            $content = Get-Content -Raw -Path $path -ErrorAction SilentlyContinue
+            if ($null -ne $content -and $content.Trim().Length -gt 0) {
+                Write-Host $content
+            } else {
+                Write-Host "(empty)"
+            }
+        } else {
+            Write-Host "(file not found)"
+        }
+    }
+
+    _dumpFile "runner stdout" $DirectRunner.StdoutFile
+    _dumpFile "runner stderr" $DirectRunner.StderrFile
+
+    # Sweep the whole temp tree for *.log files (panic log, any future logs
+    # the runner drops under config/log dirs) and dump each in full.
+    Write-Host ""
+    Write-Host "=== *.log files under $($DirectRunner.TmpRoot) ==="
+    $logFiles = @()
+    if ($DirectRunner.TmpRoot -and (Test-Path $DirectRunner.TmpRoot)) {
+        $logFiles = @(Get-ChildItem -Path $DirectRunner.TmpRoot -Recurse -Filter *.log -File -ErrorAction SilentlyContinue)
+    }
+    # Exclude the two redirect files we already dumped above.
+    $already = @($DirectRunner.StdoutFile, $DirectRunner.StderrFile)
+    $logFiles = @($logFiles | Where-Object { $already -notcontains $_.FullName })
+    if ($logFiles.Count -eq 0) {
+        Write-Host "(no additional *.log files found)"
+    } else {
+        foreach ($lf in $logFiles) {
+            _dumpFile "log file" $lf.FullName
+        }
+    }
+    Write-Host ""
+    Write-Host ("=" * 90)
 }
 
 function Wait-DirectRunnerReady {
@@ -475,9 +552,15 @@ if ($DirectExe) {
         Wait-DirectRunnerReady -Port $runnerPort -TimeoutSecs $WaitTimeoutSecs -Process $directRunner.Process
     } catch {
         Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        # Stop the process FIRST so its redirected stdout/stderr handles are
+        # released and fully flushed before we read them back.
         if ($directRunner.Process -and -not $directRunner.Process.HasExited) {
             try { Stop-Process -Id $directRunner.Process.Id -Force -ErrorAction SilentlyContinue } catch { }
         }
+        # Dump captured output + any panic/log files so the failure (early-exit
+        # OR ready-timeout) is diagnosable in CI logs instead of a bare
+        # "exited early with code N".
+        Dump-DirectRunnerDiagnostics -DirectRunner $directRunner
         exit 1
     }
     $runnerBase = "http://localhost:$runnerPort/ui-bridge"
