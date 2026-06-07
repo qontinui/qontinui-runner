@@ -301,7 +301,7 @@ jobs:
       # the sibling ui-bridge clone, and asserts the shape contracts the offline
       # manifest tests can't see. Windows-only: the runner is Windows-primary
       # and the WebView2 render `frontendReady:true` needs is a Windows surface.
-      # Reuses `src-tauri/target/debug/qontinui-runner.exe` from the step above
+      # Reuses `target/debug/qontinui-runner.exe` from the step above
       # (built from src-tauri, so `.cargo/config.toml`'s /STACK:8388608 applies
       # — no separate cargo build, no 0xc00000fd stack-overflow). `-Profile ci`
       # skips the two model-loading routes (extract/describe) that need
@@ -310,7 +310,7 @@ jobs:
       # windows job (per the plan), not a blocker for the script mode.
       - name: SDK↔runner contract smoke (direct-exe)
         if: matrix.platform == 'windows-latest'
-        run: powershell -File scripts/contract-smoke.ps1 -DirectExe src-tauri/target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
+        run: powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
         shell: bash
 
   # Gating frontend unit-test lane (vitest).
