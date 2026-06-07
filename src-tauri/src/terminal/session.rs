@@ -1326,27 +1326,44 @@ mod tests {
         let scrollback = session.scrollback_buffer.clone();
         let total = session.total_bytes_produced.clone();
 
-        // Read until EOF (child exited and pipe drained). A real PTY echo
-        // completes in well under a second; cap total read time defensively
-        // so a wedged CI box fails the poll-assert below rather than hangs.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => tee_into_scrollback(&scrollback, &total, &buf[..n]),
-                // On Windows the PTY reader errors when the child exits;
-                // treat that as EOF, mirroring the production reader thread.
-                Err(_) => break,
+        // Reader thread: tee everything into the session's own Arcs via the
+        // production path until the PTY closes. This MUST be its own thread
+        // (exactly like the production reader thread): on Windows/ConPTY,
+        // `reader.read()` keeps blocking after the child exits — only
+        // closing the MASTER unblocks it — so an inline read loop with a
+        // between-reads deadline check hangs (it wedged the windows-latest
+        // CI job for the full 90-minute timeout).
+        let reader_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => tee_into_scrollback(&scrollback, &total, &buf[..n]),
+                }
             }
-            if std::time::Instant::now() > deadline {
+        });
+
+        // The echo child exits immediately after printing.
+        let _ = child.wait();
+
+        // Bounded poll until the marker lands in the session's scrollback
+        // (the reader thread races the child's output in). On timeout we
+        // fall through — the caller's assertions then fail with the actual
+        // buffer content rather than hanging the test harness.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let (sb, _) = session.get_scrollback_buffer();
+            if String::from_utf8_lossy(&sb).contains(marker) || std::time::Instant::now() > deadline
+            {
                 break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let _ = child.wait();
-        // Keep the master alive until here so the reader above had a live
-        // pipe; dropping it now releases the OS handle.
+
+        // Closing the master tears down the PTY (ClosePseudoConsole on
+        // Windows), which unblocks the reader thread's pending `read()`.
         drop(pair.master);
+        let _ = reader_thread.join();
     }
 
     /// REGRESSION (plan
