@@ -36,6 +36,33 @@ fn write_integration_script(content: &str, name: &str) -> Option<std::path::Path
 /// Maximum scrollback buffer capacity (1 MB).
 const SCROLLBACK_CAPACITY: usize = 1_048_576;
 
+/// Append a chunk of processed PTY output to a session's scrollback ring
+/// buffer and bump its monotonic byte counter — the exact teeing step the
+/// reader thread performs per read (see [`TerminalSession::spawn`]).
+///
+/// Extracted as a free function so it can be exercised in tests against a
+/// real PTY without constructing a Tauri `AppHandle` (which the reader
+/// thread otherwise needs only for event emission, orthogonal to buffer
+/// state). `scrollback` and `total_produced` are this session's OWN Arcs —
+/// the per-session isolation that [`TerminalSession::get_scrollback_buffer`]
+/// reads back depends on each session holding distinct instances, which is
+/// what the distinct-buffers regression test locks in.
+fn tee_into_scrollback(
+    scrollback: &Arc<Mutex<VecDeque<u8>>>,
+    total_produced: &Arc<AtomicU64>,
+    data: &[u8],
+) {
+    if let Ok(mut sb) = scrollback.lock() {
+        for &byte in data {
+            if sb.len() >= SCROLLBACK_CAPACITY {
+                sb.pop_front();
+            }
+            sb.push_back(byte);
+        }
+    }
+    total_produced.fetch_add(data.len() as u64, Ordering::Relaxed);
+}
+
 /// ANSI bracketed-paste begin marker.
 const BRACKETED_PASTE_BEGIN: &[u8] = b"\x1b[200~";
 /// ANSI bracketed-paste end marker.
@@ -342,16 +369,11 @@ impl TerminalSession {
                         Ok(n) => {
                             let data = interceptor.process(&reader_id, &buf[..n]);
 
-                            // Tee processed output into scrollback ring buffer
-                            if let Ok(mut sb) = reader_scrollback.lock() {
-                                for &byte in &data {
-                                    if sb.len() >= SCROLLBACK_CAPACITY {
-                                        sb.pop_front();
-                                    }
-                                    sb.push_back(byte);
-                                }
-                            }
-                            reader_total_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            // Tee processed output into the per-session
+                            // scrollback ring buffer + byte counter. Shared
+                            // with the distinct-buffers regression test so
+                            // both drive the identical teeing path.
+                            tee_into_scrollback(&reader_scrollback, &reader_total_bytes, &data);
 
                             // Tee through the VT parser into the per-session cell grid.
                             // Detect the first OSC 0/2 title transition by
@@ -1256,5 +1278,145 @@ mod tests {
         let session = make_test_session(buf);
         assert!(session.subscribe_first_osc_title().is_some());
         assert!(session.subscribe_first_osc_title().is_none());
+    }
+
+    /// Spawn a real `portable-pty` child that prints `marker`, drive a
+    /// reader loop that tees its output into `session`'s OWN scrollback +
+    /// byte-counter Arcs via the production [`tee_into_scrollback`] path,
+    /// and stop once the child has exited and its output is drained.
+    ///
+    /// This is the exact teeing the reader thread in
+    /// [`TerminalSession::spawn`] performs per read — only the Tauri event
+    /// emission (irrelevant to buffer state) is omitted, which is why the
+    /// test can run without an `AppHandle`.
+    fn drive_real_pty_into(session: &TerminalSession, marker: &str) {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+
+        // Cross-platform single-shot echo: `cmd /C echo MARKER` on Windows,
+        // `sh -c "echo MARKER"` elsewhere. Both exit immediately after
+        // printing, so the reader loop terminates on EOF.
+        let mut cmd = if cfg!(windows) {
+            let mut c = CommandBuilder::new("cmd");
+            c.arg("/C");
+            c.arg(format!("echo {}", marker));
+            c
+        } else {
+            let mut c = CommandBuilder::new("sh");
+            c.arg("-c");
+            c.arg(format!("echo {}", marker));
+            c
+        };
+        cmd.env("TERM", "xterm-256color");
+
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn echo child");
+        let mut reader = pair.master.try_clone_reader().expect("clone reader");
+        // Drop the slave handle so the master sees EOF after the child exits.
+        drop(pair.slave);
+
+        let scrollback = session.scrollback_buffer.clone();
+        let total = session.total_bytes_produced.clone();
+
+        // Read until EOF (child exited and pipe drained). A real PTY echo
+        // completes in well under a second; cap total read time defensively
+        // so a wedged CI box fails the poll-assert below rather than hangs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => tee_into_scrollback(&scrollback, &total, &buf[..n]),
+                // On Windows the PTY reader errors when the child exits;
+                // treat that as EOF, mirroring the production reader thread.
+                Err(_) => break,
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+        let _ = child.wait();
+        // Keep the master alive until here so the reader above had a live
+        // pipe; dropping it now releases the OS handle.
+        drop(pair.master);
+    }
+
+    /// REGRESSION (plan
+    /// `2026-06-06-gate-continuation-terminal-visibility-and-execution`):
+    /// a live observation showed `GET /terminals/{id}/buffer` returning
+    /// byte-identical stale content for two DIFFERENT terminals. The read
+    /// path proved sound and the defect did not reproduce, but no buffer
+    /// or route-handler test existed. This locks in the core invariant the
+    /// handler relies on: each session owns an independent scrollback
+    /// buffer, so two sessions running distinct commands read back distinct
+    /// content — never each other's, never byte-identical.
+    ///
+    /// Uses TWO real `portable-pty` children (cross-platform echo) feeding
+    /// the production [`tee_into_scrollback`] path into each session's own
+    /// Arcs, then asserts isolation through the real
+    /// [`TerminalSession::get_scrollback_buffer`].
+    #[test]
+    fn scrollback_buffers_are_per_session_distinct() {
+        const MARKER_A: &str = "QONTINUI_DISTINCT_MARKER_AAAAA";
+        const MARKER_B: &str = "QONTINUI_DISTINCT_MARKER_BBBBB";
+
+        let session_a = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let session_b = make_test_session(Arc::new(Mutex::new(Vec::new())));
+
+        // Confirm the two sessions hold DISTINCT buffer Arcs (the precise
+        // aliasing the live defect would represent). If these ever pointed
+        // at the same allocation, the assertions below would also fail —
+        // this is the cheap, direct guard.
+        assert!(
+            !Arc::ptr_eq(&session_a.scrollback_buffer, &session_b.scrollback_buffer),
+            "sessions must not share a scrollback buffer Arc"
+        );
+
+        drive_real_pty_into(&session_a, MARKER_A);
+        drive_real_pty_into(&session_b, MARKER_B);
+
+        let (buf_a, _) = session_a.get_scrollback_buffer();
+        let (buf_b, _) = session_b.get_scrollback_buffer();
+        let text_a = String::from_utf8_lossy(&buf_a);
+        let text_b = String::from_utf8_lossy(&buf_b);
+
+        // (a) A has its own marker and NOT B's.
+        assert!(
+            text_a.contains(MARKER_A),
+            "session A buffer missing MARKER_A; got {:?}",
+            text_a
+        );
+        assert!(
+            !text_a.contains(MARKER_B),
+            "session A buffer leaked MARKER_B; got {:?}",
+            text_a
+        );
+
+        // (b) B has its own marker and NOT A's.
+        assert!(
+            text_b.contains(MARKER_B),
+            "session B buffer missing MARKER_B; got {:?}",
+            text_b
+        );
+        assert!(
+            !text_b.contains(MARKER_A),
+            "session B buffer leaked MARKER_A; got {:?}",
+            text_b
+        );
+
+        // (c) The two buffers are not byte-identical — the exact stale-read
+        // symptom from the live observation.
+        assert_ne!(
+            buf_a, buf_b,
+            "two terminals returned byte-identical scrollback buffers"
+        );
     }
 }
