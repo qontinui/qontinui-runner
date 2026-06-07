@@ -562,6 +562,17 @@ pub fn create_router(
         vision_baselines: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
+    // Publish the capture-backend telemetry handles so the device-scoped 30s
+    // fleet heartbeat (`fleet::heartbeat_to_coord`, on its own OS thread spawned
+    // before this `ApiState` exists) can report them to coord.devices. Shares
+    // the live `Arc`s the capture path bumps — see plan
+    // 2026-06-07-fleet-capture-backend-telemetry.md work item 1.
+    crate::fleet::publish_capture_telemetry_handles(crate::fleet::CaptureTelemetryHandles {
+        capture_preview_count: api_state.vision_capture_preview_count.clone(),
+        monitor_crop_count: api_state.vision_monitor_crop_count.clone(),
+        last_fallback: api_state.vision_last_fallback.clone(),
+    });
+
     // Register api_state as Tauri-managed so `#[tauri::command]` functions taking
     // `State<'_, Arc<ApiState>>` can resolve it.
     app_handle.manage(api_state.clone());
@@ -772,6 +783,17 @@ pub fn create_router(
                 return;
             };
 
+            // The responding window echoes its own label (camelCase, mirroring
+            // the request envelope). Absent → "main": both the single-window
+            // default and any pre-window-aware frontend register/deliver under
+            // "main", so the key matches what the dispatcher stored.
+            let window_label = parsed
+                .get("windowLabel")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("main")
+                .to_string();
+
             let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             let result = parsed.get("result").cloned();
             let error = parsed
@@ -784,7 +806,7 @@ pub fn create_router(
             let store = evaluate_store.clone();
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move {
-                    let delivered = store.deliver(&request_id, response).await;
+                    let delivered = store.deliver(&window_label, &request_id, response).await;
                     if !delivered {
                         tracing::debug!(
                             "UI Bridge evaluate: response for unknown request_id {} (likely timed out)",

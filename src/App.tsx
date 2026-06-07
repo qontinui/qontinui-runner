@@ -17,7 +17,11 @@ import { ContextualTutorial } from "./components/tutorial";
 import { DemoVisualOverlay } from "./components/demo-video/DemoVisualOverlay";
 import { getGraphQLClient } from "./lib/graphql-client";
 
-import { UIBridgeProvider, AutoRegisterProvider, UIBridgeWindowProvider } from "@qontinui/ui-bridge";
+import {
+  UIBridgeProvider,
+  AutoRegisterProvider,
+  UIBridgeWindowProvider,
+} from "@qontinui/ui-bridge";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { setupEventHandlers, eventRouter } from "./managers";
@@ -69,6 +73,8 @@ import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
 import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
+import { TerminalSessionProvider } from "./components/terminal/contexts";
+import { WindowAssignmentsProvider } from "./components/terminal/contexts/WindowAssignmentsContext";
 import { Now1HzProvider } from "./components/terminal/useNow1Hz";
 import { ReorganizeDialog, type ReorganizePlan } from "./components/terminal/ReorganizeDialog";
 import { PerformanceOverlay, GiantSCCFixture } from "./components/dev";
@@ -334,11 +340,7 @@ function AppContent() {
     // `get_user_projects` invoke runs only after the access token is in
     // place. The retry-on-Not-authenticated inside `loadProjects` still
     // covers the rare keychain-write/read ordering blip.
-    if (
-      auth.authStatus?.authenticated &&
-      !auth.loading &&
-      !auth.devAutoLoginPending
-    ) {
+    if (auth.authStatus?.authenticated && !auth.loading && !auth.devAutoLoginPending) {
       projectSelection.loadProjects();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- loadProjects changes with selectedProjectId; including it would reload projects on every selection change
@@ -563,8 +565,8 @@ function AppContent() {
                     // own terminal tabs — the visible counterpart to the
                     // `open-terminal-window` UI Bridge action. New terminals
                     // created in that window belong to it (window_assignments).
-                    void invoke("open_terminal_window", { placement: null }).catch(
-                      (err) => console.error("Failed to open pop-out window:", err),
+                    void invoke("open_terminal_window", { placement: null }).catch((err) =>
+                      console.error("Failed to open pop-out window:", err),
                     );
                   }}
                 />
@@ -579,14 +581,39 @@ function AppContent() {
                   />
                 )}
                 <div className="flex-1 min-h-0">
-                  <TerminalPageProvider value={terminalPages.activePageId}>
-                    <TerminalPage
-                      key={terminalPages.activePageId}
+                  {/*
+                    Phase 3 (mount-hydration lift): the terminal session state
+                    provider is lifted ABOVE TerminalPage and made page-scoped
+                    INSIDE the provider (one always-mounted PageSessionScope per
+                    page) rather than remounted per page via `key`. Switching
+                    terminal pages no longer destroys any page's tab state, and
+                    every page's `terminal-created` listener stays live so an
+                    externally-created terminal (e.g. a docked gate
+                    continuation) is never dropped while the operator is on
+                    another page. WindowAssignmentsProvider sits above so
+                    tab-ownership filtering can read "which window owns which
+                    session" (a no-op in the single-window case).
+
+                    `TerminalPageProvider` still carries the ACTIVE page id to
+                    TerminalPage (== session.pageId) so the page's render logic
+                    is untouched; the `key={activePageId}` remount is gone.
+                  */}
+                  <WindowAssignmentsProvider>
+                    <TerminalSessionProvider
+                      pages={terminalPages.pages}
+                      activePageId={terminalPages.activePageId}
                       onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
                       onNavigateToActive={() => setActiveTab("active")}
-                      onSessionCountChange={setTerminalSessionCount}
-                    />
-                  </TerminalPageProvider>
+                    >
+                      <TerminalPageProvider value={terminalPages.activePageId}>
+                        <TerminalPage
+                          onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
+                          onNavigateToActive={() => setActiveTab("active")}
+                          onSessionCountChange={setTerminalSessionCount}
+                        />
+                      </TerminalPageProvider>
+                    </TerminalSessionProvider>
+                  </WindowAssignmentsProvider>
                 </div>
               </div>
             </main>
@@ -888,7 +915,7 @@ export default function App() {
         features={{ renderLog: true, control: true, debug: true }}
         browserCaptureConfig={{
           console: true,
-          consoleLevels: ['error', 'warn', 'debug', 'info', 'log'],
+          consoleLevels: ["error", "warn", "debug", "info", "log"],
         }}
       >
         <UIBridgeEventHandler />
@@ -923,15 +950,15 @@ export default function App() {
           identical to before; pop-out windows (Phase 1) supply "term-N".
         */}
         <UIBridgeWindowProvider windowLabel={getCurrentWindow().label}>
-        <AutoRegisterProvider
-          enabled
-          idStrategy="prefer-existing"
-          debounceMs={100}
-          excludeSelectors={["[data-no-register]"]}
-          contentDiscovery={{ enabled: true, maxContentElements: 200 }}
-        >
-          <AuthProvider>
-            {/*
+          <AutoRegisterProvider
+            enabled
+            idStrategy="prefer-existing"
+            debounceMs={100}
+            excludeSelectors={["[data-no-register]"]}
+            contentDiscovery={{ enabled: true, maxContentElements: 200 }}
+          >
+            <AuthProvider>
+              {/*
               Plan 2026-05-22-coord-native-session-coordination §D12 + §Phase 4.
               TenantProvider wraps SessionProvider per plan: the active tenant
               is the default stamp for new sessions started via SessionContext.
@@ -939,25 +966,25 @@ export default function App() {
               future auth state (paired_user.json reads happen at the Rust
               layer; placement here is for symmetry with NavigationProvider).
             */}
-            <TenantProvider>
-              <SessionProvider>
-                <NavigationProvider>
-                  <EventManagerProvider>
-                    <ExecutionProvider
-                      onLog={(_level, _message) => {
-                        // Logs are handled by LogManager through event handlers
-                      }}
-                    >
-                      <AutoContinueProvider>
-                        <AppWithTutorials />
-                      </AutoContinueProvider>
-                    </ExecutionProvider>
-                  </EventManagerProvider>
-                </NavigationProvider>
-              </SessionProvider>
-            </TenantProvider>
-          </AuthProvider>
-        </AutoRegisterProvider>
+              <TenantProvider>
+                <SessionProvider>
+                  <NavigationProvider>
+                    <EventManagerProvider>
+                      <ExecutionProvider
+                        onLog={(_level, _message) => {
+                          // Logs are handled by LogManager through event handlers
+                        }}
+                      >
+                        <AutoContinueProvider>
+                          <AppWithTutorials />
+                        </AutoContinueProvider>
+                      </ExecutionProvider>
+                    </EventManagerProvider>
+                  </NavigationProvider>
+                </SessionProvider>
+              </TenantProvider>
+            </AuthProvider>
+          </AutoRegisterProvider>
         </UIBridgeWindowProvider>
       </UIBridgeProvider>
     </ApolloProvider>

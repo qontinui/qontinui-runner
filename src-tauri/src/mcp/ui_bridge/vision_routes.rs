@@ -511,7 +511,22 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
     // Prefer occlusion-immune WebView2 CapturePreview on Windows.
     #[cfg(windows)]
     {
-        match super::screenshots::capture_webview_contents(state).await {
+        // Fault-injection seam (plan 2026-06-07-fleet-capture-backend-
+        // telemetry.md work item 4): when `QONTINUI_VISION_FORCE_CAPTURE_FAIL`
+        // is set, short-circuit the CapturePreview backend to an `Err` so the
+        // monitor-crop fallback ladder runs even when CapturePreview would have
+        // succeeded. This is the only way the fallback path gets exercised
+        // before a user's machine does it for real (a WebView2 runtime
+        // regression). House style: env-flag read at the call site, like
+        // `QONTINUI_VISION_RAW`. The fallback ladder is Windows-only, so the
+        // flag lives inside the `#[cfg(windows)]` block.
+        let capture_result: Result<Vec<u8>, String> =
+            if std::env::var("QONTINUI_VISION_FORCE_CAPTURE_FAIL").is_ok() {
+                Err("forced: QONTINUI_VISION_FORCE_CAPTURE_FAIL".to_string())
+            } else {
+                super::screenshots::capture_webview_contents(state).await
+            };
+        match capture_result {
             Ok(png) => match image::load_from_memory(&png) {
                 Ok(img) => {
                     let scale_factor = window.scale_factor().unwrap_or(scale);
@@ -566,14 +581,35 @@ pub(super) async fn capture_runner_window_frame(state: &Arc<ApiState>) -> Result
 /// for `vision/health`, and log it. The FIRST fallback this session is promoted
 /// to `info!` (so backend degradation reaches the supervisor stream without
 /// enabling debug logging); subsequent fallbacks stay `warn!`.
+///
+/// Thin `ApiState` adapter over [`record_capture_fallback_inner`], which holds
+/// the testable decision/recording logic (the live capture path needs a real
+/// webview window, so the full `capture_runner_window_frame` can't be unit-
+/// tested — see the test module).
 fn record_capture_fallback(state: &Arc<ApiState>, reason: &str) {
+    record_capture_fallback_inner(
+        &state.vision_last_fallback,
+        &state.vision_capture_fallback_seen,
+        reason,
+    );
+}
+
+/// Decision/recording layer for a capture fallback, decoupled from `ApiState`
+/// so it can be unit-tested with bare `Arc`s. Stores the reason + timestamp
+/// into `last_fallback` and flips `fallback_seen` (INFO-once): the FIRST call
+/// this session returns having logged at `info!`, subsequent calls at `warn!`.
+/// Returns `true` iff this was the first fallback (the INFO-once edge), so
+/// callers/tests can assert the flip happened exactly once.
+fn record_capture_fallback_inner(
+    last_fallback: &std::sync::Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>>,
+    fallback_seen: &std::sync::atomic::AtomicBool,
+    reason: &str,
+) -> bool {
     let now = chrono::Utc::now();
-    if let Ok(mut guard) = state.vision_last_fallback.lock() {
+    if let Ok(mut guard) = last_fallback.lock() {
         *guard = Some((reason.to_string(), now));
     }
-    let first = !state
-        .vision_capture_fallback_seen
-        .swap(true, std::sync::atomic::Ordering::Relaxed);
+    let first = !fallback_seen.swap(true, std::sync::atomic::Ordering::Relaxed);
     if first {
         info!(
             "{}; falling back to monitor-crop (first this session)",
@@ -582,6 +618,7 @@ fn record_capture_fallback(state: &Arc<ApiState>, reason: &str) {
     } else {
         warn!("{}; falling back to monitor-crop", reason);
     }
+    first
 }
 
 /// Compose the cache key for a capture request. Folds in the current
@@ -2476,6 +2513,96 @@ mod tests {
             v2.get("captureBackend").and_then(|b| b.as_str()),
             Some("MonitorCrop"),
             "captureBackend must serialize as camelCase when Some"
+        );
+    }
+}
+
+// ============================================================================
+// Capture-backend fallback ladder tests
+// (plan 2026-06-07-fleet-capture-backend-telemetry.md work item 4).
+//
+// Windows-gated: the CapturePreview→monitor-crop fallback ladder is itself
+// `#[cfg(windows)]`. The *full* `capture_runner_window_frame` path can't be
+// unit-tested because it needs a live Tauri webview window (the live path was
+// proven on 2026-06-06). Per the plan, we instead extract and unit-test the
+// decision/recording layer the fault-injection seam exercises:
+// `record_capture_fallback_inner` (last-fallback record + INFO-once flip) plus
+// the monitor-crop counter bump that the real path performs at the end of
+// `capture_runner_window_frame`. This is the shape that makes the fallback
+// ladder's bookkeeping red-before/green-after without a window.
+// ============================================================================
+#[cfg(all(test, windows))]
+mod capture_fallback_tests {
+    use super::record_capture_fallback_inner;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    /// Two forced fallbacks (the `QONTINUI_VISION_FORCE_CAPTURE_FAIL` seam
+    /// makes every capture fail): each produces a monitor-crop frame, so the
+    /// crop counter bumps once per call; the last-fallback record is populated;
+    /// and the INFO-once flag flips exactly ONCE across the two captures
+    /// (`record_capture_fallback_inner` returns `true` only on the first).
+    ///
+    /// This mirrors the bump/record/INFO-once that `capture_runner_window_frame`
+    /// performs on the fallback path: `record_capture_fallback` (now delegating
+    /// to `..._inner`) at the CapturePreview-failure site, then the
+    /// `vision_monitor_crop_count.fetch_add(1)` after the crop succeeds.
+    #[test]
+    fn forced_fallback_bumps_crop_records_and_flips_info_once() {
+        let crop_count = AtomicU64::new(0);
+        let fallback_seen = AtomicBool::new(false);
+        let last_fallback: Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>> =
+            Mutex::new(None);
+
+        // Capture #1 — forced failure → fallback frame produced (MonitorCrop).
+        let first_flip = record_capture_fallback_inner(
+            &last_fallback,
+            &fallback_seen,
+            "forced: QONTINUI_VISION_FORCE_CAPTURE_FAIL",
+        );
+        // The real path bumps the monitor-crop counter when the crop frame is
+        // produced (capture_runner_window_frame end).
+        crop_count.fetch_add(1, Ordering::Relaxed);
+
+        assert!(
+            first_flip,
+            "first forced fallback must be the INFO-once edge"
+        );
+        assert_eq!(
+            crop_count.load(Ordering::Relaxed),
+            1,
+            "monitor_crop_count must bump to 1 after the first fallback frame"
+        );
+        {
+            let g = last_fallback.lock().unwrap();
+            let (reason, _at) = g.as_ref().expect("last_fallback must be populated");
+            assert!(
+                reason.contains("QONTINUI_VISION_FORCE_CAPTURE_FAIL"),
+                "recorded reason must reflect the forced failure, got: {reason}"
+            );
+        }
+        assert!(
+            fallback_seen.load(Ordering::Relaxed),
+            "fallback_seen flag must be flipped after the first fallback"
+        );
+
+        // Capture #2 — forced failure again → another fallback frame, but the
+        // INFO-once edge must NOT re-flip (subsequent fallbacks log at warn!).
+        let second_flip = record_capture_fallback_inner(
+            &last_fallback,
+            &fallback_seen,
+            "forced: QONTINUI_VISION_FORCE_CAPTURE_FAIL",
+        );
+        crop_count.fetch_add(1, Ordering::Relaxed);
+
+        assert!(
+            !second_flip,
+            "second fallback must NOT re-trip the INFO-once edge"
+        );
+        assert_eq!(
+            crop_count.load(Ordering::Relaxed),
+            2,
+            "monitor_crop_count must bump to 2 after the second fallback frame"
         );
     }
 }

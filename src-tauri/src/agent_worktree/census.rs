@@ -262,7 +262,11 @@ fn resolve_tenant_id() -> Option<Uuid> {
 /// The parent dir under which the runner's canonical checkouts +
 /// sibling worktrees live. `QONTINUI_ROOT` env → `D:/qontinui-root`
 /// (Windows) → `$HOME/qontinui-root`. Mirrors `fleet::qontinui_root`.
-fn qontinui_root() -> Option<PathBuf> {
+///
+/// `pub(crate)` so the Phase 5 fs_backstop poller enumerates governed
+/// canonical checkouts under the SAME workspace root (env → Windows default →
+/// `$HOME`) the census walks — no second root-resolution to drift from.
+pub(crate) fn qontinui_root() -> Option<PathBuf> {
     if let Ok(s) = std::env::var("QONTINUI_ROOT") {
         let p = PathBuf::from(s);
         if p.is_dir() {
@@ -473,7 +477,7 @@ fn normalize_path_str(path: &Path) -> String {
 /// mis-treated as a repo root and re-listing a shared worktree under a phantom
 /// repo (which the coord `DISTINCT ON (device, repo, path)` read then keeps as a
 /// duplicate row).
-fn is_canonical_repo_dir(name: &str) -> bool {
+pub(crate) fn is_canonical_repo_dir(name: &str) -> bool {
     name.starts_with("qontinui-") && !name.contains("-wt-") && !name.ends_with("-wt")
 }
 
@@ -621,7 +625,7 @@ fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
 /// Ξ_Worktree P7.3 — current branch of the canonical checkout
 /// (`git symbolic-ref --short HEAD`). `None` on detached HEAD (the command
 /// errors), an empty result, or any git failure.
-fn compute_canonical_branch(canonical: &Path) -> Option<String> {
+pub(crate) fn compute_canonical_branch(canonical: &Path) -> Option<String> {
     git_capture(canonical, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty())
 }
 
@@ -630,7 +634,7 @@ fn compute_canonical_branch(canonical: &Path) -> Option<String> {
 /// uncommitted changes, `Some(false)` when clean, `None` on a git failure
 /// (fail-OPEN to `None` is fine: coord reads `None` as unsafe). This is the
 /// P1-clean precondition input for SharedBranch.
-fn compute_canonical_is_dirty(canonical: &Path) -> Option<bool> {
+pub(crate) fn compute_canonical_is_dirty(canonical: &Path) -> Option<bool> {
     git_capture(canonical, &["status", "--porcelain"]).map(|s| !s.trim().is_empty())
 }
 

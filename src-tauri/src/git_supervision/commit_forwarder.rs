@@ -165,7 +165,15 @@ async fn post_commit_observation(coord_http_base: &str, body: &CommitObservation
             return;
         }
     };
-    match client.post(&url).json(body).send().await {
+    // Attach the device-JWT bearer when one is available (never fatal —
+    // unpaired / empty keychain collapses to the anonymous send coord accepts
+    // today). Same write-path attach the Ξ_FS observer uses on its push, and it
+    // feeds the data-plane auth-coverage metric. Must be `crate::auth`, not
+    // `qontinui_runner_lib::auth` — this module compiles into the bin target,
+    // and the lib path would bump the lib crate's separate counter statics,
+    // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
+    let req = crate::auth::attach_device_auth(client.post(&url));
+    match req.json(body).send().await {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {

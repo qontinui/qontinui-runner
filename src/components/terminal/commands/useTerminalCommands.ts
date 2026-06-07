@@ -36,7 +36,12 @@
 
 import { instanceStorage } from "@/lib/instance-storage";
 
-import { useTerminalSession, useTransitionEffects, useUIStateCx, useZoneMetadata } from "../contexts";
+import {
+  useTerminalSession,
+  useTransitionEffects,
+  useUIStateCx,
+  useZoneMetadata,
+} from "../contexts";
 import type { AccountUsageInfo } from "../useSessionManager";
 import { compareByUsageHeadroom } from "../../settings/types";
 import type { ResultCardSpec } from "../result-card";
@@ -65,11 +70,7 @@ export interface TerminalCommandsContext {
    * closure at `TerminalPage.tsx:559` (passed down as `onLaunchAiSession`
    * to `TerminalTabBar`).
    */
-  spawnAi: (
-    count: number,
-    configDir: string,
-    context?: string,
-  ) => Promise<string[] | void>;
+  spawnAi: (count: number, configDir: string, context?: string) => Promise<string[] | void>;
   /**
    * Snapshot of the available Claude Code accounts, in the original
    * `useSessionManager` shape (NOT sorted). Handlers sort locally when
@@ -120,7 +121,7 @@ const SCHEMA = {
     count: "number (>= 1, defaults to 1)",
     account:
       'string — either a Claude account label (e.g. "gmail", "hotmail") or the literal "best" to pick the lowest-utilization account',
-    context: 'string (optional initial prompt auto-typed after `claude` starts)',
+    context: "string (optional initial prompt auto-typed after `claude` starts)",
   },
   spawnWith: {
     count: "number (>= 1, defaults to 1)",
@@ -152,10 +153,7 @@ function fail(code: string, message?: string): CommandResult<never> {
  * number or the words `next` / `prev` / `needs-input`. Returns `null` when
  * the args don't carry a usable target.
  */
-function readZoneArg(
-  args: Record<string, unknown>,
-  field: string = "zone",
-): number | null {
+function readZoneArg(args: Record<string, unknown>, field: string = "zone"): number | null {
   const v = args[field];
   if (typeof v === "number" && Number.isFinite(v)) return Math.floor(v);
   if (typeof v === "string") {
@@ -295,7 +293,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     aliases: ["/spawn-best"],
     label: "Spawn AI session",
     description:
-      "Spawn N Claude CLI sessions in a specific account. account=\"best\" picks the " +
+      'Spawn N Claude CLI sessions in a specific account. account="best" picks the ' +
       "lowest-utilization account. context (optional) is typed after `claude` starts.",
     paramSchema: SCHEMA.spawnAi,
     // Tier-2 patterns:
@@ -372,10 +370,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       "Toggle maximize for the given zone (1-based), or the currently focused zone " +
       "when no argument is provided. Calling on the already-maximized zone restores.",
     paramSchema: SCHEMA.maximize,
-    patterns: [
-      /^maximize(?:\s+(?<zone>\d+))?$/i,
-      /^fullscreen(?:\s+(?<zone>\d+))?$/i,
-    ],
+    patterns: [/^maximize(?:\s+(?<zone>\d+))?$/i, /^fullscreen(?:\s+(?<zone>\d+))?$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
       const idx = resolveZoneIdx(args);
       if (idx === null) return fail("out-of-range");
@@ -433,11 +428,11 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
       const preset = typeof args.preset === "string" ? args.preset.toLowerCase() : "";
       // Normalize "six-pack" / "sixpack" → "six-pack"; same for full-grid.
-      const normalized = preset
-        .replace(/sixpack/, "six-pack")
-        .replace(/fullgrid/, "full-grid");
+      const normalized = preset.replace(/sixpack/, "six-pack").replace(/fullgrid/, "full-grid");
       if (!normalized) return fail("invalid-preset");
-      zoneLayout.setLayoutId(normalized);
+      // `/layout <preset>` is an explicit operator choice — pin it so auto-grow
+      // stops overriding it.
+      zoneLayout.setLayoutId(normalized, { pinned: true });
       return ok();
     },
   });
@@ -462,7 +457,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       const idx = resolveZoneIdx(args);
       if (idx === null) return fail("out-of-range");
       const tabId = zoneLayout.assignments[idx];
-      const state = tabId ? sessionStates[tabId] ?? "idle" : "idle";
+      const state = tabId ? (sessionStates[tabId] ?? "idle") : "idle";
       if (state !== "completed" && state !== "error") {
         return fail("not-restartable", `session state is ${state}`);
       }
@@ -817,9 +812,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
     paramSchema: {
       state: 'string — one of "idle", "working", "needs-input", "completed", "error"',
     },
-    patterns: [
-      /^select(?:-by-state)?\s+(?<state>idle|working|needs[-_ ]?input|completed|error)$/i,
-    ],
+    patterns: [/^select(?:-by-state)?\s+(?<state>idle|working|needs[-_ ]?input|completed|error)$/i],
     handler: async (args: Record<string, unknown>): Promise<CommandResult> => {
       const raw = typeof args.state === "string" ? args.state.toLowerCase() : "";
       const state = /^needs[-_ ]?input$/.test(raw) ? "needs-input" : raw;

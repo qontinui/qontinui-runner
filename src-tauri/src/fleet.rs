@@ -547,6 +547,72 @@ pub async fn publish_on_startup(pg: &Arc<PgDb>, role: MachineRole) {
 // to match `register_with_coord` in `bin/qontinui_profile.rs`.
 // =============================================================================
 
+// =============================================================================
+// Capture-backend telemetry bridge (plan 2026-06-07-fleet-capture-backend-
+// telemetry.md, work item 1).
+//
+// The capture-backend counters live on `ApiState`
+// (`vision_capture_preview_count` / `vision_monitor_crop_count` /
+// `vision_last_fallback`, `mcp/types.rs:282/285/292`), constructed in
+// `mcp_api::start_server` deep inside the Tauri setup. The 30s device
+// heartbeat (`heartbeat_to_coord`) is a free fn on its own dedicated OS
+// thread (`main.rs`), spawned BEFORE `ApiState` exists — so it can't hold
+// an `Arc<ApiState>`. Mirror the `CLAUDE_PROBE_CACHE` static pattern: publish
+// clones of just the three telemetry handles into a process-global `OnceLock`
+// when `ApiState` is built; the heartbeat reads them per-tick. Clones of
+// `Arc<Atomic*>`/`Arc<Mutex<_>>` share the live counters the capture path
+// bumps, so the heartbeat always reports the current cumulative values.
+// =============================================================================
+
+/// Process-global clones of the capture-backend telemetry handles, published
+/// by [`publish_capture_telemetry_handles`] when `ApiState` is constructed.
+/// `None` until then (e.g. early boot, or unit tests that never build the MCP
+/// state) — the heartbeat then reports zero/absent, which is the honest
+/// "no captures observed" value.
+static CAPTURE_TELEMETRY: std::sync::OnceLock<CaptureTelemetryHandles> = std::sync::OnceLock::new();
+
+/// Read-only clones of the three `ApiState` capture-backend telemetry handles
+/// the device heartbeat reports. Shares the live `Arc`s the capture path bumps.
+#[derive(Clone)]
+pub struct CaptureTelemetryHandles {
+    /// Cumulative WebView2 CapturePreview frames since process start.
+    pub capture_preview_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Cumulative monitor-crop fallback frames since process start.
+    pub monitor_crop_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Reason + timestamp of the most recent fallback this session, or `None`.
+    pub last_fallback: Arc<std::sync::Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>>>,
+}
+
+/// Publish the capture-backend telemetry handles for the device heartbeat to
+/// read. Called once from `ApiState` construction (`mcp_api::start_server`).
+/// Idempotent: a second call (e.g. a re-init) is silently ignored — the first
+/// set of live handles wins, which is correct since `ApiState` is built once.
+pub fn publish_capture_telemetry_handles(handles: CaptureTelemetryHandles) {
+    let _ = CAPTURE_TELEMETRY.set(handles);
+}
+
+/// Snapshot the current capture-backend telemetry for one heartbeat tick.
+/// Returns `(preview_count, crop_count, last_fallback_at)`; all zero/`None`
+/// before `ApiState` publishes its handles. `last_fallback_at` is the RFC3339
+/// timestamp of the most recent fallback (the reason string stays runner-local
+/// — only the timestamp rides the wire, per the privacy posture: no content).
+fn capture_telemetry_snapshot() -> (u64, u64, Option<chrono::DateTime<chrono::Utc>>) {
+    use std::sync::atomic::Ordering;
+    match CAPTURE_TELEMETRY.get() {
+        Some(h) => {
+            let preview = h.capture_preview_count.load(Ordering::Relaxed);
+            let crop = h.monitor_crop_count.load(Ordering::Relaxed);
+            let last = h
+                .last_fallback
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|(_, at)| *at));
+            (preview, crop, last)
+        }
+        None => (0, 0, None),
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct HeartbeatPayload {
     device_id: uuid::Uuid,
@@ -567,6 +633,25 @@ struct HeartbeatPayload {
     /// heartbeat is skipped rather than 400-spamming coord.
     /// Phase 2 of the default-tenant-propagation plan.
     tenant_id: uuid::Uuid,
+    /// Capture-backend telemetry (plan 2026-06-07-fleet-capture-backend-
+    /// telemetry.md D1) — cumulative WebView2 CapturePreview frames served
+    /// since this process started. Straight-write coord-side into
+    /// `coord.devices.capture_preview_count`. Always serialized (even 0) so a
+    /// device with zero captures still reports an honest baseline; coord
+    /// ingest tolerates absence via COALESCE so legacy/older coord ignores it.
+    capture_preview_count: u64,
+    /// Cumulative monitor-crop fallback frames since process start. Coord-side
+    /// `coord.devices.monitor_crop_count`. A nonzero value here is the fleet's
+    /// "this device is silently on the fallback" signal.
+    monitor_crop_count: u64,
+    /// RFC3339 timestamp of the most recent CapturePreview→monitor-crop
+    /// fallback this session, or absent if none yet. Straight-write coord-side
+    /// into `coord.devices.last_capture_fallback_at` when present, COALESCE
+    /// (preserve) when absent — so a runner restart with no fresh fallback
+    /// doesn't erase the last observed one. Reason string is deliberately NOT
+    /// sent (privacy: timestamp only, no content).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_capture_fallback_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Suppress serializing the field when it's the default. Keeps the
@@ -630,11 +715,17 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
 
     let claude_code_available = claude_code_probe();
 
+    let (capture_preview_count, monitor_crop_count, last_capture_fallback_at) =
+        capture_telemetry_snapshot();
+
     let payload = HeartbeatPayload {
         device_id,
         hostname: device.hostname.clone(),
         claude_code_available,
         tenant_id,
+        capture_preview_count,
+        monitor_crop_count,
+        last_capture_fallback_at,
     };
     let url = format!("{base}/coord/devices/register");
 
@@ -2051,6 +2142,9 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: false,
             tenant_id: uuid::Uuid::nil(),
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -2066,6 +2160,9 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: true,
             tenant_id: uuid::Uuid::nil(),
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -2087,6 +2184,9 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: true,
             tenant_id: tenant,
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -2106,12 +2206,81 @@ mod tests {
             hostname: "test".into(),
             claude_code_available: true,
             tenant_id: uuid::Uuid::nil(),
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
             body.get("claude_code_available").and_then(|v| v.as_bool()),
             Some(true),
             "claude_code_available must remain on the heartbeat wire (PR #216 shape)"
+        );
+    }
+
+    /// Capture-backend telemetry (plan 2026-06-07-fleet-capture-backend-
+    /// telemetry.md D1): the two counters always serialize (even at 0, the
+    /// honest "no captures yet" baseline) so coord can straight-write them;
+    /// `last_capture_fallback_at` is omitted when `None` (skip_serializing_if)
+    /// so coord COALESCE-preserves the last observed fallback. Coord ingest
+    /// tolerates absent fields via COALESCE for legacy compatibility.
+    #[test]
+    fn heartbeat_payload_serializes_capture_backend_counters() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-06-07T12:34:56Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let p = HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
+            capture_preview_count: 7,
+            monitor_crop_count: 3,
+            last_capture_fallback_at: Some(at),
+        };
+        let body = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            body.get("capture_preview_count").and_then(|v| v.as_u64()),
+            Some(7),
+            "capture_preview_count must ride the heartbeat wire"
+        );
+        assert_eq!(
+            body.get("monitor_crop_count").and_then(|v| v.as_u64()),
+            Some(3),
+            "monitor_crop_count must ride the heartbeat wire"
+        );
+        assert!(
+            body.get("last_capture_fallback_at")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "last_capture_fallback_at must serialize when present"
+        );
+
+        // Absent fallback timestamp is omitted (COALESCE-preserve coord-side);
+        // counters still present at 0.
+        let p0 = HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
+        };
+        let body0 = serde_json::to_value(&p0).unwrap();
+        assert!(
+            body0.get("last_capture_fallback_at").is_none(),
+            "absent last_capture_fallback_at must be omitted from the wire"
+        );
+        assert_eq!(
+            body0.get("capture_preview_count").and_then(|v| v.as_u64()),
+            Some(0),
+            "capture_preview_count must serialize even at 0 (honest baseline)"
+        );
+        assert_eq!(
+            body0.get("monitor_crop_count").and_then(|v| v.as_u64()),
+            Some(0),
+            "monitor_crop_count must serialize even at 0 (honest baseline)"
         );
     }
 

@@ -110,7 +110,11 @@ pub(crate) fn pending_key(window_label: &str, request_id: &str) -> String {
 /// broadcast, minus the cross-window noise. Set `QONTINUI_UI_BRIDGE_MULTI_WINDOW=0`
 /// (or `false`/`off`) to revert to unconditional broadcast. Read per-call so it can
 /// be toggled without a restart.
-fn multi_window_dispatch_enabled() -> bool {
+///
+/// `pub(crate)` so the tagged `page/evaluate` dispatcher (which owns its own
+/// event pair and store rather than funneling through `ui_bridge_request_inner`)
+/// can honor the same flag.
+pub(crate) fn multi_window_dispatch_enabled() -> bool {
     std::env::var("QONTINUI_UI_BRIDGE_MULTI_WINDOW")
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
         .unwrap_or(true)

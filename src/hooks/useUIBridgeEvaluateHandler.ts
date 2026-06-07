@@ -41,6 +41,7 @@
 
 import { useEffect } from "react";
 import { emit, type Event } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
 import { awaitWithTimeout, PAGE_EVALUATE_PROMISE_TIMEOUT_MS } from "./ui-bridge-events/utils";
@@ -68,6 +69,17 @@ interface EvaluateRequestPayload {
    * branch in usePageEvents.ts::page_evaluate.
    */
   allow_network_requests?: boolean;
+  /**
+   * Multi-window addressing — the target window's Tauri label. The Rust
+   * `tagged_page_evaluate` dispatcher stamps it on every request so a
+   * `page/evaluate` runs the expression in ONE window only (it used to
+   * broadcast to every window, firing the eval N times). A window ignores
+   * any request whose `windowLabel` differs from its own
+   * `getCurrentWindow().label`. Absent / "main" → the primary window
+   * processes it (single-window default, behavior unchanged). Mirrors the
+   * own-label filter in `useUIBridgeEventHandler.ts`.
+   */
+  windowLabel?: string;
 }
 
 interface EvaluateResponsePayload {
@@ -75,6 +87,13 @@ interface EvaluateResponsePayload {
   ok: boolean;
   result?: unknown;
   error?: string;
+  /**
+   * This window's own label, echoed so the Rust `EvaluateRequestStore`
+   * delivers the response under the same `(windowLabel, requestId)` key the
+   * request was registered with. Defaulting an omitted label to "main" on
+   * the Rust side keeps single-window callers backward-compatible.
+   */
+  windowLabel?: string;
 }
 
 /**
@@ -177,6 +196,22 @@ export async function handleEvaluateRequest(
 ): Promise<boolean> {
   const { request_id, expression, unwrap, allow_network_requests } = payload;
 
+  // Multi-window addressing — the load-bearing scoping mechanism. The Rust
+  // dispatcher targets a window via `emit_to(EventTarget::labeled(target), …)`,
+  // BUT the frontend subscribes through the process-global `listen()`
+  // (`EventTarget::Any`), which receives `emit_to`-targeted events in EVERY
+  // window. So without this own-label filter a single-consumer `page/evaluate`
+  // fans out — the expression runs once per open window. Ignore any request not
+  // addressed to THIS window. Checked BEFORE the dedupe claim so a non-target
+  // window doesn't consume the per-window dedupe slot. Absent label (legacy /
+  // single-window) → every window processes it, preserving old behavior.
+  // Short-circuit so `getCurrentWindow()` (Tauri runtime only) is invoked
+  // ONLY when a target label is present — keeps `handleEvaluateRequest` unit-
+  // testable in jsdom (the single-window default path never touches Tauri).
+  if (payload.windowLabel && payload.windowLabel !== getCurrentWindow().label) {
+    return false;
+  }
+
   if (!request_id) {
     // Without a request_id we can't route the response back. Drop the call
     // entirely — the Rust side will observe a timeout.
@@ -246,6 +281,16 @@ export async function handleEvaluateRequest(
       log.debug(`evaluate(${request_id}) threw:`, message);
       response = { request_id, ok: false, error: message };
     }
+  }
+
+  // When the request was addressed to a specific window, echo that label so the
+  // Rust dispatcher delivers the response under the same (windowLabel, requestId)
+  // key the request was registered with. The own-label filter above guarantees
+  // `payload.windowLabel` is THIS window's label, so echoing it verbatim routes
+  // the reply correctly. The single-window default (no label) leaves the response
+  // shape untouched — the Rust side defaults the key's window to "main".
+  if (payload.windowLabel) {
+    response = { ...response, windowLabel: payload.windowLabel };
   }
 
   try {

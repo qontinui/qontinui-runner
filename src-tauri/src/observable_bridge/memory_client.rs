@@ -80,9 +80,7 @@ pub async fn list(
     let resp = client
         .get(&url)
         .header(TENANT_HEADER, tenant_id.to_string())
-        // bearer_auth deferred: coord anonymous-pilot posture doesn't
-        // validate JWT; re-enable when Phase 7 SSO lands.
-        // .bearer_auth(device_token)
+        .bearer_auth(device_token)
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -110,9 +108,7 @@ pub async fn get(
     let resp = client
         .get(&url)
         .header(TENANT_HEADER, tenant_id.to_string())
-        // bearer_auth deferred: coord anonymous-pilot posture doesn't
-        // validate JWT; re-enable when Phase 7 SSO lands.
-        // .bearer_auth(device_token)
+        .bearer_auth(device_token)
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -140,9 +136,7 @@ pub async fn upsert(
     let resp = client
         .post(&url)
         .header(TENANT_HEADER, tenant_id.to_string())
-        // bearer_auth deferred: coord anonymous-pilot posture doesn't
-        // validate JWT; re-enable when Phase 7 SSO lands.
-        // .bearer_auth(device_token)
+        .bearer_auth(device_token)
         .json(req)
         .send()
         .await
@@ -171,9 +165,7 @@ pub async fn post_federation_report(
     let resp = client
         .post(&url)
         .header(TENANT_HEADER, tenant_id.to_string())
-        // bearer_auth deferred: coord anonymous-pilot posture doesn't
-        // validate JWT; re-enable when Phase 7 SSO lands.
-        // .bearer_auth(device_token)
+        .bearer_auth(device_token)
         .json(body)
         .send()
         .await
@@ -201,9 +193,7 @@ pub async fn delete(
     let resp = client
         .delete(&url)
         .header(TENANT_HEADER, tenant_id.to_string())
-        // bearer_auth deferred: coord anonymous-pilot posture doesn't
-        // validate JWT; re-enable when Phase 7 SSO lands.
-        // .bearer_auth(device_token)
+        .bearer_auth(device_token)
         .send()
         .await
         .with_context(|| format!("DELETE {url}"))?;

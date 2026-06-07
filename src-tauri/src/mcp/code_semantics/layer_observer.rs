@@ -12,13 +12,19 @@
 //! ([`super::module_graph::cross_module_edges`], UNCAPPED — it must NOT use the
 //! prompt-budget-capped `internal_deps`).
 //!
-//! **Advisory, never gate-worthy** — like its siblings the envelope is always
-//! `kernel:true`, `posterior<1`, `credibility=(causal:medium, authorial:low,
-//! boundary:low)`. There is NO permit/deny/decision/gate code path in this file:
-//! the labels are a model hint, so a "breach" is a drift *signal*, never a verdict.
-//! coord receives the kernel envelope and a top-level `drift_class` wire token
-//! (`none` / `in_place` / `divergent` / `unknown`) and decides what (if anything)
-//! to do with it.
+//! **Two paths, gated by the declared side (the credibility rule made concrete):**
+//! - **4a — no manifest (advisory):** labels come from the `Ξ_Arch` kernel (a model
+//!   hint), so the envelope is `kernel:true`, `credibility=(medium,low,low)`, and
+//!   carries NO gate recommendation — a "breach" is a drift *signal*, never a verdict.
+//! - **4b — `<repo>/qontinui-layers.toml` present (gate-grade):** labels come from
+//!   the AUTHORED manifest (the spec), so breach detection is deterministic over the
+//!   resolved graph. The envelope is `kernel:false` with the resolver's credibility
+//!   `(high,high,medium)` and a `gate` recommendation (`block`/`escalate`/`allow`).
+//!   The manifest's `exempt` modules are excluded from Φ AND cycles; `[carve_out]`
+//!   edges and the `[order]` override are honored.
+//!
+//! Both paths emit the coord wire token `drift_class` (`none`/`in_place`/`divergent`/
+//! `unknown`); coord decides what to do with it (advisory hint vs. gated block).
 //!
 //! **Coverage is honest about unknowns.** An edge whose endpoint has no label (the
 //! module wasn't classified / was capped out) or a label of `"unknown"` is *carved
@@ -37,6 +43,7 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::layer_manifest::LayerManifest;
 use super::module_graph::{self, ModuleSummary};
 use super::{arch_classify, code_graph_api, scope_project_dir, Envelope};
 use crate::mcp::types::ApiState;
@@ -86,6 +93,10 @@ async fn layer_drift(
         .unwrap_or(module_graph::DEFAULT_MAX_MODULES)
         .clamp(1, 200);
 
+    // Phase 4b: load the AUTHORED declared side, if the repo ships one. Read it
+    // before `build_layer_inputs` consumes `project_dir`.
+    let manifest = LayerManifest::load(&project_dir);
+
     // Build the resolved graph ONCE → summaries (for labels), total, fingerprint,
     // and the UNCAPPED cross-module edge set (for Φ + cycles).
     let (summaries, total_modules, fingerprint, edges) =
@@ -104,6 +115,18 @@ async fn layer_drift(
         ));
     }
 
+    // Phase 4b — AUTHORED gate-grade path: a manifest is the declared side (the
+    // spec), so labelling is deterministic (no model call, no cache), the verdict is
+    // gate-grade (kernel:false), and it carries a block/escalate/allow recommendation.
+    if let Some(manifest) = manifest {
+        let layer_of = label_from_manifest(&edges, &manifest);
+        return Json(make_gate_envelope(
+            q, &scope.key, &edges, &layer_of, &manifest,
+        ));
+    }
+
+    // Phase 4a — KERNEL advisory path (no manifest): Ξ_Arch labels are a model hint,
+    // so the verdict stays advisory (kernel:true) and NEVER recommends a gate.
     // Fingerprint cache: a prior identical graph already evaluated → free.
     if let Some(cached) = cache_get(fingerprint) {
         return Json(make_envelope(q, &scope.key, &edges, &cached, true));
@@ -158,6 +181,12 @@ enum EdgeVerdict {
     CarvedUtility,
     /// An endpoint is unlabelled or `"unknown"` — NOT judged (lowers coverage).
     CarvedUnknown,
+    /// (4b) An endpoint is an `exempt` module (composition root/barrel) — judged,
+    /// clean, never a breach; also excluded from cycle detection.
+    CarvedExempt,
+    /// (4b) The edge matches a manifest `[carve_out]` rule — an accepted exception,
+    /// judged, never a breach.
+    CarvedException,
     /// Both endpoints structural, edge violates Φ — a layer breach.
     Breach {
         from_layer: String,
@@ -227,7 +256,9 @@ fn evaluate_phi(
     for (from, to) in edges {
         match classify_edge(from, to, layer_of) {
             EdgeVerdict::Clean => judged += 1,
-            EdgeVerdict::CarvedUtility => {
+            EdgeVerdict::CarvedUtility
+            | EdgeVerdict::CarvedExempt
+            | EdgeVerdict::CarvedException => {
                 judged += 1;
                 carved += 1;
             }
@@ -512,6 +543,222 @@ fn cold_envelope(query: &str, scope_key: &str, reason: &str) -> Envelope {
 }
 
 // ===========================================================================
+// Phase 4b — authored gate-grade path (manifest declared side)
+// ===========================================================================
+
+/// Label every module node in `edges` from the manifest's `[layers]` globs. Modules
+/// with no matching glob are omitted (treated as unlabelled → a manifest coverage gap
+/// that lowers coverage honestly).
+fn label_from_manifest(
+    edges: &BTreeSet<(String, String)>,
+    manifest: &LayerManifest,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (a, b) in edges {
+        for m in [a, b] {
+            if !out.contains_key(m) {
+                if let Some(layer) = manifest.layer_of(m) {
+                    out.insert(m.clone(), layer.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Φ for one edge under the AUTHORED manifest: exempt endpoints and `[carve_out]`
+/// matches are accepted (never breaches); otherwise the structural Φ with the
+/// manifest's allowed-edge relation.
+fn classify_edge_manifest(
+    from: &str,
+    to: &str,
+    layer_of: &HashMap<String, String>,
+    manifest: &LayerManifest,
+) -> EdgeVerdict {
+    if manifest.is_exempt(from) || manifest.is_exempt(to) {
+        return EdgeVerdict::CarvedExempt;
+    }
+    let la = match layer_of.get(from).map(|s| s.as_str()) {
+        Some(l) if l != "unknown" => l,
+        _ => return EdgeVerdict::CarvedUnknown,
+    };
+    let lb = match layer_of.get(to).map(|s| s.as_str()) {
+        Some(l) if l != "unknown" => l,
+        _ => return EdgeVerdict::CarvedUnknown,
+    };
+    if la == "utility" || lb == "utility" {
+        return EdgeVerdict::CarvedUtility;
+    }
+    if manifest.is_carved(from, lb) {
+        return EdgeVerdict::CarvedException;
+    }
+    if manifest.is_allowed(la, lb) {
+        EdgeVerdict::Clean
+    } else {
+        EdgeVerdict::Breach {
+            from_layer: la.to_string(),
+            to_layer: lb.to_string(),
+        }
+    }
+}
+
+/// The manifest-path Φ result, with the carve-out breakdown for the verdict body.
+struct GatePhi {
+    breaches: Vec<Breach>,
+    judged: usize,
+    exempt: usize,
+    exception: usize,
+    utility: usize,
+    unknown: usize,
+}
+
+fn evaluate_phi_manifest(
+    edges: &BTreeSet<(String, String)>,
+    layer_of: &HashMap<String, String>,
+    manifest: &LayerManifest,
+) -> GatePhi {
+    let mut g = GatePhi {
+        breaches: Vec::new(),
+        judged: 0,
+        exempt: 0,
+        exception: 0,
+        utility: 0,
+        unknown: 0,
+    };
+    for (from, to) in edges {
+        match classify_edge_manifest(from, to, layer_of, manifest) {
+            EdgeVerdict::Clean => g.judged += 1,
+            EdgeVerdict::CarvedUtility => {
+                g.judged += 1;
+                g.utility += 1;
+            }
+            EdgeVerdict::CarvedExempt => {
+                g.judged += 1;
+                g.exempt += 1;
+            }
+            EdgeVerdict::CarvedException => {
+                g.judged += 1;
+                g.exception += 1;
+            }
+            EdgeVerdict::CarvedUnknown => g.unknown += 1,
+            EdgeVerdict::Breach {
+                from_layer,
+                to_layer,
+            } => {
+                g.judged += 1;
+                g.breaches.push(Breach {
+                    from: from.clone(),
+                    to: to.clone(),
+                    from_layer,
+                    to_layer,
+                });
+            }
+        }
+    }
+    g.breaches
+        .sort_by(|x, y| x.from.cmp(&y.from).then_with(|| x.to.cmp(&y.to)));
+    g
+}
+
+/// The gate recommendation for an authored verdict: `block` on any breach/cycle (a
+/// real layering violation against the authored spec); `escalate` when the manifest
+/// has coverage gaps (unlabelled edges → can't fully verify); else `allow`.
+fn gate_recommendation(breaches: usize, cycles: usize, unknown: usize) -> &'static str {
+    if breaches > 0 || cycles > 0 {
+        "block"
+    } else if unknown > 0 {
+        "escalate"
+    } else {
+        "allow"
+    }
+}
+
+/// Build the GATE-GRADE envelope (`kernel:false`, resolver credibility) for the
+/// authored-manifest path. Cycles run over the exempt-filtered digraph so the
+/// composition root no longer anchors a mega-SCC.
+fn make_gate_envelope(
+    query: &str,
+    scope_key: &str,
+    edges: &BTreeSet<(String, String)>,
+    layer_of: &HashMap<String, String>,
+    manifest: &LayerManifest,
+) -> Envelope {
+    let total_edges = edges.len();
+    let phi = evaluate_phi_manifest(edges, layer_of, manifest);
+
+    let cycle_edges: BTreeSet<(String, String)> = edges
+        .iter()
+        .filter(|(a, b)| !manifest.is_exempt(a) && !manifest.is_exempt(b))
+        .cloned()
+        .collect();
+    let cycles = find_layer_cycles(&cycle_edges, layer_of);
+
+    let coverage = if total_edges == 0 {
+        0.0
+    } else {
+        (phi.judged as f64 / total_edges as f64).min(1.0)
+    };
+    let posterior = coverage; // deterministic over the resolved graph — not a kernel hint
+    let gate = gate_recommendation(phi.breaches.len(), cycles.len(), phi.unknown);
+    let cls = drift_class(phi.breaches.len(), cycles.len(), phi.judged, total_edges);
+
+    let breaches_json: Vec<Value> = phi
+        .breaches
+        .iter()
+        .map(|b| {
+            json!({ "from": b.from, "to": b.to, "from_layer": b.from_layer,
+                    "to_layer": b.to_layer, "class": "arch:layer_breach" })
+        })
+        .collect();
+    let cycles_json: Vec<Value> = cycles
+        .iter()
+        .map(|c| json!({ "members": c.members, "class": "arch:layer_cycle" }))
+        .collect();
+    let layer_map: BTreeMap<&str, &str> = layer_of
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    // Manifest coverage gaps: in-scope module nodes the globs didn't label.
+    let mut unlabelled: BTreeSet<&str> = BTreeSet::new();
+    for (a, b) in edges {
+        for m in [a.as_str(), b.as_str()] {
+            if !manifest.is_exempt(m) && manifest.layer_of(m).is_none() {
+                unlabelled.insert(m);
+            }
+        }
+    }
+
+    let result = json!({
+        "scope": scope_key,
+        "declared_source": "layers_toml",
+        "gate": gate,
+        "drift_class": cls,
+        "breaches": breaches_json,
+        "cycles": cycles_json,
+        "layer_map": layer_map,
+        "carve_out": {
+            "exempt_edges": phi.exempt,
+            "exception_edges": phi.exception,
+            "utility_edges": phi.utility,
+            "unknown_edges": phi.unknown,
+            "note": "exempt = composition root/barrel (excluded from Φ + cycles); exception = manifest [carve_out]; utility = import-by-anyone; unknown = manifest coverage gap (lowers coverage)",
+        },
+        "unlabelled_modules": unlabelled.iter().collect::<Vec<_>>(),
+        "total_edges": total_edges,
+        "judged_edges": phi.judged,
+    });
+    Envelope::authored(
+        query,
+        OBSERVER,
+        super::PROV_LAYER_GATE,
+        result,
+        posterior,
+        coverage,
+    )
+}
+
+// ===========================================================================
 // Process-local fingerprint cache
 // ===========================================================================
 
@@ -756,5 +1003,178 @@ mod tests {
         let layer_of = labels(&[("m_a", "api")]);
         cache_put(fp, layer_of.clone());
         assert_eq!(cache_get(fp), Some(layer_of));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4b — authored gate-grade path (manifest)
+    // -----------------------------------------------------------------------
+
+    const MANIFEST: &str = r#"
+[order]
+allowed = [["ui","api"],["ui","service"],["api","service"],["service","data"],["api","data"]]
+[layers]
+"src/commands/**" = "api"
+"src/database/**" = "data"
+"src/util/**" = "utility"
+"src/**" = "service"
+[exempt]
+modules = ["src"]
+[carve_out]
+edges = [ { from_glob = "src/database/**", to_layer = "service", reason = "persist domain types" } ]
+"#;
+
+    fn manifest() -> LayerManifest {
+        LayerManifest::parse(MANIFEST).expect("manifest parses")
+    }
+
+    #[test]
+    fn manifest_exempt_root_edges_are_carved_and_excluded_from_cycles() {
+        let m = manifest();
+        let e = edges(&[("src", "src/commands"), ("src", "src/database")]); // root → api / data
+        let layer_of = label_from_manifest(&e, &m);
+        let phi = evaluate_phi_manifest(&e, &layer_of, &m);
+        assert!(
+            phi.breaches.is_empty(),
+            "exempt root edges are never breaches"
+        );
+        assert_eq!(phi.exempt, 2);
+        // the exempt root is filtered out of the cycle graph
+        let cycle_edges: BTreeSet<(String, String)> = e
+            .iter()
+            .filter(|(a, b)| !m.is_exempt(a) && !m.is_exempt(b))
+            .cloned()
+            .collect();
+        assert!(cycle_edges.is_empty(), "all edges touch the exempt root");
+    }
+
+    #[test]
+    fn manifest_carve_out_accepts_database_to_service() {
+        let m = manifest();
+        // data → service is normally a breach; the carve_out accepts it from database/**.
+        let e = edges(&[("src/database/pg", "src/orchestrator")]); // data → service
+        let layer_of = label_from_manifest(&e, &m);
+        let phi = evaluate_phi_manifest(&e, &layer_of, &m);
+        assert!(
+            phi.breaches.is_empty(),
+            "database→service is carved by the manifest"
+        );
+        assert_eq!(phi.exception, 1);
+    }
+
+    #[test]
+    fn manifest_order_override_allows_api_to_data_but_still_flags_upward() {
+        let m = manifest();
+        let e = edges(&[
+            ("src/commands", "src/database"), // api → data: sanctioned by [order] → clean
+            ("src/orchestrator", "src/commands"), // service → api: still a breach
+        ]);
+        let layer_of = label_from_manifest(&e, &m);
+        let phi = evaluate_phi_manifest(&e, &layer_of, &m);
+        assert_eq!(
+            phi.breaches.len(),
+            1,
+            "only the service→api upward edge breaches"
+        );
+        assert_eq!(phi.breaches[0].from, "src/orchestrator");
+        assert_eq!(phi.breaches[0].from_layer, "service");
+        assert_eq!(phi.breaches[0].to_layer, "api");
+    }
+
+    #[test]
+    fn gate_envelope_is_authored_not_kernel_and_recommends_block_on_breach() {
+        let m = manifest();
+        let e = edges(&[("src/orchestrator", "src/commands")]); // service → api breach
+        let layer_of = label_from_manifest(&e, &m);
+        let env = make_gate_envelope("layer_drift", "scope", &e, &layer_of, &m);
+        // Gate-grade: NOT a kernel; resolver credibility; deterministic posterior.
+        assert!(
+            !env.kernel,
+            "authored verdict is gate-grade, not a kernel hint"
+        );
+        assert_eq!(env.credibility.authorial, "high");
+        assert_eq!(env.provenance, super::super::PROV_LAYER_GATE);
+        assert_eq!(env.result["declared_source"], json!("layers_toml"));
+        assert_eq!(env.result["gate"], json!("block"), "a breach → block");
+        assert_eq!(env.result["drift_class"], json!("in_place"));
+    }
+
+    #[test]
+    fn gate_recommends_allow_when_clean_and_escalate_on_coverage_gap() {
+        let m = manifest();
+        // all clean + fully labelled → allow
+        let clean = edges(&[("src/commands", "src/orchestrator")]); // api → service
+        let env = make_gate_envelope(
+            "layer_drift",
+            "s",
+            &clean,
+            &label_from_manifest(&clean, &m),
+            &m,
+        );
+        assert_eq!(env.result["gate"], json!("allow"));
+        assert_eq!(env.result["drift_class"], json!("none"));
+        // an unlabelled (manifest-gap) endpoint, no breach → escalate
+        let gap = edges(&[("vendor/x", "src/orchestrator")]); // vendor/x has no glob
+        let env2 = make_gate_envelope("layer_drift", "s", &gap, &label_from_manifest(&gap, &m), &m);
+        assert_eq!(env2.result["gate"], json!("escalate"));
+        assert!(env2.coverage < 1.0);
+    }
+
+    /// Offline gate-validation bench (Phase 4b). For each repo in
+    /// `QONTINUI_BENCH_REPOS`, loads the REAL `<repo>/qontinui-layers.toml`, builds
+    /// the REAL resolved edges, and runs the REAL gate path — printing breaches,
+    /// cycles, the gate recommendation, and coverage over the COMPLETE edge set (the
+    /// confirmation the Appendix-A hand re-classification was one-sided about).
+    /// Run: `QONTINUI_BENCH_REPOS=...coord,...runner,...web cargo test --bin qontinui-runner layer_gate_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn layer_gate_bench() {
+        let repos = std::env::var("QONTINUI_BENCH_REPOS").unwrap_or_default();
+        if repos.trim().is_empty() {
+            eprintln!("set QONTINUI_BENCH_REPOS=abs1,abs2,...");
+            return;
+        }
+        for repo in repos.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let dir = std::path::Path::new(repo);
+            let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or(repo);
+            let manifest = match LayerManifest::load(dir) {
+                Some(m) => m,
+                None => {
+                    println!("=== {name}: NO qontinui-layers.toml (skipped) ===");
+                    continue;
+                }
+            };
+            let graph = crate::workflow_generation::code_graph::CodeGraph::build(dir);
+            let edges = crate::mcp::code_semantics::module_graph::cross_module_edges(&graph);
+            let layer_of = label_from_manifest(&edges, &manifest);
+            let env = make_gate_envelope("layer_drift", name, &edges, &layer_of, &manifest);
+            let r = &env.result;
+            println!("=== REPO {name} ===");
+            println!(
+                "total_edges={} judged={} coverage={:.3} gate={} drift_class={} breaches={} cycles={} carve_out={}",
+                r["total_edges"], r["judged_edges"], env.coverage, r["gate"], r["drift_class"],
+                r["breaches"].as_array().map(|a| a.len()).unwrap_or(0),
+                r["cycles"].as_array().map(|a| a.len()).unwrap_or(0),
+                r["carve_out"],
+            );
+            for b in r["breaches"].as_array().into_iter().flatten() {
+                println!(
+                    "BREACH  {} [{}] -> {} [{}]",
+                    b["from"], b["from_layer"], b["to"], b["to_layer"]
+                );
+            }
+            for c in r["cycles"].as_array().into_iter().flatten() {
+                println!("CYCLE   {:?}", c["members"]);
+            }
+            let unl = r["unlabelled_modules"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if unl > 0 {
+                println!(
+                    "MANIFEST GAPS (unlabelled in-scope modules): {unl} — {:?}",
+                    r["unlabelled_modules"]
+                );
+            }
+        }
     }
 }

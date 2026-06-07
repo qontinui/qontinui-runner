@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Env flag that turns the Ξ_FS observer producer on. Default off. Accepts
 /// the usual truthy values; anything else (including unset) is false. Matches
@@ -339,6 +339,38 @@ pub fn collect_observations(
     Ok(out)
 }
 
+/// Phase 5 (fs_observer backstop) — collect the uncommitted edits of an
+/// arbitrary checkout against its OWN current `HEAD`.
+///
+/// Unlike [`collect_observations`], whose `parent_sha` is the base commit an
+/// agent worktree branched from, this resolves the checkout's `HEAD` via
+/// libgit2 (the same `repo.head()?.target()` pattern the verify side uses in
+/// `edit_effect_loop::worktree_head_sha`) and delegates to
+/// [`collect_observations`] so it reuses ALL of the gitignore / denylist /
+/// blob-sha / hunk / cap logic — there is no second diff implementation.
+///
+/// The fs_backstop poller uses this to surface the working-tree drift of a
+/// SHARED canonical checkout that is dirty AND not covered by any live
+/// `kind=worktree` claim (an edit that leaked outside a session worktree).
+///
+/// Errors (not a git repo, unborn/detached HEAD we can't resolve, libgit2
+/// failure) are returned as `Err` so the caller degrades honestly — it never
+/// alarms on a checkout it couldn't read.
+pub fn collect_uncommitted_observations(
+    checkout_path: &Path,
+) -> Result<Vec<FsObservation>, String> {
+    let repo = git2::Repository::open(checkout_path)
+        .map_err(|e| format!("open checkout {}: {e}", checkout_path.display()))?;
+    let head = repo
+        .head()
+        .map_err(|e| format!("resolve HEAD of {}: {e}", checkout_path.display()))?;
+    let head_sha = head
+        .target()
+        .ok_or_else(|| format!("HEAD of {} has no target oid", checkout_path.display()))?
+        .to_string();
+    collect_observations(checkout_path, &head_sha)
+}
+
 /// Derive a repo basename from a worktree path or coord repo slug. Coord
 /// stores `repo` as an optional basename; we send the leaf dir name of the
 /// canonical repo (e.g. `owner/qontinui-runner` ⇒ `qontinui-runner`).
@@ -385,7 +417,7 @@ async fn post_observations(coord_http_base: &str, body: &FsObservationsRequest) 
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
-                debug!(
+                info!(
                     url = %url,
                     n = body.observations.len(),
                     status = status.as_u16(),
@@ -710,5 +742,41 @@ mod tests {
         let (_dir, repo, parent_sha) = init_repo();
         let obs = collect_observations(&repo, &parent_sha).expect("collect");
         assert!(obs.is_empty(), "clean worktree yields no observations");
+    }
+
+    // ---- Phase 5: collect_uncommitted_observations (HEAD-relative) --------
+
+    #[test]
+    fn collect_uncommitted_reports_modified_and_new_skips_ignored() {
+        let (_dir, repo, _head) = init_repo();
+        // Modify a tracked file + add an untracked one.
+        std::fs::write(repo.join("kept.rs"), "// v2 modified\n").unwrap();
+        std::fs::write(repo.join("added.rs"), "// brand new\n").unwrap();
+        // gitignored file must NOT appear.
+        std::fs::write(repo.join("ignored.txt"), "scratch\n").unwrap();
+
+        let obs = collect_uncommitted_observations(&repo).expect("collect uncommitted");
+        let paths: HashSet<&str> = obs.iter().map(|o| o.path.as_str()).collect();
+        assert!(paths.contains("kept.rs"), "modified tracked file reported");
+        assert!(paths.contains("added.rs"), "new file reported");
+        assert!(
+            !paths.contains("ignored.txt"),
+            "gitignored file must be dropped: {:?}",
+            paths
+        );
+
+        // Resolves HEAD itself — pre_sha of a modified file is the HEAD blob.
+        let kept = obs.iter().find(|o| o.path == "kept.rs").unwrap();
+        assert_eq!(
+            kept.pre_sha.as_deref(),
+            Some(blob_sha_for_bytes(b"// v1\n").unwrap().as_str())
+        );
+    }
+
+    #[test]
+    fn collect_uncommitted_empty_when_clean() {
+        let (_dir, repo, _head) = init_repo();
+        let obs = collect_uncommitted_observations(&repo).expect("collect uncommitted");
+        assert!(obs.is_empty(), "clean checkout yields no observations");
     }
 }

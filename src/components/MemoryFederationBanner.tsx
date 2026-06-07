@@ -20,6 +20,12 @@
  * is skipped for a session — missing identity or the settings
  * kill-switch). These render a single-line informational notice that
  * auto-dismisses, so the previously-silent skip becomes visible.
+ *
+ * Finally listens for `memory-federation:error` (emitted from
+ * `claude_session::federation::emit_federation_error` when the WHOLE
+ * reconcile fails — distinct from per-file `failed_names`). A
+ * reconcile-level failure is not transient, so these render a
+ * destructive, sticky (no auto-dismiss) one-line notice.
  */
 
 import { useEffect, useState } from "react";
@@ -44,9 +50,18 @@ interface SkipEvent {
   detail: string;
 }
 
+/** Payload for `memory-federation:error`. Hand-written to mirror the Rust
+ *  `ErrorPayload` struct — these federation events are NOT codegen'd. */
+interface ErrorEvent {
+  session_id: string;
+  account: string;
+  error: string;
+}
+
 type ActiveNotice =
   | ({ kind: "reconcile"; id: number; receivedAt: number } & ReconcileEvent)
-  | ({ kind: "skip"; id: number; receivedAt: number } & SkipEvent);
+  | ({ kind: "skip"; id: number; receivedAt: number } & SkipEvent)
+  | ({ kind: "error"; id: number; receivedAt: number } & ErrorEvent);
 
 const SUCCESS_TTL_MS = 6000;
 const SKIP_TTL_MS = 8000;
@@ -104,6 +119,18 @@ export function MemoryFederationBanner() {
             setNotices((prev) => [...prev, notice]);
           }),
         );
+        unlisteners.push(
+          await listen<ErrorEvent>("memory-federation:error", (event) => {
+            counter += 1;
+            const notice: ActiveNotice = {
+              kind: "error",
+              ...event.payload,
+              id: counter,
+              receivedAt: Date.now(),
+            };
+            setNotices((prev) => [...prev, notice]);
+          }),
+        );
       } catch (e) {
         console.error("MemoryFederationBanner: listen failed", e);
       }
@@ -146,6 +173,35 @@ export function MemoryFederationBanner() {
       style={containerStyle}
     >
       {notices.map((n) => {
+        if (n.kind === "error") {
+          return (
+            <div
+              key={n.id}
+              role="alert"
+              aria-live="assertive"
+              style={bannerStyleFailure}
+            >
+              <div style={{ flex: 1 }}>
+                <p style={titleStyleFailure}>Memory federation</p>
+                <p style={messageStyle}>
+                  reconcile failed: {n.error}
+                  {" — session "}
+                  <code style={codeStyle}>{n.session_id.slice(0, 8)}</code>
+                </p>
+              </div>
+              <div style={actionsColumnStyle}>
+                <button
+                  type="button"
+                  onClick={() => dismiss(n.id)}
+                  style={dismissBtn}
+                  aria-label="Dismiss"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          );
+        }
         if (n.kind === "skip") {
           return (
             <div
