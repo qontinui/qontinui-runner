@@ -60,12 +60,16 @@ $SKIP_ROUTES = @{
 # ---------------------------------------------------------------------------
 # Routes whose handler can legitimately exceed the default 10s probe timeout.
 # vision/extract (PaddleOCR) and vision/describe (VLM) load a cold model via
-# llama-swap on first request; 120s covers the cold load. Keyed by
-# "<METHOD> <PATH>" exactly as it appears in UI_BRIDGE_ROUTES.
+# llama-swap on first request — and llama-swap UNLOADS one model to load the
+# other, so describe can pay a full swap+load even right after extract ran;
+# 300s covers the worst observed cold swap. /control/specs is a disk scan
+# that can exceed 10s on a cold FS cache (fresh exe dir + Defender pass).
+# Keyed by "<METHOD> <PATH>" exactly as it appears in UI_BRIDGE_ROUTES.
 # ---------------------------------------------------------------------------
 $SLOW_ROUTES = @{
-    "POST /vision/extract"  = 120
-    "POST /vision/describe" = 120
+    "POST /vision/extract"  = 300
+    "POST /vision/describe" = 300
+    "GET /control/specs"    = 60
 }
 
 # ---------------------------------------------------------------------------
@@ -210,13 +214,24 @@ function Invoke-Probe {
         $resp = Invoke-WebRequest @params
         return @($resp.StatusCode, $resp.Content)
     } catch [System.Net.WebException] {
-        # Pull HTTP status off non-success responses.
+        # Pull HTTP status + body off non-success responses. PS 5.1 gotcha:
+        # Invoke-WebRequest has already consumed the error response stream,
+        # so GetResponseStream() reads back "" (position at END). The body
+        # lives in ErrorDetails.Message; rewinding the seekable stream is
+        # the fallback.
         $r = $_.Exception.Response
         if ($r) {
             $status = [int]$r.StatusCode
-            $stream = $r.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($stream)
-            $body   = $reader.ReadToEnd()
+            $body = $_.ErrorDetails.Message
+            if (-not $body) {
+                $stream = $r.GetResponseStream()
+                if ($stream -and $stream.CanSeek) {
+                    $stream.Position = 0
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $body = $reader.ReadToEnd()
+                }
+            }
+            if (-not $body) { $body = "" }
             return @($status, $body)
         }
         return @(0, $_.Exception.Message)
