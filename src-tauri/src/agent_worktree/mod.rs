@@ -412,9 +412,7 @@ enum CanonicalLeasePlan {
 /// `Err` stops the walk and yields a [`CanonicalLeasePlan::Bail`] carrying the
 /// successes-so-far (to release) and the error. All-`Ok` yields
 /// [`CanonicalLeasePlan::Proceed`].
-fn plan_canonical_leases(
-    outcomes: Vec<Result<ActiveClaim, AllocateError>>,
-) -> CanonicalLeasePlan {
+fn plan_canonical_leases(outcomes: Vec<Result<ActiveClaim, AllocateError>>) -> CanonicalLeasePlan {
     let mut acquired: Vec<ActiveClaim> = Vec::with_capacity(outcomes.len());
     for outcome in outcomes {
         match outcome {
@@ -1703,9 +1701,7 @@ mod tests {
                 assert_eq!(acquired[0].resource_key, "repo:qontinui-coord");
                 assert_eq!(acquired[1].resource_key, "repo:qontinui-web");
                 // The same vec the session-end release path drains.
-                assert!(acquired
-                    .iter()
-                    .all(|c| c.agent_session_id == Some(session)));
+                assert!(acquired.iter().all(|c| c.agent_session_id == Some(session)));
             }
             CanonicalLeasePlan::Bail { .. } => panic!("expected Proceed on all-Ok outcomes"),
         }
@@ -1732,10 +1728,8 @@ mod tests {
             intent: None,
         };
         // First repo acquires; second is Held by a peer.
-        let outcomes: Vec<Result<ActiveClaim, AllocateError>> = vec![
-            Ok(first),
-            Err(AllocateError::ClaimConflict(conflict)),
-        ];
+        let outcomes: Vec<Result<ActiveClaim, AllocateError>> =
+            vec![Ok(first), Err(AllocateError::ClaimConflict(conflict))];
 
         match plan_canonical_leases(outcomes) {
             CanonicalLeasePlan::Bail { to_release, error } => {
