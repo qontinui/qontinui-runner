@@ -3,6 +3,7 @@ import { ChevronDown, Pin, Filter, ArrowDownToLine } from "lucide-react";
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { STATE_BORDER_COLORS } from "./constants";
+import { useTerminalWindowActions } from "../useTerminalWindowActions";
 
 export function ZoneLabel({
   tab,
@@ -43,6 +44,7 @@ export function ZoneLabel({
   const [editingLabel, setEditingLabel] = useState(false);
   const [labelValue, setLabelValue] = useState(zoneLabel ?? "");
   const selectorRef = useRef<HTMLDivElement>(null);
+  const { popOutTab } = useTerminalWindowActions();
 
   useEffect(() => {
     if (!showSelector) return;
@@ -62,6 +64,24 @@ export function ZoneLabel({
       onDragStart={(e) => {
         e.dataTransfer.setData("text/tab-id", tab.id);
         e.dataTransfer.effectAllowed = "move";
+      }}
+      onDragEnd={(e) => {
+        // Drag-tab-out: if the header was dropped OUTSIDE this window's
+        // viewport and no in-window zone accepted it (dropEffect "none"),
+        // pop the terminal into its own new window. HTML5 DnD can't cross
+        // OS windows, so a release over another runner window also lands
+        // here as "none" with an out-of-bounds pointer — treated the same
+        // (new window). A drop onto a zone sets dropEffect "move" → skip.
+        if (e.dataTransfer.dropEffect !== "none") return;
+        const out =
+          e.clientX <= 0 ||
+          e.clientY <= 0 ||
+          e.clientX >= window.innerWidth ||
+          e.clientY >= window.innerHeight;
+        if (!out) return;
+        void popOutTab(tab.id).catch((err) =>
+          console.error("Failed to pop out terminal (drag-out):", err),
+        );
       }}
     >
       <div
