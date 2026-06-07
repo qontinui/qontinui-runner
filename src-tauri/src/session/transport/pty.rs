@@ -79,6 +79,7 @@ impl Transport for PtyTransport {
                 None,
                 self.app_handle.clone(),
                 None,
+                None,
             )
             .map_err(TransportError::Runtime)?;
 

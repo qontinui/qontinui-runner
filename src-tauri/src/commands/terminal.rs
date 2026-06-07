@@ -115,6 +115,19 @@ pub async fn terminal_create(
     let repo_detect_handle = app_handle.clone();
     let repo_detect_dir = working_dir.clone();
     let cred_helper_dir = working_dir.clone();
+    // Phase 2c — export `QONTINUI_SESSION_WORKTREES` (all materialized
+    // sibling worktrees) onto the PTY so an agent-agnostic launch can find
+    // repos that materialized on disk but aren't the process cwd. Derived
+    // from the live isolated edit context before it is parked on the
+    // session. `None` (no ctx / single-or-zero worktree) → no env var.
+    let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
+        ctx.session_worktrees_env_value().map(|v| {
+            vec![(
+                crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
+                v,
+            )]
+        })
+    });
     let info = terminal_manager.create(
         title.clone(),
         working_dir.clone(),
@@ -123,6 +136,7 @@ pub async fn terminal_create(
         rows,
         app_handle,
         command,
+        extra_env,
     )?;
 
     // Park the isolated edit context on the terminal session so its
@@ -880,6 +894,20 @@ pub(crate) fn create_terminal_session_backend(
     command: Option<Vec<String>>,
     isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
 ) -> Result<(String, Option<uuid::Uuid>), String> {
+    // Phase 2c — derive the `QONTINUI_SESSION_WORKTREES` env from the
+    // pre-acquired context (all materialized sibling worktrees) before it is
+    // parked on the session. `None` (no ctx / single-or-zero worktree) → no
+    // env var. The `--add-dir <sibling>` convenience for `claude` launches is
+    // appended into `command` by the caller (gate-continuation in
+    // `agent_runtime.rs`), since only the caller knows the launch is `claude`.
+    let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
+        ctx.session_worktrees_env_value().map(|v| {
+            vec![(
+                crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
+                v,
+            )]
+        })
+    });
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(working_dir.clone()),
@@ -888,6 +916,7 @@ pub(crate) fn create_terminal_session_backend(
         None,
         app_handle,
         command,
+        extra_env,
     )?;
 
     // Park the pre-acquired isolated edit context on the session so its

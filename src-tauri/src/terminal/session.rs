@@ -224,6 +224,7 @@ impl TerminalSession {
         app_handle: AppHandle,
         interceptor: Arc<OutputInterceptor>,
         command: Option<Vec<String>>,
+        extra_env: Option<Vec<(String, String)>>,
     ) -> Result<Self, String> {
         let pty_system = native_pty_system();
 
@@ -266,6 +267,16 @@ impl TerminalSession {
             "QONTINUI_RUNNER_API_PORT",
             crate::mcp::types::get_mcp_api_port().to_string(),
         );
+
+        // Phase 2c — caller-supplied launch env (e.g.
+        // `QONTINUI_SESSION_WORKTREES`, the agent-agnostic pointer to every
+        // materialized sibling worktree of this session). Set after the
+        // built-in runner vars so a caller can intentionally override them.
+        if let Some(env) = extra_env {
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+        }
 
         // Set CLAUDE_CONFIG_DIR so Claude Code uses the resolved account
         // (multi-account support with auto-rotation on rate-limit).

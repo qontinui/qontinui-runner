@@ -1114,11 +1114,18 @@ async fn run_continuation_terminal(
     // permission prompts — an unattended gate continuation has no operator to
     // answer them.
     let claude_bin = claude_bin_path();
-    let command = Some(vec![
-        claude_bin,
-        "--dangerously-skip-permissions".to_string(),
-        payload.initial_prompt.clone(),
-    ]);
+    // Phase 2c — `--add-dir <sibling>` for each non-cwd worktree of this
+    // continuation's context so the launched `claude` can edit sibling repos
+    // that materialized on disk but aren't the process cwd. Flags MUST precede
+    // the trailing positional prompt arg. Empty for single-repo continuations.
+    let add_dir_args = ctx
+        .as_ref()
+        .map(|c| c.claude_add_dir_args())
+        .unwrap_or_default();
+    let mut command_vec = vec![claude_bin, "--dangerously-skip-permissions".to_string()];
+    command_vec.extend(add_dir_args);
+    command_vec.push(payload.initial_prompt.clone());
+    let command = Some(command_vec);
 
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
@@ -1572,6 +1579,15 @@ fn local_repo_name(repo: &str) -> &str {
 /// runner owns this layout; coord's emitted `worktree_path` (computed for its
 /// own host) is ignored. Scheme:
 /// `<QONTINUI_ROOT>/.agent-worktrees/<agent_id>/<repo-name>`.
+///
+/// Phase 2b note (launch-provisioning): the per-spawn `<agent_id>` directory
+/// is already per-session-unique — each spawn mints a fresh `agent_id` — so
+/// this layout satisfies the §3.6 `.agent-worktrees/<session>/<repo>` model
+/// without re-keying. Cross-restart STABLE reuse (a worktree the same logical
+/// session reattaches to after a runner restart) is intentionally deferred to
+/// the restart-resilience plan; do NOT re-key this dir on a stable
+/// session id here — doing so would orphan the per-spawn worktrees the live
+/// claim bookkeeping already tracks under `<agent_id>`.
 fn local_worktree_path(root: &Path, agent_id: uuid::Uuid, repo: &str) -> PathBuf {
     root.join(".agent-worktrees")
         .join(agent_id.to_string())
