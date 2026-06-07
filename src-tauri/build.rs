@@ -3,6 +3,10 @@ fn main() {
     // the dist directory changes.  Without this, incremental builds silently
     // serve a stale frontend bundle from the compile-time cache.
     println!("cargo:rerun-if-changed=../dist");
+    // Re-run when a Tauri capability changes so incremental builds re-embed the
+    // updated ACL (e.g. adding a window label); otherwise gen/ stays stale and
+    // the new permission silently never takes effect until a clean build.
+    println!("cargo:rerun-if-changed=capabilities");
     // Force a re-run on every cargo build so RUNNER_BUILD_ID's millisecond
     // suffix actually changes between invocations. Without this, cargo will
     // cache the build-script output and re-stamp identical values into the
