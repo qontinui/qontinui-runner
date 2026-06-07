@@ -48,15 +48,28 @@ if (!rootElement) {
   console.error("Root element not found!");
   document.body.innerHTML = '<div style="color: red; padding: 20px;">Root element not found!</div>';
 } else {
+  const tree = (
+    <QueryClientProvider client={queryClient}>
+      <ErrorBoundary>
+        <ProductModeProvider>
+          <App />
+        </ProductModeProvider>
+      </ErrorBoundary>
+    </QueryClientProvider>
+  );
+
+  // StrictMode is intentionally DEV-only. In React 18, <React.StrictMode>
+  // double-invokes effects (mount → unmount → remount) — and that double
+  // invocation is NOT stripped from production builds, only its dev console
+  // warnings are. With the prior unconditional StrictMode, the
+  // mount→unmount→remount churn raced the async `listen()` in the UI Bridge
+  // handlers and accumulated duplicate Tauri listeners in the shipped
+  // headless build (PR #473 round-2 falsification: one /page/evaluate ran a
+  // command 4× on a fresh single-window instance). The handlers are now
+  // individually hardened (singleton subscription + request_id dedupe), but
+  // we also keep StrictMode's intentional double-mount out of production so
+  // shipped builds don't pay for — or get surprised by — dev-only behavior.
   ReactDOM.createRoot(rootElement).render(
-    <React.StrictMode>
-      <QueryClientProvider client={queryClient}>
-        <ErrorBoundary>
-          <ProductModeProvider>
-            <App />
-          </ProductModeProvider>
-        </ErrorBoundary>
-      </QueryClientProvider>
-    </React.StrictMode>,
+    import.meta.env.DEV ? <React.StrictMode>{tree}</React.StrictMode> : tree,
   );
 }

@@ -40,13 +40,12 @@
  */
 
 import { useEffect } from "react";
-import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
+import { emit, type Event } from "@tauri-apps/api/event";
 import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
-import {
-  awaitWithTimeout,
-  PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
-} from "./ui-bridge-events/utils";
+import { awaitWithTimeout, PAGE_EVALUATE_PROMISE_TIMEOUT_MS } from "./ui-bridge-events/utils";
+import { acquireSingletonListener } from "./ui-bridge-events/singleton-listener";
+import { evaluateRequestDedupe } from "./ui-bridge-events/request-dedupe";
 
 const log = createLogger("UIBridgeEvaluateHandler");
 
@@ -151,138 +150,146 @@ async function evaluateExpression(expression: string): Promise<unknown> {
 }
 
 /**
+ * Dependencies for {@link handleEvaluateRequest}, injected so the
+ * evaluation logic is unit-testable without a live Tauri runtime.
+ */
+export interface EvaluateHandlerDeps {
+  emit: (event: string, payload: unknown) => Promise<void>;
+}
+
+/**
+ * Pure(-ish) handler for one `ui-bridge:evaluate-request` event.
+ *
+ * Defense-in-depth EXACTLY-ONCE guard: the FIRST listener to see a given
+ * `request_id` claims it via {@link evaluateRequestDedupe} and proceeds;
+ * any later listener (e.g. an accumulated duplicate) observes the claim
+ * and drops the call. This caps execution at one per request_id even if
+ * the singleton subscription guard is somehow bypassed — critical here
+ * because the expression is executed for side effects (it can call
+ * `window.__TAURI__.core.invoke(...)`).
+ *
+ * Returns `true` if this call executed the expression (won the claim),
+ * `false` if it was deduped/ignored — exposed for tests.
+ */
+export async function handleEvaluateRequest(
+  payload: EvaluateRequestPayload,
+  deps: EvaluateHandlerDeps,
+): Promise<boolean> {
+  const { request_id, expression, unwrap, allow_network_requests } = payload;
+
+  if (!request_id) {
+    // Without a request_id we can't route the response back. Drop the call
+    // entirely — the Rust side will observe a timeout.
+    console.warn("[UIBridgeEvaluateHandler] evaluate-request missing request_id; ignoring");
+    return false;
+  }
+
+  if (!evaluateRequestDedupe.claim(request_id)) {
+    log.debug(`evaluate(${request_id}) already handled; ignoring duplicate`);
+    return false;
+  }
+
+  log.debug(`Received evaluate request`, request_id);
+
+  let response: EvaluateResponsePayload;
+
+  if (typeof expression !== "string" || expression.length === 0) {
+    response = { request_id, ok: false, error: "expression is required" };
+  } else {
+    try {
+      rejectIfDangerous(expression, allow_network_requests === true);
+      const resolved = await evaluateExpression(expression);
+      if (unwrap === true) {
+        // Opt-in consistent shape: always `{ value, type }`. Mirrors the
+        // sibling unwrap branch in usePageEvents.ts::page_evaluate. Rust
+        // passes this shape through verbatim when unwrap=true so the HTTP
+        // caller sees `{success: true, data: {value, type}}`.
+        let valueType: "scalar" | "object" | "undefined" | "function" | "null";
+        let normalizedValue: unknown;
+        if (resolved === null) {
+          valueType = "null";
+          normalizedValue = null;
+        } else if (resolved === undefined) {
+          valueType = "undefined";
+          normalizedValue = undefined;
+        } else if (typeof resolved === "function") {
+          valueType = "function";
+          // Functions aren't structured-clone-safe. Surface the name (or
+          // `<anonymous>`) so the caller gets something useful.
+          normalizedValue = (resolved as { name?: string }).name || "<anonymous>";
+        } else if (typeof resolved === "object") {
+          valueType = "object";
+          normalizedValue = resolved;
+        } else {
+          valueType = "scalar";
+          normalizedValue = resolved;
+        }
+        response = {
+          request_id,
+          ok: true,
+          result: { value: normalizedValue, type: valueType },
+        };
+      } else {
+        // Match the legacy IPC page_evaluate shape so the Rust
+        // `tagged_page_evaluate` helper can pass the `data` field through
+        // unchanged: `{ result: object | { value: primitive } }`.
+        const resultField =
+          typeof resolved === "object" && resolved !== null ? resolved : { value: resolved };
+        response = {
+          request_id,
+          ok: true,
+          result: { success: true, result: resultField },
+        };
+      }
+    } catch (err) {
+      const message = getErrorMessage(err);
+      log.debug(`evaluate(${request_id}) threw:`, message);
+      response = { request_id, ok: false, error: message };
+    }
+  }
+
+  try {
+    await deps.emit("ui-bridge:evaluate-response", response);
+  } catch (emitErr) {
+    // If emit itself fails, the Rust side will hit its timeout.
+    console.error("[UIBridgeEvaluateHandler] Failed to emit evaluate-response:", emitErr);
+  }
+  return true;
+}
+
+const evaluateDeps: EvaluateHandlerDeps = {
+  emit: (event, payload) => emit(event, payload),
+};
+
+/**
  * Install a Tauri listener on `ui-bridge:evaluate-request` that runs the
  * caller's expression (after security gating) and emits the result back
  * over `ui-bridge:evaluate-response`. Every request carries a `request_id`
  * which we echo verbatim so the Rust `EvaluateRequestStore` can correlate
  * concurrent callers.
  *
+ * The subscription is a SINGLETON per webview (see
+ * `ui-bridge-events/singleton-listener.ts`): no matter how many times this
+ * hook mounts — including React StrictMode's mount→unmount→remount, which
+ * runs in production too — exactly one underlying Tauri listener exists.
+ * That is the structural fix for the duplicate-execution bug; the
+ * `request_id` dedupe in {@link handleEvaluateRequest} is the
+ * defense-in-depth backstop.
+ *
  * Safe to mount once at app root alongside `UIBridgeInvokeHandler`.
  */
 export function useUIBridgeEvaluateHandler(): void {
   useEffect(() => {
-    let unlisten: UnlistenFn | null = null;
-    let isMounted = true;
-
-    const setupListener = async () => {
-      try {
-        log.debug("Setting up ui-bridge:evaluate-request listener");
-
-        unlisten = await listen<EvaluateRequestPayload>(
-          "ui-bridge:evaluate-request",
-          async (event) => {
-            if (!isMounted) {
-              log.debug("Component unmounted, ignoring evaluate request");
-              return;
-            }
-
-            const { request_id, expression, unwrap, allow_network_requests } = event.payload;
-            log.debug(`Received evaluate request`, request_id);
-
-            let response: EvaluateResponsePayload;
-
-            if (!request_id) {
-              // Without a request_id we can't route the response back. Drop
-              // the call entirely — the Rust side will observe a timeout.
-              console.warn(
-                "[UIBridgeEvaluateHandler] evaluate-request missing request_id; ignoring",
-              );
-              return;
-            }
-
-            if (typeof expression !== "string" || expression.length === 0) {
-              response = {
-                request_id,
-                ok: false,
-                error: "expression is required",
-              };
-            } else {
-              try {
-                rejectIfDangerous(expression, allow_network_requests === true);
-                const resolved = await evaluateExpression(expression);
-                if (unwrap === true) {
-                  // Opt-in consistent shape: always `{ value, type }`.
-                  // Mirrors the sibling unwrap branch in
-                  // usePageEvents.ts::page_evaluate. Rust passes this
-                  // shape through verbatim when unwrap=true so the HTTP
-                  // caller sees `{success: true, data: {value, type}}`.
-                  let valueType: "scalar" | "object" | "undefined" | "function" | "null";
-                  let normalizedValue: unknown;
-                  if (resolved === null) {
-                    valueType = "null";
-                    normalizedValue = null;
-                  } else if (resolved === undefined) {
-                    valueType = "undefined";
-                    normalizedValue = undefined;
-                  } else if (typeof resolved === "function") {
-                    valueType = "function";
-                    // Functions aren't structured-clone-safe. Surface the
-                    // name (or `<anonymous>`) so the caller gets something
-                    // useful.
-                    normalizedValue = (resolved as { name?: string }).name || "<anonymous>";
-                  } else if (typeof resolved === "object") {
-                    valueType = "object";
-                    normalizedValue = resolved;
-                  } else {
-                    valueType = "scalar";
-                    normalizedValue = resolved;
-                  }
-                  response = {
-                    request_id,
-                    ok: true,
-                    result: { value: normalizedValue, type: valueType },
-                  };
-                } else {
-                  // Match the legacy IPC page_evaluate shape so the Rust
-                  // `tagged_page_evaluate` helper can pass the `data` field
-                  // through unchanged: `{ result: object | { value: primitive } }`.
-                  const resultField =
-                    typeof resolved === "object" && resolved !== null
-                      ? resolved
-                      : { value: resolved };
-                  response = {
-                    request_id,
-                    ok: true,
-                    result: { success: true, result: resultField },
-                  };
-                }
-              } catch (err) {
-                const message = getErrorMessage(err);
-                log.debug(`evaluate(${request_id}) threw:`, message);
-                response = {
-                  request_id,
-                  ok: false,
-                  error: message,
-                };
-              }
-            }
-
-            try {
-              await emit("ui-bridge:evaluate-response", response);
-            } catch (emitErr) {
-              // If emit itself fails, the Rust side will hit its timeout.
-              console.error("[UIBridgeEvaluateHandler] Failed to emit evaluate-response:", emitErr);
-            }
-          },
-        );
-
-        log.debug("evaluate-request listener set up successfully");
-      } catch (error) {
-        console.error(
-          "[UIBridgeEvaluateHandler] Failed to set up evaluate-request listener:",
-          error,
-        );
-      }
-    };
-
-    setupListener();
-
+    log.debug("Acquiring singleton ui-bridge:evaluate-request listener");
+    const release = acquireSingletonListener<EvaluateRequestPayload>(
+      "ui-bridge:evaluate-request",
+      (event: Event<EvaluateRequestPayload>) => {
+        void handleEvaluateRequest(event.payload, evaluateDeps);
+      },
+    );
     return () => {
-      log.debug("Cleaning up evaluate-request listener");
-      isMounted = false;
-      if (unlisten) {
-        unlisten();
-      }
+      log.debug("Releasing singleton ui-bridge:evaluate-request listener");
+      release();
     };
   }, []);
 }

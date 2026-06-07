@@ -161,6 +161,18 @@ pub async fn create_terminal_handler(
     )
     .await;
 
+    // Phase 2c — carry `QONTINUI_SESSION_WORKTREES` (all materialized sibling
+    // worktrees) onto the PTY, derived from the live context before it is
+    // parked on the session. `None` (no ctx / single-or-zero worktree) → no env.
+    let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
+        ctx.session_worktrees_env_value().map(|v| {
+            vec![(
+                crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
+                v,
+            )]
+        })
+    });
+
     match terminal_manager.create(
         request.title,
         working_dir,
@@ -169,6 +181,7 @@ pub async fn create_terminal_handler(
         request.rows,
         app_handle,
         None,
+        extra_env,
     ) {
         Ok(info) => {
             if let Some(ctx) = isolated_ctx {

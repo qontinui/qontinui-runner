@@ -175,11 +175,63 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `QONTINUI_INSTANCE_NAME` is process-global mutable state; tests that
+    /// set/remove it race when the harness runs them on parallel threads
+    /// (one test's `remove_var` lands between another's `set_var` and its
+    /// assert — flakes on windows-latest). Every env-touching test holds this
+    /// lock for its full body. Poisoning is harmless — each test resets the
+    /// var on entry — so recover with `into_inner`. Mirrors the ENV_GUARD
+    /// pattern in `claude_session/coord_register.rs`.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     #[test]
     fn sanitize_keeps_safe_chars() {
         assert_eq!(sanitize("test-runner_1"), "test-runner_1");
         assert_eq!(sanitize("abc/def"), "abc_def");
         assert_eq!(sanitize("weird name!"), "weird_name_");
+    }
+
+    /// The outbox base dir (`~/.qontinui/runner`) must scope per-instance for
+    /// secondaries so spawn-test runners never race the primary on a single
+    /// shared `session-outbox.jsonl`. This asserts the exact `scope_path`
+    /// contract relied on by the outbox + pane-store wiring in `main.rs`.
+    #[test]
+    fn scope_path_isolates_outbox_dir_for_secondary() {
+        let _env = env_lock();
+        let base = Path::new(".qontinui").join("runner");
+
+        // Secondary: appends `instance-<sanitized-name>`.
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-runner 7!");
+        let scoped = scope_path(&base);
+        assert_eq!(
+            scoped,
+            base.join("instance-test-runner_7_"),
+            "secondary outbox dir must be instance-scoped"
+        );
+        let outbox = scoped.join("session-outbox.jsonl");
+        assert!(outbox.to_string_lossy().contains("instance-test-runner_7_"));
+
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+    }
+
+    /// The PRIMARY runner (no `QONTINUI_INSTANCE_NAME`) must keep resolving to
+    /// the UNSCOPED legacy path so its pre-existing pending outbox rows are
+    /// never orphaned by this change.
+    #[test]
+    fn scope_path_is_noop_for_primary() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        let base = Path::new(".qontinui").join("runner");
+        assert_eq!(
+            scope_path(&base),
+            base,
+            "primary must keep the legacy unscoped outbox path"
+        );
     }
 }

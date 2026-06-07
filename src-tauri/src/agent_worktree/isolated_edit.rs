@@ -510,13 +510,78 @@ fn spawn_claim_heartbeat(
     )
 }
 
-/// Convenience helper for the three runner terminal-spawn entry points
+/// Environment-variable name carrying the full set of materialized
+/// per-repo worktrees onto a launched agent process (Phase 2c). The value
+/// is a `;`-separated list of `<repo>=<abs_worktree_path>` pairs covering
+/// EVERY worktree in the launch's `IsolatedEditContext` (including the
+/// first / cwd repo), so an agent-agnostic launch can locate sibling
+/// repos that materialized on disk but aren't the process cwd.
+pub const SESSION_WORKTREES_ENV: &str = "QONTINUI_SESSION_WORKTREES";
+
+/// Build the [`SESSION_WORKTREES_ENV`] value for a set of materialized
+/// worktrees: `"<repo>=<abs_path>;<repo2>=<abs_path2>;…"` over ALL
+/// worktrees in order (the first entry is the session cwd repo). Returns
+/// `None` when there are no worktrees (worktree mode off / no allocate) so
+/// the caller can skip setting an empty env var.
+///
+/// Paths are emitted via `Path::display()` so they stay platform-native
+/// (`D:\…` on Windows, `/home/…` on POSIX). `repo` slugs never contain
+/// `=` or `;`, so the delimiter set is unambiguous.
+pub fn session_worktrees_env_value(worktrees: &[MaterializedWorktree]) -> Option<String> {
+    if worktrees.is_empty() {
+        return None;
+    }
+    let joined = worktrees
+        .iter()
+        .map(|w| format!("{}={}", w.repo, w.worktree_path.display()))
+        .collect::<Vec<_>>()
+        .join(";");
+    Some(joined)
+}
+
+/// Build the `--add-dir <path>` argument pairs for the SIBLING worktrees of
+/// a launch — every worktree except the first (the first is the process
+/// cwd, which `claude` already roots at, so it needs no `--add-dir`). Used
+/// to append to a `claude` command so a multi-repo session can edit the
+/// non-cwd repos too. Returns an empty vec for single-repo (or empty)
+/// launches.
+///
+/// Order matches `worktrees[1..]` so the resulting args are deterministic.
+pub fn claude_add_dir_args(worktrees: &[MaterializedWorktree]) -> Vec<String> {
+    worktrees
+        .iter()
+        .skip(1)
+        .flat_map(|w| {
+            [
+                "--add-dir".to_string(),
+                w.worktree_path.display().to_string(),
+            ]
+        })
+        .collect()
+}
+
+impl IsolatedEditContext {
+    /// [`session_worktrees_env_value`] over this context's worktrees — the
+    /// [`SESSION_WORKTREES_ENV`] value to export onto the launched process.
+    pub fn session_worktrees_env_value(&self) -> Option<String> {
+        session_worktrees_env_value(&self.worktrees)
+    }
+
+    /// [`claude_add_dir_args`] over this context's worktrees — the
+    /// `--add-dir <sibling>` args to append to a `claude` launch command.
+    pub fn claude_add_dir_args(&self) -> Vec<String> {
+        claude_add_dir_args(&self.worktrees)
+    }
+}
+
+/// Convenience helper for the runner terminal-spawn entry points
 /// (`commands/terminal.rs::terminal_create`, `commands/productivity.rs::
-/// spawn_worker_session`, `mcp/tauri_proxy.rs::"terminal_create"`,
-/// `mcp/backend_relay.rs::handle_terminal_create`). Given the caller's
-/// `intent_repo` + `purpose` + original `working_dir`, returns the
-/// effective working dir for the PTY plus an `IsolatedEditContext` to
-/// park on the resulting `TerminalSession`.
+/// spawn_worker_session` + `launch_coordinator_session`,
+/// `mcp/terminals.rs::handle_terminal_create`, `mcp/tauri_proxy.rs::
+/// "terminal_create"`, `mcp/backend_relay.rs::handle_terminal_create`).
+/// Given the caller's `intent_repo` + `purpose` + original `working_dir`,
+/// returns the effective working dir for the PTY plus an
+/// `IsolatedEditContext` to park on the resulting `TerminalSession`.
 ///
 /// Behavior:
 /// - `intent_repo == None` → returns `(working_dir, None)`. Observation
@@ -843,5 +908,109 @@ mod tests {
             .expect("flag-off should return Ok(None), not Err");
             assert!(ctx.is_none(), "flag-off must return None");
         }
+    }
+
+    // ---- Phase 2c: QONTINUI_SESSION_WORKTREES env + --add-dir args ----
+
+    /// Expected `<repo>=<path>` segment for a `repo_fixture`-built worktree —
+    /// its `worktree_path` is the repo's `default_canonical_path`, so we
+    /// derive both sides from the same helpers (platform-portable; never a
+    /// hardcoded `d:/qontinui-root/...` literal).
+    fn expected_env_segment(repo: &str) -> String {
+        let canonical = super::super::canonical_paths::default_canonical_path(repo).unwrap();
+        format!("{}={}", repo, canonical.display())
+    }
+
+    #[test]
+    fn session_worktrees_env_value_covers_all_repos_in_order() {
+        // The env string lists EVERY materialized worktree (incl. repo[0]) as
+        // `<repo>=<abs_path>` joined by `;`, in worktree order.
+        let (wa, _ca) = repo_fixture("qontinui-runner");
+        let (wb, _cb) = repo_fixture("qontinui-coord");
+        let worktrees = vec![wa, wb];
+
+        let value = session_worktrees_env_value(&worktrees)
+            .expect("multi-repo context yields an env value");
+
+        let expected = format!(
+            "{};{}",
+            expected_env_segment("qontinui-runner"),
+            expected_env_segment("qontinui-coord"),
+        );
+        assert_eq!(value, expected);
+
+        // Every repo is represented, with its canonical path.
+        for repo in ["qontinui-runner", "qontinui-coord"] {
+            assert!(
+                value.contains(&expected_env_segment(repo)),
+                "env value missing segment for {repo}"
+            );
+        }
+        // Exactly one delimiter for two repos.
+        assert_eq!(value.matches(';').count(), 1, "one ';' between two repos");
+    }
+
+    #[test]
+    fn session_worktrees_env_value_is_none_for_empty() {
+        assert!(
+            session_worktrees_env_value(&[]).is_none(),
+            "no worktrees → no env var"
+        );
+    }
+
+    #[test]
+    fn claude_add_dir_args_skips_the_first_worktree() {
+        // `--add-dir` is appended once per SIBLING (worktrees[1..]); the first
+        // worktree is the process cwd and needs no `--add-dir`.
+        let (wa, _ca) = repo_fixture("qontinui-runner");
+        let (wb, _cb) = repo_fixture("qontinui-coord");
+        let worktrees = vec![wa, wb];
+
+        let args = claude_add_dir_args(&worktrees);
+
+        let coord_path = super::super::canonical_paths::default_canonical_path("qontinui-coord")
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(
+            args,
+            vec!["--add-dir".to_string(), coord_path],
+            "exactly one --add-dir pair, for the sibling (non-cwd) repo"
+        );
+    }
+
+    #[test]
+    fn claude_add_dir_args_empty_for_single_repo() {
+        let (wa, _ca) = repo_fixture("qontinui-runner");
+        assert!(
+            claude_add_dir_args(&[wa]).is_empty(),
+            "single-repo launch has no sibling --add-dir args"
+        );
+        assert!(
+            claude_add_dir_args(&[]).is_empty(),
+            "empty launch has no --add-dir args"
+        );
+    }
+
+    #[test]
+    fn context_accessors_match_freestanding_helpers() {
+        // The `IsolatedEditContext` convenience accessors must agree with the
+        // freestanding helpers over the same worktrees.
+        let (wa, ca) = repo_fixture("qontinui-runner");
+        let (wb, cb) = repo_fixture("qontinui-coord");
+        let mut ctx = IsolatedEditContext::for_test(vec![wa, wb], vec![ca, cb]);
+
+        assert_eq!(
+            ctx.session_worktrees_env_value(),
+            session_worktrees_env_value(&ctx.worktrees)
+        );
+        assert_eq!(
+            ctx.claude_add_dir_args(),
+            claude_add_dir_args(&ctx.worktrees)
+        );
+
+        // Non-async test: drain before drop.
+        ctx.active_claims.clear();
+        ctx.worktrees.clear();
     }
 }

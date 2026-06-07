@@ -741,10 +741,17 @@ async fn tagged_page_evaluate(
         "allow_network_requests": allow_network_requests,
     });
 
-    if let Err(e) = state
-        .app_handle
-        .emit("ui-bridge:evaluate-request", &payload)
-    {
+    // Target the canonical MAIN window only. `AppHandle::emit` is a GLOBAL
+    // broadcast that reaches every webview (main + pop-out `term-N`
+    // terminals); each window's `useUIBridgeEvaluateHandler` would then run
+    // the expression independently, fanning out a single-consumer request to
+    // N windows (duplicate side-effecting invokes). `emit_to(<main label>)`
+    // routes it to exactly one deterministic consumer.
+    if let Err(e) = state.app_handle.emit_to(
+        qontinui_runner_lib::get_main_window_label(),
+        "ui-bridge:evaluate-request",
+        &payload,
+    ) {
         state.ui_bridge_evaluate_store.cancel(&request_id).await;
         return Err(format!("Failed to emit ui-bridge:evaluate-request: {}", e));
     }

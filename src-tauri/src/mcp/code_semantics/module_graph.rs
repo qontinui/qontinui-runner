@@ -198,6 +198,62 @@ pub(super) async fn build_module_graph(dir: PathBuf) -> Option<(Vec<ModuleSummar
     .ok()
 }
 
+/// The UNCAPPED cross-module (directory→directory) dependency digraph edges.
+///
+/// For every import that the resolver bound to an in-repo file (`resolved_target`
+/// set, `resolution` neither `External` nor `Unresolved`), map both endpoints to
+/// their module dir; keep the edge only when it crosses a module boundary
+/// (`from != to`). Unlike [`ModuleSummary::internal_deps`] (capped at
+/// `MAX_DEPS_PER_MODULE` for the prompt budget), this is the FULL edge set — the
+/// layering Φ predicate (`Ξ_Layering`) MUST use this, never the capped summaries,
+/// or a 9th cross-layer breach edge would be silently dropped. The `BTreeSet`
+/// de-duplicates + orders the edges deterministically.
+pub(super) fn cross_module_edges(graph: &CodeGraph) -> BTreeSet<(String, String)> {
+    use crate::workflow_generation::code_graph::ResolutionKind;
+    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+    for imp in &graph.imports {
+        let target = match &imp.resolved_target {
+            Some(t) => t,
+            None => continue,
+        };
+        // Only honestly-resolved in-repo edges; External/Unresolved are not
+        // cross-module dependency edges.
+        if matches!(
+            imp.resolution,
+            ResolutionKind::External | ResolutionKind::Unresolved
+        ) {
+            continue;
+        }
+        let from = module_dir(&imp.from_file);
+        let to = module_dir(target);
+        if from != to {
+            edges.insert((from, to));
+        }
+    }
+    edges
+}
+
+/// Build the resolved `Ξ_AST` graph ONCE and derive everything `Ξ_Layering` needs
+/// off the async runtime: the per-module summaries (for the label prompt), the
+/// total module count, the structure fingerprint (cache key), and the UNCAPPED
+/// [`cross_module_edges`] digraph (for the Φ predicate + cycle detection). Returns
+/// `None` if the blocking build task panicked (the caller degrades to a cold
+/// envelope). Modeled on [`build_module_graph`]; the graph is built exactly once.
+pub(super) async fn build_layer_inputs(
+    dir: PathBuf,
+) -> Option<(Vec<ModuleSummary>, usize, u64, BTreeSet<(String, String)>)> {
+    tokio::task::spawn_blocking(move || {
+        let graph = CodeGraph::build(&dir);
+        let mods = summarize_modules(&graph);
+        let total = mods.len();
+        let fp = fingerprint_modules(&mods);
+        let edges = cross_module_edges(&graph);
+        (mods, total, fp, edges)
+    })
+    .await
+    .ok()
+}
+
 /// Render the numbered module-list block shared by both observers' prompts.
 /// Deterministic (modules in the given order, internal lists pre-sorted) so the
 /// prompt + tests are stable.
@@ -391,6 +447,55 @@ mod tests {
         // The Unresolved edge is dropped from external packages (coverage hole, not a pkg).
         assert!(!mods[0].external_pkgs.contains(&"./missing".to_string()));
         assert_eq!(mods[1].module, "src/services");
+    }
+
+    #[test]
+    fn cross_module_edges_are_uncapped_and_skip_external_unresolved() {
+        // src/api imports 9 distinct resolved targets in 9 different modules, plus an
+        // External and an Unresolved edge that must NOT become cross-module edges.
+        let mut imports = Vec::new();
+        for i in 0..9 {
+            imports.push(import(
+                "src/api/routes.ts",
+                &format!("../dep{i}/x"),
+                Some(&format!("src/dep{i}/x.ts")),
+                ResolutionKind::Relative,
+            ));
+        }
+        imports.push(import(
+            "src/api/routes.ts",
+            "express",
+            None,
+            ResolutionKind::External,
+        ));
+        imports.push(import(
+            "src/api/routes.ts",
+            "./missing",
+            None,
+            ResolutionKind::Unresolved,
+        ));
+        // An intra-module edge (same dir) must be dropped (from == to).
+        imports.push(import(
+            "src/api/routes.ts",
+            "./handlers",
+            Some("src/api/handlers.ts"),
+            ResolutionKind::Relative,
+        ));
+        let graph = CodeGraph {
+            files: vec![file("src/api/routes.ts")],
+            functions: vec![],
+            classes: vec![],
+            imports,
+            exports: vec![],
+            build_duration_ms: 0,
+        };
+        let edges = cross_module_edges(&graph);
+        // Exactly the 9 cross-module resolved edges — proves no cap at 8 (the
+        // MAX_DEPS_PER_MODULE prompt budget) and that External/Unresolved/intra are
+        // excluded.
+        assert_eq!(edges.len(), 9, "uncapped: all 9 cross-module edges kept");
+        assert!(edges.contains(&("src/api".to_string(), "src/dep8".to_string())));
+        assert!(!edges.iter().any(|(f, t)| f == "src/api" && t == "src/api"));
     }
 
     #[test]
