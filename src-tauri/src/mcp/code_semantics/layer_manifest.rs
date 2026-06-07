@@ -1,4 +1,4 @@
-//! `.qontinui/layers.toml` — the **authored declared side** for `Ξ_Layering`
+//! `qontinui-layers.toml` — the **authored declared side** for `Ξ_Layering`
 //! (Phase 4b). When a repo ships this manifest, `layer_observer` labels modules
 //! from it (instead of the `Ξ_Arch` kernel) and the verdict becomes **gate-grade**:
 //! the declared side is authored intent (the spec), so per the construct's
@@ -157,10 +157,13 @@ pub(super) struct LayerManifest {
 }
 
 impl LayerManifest {
-    /// Load `<project_dir>/.qontinui/layers.toml`. Returns `None` if the file is
-    /// absent or unparseable (the caller then falls back to the `Ξ_Arch` kernel path).
+    /// Load `<project_dir>/qontinui-layers.toml`. Returns `None` if the file is
+    /// absent or unparseable (the caller then falls back to the `Ξ_Arch` kernel
+    /// path). The manifest lives at the repo ROOT — NOT under `.qontinui/`, which is
+    /// a runtime-state dir gitignored in some repos (an authored declared side must
+    /// be committable).
     pub(super) fn load(project_dir: &Path) -> Option<LayerManifest> {
-        let path = project_dir.join(".qontinui").join("layers.toml");
+        let path = project_dir.join("qontinui-layers.toml");
         let content = std::fs::read_to_string(&path).ok()?;
         Self::parse(&content)
     }

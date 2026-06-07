@@ -156,7 +156,7 @@ pub const PROV_KERNEL_DOMAIN: &str = "claude_cli_domain";
 /// Advisory, never gate-worthy.
 pub const PROV_KERNEL_LAYER: &str = "claude_cli_layer";
 /// `Ξ_Layering` GATE-GRADE provenance (Phase 4b): the declared side is the authored
-/// `.qontinui/layers.toml`, so breach detection is deterministic over the resolved
+/// `qontinui-layers.toml`, so breach detection is deterministic over the resolved
 /// graph (not a kernel) — the verdict can recommend block/escalate.
 pub const PROV_LAYER_GATE: &str = "layer_drift_authored";
 /// Python `mypy` typecheck provenance (Phase A): full-fidelity, true overlay via
@@ -272,7 +272,7 @@ impl Envelope {
     }
 
     /// GATE-GRADE answer for `Ξ_Layering` 4b: the declared side is the authored
-    /// `.qontinui/layers.toml` (the spec), so the breach check is deterministic over
+    /// `qontinui-layers.toml` (the spec), so the breach check is deterministic over
     /// the resolved graph — `kernel:false`, with the resolver's credibility
     /// `(causal:high, authorial:high, boundary:medium)` rather than the model-hint
     /// kernel. The `result` body carries the `gate` recommendation.

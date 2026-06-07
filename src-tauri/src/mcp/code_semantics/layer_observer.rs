@@ -16,7 +16,7 @@
 //! - **4a — no manifest (advisory):** labels come from the `Ξ_Arch` kernel (a model
 //!   hint), so the envelope is `kernel:true`, `credibility=(medium,low,low)`, and
 //!   carries NO gate recommendation — a "breach" is a drift *signal*, never a verdict.
-//! - **4b — `<repo>/.qontinui/layers.toml` present (gate-grade):** labels come from
+//! - **4b — `<repo>/qontinui-layers.toml` present (gate-grade):** labels come from
 //!   the AUTHORED manifest (the spec), so breach detection is deterministic over the
 //!   resolved graph. The envelope is `kernel:false` with the resolver's credibility
 //!   `(high,high,medium)` and a `gate` recommendation (`block`/`escalate`/`allow`).
@@ -1120,7 +1120,7 @@ edges = [ { from_glob = "src/database/**", to_layer = "service", reason = "persi
     }
 
     /// Offline gate-validation bench (Phase 4b). For each repo in
-    /// `QONTINUI_BENCH_REPOS`, loads the REAL `<repo>/.qontinui/layers.toml`, builds
+    /// `QONTINUI_BENCH_REPOS`, loads the REAL `<repo>/qontinui-layers.toml`, builds
     /// the REAL resolved edges, and runs the REAL gate path — printing breaches,
     /// cycles, the gate recommendation, and coverage over the COMPLETE edge set (the
     /// confirmation the Appendix-A hand re-classification was one-sided about).
@@ -1139,7 +1139,7 @@ edges = [ { from_glob = "src/database/**", to_layer = "service", reason = "persi
             let manifest = match LayerManifest::load(dir) {
                 Some(m) => m,
                 None => {
-                    println!("=== {name}: NO .qontinui/layers.toml (skipped) ===");
+                    println!("=== {name}: NO qontinui-layers.toml (skipped) ===");
                     continue;
                 }
             };
