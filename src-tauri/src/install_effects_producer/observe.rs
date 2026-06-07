@@ -202,10 +202,12 @@ pub fn observe_audit(pm: PackageManager, repo_path: &Path, env: &RegistryEnv) ->
 /// operator-overridden escalation.
 ///
 /// Files whose extension isn't `.rs`/`.py` are still POSTed (the endpoint
-/// dispatches; a TS file goes through the language-service path) but a file the
-/// endpoint can't check (engine unavailable / cold) yields no result — it is
-/// simply not added (honest: we couldn't check it). The loop still counts as
-/// `ran` because it attempted.
+/// dispatches; a TS file goes through the tsc / language-service path) but a
+/// file the endpoint can't check (engine unavailable / cold) yields no result —
+/// it is simply not added (honest: we couldn't check it). `ran` is true ONLY
+/// when ≥1 USABLE result was produced: an attempted-but-all-undecidable loop
+/// must read as "not checked" (coord ⇒ honest Partial), never as "checked and
+/// nothing was affected" (coord ⇒ Confirmed).
 pub async fn run_typecheck_loopback(
     loopback_base: &str,
     repo_path: &Path,
@@ -231,10 +233,8 @@ pub async fn run_typecheck_loopback(
     );
 
     let mut results = Vec::new();
-    let mut ran = false;
     for rel in affected_files.iter().take(MAX_TYPECHECK_FILES) {
-        ran = true; // we attempted this file — the loop ran
-                    // The endpoint resolves the scope from the (absolute) file path.
+        // The endpoint resolves the scope from the (absolute) file path.
         let abs = repo_path.join(rel);
         let file_arg = abs.to_string_lossy().to_string();
         let body = serde_json::json!({ "file": file_arg });
@@ -260,16 +260,31 @@ pub async fn run_typecheck_loopback(
             results.push(tc);
         }
     }
+    // `ran` ⇐ ≥1 USABLE result — not merely "≥1 file attempted". When every
+    // attempted file came back undecidable (cold-scope `indexing`, engine
+    // unavailable, transport error), sending `typecheck_ran: true` with an
+    // empty result set would hit coord's "ran but no file was affected ⇒
+    // nothing could break ⇒ Confirmed" branch (`type_verdict`,
+    // install_effects.rs) — a FALSE Confirmed minted from zero actual checks
+    // (live-observed 2026-06-07: cold LS scope ⇒ type=Confirmed). Zero usable
+    // results ⇒ `ran=false` ⇒ coord composes an honest Partial instead.
+    let ran = !results.is_empty();
     (results, ran)
 }
 
 /// Map a `/code-semantics/typecheck` envelope into a coord [`TypecheckResult`].
-/// `pass` ⇐ `result.ok` (false when absent — a checker that couldn't decide is
-/// not a pass); `coverage` ⇐ `result.coverage` else envelope `coverage`;
-/// `provenance` ⇐ envelope `provenance` (+`+overridden` suffix when the
-/// escalation was overridden); `diagnostics` ⇐ stringified `result.errors`.
-/// Returns `None` for an `indexing`/`engine_unavailable` envelope (coverage 0,
-/// not a real check) so a cold scope reads as "not checked", not a false pass.
+/// `pass` ⇐ `result.ok` when present (tsc / cargo-check / mypy bodies all carry
+/// it); the TS Language-Service result body carries NO `ok` — there `pass` ⇐
+/// `result.errors` emptiness (the authoritative field that body does carry;
+/// live-observed 2026-06-07: a CLEAN LS check was previously recorded as
+/// `pass:false` via the old `ok`-absent ⇒ false rule, which coord composes as
+/// a FALSE Contradiction). A body with NEITHER `ok` NOR an `errors` array is
+/// not a decidable check — skipped (`None`), same as `indexing`. `coverage` ⇐
+/// `result.coverage` else envelope `coverage`; `provenance` ⇐ envelope
+/// `provenance` (+`+overridden` suffix when the escalation was overridden);
+/// `diagnostics` ⇐ stringified `result.errors`. Returns `None` for an
+/// `indexing`/`engine_unavailable` envelope (coverage 0, not a real check) so
+/// a cold scope reads as "not checked", not a false pass.
 fn typecheck_from_envelope(
     rel: &str,
     env: &serde_json::Value,
@@ -282,10 +297,17 @@ fn typecheck_from_envelope(
         return None;
     }
     let result = env.get("result");
-    let pass = result
-        .and_then(|r| r.get("ok"))
-        .and_then(|o| o.as_bool())
-        .unwrap_or(false);
+    let pass = match result.and_then(|r| r.get("ok")).and_then(|o| o.as_bool()) {
+        Some(ok) => ok,
+        None => match result
+            .and_then(|r| r.get("errors"))
+            .and_then(|e| e.as_array())
+        {
+            Some(errs) => errs.is_empty(),
+            // No `ok`, no `errors` — this body asserts nothing checkable.
+            None => return None,
+        },
+    };
     let coverage = result
         .and_then(|r| r.get("coverage"))
         .and_then(|c| c.as_f64())
@@ -490,5 +512,77 @@ mod tests {
         assert!(typecheck_from_envelope("a.rs", &env, false).is_none());
         let env2 = serde_json::json!({ "provenance": "engine_unavailable", "result": {} });
         assert!(typecheck_from_envelope("a.rs", &env2, false).is_none());
+    }
+
+    /// The TS Language-Service result body carries NO `ok` field — a clean
+    /// check is `errors: []`. Live-observed 2026-06-07: the old
+    /// `ok`-absent ⇒ `pass:false` rule turned a CLEAN LS check into a false
+    /// Contradiction at coord.
+    #[test]
+    fn typecheck_envelope_ls_shape_without_ok_uses_errors_emptiness() {
+        let clean = serde_json::json!({
+            "provenance": "ts-language-service",
+            "coverage": 1.0,
+            "result": {
+                "changed_signatures": [],
+                "coverage": 1.0,
+                "errors": [],
+                "overlay": false,
+                "removed_symbols": []
+            }
+        });
+        let tc = typecheck_from_envelope("src/user.ts", &clean, false).unwrap();
+        assert!(tc.pass, "clean LS check (errors: []) must map to pass:true");
+        assert_eq!(tc.provenance.as_deref(), Some("ts-language-service"));
+        assert_eq!(tc.coverage, 1.0);
+
+        let failing = serde_json::json!({
+            "provenance": "ts-language-service",
+            "coverage": 1.0,
+            "result": { "errors": ["user.ts(2,14): error TS2322"], "coverage": 1.0 }
+        });
+        let tc2 = typecheck_from_envelope("src/user.ts", &failing, false).unwrap();
+        assert!(!tc2.pass);
+        assert_eq!(tc2.diagnostics.len(), 1);
+    }
+
+    /// A result body with NEITHER `ok` NOR an `errors` array asserts nothing
+    /// checkable — it must be skipped, not recorded as a false fail.
+    #[test]
+    fn typecheck_envelope_undecidable_body_is_skipped() {
+        let env = serde_json::json!({
+            "provenance": "ts-language-service",
+            "coverage": 0.5,
+            "result": { "overlay": false }
+        });
+        assert!(typecheck_from_envelope("src/a.ts", &env, false).is_none());
+    }
+
+    /// All-attempted-but-all-skipped must report `ran=false` so coord composes
+    /// an honest Partial — NOT `typecheck_ran:true` + empty results, which
+    /// coord's `type_verdict` reads as "nothing could break ⇒ Confirmed"
+    /// (live-observed 2026-06-07 on a cold LS scope).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typecheck_loop_all_skipped_reports_ran_false() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/code-semantics/typecheck",
+            post(|| async {
+                Json(serde_json::json!({
+                    "provenance": "indexing",
+                    "coverage": 0.0,
+                    "result": {}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let d = tempdir().unwrap();
+        let (results, ran) =
+            run_typecheck_loopback(&base, d.path(), &["src/user.ts".to_string()], false).await;
+        assert!(results.is_empty());
+        assert!(!ran, "all-undecidable loop must NOT claim typecheck_ran");
     }
 }
