@@ -32,10 +32,12 @@
  */
 
 import { useEffect } from "react";
-import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
+import { emit, type Event } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
 import { getErrorMessage } from "@/lib/utils";
+import { acquireSingletonListener } from "./ui-bridge-events/singleton-listener";
+import { invokeRequestDedupe } from "./ui-bridge-events/request-dedupe";
 
 /**
  * Serialize an invoke() rejection into a string the Rust side can forward.
@@ -75,74 +77,100 @@ interface InvokeResponsePayload {
 }
 
 /**
+ * Dependencies for {@link handleInvokeRequest}, injected so the dispatch
+ * logic is unit-testable without a live Tauri runtime.
+ */
+export interface InvokeHandlerDeps {
+  invoke: (command: string, args: Record<string, unknown>) => Promise<unknown>;
+  emit: (event: string, payload: unknown) => Promise<void>;
+}
+
+/**
+ * Pure(-ish) handler for one `ui-bridge:invoke-request` event.
+ *
+ * Defense-in-depth EXACTLY-ONCE guard: the FIRST listener to see a given
+ * `request_id` claims it via {@link invokeRequestDedupe} and proceeds;
+ * any later listener (e.g. an accumulated duplicate) observes the claim
+ * and drops the call. This caps execution at one per request_id even if
+ * the singleton subscription guard is somehow bypassed.
+ *
+ * Returns `true` if this call executed the command (won the claim),
+ * `false` if it was deduped/ignored — exposed for tests.
+ */
+export async function handleInvokeRequest(
+  payload: InvokeRequestPayload,
+  deps: InvokeHandlerDeps,
+): Promise<boolean> {
+  const { request_id, command, args } = payload;
+
+  if (!request_id) {
+    // Without a request_id we can't route the response back. Drop it.
+    console.warn("[UIBridgeInvokeHandler] invoke-request missing request_id; ignoring");
+    return false;
+  }
+
+  if (!invokeRequestDedupe.claim(request_id)) {
+    log.debug(`invoke(${request_id}) already handled; ignoring duplicate`);
+    return false;
+  }
+
+  log.debug(`Received invoke request: ${command}`, request_id);
+
+  let response: InvokeResponsePayload;
+  try {
+    // Forward args verbatim. Tauri's IPC renames top-level camelCase keys
+    // to snake_case for the Rust command signature.
+    const result = await deps.invoke(command, args ?? {});
+    response = { request_id, ok: true, result: result as unknown };
+  } catch (err) {
+    const message = serializeInvokeError(err);
+    log.debug(`invoke(${command}) threw:`, message);
+    response = { request_id, ok: false, error: message };
+  }
+
+  try {
+    await deps.emit("ui-bridge:invoke-response", response);
+  } catch (emitErr) {
+    // If emit itself fails, the Rust side will hit its timeout. There's no
+    // better fallback here — we log and move on.
+    console.error("[UIBridgeInvokeHandler] Failed to emit invoke-response:", emitErr);
+  }
+  return true;
+}
+
+const invokeDeps: InvokeHandlerDeps = {
+  invoke: (command, args) => invoke(command, args),
+  emit: (event, payload) => emit(event, payload),
+};
+
+/**
  * Install a Tauri listener on `ui-bridge:invoke-request` that dispatches to
  * `invoke(command, args)` and emits the result back over
  * `ui-bridge:invoke-response`.
+ *
+ * The subscription is a SINGLETON per webview (see
+ * `ui-bridge-events/singleton-listener.ts`): no matter how many times this
+ * hook mounts — including React StrictMode's mount→unmount→remount, which
+ * runs in production too — exactly one underlying Tauri listener exists.
+ * That is the structural fix for the duplicate-execution bug; the
+ * `request_id` dedupe in {@link handleInvokeRequest} is the
+ * defense-in-depth backstop.
  *
  * Safe to mount once at app root alongside `UIBridgeEventHandler`. Multiple
  * concurrent invokes are supported (each carries its own `request_id`).
  */
 export function useUIBridgeInvokeHandler(): void {
   useEffect(() => {
-    let unlisten: UnlistenFn | null = null;
-    let isMounted = true;
-
-    const setupListener = async () => {
-      try {
-        log.debug("Setting up ui-bridge:invoke-request listener");
-
-        unlisten = await listen<InvokeRequestPayload>("ui-bridge:invoke-request", async (event) => {
-          if (!isMounted) {
-            log.debug("Component unmounted, ignoring invoke request");
-            return;
-          }
-
-          const { request_id, command, args } = event.payload;
-          log.debug(`Received invoke request: ${command}`, request_id);
-
-          let response: InvokeResponsePayload;
-          try {
-            // Forward args verbatim. Tauri's IPC renames top-level
-            // camelCase keys to snake_case for the Rust command signature.
-            const result = await invoke(command, args ?? {});
-            response = {
-              request_id,
-              ok: true,
-              result: result as unknown,
-            };
-          } catch (err) {
-            const message = serializeInvokeError(err);
-            log.debug(`invoke(${command}) threw:`, message);
-            response = {
-              request_id,
-              ok: false,
-              error: message,
-            };
-          }
-
-          try {
-            await emit("ui-bridge:invoke-response", response);
-          } catch (emitErr) {
-            // If emit itself fails, the Rust side will hit its timeout.
-            // There's no better fallback here — we log and move on.
-            console.error("[UIBridgeInvokeHandler] Failed to emit invoke-response:", emitErr);
-          }
-        });
-
-        log.debug("invoke-request listener set up successfully");
-      } catch (error) {
-        console.error("[UIBridgeInvokeHandler] Failed to set up invoke-request listener:", error);
-      }
-    };
-
-    setupListener();
-
+    log.debug("Acquiring singleton ui-bridge:invoke-request listener");
+    const release = acquireSingletonListener<InvokeRequestPayload>(
+      "ui-bridge:invoke-request",
+      (event: Event<InvokeRequestPayload>) => {
+        void handleInvokeRequest(event.payload, invokeDeps);
+      },
+    );
     return () => {
-      log.debug("Cleaning up invoke-request listener");
-      isMounted = false;
-      if (unlisten) {
-        unlisten();
-      }
+      log.debug("Releasing singleton ui-bridge:invoke-request listener");
+      release();
     };
   }, []);
 }
