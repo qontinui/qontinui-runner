@@ -26,6 +26,12 @@ pub fn is_rate_limit_error(error_msg: &str) -> bool {
         || lower.contains("overloaded")
         || lower.contains("token limit")
         || lower.contains("usage limit")
+        // The Claude CLI prints "You've hit your monthly spend limit ..." on a
+        // capacity-exhausted account. Treat it as a rate-limit so a mid-request
+        // hit rotates to another account instead of failing the call. (The
+        // weekly-usage snapshot already de-prefers such accounts at selection
+        // time; this covers an account that tips over mid-flight.)
+        || lower.contains("spend limit")
 }
 
 /// Determine whether an AI error response represents a transient/retryable failure.
@@ -43,6 +49,16 @@ pub fn is_rate_limit_error(error_msg: &str) -> bool {
 /// - Missing API key configuration
 /// - Client construction failures
 pub(super) fn is_retryable_error(error_msg: &str) -> bool {
+    // Every rate-limit / capacity-exhaustion error is retryable — it triggers
+    // account rotation upstream (the rotation branch is gated behind this
+    // function returning true). Keeping this as the first check makes
+    // `is_rate_limit_error` a true subset, so signals it matches but the
+    // explicit list below omits (e.g. "token limit", "usage limit", "spend
+    // limit") still reach the rotation path.
+    if is_rate_limit_error(error_msg) {
+        return true;
+    }
+
     let lower = error_msg.to_lowercase();
 
     // HTTP status code checks (from API error messages like "API error (429): ...")
@@ -392,6 +408,16 @@ mod tests {
         ));
         assert!(is_retryable_error("Too Many Requests"));
         assert!(is_retryable_error("rate limit reached, please slow down"));
+    }
+
+    #[test]
+    fn test_spend_limit_is_rate_limit() {
+        // The Claude CLI's monthly-spend-limit message must count as a
+        // rate-limit so a mid-request hit triggers account rotation.
+        let msg = "Claude CLI failed (exit 1): stdout: You've hit your monthly \
+                   spend limit . raise it at claude.ai/settings/usage";
+        assert!(is_rate_limit_error(msg));
+        assert!(is_retryable_error(msg));
     }
 
     #[test]
