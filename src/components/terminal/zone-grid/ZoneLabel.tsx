@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect } from "react";
-import { ChevronDown, Pin, Filter, ArrowDownToLine } from "lucide-react";
+import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap } from "lucide-react";
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { STATE_BORDER_COLORS } from "./constants";
+import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 
 export function ZoneLabel({
@@ -91,6 +92,21 @@ export function ZoneLabel({
         style={{ backgroundColor: STATE_BORDER_COLORS[state] }}
       />
       <span className="text-[10px] text-[#a9b1d6] truncate font-medium">{tab.title}</span>
+
+      {/* Honesty label (Phase 5): interactive PTY shells are non-durable — a
+          runner restart ends them. Mirrors the compact-card marker so the
+          operator sees it in the full-terminal view too, not only in the
+          compact multi-zone overview. */}
+      {isNonDurablePty(tab) && (
+        <span
+          className="flex items-center gap-0.5 shrink-0 text-[8px] text-[#565f89] bg-[#565f89]/15 px-1 py-0 rounded"
+          title={NON_DURABLE_TOOLTIP}
+          aria-label={`Ephemeral session: ${NON_DURABLE_TOOLTIP}`}
+        >
+          <Zap className="w-2.5 h-2.5" />
+          {NON_DURABLE_LABEL}
+        </span>
+      )}
 
       {outputLineCount !== undefined && outputLineCount > 0 && (
         <span className="text-[9px] text-[#565f89] font-mono ml-1 shrink-0">
