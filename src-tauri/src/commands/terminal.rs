@@ -920,14 +920,29 @@ pub(crate) fn create_terminal_session_backend(
     // env var. The `--add-dir <sibling>` convenience for `claude` launches is
     // appended into `command` by the caller (gate-continuation in
     // `agent_runtime.rs`), since only the caller knows the launch is `claude`.
-    let extra_env = isolated_ctx.as_ref().and_then(|ctx| {
-        ctx.session_worktrees_env_value().map(|v| {
-            vec![(
+    let mut env_pairs: Vec<(String, String)> = Vec::new();
+    if let Some(ctx) = isolated_ctx.as_ref() {
+        if let Some(v) = ctx.session_worktrees_env_value() {
+            env_pairs.push((
                 crate::agent_worktree::isolated_edit::SESSION_WORKTREES_ENV.to_string(),
                 v,
-            )]
-        })
-    });
+            ));
+        }
+    }
+    // Account selection: pin the spawned PTY to the account the caller chose
+    // (gate continuations set `capture_hint.config_dir` to the selected,
+    // token-bearing account). Without this, a backend-spawned `claude` inherits
+    // the runner's ambient `CLAUDE_CONFIG_DIR` (e.g. a quota-exhausted account)
+    // and dies instantly. The interactive terminal path sets this via the shell
+    // command instead; this is the backend-spawn equivalent.
+    if let Some(dir) = capture_hint.as_ref().and_then(|h| h.config_dir.clone()) {
+        env_pairs.push(("CLAUDE_CONFIG_DIR".to_string(), dir));
+    }
+    let extra_env = if env_pairs.is_empty() {
+        None
+    } else {
+        Some(env_pairs)
+    };
     // Keep a handle for the (optional) durable-record poller below, since the
     // `create` call consumes `app_handle`. `AppHandle` is a cheap Arc clone.
     let app_state = capture_hint.as_ref().map(|_| app_handle.clone());
