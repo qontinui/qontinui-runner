@@ -218,7 +218,20 @@ impl PgDb {
                 &[&assigned_session_id, &status, &origin, &description],
             )
             .await
-            .map_err(|e| format!("Failed to create emergent task: {}", e))?;
+            .map_err(|e| {
+                // `tokio_postgres::Error`'s Display prints only "db error" for
+                // server-side failures (it ignores the alternate `{:#}` flag);
+                // the real SQLSTATE + message live in the db-error cause. Surface
+                // them so a failure like 42P10 is diagnosable instead of opaque.
+                match e.as_db_error() {
+                    Some(db) => format!(
+                        "Failed to create emergent task: [{}] {}",
+                        db.code().code(),
+                        db
+                    ),
+                    None => format!("Failed to create emergent task: {e}"),
+                }
+            })?;
 
         Ok(row.map(|r| r.get(0)))
     }
