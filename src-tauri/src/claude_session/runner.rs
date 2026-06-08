@@ -2438,6 +2438,7 @@ pub fn run_claude_session_interactive(
         model_override,
         None, // worktree — promoted later via ClaudeSession::promote_to_worktree
         tool_policy,
+        None, // cli_session_ctx — non-chat spawn; CLI generates its own id
     )?;
 
     // Register with Doctor health monitoring

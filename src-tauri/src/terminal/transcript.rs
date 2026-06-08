@@ -189,6 +189,25 @@ fn encode_project_path(project_path: &str) -> String {
         .replace([':', '/', '\\', '_'], "-")
 }
 
+/// Absolute path to the on-disk JSONL transcript for a `(config_dir,
+/// project_path, session_id)` triple, whether or not it exists.
+///
+/// Mirrors the path construction used by [`read_session`] / [`session_digest`]
+/// (`<config_dir>/projects/<encoded(project_path)>/<session_id>.jsonl`).
+/// Exposed so the chat-resume path (Phase 3, restart resilience) can probe
+/// whether a lossless `--resume` is possible before deciding to fall back to a
+/// lossy output_log summary.
+pub fn session_transcript_path(
+    config_dir: &Path,
+    project_path: &str,
+    session_id: &str,
+) -> PathBuf {
+    config_dir
+        .join("projects")
+        .join(encode_project_path(project_path))
+        .join(format!("{}.jsonl", session_id))
+}
+
 // ── Session Listing ──────────────────────────────────────────────────────────
 
 /// List Claude Code sessions for a given project path.

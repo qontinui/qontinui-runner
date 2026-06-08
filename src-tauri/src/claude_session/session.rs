@@ -161,6 +161,7 @@ impl ClaudeSession {
         model_override: Option<&str>,
         worktree: Option<WorktreeInfo>,
         tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
+        cli_session_ctx: Option<&crate::claude_session::runner::CliSessionContext>,
     ) -> Result<Self, String> {
         info!(
             "Spawning interactive Claude session: {} in {}",
@@ -180,6 +181,32 @@ impl ClaudeSession {
             "--permission-mode".to_string(),
             "bypassPermissions".to_string(),
         ];
+
+        // ── Claude CLI session id (restart survival) ──────────────────────
+        // `--session-id <uuid>` pins the CLI session id on a NEW launch so the
+        // on-disk transcript lands at `<config_dir>/projects/<encoded(cwd)>/
+        // <id>.jsonl`; `--resume <uuid>` resumes a previously-pinned session
+        // losslessly from that transcript. The chat path passes the runner's
+        // own `session_id` (== task_run_id) as the CLI id so resume is
+        // deterministic without persisting a separate Claude-internal id.
+        // `None` preserves today's behavior (CLI generates a random id).
+        if let Some(ctx) = cli_session_ctx {
+            if ctx.is_resume {
+                cli_args.push("--resume".to_string());
+                cli_args.push(ctx.cli_session_id.clone());
+                info!(
+                    "Resuming Claude CLI session {} for interactive session {}",
+                    ctx.cli_session_id, session_id
+                );
+            } else {
+                cli_args.push("--session-id".to_string());
+                cli_args.push(ctx.cli_session_id.clone());
+                info!(
+                    "Pinning Claude CLI session id {} for interactive session {}",
+                    ctx.cli_session_id, session_id
+                );
+            }
+        }
 
         // Add model override if specified (e.g., from per-stage config)
         if let Some(model) = model_override {
@@ -1636,6 +1663,7 @@ impl ClaudeSession {
             None, // model_override
             Some(info.clone()),
             None, // tool_policy — worktree promotion preserves the original spawn's policy state
+            None, // cli_session_ctx — promotion changes cwd + does its own replay; no --resume
         )
         .map_err(|e| format!("promote_to_worktree: respawn failed: {}", e))?;
 
@@ -1734,6 +1762,7 @@ impl ClaudeSession {
             None, // model_override
             None, // worktree (rate-limit restart preserves the original cwd)
             None, // tool_policy (rate-limit restart preserves the original policy-less spawn)
+            None, // cli_session_ctx — in-process restart does its own replay; no --resume
         ) {
             Ok(new_session) => {
                 let new_session = Arc::new(new_session);

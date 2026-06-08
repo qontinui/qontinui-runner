@@ -2312,6 +2312,7 @@ pub async fn create_ai_session(
         None, // model_override
         None, // worktree
         None, // tool_policy
+        None, // cli_session_ctx
     ) {
         Ok(session) => {
             let session = Arc::new(session);

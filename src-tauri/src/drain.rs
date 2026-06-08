@@ -305,6 +305,109 @@ pub fn capture_wip_ref(
     Ok(true)
 }
 
+/// Outcome of a [`restore_wip_ref`] attempt — symmetric with
+/// [`capture_wip_ref`] so the resume path can log + react.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct RestoreOutcome {
+    /// True if a `refs/wip/<agent_session_id>` ref existed at all.
+    pub ref_existed: bool,
+    /// True if `git stash apply` of the ref applied cleanly (no conflicts /
+    /// non-zero exit). Only meaningful when `ref_existed`.
+    pub applied_clean: bool,
+    /// True if the ref was deleted after a clean apply. By contract we ONLY
+    /// delete on a clean apply — a dirty/failed apply keeps the ref so the
+    /// operator can recover it manually.
+    pub ref_deleted: bool,
+    /// The full ref name (`refs/wip/<agent_session_id>`), for logging /
+    /// SYSTEM_NOTE surfacing on the not-clean path.
+    pub ref_name: String,
+}
+
+/// Restore the working-tree state captured by [`capture_wip_ref`] into
+/// `repo_worktree`, symmetric with capture.
+///
+/// Reads `refs/wip/<agent_session_id>` (a `git stash create` commit) and:
+///   - If the ref does not exist → `Ok(RestoreOutcome{ ref_existed:false, .. })`
+///     (nothing captured at drain time — clean no-op).
+///   - If it exists → `git stash apply <ref-sha>` onto the working tree.
+///     - On a CLEAN apply (zero exit) → delete the ref
+///       (`update-ref -d`) so WIP refs don't accumulate ("squashed/dropped
+///       on successful resume") and return `applied_clean:true, ref_deleted:true`.
+///     - On a NON-clean apply (conflicts / non-zero exit) → KEEP the ref and
+///       return `applied_clean:false, ref_deleted:false`. The caller surfaces
+///       the ref name (a `[SYSTEM_NOTE]`) so the operator can apply it by hand.
+///       This never loses the captured state.
+///
+/// `Err` is reserved for a failure to even probe the ref (git spawn failure on
+/// `rev-parse`); a non-zero `stash apply` is NOT an `Err` — it is a clean
+/// `Ok(RestoreOutcome{ applied_clean:false, .. })` so resume degrades
+/// gracefully rather than aborting.
+pub fn restore_wip_ref(
+    repo_worktree: &std::path::Path,
+    agent_session_id: &Uuid,
+) -> Result<RestoreOutcome, String> {
+    let ref_name = format!("refs/wip/{agent_session_id}");
+    let mut outcome = RestoreOutcome {
+        ref_name: ref_name.clone(),
+        ..Default::default()
+    };
+
+    // Resolve the ref → stash sha. A missing ref is the clean no-op case;
+    // `rev-parse --verify --quiet` exits non-zero with empty stdout for a
+    // missing ref, which we distinguish from a spawn failure.
+    let sha = match run_git(
+        repo_worktree,
+        &["rev-parse", "--verify", "--quiet", &ref_name],
+    ) {
+        Ok(s) => {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                // Ref absent — nothing to restore.
+                return Ok(outcome);
+            }
+            s
+        }
+        // Non-zero exit from rev-parse --quiet means the ref is absent (git
+        // returns 1 with empty stderr). Treat as clean no-op, not an error.
+        Err(_) => return Ok(outcome),
+    };
+
+    outcome.ref_existed = true;
+
+    // Apply the captured stash commit onto the working tree. A clean apply
+    // exits 0; a conflicting apply exits non-zero (run_git → Err) but the
+    // stash commit itself is untouched, so the ref remains valid.
+    match run_git(repo_worktree, &["stash", "apply", &sha]) {
+        Ok(_) => {
+            outcome.applied_clean = true;
+            // Clean apply — drop the ref so it doesn't accumulate across
+            // restarts. A failure to delete is non-fatal (the ref simply
+            // lingers; a later clean restore is idempotent).
+            match run_git(repo_worktree, &["update-ref", "-d", &ref_name]) {
+                Ok(_) => outcome.ref_deleted = true,
+                Err(e) => warn!(
+                    "drain: restore applied cleanly but failed to delete {} ({}): {}",
+                    ref_name,
+                    repo_worktree.display(),
+                    e
+                ),
+            }
+        }
+        Err(e) => {
+            // Conflicted / failed apply — KEEP the ref. The caller surfaces
+            // `ref_name` for manual recovery.
+            warn!(
+                "drain: restore of {} did not apply cleanly ({}); keeping ref for manual apply: {}",
+                ref_name,
+                repo_worktree.display(),
+                e
+            );
+        }
+    }
+
+    Ok(outcome)
+}
+
 /// Run a `git -C <repo_dir> <args...>` command, returning trimmed stdout on
 /// success or a descriptive error on non-zero exit / spawn failure.
 fn run_git(repo_dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
@@ -351,6 +454,10 @@ mod tests {
         run(&["config", "user.email", "drain-test@example.com"]);
         run(&["config", "user.name", "Drain Test"]);
         run(&["config", "commit.gpgsign", "false"]);
+        // Pin line-ending handling off so round-trip content comparisons are
+        // exact on Windows (default core.autocrlf=true would rewrite \n→\r\n
+        // on checkout/reset).
+        run(&["config", "core.autocrlf", "false"]);
         std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "seed"]);
@@ -427,6 +534,80 @@ mod tests {
             ref_exists(&dir, &ref_name),
             "wip ref {ref_name} should exist after capture"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Read the working-tree content of a tracked file (or "" if absent),
+    /// with CRLF normalized to LF so comparisons are platform-independent.
+    fn read_file(dir: &std::path::Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name))
+            .unwrap_or_default()
+            .replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn restore_wip_ref_round_trips_with_capture() {
+        let dir = temp_dir("roundtrip");
+        init_repo(&dir);
+
+        // Dirty the tree: modify a tracked file + add an untracked file.
+        std::fs::write(dir.join("seed.txt"), "seed\nWIP edit\n").unwrap();
+        std::fs::write(dir.join("scratch.txt"), "uncommitted\n").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+
+        let sid = stable_ai_session_id("task-roundtrip");
+        let ref_name = format!("refs/wip/{sid}");
+
+        // Capture → ref exists.
+        let wrote = capture_wip_ref(&dir, &sid, "task-roundtrip").expect("capture ok");
+        assert!(wrote, "dirty tree must capture a ref");
+        assert!(ref_exists(&dir, &ref_name));
+
+        // Reset the working tree back to the committed state (simulating a
+        // fresh worktree on resume before restore runs).
+        let reset = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["reset", "--hard", "-q"])
+            .output()
+            .unwrap();
+        assert!(reset.status.success());
+        let _ = std::fs::remove_file(dir.join("scratch.txt"));
+        assert_eq!(read_file(&dir, "seed.txt"), "seed\n", "tree reset to base");
+
+        // Restore → tree matches the captured WIP, ref deleted.
+        let outcome = restore_wip_ref(&dir, &sid).expect("restore ok");
+        assert!(outcome.ref_existed, "ref must have existed");
+        assert!(outcome.applied_clean, "apply onto a clean tree is conflict-free");
+        assert!(outcome.ref_deleted, "clean apply must delete the ref");
+        assert_eq!(outcome.ref_name, ref_name);
+
+        // Working tree now carries the captured edits again.
+        assert_eq!(read_file(&dir, "seed.txt"), "seed\nWIP edit\n");
+        assert_eq!(read_file(&dir, "scratch.txt"), "uncommitted\n");
+        // Ref is gone (no accumulation).
+        assert!(
+            !ref_exists(&dir, &ref_name),
+            "ref must be deleted after a clean restore"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_wip_ref_absent_is_clean_noop() {
+        let dir = temp_dir("absent");
+        init_repo(&dir);
+        let sid = stable_ai_session_id("task-absent");
+        let outcome = restore_wip_ref(&dir, &sid).expect("restore ok");
+        assert!(!outcome.ref_existed, "no ref → ref_existed false");
+        assert!(!outcome.applied_clean);
+        assert!(!outcome.ref_deleted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
