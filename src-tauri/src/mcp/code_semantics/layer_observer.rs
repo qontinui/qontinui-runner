@@ -73,7 +73,9 @@ pub struct LayerDriftReq {
 
 /// Routes contributed alongside the `/code-graph/*` surface.
 pub fn routes() -> Router<Arc<ApiState>> {
-    Router::new().route("/code-graph/layer-drift", post(layer_drift))
+    Router::new()
+        .route("/code-graph/layer-drift", post(layer_drift))
+        .route("/code-graph/layer-credibility", post(layer_credibility))
 }
 
 /// POST /code-graph/layer-drift → kernel envelope of layer-drift findings.
@@ -143,6 +145,118 @@ async fn layer_drift(
 
     cache_put(fingerprint, layer_of.clone());
     Json(make_envelope(q, &scope.key, &edges, &layer_of, false))
+}
+
+/// POST /code-graph/layer-credibility → the declared-vs-kernel cross-check
+/// (rollout-safety follow-up). For a repo that ships `qontinui-layers.toml`, compares
+/// the AUTHORED manifest layer of each module against the `Ξ_Arch` LLM-INFERRED layer.
+/// `disagreements` (manifest layer != the model's read) are the soak-review signal — a
+/// likely manifest mislabel and a false-positive source for the gate. `suggestions` (a
+/// module with no manifest glob that the model would label) are coverage-gap fixes
+/// (what `[layers]` glob to add). `credibility` is the fraction of jointly-labelled
+/// modules where the manifest agrees with the model; low credibility means the
+/// manifest likely mislabels.
+///
+/// Stochastic (`kernel:true`) — it RANKS/FLAGS for a human, never decides. Pairs with
+/// coord's deterministic `coord_layering_triage` (the breach worklist).
+async fn layer_credibility(
+    State(_state): State<Arc<ApiState>>,
+    Json(req): Json<LayerDriftReq>,
+) -> Json<Envelope> {
+    let q = "layer_credibility";
+
+    let scope = match code_graph_api::resolve_project_scope(req.scope.as_deref(), None) {
+        Some(s) => s,
+        None => return Json(cold_envelope(q, "", "no resolvable scope (cold)")),
+    };
+    let project_dir = scope_project_dir(&scope);
+    let max_modules = req
+        .max_modules
+        .unwrap_or(module_graph::DEFAULT_MAX_MODULES)
+        .clamp(1, 200);
+
+    // The authored side is REQUIRED — credibility compares the manifest to the model.
+    let manifest = match LayerManifest::load(&project_dir) {
+        Some(m) => m,
+        None => {
+            return Json(cold_envelope(
+                q,
+                &scope.key,
+                "no qontinui-layers.toml — credibility needs an authored manifest to compare against",
+            ));
+        }
+    };
+
+    let (summaries, total_modules, _fp, edges) =
+        match module_graph::build_layer_inputs(project_dir).await {
+            Some(t) => t,
+            None => return Json(cold_envelope(q, &scope.key, "graph build failed")),
+        };
+    if total_modules == 0 || edges.is_empty() {
+        return Json(cold_envelope(q, &scope.key, "empty / cold graph"));
+    }
+
+    // Authored layer per module (manifest globs over the edge endpoints).
+    let authored = label_from_manifest(&edges, &manifest);
+
+    // Inferred layer per module (the Ξ_Arch LLM kernel; capped for the prompt budget).
+    let capped: Vec<ModuleSummary> = summaries.into_iter().take(max_modules).collect();
+    let assignments = arch_classify::classify_layers(&capped).await;
+    let inferred: BTreeMap<String, String> = assignments
+        .iter()
+        .map(|a| (a.module.clone(), a.layer.clone()))
+        .collect();
+
+    let mut agreements = 0usize;
+    let mut disagreements: Vec<Value> = Vec::new();
+    let mut suggestions: Vec<Value> = Vec::new();
+    for (module, inf_layer) in &inferred {
+        if inf_layer == "unknown" {
+            continue; // the model couldn't decide — not a credibility signal.
+        }
+        match authored.get(module) {
+            Some(auth_layer) if auth_layer == inf_layer => agreements += 1,
+            Some(auth_layer) => disagreements.push(json!({
+                "module": module, "authored": auth_layer, "inferred": inf_layer,
+            })),
+            None => {
+                if !manifest.is_exempt(module) {
+                    suggestions.push(json!({ "module": module, "inferred": inf_layer }));
+                }
+            }
+        }
+    }
+    disagreements.sort_by(|a, b| a["module"].as_str().cmp(&b["module"].as_str()));
+    suggestions.sort_by(|a, b| a["module"].as_str().cmp(&b["module"].as_str()));
+
+    let judged = agreements + disagreements.len();
+    let credibility = if judged == 0 {
+        0.0
+    } else {
+        agreements as f64 / judged as f64
+    };
+    let coverage = (judged as f64 / total_modules as f64).min(1.0);
+    let posterior = if judged > 0 {
+        module_graph::KERNEL_POSTERIOR
+    } else {
+        0.0
+    };
+
+    let result = json!({
+        "scope": scope.key,
+        "authored_modules": authored.len(),
+        "classified_modules": inferred.len(),
+        "agreements": agreements,
+        "credibility": credibility,
+        "disagreements": disagreements,
+        "suggestions": suggestions,
+        "note": "disagreements = manifest layer differs from the model's read (likely a \
+                 manifest mislabel / gate false-positive source); suggestions = modules with \
+                 no manifest glob that the model would label (coverage-gap fixes).",
+    });
+    Json(Envelope::kernel(
+        q, OBSERVER, PROVENANCE, result, posterior, coverage,
+    ))
 }
 
 // ===========================================================================
