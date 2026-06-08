@@ -738,11 +738,12 @@ mod manifest_drift_tests {
             // Pairs with `terminal-launch-menu` component actions.
             ("GET", "/ui-bridge/control/terminal-sessions"),
             ("GET", "/ui-bridge/control/terminal-sessions/{}"),
-            // Runner-owned webview windows — runner-only (enumerates THIS
-            // process's own Tauri windows; the SDK contract and the OS-window
-            // enumerator at /control/windows don't cover them). Phase 0 of the
-            // pop-out terminal-windows plan (2026-06-03).
-            ("GET", "/ui-bridge/control/runner-windows"),
+            // NOTE: /ui-bridge/control/runner-windows was here (runner-only
+            // allow-list) until the SDK declared it in UI_BRIDGE_ROUTES as the
+            // `listWindows` discovery method (plan 2026-06-07-multi-window-sdk-
+            // automation, Phase 2). Now that both sides declare it, it must NOT
+            // be allow-listed — leave it in the bidirectional diff so SDK and
+            // runner stay in lockstep.
             // /control/ai/* aliases mirroring SDK /ai/* (runner-side dual mount)
             ("DELETE", "/ui-bridge/control/ai/bookmark/{}"),
             ("DELETE", "/ui-bridge/control/ai/bookmarks/{}"),
