@@ -1831,6 +1831,12 @@ pub fn create_router(
     //   2. In debug builds only, add the audit layer via a rebind.
     //   3. Add the outermost CatchPanicLayer + state unconditionally.
     let router_with_inner_layers = base_router
+        // Degraded-boot guard (D2): when PG is unavailable (QONTINUI_ALLOW_NO_DB),
+        // short-circuit KNOWN DB-backed routes to a clean 503. No-op (one atomic
+        // load) on the normal PG-available path. See crate::mcp::pg_guard.
+        .layer(axum::middleware::from_fn(
+            crate::mcp::pg_guard::pg_degraded_guard_middleware,
+        ))
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))
@@ -1958,6 +1964,19 @@ pub async fn start_server(
     info!("MCP API server: building router via create_router...");
     let router = create_router(app_state, rag_state, app_handle, instance_manager);
     info!("MCP API server: create_router returned, entering bind loop");
+
+    // D3 (self-healing degraded mode): if the runner booted degraded (PG
+    // unreachable + QONTINUI_ALLOW_NO_DB), start a background probe that
+    // reconnects + provisions and lifts the pg_guard 503 gate when PG returns —
+    // no restart needed for a transient outage. No-op on a normal boot.
+    if !crate::database::pg::pg_available() {
+        if let Some(pg) = crate::database::pg::PgDb::try_global() {
+            tracing::warn!(
+                "Runner booted DEGRADED (no PG); starting background PG reconnect probe"
+            );
+            pg.spawn_reconnect_probe();
+        }
+    }
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
     // This can happen on Windows when previous process crashes leave orphaned sockets

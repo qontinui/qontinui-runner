@@ -97,12 +97,34 @@ pub mod worktrees;
 pub mod wsv_disagreements;
 
 use std::sync::{Arc, OnceLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Global PgDb instance, set once during app initialization.
 /// Allows sync-context code (thread spawns, closures) to access PG
 /// without threading Arc<PgDb> through every call chain.
 static GLOBAL_PG_DB: OnceLock<Arc<PgDb>> = OnceLock::new();
+
+/// Whether the canonical PG was reachable at boot. `true` after a successful
+/// `PgDb::new`; `false` when the runner booted degraded (`QONTINUI_ALLOW_NO_DB`)
+/// with PG unreachable. DB-backed HTTP handlers consult `pg_available()` to
+/// return a clean `503 database unavailable` instead of hitting a dead pool.
+///
+/// Defaults to `true` so the overwhelmingly common path (PG present) needs no
+/// explicit set and any code that reads it before boot completes does not
+/// spuriously 503; the degraded-boot path explicitly flips it to `false`.
+static PG_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Record whether the canonical PG is available. Called once at boot:
+/// `true` on a verified connection, `false` on degraded boot.
+pub fn set_pg_available(available: bool) {
+    PG_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns `false` only when the runner booted degraded with PG unreachable.
+/// DB-backed handlers use this to short-circuit to a 503 in degraded mode.
+pub fn pg_available() -> bool {
+    PG_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// PostgreSQL connection pool backed by deadpool-postgres.
 pub struct PgDb {
@@ -132,13 +154,13 @@ impl PgDb {
         GLOBAL_PG_DB.get().cloned()
     }
 
-    /// Connect to PostgreSQL using the given connection string.
-    ///
-    /// The connection string should NOT include search_path — it's set per-connection
-    /// via the pool's post_create hook to avoid parsing issues.
-    ///
-    /// Returns `Err` if the connection string is invalid or initial connectivity fails.
-    pub async fn new(database_url: &str) -> Result<Self, String> {
+    /// Build the deadpool connection pool WITHOUT verifying connectivity or
+    /// running the self-provision DDL. Shared by `new` (which then probes and
+    /// self-provisions) and `new_degraded` (which does neither). The builder
+    /// does no I/O and registers no timers (we deliberately avoid
+    /// `.recycle_timeout` — see the comment below), so it is safe to call from
+    /// a synchronous context outside a Tokio runtime.
+    fn build_pool(database_url: &str) -> Result<deadpool_postgres::Pool, String> {
         let pg_config: tokio_postgres::Config = database_url
             .parse()
             .map_err(|e| format!("Invalid PostgreSQL connection string: {}", e))?;
@@ -165,7 +187,7 @@ impl PgDb {
         // runs synchronously before the first `.await`, so the timer
         // registration races with runtime entry and panics.
         // See: src/main.rs:285 for the calling context.
-        let pool = deadpool_postgres::Pool::builder(mgr)
+        deadpool_postgres::Pool::builder(mgr)
             .max_size(8)
             .post_create(deadpool_postgres::Hook::async_fn(|conn, _| {
                 Box::pin(async move {
@@ -180,10 +202,45 @@ impl PgDb {
                 })
             }))
             .build()
-            .map_err(|e| format!("Failed to create PG pool: {}", e))?;
+            .map_err(|e| format!("Failed to create PG pool: {}", e))
+    }
 
+    /// Construct a DEGRADED PgDb for `QONTINUI_ALLOW_NO_DB` boot: the pool is
+    /// built (and reconnects lazily if PG later becomes reachable) but initial
+    /// connectivity is NOT verified and the self-provision DDL is skipped.
+    ///
+    /// Used only by the degraded-boot path in `main.rs` when the canonical PG
+    /// is unreachable AND degraded boot is explicitly enabled. The caller MUST
+    /// flip `set_pg_available(false)` so DB-backed handlers can return 503
+    /// instead of repeatedly hitting a pool that has no live backend.
+    pub fn new_degraded(database_url: &str) -> Result<Self, String> {
+        let pool = Self::build_pool(database_url)?;
+        Ok(Self { pool })
+    }
+
+    /// Connect to PostgreSQL using the given connection string.
+    ///
+    /// The connection string should NOT include search_path — it's set per-connection
+    /// via the pool's post_create hook to avoid parsing issues.
+    ///
+    /// Returns `Err` if the connection string is invalid or initial connectivity fails.
+    pub async fn new(database_url: &str) -> Result<Self, String> {
+        let pool = Self::build_pool(database_url)?;
+        let db = Self { pool };
+        db.verify_and_provision().await?;
+        Ok(db)
+    }
+
+    /// Verify connectivity and run the idempotent self-provision DDL (schema +
+    /// pgvector extension + the workflow-verification self-heals). Shared by
+    /// `new` at boot and the degraded-mode reconnect probe
+    /// (`spawn_reconnect_probe`), so a runner that booted with
+    /// `QONTINUI_ALLOW_NO_DB` provisions exactly as a normal boot would once PG
+    /// becomes reachable. Idempotent — safe to re-run on every retry.
+    pub async fn verify_and_provision(&self) -> Result<(), String> {
         // Verify connectivity and schema
-        let conn = pool
+        let conn = self
+            .pool
             .get()
             .await
             .map_err(|e| format!("PostgreSQL connection failed: {}", e))?;
@@ -361,8 +418,49 @@ impl PgDb {
 
         info!("PostgreSQL connected (deadpool, max_size=8, schema=runner)");
 
-        let db = Self { pool };
-        Ok(db)
+        Ok(())
+    }
+
+    /// D3 (self-healing degraded mode): when the runner booted degraded
+    /// (`QONTINUI_ALLOW_NO_DB` + PG unreachable, so `pg_available()` is false),
+    /// spawn a background task that retries `verify_and_provision` with
+    /// exponential backoff (2s → 60s cap). On the first success it provisions
+    /// the schema/extension that degraded boot skipped, flips
+    /// `set_pg_available(true)` so `pg_guard` stops 503-ing DB-backed routes,
+    /// and exits. The deadpool pool reconnects lazily, so a transient PG outage
+    /// self-heals without a runner restart. No-op if PG is already available.
+    pub fn spawn_reconnect_probe(self: Arc<Self>) {
+        if pg_available() {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(2);
+            let max_delay = std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(delay).await;
+                // Another path may have already lifted the gate — stop probing.
+                if pg_available() {
+                    break;
+                }
+                match self.verify_and_provision().await {
+                    Ok(()) => {
+                        set_pg_available(true);
+                        info!(
+                            "PG reconnect probe: PostgreSQL is reachable and provisioned — \
+                             exiting degraded mode, DB-backed routes resumed"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        debug!(
+                            "PG reconnect probe: still unavailable ({}); retrying in {:?}",
+                            e, delay
+                        );
+                        delay = (delay * 2).min(max_delay);
+                    }
+                }
+            }
+        });
     }
 
     // ========================================================================
