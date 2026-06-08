@@ -98,7 +98,11 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
     execution_mode: "auto",
     timeout_seconds: 600,
     config_dir: undefined,
-    account_selection_mode: "manual",
+    // Default to least-usage so a multi-account runner auto-balances across
+    // accounts (and never pins to a single, possibly-exhausted one). No-op
+    // with fewer than two config dirs, so safe as the default. Matches the
+    // Rust default (settings.rs AccountSelectionMode::LeastUsage).
+    account_selection_mode: "least_usage",
   },
   claude_api: {
     model: "claude-sonnet-4-20250514",

@@ -223,7 +223,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         customPath: settings.claude_cli.custom_path || null,
         timeoutSeconds: settings.claude_cli.timeout_seconds,
         configDir: settings.claude_cli.config_dir || null,
-        accountSelectionMode: settings.claude_cli.account_selection_mode || "manual",
+        accountSelectionMode: settings.claude_cli.account_selection_mode || "least_usage",
         model: settings.claude_api.model,
         maxTokens: settings.claude_api.max_tokens,
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,
