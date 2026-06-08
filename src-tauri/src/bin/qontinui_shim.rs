@@ -143,6 +143,12 @@ fn run(tool: ShimTool, args: &[String]) -> Option<i32> {
     let mut correlation_id: Option<String> = None;
     let mut escalate = false;
     let mut risk_factors = String::new();
+    // DYNAMIC interception mode (P4): start from the spawn-time env MODE and
+    // OVERRIDE it with the producer-returned `effective_mode` when present, so
+    // the fleet policy governs this already-injected stub. Absent (old
+    // runner/coord) ⇒ keep the env-derived mode (full back-compat). Parity with
+    // the bash shim's `eff_mode="${resp_eff_mode:-$MODE}"`.
+    let mut eff_mode = mode;
     if let Some(port) = port {
         let body = pre_call_body(tool.wire_pm().as_str(), &packages, dev, override_on);
         match http_post(port, "/install-effects/run", &body) {
@@ -151,6 +157,9 @@ fn run(tool: ShimTool, args: &[String]) -> Option<i32> {
                 escalate = resp.contains("\"gate\":\"escalate\"")
                     || resp.contains("\"gate\": \"escalate\"");
                 risk_factors = extract_risk_factors(&resp);
+                if let Some(em) = extract_effective_mode(&resp) {
+                    eff_mode = InterceptMode::parse(&em);
+                }
             }
             Err(_) => {
                 log_unavailable_once();
@@ -164,8 +173,9 @@ fn run(tool: ShimTool, args: &[String]) -> Option<i32> {
     }
 
     // ---- gate decision (lib-crate truth table) ---------------------------
+    // Uses `eff_mode` (effective_mode-over-env), NOT the raw spawn-time `mode`.
     if should_block(
-        mode,
+        eff_mode,
         escalate,
         override_on,
         lockfile_sync,
@@ -257,6 +267,27 @@ fn extract_correlation_id(resp: &str) -> Option<String> {
     let after_q1 = &after[q1 + 1..];
     let q2 = after_q1.find('"')?;
     Some(after_q1[..q2].to_string())
+}
+
+/// Best-effort grab of `"effective_mode":"…"` from the pre-call response
+/// (P4 — the dynamic per-install interception mode). `None` when absent (an
+/// old runner/coord that omits the field) so the caller keeps the spawn-time
+/// env mode. Mirrors `extract_correlation_id` + the bash shim's grep.
+fn extract_effective_mode(resp: &str) -> Option<String> {
+    let key = "\"effective_mode\"";
+    let i = resp.find(key)? + key.len();
+    let rest = &resp[i..];
+    let colon = rest.find(':')?;
+    let after = &rest[colon + 1..];
+    let q1 = after.find('"')?;
+    let after_q1 = &after[q1 + 1..];
+    let q2 = after_q1.find('"')?;
+    let val = after_q1[..q2].to_string();
+    if val.trim().is_empty() {
+        None
+    } else {
+        Some(val)
+    }
 }
 
 /// Best-effort display-only join of the `risk_factors` string array. Not
@@ -531,6 +562,28 @@ mod tests {
             Some("11111111-2222-3333-4444-555555555555")
         );
         assert_eq!(extract_correlation_id("{}"), None);
+    }
+
+    #[test]
+    fn extract_effective_mode_reads_field_or_falls_back() {
+        // Present + non-empty ⇒ Some(value), driving the dynamic override.
+        let resp = r#"{"gate":"escalate","effective_mode":"gate"}"#;
+        assert_eq!(extract_effective_mode(resp).as_deref(), Some("gate"));
+        assert_eq!(
+            extract_effective_mode(r#"{"effective_mode":"observe"}"#).as_deref(),
+            Some("observe")
+        );
+        // Absent (old runner/coord) ⇒ None ⇒ caller keeps the env mode.
+        assert_eq!(extract_effective_mode(r#"{"gate":"proceed"}"#), None);
+        assert_eq!(extract_effective_mode("{}"), None);
+        // Empty string ⇒ None (treated as absent, not a parseable mode).
+        assert_eq!(extract_effective_mode(r#"{"effective_mode":""}"#), None);
+        // Back-compat: an unrecognized value still parses (InterceptMode::parse
+        // fails open to Observe), but the extractor surfaces it verbatim.
+        assert_eq!(
+            extract_effective_mode(r#"{"effective_mode":"bogus"}"#).as_deref(),
+            Some("bogus")
+        );
     }
 
     #[test]

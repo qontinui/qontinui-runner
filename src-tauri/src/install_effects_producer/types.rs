@@ -126,6 +126,13 @@ impl From<&PackageSpecInput> for PackageSpec {
 pub struct RunResponse {
     /// The uuid minted for this run; echoed into every coord call so declare /
     /// predict-and-check / (Phase 3) verify correlate.
+    ///
+    /// OMITTED from the JSON when nil (`Uuid::nil()`): the P4 `off`
+    /// short-circuit returns a nil id so the shim's existing
+    /// `[ -n "$correlation_id" ]` guard skips the post-call WITHOUT any shim
+    /// change for the off path. A real run always mints a v4 (never nil), so
+    /// this only ever fires on the off short-circuit.
+    #[serde(skip_serializing_if = "Uuid::is_nil")]
     pub correlation_id: Uuid,
     /// The resolved repo slug (basename of `repo_path`).
     pub repo: String,
@@ -152,6 +159,17 @@ pub struct RunResponse {
     /// `None` when no verify ran (`dry_run_only` / blocked escalation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifyOutcome>,
+    /// The EFFECTIVE per-install interception mode this device resolved from
+    /// the fleet policy at pre-call time (`off` | `observe` | `gate`), P4 of
+    /// the fleet-policy channel redesign. The shim obeys THIS over its
+    /// spawn-time `QONTINUI_INSTALL_INTERCEPT_MODE` env so an operator flipping
+    /// the policy takes effect on already-injected terminals.
+    ///
+    /// Additive + serde-default: an old runner/coord that omits the field
+    /// deserializes as `""`, and the shim's `eff_mode="${resp_eff_mode:-$MODE}"`
+    /// fallback then keeps using the spawn-time env (full back-compat).
+    #[serde(default)]
+    pub effective_mode: String,
 }
 
 /// The slice of coord's `InstallVerification` the route surfaces to the caller

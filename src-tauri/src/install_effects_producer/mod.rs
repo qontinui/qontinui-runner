@@ -333,6 +333,41 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
     let correlation_id = Uuid::new_v4();
     let repo = repo_basename(&req.repo_path);
 
+    // ---- DYNAMIC interception mode (P4) -------------------------------------
+    // Read the device's EFFECTIVE install-interception level from the
+    // process-global fleet-policy cache (refreshed every ~45s by
+    // `mcp::fleet_policy_poller`). `run_with_base` has no app state, so the
+    // accessor is a synchronous lock read of the cache directly. Defaults to
+    // `"off"` until the poller's first success (fail-safe — never gate).
+    let effective_mode = crate::mcp::fleet_policy_poller::effective_install_intercept_mode();
+
+    // OFF short-circuit (D6): when the effective mode is `off`, an interception
+    // pre-call must SKIP declare/predict entirely, return NO `correlation_id`
+    // (so the shim's `[ -n "$correlation_id" ]` guard skips the post-call), and
+    // hand back `effective_mode:"off"` immediately — the real tool still runs
+    // in the agent's shell (the shim runs it; we just don't observe). The
+    // explicit `Full` route is UNAFFECTED (it never short-circuits on the fleet
+    // policy — it's the operator-driven `/install-effects/run` path).
+    if req.mode == RunMode::Intercept && effective_mode == "off" {
+        info!(
+            "install-effects: INTERCEPT pre-call but fleet policy = OFF (repo={repo}) \
+             — short-circuiting (no declare/predict, no correlation_id; tool runs uninstrumented)"
+        );
+        return Ok(ApiResponse::success(RunResponse {
+            correlation_id: Uuid::nil(),
+            repo,
+            package_manager: pm.as_str().to_string(),
+            gate: GateOutcome::Proceed,
+            risk_factors: Vec::new(),
+            escalation_overridden: false,
+            install: None,
+            dry_run_only: false,
+            resolution: serde_json::Value::Null,
+            verify: None,
+            effective_mode: "off".to_string(),
+        }));
+    }
+
     // ---- Phase 4: resolve private-registry auth env (NEVER logged/sent) ------
     // Injected into the dry-run / install / audit subprocesses ONLY. Custom
     // `CARGO_REGISTRIES_<NAME>_TOKEN` names the caller declares ride in
@@ -469,7 +504,8 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
         );
         info!(
             "install-effects: INTERCEPT pre-call (corr={correlation_id}, repo={repo}, pm={}) \
-             — declared+gated, install deferred to the agent shell; gate={gate:?}",
+             — declared+gated, install deferred to the agent shell; gate={gate:?}, \
+             effective_mode={effective_mode}",
             pm.as_str()
         );
         return Ok(ApiResponse::success(RunResponse {
@@ -483,6 +519,8 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
             dry_run_only: false,
             resolution: pac.resolution,
             verify: None,
+            // `observe` or `gate` here — `off` was short-circuited before declare.
+            effective_mode: effective_mode.clone(),
         }));
     }
 
@@ -505,6 +543,7 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
             dry_run_only: req.dry_run_only,
             resolution: pac.resolution,
             verify: None,
+            effective_mode: effective_mode.clone(),
         }));
     }
 
@@ -547,6 +586,7 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
         dry_run_only: false,
         resolution: pac.resolution,
         verify: Some(verify),
+        effective_mode,
     }))
 }
 
@@ -1583,7 +1623,13 @@ mod tests {
     // ===================================================================
 
     /// Build an intercept-mode pre-call request for a real `repo_path`.
+    ///
+    /// Pins the process-global fleet-policy cache to `observe` as a side effect
+    /// so the P4 `off` short-circuit (which fires when the cache is `off`, the
+    /// fail-safe default before any live poll) does NOT trigger — these tests
+    /// exercise the full declare→gate→stash intercept pre-call path.
     fn intercept_req(repo_path: &str, packages: Vec<&str>) -> RunRequest {
+        crate::mcp::fleet_policy_poller::set_mode_for_test("observe");
         RunRequest {
             repo_path: repo_path.to_string(),
             package_manager: Some("npm".to_string()),

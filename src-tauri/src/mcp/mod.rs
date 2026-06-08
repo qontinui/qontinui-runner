@@ -64,6 +64,7 @@ pub mod extraction;
 pub mod file_browser;
 pub mod file_registry;
 pub mod findings_api;
+pub mod fleet_policy_poller;
 pub mod generation_rules_api;
 pub mod generator_eval;
 pub mod git_supervision_api;
