@@ -63,6 +63,7 @@ use tokio_tungstenite::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::mcp::task_supervisor;
 use crate::mcp::types::ApiState;
 
 /// Maximum size (bytes) of a request or response body the generic
@@ -338,8 +339,8 @@ impl BackendRelayState {
 /// so settings changes (new backend URL, fresh token) take effect on the
 /// next attempt without a runner restart.
 pub async fn start_relay(api_state: Arc<ApiState>) -> Arc<BackendRelayState> {
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let (kick_tx, mut kick_rx) = watch::channel(0u64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (kick_tx, kick_rx) = watch::channel(0u64);
     let state = api_state;
 
     // SUPERVISOR. `relay_loop` owns the connection lifecycle and is only
@@ -353,74 +354,25 @@ pub async fn start_relay(api_state: Arc<ApiState>) -> Arc<BackendRelayState> {
     // `ws_connected:false` with every idle-gate green and kicks doing nothing
     // (and a pile of CLOSE_WAIT sockets from the relay's last connections).
     //
-    // This outer task supervises `relay_loop` and respawns it on a panic OR an
-    // unexpected (non-shutdown) return, with escalating backoff so a panic
-    // that reproduces immediately can't hot-spin. `catch_unwind` keeps a relay
-    // panic from escaping the supervisor (the crate builds panic=unwind;
-    // sentry still records the panic via its panic integration). A deliberate
-    // `stop()` (shutdown signal) is still the only clean exit.
-    let task_handle = tokio::spawn(async move {
-        use futures_util::FutureExt;
-        use std::panic::AssertUnwindSafe;
-
-        let mut respawn_backoff = Duration::from_secs(1);
-        const MAX_RESPAWN_BACKOFF: Duration = Duration::from_secs(30);
-
-        loop {
-            if *shutdown_rx.borrow() {
-                info!("Backend relay supervisor: shutdown observed, exiting");
-                return;
-            }
-
-            // Start each run level with the current kick version so a kick
-            // delivered between respawns doesn't make the fresh loop fire on
-            // an already-handled kick.
-            kick_rx.borrow_and_update();
-
-            let started = std::time::Instant::now();
-            let run = AssertUnwindSafe(relay_loop(
-                state.clone(),
-                shutdown_rx.clone(),
-                kick_rx.clone(),
-            ))
-            .catch_unwind()
-            .await;
-
-            // A shutdown is the ONLY clean reason for `relay_loop` to return.
-            if *shutdown_rx.borrow() {
-                info!("Backend relay supervisor: relay_loop exited on shutdown, exiting");
-                return;
-            }
-
-            match run {
-                Ok(()) => warn!(
-                    "Backend relay loop returned without a shutdown signal after {:.1}s \
-                     — respawning",
-                    started.elapsed().as_secs_f64()
-                ),
-                Err(_panic) => warn!(
-                    "Backend relay loop PANICKED after {:.1}s — respawning (the cloud relay \
-                     would otherwise stay dead until a runner restart)",
-                    started.elapsed().as_secs_f64()
-                ),
-            }
-
-            // A relay that ran a healthy while before dying resets the
-            // backoff; a quick re-death escalates it (capped).
-            if started.elapsed() >= Duration::from_secs(60) {
-                respawn_backoff = Duration::from_secs(1);
-            }
-            // Sleep before respawning, but wake immediately on shutdown so a
-            // `stop()` during the backoff window isn't delayed.
-            tokio::select! {
-                _ = tokio::time::sleep(respawn_backoff) => {}
-                _ = shutdown_rx.changed() => {
-                    info!("Backend relay supervisor: shutdown during respawn backoff, exiting");
-                    return;
-                }
-            }
-            respawn_backoff = (respawn_backoff * 2).min(MAX_RESPAWN_BACKOFF);
-        }
+    // `task_supervisor::spawn_supervised` is the shared respawn idiom (see also
+    // the device-JWT refresher): it respawns `relay_loop` on a panic OR an
+    // unexpected (non-shutdown) return, with escalating backoff so a panic that
+    // reproduces immediately can't hot-spin. A deliberate `stop()` (shutdown
+    // signal) is still the only clean exit. The factory below clones a fresh
+    // `kick_rx`/`shutdown_rx` per respawn, so `kick_cloud_relay` keeps working
+    // across respawns.
+    let mut kick_rx_loop = kick_rx;
+    let shutdown_rx_loop = shutdown_rx.clone();
+    let task_handle = task_supervisor::spawn_supervised("Backend relay", shutdown_rx, move || {
+        // Start each run level with the current kick version so a kick
+        // delivered between respawns doesn't make the fresh loop fire on an
+        // already-handled kick.
+        kick_rx_loop.borrow_and_update();
+        relay_loop(
+            state.clone(),
+            shutdown_rx_loop.clone(),
+            kick_rx_loop.clone(),
+        )
     });
 
     Arc::new(BackendRelayState {
