@@ -841,7 +841,7 @@ pub async fn ui_bridge_execute_action_handler(
     //      `serde_json::Error::InvalidUnicodeCodePoint`. Manual parsing
     //      lets us fall back to `String::from_utf8_lossy` and retry so a
     //      stray byte doesn't break the whole "type" action.
-    let request: UIBridgeActionRequest = match serde_json::from_slice(&body_bytes) {
+    let mut request: UIBridgeActionRequest = match serde_json::from_slice(&body_bytes) {
         Ok(req) => req,
         Err(first_err) => {
             // First retry: bytes may be valid JSON whose string contents
@@ -892,7 +892,19 @@ pub async fn ui_bridge_execute_action_handler(
     // detector/validation queries below so the element id resolves in the right
     // window's registry. Owned so it survives the awaits without borrowing query.
     // Empty string is treated as "no target" (main).
-    let window_label = query.window_label.clone();
+    //
+    // The `?windowLabel=` query wins; otherwise fall back to a `windowLabel`
+    // body field. The SDK's `ControlActionRequest` and the `windowScope` facade
+    // send the label in the body (like `page_evaluate` and the read/convenience
+    // family), so without this fallback a body-only label would silently run in
+    // the main window. Removed from `extra` so it never leaks into the merged
+    // action params.
+    let window_label = query.window_label.clone().or_else(|| {
+        request
+            .extra
+            .remove("windowLabel")
+            .and_then(|v| v.as_str().map(String::from))
+    });
     let window_label = window_label.as_deref().filter(|s| !s.is_empty());
 
     // ── Unknown-window gate ─────────────────────────────────────────────
