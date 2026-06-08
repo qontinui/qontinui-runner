@@ -1382,6 +1382,37 @@ impl ClaudeSession {
         }
     }
 
+    /// Flush any unpersisted accumulated output to `output_log` WITHOUT
+    /// closing the session.
+    ///
+    /// Used by the graceful-drain sequence (`crate::drain`) to ensure an
+    /// in-flight turn's text reaches the DB before a planned restart, so the
+    /// resume replay sees it. Idempotent vs. the dispatcher's own per-turn
+    /// flush (both guard on `persisted_output_len`): a turn that already
+    /// checkpointed Processing → Ready flushes nothing extra here.
+    ///
+    /// Mirrors the flush block in [`Self::close`], but leaves stdin, the state
+    /// machine, and the persister thread alive — the session keeps running
+    /// until the seam's `close_all_sessions` tears it down.
+    pub fn flush_pending_output(&self) {
+        if let Some(ref tx) = self.turn_persist_tx {
+            if let Ok(buf) = self.accumulated_output.lock() {
+                // Reserve the persisted region atomically so a concurrent
+                // dispatcher flush for the same content can't double-send.
+                let persisted = self.persisted_output_len.swap(usize::MAX, Ordering::SeqCst);
+                if buf.len() > persisted && persisted != usize::MAX {
+                    let delta = buf[persisted..].to_string();
+                    if !delta.trim().is_empty() {
+                        let _ = tx.send(delta);
+                    }
+                }
+                // Do NOT clear the buffer — the session stays alive and may
+                // produce more output before the seam closes it (close() will
+                // flush the remainder and clear).
+            }
+        }
+    }
+
     /// Gracefully close the session.
     pub fn close(&self) -> Result<(), String> {
         info!("Closing session {}", self.session_id);

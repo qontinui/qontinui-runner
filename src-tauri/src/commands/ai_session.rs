@@ -136,6 +136,15 @@ pub async fn send_user_message(
         message.len()
     );
 
+    // Graceful-drain gate (Phase 2): once a planned restart begins draining,
+    // refuse new AI turns so we don't start work that the imminent kill would
+    // tear in half. The drain flushes in-flight turns; new ones are rejected.
+    if crate::drain::is_draining() {
+        return Err(
+            "runner is draining for a planned restart — new messages are refused".to_string(),
+        );
+    }
+
     // Session-automation Phase 0 (R3) — operator interaction is the ONLY signal
     // that refreshes this session's coord heartbeat. Driving the heartbeat off
     // `send_user_message` (rather than the unconditional registry heartbeat

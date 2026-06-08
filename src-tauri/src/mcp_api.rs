@@ -388,6 +388,34 @@ async fn health(
     }))
 }
 
+/// `POST /drain` — graceful drain on planned restart (Phase 2 of
+/// `2026-06-06-runner-dev-loop-and-restart-resilience`).
+///
+/// Triggers the [`crate::drain::drain`] sequence: flips the global draining
+/// flag (refuses new AI turns), flushes in-flight turns to `output_log`,
+/// auto-commits each session's dirty worktree to `refs/wip/<agent_session_id>`,
+/// and heartbeats coord claims — all bounded by a hard timeout so a stuck
+/// session can never block a deploy. The supervisor calls this before its
+/// `taskkill`; the in-process exit seam also calls the drain fn directly.
+///
+/// Safe to call when idle (no sessions → fast no-op). Idempotent: a second
+/// call after a completed drain returns `{already_drained: true}` instantly.
+async fn drain_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> Json<crate::drain::DrainSummary> {
+    let app_handle = state.app_handle.clone();
+    let timeout = crate::drain::configured_timeout();
+    // The drain sequence is synchronous (blocking git + bounded polling), so
+    // run it on a blocking thread to keep the async executor free.
+    let summary = tokio::task::spawn_blocking(move || crate::drain::drain(&app_handle, timeout))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("drain task panicked: {e}");
+            crate::drain::DrainSummary::default()
+        });
+    Json(summary)
+}
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -1632,6 +1660,10 @@ pub fn create_router(
         .route("/health", get(health))
         .route("/ui-bridge/health", get(health))
         .route("/ui-bridge/status", get(health))
+        // Phase 2 — graceful drain on planned restart. The supervisor POSTs
+        // here before its hard taskkill so in-flight turns flush, dirty
+        // worktrees are stashed to refs/wip/*, and coord claims persist.
+        .route("/drain", post(drain_handler))
         // Relay web-integration diagnostic — exposes the idle-gating state
         // (tier, enabled, device-JWT presence, WS connection, last error) so
         // an operator can see WHY a runner never appears to the cloud/mobile.
