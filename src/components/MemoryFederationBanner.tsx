@@ -326,7 +326,7 @@ const bannerStyleSuccess: React.CSSProperties = {
 
 const bannerStyleFailure: React.CSSProperties = {
   ...bannerBase,
-  border: "1px solid var(--destructive, #ef4444)",
+  border: "1px solid hsl(var(--destructive, 0 84% 60%))",
 };
 
 const titleStyleSuccess: React.CSSProperties = {
@@ -340,7 +340,7 @@ const titleStyleFailure: React.CSSProperties = {
   margin: 0,
   marginBottom: 4,
   fontWeight: 600,
-  color: "var(--destructive, #ef4444)",
+  color: "hsl(var(--destructive, 0 84% 60%))",
 };
 
 const messageStyle: React.CSSProperties = {
@@ -359,7 +359,7 @@ const codeStyle: React.CSSProperties = {
 };
 
 const failedNumberStyle: React.CSSProperties = {
-  color: "var(--destructive, #ef4444)",
+  color: "hsl(var(--destructive, 0 84% 60%))",
 };
 
 const actionsColumnStyle: React.CSSProperties = {

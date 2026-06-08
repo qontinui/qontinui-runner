@@ -72,15 +72,15 @@ async fn get_federation_reports_impl(
         url.push_str(&params.join("&"));
     }
 
-    let tenant_id = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk()
-        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
+    // coord resolves the tenant from the verified bearer (FleetPrincipal,
+    // coord #440) — NOT the X-Qontinui-Tenant-Id header, which it no longer
+    // reads. Forward the device-JWT exactly like the reconcile path
+    // (`memory_client`); without it this read 403s `auth_required`.
+    let token = crate::auth::AuthManager::new()
+        .get_access_token()
+        .map_err(|e| anyhow::anyhow!("federation reports: no device token: {e}"))?;
 
-    let mut req = client.get(&url);
-    if let Some(tid) = tenant_id {
-        req = req.header("X-Qontinui-Tenant-Id", tid.to_string());
-    }
-
-    let resp = req.send().await?;
+    let resp = client.get(&url).bearer_auth(token).send().await?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
