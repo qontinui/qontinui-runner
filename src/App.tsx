@@ -71,6 +71,7 @@ import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
+import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
 import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
 import { TerminalSessionProvider } from "./components/terminal/contexts";
@@ -595,6 +596,16 @@ function AppContent() {
                     );
                   }}
                 />
+                {/*
+                  Phase 4 — startup session-recovery banner. Subscribes to the
+                  one-shot `session-recovery-summary` event emitted after
+                  auto-reattach; renders a prominent (crash) or quiet (planned)
+                  dismissible advisory in the top-right column, stacking with
+                  CoordWarningBanner. Renders nothing when there's nothing to
+                  report. Composes with the session-visibility surfaces rather
+                  than owning any session state.
+                */}
+                <SessionRecoveryBanner />
                 {showReorganize && (
                   <ReorganizeDialog
                     pages={terminalPages.pages}

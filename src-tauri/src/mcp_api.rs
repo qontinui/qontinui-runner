@@ -1053,11 +1053,44 @@ pub fn create_router(
             // Wait a bit longer than unified workflows to let the server fully start
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-            let count = crate::commands::ai_session::resume_ai_sessions(chat_sm, chat_handle).await;
-
-            if count > 0 {
-                info!("Resumed {} AI session(s) on startup", count);
+            // Phase 4 — classify this boot as crash recovery vs a planned
+            // restart from the on-disk shutdown marker, BEFORE we overwrite
+            // it. A missing / `clean:false` / corrupt marker ⇒ the previous
+            // shutdown was NOT clean ⇒ crash recovery. We then immediately
+            // (re)write the marker `clean:false` for the NOW-running process
+            // so that if THIS process crashes the next boot detects it. The
+            // clean drain / exit seam flips it back to `clean:true`.
+            let marker_path = crate::session::shutdown_marker::marker_path(
+                crate::mcp::types::get_mcp_api_port(),
+            );
+            let crash_recovery =
+                crate::session::shutdown_marker::was_unclean_shutdown(&marker_path);
+            crate::session::shutdown_marker::mark_running(&marker_path);
+            if crash_recovery {
+                warn!("Startup recovery: previous shutdown was NOT clean — this is crash recovery");
             }
+
+            let summary = crate::commands::ai_session::resume_ai_sessions(
+                chat_sm,
+                chat_handle.clone(),
+                crash_recovery,
+            )
+            .await;
+
+            if summary.resumed_count > 0 {
+                info!(
+                    "Resumed {} AI session(s) on startup (crash_recovery={})",
+                    summary.resumed_count, summary.crash_recovery
+                );
+            }
+
+            // Emit the structured startup-recovery summary ONCE so the
+            // frontend can surface a (prominent on crash / quiet on planned)
+            // banner with honest per-session fidelity + claim + WIP status.
+            // Always emit — even with zero sessions — so a late-mounting
+            // banner that requested a replay can settle; the frontend hides
+            // itself when there's nothing to show.
+            crate::commands::ai_session::emit_session_recovery_summary(&chat_handle, &summary);
         });
     }
 

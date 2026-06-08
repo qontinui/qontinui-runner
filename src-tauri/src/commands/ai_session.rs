@@ -40,6 +40,104 @@ pub struct SessionStateEvent {
     pub resumed: bool,
 }
 
+/// How a session's conversation was reconstructed on resume (Phase 4
+/// honesty gate). Serialized lowercase-kebab for the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResumeFidelity {
+    /// Resumed losslessly via the on-disk `--resume` transcript.
+    Lossless,
+    /// Reconstructed from the lossy `output_log` summary — earlier context
+    /// may be missing. `turnsCovered` carries the count.
+    Summary,
+}
+
+/// What happened to the session's isolated-worktree coord claim on resume
+/// (Phase 4 honesty gate). Serialized lowercase-kebab for the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimStatus {
+    /// No isolated worktree was involved (shared checkout / worktree mode
+    /// off) — nothing session-scoped to re-acquire.
+    None,
+    /// The worktree claim was cleanly re-acquired under the original owner.
+    Reacquired,
+    /// A peer now holds the claim under a different owner — degraded to the
+    /// shared checkout in read-mostly mode (NOT clobbered).
+    PeerConflict,
+    /// Re-acquire failed for another reason — degraded to the shared
+    /// checkout without a claim.
+    Degraded,
+}
+
+/// What happened to the session's drained WIP ref on resume (Phase 4 honesty
+/// gate). Serialized lowercase-kebab for the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WipStatus {
+    /// No WIP ref was captured at drain time (clean tree / no worktree).
+    None,
+    /// The drained WIP applied cleanly back into the worktree.
+    Restored,
+    /// The WIP could not be applied cleanly — kept at `refs/wip/*` for the
+    /// operator to recover manually.
+    KeptForManual,
+}
+
+/// Per-session recovery outcome, assembled as `resume_ai_sessions` resumes
+/// each session (Phase 4). Threaded out of the resume loop and into the
+/// `session-recovery-summary` event so the frontend can surface an HONEST
+/// per-session status (lossy / degraded / peer-conflict are never hidden).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecoveryOutcome {
+    /// The resumed session's task run id (stable identity across restarts).
+    pub task_run_id: String,
+    /// Human-readable title shown in the banner.
+    pub title: String,
+    /// Lossless `--resume` vs lossy summary fallback.
+    pub fidelity: ResumeFidelity,
+    /// On a `summary` fidelity, the number of conversation turns the lossy
+    /// summary covers (mirrors the honest-label marker). `0` for lossless.
+    pub turns_covered: usize,
+    /// Worktree-claim re-acquire outcome.
+    pub claim_status: ClaimStatus,
+    /// Drained-WIP restore outcome.
+    pub wip_status: WipStatus,
+}
+
+/// Structured startup-recovery summary emitted ONCE after `resume_ai_sessions`
+/// runs at boot (Phase 4). Carries the crash-vs-planned classification (from
+/// the on-disk shutdown marker) plus a per-session honesty breakdown.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecoverySummary {
+    /// `true` when the previous shutdown was NOT clean (the runner crashed /
+    /// was hard-killed). Drives the prominent vs quiet banner on the
+    /// frontend.
+    pub crash_recovery: bool,
+    /// Number of sessions successfully resumed.
+    pub resumed_count: u32,
+    /// Per-session honest outcomes (one entry per successfully resumed
+    /// session).
+    pub sessions: Vec<SessionRecoveryOutcome>,
+}
+
+/// Tauri event name for the one-shot startup recovery summary (Phase 4).
+pub const SESSION_RECOVERY_SUMMARY_EVENT: &str = "session-recovery-summary";
+
+/// Emit the startup recovery summary to the frontend, once, after resume
+/// completes. A banner subscribes and renders crash-vs-planned + per-session
+/// fidelity/claim/WIP honesty. No-op-safe: an emit failure is logged only.
+pub fn emit_session_recovery_summary(
+    app_handle: &tauri::AppHandle,
+    summary: &SessionRecoverySummary,
+) {
+    if let Err(e) = app_handle.emit(SESSION_RECOVERY_SUMMARY_EVENT, summary) {
+        warn!("Failed to emit {} event: {}", SESSION_RECOVERY_SUMMARY_EVENT, e);
+    }
+}
+
 /// Emit a session state change event to the frontend.
 pub fn emit_session_state(
     app_handle: &tauri::AppHandle,
@@ -1294,6 +1392,8 @@ async fn reacquire_and_restore_session_worktree(
     Option<String>,
     Vec<String>,
     Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    ClaimStatus,
+    WipStatus,
 ) {
     use crate::agent_worktree::isolated_edit::{acquire, AcquireRequest};
 
@@ -1310,11 +1410,11 @@ async fn reacquire_and_restore_session_worktree(
                 "AI session resume: worktree lookup failed for {} ({}); shared-checkout fallback",
                 task_run_id, e
             );
-            return (None, notes, None);
+            return (None, notes, None, ClaimStatus::None, WipStatus::None);
         }
     };
     if worktree_rows.is_empty() {
-        return (None, notes, None);
+        return (None, notes, None, ClaimStatus::None, WipStatus::None);
     }
 
     // 2. Map each worktree's `repo_path` (the source checkout) back to a bare
@@ -1336,7 +1436,7 @@ async fn reacquire_and_restore_session_worktree(
         }
     }
     if repos.is_empty() {
-        return (None, notes, None);
+        return (None, notes, None, ClaimStatus::None, WipStatus::None);
     }
 
     // 3. Re-acquire under the SAME stable agent_session_id the drain used, so
@@ -1367,9 +1467,16 @@ async fn reacquire_and_restore_session_worktree(
 
             // 4. Restore the drained WIP ref into each re-acquired worktree
             //    (Phase 2 wrote `refs/wip/<agent_session_id>` per worktree).
+            //    `wip_status` is the WORST outcome across worktrees: a single
+            //    not-clean apply degrades the whole session to KeptForManual
+            //    (the honest banner state).
+            let mut wip_status = WipStatus::None;
             for w in &ctx.worktrees {
                 match crate::drain::restore_wip_ref(&w.worktree_path, &agent_session_id) {
                     Ok(outcome) if outcome.ref_existed && outcome.applied_clean => {
+                        if wip_status == WipStatus::None {
+                            wip_status = WipStatus::Restored;
+                        }
                         info!(
                             "AI session resume: restored WIP {} into {} (ref deleted={})",
                             outcome.ref_name,
@@ -1379,6 +1486,7 @@ async fn reacquire_and_restore_session_worktree(
                     }
                     Ok(outcome) if outcome.ref_existed => {
                         // Apply was not clean — ref kept; surface for manual apply.
+                        wip_status = WipStatus::KeptForManual;
                         notes.push(format!(
                             "[SYSTEM_NOTE] Uncommitted work from before the restart could not be \
                              applied cleanly in {}. It is preserved at `{}` — run \
@@ -1413,16 +1521,21 @@ async fn reacquire_and_restore_session_worktree(
             // would keep the heartbeat alive until process exit and never
             // release the claim, blocking a peer from re-acquiring the
             // worktree after this session dies.
-            (workdir, notes, Some(ctx))
+            (workdir, notes, Some(ctx), ClaimStatus::Reacquired, wip_status)
         }
         Ok(None) => {
             // Worktree mode off — shared-checkout fallback, no claim.
-            (None, notes, None)
+            (None, notes, None, ClaimStatus::None, WipStatus::None)
         }
         Err(e) => {
             // A `ClaimConflict` (peer holds it under a different owner) or any
             // other allocate error → DO NOT clobber. Surface + degrade to the
-            // shared checkout in read-mostly mode.
+            // shared checkout in read-mostly mode. A genuine peer-conflict is
+            // classified distinctly (PeerConflict) so the banner can be HONEST
+            // that another agent now holds the worktree, vs a generic transport
+            // failure (Degraded).
+            let is_peer_conflict =
+                matches!(e, crate::agent_worktree::AllocateError::ClaimConflict(_));
             let msg = e.to_string();
             warn!(
                 "AI session resume: worktree re-acquire for {} failed ({}); \
@@ -1434,7 +1547,12 @@ async fn reacquire_and_restore_session_worktree(
                  the restart ({msg}). Another agent may now hold it — resuming in shared, \
                  read-mostly mode. Re-check ownership before making edits."
             ));
-            (None, notes, None)
+            let claim_status = if is_peer_conflict {
+                ClaimStatus::PeerConflict
+            } else {
+                ClaimStatus::Degraded
+            };
+            (None, notes, None, claim_status, WipStatus::None)
         }
     }
 }
@@ -1454,13 +1572,31 @@ async fn reacquire_and_restore_session_worktree(
 /// marked failed in PG with a `resume_failed:` error message so the sidebar
 /// reflects reality rather than showing a phantom "running" state.
 ///
-/// Returns the number of sessions successfully resumed.
+/// `crash_recovery` is the boot classification from the on-disk shutdown
+/// marker (see `session::shutdown_marker`): `true` when the previous shutdown
+/// was NOT clean. It is threaded onto the returned [`SessionRecoverySummary`]
+/// so the caller can emit a single `session-recovery-summary` event and the
+/// frontend can choose a prominent (crash) vs quiet (planned) banner.
+///
+/// Returns a [`SessionRecoverySummary`] carrying the resumed count, the
+/// crash-vs-planned flag, and a per-session honesty breakdown (resume
+/// fidelity + claim status + WIP status).
 pub async fn resume_ai_sessions(
     session_manager: Arc<SessionManager>,
     app_handle: tauri::AppHandle,
-) -> u32 {
+    crash_recovery: bool,
+) -> SessionRecoverySummary {
     use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
     use crate::claude_session::ClaudeSession;
+
+    // An empty summary carries only the boot classification — used for every
+    // early exit (no sessions / not-yet-ready) so the caller still learns
+    // whether this was a crash boot.
+    let empty_summary = || SessionRecoverySummary {
+        crash_recovery,
+        resumed_count: 0,
+        sessions: Vec::new(),
+    };
 
     // Grab AppState from Tauri's managed state — same pattern other resume
     // paths use. If unavailable we're being invoked before setup completes;
@@ -1469,7 +1605,7 @@ pub async fn resume_ai_sessions(
         Some(s) => s.inner().clone(),
         None => {
             warn!("AI session resume: AppState not yet available; skipping");
-            return 0;
+            return empty_summary();
         }
     };
 
@@ -1486,7 +1622,7 @@ pub async fn resume_ai_sessions(
         .load(std::sync::atomic::Ordering::Relaxed);
     if my_port == 0 {
         warn!("AI session resume: api_port not set yet; skipping");
-        return 0;
+        return empty_summary();
     }
 
     let pg = app_state.pg_db.clone();
@@ -1495,13 +1631,13 @@ pub async fn resume_ai_sessions(
         Ok(rows) => rows,
         Err(e) => {
             error!("AI session resume: failed to query resumable chats: {}", e);
-            return 0;
+            return empty_summary();
         }
     };
 
     if rows.is_empty() {
         info!("AI session resume: no resumable chat sessions found");
-        return 0;
+        return empty_summary();
     }
 
     info!(
@@ -1517,6 +1653,7 @@ pub async fn resume_ai_sessions(
     };
 
     let mut resumed: u32 = 0;
+    let mut outcomes: Vec<SessionRecoveryOutcome> = Vec::new();
 
     for (task_run_id, task_name, auto_continue) in rows {
         if !auto_continue {
@@ -1578,7 +1715,7 @@ pub async fn resume_ai_sessions(
         // Returns the worktree path to re-spawn into (when re-acquire
         // succeeded) plus any operator-facing notes (peer-conflict / manual
         // WIP recovery). Graceful-degrades to the shared cwd on any failure.
-        let (workdir_override, system_notes, reacquired_ctx) =
+        let (workdir_override, system_notes, reacquired_ctx, claim_status, wip_status) =
             reacquire_and_restore_session_worktree(&task_run_id, &pg).await;
 
         // Effective working dir: the re-acquired worktree, else the shared cwd
@@ -1641,6 +1778,18 @@ pub async fn resume_ai_sessions(
                 build_honest_summary_prompt(&replay_prompt, turns.len())
             ))
         };
+
+        // Capture the per-session honesty signals BEFORE the spawn closure
+        // moves/consumes the locals. `fidelity` is lossless iff we resumed from
+        // an on-disk transcript; otherwise it's the lossy summary, and
+        // `turns_covered` records how many turns that summary spans.
+        let fidelity = if can_full_resume {
+            ResumeFidelity::Lossless
+        } else {
+            ResumeFidelity::Summary
+        };
+        let turns_covered = if can_full_resume { 0 } else { turns.len() };
+        let outcome_title = task_name.clone();
 
         // Spawn the Claude CLI session on a blocking thread — ClaudeSession::spawn
         // blocks waiting for the init handshake. This mirrors create_ai_session.
@@ -1745,8 +1894,19 @@ pub async fn resume_ai_sessions(
 
         match spawn_result {
             Ok(Ok(())) => {
-                info!("AI session resume: resumed {}", task_run_id);
+                info!(
+                    "AI session resume: resumed {} (fidelity={:?} claim={:?} wip={:?})",
+                    task_run_id, fidelity, claim_status, wip_status
+                );
                 resumed += 1;
+                outcomes.push(SessionRecoveryOutcome {
+                    task_run_id: task_run_id.clone(),
+                    title: outcome_title,
+                    fidelity,
+                    turns_covered,
+                    claim_status,
+                    wip_status,
+                });
             }
             Ok(Err(e)) => {
                 warn!("AI session resume: {} failed: {}", task_run_id, e);
@@ -1767,7 +1927,11 @@ pub async fn resume_ai_sessions(
         }
     }
 
-    resumed
+    SessionRecoverySummary {
+        crash_recovery,
+        resumed_count: resumed,
+        sessions: outcomes,
+    }
 }
 
 /// Tries both the cached external app specs and the runner's own specs.
@@ -2057,5 +2221,109 @@ mod resume_tests {
         // marker string only originates from honest_summary_marker, which the
         // full-resume branch does not call.
         assert!(!notes_only.contains(&honest_summary_marker(1)));
+    }
+
+    // ── Phase 4 — recovery-summary assembly + serde honesty contract ────────
+
+    fn outcome(
+        id: &str,
+        fidelity: ResumeFidelity,
+        turns: usize,
+        claim: ClaimStatus,
+        wip: WipStatus,
+    ) -> SessionRecoveryOutcome {
+        SessionRecoveryOutcome {
+            task_run_id: id.to_string(),
+            title: format!("title-{id}"),
+            fidelity,
+            turns_covered: turns,
+            claim_status: claim,
+            wip_status: wip,
+        }
+    }
+
+    #[test]
+    fn summary_assembles_count_and_crash_flag() {
+        let summary = SessionRecoverySummary {
+            crash_recovery: true,
+            resumed_count: 2,
+            sessions: vec![
+                outcome(
+                    "a",
+                    ResumeFidelity::Lossless,
+                    0,
+                    ClaimStatus::Reacquired,
+                    WipStatus::Restored,
+                ),
+                outcome(
+                    "b",
+                    ResumeFidelity::Summary,
+                    5,
+                    ClaimStatus::PeerConflict,
+                    WipStatus::KeptForManual,
+                ),
+            ],
+        };
+        assert!(summary.crash_recovery);
+        assert_eq!(summary.resumed_count, 2);
+        assert_eq!(summary.sessions.len(), 2);
+    }
+
+    #[test]
+    fn summary_serializes_camelcase_with_honest_kebab_statuses() {
+        // The frontend banner type mirrors this exact wire shape; pin it so a
+        // rename can't silently break the honesty surfacing.
+        let summary = SessionRecoverySummary {
+            crash_recovery: true,
+            resumed_count: 1,
+            sessions: vec![outcome(
+                "task-1",
+                ResumeFidelity::Summary,
+                3,
+                ClaimStatus::PeerConflict,
+                WipStatus::KeptForManual,
+            )],
+        };
+        let v = serde_json::to_value(&summary).expect("serialize");
+
+        assert_eq!(v["crashRecovery"], serde_json::json!(true));
+        assert_eq!(v["resumedCount"], serde_json::json!(1));
+
+        let s = &v["sessions"][0];
+        assert_eq!(s["taskRunId"], serde_json::json!("task-1"));
+        assert_eq!(s["title"], serde_json::json!("title-task-1"));
+        // Honesty contract: lossy / degraded / peer-conflict states are
+        // surfaced verbatim as kebab-case enum tags.
+        assert_eq!(s["fidelity"], serde_json::json!("summary"));
+        assert_eq!(s["turnsCovered"], serde_json::json!(3));
+        assert_eq!(s["claimStatus"], serde_json::json!("peer-conflict"));
+        assert_eq!(s["wipStatus"], serde_json::json!("kept-for-manual"));
+    }
+
+    #[test]
+    fn lossless_clean_session_serializes_honestly() {
+        let summary = SessionRecoverySummary {
+            crash_recovery: false,
+            resumed_count: 1,
+            sessions: vec![outcome(
+                "task-2",
+                ResumeFidelity::Lossless,
+                0,
+                ClaimStatus::Reacquired,
+                WipStatus::None,
+            )],
+        };
+        let v = serde_json::to_value(&summary).expect("serialize");
+        assert_eq!(v["crashRecovery"], serde_json::json!(false));
+        let s = &v["sessions"][0];
+        assert_eq!(s["fidelity"], serde_json::json!("lossless"));
+        assert_eq!(s["claimStatus"], serde_json::json!("reacquired"));
+        assert_eq!(s["wipStatus"], serde_json::json!("none"));
+    }
+
+    #[test]
+    fn recovery_event_name_is_stable() {
+        // The frontend `useSessionRecovery` hook listens on this exact name.
+        assert_eq!(SESSION_RECOVERY_SUMMARY_EVENT, "session-recovery-summary");
     }
 }

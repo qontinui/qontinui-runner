@@ -249,6 +249,19 @@ pub fn drain(app_handle: &tauri::AppHandle, timeout: Duration) -> DrainSummary {
 
     summary.elapsed_ms = started.elapsed().as_millis() as u64;
     DRAINED.store(true, Ordering::SeqCst);
+
+    // Phase 4 — a completed drain is the STRONGEST "clean shutdown" signal:
+    // every in-flight turn was flushed, dirty worktrees were stashed, and
+    // claims were heartbeated. Flip the on-disk shutdown marker to
+    // `clean:true` so the NEXT boot classifies itself as a planned restart
+    // (quiet banner) rather than crash recovery. Namespaced by API port to
+    // match the resume-path reader. Best-effort: a marker write failure only
+    // degrades the next boot to "treated as crash", which is the safe
+    // direction.
+    let marker_path =
+        crate::session::shutdown_marker::marker_path(crate::mcp::types::get_mcp_api_port());
+    crate::session::shutdown_marker::mark_clean_shutdown(&marker_path);
+
     info!(
         "drain: complete drained_sessions={} wip_refs={} claims={} timed_out={} elapsed_ms={}",
         summary.drained_sessions,

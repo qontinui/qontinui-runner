@@ -3602,6 +3602,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         summary.elapsed_ms,
                         summary.already_drained
                     );
+
+                    // Phase 4 — the ExitRequested seam is the catch-all CLEAN
+                    // shutdown signal: even a direct X-button / programmatic
+                    // app.exit that produced an `already_drained` no-op above
+                    // (or ran with zero sessions) is still a PLANNED exit, not
+                    // a crash. Stamp the marker `clean:true` here unconditionally
+                    // so the next boot's resume classifies a quiet (planned)
+                    // restart. `drain()` also stamps it on a fresh pass; this is
+                    // the idempotent backstop for the no-op / zero-session case.
+                    let marker_path = session::shutdown_marker::marker_path(
+                        crate::mcp::types::get_mcp_api_port(),
+                    );
+                    session::shutdown_marker::mark_clean_shutdown(&marker_path);
                 }
 
                 // Close all interactive Claude sessions
