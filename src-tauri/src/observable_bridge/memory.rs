@@ -126,18 +126,12 @@ impl MemoryBridge {
                     written_by_agent: Some(session_ctx.session_id.to_string()),
                     written_by_device: Some(session_ctx.device_id.to_string()),
                 };
-                if let Err(e) =
-                    memory_client::upsert(&self.http, &base, &token, session_ctx.tenant_id, &req)
-                        .await
-                {
+                if let Err(e) = memory_client::upsert(&self.http, &base, &token, &req).await {
                     warn!("observable_bridge::memory::push upsert {name} failed: {e}");
                 }
             }
             ObservableChange::Deleted { name } => {
-                if let Err(e) =
-                    memory_client::delete(&self.http, &base, &token, session_ctx.tenant_id, &name)
-                        .await
-                {
+                if let Err(e) = memory_client::delete(&self.http, &base, &token, &name).await {
                     warn!("observable_bridge::memory::push delete {name} failed: {e}");
                 }
             }
@@ -369,18 +363,17 @@ impl RunnerObservableBridge for MemoryBridge {
         };
 
         // Step 1: list coord's tenant pool.
-        let listing =
-            match memory_client::list(&self.http, &base, &token, session_ctx.tenant_id).await {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!(
-                        "observable_bridge::memory::pull: list failed ({e}); \
+        let listing = match memory_client::list(&self.http, &base, &token).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(
+                    "observable_bridge::memory::pull: list failed ({e}); \
                      leaving memory_dir untouched, snapshot = local"
-                    );
-                    session_ctx.post_pull_snapshot = Some(local_pre);
-                    return Ok(());
-                }
-            };
+                );
+                session_ctx.post_pull_snapshot = Some(local_pre);
+                return Ok(());
+            }
+        };
 
         // Step 2: for each coord entry, GET full payload (the list
         // response omits content + hash to keep the metadata call
@@ -392,15 +385,7 @@ impl RunnerObservableBridge for MemoryBridge {
         let mut coord_names: HashSet<String> = HashSet::new();
         for summary in &listing.items {
             coord_names.insert(summary.name.clone());
-            let full = match memory_client::get(
-                &self.http,
-                &base,
-                &token,
-                session_ctx.tenant_id,
-                &summary.name,
-            )
-            .await
-            {
+            let full = match memory_client::get(&self.http, &base, &token, &summary.name).await {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(
@@ -444,9 +429,7 @@ impl RunnerObservableBridge for MemoryBridge {
                 written_by_agent: Some(session_ctx.session_id.to_string()),
                 written_by_device: Some(session_ctx.device_id.to_string()),
             };
-            if let Err(e) =
-                memory_client::upsert(&self.http, &base, &token, session_ctx.tenant_id, &req).await
-            {
+            if let Err(e) = memory_client::upsert(&self.http, &base, &token, &req).await {
                 warn!(
                     "observable_bridge::memory::pull: first-contact upsert {} failed: {e}",
                     fp.name
@@ -626,9 +609,7 @@ impl RunnerObservableBridge for MemoryBridge {
                 written_by_agent: Some(session_ctx.session_id.to_string()),
                 written_by_device: Some(session_ctx.device_id.to_string()),
             };
-            match memory_client::upsert(&self.http, &base, &token, session_ctx.tenant_id, &req)
-                .await
-            {
+            match memory_client::upsert(&self.http, &base, &token, &req).await {
                 Ok(_) => report.pushed = report.pushed.saturating_add(1),
                 Err(e) => {
                     warn!(
@@ -643,9 +624,7 @@ impl RunnerObservableBridge for MemoryBridge {
 
         // Deletes: name in pre_pull but gone now.
         for name in pre_names.difference(&post_names) {
-            match memory_client::delete(&self.http, &base, &token, session_ctx.tenant_id, name)
-                .await
-            {
+            match memory_client::delete(&self.http, &base, &token, name).await {
                 Ok(_) => report.pushed = report.pushed.saturating_add(1),
                 Err(e) => {
                     warn!(
