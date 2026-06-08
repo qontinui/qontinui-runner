@@ -1273,18 +1273,28 @@ fn transcript_exists_for(working_dir: &str, cli_session_id: &str) -> bool {
 /// TTL expired.
 ///
 /// Returns the effective working dir for the re-spawn (the worktree path when
-/// re-acquire succeeded, else `None` → caller keeps the shared cwd) plus any
-/// `[SYSTEM_NOTE]` strings to surface (peer-conflict / manual-WIP-recovery).
+/// re-acquire succeeded, else `None` → caller keeps the shared cwd); any
+/// `[SYSTEM_NOTE]` strings to surface (peer-conflict / manual-WIP-recovery);
+/// and the re-acquired `IsolatedEditContext` (`Some` only when re-acquire
+/// succeeded). The caller MUST hand the context to the resumed
+/// `ClaudeSession` (via `set_isolated_edit_ctx`) so the claim heartbeat lives
+/// for the session's lifetime and the claim RELEASES (via the context's Drop)
+/// when the session ends — NOT `mem::forget` it (that orphans the claim past
+/// session end and blocks a peer from re-acquiring the worktree).
 ///
 /// Graceful degrade (mirrors the launch path): worktree mode off / no persisted
-/// worktree / acquire fails → returns `(None, notes)` and resume continues in
-/// the shared checkout with no claim. A peer holding the claim under a
+/// worktree / acquire fails → returns `(None, notes, None)` and resume continues
+/// in the shared checkout with no claim. A peer holding the claim under a
 /// DIFFERENT owner is surfaced (note) and NOT clobbered — resume goes
 /// read-mostly/shared.
 async fn reacquire_and_restore_session_worktree(
     task_run_id: &str,
     pg: &Arc<crate::database::pg::PgDb>,
-) -> (Option<String>, Vec<String>) {
+) -> (
+    Option<String>,
+    Vec<String>,
+    Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+) {
     use crate::agent_worktree::isolated_edit::{acquire, AcquireRequest};
 
     let mut notes: Vec<String> = Vec::new();
@@ -1300,11 +1310,11 @@ async fn reacquire_and_restore_session_worktree(
                 "AI session resume: worktree lookup failed for {} ({}); shared-checkout fallback",
                 task_run_id, e
             );
-            return (None, notes);
+            return (None, notes, None);
         }
     };
     if worktree_rows.is_empty() {
-        return (None, notes);
+        return (None, notes, None);
     }
 
     // 2. Map each worktree's `repo_path` (the source checkout) back to a bare
@@ -1326,7 +1336,7 @@ async fn reacquire_and_restore_session_worktree(
         }
     }
     if repos.is_empty() {
-        return (None, notes);
+        return (None, notes, None);
     }
 
     // 3. Re-acquire under the SAME stable agent_session_id the drain used, so
@@ -1395,16 +1405,19 @@ async fn reacquire_and_restore_session_worktree(
                 }
             }
 
-            // The IsolatedEditContext owns the claim heartbeats; leak it so the
-            // claim stays live for the resumed session's lifetime (the CLI
-            // outlives this function). Dropping it here would tear down the
-            // heartbeat we just re-established.
-            std::mem::forget(ctx);
-            (workdir, notes)
+            // The IsolatedEditContext owns the claim heartbeat. Hand it BACK
+            // to the caller, which parks it on the resumed `ClaudeSession`
+            // (`set_isolated_edit_ctx`) so the heartbeat lives for the
+            // session's lifetime AND the claim RELEASES (via the context's
+            // Drop) when the session ends. We must NOT `mem::forget` it: that
+            // would keep the heartbeat alive until process exit and never
+            // release the claim, blocking a peer from re-acquiring the
+            // worktree after this session dies.
+            (workdir, notes, Some(ctx))
         }
         Ok(None) => {
             // Worktree mode off — shared-checkout fallback, no claim.
-            (None, notes)
+            (None, notes, None)
         }
         Err(e) => {
             // A `ClaimConflict` (peer holds it under a different owner) or any
@@ -1421,7 +1434,7 @@ async fn reacquire_and_restore_session_worktree(
                  the restart ({msg}). Another agent may now hold it — resuming in shared, \
                  read-mostly mode. Re-check ownership before making edits."
             ));
-            (None, notes)
+            (None, notes, None)
         }
     }
 }
@@ -1565,7 +1578,7 @@ pub async fn resume_ai_sessions(
         // Returns the worktree path to re-spawn into (when re-acquire
         // succeeded) plus any operator-facing notes (peer-conflict / manual
         // WIP recovery). Graceful-degrades to the shared cwd on any failure.
-        let (workdir_override, system_notes) =
+        let (workdir_override, system_notes, reacquired_ctx) =
             reacquire_and_restore_session_worktree(&task_run_id, &pg).await;
 
         // Effective working dir: the re-acquired worktree, else the shared cwd
@@ -1638,6 +1651,10 @@ pub async fn resume_ai_sessions(
         let initial_for_spawn = initial_prompt;
         let working_dir_for_spawn = working_dir;
         let resume_from_transcript = can_full_resume;
+        // The re-acquired claim context (Some only when re-acquire succeeded).
+        // Moved into the spawn closure and parked on the resumed session AFTER
+        // register, so its Drop releases the claim when the session ends.
+        let reacquired_ctx_for_spawn = reacquired_ctx;
 
         let spawn_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
@@ -1670,6 +1687,16 @@ pub async fn resume_ai_sessions(
 
             sm.register(&trid, session.clone())
                 .map_err(|e| format!("register failed: {}", e))?;
+
+            // Park the re-acquired worktree claim on the now-registered
+            // session so the heartbeat lives for its lifetime and the claim
+            // RELEASES (via the context's Drop) when the session closes — the
+            // P3 fix for the `mem::forget` leak that orphaned the claim past
+            // session end. `None` (worktree mode off / shared-checkout
+            // fallback / peer-conflict degrade) is a no-op.
+            if let Some(ctx) = reacquired_ctx_for_spawn {
+                session.set_isolated_edit_ctx(ctx);
+            }
 
             // Send an initial turn ONLY when we have something to say:
             //   - summary fallback → the honest-labelled replay summary, or
