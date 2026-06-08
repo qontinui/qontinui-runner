@@ -1831,6 +1831,12 @@ pub fn create_router(
     //   2. In debug builds only, add the audit layer via a rebind.
     //   3. Add the outermost CatchPanicLayer + state unconditionally.
     let router_with_inner_layers = base_router
+        // Degraded-boot guard (D2): when PG is unavailable (QONTINUI_ALLOW_NO_DB),
+        // short-circuit KNOWN DB-backed routes to a clean 503. No-op (one atomic
+        // load) on the normal PG-available path. See crate::mcp::pg_guard.
+        .layer(axum::middleware::from_fn(
+            crate::mcp::pg_guard::pg_degraded_guard_middleware,
+        ))
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))

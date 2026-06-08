@@ -366,6 +366,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 info!("PostgreSQL connected successfully");
                 let pg = Arc::new(pg);
                 crate::database::pg::PgDb::set_global(pg.clone());
+                crate::database::pg::set_pg_available(true);
 
                 // Phase 5 startup sweep (productivity-coordinator-completion-reports
                 // §9 "Memory pressure audit"): clear any stale
@@ -412,11 +413,51 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 pg
             }
             Err(e) => {
-                error!(
-                    "PostgreSQL connection failed: {}. Ensure docker-compose PG is running.",
-                    e
-                );
-                panic!("PostgreSQL connection required — {}", e);
+                // Degraded boot (QONTINUI_ALLOW_NO_DB): the runner normally
+                // HARD-PANICS here so a misconfigured production runner surfaces
+                // the broken DB immediately. When degraded boot is explicitly
+                // enabled (CI contract smoke, offline demos, fast local UI
+                // iteration, or riding out a transient PG blip), construct an
+                // UNVERIFIED PgDb whose deadpool pool reconnects lazily, mark PG
+                // unavailable so DB-backed routes return a clean 503, and
+                // continue booting the Tauri/axum stack. Default (flag unset) =
+                // the current fail-fast invariant — prod is unchanged.
+                let degraded = std::env::var("QONTINUI_ALLOW_NO_DB")
+                    .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+                    .unwrap_or(false);
+                if degraded {
+                    warn!(
+                        "PostgreSQL connection failed: {}. QONTINUI_ALLOW_NO_DB is set — \
+                         booting DEGRADED: DB-backed routes return 503 until PG is reachable. \
+                         DO NOT use this mode in production.",
+                        e
+                    );
+                    match crate::database::pg::PgDb::new_degraded(&pg_url) {
+                        Ok(pg) => {
+                            let pg = Arc::new(pg);
+                            crate::database::pg::PgDb::set_global(pg.clone());
+                            crate::database::pg::set_pg_available(false);
+                            pg
+                        }
+                        Err(build_err) => {
+                            // Even building the pool failed — a genuine config
+                            // error (unparseable URL), not mere unreachability.
+                            // Fail fast regardless of the degraded flag.
+                            error!(
+                                "Degraded boot requested but PG pool could not be built: {}",
+                                build_err
+                            );
+                            panic!("PostgreSQL pool construction failed — {}", build_err);
+                        }
+                    }
+                } else {
+                    error!(
+                        "PostgreSQL connection failed: {}. Ensure docker-compose PG is running \
+                         (or set QONTINUI_ALLOW_NO_DB=1 to boot DB-less in degraded mode).",
+                        e
+                    );
+                    panic!("PostgreSQL connection required — {}", e);
+                }
             }
         }
     };
