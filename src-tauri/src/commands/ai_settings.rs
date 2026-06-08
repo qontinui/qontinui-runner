@@ -1280,15 +1280,46 @@ pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandRes
     })
 }
 
+/// Weekly utilization at/above which an account is treated as "out of tokens"
+/// for selection — close enough to the cap that it won't reliably serve a
+/// request. A backstop alongside the server `status` / probe-error signals in
+/// [`probe_result_exhausted`].
+const EXHAUSTION_UTILIZATION: f64 = 0.99;
+
+/// Whether a probe result means the account **won't serve a request right
+/// now**. True when the probe call itself failed (the probe hits the same
+/// per-account quota the CLI uses — so a 429/403/spend-limit rejection shows
+/// up here even if weekly *token* utilization still looks low), when the
+/// server reports the account rejected/blocked/exceeded, or when weekly
+/// utilization is at/over [`EXHAUSTION_UTILIZATION`].
+fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
+    if info.error.is_some() || info.utilization >= EXHAUSTION_UTILIZATION {
+        return true;
+    }
+    info.status.as_deref().is_some_and(|s| {
+        let s = s.to_ascii_lowercase();
+        s.contains("reject") || s.contains("block") || s.contains("exceed")
+    })
+}
+
 /// Record probe results into the account-selection usage snapshot.
 ///
 /// Shared by every usage-probe caller so the hot-path picker
 /// (`ai_provider::pick_best_account`) always reads from a cache rather than
-/// issuing its own (self-rate-limiting) probe.
+/// issuing its own (self-rate-limiting) probe. Computes the per-account
+/// `exhausted` flag here, where the full probe result (status + error) is
+/// available.
 pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
-    let samples: Vec<(String, f64, Option<f64>)> = results
+    let samples: Vec<(String, f64, Option<f64>, bool)> = results
         .iter()
-        .map(|r| (r.config_dir.clone(), r.utilization, r.usage_delta))
+        .map(|r| {
+            (
+                r.config_dir.clone(),
+                r.utilization,
+                r.usage_delta,
+                probe_result_exhausted(r),
+            )
+        })
         .collect();
     crate::ai_provider::record_account_usage(&samples);
 }
@@ -1894,4 +1925,59 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             reset_provider_circuit,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod exhaustion_tests {
+    use super::*;
+
+    fn usage(utilization: f64, status: Option<&str>, error: Option<&str>) -> AccountUsageInfo {
+        AccountUsageInfo {
+            config_dir: "/test/acct".to_string(),
+            label: "acct".to_string(),
+            utilization,
+            rate_limit_type: Some("seven_day".to_string()),
+            resets_at: None,
+            status: status.map(|s| s.to_string()),
+            error: error.map(|s| s.to_string()),
+            expected_utilization: None,
+            usage_delta: None,
+            period_elapsed_fraction: None,
+            period_remaining_days: None,
+        }
+    }
+
+    #[test]
+    fn under_cap_and_allowed_is_not_exhausted() {
+        assert!(!probe_result_exhausted(&usage(0.80, Some("allowed"), None)));
+        // Even fully under projection but high (98%) — still usable.
+        assert!(!probe_result_exhausted(&usage(
+            0.98,
+            Some("allowed_warning"),
+            None
+        )));
+    }
+
+    #[test]
+    fn at_or_over_cap_is_exhausted() {
+        assert!(probe_result_exhausted(&usage(0.99, Some("allowed"), None)));
+        assert!(probe_result_exhausted(&usage(1.0, None, None)));
+    }
+
+    #[test]
+    fn probe_error_is_exhausted() {
+        // Probe rejected (429/403/spend-limit) → won't serve a request, even if
+        // the weekly token utilization header still reads low.
+        assert!(probe_result_exhausted(&usage(
+            0.10,
+            None,
+            Some("API error (429): rate limit")
+        )));
+    }
+
+    #[test]
+    fn rejected_status_is_exhausted() {
+        assert!(probe_result_exhausted(&usage(0.50, Some("rejected"), None)));
+        assert!(probe_result_exhausted(&usage(0.50, Some("BLOCKED"), None)));
+    }
 }
