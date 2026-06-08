@@ -625,6 +625,10 @@ pub async fn ui_bridge_batch_actions_handler(
 /// `scroll_into_view`, see `recovery_executor::execute_recovery_command`).
 const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "click",
+    // Reveal a hover-gated control (`pointer-events:none` until `:hover`/
+    // `group-hover`) then click it, in one dispatch. Handled SDK-side by
+    // `@qontinui/ui-bridge` >= 0.16.0; the runner just forwards it.
+    "hoverClick",
     "doubleClick",
     "double_click",
     "double",
@@ -719,7 +723,16 @@ pub(crate) fn extract_supported_actions(elem_data: &serde_json::Value) -> Option
 /// distortion not a feature.
 pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>) -> bool {
     match supported {
-        Some(list) => list.iter().any(|s| s == action),
+        Some(list) => {
+            list.iter().any(|s| s == action)
+                // `hoverClick` is a click-variant — it reveals a hover-gated
+                // control then clicks it. Any element that advertises `click`
+                // can be hover-clicked, even when the SDK's inferActions didn't
+                // enumerate `hoverClick` explicitly on this element. Without
+                // this, hover-revealed toolbar buttons (which advertise `click`
+                // but not `hoverClick`) would be rejected here pre-IPC.
+                || (action == "hoverClick" && list.iter().any(|s| s == "click"))
+        }
         // Unknown supported list (fetch failed or element didn't advertise
         // any) — assume yes, so we don't manufacture false ACTION_NOT_SUPPORTED.
         None => true,

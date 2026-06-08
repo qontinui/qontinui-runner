@@ -265,3 +265,26 @@ export function closestElementIds(target: string, candidates: readonly string[])
   scored.sort((a, b) => a.distance - b.distance || a.id.localeCompare(b.id));
   return scored.slice(0, 5).map((s) => s.id);
 }
+
+/**
+ * Per-element action-allow gate for the `execute_action` IPC handler.
+ *
+ * Returns `true` when `action` may be dispatched to the element. An element
+ * with NO declared action set (`allowedActions` empty) is permissive (the SDK's
+ * global supported-action validation still applies downstream). When a declared
+ * set is present, the action must be in it — EXCEPT `hoverClick`, a click-variant
+ * (reveal a `pointer-events:none`-until-`:hover`/`group-hover` control, then
+ * click) that is allowed wherever `click` is. This mirrors the runner-side Rust
+ * `is_action_advertised` click-variant exemption so the two advertised-action
+ * gates (Rust pre-IPC + this frontend pre-check) can't disagree and silently
+ * reject a hover-gated toolbar button registered with an explicit `actions=` prop.
+ */
+export function isElementActionAllowed(
+  allowedActions: readonly string[],
+  action: string,
+): boolean {
+  if (allowedActions.length === 0) return true;
+  if (allowedActions.includes(action)) return true;
+  if (action === "hoverClick" && allowedActions.includes("click")) return true;
+  return false;
+}
