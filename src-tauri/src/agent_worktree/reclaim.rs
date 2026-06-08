@@ -534,6 +534,21 @@ pub(super) fn probe_building(worktree: &Path) -> bool {
     worktree_is_building(worktree, Duration::from_secs(activity_window_secs()))
 }
 
+/// Census-only build signal: a genuinely-held cargo build lock under
+/// `<worktree>/target/`, and NOTHING else. Unlike [`probe_building`] (used by
+/// the reclaim executor, which legitimately also skips a recently-touched
+/// worktree) this DROPS the recent-activity heuristic — an editor save,
+/// `git status`, or any write to the worktree root bumps mtime WITHOUT a build
+/// in flight. Reporting that as `building` in the FLEET census over-reported
+/// coord's build-concurrency gauge (`count_building` climbed across idle/edited
+/// dev worktrees with no real builds), pinning `decide_isolation` in rule 3c so
+/// every allocate `Wait`-ed and sessions fell back to the shared root. Phase 2
+/// of `plans/2026-06-08-coord-build-slot-budget-saturation-fix.md`; coord's
+/// building-freshness TTL is the backstop for any flag that still goes stale.
+pub(super) fn probe_building_for_census(worktree: &Path) -> bool {
+    cargo_lock_held(&worktree.join("target"))
+}
+
 /// G6: is this worktree currently being built? Either signal → skip.
 /// Injectable (takes the worktree root) so tests drive it with tempdirs.
 ///

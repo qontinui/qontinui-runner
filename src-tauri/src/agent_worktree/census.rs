@@ -694,9 +694,12 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     // None when undeterminable (no origin/main, git failure).
     let landed_in_main = compute_landed_in_main(worktree);
 
-    // G6 shadow-mode: the same build probe the reclaim executor uses,
-    // reported every tick regardless of arming (the passive prove-out feed).
-    let building = Some(super::reclaim::probe_building(worktree));
+    // G6 shadow-mode: held-cargo-lock-only build probe for the FLEET census
+    // (NOT the reclaim executor's `probe_building`, which also counts recent
+    // file activity — editor saves / git ops are not builds and over-reported
+    // coord's build-concurrency gauge). Phase 2 of
+    // `plans/2026-06-08-coord-build-slot-budget-saturation-fix.md`.
+    let building = Some(super::reclaim::probe_building_for_census(worktree));
 
     // Ξ_Worktree P7.3 — canonical-checkout state (per-REPO, not per-worktree;
     // it's fine that every worktree row of a repo carries the same values —
