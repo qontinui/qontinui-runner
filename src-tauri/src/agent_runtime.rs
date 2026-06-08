@@ -1755,17 +1755,29 @@ async fn run_continuation_terminal(
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
 
+    // Account selection: pin the most-available (token-bearing) account so the
+    // continuation does not spawn under a quota-exhausted default and die
+    // instantly (the bug: continuations spawned under the runner's boot account
+    // even when it was out of tokens). The resolved dir is threaded to the PTY
+    // as `CLAUDE_CONFIG_DIR` via `capture_hint.config_dir` (consumed by
+    // `create_terminal_session_backend`). spawn_blocking: the selector reads
+    // settings + cooldown state.
+    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    let selected_config_dir = {
+        let ai = crate::settings::get_ai_settings();
+        crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
+    };
+
     // Durable lifecycle capture: this backend path never fires the frontend
     // `terminal_session_record_open`, so without a hint a restart loses the
-    // continuation. `config_dir: None` — the continuation runs under the
-    // runner's DEFAULT config dir (no `CLAUDE_CONFIG_DIR` is set above), which
-    // is self-consistent with restore (`buildResumeCmd` resumes with no prefix
-    // when configDir is absent → same default dir). RISK: the resolver scans
-    // ALL config dirs first-hit-wins, so two accounts touching the SAME
-    // worktree path could bind an id from the wrong dir; worktree paths are
-    // per-continuation-unique, so this is low-probability — accept + log.
+    // continuation. `config_dir` is now the SELECTED account dir (above): it
+    // both sets `CLAUDE_CONFIG_DIR` for the spawn AND keeps restore consistent
+    // (`buildResumeCmd` resumes under the same dir). `None` (single-account /
+    // Manual default) keeps the prior behavior. RISK note: the id resolver
+    // scans config dirs first-hit-wins, but worktree paths are
+    // per-continuation-unique, so cross-account binding stays low-probability.
     let capture_hint = Some(crate::commands::terminal::SessionCaptureHint {
-        config_dir: None,
+        config_dir: selected_config_dir,
         working_dir: workdir.to_string(),
         title: title.clone(),
     });
@@ -1938,6 +1950,10 @@ async fn run_continuation_headless(
     initial_prompt: &str,
 ) -> anyhow::Result<()> {
     let log_path = agent_log_path(agent_id);
+    // Select the most-available account once before spawning (pins the resolved
+    // config dir that `spawn_claude_child` reads). spawn_blocking: the selector
+    // reads settings + cooldown state.
+    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
     match spawn_claude_child(workdir, initial_prompt).await {
         Ok(mut child) => {
             let pid = child.id().map(|p| p as i64);
@@ -2035,6 +2051,12 @@ async fn run_agent_subprocess(
     let mut restarts = 0u32;
     let mut final_exit_code: Option<i64> = None;
     let mut final_reason: Option<String> = None;
+
+    // Select the most-available account once before the (re)spawn loop. On a
+    // mid-run rate-limit the inference path rotates via
+    // `rotate_account_on_rate_limit`, and `spawn_claude_child` re-reads the
+    // resolved dir on each respawn, so retries pick up the rotation.
+    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
 
     loop {
         // Stop requested during a restart back-off (or before the first spawn):
@@ -2319,6 +2341,17 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Account selection: pin CLAUDE_CONFIG_DIR to the selected (token-bearing)
+    // account instead of inheriting the process-ambient default. Without this a
+    // continuation/worker `claude` spawns under whatever account the runner
+    // booted with (e.g. a quota-exhausted one) and dies instantly. The caller
+    // calls `pick_best_account()` once per unit of work; here we read the
+    // resolved-or-manual effective dir. `None` → leave env unset (single-account
+    // / Manual-mode default — unchanged behavior).
+    let ai = crate::settings::get_ai_settings();
+    if let Some(dir) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli) {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
