@@ -17,23 +17,12 @@ use qontinui_types::memory::{
     MemoryListResponse, MemoryUpsertRequest, MemoryUpsertResponse, MemoryWithHistory,
 };
 use std::time::Duration;
-use uuid::Uuid;
 
 /// Per-call timeout. List/get are cheap metadata reads; upsert writes
 /// one row; delete writes one tombstone — all should land well under
 /// this. Matches the 10s timeout `fleet::publish_budget` uses for
 /// similar single-row POSTs.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Coord's tenant-scoping header. Coord's `TenantId` extractor
-/// (`qontinui-coord/src/tenant_scope.rs`) resolves the tenant **solely**
-/// from this header — it does NOT parse the Bearer JWT (device-token →
-/// tenant resolution is a deferred coord hardening pass). The bridge
-/// resolves `tenant_id` locally (paired_user.json / OAuth claim) and
-/// sends it here; the Bearer token is retained for forward-compat with
-/// that future authenticated path. Without this header every call 403s
-/// with `tenant_not_resolved`.
-const TENANT_HEADER: &str = "X-Qontinui-Tenant-Id";
 
 /// Build the long-lived reqwest client the bridge reuses across calls.
 /// Returned to the bridge once at construction; cloned cheaply (it's an
@@ -74,12 +63,10 @@ pub async fn list(
     client: &reqwest::Client,
     base: &str,
     device_token: &str,
-    tenant_id: Uuid,
 ) -> Result<MemoryListResponse> {
     let url = format!("{base}/coord/memory/list");
     let resp = client
         .get(&url)
-        .header(TENANT_HEADER, tenant_id.to_string())
         .bearer_auth(device_token)
         .send()
         .await
@@ -101,13 +88,11 @@ pub async fn get(
     client: &reqwest::Client,
     base: &str,
     device_token: &str,
-    tenant_id: Uuid,
     name: &str,
 ) -> Result<MemoryWithHistory> {
     let url = format!("{base}/coord/memory/{}", urlencoding::encode(name));
     let resp = client
         .get(&url)
-        .header(TENANT_HEADER, tenant_id.to_string())
         .bearer_auth(device_token)
         .send()
         .await
@@ -129,13 +114,11 @@ pub async fn upsert(
     client: &reqwest::Client,
     base: &str,
     device_token: &str,
-    tenant_id: Uuid,
     req: &MemoryUpsertRequest,
 ) -> Result<MemoryUpsertResponse> {
     let url = format!("{base}/coord/memory/upsert");
     let resp = client
         .post(&url)
-        .header(TENANT_HEADER, tenant_id.to_string())
         .bearer_auth(device_token)
         .json(req)
         .send()
@@ -158,13 +141,11 @@ pub async fn post_federation_report(
     client: &reqwest::Client,
     base: &str,
     device_token: &str,
-    tenant_id: Uuid,
     body: &serde_json::Value,
 ) -> Result<()> {
     let url = format!("{base}/coord/federation/reports");
     let resp = client
         .post(&url)
-        .header(TENANT_HEADER, tenant_id.to_string())
         .bearer_auth(device_token)
         .json(body)
         .send()
@@ -186,13 +167,11 @@ pub async fn delete(
     client: &reqwest::Client,
     base: &str,
     device_token: &str,
-    tenant_id: Uuid,
     name: &str,
 ) -> Result<()> {
     let url = format!("{base}/coord/memory/{}", urlencoding::encode(name));
     let resp = client
         .delete(&url)
-        .header(TENANT_HEADER, tenant_id.to_string())
         .bearer_auth(device_token)
         .send()
         .await

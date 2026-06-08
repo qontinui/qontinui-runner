@@ -377,11 +377,8 @@ fn post_report_to_coord(ctx: &SessionContext, report: &ReconcileReport) {
         }
     };
 
-    let tenant_id = ctx.tenant_id;
     spawn_detached_best_effort(async move {
-        if let Err(e) =
-            memory_client::post_federation_report(&http, &base, &token, tenant_id, &body).await
-        {
+        if let Err(e) = memory_client::post_federation_report(&http, &base, &token, &body).await {
             debug!("federation report: coord POST failed: {e} (non-fatal)");
         }
     });
