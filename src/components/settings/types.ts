@@ -125,21 +125,61 @@ export interface AccountUsageInfo {
   period_remaining_days: number | null;
 }
 
+/** Weekly utilization at/above which an account is treated as "out of
+ * tokens" for selection. Mirrors `EXHAUSTION_UTILIZATION` in the runner
+ * (`src-tauri/src/commands/ai_settings.rs`). */
+const EXHAUSTION_UTILIZATION = 0.99;
+
 /**
- * Comparator for "best account" selection. Prefers the account furthest
- * UNDER its projected usage — i.e. the most-negative `usage_delta`
- * (actual minus expected), which is "least usage relative to its
- * projected usage". Falls back to raw `utilization` when `usage_delta`
- * is unavailable (e.g. `expected_utilization` is null). Ascending: the
- * best (most headroom) account sorts first.
+ * Whether an account **won't serve a request right now** — at/over its weekly
+ * cap, server-reported rejected/blocked/exceeded, or its usage probe errored
+ * (the probe hits the same per-account quota the CLI uses, so this also catches
+ * a spend-limited account whose weekly *token* utilization still reads low).
+ * Mirrors the runner's `probe_result_exhausted`.
+ */
+export function isAccountExhausted(a: {
+  utilization: number;
+  status?: string | null;
+  error?: string | null;
+}): boolean {
+  if (a.error != null || a.utilization >= EXHAUSTION_UTILIZATION) return true;
+  const s = (a.status ?? "").toLowerCase();
+  return s.includes("reject") || s.includes("block") || s.includes("exceed");
+}
+
+/**
+ * Comparator for "best account" selection. Two-level key `(exhausted,
+ * headroom)`, ascending — the best account sorts first.
  *
+ * 1. Exhausted accounts (out of tokens / rejected; see {@link
+ *    isAccountExhausted}) always sort AFTER usable ones, no matter how
+ *    favourable their headroom — a fully-used account that is "under
+ *    projection" still has no tokens left.
+ * 2. Within a tier, the account furthest UNDER its projected usage wins —
+ *    the most-negative `usage_delta` (actual minus expected), falling back to
+ *    raw `utilization` when `usage_delta` is unavailable.
+ *
+ * Mirrors the runner's `pick_from` ranking (`ai_provider/account_usage.rs`).
  * Structurally typed so both `AccountUsageInfo` shapes (settings + the
  * terminal subset in `useSessionManager`) can use the one comparator.
  */
 export function compareByUsageHeadroom(
-  a: { utilization: number; usage_delta?: number | null },
-  b: { utilization: number; usage_delta?: number | null },
+  a: {
+    utilization: number;
+    usage_delta?: number | null;
+    status?: string | null;
+    error?: string | null;
+  },
+  b: {
+    utilization: number;
+    usage_delta?: number | null;
+    status?: string | null;
+    error?: string | null;
+  },
 ): number {
+  const ea = isAccountExhausted(a) ? 1 : 0;
+  const eb = isAccountExhausted(b) ? 1 : 0;
+  if (ea !== eb) return ea - eb;
   const ka = a.usage_delta ?? a.utilization ?? 0;
   const kb = b.usage_delta ?? b.utilization ?? 0;
   return ka - kb;
