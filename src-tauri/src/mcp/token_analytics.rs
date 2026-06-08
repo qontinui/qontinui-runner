@@ -303,6 +303,9 @@ pub async fn get_account_usage(
     let results = futures::future::join_all(futures).await;
     let count = results.len();
 
+    // Keep the account-selection usage snapshot warm off the hot path.
+    crate::commands::ai_settings::record_usage_snapshot(&results);
+
     Ok(Json(serde_json::json!({
         "success": true,
         "data": results,

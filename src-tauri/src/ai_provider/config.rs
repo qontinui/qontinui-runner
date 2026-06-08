@@ -20,6 +20,35 @@ static ACCOUNT_COOLDOWNS: Mutex<Option<HashMap<String, (Instant, Duration)>>> = 
 /// on stdout without a header). Five minutes.
 const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 
+/// One account's weekly-usage sample, captured by the usage probe
+/// (`commands::ai_settings::probe_account_usage`). `usage_delta` is the
+/// account's actual 7-day utilization minus its *expected* linear utilization
+/// at this point in the billing window (negative = under projected pace);
+/// `None` when the probe couldn't compute it (e.g. the 7d-reset header was
+/// absent). `utilization` is the raw 0.0–1.0 weekly fraction, used as the
+/// fallback selection key when `usage_delta` is unavailable — mirroring the
+/// frontend `compareByUsageHeadroom` (`src/components/settings/types.ts`).
+#[derive(Clone, Copy, Debug)]
+struct UsageSample {
+    captured_at: Instant,
+    usage_delta: Option<f64>,
+    utilization: f64,
+}
+
+/// Latest weekly-usage snapshot per account, keyed by config dir. Populated
+/// off the selection hot path by the usage-probe callers (the periodic
+/// startup refresh, the Settings/Terminal `check_accounts_usage` command, and
+/// the `/analytics/account-usage` route) so [`usage_headroom_key`] can rank
+/// accounts by headroom without making its own HTTP calls. The probe
+/// endpoint self-rate-limits, so the hot path must never probe inline — it
+/// reads this cache instead.
+static USAGE_SNAPSHOT: Mutex<Option<HashMap<String, UsageSample>>> = Mutex::new(None);
+
+/// Maximum age of a usage sample before [`usage_headroom_key`] treats it as
+/// stale and returns `None` (so selection falls back to cooldown ordering).
+/// Fifteen minutes — comfortably longer than the startup refresh cadence.
+const USAGE_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
+
 /// Set the resolved config directory (called after usage check).
 pub fn set_resolved_config_dir(dir: Option<String>) {
     if let Ok(mut cached) = RESOLVED_CONFIG_DIR.lock() {
@@ -111,6 +140,47 @@ pub fn time_until_cooled_down(config_dir: &str) -> Option<Duration> {
     } else {
         Some(remaining)
     }
+}
+
+/// Record weekly-usage samples from a probe into the selection snapshot.
+///
+/// Called by the usage-probe paths (startup periodic refresh, the
+/// `check_accounts_usage` command, the `/analytics/account-usage` route) so
+/// the selection hot path has fresh headroom data without issuing its own
+/// HTTP calls. Each tuple is `(config_dir, utilization, usage_delta)`.
+pub fn record_account_usage(samples: &[(String, f64, Option<f64>)]) {
+    if let Ok(mut snap) = USAGE_SNAPSHOT.lock() {
+        let map = snap.get_or_insert_with(HashMap::new);
+        let now = Instant::now();
+        for (dir, utilization, usage_delta) in samples {
+            map.insert(
+                dir.clone(),
+                UsageSample {
+                    captured_at: now,
+                    usage_delta: *usage_delta,
+                    utilization: *utilization,
+                },
+            );
+        }
+    }
+}
+
+/// Weekly-usage headroom key for an account from the latest snapshot, if a
+/// fresh sample exists. Returns `usage_delta` when available (most-negative =
+/// furthest under projected weekly pace = best), else the raw `utilization`
+/// — mirroring the frontend `compareByUsageHeadroom`. Returns `None` when
+/// there is no sample or it is older than [`USAGE_SNAPSHOT_TTL`], so callers
+/// fall back to cooldown-only ordering.
+///
+/// Lower is better (ascending = most headroom first).
+pub fn usage_headroom_key(config_dir: &str) -> Option<f64> {
+    let snap = USAGE_SNAPSHOT.lock().ok()?;
+    let map = snap.as_ref()?;
+    let sample = map.get(config_dir)?;
+    if sample.captured_at.elapsed() > USAGE_SNAPSHOT_TTL {
+        return None;
+    }
+    Some(sample.usage_delta.unwrap_or(sample.utilization))
 }
 
 /// Rotate to the next available account after a rate-limit hit.
@@ -414,6 +484,23 @@ mod tests {
             "expired cooldown should report None"
         );
         clear_dir(dir);
+    }
+
+    #[test]
+    fn usage_headroom_prefers_delta_then_falls_back_to_utilization() {
+        let dir_delta = "/test/config/headroom_delta";
+        let dir_util = "/test/config/headroom_util";
+        // Fresh sample with a delta → key is the delta.
+        record_account_usage(&[(dir_delta.to_string(), 0.80, Some(-0.25))]);
+        assert_eq!(usage_headroom_key(dir_delta), Some(-0.25));
+        // Fresh sample without a delta → key falls back to raw utilization.
+        record_account_usage(&[(dir_util.to_string(), 0.42, None)]);
+        assert_eq!(usage_headroom_key(dir_util), Some(0.42));
+    }
+
+    #[test]
+    fn usage_headroom_none_when_unrecorded() {
+        assert_eq!(usage_headroom_key("/test/config/headroom_never"), None);
     }
 
     #[test]
