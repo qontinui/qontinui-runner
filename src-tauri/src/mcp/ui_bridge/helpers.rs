@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::mcp::types::ApiState;
 
-use super::request::ui_bridge_request_sync;
+use super::request::{ui_bridge_request_sync, ui_bridge_request_sync_in_window, MAIN_WINDOW_LABEL};
 
 /// Allowed top-level field names for the `?fields=` filter on
 /// `GET /control/element/{id}`. Unknown names are silently dropped to keep
@@ -565,6 +565,71 @@ pub(super) async fn evaluate_js_expression(
     }
 }
 
+/// Like [`evaluate_js_expression`] but targets a specific runner window.
+///
+/// For the main window (empty label or [`MAIN_WINDOW_LABEL`]) this is identical
+/// to [`evaluate_js_expression`] — the IPC fast-path with a direct-WebView
+/// fallback. For a pop-out window it routes the IPC request to that window via
+/// [`ui_bridge_request_sync_in_window`]. There is intentionally NO direct-eval
+/// fallback for non-main windows: [`direct_webview_evaluate_with_result`] is
+/// main-coupled (it resolves `get_main_window_label()` and its injected JS posts
+/// the result back under the `(main, id)` key), so falling back would silently
+/// run the expression in the WRONG window. An unknown label yields the same
+/// structured error as `page/evaluate` (`page.rs`), pointing at the discovery
+/// route.
+pub(super) async fn evaluate_js_expression_in_window(
+    state: &Arc<ApiState>,
+    expression: &str,
+    window_label: &str,
+) -> Result<String, String> {
+    if window_label.is_empty() || window_label == MAIN_WINDOW_LABEL {
+        return evaluate_js_expression(state, expression).await;
+    }
+
+    // Fail fast on an unknown label rather than hanging on an IPC request
+    // nothing can answer — same contract as `page/evaluate`.
+    {
+        use tauri::Manager;
+        if state.app_handle.get_webview_window(window_label).is_none() {
+            return Err(format!(
+                "No runner window labeled '{window_label}'. Discover live windows via \
+                 GET /ui-bridge/control/runner-windows."
+            ));
+        }
+    }
+
+    let payload = serde_json::json!({ "expression": expression });
+    let data =
+        ui_bridge_request_sync_in_window(state, "page_evaluate", payload, window_label).await?;
+
+    // Surface an inner evaluation error rather than masking it with a main-window
+    // fallback (which would be the wrong window).
+    if data.get("success") == Some(&serde_json::Value::Bool(false)) || data.get("error").is_some() {
+        let msg = data
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("evaluation failed in target window");
+        return Err(msg.to_string());
+    }
+    if let Some(result) = data.get("result").and_then(|r| r.get("value")) {
+        match result {
+            serde_json::Value::String(s) => Ok(s.clone()),
+            other => Ok(other.to_string()),
+        }
+    } else {
+        Ok(data.to_string())
+    }
+}
+
+/// Read the optional `windowLabel` body field used by the read/convenience
+/// family (`read-value`, `type-into`, `click-by-text`, …) to scope a read to a
+/// pop-out window. Absent, non-string, or empty → `""` (the main window).
+pub(super) fn read_window_label(body: &serde_json::Value) -> &str {
+    body.get("windowLabel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
 /// Match a path string against a glob pattern. `*` matches a single path
 /// segment (no `/`); `**` matches any sequence of characters including `/`.
 /// All other characters match literally.
@@ -745,4 +810,33 @@ where
     }
 
     deserializer.deserialize_option(TimestampVisitor)
+}
+
+#[cfg(test)]
+mod read_window_label_tests {
+    use super::read_window_label;
+    use serde_json::json;
+
+    #[test]
+    fn absent_window_label_is_main() {
+        assert_eq!(read_window_label(&json!({ "selector": "input" })), "");
+    }
+
+    #[test]
+    fn empty_window_label_is_main() {
+        assert_eq!(read_window_label(&json!({ "windowLabel": "" })), "");
+    }
+
+    #[test]
+    fn non_string_window_label_is_main() {
+        assert_eq!(read_window_label(&json!({ "windowLabel": 42 })), "");
+    }
+
+    #[test]
+    fn present_window_label_is_returned() {
+        assert_eq!(
+            read_window_label(&json!({ "windowLabel": "term-2" })),
+            "term-2"
+        );
+    }
 }

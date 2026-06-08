@@ -185,6 +185,13 @@ Two thread-through styles, mirroring the `tabId` split:
   (`ActionQueryParams.window_label`, which also scopes its pre/post detector and
   disabled-state queries so the element id resolves in the right window's
   registry). Rust callers holding a label call `ui_bridge_request_sync_in_window`.
+- **Read/convenience family** — `find-by-text`, `click-by-text`,
+  `click-by-selector`, `read-value`, `type-into` (`elements.rs`) read an optional
+  `windowLabel` **body** field and evaluate through
+  `helpers::evaluate_js_expression_in_window`, which routes the IPC `page_evaluate`
+  to that window (no main-window direct-eval fallback for pop-outs — that path is
+  main-coupled). Omitting `windowLabel` is byte-identical to the single-window
+  default. (Phase 4, plan 2026-06-07-multi-window-sdk-automation.)
 
 An unknown `windowLabel` (no such window — e.g. a pop-out that already closed)
 returns an immediate, structured error naming the missing window and the
