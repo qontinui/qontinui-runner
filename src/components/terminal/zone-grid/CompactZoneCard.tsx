@@ -1,7 +1,18 @@
 import { useCallback, useMemo, useReducer, useRef, useEffect } from "react";
-import { Maximize2, Check, X, Send, AlertTriangle, Copy, Filter, RotateCcw } from "lucide-react";
+import {
+  Maximize2,
+  Check,
+  X,
+  Send,
+  AlertTriangle,
+  Copy,
+  Filter,
+  RotateCcw,
+  Zap,
+} from "lucide-react";
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
+import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { STATE_BORDER_COLORS, STATE_BG_COLORS, STATE_LABELS, TREND_ICONS } from "./constants";
 import { isActionableLine, isYesNoPrompt, computeOutputTrend } from "./utils";
 import { ActivitySparkline } from "./ActivitySparkline";
@@ -302,6 +313,16 @@ export function CompactZoneCard({
           />
         )}
         <span className="text-[11px] text-[#c0caf5] font-medium truncate flex-1">{tab.title}</span>
+        {isNonDurablePty(tab) && (
+          <span
+            className="flex items-center gap-0.5 text-[8px] font-medium px-1 py-0.5 rounded-full shrink-0 bg-[#565f89]/15 text-[#565f89]"
+            title={NON_DURABLE_TOOLTIP}
+            aria-label={`Ephemeral session: ${NON_DURABLE_TOOLTIP}`}
+          >
+            <Zap className="w-2.5 h-2.5" />
+            {NON_DURABLE_LABEL}
+          </span>
+        )}
         {lastLines.length > 0 && (
           <button
             className={`p-0.5 rounded transition-colors shrink-0 ${
