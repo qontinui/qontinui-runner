@@ -3170,15 +3170,34 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                // Cooldown-driven account selection. `pick_best_account`
+                // Weekly-usage-aware account selection. `pick_best_account`
                 // internally checks `account_selection_mode == LeastUsage`
                 // and returns immediately otherwise — no need to gate the
-                // call here. Runs on a blocking pool because the picker
-                // reads global settings/state synchronously.
-                info!("Running cooldown-driven account selection at startup...");
+                // call here. Refresh the usage snapshot FIRST so the initial
+                // pick can rank accounts by weekly-usage headroom rather than
+                // falling back to cooldown-only ordering.
+                info!("Refreshing Claude account usage snapshot at startup...");
+                commands::ai_settings::refresh_account_usage_snapshot().await;
+                info!("Running account selection at startup...");
                 tokio::task::spawn_blocking(ai_provider::pick_best_account)
                     .await
                     .ok();
+
+                // Keep the usage snapshot fresh for headless / co-pilot-only
+                // runners whose Settings/Terminal UI never polls usage. This
+                // loop ONLY refreshes the cache — re-picking is deferred to
+                // the next unit of AI work (so warm-provider prompt-cache
+                // locality within a unit is preserved). `refresh_*` is a
+                // no-op unless ≥2 accounts are configured.
+                tauri::async_runtime::spawn(async {
+                    let mut tick =
+                        tokio::time::interval(tokio::time::Duration::from_secs(10 * 60));
+                    tick.tick().await; // consume the immediate first tick (just refreshed)
+                    loop {
+                        tick.tick().await;
+                        commands::ai_settings::refresh_account_usage_snapshot().await;
+                    }
+                });
             });
 
             // Bootstrap World State Verifier live config from persisted

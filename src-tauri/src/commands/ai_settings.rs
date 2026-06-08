@@ -1266,6 +1266,11 @@ pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandRes
 
     let results = futures::future::join_all(futures).await;
 
+    // Feed the selection hot path's usage snapshot for free, so
+    // `pick_best_account` can rank by weekly-usage headroom without probing
+    // inline (see `ai_provider::account_usage`).
+    record_usage_snapshot(&results);
+
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Checked {} accounts", results.len())),
@@ -1273,6 +1278,39 @@ pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandRes
             serde_json::to_value(&results).map_err(|e| String::from(AppError::JsonError(e)))?,
         ),
     })
+}
+
+/// Record probe results into the account-selection usage snapshot.
+///
+/// Shared by every usage-probe caller so the hot-path picker
+/// (`ai_provider::pick_best_account`) always reads from a cache rather than
+/// issuing its own (self-rate-limiting) probe.
+pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
+    let samples: Vec<(String, f64, Option<f64>)> = results
+        .iter()
+        .map(|r| (r.config_dir.clone(), r.utilization, r.usage_delta))
+        .collect();
+    crate::ai_provider::record_account_usage(&samples);
+}
+
+/// Probe every configured account and refresh the selection usage snapshot.
+///
+/// Called off the hot path — at startup and on a periodic timer (see
+/// `main.rs`) — so a runner whose Settings/Terminal UI is never opened (e.g. a
+/// headless or co-pilot-only runner) still has fresh weekly-usage headroom
+/// data for `pick_best_account`. No-op when fewer than two accounts are
+/// configured (single-account runners have nothing to choose between).
+pub async fn refresh_account_usage_snapshot() {
+    let config_dirs = crate::settings::get_claude_config_dirs();
+    if config_dirs.len() < 2 {
+        return;
+    }
+    let futures: Vec<_> = config_dirs
+        .into_iter()
+        .map(|dir| async move { probe_account_usage(dir).await })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+    record_usage_snapshot(&results);
 }
 
 // ============================================================================

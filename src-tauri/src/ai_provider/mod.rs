@@ -34,7 +34,7 @@ mod types;
 pub use account_usage::pick_best_account;
 pub use cache_aware_builder::StructuredPrompt;
 pub use config::{
-    get_account_statuses, get_effective_config_dir, get_resolved_config_dir,
+    get_account_statuses, get_effective_config_dir, get_resolved_config_dir, record_account_usage,
     rotate_account_on_rate_limit, set_resolved_config_dir, switch_to_account,
 };
 pub use multimodal::{ContentBlock, ImageSource, MultimodalPrompt};
