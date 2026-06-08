@@ -52,8 +52,9 @@ pub fn coord_http_base() -> Option<String> {
 /// `POST /coord/git-ops/record` — append one git op to the tenant feed.
 ///
 /// Best-effort: returns `Result` so the caller can log and continue. The
-/// tenant is resolved server-side from the `X-Qontinui-Tenant-Id` header
-/// (NOT the JWT) — see [`TENANT_HEADER`].
+/// tenant is resolved server-side from the verified device-JWT bearer
+/// (coord's `FleetPrincipal`); the `X-Qontinui-Tenant-Id` header is retained
+/// transitionally but coord no longer reads it.
 pub async fn record(
     client: &reqwest::Client,
     base: &str,
@@ -61,14 +62,13 @@ pub async fn record(
     tenant_id: Uuid,
     req: &RecordGitOpRequest,
 ) -> Result<()> {
-    let _ = device_token; // retained for forward-compat; see TENANT_HEADER.
     let url = format!("{base}/coord/git-ops/record");
     let resp = client
         .post(&url)
+        // coord resolves the tenant from the verified bearer (FleetPrincipal);
+        // the header is retained transitionally (coord no longer reads it).
         .header(TENANT_HEADER, tenant_id.to_string())
-        // bearer_auth deferred: coord anonymous-pilot posture doesn't
-        // validate JWT; re-enable when SSO lands.
-        // .bearer_auth(device_token)
+        .bearer_auth(device_token)
         .json(req)
         .send()
         .await

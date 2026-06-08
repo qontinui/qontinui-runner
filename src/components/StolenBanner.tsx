@@ -137,7 +137,7 @@ const bannerStyle: React.CSSProperties = {
   padding: "12px 14px",
   background: "var(--bg-tertiary, #242837)",
   color: "var(--text-primary, #e4e4e7)",
-  border: "1px solid var(--destructive, #ef4444)",
+  border: "1px solid hsl(var(--destructive, 0 84% 60%))",
   borderRadius: 8,
   boxShadow: "0 4px 16px rgba(0, 0, 0, 0.35)",
   fontSize: "0.875rem",
@@ -147,7 +147,7 @@ const titleStyle: React.CSSProperties = {
   margin: 0,
   marginBottom: 4,
   fontWeight: 600,
-  color: "var(--destructive, #ef4444)",
+  color: "hsl(var(--destructive, 0 84% 60%))",
 };
 
 const messageStyle: React.CSSProperties = {

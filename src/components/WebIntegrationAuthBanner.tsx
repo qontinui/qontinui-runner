@@ -327,7 +327,7 @@ export function WebIntegrationAuthBanner() {
             {reKickError ? (
               <>
                 <br />
-                <span style={{ color: "var(--destructive, #ef4444)" }}>{reKickError}</span>
+                <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{reKickError}</span>
               </>
             ) : null}
           </div>
@@ -395,7 +395,7 @@ export function WebIntegrationAuthBanner() {
           {authorizeError ? (
             <>
               <br />
-              <span style={{ color: "var(--destructive, #ef4444)" }}>{authorizeError}</span>
+              <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{authorizeError}</span>
             </>
           ) : null}
         </div>
