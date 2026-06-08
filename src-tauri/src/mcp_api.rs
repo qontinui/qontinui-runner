@@ -1060,9 +1060,8 @@ pub fn create_router(
             // (re)write the marker `clean:false` for the NOW-running process
             // so that if THIS process crashes the next boot detects it. The
             // clean drain / exit seam flips it back to `clean:true`.
-            let marker_path = crate::session::shutdown_marker::marker_path(
-                crate::mcp::types::get_mcp_api_port(),
-            );
+            let marker_path =
+                crate::session::shutdown_marker::marker_path(crate::mcp::types::get_mcp_api_port());
             let crash_recovery =
                 crate::session::shutdown_marker::was_unclean_shutdown(&marker_path);
             crate::session::shutdown_marker::mark_running(&marker_path);

@@ -1948,9 +1948,7 @@ mod tests {
         let slot: Arc<Mutex<Option<DropFlag>>> = Arc::new(Mutex::new(None));
 
         // Park the value (mirrors `set_isolated_edit_ctx` after resume).
-        slot.lock()
-            .unwrap()
-            .replace(DropFlag(dropped.clone()));
+        slot.lock().unwrap().replace(DropFlag(dropped.clone()));
         assert!(
             !dropped.load(Ordering::SeqCst),
             "held value must stay alive while parked on the session"

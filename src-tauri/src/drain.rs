@@ -309,11 +309,8 @@ pub fn capture_wip_ref(
 
     let ref_name = format!("refs/wip/{agent_session_id}");
     let msg = format!("qontinui-drain WIP for task_run_id={task_run_id}");
-    run_git(
-        repo_dir,
-        &["update-ref", "-m", &msg, &ref_name, stash_sha],
-    )
-    .map_err(|e| format!("git update-ref {ref_name} failed: {e}"))?;
+    run_git(repo_dir, &["update-ref", "-m", &msg, &ref_name, stash_sha])
+        .map_err(|e| format!("git update-ref {ref_name} failed: {e}"))?;
 
     Ok(true)
 }
@@ -596,7 +593,10 @@ mod tests {
         // Restore → tree matches the captured WIP, ref deleted.
         let outcome = restore_wip_ref(&dir, &sid).expect("restore ok");
         assert!(outcome.ref_existed, "ref must have existed");
-        assert!(outcome.applied_clean, "apply onto a clean tree is conflict-free");
+        assert!(
+            outcome.applied_clean,
+            "apply onto a clean tree is conflict-free"
+        );
         assert!(outcome.ref_deleted, "clean apply must delete the ref");
         assert_eq!(outcome.ref_name, ref_name);
 

@@ -197,11 +197,7 @@ fn encode_project_path(project_path: &str) -> String {
 /// Exposed so the chat-resume path (Phase 3, restart resilience) can probe
 /// whether a lossless `--resume` is possible before deciding to fall back to a
 /// lossy output_log summary.
-pub fn session_transcript_path(
-    config_dir: &Path,
-    project_path: &str,
-    session_id: &str,
-) -> PathBuf {
+pub fn session_transcript_path(config_dir: &Path, project_path: &str, session_id: &str) -> PathBuf {
     config_dir
         .join("projects")
         .join(encode_project_path(project_path))

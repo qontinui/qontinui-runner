@@ -134,7 +134,10 @@ pub fn emit_session_recovery_summary(
     summary: &SessionRecoverySummary,
 ) {
     if let Err(e) = app_handle.emit(SESSION_RECOVERY_SUMMARY_EVENT, summary) {
-        warn!("Failed to emit {} event: {}", SESSION_RECOVERY_SUMMARY_EVENT, e);
+        warn!(
+            "Failed to emit {} event: {}",
+            SESSION_RECOVERY_SUMMARY_EVENT, e
+        );
     }
 }
 
@@ -1521,7 +1524,13 @@ async fn reacquire_and_restore_session_worktree(
             // would keep the heartbeat alive until process exit and never
             // release the claim, blocking a peer from re-acquiring the
             // worktree after this session dies.
-            (workdir, notes, Some(ctx), ClaimStatus::Reacquired, wip_status)
+            (
+                workdir,
+                notes,
+                Some(ctx),
+                ClaimStatus::Reacquired,
+                wip_status,
+            )
         }
         Ok(None) => {
             // Worktree mode off — shared-checkout fallback, no claim.
