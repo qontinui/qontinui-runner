@@ -1117,6 +1117,23 @@ pub fn create_router(
         });
     }
 
+    // Auto-start the fleet-policy poller (P3 of the fleet-policy channel
+    // redesign). Device-scoped: it polls coord's effective
+    // `install_interception` level every ~45s and caches it for the
+    // interception pre-call to make the per-install mode dynamic (P4). It
+    // no-ops quietly while unpaired (no device JWT) and fails safe to `off`
+    // before its first success, so spawning unconditionally is harmless.
+    {
+        let poller_api_state = api_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            crate::mcp::fleet_policy_poller::commands::auto_start_fleet_policy_poller(
+                poller_api_state,
+            )
+            .await;
+        });
+    }
+
     // Sync workflows from web backend on startup (background task)
     {
         let sync_pg_db = api_state.app_state.pg_db.clone();

@@ -302,6 +302,7 @@ pkgs_json="$pkgs_json]"
 correlation_id=""
 gate=""
 risk_factors=""
+resp_eff_mode=""
 PORT="${QONTINUI_INSTALL_INTERCEPT_PORT:-}"
 MODE="${QONTINUI_INSTALL_INTERCEPT_MODE:-observe}"
 OVERRIDE="${QONTINUI_INSTALL_OVERRIDE:-}"
@@ -347,6 +348,16 @@ elif command -v curl >/dev/null 2>&1; then
     if printf '%s' "$pre_resp" | grep -q '"gate"[[:space:]]*:[[:space:]]*"escalate"'; then
       gate="escalate"
     fi
+    # DYNAMIC interception mode (P4): the producer returns the device's EFFECTIVE
+    # interception level resolved from the fleet policy at pre-call time
+    # ("off" | "observe" | "gate"). When present, it OVERRIDES this shim's
+    # spawn-time MODE env so an operator flipping the policy takes effect on
+    # already-injected terminals. Parsed with the SAME grep style as gate above.
+    # ABSENT (old runner/coord) -> empty -> the eff_mode fallback below keeps the
+    # env MODE (full back-compat). An "off" effective mode short-circuits the
+    # producer (no correlation_id), so the post-call is already skipped by the
+    # existing [ -n "$correlation_id" ] guard.
+    resp_eff_mode="$(printf '%s' "$pre_resp" | grep -o '"effective_mode"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')"
     # risk_factors is a JSON string array; the extraction is DISPLAY-ONLY
     # best-effort (not load-bearing — only the gate field is). Pull the bracketed
     # array, strip quotes/brackets, join elements with "; ".
@@ -362,12 +373,20 @@ fi
 
 # ---------------------------------------------------------------------------
 # GATE DECISION (plan §3 A4 — shell transliteration of gate::should_block).
-# BLOCK iff: MODE==gate AND gate==escalate AND OVERRIDE!=1 AND NOT lockfile_only
-# (A6) AND NOT never-gate tool (npx, NEVER_GATE==1). Every other case proceeds.
-# A block prints the A4 UX to STDERR and exits 1 WITHOUT running the real tool
-# and WITHOUT a post-call (no install happened — PreContext TTLs out).
+# BLOCK iff: eff_mode==gate AND gate==escalate AND OVERRIDE!=1 AND NOT
+# lockfile_only (A6) AND NOT never-gate tool (npx, NEVER_GATE==1). Every other
+# case proceeds. A block prints the A4 UX to STDERR and exits 1 WITHOUT running
+# the real tool and WITHOUT a post-call (no install happened — PreContext TTLs
+# out).
+#
+# eff_mode (P4): the EFFECTIVE interception mode is the producer-returned
+# effective_mode when present, else the spawn-time MODE env (back-compat with an
+# old runner/coord that omits the field). This is what makes the per-install
+# mode DYNAMIC — the fleet policy governs already-injected terminals, not just
+# the env captured when the terminal was spawned.
 # ---------------------------------------------------------------------------
-if [ "$MODE" = "gate" ] \
+eff_mode="${resp_eff_mode:-$MODE}"
+if [ "$eff_mode" = "gate" ] \
    && [ "$gate" = "escalate" ] \
    && [ "$OVERRIDE" != "1" ] \
    && [ "$lockfile_only" != "true" ] \
