@@ -38,8 +38,8 @@ use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 use super::diagnostics::{extract_error_code, CanonicalCode};
 use super::helpers::{
     count_elements_in_discover_payload, direct_webview_evaluate_with_result,
-    evaluate_js_expression, extract_ai_find_match, extract_get_element_match,
-    filter_element_fields, snapshot_signature,
+    evaluate_js_expression_in_window, extract_ai_find_match, extract_get_element_match,
+    filter_element_fields, read_window_label, snapshot_signature,
 };
 use super::recovery_executor::attempt_recovery;
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
@@ -3278,7 +3278,10 @@ pub async fn ui_bridge_find_by_text_handler(
         match_expr = match_expr
     );
 
-    match evaluate_js_expression(&state, &js).await {
+    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
+    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
+    let window_label = read_window_label(&body);
+    match evaluate_js_expression_in_window(&state, &js, window_label).await {
         Ok(result) => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&result).unwrap_or(serde_json::Value::Array(vec![]));
@@ -3347,7 +3350,10 @@ pub async fn ui_bridge_click_by_text_handler(
         index = index
     );
 
-    match evaluate_js_expression(&state, &js).await {
+    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
+    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
+    let window_label = read_window_label(&body);
+    match evaluate_js_expression_in_window(&state, &js, window_label).await {
         Ok(result) => {
             let parsed: serde_json::Value = serde_json::from_str(&result)
                 .unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
@@ -3401,7 +3407,10 @@ pub async fn ui_bridge_click_by_selector_handler(
         index = index
     );
 
-    match evaluate_js_expression(&state, &js).await {
+    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
+    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
+    let window_label = read_window_label(&body);
+    match evaluate_js_expression_in_window(&state, &js, window_label).await {
         Ok(result) => {
             let parsed: serde_json::Value = serde_json::from_str(&result)
                 .unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
@@ -3454,7 +3463,10 @@ pub async fn ui_bridge_read_value_handler(
         index = index
     );
 
-    match evaluate_js_expression(&state, &js).await {
+    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
+    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
+    let window_label = read_window_label(&body);
+    match evaluate_js_expression_in_window(&state, &js, window_label).await {
         Ok(result) => {
             let parsed: serde_json::Value = serde_json::from_str(&result)
                 .unwrap_or(serde_json::json!({"found": false, "error": "Parse error"}));
@@ -3549,7 +3561,10 @@ pub async fn ui_bridge_type_into_handler(
         text_literal = text_js_literal
     );
 
-    match evaluate_js_expression(&state, &js).await {
+    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
+    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
+    let window_label = read_window_label(&body);
+    match evaluate_js_expression_in_window(&state, &js, window_label).await {
         Ok(result) => {
             let parsed: serde_json::Value = serde_json::from_str(&result)
                 .unwrap_or(serde_json::json!({"typed": false, "error": "Parse error"}));
