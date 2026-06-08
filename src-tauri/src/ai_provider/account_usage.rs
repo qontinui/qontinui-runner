@@ -2,20 +2,24 @@
 //!
 //! [`pick_best_account`] picks an effective Claude config dir from the
 //! configured `claude_config_dirs`. Among accounts that are **not** in a
-//! rate-limit cooldown, it prefers the one with the most weekly-usage
-//! *headroom* — the lowest [`super::config::usage_headroom_key`] (actual
+//! rate-limit cooldown, it ranks by [`super::config::usage_rank`] —
+//! `(exhausted, headroom)`. `headroom` is the weekly-usage signal (actual
 //! 7-day utilization minus the expected linear utilization at this point in
-//! the billing window; negative = under projected pace). This mirrors the
+//! the billing window; negative = under projected pace), mirroring the
 //! Terminal "best account" picker (`compareByUsageHeadroom` in
-//! `src/components/settings/types.ts`), so the co-pilot — which relays its
-//! planning prompt through this picker — chooses the same account a human
-//! would when opening a new session.
+//! `src/components/settings/types.ts`). `exhausted` is the dominating tier: an
+//! out-of-tokens / rejected account is deprioritized no matter how favourable
+//! its headroom (a fully-used account that is "under projection" still has no
+//! tokens left). The co-pilot relays its planning prompt through this picker,
+//! so it chooses the same account a human would when opening a new session.
 //!
 //! Selection order:
-//! 1. Among non-cooled accounts with a fresh usage sample, the one with the
-//!    most headroom (lowest `usage_delta`, else lowest raw utilization).
+//! 1. Among non-cooled accounts with a fresh usage sample, the best by
+//!    `(exhausted, headroom)` ascending: a usable account beats an exhausted
+//!    one, then most-under-projection wins within a tier.
 //! 2. If no non-cooled account has a fresh sample, the first non-cooled
-//!    account (legacy cooldown-only behaviour — preserved for cold start).
+//!    account (legacy cooldown-only behaviour — preserved for cold start and
+//!    for the single-account case, where the one account is simply pinned).
 //! 3. If every account is cooled, the one with the **shortest remaining
 //!    cooldown** (closest to expiry).
 //!
@@ -35,7 +39,7 @@
 //! the default 5-minute cooldown (no header source on stdout).
 //!
 //! [`pick_best_account`] is a no-op when `account_selection_mode != LeastUsage`
-//! or fewer than two accounts are configured.
+//! or no accounts are configured.
 
 use crate::settings::{self, AccountSelectionMode};
 use std::path::Path;
@@ -49,11 +53,14 @@ use tracing::info;
 ///
 /// No-op when:
 ///   - account selection mode is `Manual`
-///   - fewer than two accounts are configured
+///   - no accounts are configured
 ///
-/// Selection prefers the non-cooled account with the most weekly-usage
-/// headroom; falls back to first-non-cooled (cold start), then to the
-/// soonest-to-expire cooldown when every account is rate-limited.
+/// With a single configured account it simply pins that account (so the
+/// effective config dir resolves even for users who never set a manual
+/// `config_dir`). With several, selection prefers the non-cooled, non-
+/// exhausted account with the most weekly-usage headroom; falls back to
+/// first-non-cooled (cold start), then to the soonest-to-expire cooldown when
+/// every account is rate-limited.
 pub fn pick_best_account() {
     let ai_settings = settings::get_ai_settings();
     if ai_settings.claude_cli.account_selection_mode != AccountSelectionMode::LeastUsage {
@@ -61,14 +68,14 @@ pub fn pick_best_account() {
     }
 
     let config_dirs = settings::get_claude_config_dirs();
-    if config_dirs.len() < 2 {
+    if config_dirs.is_empty() {
         return;
     }
 
     let chosen = pick_from(
         &config_dirs,
         |d| super::config::is_account_cooled_down(d),
-        |d| super::config::usage_headroom_key(d),
+        |d| super::config::usage_rank(d),
         |d| super::config::time_until_cooled_down(d),
     );
 
@@ -84,26 +91,37 @@ pub fn pick_best_account() {
 /// Pure selection core, parameterised over the cooldown/usage/expiry lookups
 /// so it can be unit-tested without the global settings + state singletons.
 ///
-/// `is_cooled` / `headroom` / `remaining` mirror the `super::config` helpers.
+/// `is_cooled` / `usage` / `remaining` mirror the `super::config` helpers.
+/// `usage` returns `(exhausted, headroom)` for accounts with a fresh sample.
 /// Returns the chosen config dir, or `None` only when `config_dirs` is empty.
 fn pick_from<'a>(
     config_dirs: &'a [String],
     is_cooled: impl Fn(&str) -> bool,
-    headroom: impl Fn(&str) -> Option<f64>,
+    usage: impl Fn(&str) -> Option<(bool, f64)>,
     remaining: impl Fn(&str) -> Option<Duration>,
 ) -> Option<String> {
     let available: Vec<&'a String> = config_dirs.iter().filter(|d| !is_cooled(d)).collect();
 
     if !available.is_empty() {
-        // Prefer the available account with the most usage headroom (lowest
-        // key). Only ranks accounts that have a fresh usage sample; if none
-        // do, fall back to the first available (legacy cooldown-only pick).
-        let best_by_headroom = available
+        // Among available accounts that have a fresh usage sample, pick the
+        // best by `(exhausted, headroom)` ascending: a usable account always
+        // beats an exhausted one (out of tokens / rejected) regardless of
+        // headroom, and within a tier the most-under-projection wins. If no
+        // available account has a fresh sample, fall back to the first
+        // available (legacy cooldown-only pick / cold start).
+        let best = available
             .iter()
-            .filter_map(|d| headroom(d).map(|k| (*d, k)))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .filter_map(|d| usage(d).map(|rank| (*d, rank)))
+            .min_by(|a, b| {
+                // (exhausted, headroom) — false < true, then headroom ascending.
+                a.1 .0.cmp(&b.1 .0).then(
+                    a.1 .1
+                        .partial_cmp(&b.1 .1)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            })
             .map(|(d, _)| d.clone());
-        return best_by_headroom.or_else(|| available.first().map(|d| (*d).clone()));
+        return best.or_else(|| available.first().map(|d| (*d).clone()));
     }
 
     // All cooled: pick the one with the shortest remaining cooldown.
@@ -218,8 +236,10 @@ mod tests {
     //
     // `pick_from` is parameterised over the cooldown/usage/expiry lookups, so
     // these tests inject closures and assert the ranking directly — no global
-    // settings/state needed. Mirrors the frontend `compareByUsageHeadroom`
-    // semantics: lowest `usage_delta` (else utilization) wins among available.
+    // settings/state needed. `usage` returns `(exhausted, headroom)`: a usable
+    // account beats an exhausted one regardless of headroom, and within a tier
+    // the lowest `usage_delta` (else utilization) wins — mirroring the frontend
+    // `compareByUsageHeadroom` plus the out-of-tokens guard.
 
     fn dirs(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
@@ -229,14 +249,50 @@ mod tests {
     fn headroom_wins_among_available() {
         let d = dirs(&["/a", "/b", "/c"]);
         // /b is furthest under projected pace (most-negative delta) → chosen,
-        // even though /a sorts first by position.
+        // even though /a sorts first by position. None exhausted.
         let chosen = pick_from(
             &d,
             |_| false, // none cooled
             |x| match x {
-                "/a" => Some(0.10),
-                "/b" => Some(-0.30),
-                "/c" => Some(0.05),
+                "/a" => Some((false, 0.10)),
+                "/b" => Some((false, -0.30)),
+                "/c" => Some((false, 0.05)),
+                _ => None,
+            },
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn usable_account_beats_exhausted_with_better_headroom() {
+        let d = dirs(&["/full", "/usable"]);
+        // /full is fully used (100%) when 95% expected → favourable delta
+        // (-... no, +0.05) BUT exhausted. /usable is 80% used / 60% expected
+        // (+0.20, worse delta) but has tokens left → must win.
+        let chosen = pick_from(
+            &d,
+            |_| false,
+            |x| match x {
+                "/full" => Some((true, 0.05)),    // exhausted, better headroom
+                "/usable" => Some((false, 0.20)), // usable, worse headroom
+                _ => None,
+            },
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/usable"));
+    }
+
+    #[test]
+    fn all_exhausted_picks_best_headroom_among_them() {
+        let d = dirs(&["/a", "/b"]);
+        // Both exhausted → least-bad (lowest headroom) is the fallback choice.
+        let chosen = pick_from(
+            &d,
+            |_| false,
+            |x| match x {
+                "/a" => Some((true, 0.30)),
+                "/b" => Some((true, 0.10)),
                 _ => None,
             },
             |_| None,
@@ -252,8 +308,8 @@ mod tests {
             &d,
             |x| x == "/a",
             |x| match x {
-                "/a" => Some(-0.90),
-                "/b" => Some(0.20),
+                "/a" => Some((false, -0.90)),
+                "/b" => Some((false, 0.20)),
                 _ => None,
             },
             |_| None,
@@ -273,15 +329,32 @@ mod tests {
     #[test]
     fn ranks_only_accounts_with_samples_then_keeps_them() {
         let d = dirs(&["/a", "/b"]);
-        // Only /b has a sample → it is selected (a known-headroom account is
+        // Only /b has a sample → it is selected (a known-rank account is
         // preferred over an unprobed one).
         let chosen = pick_from(
             &d,
             |_| false,
-            |x| if x == "/b" { Some(0.40) } else { None },
+            |x| if x == "/b" { Some((false, 0.40)) } else { None },
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn single_account_is_pinned() {
+        // One configured account, no usage sample, not cooled → it is selected
+        // (the single-account case must resolve, not no-op).
+        let d = dirs(&["/only"]);
+        let chosen = pick_from(&d, |_| false, |_| None, |_| None);
+        assert_eq!(chosen.as_deref(), Some("/only"));
+    }
+
+    #[test]
+    fn single_exhausted_account_still_pinned() {
+        // One account, exhausted → still the only option, so still selected.
+        let d = dirs(&["/only"]);
+        let chosen = pick_from(&d, |_| false, |_| Some((true, 1.0)), |_| None);
+        assert_eq!(chosen.as_deref(), Some("/only"));
     }
 
     #[test]
