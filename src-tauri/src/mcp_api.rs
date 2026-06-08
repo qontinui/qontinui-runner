@@ -388,6 +388,34 @@ async fn health(
     }))
 }
 
+/// `POST /drain` — graceful drain on planned restart (Phase 2 of
+/// `2026-06-06-runner-dev-loop-and-restart-resilience`).
+///
+/// Triggers the [`crate::drain::drain`] sequence: flips the global draining
+/// flag (refuses new AI turns), flushes in-flight turns to `output_log`,
+/// auto-commits each session's dirty worktree to `refs/wip/<agent_session_id>`,
+/// and heartbeats coord claims — all bounded by a hard timeout so a stuck
+/// session can never block a deploy. The supervisor calls this before its
+/// `taskkill`; the in-process exit seam also calls the drain fn directly.
+///
+/// Safe to call when idle (no sessions → fast no-op). Idempotent: a second
+/// call after a completed drain returns `{already_drained: true}` instantly.
+async fn drain_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> Json<crate::drain::DrainSummary> {
+    let app_handle = state.app_handle.clone();
+    let timeout = crate::drain::configured_timeout();
+    // The drain sequence is synchronous (blocking git + bounded polling), so
+    // run it on a blocking thread to keep the async executor free.
+    let summary = tokio::task::spawn_blocking(move || crate::drain::drain(&app_handle, timeout))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("drain task panicked: {e}");
+            crate::drain::DrainSummary::default()
+        });
+    Json(summary)
+}
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -1025,11 +1053,43 @@ pub fn create_router(
             // Wait a bit longer than unified workflows to let the server fully start
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-            let count = crate::commands::ai_session::resume_ai_sessions(chat_sm, chat_handle).await;
-
-            if count > 0 {
-                info!("Resumed {} AI session(s) on startup", count);
+            // Phase 4 — classify this boot as crash recovery vs a planned
+            // restart from the on-disk shutdown marker, BEFORE we overwrite
+            // it. A missing / `clean:false` / corrupt marker ⇒ the previous
+            // shutdown was NOT clean ⇒ crash recovery. We then immediately
+            // (re)write the marker `clean:false` for the NOW-running process
+            // so that if THIS process crashes the next boot detects it. The
+            // clean drain / exit seam flips it back to `clean:true`.
+            let marker_path =
+                crate::session::shutdown_marker::marker_path(crate::mcp::types::get_mcp_api_port());
+            let crash_recovery =
+                crate::session::shutdown_marker::was_unclean_shutdown(&marker_path);
+            crate::session::shutdown_marker::mark_running(&marker_path);
+            if crash_recovery {
+                warn!("Startup recovery: previous shutdown was NOT clean — this is crash recovery");
             }
+
+            let summary = crate::commands::ai_session::resume_ai_sessions(
+                chat_sm,
+                chat_handle.clone(),
+                crash_recovery,
+            )
+            .await;
+
+            if summary.resumed_count > 0 {
+                info!(
+                    "Resumed {} AI session(s) on startup (crash_recovery={})",
+                    summary.resumed_count, summary.crash_recovery
+                );
+            }
+
+            // Emit the structured startup-recovery summary ONCE so the
+            // frontend can surface a (prominent on crash / quiet on planned)
+            // banner with honest per-session fidelity + claim + WIP status.
+            // Always emit — even with zero sessions — so a late-mounting
+            // banner that requested a replay can settle; the frontend hides
+            // itself when there's nothing to show.
+            crate::commands::ai_session::emit_session_recovery_summary(&chat_handle, &summary);
         });
     }
 
@@ -1632,6 +1692,10 @@ pub fn create_router(
         .route("/health", get(health))
         .route("/ui-bridge/health", get(health))
         .route("/ui-bridge/status", get(health))
+        // Phase 2 — graceful drain on planned restart. The supervisor POSTs
+        // here before its hard taskkill so in-flight turns flush, dirty
+        // worktrees are stashed to refs/wip/*, and coord claims persist.
+        .route("/drain", post(drain_handler))
         // Relay web-integration diagnostic — exposes the idle-gating state
         // (tier, enabled, device-JWT presence, WS connection, last error) so
         // an operator can see WHY a runner never appears to the cloud/mobile.

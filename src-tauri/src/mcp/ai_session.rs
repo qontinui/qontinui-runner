@@ -1610,6 +1610,18 @@ pub async fn run_prompt(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<RunPromptRequest>,
 ) -> Result<Json<ApiResponse<RunPromptResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Graceful-drain gate (Phase 2): refuse new AI turns once a planned
+    // restart has begun draining, so we don't spawn work the imminent kill
+    // would tear in half. Mirrors the `send_user_message` Tauri-command gate.
+    if crate::drain::is_draining() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error(
+                "runner is draining for a planned restart — new prompts are refused",
+            )),
+        ));
+    }
+
     // Determine mode and get prompt name + content + orchestrator config
     // Orchestrator config is extracted from saved prompts (system-level setting, not user-controllable)
     let (

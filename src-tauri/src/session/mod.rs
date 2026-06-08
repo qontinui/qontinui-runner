@@ -64,6 +64,7 @@ pub mod local_store;
 pub mod output_pipe;
 pub mod pane_store;
 pub mod session_lifecycle_store;
+pub mod shutdown_marker;
 pub mod transport;
 
 use std::collections::HashMap;

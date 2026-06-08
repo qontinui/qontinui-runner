@@ -1866,6 +1866,7 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
             None,
             None,
             None, // tool_policy
+            None, // cli_session_ctx
         ) {
             Ok(session) => {
                 let session = Arc::new(session);

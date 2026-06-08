@@ -305,6 +305,27 @@ impl SessionManager {
         active
     }
 
+    /// Snapshot every active `ClaudeSession` as `(task_run_id, session)`.
+    ///
+    /// Used by the graceful-drain sequence (`crate::drain`) which needs the
+    /// live `Arc<ClaudeSession>` (not just the id) to flush in-flight turns,
+    /// read each session's `worktree()`, and force-flush unpersisted output.
+    /// Excludes Workers and inline PIDs — they don't run a resumable Claude
+    /// conversation with an `output_log` replay, so there's nothing to drain.
+    pub fn active_claude_sessions(&self) -> Vec<(String, Arc<ClaudeSession>)> {
+        self.sessions
+            .lock()
+            .ok()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|(_, s)| s.state().is_active())
+                    .map(|(k, s)| (k.clone(), s.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Clean up any closed sessions and workers.
     pub fn cleanup_closed(&self) {
         if let Ok(mut guard) = self.sessions.lock() {

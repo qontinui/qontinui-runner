@@ -59,6 +59,7 @@ mod discoveries;
 mod display;
 mod doctor;
 mod dom_capture;
+mod drain;
 mod error;
 mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
 mod event_system;
@@ -3567,6 +3568,53 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          process exit",
                         SHUTDOWN_JOIN_DEADLINE_MS
                     );
+                }
+
+                // ── Graceful drain (Phase 2) ──
+                //
+                // Before the hard session-close + taskkill below, run the
+                // bounded drain so even a DIRECT exit (X button / programmatic
+                // app.exit that didn't route through the supervisor's
+                // POST /drain) flushes in-flight AI turns to output_log,
+                // stashes dirty worktrees to refs/wip/*, and heartbeats coord
+                // claims. `drain()` is idempotent: if the supervisor already
+                // hit POST /drain, this returns instantly (already_drained).
+                //
+                // The timeout is clamped well under the force-exit watchdog so
+                // a stuck session can't wedge the close handler. The drain runs
+                // synchronously on this thread (it's pure blocking git +
+                // bounded polling), which is fine — the watchdog at the bottom
+                // is the ultimate backstop.
+                {
+                    let exit_drain_timeout = std::cmp::min(
+                        drain::configured_timeout(),
+                        std::time::Duration::from_secs(8),
+                    );
+                    let summary =
+                        drain::drain(&window.app_handle().clone(), exit_drain_timeout);
+                    info!(
+                        "Exit-seam drain: drained={} wip_refs={} claims={} timed_out={} \
+                         elapsed_ms={} already_drained={}",
+                        summary.drained_sessions,
+                        summary.wip_refs_written,
+                        summary.claims_persisted,
+                        summary.timed_out,
+                        summary.elapsed_ms,
+                        summary.already_drained
+                    );
+
+                    // Phase 4 — the ExitRequested seam is the catch-all CLEAN
+                    // shutdown signal: even a direct X-button / programmatic
+                    // app.exit that produced an `already_drained` no-op above
+                    // (or ran with zero sessions) is still a PLANNED exit, not
+                    // a crash. Stamp the marker `clean:true` here unconditionally
+                    // so the next boot's resume classifies a quiet (planned)
+                    // restart. `drain()` also stamps it on a fresh pass; this is
+                    // the idempotent backstop for the no-op / zero-session case.
+                    let marker_path = session::shutdown_marker::marker_path(
+                        crate::mcp::types::get_mcp_api_port(),
+                    );
+                    session::shutdown_marker::mark_clean_shutdown(&marker_path);
                 }
 
                 // Close all interactive Claude sessions

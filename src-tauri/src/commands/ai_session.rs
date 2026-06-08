@@ -40,6 +40,107 @@ pub struct SessionStateEvent {
     pub resumed: bool,
 }
 
+/// How a session's conversation was reconstructed on resume (Phase 4
+/// honesty gate). Serialized lowercase-kebab for the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResumeFidelity {
+    /// Resumed losslessly via the on-disk `--resume` transcript.
+    Lossless,
+    /// Reconstructed from the lossy `output_log` summary — earlier context
+    /// may be missing. `turnsCovered` carries the count.
+    Summary,
+}
+
+/// What happened to the session's isolated-worktree coord claim on resume
+/// (Phase 4 honesty gate). Serialized lowercase-kebab for the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimStatus {
+    /// No isolated worktree was involved (shared checkout / worktree mode
+    /// off) — nothing session-scoped to re-acquire.
+    None,
+    /// The worktree claim was cleanly re-acquired under the original owner.
+    Reacquired,
+    /// A peer now holds the claim under a different owner — degraded to the
+    /// shared checkout in read-mostly mode (NOT clobbered).
+    PeerConflict,
+    /// Re-acquire failed for another reason — degraded to the shared
+    /// checkout without a claim.
+    Degraded,
+}
+
+/// What happened to the session's drained WIP ref on resume (Phase 4 honesty
+/// gate). Serialized lowercase-kebab for the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WipStatus {
+    /// No WIP ref was captured at drain time (clean tree / no worktree).
+    None,
+    /// The drained WIP applied cleanly back into the worktree.
+    Restored,
+    /// The WIP could not be applied cleanly — kept at `refs/wip/*` for the
+    /// operator to recover manually.
+    KeptForManual,
+}
+
+/// Per-session recovery outcome, assembled as `resume_ai_sessions` resumes
+/// each session (Phase 4). Threaded out of the resume loop and into the
+/// `session-recovery-summary` event so the frontend can surface an HONEST
+/// per-session status (lossy / degraded / peer-conflict are never hidden).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecoveryOutcome {
+    /// The resumed session's task run id (stable identity across restarts).
+    pub task_run_id: String,
+    /// Human-readable title shown in the banner.
+    pub title: String,
+    /// Lossless `--resume` vs lossy summary fallback.
+    pub fidelity: ResumeFidelity,
+    /// On a `summary` fidelity, the number of conversation turns the lossy
+    /// summary covers (mirrors the honest-label marker). `0` for lossless.
+    pub turns_covered: usize,
+    /// Worktree-claim re-acquire outcome.
+    pub claim_status: ClaimStatus,
+    /// Drained-WIP restore outcome.
+    pub wip_status: WipStatus,
+}
+
+/// Structured startup-recovery summary emitted ONCE after `resume_ai_sessions`
+/// runs at boot (Phase 4). Carries the crash-vs-planned classification (from
+/// the on-disk shutdown marker) plus a per-session honesty breakdown.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecoverySummary {
+    /// `true` when the previous shutdown was NOT clean (the runner crashed /
+    /// was hard-killed). Drives the prominent vs quiet banner on the
+    /// frontend.
+    pub crash_recovery: bool,
+    /// Number of sessions successfully resumed.
+    pub resumed_count: u32,
+    /// Per-session honest outcomes (one entry per successfully resumed
+    /// session).
+    pub sessions: Vec<SessionRecoveryOutcome>,
+}
+
+/// Tauri event name for the one-shot startup recovery summary (Phase 4).
+pub const SESSION_RECOVERY_SUMMARY_EVENT: &str = "session-recovery-summary";
+
+/// Emit the startup recovery summary to the frontend, once, after resume
+/// completes. A banner subscribes and renders crash-vs-planned + per-session
+/// fidelity/claim/WIP honesty. No-op-safe: an emit failure is logged only.
+pub fn emit_session_recovery_summary(
+    app_handle: &tauri::AppHandle,
+    summary: &SessionRecoverySummary,
+) {
+    if let Err(e) = app_handle.emit(SESSION_RECOVERY_SUMMARY_EVENT, summary) {
+        warn!(
+            "Failed to emit {} event: {}",
+            SESSION_RECOVERY_SUMMARY_EVENT, e
+        );
+    }
+}
+
 /// Emit a session state change event to the frontend.
 pub fn emit_session_state(
     app_handle: &tauri::AppHandle,
@@ -135,6 +236,15 @@ pub async fn send_user_message(
         task_run_id,
         message.len()
     );
+
+    // Graceful-drain gate (Phase 2): once a planned restart begins draining,
+    // refuse new AI turns so we don't start work that the imminent kill would
+    // tear in half. The drain flushes in-flight turns; new ones are rejected.
+    if crate::drain::is_draining() {
+        return Err(
+            "runner is draining for a planned restart — new messages are refused".to_string(),
+        );
+    }
 
     // Session-automation Phase 0 (R3) — operator interaction is the ONLY signal
     // that refreshes this session's coord heartbeat. Driving the heartbeat off
@@ -366,6 +476,17 @@ pub async fn create_ai_session(
         // and the frontend would be unable to filter them.
         let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
 
+        // Pin the Claude CLI session id to the task_run_id on this fresh launch
+        // (Phase 3, restart resilience). This makes the on-disk transcript land
+        // at a DETERMINISTIC path (`<config_dir>/projects/<encoded(cwd)>/
+        // <task_run_id>.jsonl`), so a later restart can resume LOSSLESSLY via
+        // `--resume <task_run_id>` instead of replaying a lossy output_log
+        // summary. `is_resume:false` → `--session-id` (new), not `--resume`.
+        let cli_session_ctx = crate::claude_session::runner::CliSessionContext {
+            cli_session_id: trid.clone(),
+            is_resume: false,
+        };
+
         match crate::claude_session::ClaudeSession::spawn(
             &working_dir,
             &trid,
@@ -377,6 +498,7 @@ pub async fn create_ai_session(
             None,              // model_override
             None,              // worktree
             None,              // tool_policy
+            Some(&cli_session_ctx),
         ) {
             Ok(session) => {
                 let session = Arc::new(session);
@@ -1191,6 +1313,259 @@ pub async fn recent_session_touched_files(
         .collect())
 }
 
+/// Honest-label marker prepended to a SUMMARY-fallback replay so the
+/// operator/agent knows the resume is LOSSY (the full on-disk transcript was
+/// unavailable). The `{n}` is the actual number of conversation turns the
+/// summary covers — see [`build_honest_summary_prompt`].
+///
+/// This is the UX honesty gate (Phase 3, plan
+/// `2026-06-06-runner-dev-loop-and-restart-resilience`): we never silently
+/// present a reconstructed-from-output_log summary as a complete resume.
+fn honest_summary_marker(turns_covered: usize) -> String {
+    format!(
+        "[SYSTEM_NOTE] Resumed from the last {turns_covered} turns \
+         (full transcript unavailable — earlier context may be missing).\n\n"
+    )
+}
+
+/// Prepend [`honest_summary_marker`] to a `build_replay_prompt` summary so the
+/// lossy nature of the resume is labelled. `turns_covered` is the count of
+/// parsed turns the summary was built from.
+fn build_honest_summary_prompt(replay_prompt: &str, turns_covered: usize) -> String {
+    format!("{}{}", honest_summary_marker(turns_covered), replay_prompt)
+}
+
+/// Does an on-disk Claude transcript exist for `(working_dir, cli_session_id)`?
+///
+/// The chat path pins the CLI session id to the `task_run_id` (see
+/// `create_ai_session`), so the transcript lands at
+/// `<config_dir>/projects/<encoded(working_dir)>/<cli_session_id>.jsonl`. When
+/// it exists we can resume LOSSLESSLY via `--resume <cli_session_id>` and skip
+/// the lossy output_log summary entirely. We probe every discovered Claude
+/// config dir (multi-account installs) and the resolved effective dir.
+fn transcript_exists_for(working_dir: &str, cli_session_id: &str) -> bool {
+    use crate::terminal::transcript;
+
+    // The effective config dir for the active account, plus all discovered
+    // config dirs (multi-account). Any hit means the transcript is resumable.
+    let mut config_dirs: Vec<std::path::PathBuf> = transcript::find_claude_config_dirs();
+    if let Some(eff) =
+        crate::ai_provider::get_effective_config_dir(&crate::settings::get_ai_settings().claude_cli)
+    {
+        let p = std::path::PathBuf::from(eff);
+        if !config_dirs.iter().any(|d| d == &p) {
+            config_dirs.push(p);
+        }
+    }
+
+    config_dirs
+        .iter()
+        .any(|cfg| transcript::session_transcript_path(cfg, working_dir, cli_session_id).exists())
+}
+
+/// Re-acquire the coord `kind=worktree` claim(s) for a resumed chat session and
+/// restore its drained WIP state, BEFORE re-spawning the CLI.
+///
+/// Closes the P0c gap: the legacy resume path never re-`acquire`d the worktree
+/// claim, orphaning it for the TTL (a peer could steal it). We derive the same
+/// stable `agent_session_id` Phase 2's drain used
+/// (`drain::stable_ai_session_id(task_run_id)`), so the re-acquire idempotently
+/// RENEWS the original claim if still within TTL, or cleanly re-takes it if the
+/// TTL expired.
+///
+/// Returns the effective working dir for the re-spawn (the worktree path when
+/// re-acquire succeeded, else `None` → caller keeps the shared cwd); any
+/// `[SYSTEM_NOTE]` strings to surface (peer-conflict / manual-WIP-recovery);
+/// and the re-acquired `IsolatedEditContext` (`Some` only when re-acquire
+/// succeeded). The caller MUST hand the context to the resumed
+/// `ClaudeSession` (via `set_isolated_edit_ctx`) so the claim heartbeat lives
+/// for the session's lifetime and the claim RELEASES (via the context's Drop)
+/// when the session ends — NOT `mem::forget` it (that orphans the claim past
+/// session end and blocks a peer from re-acquiring the worktree).
+///
+/// Graceful degrade (mirrors the launch path): worktree mode off / no persisted
+/// worktree / acquire fails → returns `(None, notes, None)` and resume continues
+/// in the shared checkout with no claim. A peer holding the claim under a
+/// DIFFERENT owner is surfaced (note) and NOT clobbered — resume goes
+/// read-mostly/shared.
+async fn reacquire_and_restore_session_worktree(
+    task_run_id: &str,
+    pg: &Arc<crate::database::pg::PgDb>,
+) -> (
+    Option<String>,
+    Vec<String>,
+    Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    ClaimStatus,
+    WipStatus,
+) {
+    use crate::agent_worktree::isolated_edit::{acquire, AcquireRequest};
+
+    let mut notes: Vec<String> = Vec::new();
+
+    // 1. Which repo(s)/worktree(s) was this session editing? Sourced from the
+    //    persisted `coord.worktrees` rows keyed by task_run_id (written by
+    //    `promote_to_worktree`). No row → the session ran in the shared cwd;
+    //    nothing session-scoped to re-acquire.
+    let worktree_rows = match pg.get_worktrees_for_task_run(task_run_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                "AI session resume: worktree lookup failed for {} ({}); shared-checkout fallback",
+                task_run_id, e
+            );
+            return (None, notes, None, ClaimStatus::None, WipStatus::None);
+        }
+    };
+    if worktree_rows.is_empty() {
+        return (None, notes, None, ClaimStatus::None, WipStatus::None);
+    }
+
+    // 2. Map each worktree's `repo_path` (the source checkout) back to a bare
+    //    repo slug for the acquire facade. A slug we can't resolve is skipped
+    //    (best-effort) rather than failing the whole resume.
+    let mut repos: Vec<String> = Vec::new();
+    for row in &worktree_rows {
+        if let Some(slug) = crate::agent_worktree::canonical_paths::repo_slug_for_path(
+            std::path::Path::new(&row.repo_path),
+        ) {
+            if !repos.contains(&slug) {
+                repos.push(slug);
+            }
+        } else {
+            warn!(
+                "AI session resume: could not resolve repo slug for {} (worktree {}); skipping",
+                row.repo_path, row.id
+            );
+        }
+    }
+    if repos.is_empty() {
+        return (None, notes, None, ClaimStatus::None, WipStatus::None);
+    }
+
+    // 3. Re-acquire under the SAME stable agent_session_id the drain used, so
+    //    the owner token (`<machine_id>:<agent_session_id>`) matches the
+    //    original claim → idempotent renew within TTL / clean re-take after.
+    let agent_session_id = crate::drain::stable_ai_session_id(task_run_id);
+    let intent = format!("resume chat session {task_run_id}");
+
+    match acquire(AcquireRequest {
+        repos: &repos,
+        intent: Some(&intent),
+        declared_overlap_paths: None,
+        plan_id: None,
+        phase: None,
+        agent_session_id: Some(agent_session_id),
+    })
+    .await
+    {
+        Ok(Some(ctx)) => {
+            let workdir = ctx
+                .worktrees
+                .first()
+                .map(|w| w.worktree_path.to_string_lossy().to_string());
+            info!(
+                "AI session resume: re-acquired worktree claim(s) for {} (repos={:?}, agent_session_id={})",
+                task_run_id, repos, agent_session_id
+            );
+
+            // 4. Restore the drained WIP ref into each re-acquired worktree
+            //    (Phase 2 wrote `refs/wip/<agent_session_id>` per worktree).
+            //    `wip_status` is the WORST outcome across worktrees: a single
+            //    not-clean apply degrades the whole session to KeptForManual
+            //    (the honest banner state).
+            let mut wip_status = WipStatus::None;
+            for w in &ctx.worktrees {
+                match crate::drain::restore_wip_ref(&w.worktree_path, &agent_session_id) {
+                    Ok(outcome) if outcome.ref_existed && outcome.applied_clean => {
+                        if wip_status == WipStatus::None {
+                            wip_status = WipStatus::Restored;
+                        }
+                        info!(
+                            "AI session resume: restored WIP {} into {} (ref deleted={})",
+                            outcome.ref_name,
+                            w.worktree_path.display(),
+                            outcome.ref_deleted
+                        );
+                    }
+                    Ok(outcome) if outcome.ref_existed => {
+                        // Apply was not clean — ref kept; surface for manual apply.
+                        wip_status = WipStatus::KeptForManual;
+                        notes.push(format!(
+                            "[SYSTEM_NOTE] Uncommitted work from before the restart could not be \
+                             applied cleanly in {}. It is preserved at `{}` — run \
+                             `git -C {} stash apply {}` to recover it manually.",
+                            w.repo,
+                            outcome.ref_name,
+                            w.worktree_path.display(),
+                            outcome.ref_name
+                        ));
+                        warn!(
+                            "AI session resume: WIP {} did not apply cleanly into {}; kept for manual recovery",
+                            outcome.ref_name,
+                            w.worktree_path.display()
+                        );
+                    }
+                    Ok(_) => { /* no ref captured — clean drain or clean tree */ }
+                    Err(e) => {
+                        warn!(
+                            "AI session resume: WIP restore probe failed in {}: {}",
+                            w.worktree_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+
+            // The IsolatedEditContext owns the claim heartbeat. Hand it BACK
+            // to the caller, which parks it on the resumed `ClaudeSession`
+            // (`set_isolated_edit_ctx`) so the heartbeat lives for the
+            // session's lifetime AND the claim RELEASES (via the context's
+            // Drop) when the session ends. We must NOT `mem::forget` it: that
+            // would keep the heartbeat alive until process exit and never
+            // release the claim, blocking a peer from re-acquiring the
+            // worktree after this session dies.
+            (
+                workdir,
+                notes,
+                Some(ctx),
+                ClaimStatus::Reacquired,
+                wip_status,
+            )
+        }
+        Ok(None) => {
+            // Worktree mode off — shared-checkout fallback, no claim.
+            (None, notes, None, ClaimStatus::None, WipStatus::None)
+        }
+        Err(e) => {
+            // A `ClaimConflict` (peer holds it under a different owner) or any
+            // other allocate error → DO NOT clobber. Surface + degrade to the
+            // shared checkout in read-mostly mode. A genuine peer-conflict is
+            // classified distinctly (PeerConflict) so the banner can be HONEST
+            // that another agent now holds the worktree, vs a generic transport
+            // failure (Degraded).
+            let is_peer_conflict =
+                matches!(e, crate::agent_worktree::AllocateError::ClaimConflict(_));
+            let msg = e.to_string();
+            warn!(
+                "AI session resume: worktree re-acquire for {} failed ({}); \
+                 resuming in shared/read-mostly mode without a claim",
+                task_run_id, msg
+            );
+            notes.push(format!(
+                "[SYSTEM_NOTE] Could not re-acquire the isolated worktree for this session after \
+                 the restart ({msg}). Another agent may now hold it — resuming in shared, \
+                 read-mostly mode. Re-check ownership before making edits."
+            ));
+            let claim_status = if is_peer_conflict {
+                ClaimStatus::PeerConflict
+            } else {
+                ClaimStatus::Degraded
+            };
+            (None, notes, None, claim_status, WipStatus::None)
+        }
+    }
+}
+
 /// Resume interrupted AI sessions on startup.
 ///
 /// Queries for task runs with status='running' and workflow_type='chat'
@@ -1206,13 +1581,31 @@ pub async fn recent_session_touched_files(
 /// marked failed in PG with a `resume_failed:` error message so the sidebar
 /// reflects reality rather than showing a phantom "running" state.
 ///
-/// Returns the number of sessions successfully resumed.
+/// `crash_recovery` is the boot classification from the on-disk shutdown
+/// marker (see `session::shutdown_marker`): `true` when the previous shutdown
+/// was NOT clean. It is threaded onto the returned [`SessionRecoverySummary`]
+/// so the caller can emit a single `session-recovery-summary` event and the
+/// frontend can choose a prominent (crash) vs quiet (planned) banner.
+///
+/// Returns a [`SessionRecoverySummary`] carrying the resumed count, the
+/// crash-vs-planned flag, and a per-session honesty breakdown (resume
+/// fidelity + claim status + WIP status).
 pub async fn resume_ai_sessions(
     session_manager: Arc<SessionManager>,
     app_handle: tauri::AppHandle,
-) -> u32 {
+    crash_recovery: bool,
+) -> SessionRecoverySummary {
     use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
     use crate::claude_session::ClaudeSession;
+
+    // An empty summary carries only the boot classification — used for every
+    // early exit (no sessions / not-yet-ready) so the caller still learns
+    // whether this was a crash boot.
+    let empty_summary = || SessionRecoverySummary {
+        crash_recovery,
+        resumed_count: 0,
+        sessions: Vec::new(),
+    };
 
     // Grab AppState from Tauri's managed state — same pattern other resume
     // paths use. If unavailable we're being invoked before setup completes;
@@ -1221,7 +1614,7 @@ pub async fn resume_ai_sessions(
         Some(s) => s.inner().clone(),
         None => {
             warn!("AI session resume: AppState not yet available; skipping");
-            return 0;
+            return empty_summary();
         }
     };
 
@@ -1238,7 +1631,7 @@ pub async fn resume_ai_sessions(
         .load(std::sync::atomic::Ordering::Relaxed);
     if my_port == 0 {
         warn!("AI session resume: api_port not set yet; skipping");
-        return 0;
+        return empty_summary();
     }
 
     let pg = app_state.pg_db.clone();
@@ -1247,13 +1640,13 @@ pub async fn resume_ai_sessions(
         Ok(rows) => rows,
         Err(e) => {
             error!("AI session resume: failed to query resumable chats: {}", e);
-            return 0;
+            return empty_summary();
         }
     };
 
     if rows.is_empty() {
         info!("AI session resume: no resumable chat sessions found");
-        return 0;
+        return empty_summary();
     }
 
     info!(
@@ -1269,6 +1662,7 @@ pub async fn resume_ai_sessions(
     };
 
     let mut resumed: u32 = 0;
+    let mut outcomes: Vec<SessionRecoveryOutcome> = Vec::new();
 
     for (task_run_id, task_name, auto_continue) in rows {
         if !auto_continue {
@@ -1325,16 +1719,86 @@ pub async fn resume_ai_sessions(
             continue;
         }
 
-        let replay_prompt = build_replay_prompt(&turns, None);
-        if replay_prompt.is_empty() {
-            mark_failed(
-                task_run_id.clone(),
-                "empty replay prompt".to_string(),
-                pg.clone(),
-            )
-            .await;
-            continue;
-        }
+        // ── (A) Re-acquire the worktree claim + (C) restore drained WIP ────
+        // Closes the P0c gap. Runs in the async context (PG + coord I/O).
+        // Returns the worktree path to re-spawn into (when re-acquire
+        // succeeded) plus any operator-facing notes (peer-conflict / manual
+        // WIP recovery). Graceful-degrades to the shared cwd on any failure.
+        let (workdir_override, system_notes, reacquired_ctx, claim_status, wip_status) =
+            reacquire_and_restore_session_worktree(&task_run_id, &pg).await;
+
+        // Effective working dir: the re-acquired worktree, else the shared cwd
+        // the session originally ran in.
+        let working_dir = workdir_override.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        });
+
+        // ── (B) Prefer lossless `--resume`; honestly label the summary ─────
+        // The chat path pins the CLI session id to the task_run_id, so an
+        // on-disk transcript at `<cfg>/projects/<encoded(cwd)>/<id>.jsonl`
+        // means we can resume losslessly via `--resume` and SKIP the lossy
+        // output_log summary entirely. Only when no transcript exists do we
+        // fall back to `build_replay_prompt` — and we LABEL it honestly so the
+        // operator/agent knows earlier context may be missing.
+        let can_full_resume = transcript_exists_for(&working_dir, &task_run_id);
+
+        // The replay prompt is only used on the summary fallback. When we have
+        // a full transcript we send NO initial prompt (the --resume restores
+        // the real conversation; injecting a summary would be redundant +
+        // lossy). `notes_prefix` carries any worktree SYSTEM_NOTEs onto
+        // whichever initial turn we DO send.
+        let notes_prefix = if system_notes.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n\n", system_notes.join("\n\n"))
+        };
+
+        let initial_prompt: Option<String> = if can_full_resume {
+            info!(
+                "AI session resume: {} has an on-disk transcript — resuming losslessly via --resume",
+                task_run_id
+            );
+            // Even on a lossless resume, surface worktree notes (if any) as a
+            // standalone initial turn so the operator sees the conflict/WIP
+            // status. No notes → no initial prompt at all.
+            if notes_prefix.is_empty() {
+                None
+            } else {
+                Some(notes_prefix.trim_end().to_string())
+            }
+        } else {
+            let replay_prompt = build_replay_prompt(&turns, None);
+            if replay_prompt.is_empty() {
+                mark_failed(
+                    task_run_id.clone(),
+                    "empty replay prompt".to_string(),
+                    pg.clone(),
+                )
+                .await;
+                continue;
+            }
+            // Honesty gate: label the lossy summary with the turn count it
+            // covers, prefixed by any worktree notes.
+            Some(format!(
+                "{}{}",
+                notes_prefix,
+                build_honest_summary_prompt(&replay_prompt, turns.len())
+            ))
+        };
+
+        // Capture the per-session honesty signals BEFORE the spawn closure
+        // moves/consumes the locals. `fidelity` is lossless iff we resumed from
+        // an on-disk transcript; otherwise it's the lossy summary, and
+        // `turns_covered` records how many turns that summary spans.
+        let fidelity = if can_full_resume {
+            ResumeFidelity::Lossless
+        } else {
+            ResumeFidelity::Summary
+        };
+        let turns_covered = if can_full_resume { 0 } else { turns.len() };
+        let outcome_title = task_name.clone();
 
         // Spawn the Claude CLI session on a blocking thread — ClaudeSession::spawn
         // blocks waiting for the init handshake. This mirrors create_ai_session.
@@ -1342,17 +1806,28 @@ pub async fn resume_ai_sessions(
         let handle = app_handle.clone();
         let trid = task_run_id.clone();
         let name_for_ctx = task_name.clone();
-        let replay_for_spawn = replay_prompt;
+        let initial_for_spawn = initial_prompt;
+        let working_dir_for_spawn = working_dir;
+        let resume_from_transcript = can_full_resume;
+        // The re-acquired claim context (Some only when re-acquire succeeded).
+        // Moved into the spawn closure and parked on the resumed session AFTER
+        // register, so its Drop releases the claim when the session ends.
+        let reacquired_ctx_for_spawn = reacquired_ctx;
 
         let spawn_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let working_dir = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string());
-
             let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
 
+            // Pin/resume the CLI session id to the task_run_id. `is_resume` is
+            // true ONLY when an on-disk transcript exists (→ `--resume`); else
+            // we still `--session-id`-pin so a SUBSEQUENT restart can resume
+            // losslessly from the transcript this launch creates.
+            let cli_session_ctx = crate::claude_session::runner::CliSessionContext {
+                cli_session_id: trid.clone(),
+                is_resume: resume_from_transcript,
+            };
+
             let session = ClaudeSession::spawn(
-                &working_dir,
+                &working_dir_for_spawn,
                 &trid,
                 &handle,
                 Some(session_ctx),
@@ -1362,6 +1837,7 @@ pub async fn resume_ai_sessions(
                 None, // model_override
                 None, // worktree
                 None, // tool_policy
+                Some(&cli_session_ctx),
             )
             .map_err(|e| format!("spawn failed: {}", e))?;
 
@@ -1370,17 +1846,30 @@ pub async fn resume_ai_sessions(
             sm.register(&trid, session.clone())
                 .map_err(|e| format!("register failed: {}", e))?;
 
-            // Send the replay prompt as the initial turn. `send_initial_prompt`
-            // is exactly the right entrypoint: it requires Ready state (which
-            // spawn just established), writes to stdin, transitions to
-            // Processing, and crucially does NOT set `user_has_interacted` —
-            // so the next real user message still triggers the
-            // first-interaction context-switch note in send_user_message.
-            // It also does not append anything to output_log, so the next
-            // restart's replay won't double-count.
-            session
-                .send_initial_prompt(&replay_for_spawn)
-                .map_err(|e| format!("send_initial_prompt failed: {}", e))?;
+            // Park the re-acquired worktree claim on the now-registered
+            // session so the heartbeat lives for its lifetime and the claim
+            // RELEASES (via the context's Drop) when the session closes — the
+            // P3 fix for the `mem::forget` leak that orphaned the claim past
+            // session end. `None` (worktree mode off / shared-checkout
+            // fallback / peer-conflict degrade) is a no-op.
+            if let Some(ctx) = reacquired_ctx_for_spawn {
+                session.set_isolated_edit_ctx(ctx);
+            }
+
+            // Send an initial turn ONLY when we have something to say:
+            //   - summary fallback → the honest-labelled replay summary, or
+            //   - lossless resume  → just the worktree SYSTEM_NOTEs (if any).
+            // `send_initial_prompt` requires Ready state (spawn just
+            // established it), writes to stdin, transitions to Processing, and
+            // crucially does NOT set `user_has_interacted` — so the next real
+            // user message still triggers the first-interaction context-switch
+            // note. It does not append to output_log, so the next restart's
+            // replay won't double-count.
+            if let Some(prompt) = initial_for_spawn.as_deref() {
+                session
+                    .send_initial_prompt(prompt)
+                    .map_err(|e| format!("send_initial_prompt failed: {}", e))?;
+            }
 
             // Emit the state event with resumed=true so the frontend can
             // surface a one-time "resumed" badge/toast.
@@ -1414,8 +1903,19 @@ pub async fn resume_ai_sessions(
 
         match spawn_result {
             Ok(Ok(())) => {
-                info!("AI session resume: resumed {}", task_run_id);
+                info!(
+                    "AI session resume: resumed {} (fidelity={:?} claim={:?} wip={:?})",
+                    task_run_id, fidelity, claim_status, wip_status
+                );
                 resumed += 1;
+                outcomes.push(SessionRecoveryOutcome {
+                    task_run_id: task_run_id.clone(),
+                    title: outcome_title,
+                    fidelity,
+                    turns_covered,
+                    claim_status,
+                    wip_status,
+                });
             }
             Ok(Err(e)) => {
                 warn!("AI session resume: {} failed: {}", task_run_id, e);
@@ -1436,7 +1936,11 @@ pub async fn resume_ai_sessions(
         }
     }
 
-    resumed
+    SessionRecoverySummary {
+        crash_recovery,
+        resumed_count: resumed,
+        sessions: outcomes,
+    }
 }
 
 /// Tries both the cached external app specs and the runner's own specs.
@@ -1673,4 +2177,162 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             recent_session_touched_files,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    #[test]
+    fn honest_marker_reports_actual_turn_count() {
+        let marker = honest_summary_marker(7);
+        assert!(marker.starts_with("[SYSTEM_NOTE]"));
+        assert!(
+            marker.contains("last 7 turns"),
+            "marker must state the actual N turns it covers: {marker}"
+        );
+        assert!(
+            marker.contains("full transcript unavailable"),
+            "marker must flag the resume as lossy: {marker}"
+        );
+    }
+
+    #[test]
+    fn summary_fallback_is_labelled_with_n() {
+        // The summary path (no on-disk transcript) prepends the honest marker
+        // to the replay prompt, with N = number of turns covered.
+        let replay = "<conversation_history>...</conversation_history>";
+        let n = 3usize;
+        let labelled = build_honest_summary_prompt(replay, n);
+        assert!(
+            labelled.starts_with("[SYSTEM_NOTE]"),
+            "summary fallback must be honestly labelled"
+        );
+        assert!(labelled.contains("last 3 turns"));
+        assert!(
+            labelled.ends_with(replay),
+            "the original replay prompt must follow the marker verbatim"
+        );
+    }
+
+    #[test]
+    fn full_resume_path_has_no_honesty_marker() {
+        // On the lossless `--resume` path we send NO summary, so the honesty
+        // marker MUST be absent. We model the decision: when can_full_resume is
+        // true and there are no worktree notes, the initial prompt is None;
+        // with notes it is just the notes (never the lossy marker).
+        let notes_only = "[SYSTEM_NOTE] Could not re-acquire the isolated worktree.";
+        assert!(
+            !notes_only.contains("full transcript unavailable"),
+            "the lossless-resume initial turn must never carry the lossy summary marker"
+        );
+        // And the summary builder is simply never invoked on this path — the
+        // marker string only originates from honest_summary_marker, which the
+        // full-resume branch does not call.
+        assert!(!notes_only.contains(&honest_summary_marker(1)));
+    }
+
+    // ── Phase 4 — recovery-summary assembly + serde honesty contract ────────
+
+    fn outcome(
+        id: &str,
+        fidelity: ResumeFidelity,
+        turns: usize,
+        claim: ClaimStatus,
+        wip: WipStatus,
+    ) -> SessionRecoveryOutcome {
+        SessionRecoveryOutcome {
+            task_run_id: id.to_string(),
+            title: format!("title-{id}"),
+            fidelity,
+            turns_covered: turns,
+            claim_status: claim,
+            wip_status: wip,
+        }
+    }
+
+    #[test]
+    fn summary_assembles_count_and_crash_flag() {
+        let summary = SessionRecoverySummary {
+            crash_recovery: true,
+            resumed_count: 2,
+            sessions: vec![
+                outcome(
+                    "a",
+                    ResumeFidelity::Lossless,
+                    0,
+                    ClaimStatus::Reacquired,
+                    WipStatus::Restored,
+                ),
+                outcome(
+                    "b",
+                    ResumeFidelity::Summary,
+                    5,
+                    ClaimStatus::PeerConflict,
+                    WipStatus::KeptForManual,
+                ),
+            ],
+        };
+        assert!(summary.crash_recovery);
+        assert_eq!(summary.resumed_count, 2);
+        assert_eq!(summary.sessions.len(), 2);
+    }
+
+    #[test]
+    fn summary_serializes_camelcase_with_honest_kebab_statuses() {
+        // The frontend banner type mirrors this exact wire shape; pin it so a
+        // rename can't silently break the honesty surfacing.
+        let summary = SessionRecoverySummary {
+            crash_recovery: true,
+            resumed_count: 1,
+            sessions: vec![outcome(
+                "task-1",
+                ResumeFidelity::Summary,
+                3,
+                ClaimStatus::PeerConflict,
+                WipStatus::KeptForManual,
+            )],
+        };
+        let v = serde_json::to_value(&summary).expect("serialize");
+
+        assert_eq!(v["crashRecovery"], serde_json::json!(true));
+        assert_eq!(v["resumedCount"], serde_json::json!(1));
+
+        let s = &v["sessions"][0];
+        assert_eq!(s["taskRunId"], serde_json::json!("task-1"));
+        assert_eq!(s["title"], serde_json::json!("title-task-1"));
+        // Honesty contract: lossy / degraded / peer-conflict states are
+        // surfaced verbatim as kebab-case enum tags.
+        assert_eq!(s["fidelity"], serde_json::json!("summary"));
+        assert_eq!(s["turnsCovered"], serde_json::json!(3));
+        assert_eq!(s["claimStatus"], serde_json::json!("peer-conflict"));
+        assert_eq!(s["wipStatus"], serde_json::json!("kept-for-manual"));
+    }
+
+    #[test]
+    fn lossless_clean_session_serializes_honestly() {
+        let summary = SessionRecoverySummary {
+            crash_recovery: false,
+            resumed_count: 1,
+            sessions: vec![outcome(
+                "task-2",
+                ResumeFidelity::Lossless,
+                0,
+                ClaimStatus::Reacquired,
+                WipStatus::None,
+            )],
+        };
+        let v = serde_json::to_value(&summary).expect("serialize");
+        assert_eq!(v["crashRecovery"], serde_json::json!(false));
+        let s = &v["sessions"][0];
+        assert_eq!(s["fidelity"], serde_json::json!("lossless"));
+        assert_eq!(s["claimStatus"], serde_json::json!("reacquired"));
+        assert_eq!(s["wipStatus"], serde_json::json!("none"));
+    }
+
+    #[test]
+    fn recovery_event_name_is_stable() {
+        // The frontend `useSessionRecovery` hook listens on this exact name.
+        assert_eq!(SESSION_RECOVERY_SUMMARY_EVENT, "session-recovery-summary");
+    }
 }

@@ -13,11 +13,13 @@ import {
   Loader2,
   CheckCircle2,
   Lock,
+  RotateCcw,
 } from "lucide-react";
 import type { UnifiedSession, SessionLiveStatus } from "./useSessionManager";
 import type { LockState } from "./useFileLockTracking";
 import type { CommandResponse } from "./types";
 import { isInjectedSession } from "./syntheticTabs";
+import { DURABLE_TOOLTIP } from "./sessionDurability";
 
 interface PromoteToWorktreeData {
   worktree_id: string;
@@ -387,6 +389,23 @@ export function SessionCard({
             >
               <FileWarning className="w-3 h-3 text-[#e0af68]" />
               <span className="text-[9px] text-[#e0af68]/80">{fileConflictCount}</span>
+            </span>
+          )}
+          {/* Durable AI-session affordance (Phase 5 honesty label). Every
+              SessionCard renders a transcript-backed AI/chat session, which
+              resumes automatically on a runner restart (and is listed by the
+              startup recovery banner). We surface a subtle, calm cue ONLY for
+              live sessions — historical dormant/completed transcripts don't
+              need the reassurance and it would clutter the long list. This is
+              the deliberate counterpart to the "ephemeral" marker on
+              non-durable interactive PTY tabs. */}
+          {session.liveStatus !== "dormant" && session.liveStatus !== "completed" && (
+            <span
+              className="shrink-0 inline-flex"
+              title={DURABLE_TOOLTIP}
+              aria-label={`Durable session: ${DURABLE_TOOLTIP}`}
+            >
+              <RotateCcw className="w-3 h-3 text-[#565f89]" />
             </span>
           )}
           {isPinned && <Pin className="w-3 h-3 text-[#e0af68] shrink-0" />}

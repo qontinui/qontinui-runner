@@ -132,6 +132,16 @@ pub struct ClaudeSession {
     ///
     /// Plan: `2026-05-22-memories-on-coord-cross-machine.md` Phase 5.D.
     federation_ctx: Option<qontinui_runner_lib::observable_bridge::SessionContext>,
+    /// Worktree-isolation Phase 3 (restart-resilience): when a RESUMED chat
+    /// session re-acquired its `kind=worktree` coord claim on startup, this
+    /// carries the re-acquired `IsolatedEditContext`. The context's `Drop`
+    /// impl stops the heartbeat task and fires a best-effort claim release,
+    /// so the claim's lifetime tracks this session — `close()` clears the
+    /// slot first so release fires before the rest of the teardown.
+    /// Mirrors `TerminalSession::isolated_edit_ctx`. `None` for fresh
+    /// sessions and sessions that resumed into the shared checkout.
+    isolated_edit_ctx:
+        Arc<Mutex<Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>>>,
 }
 
 // SAFETY: ClaudeSession contains a raw Windows handle (RawHandle = *mut c_void) for the stdout
@@ -161,6 +171,7 @@ impl ClaudeSession {
         model_override: Option<&str>,
         worktree: Option<WorktreeInfo>,
         tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
+        cli_session_ctx: Option<&crate::claude_session::runner::CliSessionContext>,
     ) -> Result<Self, String> {
         info!(
             "Spawning interactive Claude session: {} in {}",
@@ -180,6 +191,32 @@ impl ClaudeSession {
             "--permission-mode".to_string(),
             "bypassPermissions".to_string(),
         ];
+
+        // ── Claude CLI session id (restart survival) ──────────────────────
+        // `--session-id <uuid>` pins the CLI session id on a NEW launch so the
+        // on-disk transcript lands at `<config_dir>/projects/<encoded(cwd)>/
+        // <id>.jsonl`; `--resume <uuid>` resumes a previously-pinned session
+        // losslessly from that transcript. The chat path passes the runner's
+        // own `session_id` (== task_run_id) as the CLI id so resume is
+        // deterministic without persisting a separate Claude-internal id.
+        // `None` preserves today's behavior (CLI generates a random id).
+        if let Some(ctx) = cli_session_ctx {
+            if ctx.is_resume {
+                cli_args.push("--resume".to_string());
+                cli_args.push(ctx.cli_session_id.clone());
+                info!(
+                    "Resuming Claude CLI session {} for interactive session {}",
+                    ctx.cli_session_id, session_id
+                );
+            } else {
+                cli_args.push("--session-id".to_string());
+                cli_args.push(ctx.cli_session_id.clone());
+                info!(
+                    "Pinning Claude CLI session id {} for interactive session {}",
+                    ctx.cli_session_id, session_id
+                );
+            }
+        }
 
         // Add model override if specified (e.g., from per-stage config)
         if let Some(model) = model_override {
@@ -1146,6 +1183,7 @@ impl ClaudeSession {
             turn_persist_tx: turn_persist_tx_option,
             worktree,
             federation_ctx,
+            isolated_edit_ctx: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1382,9 +1420,64 @@ impl ClaudeSession {
         }
     }
 
+    /// Flush any unpersisted accumulated output to `output_log` WITHOUT
+    /// closing the session.
+    ///
+    /// Used by the graceful-drain sequence (`crate::drain`) to ensure an
+    /// in-flight turn's text reaches the DB before a planned restart, so the
+    /// resume replay sees it. Idempotent vs. the dispatcher's own per-turn
+    /// flush (both guard on `persisted_output_len`): a turn that already
+    /// checkpointed Processing → Ready flushes nothing extra here.
+    ///
+    /// Mirrors the flush block in [`Self::close`], but leaves stdin, the state
+    /// machine, and the persister thread alive — the session keeps running
+    /// until the seam's `close_all_sessions` tears it down.
+    pub fn flush_pending_output(&self) {
+        if let Some(ref tx) = self.turn_persist_tx {
+            if let Ok(buf) = self.accumulated_output.lock() {
+                // Reserve the persisted region atomically so a concurrent
+                // dispatcher flush for the same content can't double-send.
+                let persisted = self.persisted_output_len.swap(usize::MAX, Ordering::SeqCst);
+                if buf.len() > persisted && persisted != usize::MAX {
+                    let delta = buf[persisted..].to_string();
+                    if !delta.trim().is_empty() {
+                        let _ = tx.send(delta);
+                    }
+                }
+                // Do NOT clear the buffer — the session stays alive and may
+                // produce more output before the seam closes it (close() will
+                // flush the remainder and clear).
+            }
+        }
+    }
+
     /// Gracefully close the session.
+    /// Worktree-isolation Phase 3 — park the `IsolatedEditContext` returned
+    /// by `agent_worktree::isolated_edit::acquire` (during resume re-acquire)
+    /// so its heartbeat task + coord claim live exactly as long as this
+    /// session. The slot is cleared in `close()` (and on `Drop`), which drops
+    /// the context and fires the best-effort claim release. Mirrors
+    /// `TerminalSession::set_isolated_edit_ctx`.
+    pub fn set_isolated_edit_ctx(
+        &self,
+        ctx: crate::agent_worktree::isolated_edit::IsolatedEditContext,
+    ) {
+        if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
+            *slot = Some(ctx);
+        }
+    }
+
     pub fn close(&self) -> Result<(), String> {
         info!("Closing session {}", self.session_id);
+
+        // Worktree-isolation Phase 3 — drop the re-acquired isolated edit
+        // context first so the claim-release fire-and-forget posts ahead of
+        // the rest of teardown (release uses tokio::spawn; running it before
+        // we tear down stdin/threads makes ordering observable in coord audit
+        // logs). No-op for fresh / shared-checkout sessions (slot is None).
+        if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
+            slot.take();
+        }
 
         // Stop heartbeat
         if let Some(ref tx) = self.stop_heartbeat {
@@ -1605,6 +1698,7 @@ impl ClaudeSession {
             None, // model_override
             Some(info.clone()),
             None, // tool_policy — worktree promotion preserves the original spawn's policy state
+            None, // cli_session_ctx — promotion changes cwd + does its own replay; no --resume
         )
         .map_err(|e| format!("promote_to_worktree: respawn failed: {}", e))?;
 
@@ -1703,6 +1797,7 @@ impl ClaudeSession {
             None, // model_override
             None, // worktree (rate-limit restart preserves the original cwd)
             None, // tool_policy (rate-limit restart preserves the original policy-less spawn)
+            None, // cli_session_ctx — in-process restart does its own replay; no --resume
         ) {
             Ok(new_session) => {
                 let new_session = Arc::new(new_session);
@@ -1820,5 +1915,54 @@ impl std::fmt::Debug for ClaudeSession {
             .field("pid", &self.child_pid)
             .field("user_interacted", &self.has_user_interacted())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// The `isolated_edit_ctx` slot on `ClaudeSession` is the worktree-isolation
+    /// Phase 3 (restart-resilience) fix for the `mem::forget` claim leak: a
+    /// resumed session OWNS its re-acquired `IsolatedEditContext` in this slot,
+    /// and `close()` (and `Drop`, since the field lives on the struct) clears
+    /// the slot so the context's own `Drop` runs — which stops the heartbeat
+    /// and releases the coord claim. This test pins the load-bearing mechanism:
+    /// taking the value out of the `Arc<Mutex<Option<_>>>` slot (exactly what
+    /// `close()` does via `slot.take()`) DROPS the held value. A real
+    /// `IsolatedEditContext` can't be exercised without a tokio runtime for its
+    /// fire-and-forget Drop tasks, so we stand in a drop-flagging sentinel held
+    /// in the same slot shape.
+    #[test]
+    fn clearing_isolated_edit_ctx_slot_drops_the_held_value() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        // Same slot shape as `ClaudeSession::isolated_edit_ctx`.
+        let slot: Arc<Mutex<Option<DropFlag>>> = Arc::new(Mutex::new(None));
+
+        // Park the value (mirrors `set_isolated_edit_ctx` after resume).
+        slot.lock().unwrap().replace(DropFlag(dropped.clone()));
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "held value must stay alive while parked on the session"
+        );
+
+        // Close path: `close()` does `slot.take()` to drop the context first
+        // so the claim release fires ahead of the rest of teardown.
+        let taken = slot.lock().unwrap().take();
+        assert!(taken.is_some(), "slot held a value before close");
+        drop(taken);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "clearing the slot must drop the held context (releasing the claim) — \
+             NOT leak it the way mem::forget did"
+        );
     }
 }
