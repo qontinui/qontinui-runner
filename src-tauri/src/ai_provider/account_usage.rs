@@ -17,9 +17,11 @@
 //! 1. Among non-cooled accounts with a fresh usage sample, the best by
 //!    `(exhausted, headroom)` ascending: a usable account beats an exhausted
 //!    one, then most-under-projection wins within a tier.
-//! 2. If no non-cooled account has a fresh sample, the first non-cooled
-//!    account (legacy cooldown-only behaviour — preserved for cold start and
-//!    for the single-account case, where the one account is simply pinned).
+//! 2. If no non-cooled account has a fresh sample (cold start / stale
+//!    snapshot), the first non-cooled account that is not *known-exhausted*
+//!    (per the last sample, with a longer staleness tolerance); if every
+//!    available account is known-exhausted, the first non-cooled. The
+//!    single-account case resolves here — the one account is simply pinned.
 //! 3. If every account is cooled, the one with the **shortest remaining
 //!    cooldown** (closest to expiry).
 //!
@@ -76,6 +78,7 @@ pub fn pick_best_account() {
         &config_dirs,
         |d| super::config::is_account_cooled_down(d),
         |d| super::config::usage_rank(d),
+        |d| super::config::account_known_exhausted(d),
         |d| super::config::time_until_cooled_down(d),
     );
 
@@ -91,13 +94,17 @@ pub fn pick_best_account() {
 /// Pure selection core, parameterised over the cooldown/usage/expiry lookups
 /// so it can be unit-tested without the global settings + state singletons.
 ///
-/// `is_cooled` / `usage` / `remaining` mirror the `super::config` helpers.
-/// `usage` returns `(exhausted, headroom)` for accounts with a fresh sample.
-/// Returns the chosen config dir, or `None` only when `config_dirs` is empty.
+/// `is_cooled` / `usage` / `known_exhausted` / `remaining` mirror the
+/// `super::config` helpers. `usage` returns `(exhausted, headroom)` for
+/// accounts with a *fresh* sample; `known_exhausted` reports the last-seen
+/// exhaustion with a longer staleness tolerance, used only by the cold-start
+/// fallback. Returns the chosen config dir, or `None` only when `config_dirs`
+/// is empty.
 fn pick_from<'a>(
     config_dirs: &'a [String],
     is_cooled: impl Fn(&str) -> bool,
     usage: impl Fn(&str) -> Option<(bool, f64)>,
+    known_exhausted: impl Fn(&str) -> bool,
     remaining: impl Fn(&str) -> Option<Duration>,
 ) -> Option<String> {
     let available: Vec<&'a String> = config_dirs.iter().filter(|d| !is_cooled(d)).collect();
@@ -106,9 +113,7 @@ fn pick_from<'a>(
         // Among available accounts that have a fresh usage sample, pick the
         // best by `(exhausted, headroom)` ascending: a usable account always
         // beats an exhausted one (out of tokens / rejected) regardless of
-        // headroom, and within a tier the most-under-projection wins. If no
-        // available account has a fresh sample, fall back to the first
-        // available (legacy cooldown-only pick / cold start).
+        // headroom, and within a tier the most-under-projection wins.
         let best = available
             .iter()
             .filter_map(|d| usage(d).map(|rank| (*d, rank)))
@@ -121,7 +126,20 @@ fn pick_from<'a>(
                 )
             })
             .map(|(d, _)| d.clone());
-        return best.or_else(|| available.first().map(|d| (*d).clone()));
+        return best
+            // Cold start / stale snapshot (no fresh ranks): prefer the first
+            // available account NOT known-exhausted, so we don't pin a
+            // recently-maxed-out account just because it isn't in cooldown
+            // (the usage probe's 429 doesn't set an inference cooldown).
+            .or_else(|| {
+                available
+                    .iter()
+                    .find(|d| !known_exhausted(d))
+                    .map(|d| (*d).clone())
+            })
+            // Everything available is known-exhausted (or unknown): fall back
+            // to the first available so we always return something.
+            .or_else(|| available.first().map(|d| (*d).clone()));
     }
 
     // All cooled: pick the one with the shortest remaining cooldown.
@@ -259,6 +277,7 @@ mod tests {
                 "/c" => Some((false, 0.05)),
                 _ => None,
             },
+            |_| false,
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/b"));
@@ -278,6 +297,7 @@ mod tests {
                 "/usable" => Some((false, 0.20)), // usable, worse headroom
                 _ => None,
             },
+            |_| false,
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/usable"));
@@ -295,6 +315,7 @@ mod tests {
                 "/b" => Some((true, 0.10)),
                 _ => None,
             },
+            |_| false,
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/b"));
@@ -312,6 +333,7 @@ mod tests {
                 "/b" => Some((false, 0.20)),
                 _ => None,
             },
+            |_| false,
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/b"));
@@ -322,8 +344,34 @@ mod tests {
         let d = dirs(&["/a", "/b", "/c"]);
         // No fresh samples → legacy "first non-cooled" behaviour. /a is cooled,
         // so /b (first available) wins.
-        let chosen = pick_from(&d, |x| x == "/a", |_| None, |_| None);
+        let chosen = pick_from(&d, |x| x == "/a", |_| None, |_| false, |_| None);
         assert_eq!(chosen.as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn stale_fallback_skips_known_exhausted() {
+        let d = dirs(&["/gmail", "/hotmail", "/paktis"]);
+        // Stale snapshot: no fresh ranks. /gmail is known-exhausted and NOT
+        // cooled (the usage probe's 429 doesn't set an inference cooldown), so
+        // the cold-start fallback must skip it and take the first non-exhausted
+        // available account.
+        let chosen = pick_from(
+            &d,
+            |_| false,         // none cooled
+            |_| None,          // no fresh usage sample (stale)
+            |x| x == "/gmail", // gmail last seen exhausted
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/hotmail"));
+    }
+
+    #[test]
+    fn stale_fallback_all_known_exhausted_returns_first() {
+        let d = dirs(&["/a", "/b"]);
+        // Stale snapshot and every available account known-exhausted → still
+        // return something (first available) rather than nothing.
+        let chosen = pick_from(&d, |_| false, |_| None, |_| true, |_| None);
+        assert_eq!(chosen.as_deref(), Some("/a"));
     }
 
     #[test]
@@ -335,6 +383,7 @@ mod tests {
             &d,
             |_| false,
             |x| if x == "/b" { Some((false, 0.40)) } else { None },
+            |_| false,
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/b"));
@@ -345,7 +394,7 @@ mod tests {
         // One configured account, no usage sample, not cooled → it is selected
         // (the single-account case must resolve, not no-op).
         let d = dirs(&["/only"]);
-        let chosen = pick_from(&d, |_| false, |_| None, |_| None);
+        let chosen = pick_from(&d, |_| false, |_| None, |_| false, |_| None);
         assert_eq!(chosen.as_deref(), Some("/only"));
     }
 
@@ -353,7 +402,7 @@ mod tests {
     fn single_exhausted_account_still_pinned() {
         // One account, exhausted → still the only option, so still selected.
         let d = dirs(&["/only"]);
-        let chosen = pick_from(&d, |_| false, |_| Some((true, 1.0)), |_| None);
+        let chosen = pick_from(&d, |_| false, |_| Some((true, 1.0)), |_| true, |_| None);
         assert_eq!(chosen.as_deref(), Some("/only"));
     }
 
@@ -364,6 +413,7 @@ mod tests {
             &d,
             |_| true, // all cooled
             |_| None,
+            |_| false,
             |x| match x {
                 "/a" => Some(Duration::from_secs(600)),
                 "/b" => Some(Duration::from_secs(30)),
@@ -376,7 +426,7 @@ mod tests {
     #[test]
     fn empty_config_dirs_returns_none() {
         let d: Vec<String> = Vec::new();
-        let chosen = pick_from(&d, |_| false, |_| None, |_| None);
+        let chosen = pick_from(&d, |_| false, |_| None, |_| false, |_| None);
         assert_eq!(chosen, None);
     }
 }
