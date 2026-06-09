@@ -112,6 +112,21 @@ pub async fn terminal_create(
     )
     .await;
 
+    // Provision `.mcp.json` so this operator-opened terminal tab can reach coord
+    // coordination tools (`coord_register_gate` over /mcp) and
+    // `coord-acting-bearer.sh` for the operator-scoped write surface — the same
+    // device-JWT path #526 wired into gate continuations, now closing the last
+    // dark runner-spawned session kind (operator tabs). Targets the POST-acquire
+    // `working_dir` (the PTY cwd): worktree-mode-on → a fresh isolated dir,
+    // -off → the operator's real cwd. `working_dir` is `Option`; when `None` the
+    // PTY inherits the runner's ambient cwd, which we deliberately do NOT
+    // provision into. The helper's sub_type + non-clobber guards make this safe
+    // even when the tab opened in a checkout that already holds the operator's
+    // own `.mcp.json` (left untouched). Mirrors the continuation call site.
+    if let Some(ref wd) = working_dir {
+        crate::agent_runtime::provision_coord_mcp_for_session(wd);
+    }
+
     let repo_detect_handle = app_handle.clone();
     let repo_detect_dir = working_dir.clone();
     let cred_helper_dir = working_dir.clone();
