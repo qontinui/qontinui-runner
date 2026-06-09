@@ -950,8 +950,36 @@ export default function App() {
       <UIBridgeProvider
         features={{ renderLog: true, control: true, debug: true }}
         browserCaptureConfig={{
+          // Capture errors/warnings only. The runner's error-monitor consumes
+          // console errors, resource errors, WS disconnects, and React error
+          // overlays — all event-driven and rare.
+          //
+          // CRITICAL: the continuous performance/telemetry capture modules
+          // (`network`, `navigation`, `longTasks`, `longAnimationFrames`,
+          // `webVitals`, `memory`, `domMetrics`) default to ON in the SDK's
+          // DEFAULT_CAPTURE_CONFIG, so this object — which previously only set
+          // `console` — silently enabled all of them. `network` monkey-patches
+          // `fetch`/XHR and tracks every request; on the runner that includes
+          // the long-lived SSE stream and the 3s/10s background polls, whose
+          // response data accumulates unboundedly → the WebView2 renderer grew
+          // ~84MB/min while idle and crashed with "Out of memory" in under an
+          // hour (verified via live A/B: capture ON → +84MB/min, OFF → flat).
+          // Disable every continuous module explicitly; keep only the rare,
+          // event-driven error captures the error-monitor actually needs.
           console: true,
-          consoleLevels: ["error", "warn", "debug", "info", "log"],
+          consoleLevels: ["error", "warn"],
+          network: false,
+          navigation: false,
+          longTasks: false,
+          longAnimationFrames: false,
+          webVitals: false,
+          memory: false,
+          domMetrics: false,
+          freezeDetector: false,
+          hmr: false,
+          resourceErrors: true,
+          wsDisconnections: true,
+          frameworkOverlays: true,
         }}
       >
         <UIBridgeEventHandler />
