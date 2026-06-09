@@ -601,37 +601,49 @@ pub async fn acquire_for_terminal(
     working_dir: Option<String>,
     agent_session_id: Option<uuid::Uuid>,
 ) -> (Option<String>, Option<IsolatedEditContext>) {
-    let Some(repo) = intent_repo else {
-        return (working_dir, None);
+    let out: (Option<String>, Option<IsolatedEditContext>) = match intent_repo {
+        None => (working_dir, None),
+        Some(repo) => {
+            let repos = vec![repo.to_string()];
+            match acquire(AcquireRequest {
+                repos: &repos,
+                intent: Some(purpose),
+                declared_overlap_paths: None,
+                plan_id: None,
+                phase: None,
+                agent_session_id,
+            })
+            .await
+            {
+                Ok(Some(ctx)) => {
+                    let wt_path = ctx
+                        .worktrees
+                        .first()
+                        .map(|w| w.worktree_path.to_string_lossy().to_string());
+                    (wt_path.or(working_dir), Some(ctx))
+                }
+                Ok(None) => (working_dir, None),
+                Err(e) => {
+                    warn!(
+                        intent_repo = %repo,
+                        error = %e,
+                        "acquire_for_terminal: isolated worktree allocate failed — falling back to shared cwd"
+                    );
+                    (working_dir, None)
+                }
+            }
+        }
     };
-    let repos = vec![repo.to_string()];
-    match acquire(AcquireRequest {
-        repos: &repos,
-        intent: Some(purpose),
-        declared_overlap_paths: None,
-        plan_id: None,
-        phase: None,
-        agent_session_id,
-    })
-    .await
-    {
-        Ok(Some(ctx)) => {
-            let wt_path = ctx
-                .worktrees
-                .first()
-                .map(|w| w.worktree_path.to_string_lossy().to_string());
-            (wt_path.or(working_dir), Some(ctx))
-        }
-        Ok(None) => (working_dir, None),
-        Err(e) => {
-            warn!(
-                intent_repo = %repo,
-                error = %e,
-                "acquire_for_terminal: isolated worktree allocate failed — falling back to shared cwd"
-            );
-            (working_dir, None)
-        }
+    // Provision coord-mcp into the finalized session cwd — the single chokepoint
+    // for every device-JWT terminal path (operator tab, HTTP /terminals, tauri
+    // proxy, backend relay, coordinator/worker sessions). Targets the POST-acquire
+    // working_dir (worktree-on isolated dir OR worktree-off real cwd); `None` →
+    // PTY inherits ambient cwd, deliberately not provisioned. The fn's sub_type +
+    // non-clobber guards make this safe. Plan: centralize-coord-mcp-provisioning.
+    if let Some(wd) = &out.0 {
+        crate::coord_mcp::provision_coord_mcp_for_session(wd);
     }
+    out
 }
 
 /// Read the device UUID from `~/.qontinui/machine.json`. Accepts the

@@ -45,6 +45,7 @@ mod constraint_engine;
 mod container;
 mod context;
 mod coord_http;
+mod coord_mcp;
 mod coord_questions;
 mod coordinator;
 mod cost_management;
