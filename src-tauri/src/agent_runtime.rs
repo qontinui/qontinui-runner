@@ -222,10 +222,19 @@ fn agent_log_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
     agent_logs_root().map(|d| d.join(format!("{agent_id}.log")))
 }
 
-/// Resolve the coord HTTP base from the active profile (mirrors the
-/// resolver in `fleet.rs`). Returns `None` when no profile or no
-/// coord_url is configured — runtime no-ops in that case.
+/// Resolve the coord HTTP base. Honors the `COORD_HTTP_URL` env var FIRST
+/// (mirrors `mcp::agent_worktrees::coord_http_base`'s env check — every other
+/// resolver honors it, this one used to ignore it), then falls back to the
+/// active profile's `coord_url` (mirrors the resolver in `fleet.rs`). Returns
+/// `None` when neither is set — runtime no-ops in that case (no localhost
+/// fallback, unchanged).
 fn coord_http_base() -> Option<String> {
+    // env override first — the source-of-truth chain every other resolver uses.
+    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
     let coord_url = qontinui_runner_lib::profiles::load_strict()
         .ok()?
         .coord_url?;

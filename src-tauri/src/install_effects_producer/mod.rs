@@ -381,11 +381,209 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
         );
     }
 
+    // ---- ASYNC-OBSERVE fast-path (§6) ---------------------------------------
+    // In OBSERVE mode the shim NEVER blocks on the gate verdict — it always
+    // proceeds and runs the real install regardless of what we'd return. The
+    // expensive pre-call work (the ~13s npm `--dry-run`, the importer/sibling
+    // scans, and the two coord round-trips for `declare` + `predict-and-check`)
+    // therefore has no business sitting on the request the agent's shell is
+    // blocked on. So for `mode:intercept` + `effective_mode == "observe"` we:
+    //
+    //   1. capture pre-shas SYNCHRONOUSLY and FIRST (the pre-install
+    //      manifest/lockfile blob shas are NOT re-derivable once the install
+    //      mutates the lockfile — a cheap git blob-sha read, the one thing that
+    //      MUST happen before we hand control back to the shim),
+    //   2. stash a PreContext (pre-shas present; the predicted-pins / CVEs /
+    //      affected-files fields are filled in later by the deferred task),
+    //   3. RETURN the intercept response IMMEDIATELY (gate:proceed,
+    //      correlation_id present, effective_mode:"observe"), and
+    //   4. `tokio::spawn` the deferred work (dry-run + scans + declare +
+    //      predict-and-check) to BACKFILL/UPDATE the stashed PreContext.
+    //
+    // BEHAVIOR CHANGE (explicit §6 intent — "observe never blocks"): in observe
+    // mode `declare` is now BEST-EFFORT. On the synchronous gate path below it
+    // is `?`-load-bearing (a declare failure fails the pre-call); here a
+    // coord-down observe install instead PROCEEDS and records best-effort
+    // (declare/predict errors are logged, not surfaced). The matching post-call
+    // (`observe-verify`) already tolerates a missing/partial PreContext
+    // (mod.rs:210-231 degrades to an honest Partial), so the brief window where
+    // the spawned task hasn't yet re-`put` the enriched context is safe.
+    //
+    // GATE mode is UNCHANGED — it falls through to the synchronous path below
+    // because the shim blocks on the `gate` verdict (intercept/mod.rs), so
+    // dry-run + predict MUST complete before we return. OFF was already
+    // short-circuited above.
+    if req.mode == RunMode::Intercept && effective_mode == "observe" {
+        // (1) pre-shas — synchronous, FIRST, before any install can mutate the
+        // worktree. This is the only pre-call step that is irreversibly
+        // time-sensitive.
+        let pre_shas = observe::capture_pre_shas(pm, repo_path);
+
+        // (2) stash a PreContext now. predicted_pinned / predicted_cves /
+        // affected_files start EMPTY (honest) and are enriched by the deferred
+        // task's re-`put` below once declare-time data is available.
+        precontext::put(
+            correlation_id,
+            PreContext {
+                repo: repo.clone(),
+                repo_path: req.repo_path.clone(),
+                package_manager: pm,
+                escalation_overridden: false,
+                affected_files: Vec::new(),
+                predicted_pinned: std::collections::BTreeMap::new(),
+                predicted_cves: Vec::new(),
+                pre_shas: pre_shas.clone(),
+            },
+        );
+
+        // (4) spawn the deferred declare/predict work. It backfills the stashed
+        // PreContext (re-`put` under the SAME correlation_id, preserving the
+        // already-captured pre-shas) so a post-call that arrives after this
+        // completes sees the enriched signature; a post-call that races ahead
+        // still gets an honest Partial. Owned captures only — `cred_store` is a
+        // borrow, so registry env is resolved SYNCHRONOUSLY above and the owned
+        // `RegistryEnv` is moved in.
+        {
+            let repo_path_buf = repo_path.to_path_buf();
+            let repo_path_str = req.repo_path.clone();
+            let packages = req.packages.clone();
+            let dev = req.dev;
+            let repo_owned = repo.clone();
+            let coord_base_owned = coord_base.to_string();
+            let registry_env_owned = registry_env.clone();
+            let req_for_declare = req.clone();
+            tokio::spawn(async move {
+                let ground_truth = {
+                    let rp = repo_path_buf.clone();
+                    let pkgs = packages.clone();
+                    let env = registry_env_owned.clone();
+                    tokio::task::spawn_blocking(move || {
+                        dry_run_invoke::produce_ground_truth(pm, &rp, &pkgs, dev, &env)
+                    })
+                    .await
+                    .unwrap_or_default()
+                };
+                let importer_scan = {
+                    let rp = repo_path_buf.clone();
+                    let pkgs = packages.clone();
+                    tokio::task::spawn_blocking(move || {
+                        importer_scan::scan_importers(pm, &rp, &pkgs)
+                    })
+                    .await
+                    .unwrap_or_default()
+                };
+                let sibling_manifests = {
+                    let rp = repo_path_buf.clone();
+                    tokio::task::spawn_blocking(move || {
+                        sibling_manifests::collect_sibling_manifests(pm, &rp)
+                    })
+                    .await
+                    .unwrap_or_default()
+                };
+
+                let predicted_pinned = ground_truth
+                    .dry_run
+                    .as_ref()
+                    .map(|d| d.predicted_pinned.clone())
+                    .unwrap_or_default();
+                let predicted_cves = ground_truth
+                    .dry_run
+                    .as_ref()
+                    .map(|d| d.predicted_cves.clone())
+                    .unwrap_or_default();
+
+                let declare_req = build_declare(
+                    pm,
+                    &req_for_declare,
+                    &repo_owned,
+                    correlation_id,
+                    ground_truth,
+                    importer_scan.inventory.clone(),
+                    sibling_manifests,
+                );
+
+                // BEST-EFFORT (the §6 change): declare/predict errors are LOGGED
+                // here, never surfaced — a coord-down observe install must still
+                // proceed and record best-effort.
+                let client = match CoordInstallClient::new(coord_base_owned) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(
+                            "install-effects: OBSERVE deferred declare skipped \
+                             (corr={correlation_id}, repo={repo_owned}) — coord client \
+                             build failed (best-effort): {e}"
+                        );
+                        return;
+                    }
+                };
+                if let Err(e) = client.declare(&declare_req).await {
+                    warn!(
+                        "install-effects: OBSERVE deferred declare failed \
+                         (corr={correlation_id}, repo={repo_owned}) — proceeding \
+                         best-effort, PreContext keeps pre-shas only: {e}"
+                    );
+                    return;
+                }
+                // predict-and-check is advisory in observe mode (the shim never
+                // blocks on it) — a failure just means no enrichment.
+                if let Err(e) = client.predict_and_check(&declare_req).await {
+                    warn!(
+                        "install-effects: OBSERVE deferred predict-and-check failed \
+                         (corr={correlation_id}, repo={repo_owned}) — best-effort: {e}"
+                    );
+                }
+
+                // Re-stash the ENRICHED PreContext under the same id, preserving
+                // the original pre-shas (un-mutated worktree state captured on
+                // the request thread). A post-call that already consumed the
+                // partial context is fine — it degraded to an honest Partial.
+                precontext::put(
+                    correlation_id,
+                    PreContext {
+                        repo: repo_owned,
+                        repo_path: repo_path_str,
+                        package_manager: pm,
+                        escalation_overridden: false,
+                        affected_files: importer_scan.affected_files,
+                        predicted_pinned,
+                        predicted_cves,
+                        pre_shas,
+                    },
+                );
+            });
+        }
+
+        info!(
+            "install-effects: INTERCEPT/OBSERVE pre-call (corr={correlation_id}, repo={repo}, \
+             pm={}) — pre-shas captured + returning immediately; declare/predict deferred \
+             (best-effort), install proceeds in the agent shell",
+            pm.as_str()
+        );
+        // (3) return immediately — gate ALWAYS proceeds in observe mode.
+        return Ok(ApiResponse::success(RunResponse {
+            correlation_id,
+            repo,
+            package_manager: pm.as_str().to_string(),
+            gate: GateOutcome::Proceed,
+            risk_factors: Vec::new(),
+            escalation_overridden: false,
+            install: None,
+            dry_run_only: false,
+            resolution: serde_json::Value::Null,
+            verify: None,
+            effective_mode: "observe".to_string(),
+        }));
+    }
+
     // ---- Phase 2: read-only dry-run + native-audit probes --------------------
     // Shell out the package manager's own `--dry-run` (+ `audit`) on a blocking
     // thread and feed the captured output to the pure parsers. Best-effort: a
     // missing tool / unparseable output ⇒ honest `None`/`false` (coord degrades
     // to `Unknown`), never a fabricated plan, never a blocked install.
+    //
+    // Reached by GATE-mode intercept (which blocks on the verdict) and the
+    // explicit `Full` `/install-effects/run` route — NOT by observe-intercept,
+    // which took the async fast-path above.
     let ground_truth = {
         let repo_path = repo_path.to_path_buf();
         let packages = req.packages.clone();
@@ -477,16 +675,21 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
         );
     }
 
-    // ---- INTERCEPT mode (plan §3 A2/A3) -------------------------------------
+    // ---- INTERCEPT/GATE mode (plan §3 A2/A3) --------------------------------
+    // Reached ONLY by GATE-mode intercept now: observe-mode intercept took the
+    // async fast-path above (§6) and `off` was short-circuited earlier, so
+    // `effective_mode` here is always `"gate"`. GATE mode MUST stay synchronous
+    // — the shim blocks on the returned `gate` verdict (intercept/mod.rs), so
+    // declare + predict-and-check had to complete on the request path above.
+    //
     // The shim's pre-call: declare + predict-and-check already ran above. We do
     // NOT run the install (the agent's own shell does). Capture pre-shas now
     // (worktree still un-mutated), stash the PreContext under the correlation_id
     // for the matching `/install-effects/observe-verify` post-call, and return
-    // the gate verdict so the shim can branch (observe mode always proceeds;
-    // gate mode — Phase 3 — honors Escalate). This branch is BEFORE the
-    // dry_run_only/blocked early-return so an intercept run ALWAYS hands back a
-    // correlation_id regardless of the gate (the shim, not the producer, owns
-    // the block decision).
+    // the gate verdict so the shim can branch (gate mode — Phase 3 — honors
+    // Escalate). This branch is BEFORE the dry_run_only/blocked early-return so
+    // an intercept run ALWAYS hands back a correlation_id regardless of the gate
+    // (the shim, not the producer, owns the block decision).
     if req.mode == RunMode::Intercept {
         let pre_shas = observe::capture_pre_shas(pm, repo_path);
         precontext::put(
@@ -519,7 +722,8 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
             dry_run_only: false,
             resolution: pac.resolution,
             verify: None,
-            // `observe` or `gate` here — `off` was short-circuited before declare.
+            // Always `gate` here — `observe` took the async fast-path above and
+            // `off` was short-circuited before declare.
             effective_mode: effective_mode.clone(),
         }));
     }
@@ -1622,14 +1826,26 @@ mod tests {
     // Interception — `mode:"intercept"` pre-call + `/observe-verify` post
     // ===================================================================
 
-    /// Build an intercept-mode pre-call request for a real `repo_path`.
+    /// Build an intercept-mode pre-call request for a real `repo_path`, pinned
+    /// to GATE mode.
     ///
-    /// Pins the process-global fleet-policy cache to `observe` as a side effect
-    /// so the P4 `off` short-circuit (which fires when the cache is `off`, the
-    /// fail-safe default before any live poll) does NOT trigger — these tests
-    /// exercise the full declare→gate→stash intercept pre-call path.
+    /// Pins the process-global fleet-policy cache to `gate` as a side effect so
+    /// (a) the P4 `off` short-circuit does NOT trigger and (b) the SYNCHRONOUS
+    /// declare→predict→gate→stash path runs on the request thread. GATE mode is
+    /// the deterministic path for asserting declare/predict hit counts, the gate
+    /// verdict, the override/escalation flag, and the stashed declare body — all
+    /// of which are computed BEFORE the response returns.
+    ///
+    /// (The §6 async-observe fast-path defers declare/predict to a `tokio::spawn`,
+    /// so those assertions can't be made synchronously in observe mode — observe
+    /// has its own dedicated test below.)
     fn intercept_req(repo_path: &str, packages: Vec<&str>) -> RunRequest {
-        crate::mcp::fleet_policy_poller::set_mode_for_test("observe");
+        intercept_req_mode(repo_path, packages, "gate")
+    }
+
+    /// As [`intercept_req`] but pins the effective interception mode explicitly.
+    fn intercept_req_mode(repo_path: &str, packages: Vec<&str>, mode: &str) -> RunRequest {
+        crate::mcp::fleet_policy_poller::set_mode_for_test(mode);
         RunRequest {
             repo_path: repo_path.to_string(),
             package_manager: Some("npm".to_string()),
@@ -1904,5 +2120,80 @@ mod tests {
             "bare install declares empty package_specs"
         );
         assert!(precontext::take(&data.correlation_id).is_some());
+    }
+
+    #[test]
+    fn observe_mode_returns_immediately_with_pre_shas_then_backfills() {
+        // §6 async-observe contract: the OBSERVE-mode intercept pre-call returns
+        // IMMEDIATELY (gate:proceed, correlation_id present, effective_mode
+        // "observe") with pre-shas captured SYNCHRONOUSLY — declare/predict are
+        // deferred to a spawned task that BACKFILLS the stashed PreContext. The
+        // shim never blocks on the gate verdict in observe mode, so the response
+        // is unconditional `proceed`.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("package.json"),
+            "{\"name\":\"x\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        // Even an ESCALATE resolution from coord must NOT block / change the
+        // observe response — observe always proceeds (gate is informational).
+        let (base, _hits, _sd) = spawn_coord_mock(escalate_resolution(), vec!["major bump".into()]);
+
+        // Drive on a runtime we keep alive so the spawned backfill task can run
+        // to completion AFTER run_with_base returns (block_on returns as soon as
+        // the fast-path responds; the deferred task is still scheduled on this
+        // runtime's workers).
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let req = intercept_req_mode(&d.path().display().to_string(), vec!["left-pad"], "observe");
+        let resp = rt
+            .block_on(run_with_base(
+                req,
+                &base,
+                DEAD_LOOPBACK,
+                &FakeCredStore::empty(),
+            ))
+            .unwrap();
+        let data = resp.data.unwrap();
+
+        // Immediate-return contract: proceed + observe + correlation_id, no install.
+        assert_eq!(
+            data.gate,
+            GateOutcome::Proceed,
+            "observe always proceeds (even on an escalate verdict)"
+        );
+        assert_eq!(data.effective_mode, "observe");
+        assert!(data.install.is_none());
+        assert!(data.verify.is_none());
+        assert!(
+            data.risk_factors.is_empty(),
+            "observe response carries no risk factors"
+        );
+        assert!(
+            !data.escalation_overridden,
+            "observe response never reports escalation_overridden"
+        );
+        let corr = data.correlation_id;
+        assert_ne!(corr, Uuid::nil(), "observe returns a real correlation_id");
+
+        // §6 core (deterministic): pre-shas are captured SYNCHRONOUSLY, so the
+        // PreContext is stashed the INSTANT the response returns — independent of
+        // the deferred declare/predict backfill. We assert the sync capture
+        // directly. (That declare/predict eventually fire is a best-effort
+        // backfill whose timing depends on a real `npm --dry-run`; that path is
+        // verified live, not in this unit test, to keep it deterministic +
+        // network-free. Pre-shas are preserved across the backfill's re-`put`,
+        // so this holds whether or not the backfill has run yet.)
+        let ctx = precontext::take(&corr).expect("PreContext stashed synchronously");
+        assert_eq!(ctx.package_manager, PackageManager::Npm);
+        assert!(
+            ctx.pre_shas.get("package.json").map(|o| o.is_some()) == Some(true),
+            "pre-sha for package.json captured synchronously: {:?}",
+            ctx.pre_shas
+        );
     }
 }
