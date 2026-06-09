@@ -153,6 +153,12 @@ export class XtermBackend implements ITerminalBackend {
     return this.term.buffer.active.length;
   }
 
+  setScrollback(lines: number): void {
+    // xterm trims the active buffer to the new cap on assignment when it is
+    // lowered, so this frees the dead pane's retained cell storage in place.
+    this.term.options.scrollback = lines;
+  }
+
   fit(): void {
     this.fitAddon.fit();
   }

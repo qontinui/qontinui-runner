@@ -145,6 +145,14 @@ export interface ITerminalBackend {
   getBufferLine(line: number): string | null;
   /** Total number of lines in the active buffer (scrollback + viewport). */
   getBufferLength(): number;
+  /**
+   * Set the maximum scrollback line count, trimming the existing buffer down
+   * to the new cap immediately when it is lowered. Used to release memory held
+   * by a terminal whose process has exited — a dead pane never produces more
+   * output, so only its tail is worth keeping resident. Backends without
+   * runtime scrollback control may no-op.
+   */
+  setScrollback(lines: number): void;
 
   // -- Layout ---------------------------------------------------------------
   /** Fit the terminal to its container. */

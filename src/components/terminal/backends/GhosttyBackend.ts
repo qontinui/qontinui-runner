@@ -108,6 +108,12 @@ export class GhosttyBackend implements ITerminalBackend {
     return this.term.buffer.active.length;
   }
 
+  setScrollback(lines: number): void {
+    // GhosttyBackend wraps an xterm Terminal too, so the same in-place trim
+    // applies (see XtermBackend.setScrollback).
+    this.term.options.scrollback = lines;
+  }
+
   fit(): void {
     this.fitAddon.fit();
   }
