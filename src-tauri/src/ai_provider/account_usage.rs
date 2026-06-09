@@ -76,6 +76,7 @@ pub fn pick_best_account() {
 
     let chosen = pick_from(
         &config_dirs,
+        |d| super::oauth_refresh::has_valid_credentials(d),
         |d| super::config::is_account_cooled_down(d),
         |d| super::config::usage_rank(d),
         |d| super::config::account_known_exhausted(d),
@@ -94,20 +95,34 @@ pub fn pick_best_account() {
 /// Pure selection core, parameterised over the cooldown/usage/expiry lookups
 /// so it can be unit-tested without the global settings + state singletons.
 ///
-/// `is_cooled` / `usage` / `known_exhausted` / `remaining` mirror the
-/// `super::config` helpers. `usage` returns `(exhausted, headroom)` for
-/// accounts with a *fresh* sample; `known_exhausted` reports the last-seen
+/// `has_valid_creds` / `is_cooled` / `usage` / `known_exhausted` / `remaining`
+/// mirror the `super::oauth_refresh` + `super::config` helpers.
+/// `has_valid_creds` is the highest-precedence filter — an account without
+/// live credentials is never selectable (it would 401 the moment a `claude`
+/// subprocess spawns under it), so it is excluded from BOTH the non-cooled
+/// ranking and the all-cooled fallback. `usage` returns `(exhausted, headroom)`
+/// for accounts with a *fresh* sample; `known_exhausted` reports the last-seen
 /// exhaustion with a longer staleness tolerance, used only by the cold-start
-/// fallback. Returns the chosen config dir, or `None` only when `config_dirs`
-/// is empty.
+/// fallback. Returns the chosen config dir, or `None` when `config_dirs` is
+/// empty OR no dir has valid credentials.
 fn pick_from<'a>(
     config_dirs: &'a [String],
+    has_valid_creds: impl Fn(&str) -> bool,
     is_cooled: impl Fn(&str) -> bool,
     usage: impl Fn(&str) -> Option<(bool, f64)>,
     known_exhausted: impl Fn(&str) -> bool,
     remaining: impl Fn(&str) -> Option<Duration>,
 ) -> Option<String> {
-    let available: Vec<&'a String> = config_dirs.iter().filter(|d| !is_cooled(d)).collect();
+    // Validity filter ABOVE cooldown: never select an account without live
+    // credentials. With none valid, return `None` — the caller leaves the
+    // resolved dir unchanged and the spawn path fails loud (see
+    // `agent_runtime::run_continuation_terminal` / `spawn_claude_child`).
+    let valid: Vec<&'a String> = config_dirs.iter().filter(|d| has_valid_creds(d)).collect();
+    if valid.is_empty() {
+        return None;
+    }
+
+    let available: Vec<&'a String> = valid.iter().filter(|d| !is_cooled(d)).copied().collect();
 
     if !available.is_empty() {
         // Among available accounts that have a fresh usage sample, pick the
@@ -142,11 +157,15 @@ fn pick_from<'a>(
             .or_else(|| available.first().map(|d| (*d).clone()));
     }
 
-    // All cooled: pick the one with the shortest remaining cooldown.
-    config_dirs
+    // All (credential-valid) accounts cooled: pick the valid one with the
+    // shortest remaining cooldown. Restricting to `valid` matters — a
+    // credential-less dir has no cooldown entry (`remaining` → `None` →
+    // `Duration::ZERO`) and would otherwise win the `min` precisely when every
+    // authenticated account is rate-limited.
+    valid
         .iter()
         .min_by_key(|d| remaining(d).unwrap_or(Duration::ZERO))
-        .cloned()
+        .map(|d| (*d).clone())
 }
 
 fn short_label(config_dir: &str) -> &str {
@@ -263,6 +282,11 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    // Every legacy test injects `|_| true` for the credential-validity filter
+    // (all candidates authenticated) so its assertion isolates the ranking it
+    // targets. The credential-filter behaviour itself is exercised by the
+    // `credential_*` tests at the end of this module.
+
     #[test]
     fn headroom_wins_among_available() {
         let d = dirs(&["/a", "/b", "/c"]);
@@ -270,6 +294,7 @@ mod tests {
         // even though /a sorts first by position. None exhausted.
         let chosen = pick_from(
             &d,
+            |_| true,  // all valid
             |_| false, // none cooled
             |x| match x {
                 "/a" => Some((false, 0.10)),
@@ -291,6 +316,7 @@ mod tests {
         // (+0.20, worse delta) but has tokens left → must win.
         let chosen = pick_from(
             &d,
+            |_| true,
             |_| false,
             |x| match x {
                 "/full" => Some((true, 0.05)),    // exhausted, better headroom
@@ -309,6 +335,7 @@ mod tests {
         // Both exhausted → least-bad (lowest headroom) is the fallback choice.
         let chosen = pick_from(
             &d,
+            |_| true,
             |_| false,
             |x| match x {
                 "/a" => Some((true, 0.30)),
@@ -327,6 +354,7 @@ mod tests {
         // /a has the best headroom but is cooled → must not be picked.
         let chosen = pick_from(
             &d,
+            |_| true,
             |x| x == "/a",
             |x| match x {
                 "/a" => Some((false, -0.90)),
@@ -344,7 +372,7 @@ mod tests {
         let d = dirs(&["/a", "/b", "/c"]);
         // No fresh samples → legacy "first non-cooled" behaviour. /a is cooled,
         // so /b (first available) wins.
-        let chosen = pick_from(&d, |x| x == "/a", |_| None, |_| false, |_| None);
+        let chosen = pick_from(&d, |_| true, |x| x == "/a", |_| None, |_| false, |_| None);
         assert_eq!(chosen.as_deref(), Some("/b"));
     }
 
@@ -357,6 +385,7 @@ mod tests {
         // available account.
         let chosen = pick_from(
             &d,
+            |_| true,
             |_| false,         // none cooled
             |_| None,          // no fresh usage sample (stale)
             |x| x == "/gmail", // gmail last seen exhausted
@@ -370,7 +399,7 @@ mod tests {
         let d = dirs(&["/a", "/b"]);
         // Stale snapshot and every available account known-exhausted → still
         // return something (first available) rather than nothing.
-        let chosen = pick_from(&d, |_| false, |_| None, |_| true, |_| None);
+        let chosen = pick_from(&d, |_| true, |_| false, |_| None, |_| true, |_| None);
         assert_eq!(chosen.as_deref(), Some("/a"));
     }
 
@@ -381,6 +410,7 @@ mod tests {
         // preferred over an unprobed one).
         let chosen = pick_from(
             &d,
+            |_| true,
             |_| false,
             |x| if x == "/b" { Some((false, 0.40)) } else { None },
             |_| false,
@@ -394,7 +424,7 @@ mod tests {
         // One configured account, no usage sample, not cooled → it is selected
         // (the single-account case must resolve, not no-op).
         let d = dirs(&["/only"]);
-        let chosen = pick_from(&d, |_| false, |_| None, |_| false, |_| None);
+        let chosen = pick_from(&d, |_| true, |_| false, |_| None, |_| false, |_| None);
         assert_eq!(chosen.as_deref(), Some("/only"));
     }
 
@@ -402,7 +432,14 @@ mod tests {
     fn single_exhausted_account_still_pinned() {
         // One account, exhausted → still the only option, so still selected.
         let d = dirs(&["/only"]);
-        let chosen = pick_from(&d, |_| false, |_| Some((true, 1.0)), |_| true, |_| None);
+        let chosen = pick_from(
+            &d,
+            |_| true,
+            |_| false,
+            |_| Some((true, 1.0)),
+            |_| true,
+            |_| None,
+        );
         assert_eq!(chosen.as_deref(), Some("/only"));
     }
 
@@ -411,6 +448,7 @@ mod tests {
         let d = dirs(&["/a", "/b"]);
         let chosen = pick_from(
             &d,
+            |_| true,
             |_| true, // all cooled
             |_| None,
             |_| false,
@@ -426,7 +464,77 @@ mod tests {
     #[test]
     fn empty_config_dirs_returns_none() {
         let d: Vec<String> = Vec::new();
-        let chosen = pick_from(&d, |_| false, |_| None, |_| false, |_| None);
+        let chosen = pick_from(&d, |_| true, |_| false, |_| None, |_| false, |_| None);
         assert_eq!(chosen, None);
+    }
+
+    // --- credential-validity filter (highest precedence) --------------------
+
+    #[test]
+    fn credential_invalid_dir_never_selected() {
+        let d = dirs(&["/no-creds", "/authed"]);
+        // /no-creds has the best headroom but no live credentials → must be
+        // excluded entirely; /authed wins despite worse headroom.
+        let chosen = pick_from(
+            &d,
+            |x| x == "/authed",
+            |_| false,
+            |x| match x {
+                "/no-creds" => Some((false, -0.90)),
+                "/authed" => Some((false, 0.20)),
+                _ => None,
+            },
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/authed"));
+    }
+
+    #[test]
+    fn expired_refreshable_account_is_selectable() {
+        let d = dirs(&["/refreshable"]);
+        // `has_valid_credentials` returns true for an expired-but-refreshed dir;
+        // model that with the injected validity closure → it stays selectable.
+        let chosen = pick_from(
+            &d,
+            |x| x == "/refreshable",
+            |_| false,
+            |_| None,
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/refreshable"));
+    }
+
+    #[test]
+    fn no_valid_account_returns_none() {
+        let d = dirs(&["/a", "/b"]);
+        // Every candidate lacks live credentials → no spawnable account. `None`
+        // is the signal the spawn path uses to fail loud instead of 401-zombie.
+        let chosen = pick_from(&d, |_| false, |_| false, |_| None, |_| false, |_| None);
+        assert_eq!(chosen, None);
+    }
+
+    #[test]
+    fn all_valid_cooled_never_picks_credentialless_dir() {
+        let d = dirs(&["/no-creds", "/authed-cooled"]);
+        // Every credential-valid account is cooled; a credential-LESS dir has no
+        // cooldown (remaining → None → ZERO) and would win the min if the
+        // all-cooled fallback didn't restrict to valid dirs. It must not.
+        let chosen = pick_from(
+            &d,
+            |x| x == "/authed-cooled",
+            |x| x == "/authed-cooled", // the only valid account is cooled
+            |_| None,
+            |_| false,
+            |x| {
+                if x == "/authed-cooled" {
+                    Some(Duration::from_secs(300))
+                } else {
+                    None
+                }
+            },
+        );
+        assert_eq!(chosen.as_deref(), Some("/authed-cooled"));
     }
 }

@@ -187,6 +187,51 @@ pub(crate) fn try_ensure_valid_credentials(config_dir: Option<&str>) {
     }
 }
 
+/// Whether `config_dir` has live, usable Claude OAuth credentials: a
+/// `.credentials.json` exists *in that exact dir* AND the token is either
+/// unexpired or successfully refreshed in place.
+///
+/// This is the highest-precedence account-selection filter (see
+/// [`super::account_usage::pick_best_account`]): selection must never pin a
+/// config dir that would 401 the moment a `claude` subprocess spawns under it.
+///
+/// IMPORTANT — checks `config_dir` **directly**, NOT via [`find_creds_path`].
+/// `find_creds_path` falls back to `$CLAUDE_CONFIG_DIR` then `~/.claude` when
+/// `dir` lacks creds; used as a per-candidate selection filter that fallback
+/// would collapse every credential-less candidate onto the same shared file
+/// and report them all identically — silently defeating the per-account
+/// distinction this predicate exists to make.
+pub(crate) fn has_valid_credentials(config_dir: &str) -> bool {
+    let creds_path = PathBuf::from(config_dir).join(".credentials.json");
+    creds_path_is_valid(&creds_path)
+}
+
+/// Whether the **ambient default** credential location has live, usable
+/// credentials. This is the location a `claude` subprocess inherits when
+/// `CLAUDE_CONFIG_DIR` is left unset — i.e. when account selection resolves no
+/// explicit dir to pin. Resolution order matches [`find_creds_path`] with no
+/// override: `$CLAUDE_CONFIG_DIR` then `~/.claude/.credentials.json`.
+///
+/// Spawn paths use this to decide whether an unset-`CLAUDE_CONFIG_DIR` spawn
+/// would land on a real login or 401-zombie under a dead default.
+pub(crate) fn default_location_has_valid_credentials() -> bool {
+    match find_creds_path(None) {
+        Some(path) => creds_path_is_valid(&path),
+        None => false,
+    }
+}
+
+/// Shared validity core: an existing creds file that is unexpired, or expired
+/// but refreshed in place. `try_refresh_credentials` returns `None` with no
+/// network call when there is no `refreshToken`, so an expired, unrefreshable
+/// account deterministically reports invalid.
+fn creds_path_is_valid(creds_path: &Path) -> bool {
+    if !creds_path.exists() {
+        return false;
+    }
+    !is_expired(creds_path) || try_refresh_credentials(creds_path).is_some()
+}
+
 fn find_creds_path(config_dir: Option<&str>) -> Option<PathBuf> {
     if let Some(dir) = config_dir {
         let p = PathBuf::from(dir).join(".credentials.json");
@@ -230,4 +275,80 @@ fn is_expired(creds_path: &Path) -> bool {
         .unwrap_or_default()
         .as_millis() as i64;
     now_ms >= expires_at_ms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write a `.credentials.json` into a fresh temp dir and return
+    /// `(tempdir_guard, dir_path_string)`. The guard must be kept alive for
+    /// the duration of the test (drop removes the dir).
+    fn dir_with_creds(expires_at_ms: i64, refresh_token: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-oauth-test",
+                "refreshToken": refresh_token,
+                "expiresAt": expires_at_ms,
+                "scopes": ["user:inference"],
+            }
+        });
+        let mut f = std::fs::File::create(dir.path().join(".credentials.json")).expect("create");
+        write!(f, "{body}").expect("write");
+        let path = dir.path().to_string_lossy().to_string();
+        (dir, path)
+    }
+
+    fn future_ms() -> i64 {
+        (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64)
+            + 3_600_000
+    }
+
+    fn past_ms() -> i64 {
+        (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64)
+            - 60_000
+    }
+
+    #[test]
+    fn has_valid_credentials_false_when_dir_has_no_creds_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        assert!(!has_valid_credentials(&path));
+    }
+
+    #[test]
+    fn has_valid_credentials_true_when_unexpired() {
+        let (_guard, path) = dir_with_creds(future_ms(), "rt-present");
+        assert!(has_valid_credentials(&path));
+    }
+
+    #[test]
+    fn has_valid_credentials_false_when_expired_and_no_refresh_token() {
+        // Empty refreshToken → `try_refresh_credentials` returns `None` with no
+        // network call, so an expired, unrefreshable account is rejected
+        // deterministically (no live HTTP in this unit test).
+        let (_guard, path) = dir_with_creds(past_ms(), "");
+        assert!(!has_valid_credentials(&path));
+    }
+
+    #[test]
+    fn has_valid_credentials_checks_the_exact_dir_not_a_fallback() {
+        // A dir that contains NO `.credentials.json` must report invalid even
+        // when `$CLAUDE_CONFIG_DIR`/`~/.claude` happen to have one — this is the
+        // distinction `find_creds_path`'s fallback chain would erase.
+        let empty = tempfile::tempdir().expect("tempdir");
+        let path = empty.path().to_string_lossy().to_string();
+        assert!(
+            !has_valid_credentials(&path),
+            "credential-less dir must be invalid regardless of fallback locations"
+        );
+    }
 }
