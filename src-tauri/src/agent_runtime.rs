@@ -154,6 +154,15 @@ pub struct GateContinuationPayload {
     /// currently-deployed coord. The poll surface ALWAYS supplies it.
     #[serde(default)]
     pub gate_id: Option<uuid::Uuid>,
+    /// Explicit instance target (E2E carve-out). When set, ONLY the runner
+    /// instance whose `QONTINUI_INSTANCE_NAME` equals this value spawns the
+    /// continuation. When ABSENT (the normal case, and every coord on
+    /// `origin/main` today), the continuation is addressed to the PRIMARY
+    /// (`instance::instance_name() == None`) — temp/named runners skip it. Coord
+    /// passes this through verbatim like `presentation`/`anchor_key`. See
+    /// [`continuation_addressed_to_self`] for the matching rule.
+    #[serde(default)]
+    pub target_instance_name: Option<String>,
 }
 
 /// The `source` discriminator coord stamps on a gate-continuation spawn frame.
@@ -881,9 +890,16 @@ fn claim_gate_dispatch(gate_id: uuid::Uuid) -> bool {
 // =============================================================================
 
 /// Default cap on concurrently-live *continuation-spawned* terminal sessions.
-/// Overridable via `QONTINUI_CONTINUATION_SESSION_CAP`. Operator-opened
-/// sessions are never counted (they are never registered here).
-const DEFAULT_CONTINUATION_SESSION_CAP: usize = 4;
+///
+/// **Unbounded by default** (`usize::MAX`). The primary runner — the only
+/// instance in production — must spawn EVERY continuation regardless of how many
+/// are already live; the Terminal UI scales to unlimited sessions via a 9-zone
+/// grid per page × many page tabs (overflow lands in each page's Unassigned
+/// list). A finite throttle is still available by setting
+/// `QONTINUI_CONTINUATION_SESSION_CAP` (rarely needed; when unset, no cap
+/// applies). Operator-opened sessions are never counted (they are never
+/// registered here).
+const DEFAULT_CONTINUATION_SESSION_CAP: usize = usize::MAX;
 
 /// One registered continuation-spawned session.
 #[derive(Debug, Clone)]
@@ -917,6 +933,32 @@ fn continuation_session_cap() -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_CONTINUATION_SESSION_CAP)
+}
+
+/// Whether THIS runner instance should spawn a continuation addressed to
+/// `target_instance_name`.
+///
+/// A continuation spawns on EXACTLY the instance it is addressed to. An absent
+/// target (`None`) addresses the PRIMARY, whose `instance_name()` is also `None`,
+/// so the rule collapses to a single equality:
+///
+/// | `target_instance_name` | spawns on |
+/// |---|---|
+/// | `None` (normal)        | the primary only (`instance_name() == None`) |
+/// | `Some("test-xyz")`     | only the secondary named `"test-xyz"` |
+///
+/// Note this also keeps the primary from double-spawning a continuation that is
+/// explicitly addressed to a named secondary (`Some(t)` ≠ primary's `None`).
+///
+/// Pure over (`target`, `this_instance`) so the primary-only / named-carve-out
+/// policy is unit-testable without env or a live dispatcher. The real call site
+/// ([`dispatch_gate_continuation`]) passes `instance::instance_name()` as
+/// `this_instance`.
+fn continuation_addressed_to_self(
+    target_instance_name: Option<&str>,
+    this_instance_name: Option<&str>,
+) -> bool {
+    target_instance_name == this_instance_name
 }
 
 /// Drop registry entries whose terminal is no longer live, using `is_live`
@@ -1224,6 +1266,30 @@ fn focus_existing_continuation(terminal_id: &str) {
 /// Absent `gate_id` (legacy coord) → no dedupe-by-id, no claim, no outcome:
 /// dispatch exactly once via [`spawn_gate_continuation_task`] (unchanged).
 fn dispatch_gate_continuation(payload: GateContinuationPayload, device_id: uuid::Uuid) {
+    // Instance-targeting self-gate (primary-only by default). A continuation
+    // spawns on EXACTLY the instance it is addressed to; an absent
+    // `target_instance_name` addresses the PRIMARY (`instance_name() == None`).
+    // Enforced HERE — before the in-process dedupe and any coord claim, and on
+    // BOTH the WS fast-path and the replay-poll path (both route through this
+    // fn) — so a temp/named runner never spawns a continuation meant for the
+    // primary. This is the load-bearing fix for the temp-runner overflow: the
+    // coord consume claim is keyed on `device_id` alone (idempotent-200, NOT
+    // first-claimer-wins) and every runner instance on this machine shares the
+    // device id, so coord cannot route a continuation to one instance — the
+    // instance must gate itself. No coord claim/outcome is posted on this skip:
+    // the addressed instance owns the claim+spawn (contract item 4).
+    if !continuation_addressed_to_self(
+        payload.target_instance_name.as_deref(),
+        crate::instance::instance_name().as_deref(),
+    ) {
+        debug!(
+            "agent_runtime: gate-continuation not addressed to this instance \
+             (this={:?}, target={:?}); skipping — the addressed instance spawns it",
+            crate::instance::instance_name(),
+            payload.target_instance_name,
+        );
+        return;
+    }
     if let Some(gate_id) = payload.gate_id {
         // Synchronous fast-path: drop an in-process duplicate before any I/O.
         if !claim_gate_dispatch(gate_id) {
@@ -3153,6 +3219,7 @@ mod tests {
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: anchor.map(|s| s.to_string()),
             gate_id: None,
+            target_instance_name: None,
         };
 
         let a1 = continuation_session_id(&mk(Some("gate-7f2358d5")));
@@ -3194,6 +3261,7 @@ mod tests {
             source: GATE_CONTINUATION_SOURCE.to_string(),
             anchor_key: Some("anchor-z".to_string()),
             gate_id: None,
+            target_instance_name: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(uuid::Uuid::now_v7(), &workdir, &payload, None).await;
@@ -3560,6 +3628,48 @@ mod tests {
             Some(v) => std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", v),
             None => std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP"),
         }
+    }
+
+    /// The default cap is unbounded: an unset env never refuses on count, so a
+    /// loaded registry still proceeds (the primary spawns every continuation).
+    #[test]
+    fn unbounded_default_cap_never_refuses_on_count() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap();
+        clear_continuation_registry();
+        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+        assert_eq!(continuation_session_cap(), usize::MAX);
+
+        let live_all = |_id: &str| true;
+        // Many live sessions, no env cap → still Proceed (never AtCap).
+        for i in 0..50 {
+            register_continuation_session(format!("t{i}"), Some(format!("a{i}")));
+        }
+        assert_eq!(
+            evaluate_continuation_guard(Some("a-new"), &live_all),
+            ContinuationGuard::Proceed
+        );
+        clear_continuation_registry();
+    }
+
+    /// Instance-targeting self-gate: a continuation spawns on EXACTLY the
+    /// instance it is addressed to; an absent target addresses the primary.
+    #[test]
+    fn continuation_addressed_to_self_matrix() {
+        // Normal (no target) → primary (None) spawns; a secondary does not.
+        assert!(continuation_addressed_to_self(None, None));
+        assert!(!continuation_addressed_to_self(None, Some("test-19eab")));
+
+        // Named target → only the matching secondary spawns; primary does not,
+        // and a different secondary does not (no double-spawn either way).
+        assert!(continuation_addressed_to_self(
+            Some("test-19eab"),
+            Some("test-19eab")
+        ));
+        assert!(!continuation_addressed_to_self(Some("test-19eab"), None));
+        assert!(!continuation_addressed_to_self(
+            Some("test-19eab"),
+            Some("other-runner")
+        ));
     }
 
     // =========================================================================
