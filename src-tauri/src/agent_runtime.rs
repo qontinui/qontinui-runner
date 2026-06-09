@@ -2433,7 +2433,12 @@ fn write_coord_mcp_config(primary_wt: &str, jwt: &str) {
 ///    checkout (worktree mode off / acquire declined), which may already hold
 ///    the operator's own `.mcp.json`. Overwrite only when the file is absent or
 ///    is solely our `coord-mcp` config (see [`coord_mcp_safe_to_write`]).
-fn provision_coord_mcp_for_session(workdir: &str) {
+// `pub(crate)` so the operator-opened-tab entry point
+// (`commands::terminal::terminal_create`) reuses this exact helper — closing the
+// last dark runner-spawned session kind (plan
+// 2026-06-09-provision-coord-mcp-operator-tabs). Both modules compile into the
+// runner bin crate, so `pub(crate)` is the minimal visibility that reaches it.
+pub(crate) fn provision_coord_mcp_for_session(workdir: &str) {
     let jwt = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) if !t.trim().is_empty() => t,
         _ => {
