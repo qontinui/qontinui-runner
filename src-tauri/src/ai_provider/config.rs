@@ -84,18 +84,30 @@ pub fn get_resolved_config_dir() -> Option<String> {
 }
 
 /// Get the effective config directory, considering account selection mode.
+///
+/// Returns a config dir ONLY when it has live credentials (a `.credentials.json`
+/// that is unexpired or refreshable — see
+/// [`super::oauth_refresh::has_valid_credentials`]). A credential-less or
+/// unrefreshable candidate yields `None` so the spawn path fails loud
+/// (`agent_runtime::run_continuation_terminal` / `spawn_claude_child`) instead
+/// of pinning `CLAUDE_CONFIG_DIR` to a dead account and 401-zombie-ing the
+/// subprocess. In `LeastUsage` mode the resolved dir
+/// ([`pick_best_account`](super::account_usage::pick_best_account)) is already
+/// credential-filtered; the recheck here also covers `Manual` mode, whose
+/// `config_dir` is never run through the picker.
 pub fn get_effective_config_dir(cli_settings: &settings::ClaudeCliSettings) -> Option<String> {
-    match cli_settings.account_selection_mode {
+    let candidate = match cli_settings.account_selection_mode {
         AccountSelectionMode::LeastUsage => {
-            if let Ok(cached) = RESOLVED_CONFIG_DIR.lock() {
-                if cached.is_some() {
-                    return cached.clone();
-                }
-            }
-            // Fallback to manual config_dir if no resolved dir
-            cli_settings.config_dir.clone()
+            // The resolved dir (set by the credential-aware picker) wins; else
+            // fall back to the manual config_dir.
+            get_resolved_config_dir().or_else(|| cli_settings.config_dir.clone())
         }
         AccountSelectionMode::Manual => cli_settings.config_dir.clone(),
+    };
+
+    match candidate {
+        Some(dir) if super::oauth_refresh::has_valid_credentials(&dir) => Some(dir),
+        _ => None,
     }
 }
 

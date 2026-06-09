@@ -1891,6 +1891,25 @@ async fn run_continuation_terminal(
         crate::ai_provider::get_effective_config_dir(&ai.claude_cli)
     };
 
+    // Fail loud, not a 401 zombie: `None` here means no credential-valid account
+    // was resolved, so `CLAUDE_CONFIG_DIR` would be left unset and the PTY would
+    // inherit the ambient default. That is only safe if the ambient default
+    // itself has live credentials; otherwise the continuation would spawn a
+    // `claude` that immediately dies with `401 ... Please run /login`, leaving a
+    // dead terminal the operator can't diagnose. Abort with an actionable
+    // reason so coord/the operator sees WHY instead of a blank 401 pane.
+    if selected_config_dir.is_none()
+        && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()
+    {
+        let instance = crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
+        let reason = format!(
+            "no authenticated Claude account on this runner — run /login (instance={instance})"
+        );
+        warn!("agent_runtime: gate-continuation terminal aborted — {reason}");
+        report_spawn_failed(agent_id, &reason, None, 0).await;
+        return Err(anyhow::anyhow!(reason));
+    }
+
     // Durable lifecycle capture: this backend path never fires the frontend
     // `terminal_session_record_open`, so without a hint a restart loses the
     // continuation. `config_dir` is now the SELECTED account dir (above): it
@@ -2601,11 +2620,29 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
     // continuation/worker `claude` spawns under whatever account the runner
     // booted with (e.g. a quota-exhausted one) and dies instantly. The caller
     // calls `pick_best_account()` once per unit of work; here we read the
-    // resolved-or-manual effective dir. `None` → leave env unset (single-account
-    // / Manual-mode default — unchanged behavior).
+    // resolved-or-manual effective dir (already credential-validated).
+    //
+    // `None` means no credential-valid account resolved → leaving the env unset
+    // would inherit the ambient default. That is only safe if the ambient
+    // default itself has live credentials; otherwise the spawn is a 401 zombie.
+    // Fail loud with an actionable reason (the callers turn this `Err` into a
+    // `report_spawn_failed` lifecycle post) rather than starting a dead `claude`.
     let ai = crate::settings::get_ai_settings();
-    if let Some(dir) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli) {
-        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    match crate::ai_provider::get_effective_config_dir(&ai.claude_cli) {
+        Some(dir) => {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        None => {
+            if !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials() {
+                let instance =
+                    crate::instance::instance_name().unwrap_or_else(|| "primary".to_string());
+                return Err(anyhow::anyhow!(
+                    "no authenticated Claude account on this runner — run /login (instance={instance})"
+                ));
+            }
+            // None + ambient default has live creds → inherit it (single-account
+            // / unset-CLAUDE_CONFIG_DIR default — unchanged behavior).
+        }
     }
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
