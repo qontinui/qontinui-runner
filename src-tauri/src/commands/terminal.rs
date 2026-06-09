@@ -884,6 +884,9 @@ pub(crate) struct SessionCaptureHint {
     pub working_dir: String,
     /// Human-readable title for the restored grid tile.
     pub title: String,
+    /// Page the session should land on (and be durably recorded against) so a
+    /// restart re-lands the continuation on its page. `None` → `"default"`.
+    pub page_id: Option<String>,
 }
 
 /// Backend-task entry point for creating a terminal session + coord row from a
@@ -913,6 +916,7 @@ pub(crate) fn create_terminal_session_backend(
     command: Option<Vec<String>>,
     isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
     capture_hint: Option<SessionCaptureHint>,
+    page_id: Option<String>,
 ) -> Result<(String, Option<uuid::Uuid>), String> {
     // Phase 2c — derive the `QONTINUI_SESSION_WORKTREES` env from the
     // pre-acquired context (all materialized sibling worktrees) before it is
@@ -949,7 +953,7 @@ pub(crate) fn create_terminal_session_backend(
     let info = terminal_manager.create(
         Some(title.clone()),
         Some(working_dir.clone()),
-        None,
+        page_id.clone(),
         None,
         None,
         app_handle,
@@ -1050,7 +1054,11 @@ pub(crate) fn create_terminal_session_backend(
                 config_dir,
                 working_dir,
                 title,
+                page_id: hint_page_id,
             } = hint;
+            // Single source of truth for the recorded page: the hint's page_id
+            // (set by the caller to the picked page), defaulting to "default".
+            let record_page_id = hint_page_id.unwrap_or_else(|| "default".to_string());
             let since = chrono::Utc::now();
             let resolver_dir = working_dir.clone();
             let resolver = move || resolve_latest_claude_session_id(&resolver_dir, since);
@@ -1061,6 +1069,7 @@ pub(crate) fn create_terminal_session_backend(
                 config_dir,
                 working_dir,
                 title,
+                record_page_id,
                 SESSION_CAPTURE_POLL_INTERVAL,
                 SESSION_CAPTURE_TIMEOUT,
             ));
@@ -1119,6 +1128,7 @@ async fn poll_and_record_session<F>(
     config_dir: Option<String>,
     working_dir: String,
     title: String,
+    page_id: String,
     interval: std::time::Duration,
     timeout: std::time::Duration,
 ) where
@@ -1131,7 +1141,7 @@ async fn poll_and_record_session<F>(
                 claude_session_id: claude_session_id.clone(),
                 config_dir: config_dir.clone(),
                 working_dir: Some(working_dir.clone()),
-                page_id: "default".to_string(),
+                page_id: page_id.clone(),
                 zone_index: 0,
                 title: Some(title.clone()),
                 terminal_id: terminal_id.clone(),
@@ -1215,6 +1225,7 @@ mod tests {
             None,
             "/work/dir".to_string(),
             "My Continuation".to_string(),
+            "default".to_string(),
             Duration::from_millis(1),
             Duration::from_secs(5),
         )
@@ -1232,6 +1243,33 @@ mod tests {
         assert_eq!(rec.config_dir, None);
         assert_eq!(rec.state, "open");
         assert!(rec.opened_at > 0, "record_open seeds opened_at");
+    }
+
+    /// The recorded page honors the supplied `page_id` (not a hardcoded
+    /// "default") so a continuation placed on a non-default page restores there.
+    #[tokio::test]
+    async fn poll_and_record_session_honors_supplied_page_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+
+        poll_and_record_session(
+            store.clone(),
+            || Some("resolved-sess-9".to_string()),
+            "term-9".to_string(),
+            None,
+            "/work/dir".to_string(),
+            "Overflow Continuation".to_string(),
+            "page-7".to_string(),
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let open = store.open_records();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].page_id, "page-7");
     }
 
     /// When the resolver never yields an id, the poller gives up after the
@@ -1256,6 +1294,7 @@ mod tests {
             None,
             "/work/dir".to_string(),
             "Never Resolves".to_string(),
+            "default".to_string(),
             Duration::from_millis(1),
             Duration::from_millis(20),
         )
