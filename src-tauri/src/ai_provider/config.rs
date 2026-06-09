@@ -60,6 +60,13 @@ static USAGE_SNAPSHOT: Mutex<Option<HashMap<String, UsageSample>>> = Mutex::new(
 /// minutes — comfortably longer than the startup refresh cadence.
 const USAGE_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 
+/// Maximum age at which a sample's `exhausted` flag is still trusted by
+/// [`account_known_exhausted`]. Longer than [`USAGE_SNAPSHOT_TTL`] because
+/// exhaustion is a slow-changing signal — a weekly cap doesn't clear in
+/// minutes — so the cold-start/stale fallback can still avoid an account we
+/// saw maxed out a little while ago, without acting on hours-old data.
+const EXHAUSTION_STALE_TTL: Duration = Duration::from_secs(60 * 60);
+
 /// Set the resolved config directory (called after usage check).
 pub fn set_resolved_config_dir(dir: Option<String>) {
     if let Ok(mut cached) = RESOLVED_CONFIG_DIR.lock() {
@@ -201,6 +208,24 @@ pub fn usage_rank(config_dir: &str) -> Option<(bool, f64)> {
         sample.exhausted,
         sample.usage_delta.unwrap_or(sample.utilization),
     ))
+}
+
+/// Whether an account was last seen **exhausted** (out of tokens / rejected),
+/// tolerating a longer staleness than [`usage_rank`] (see
+/// [`EXHAUSTION_STALE_TTL`]). Used only by the cold-start / stale-snapshot
+/// fallback in `pick_best_account` to skip an account we recently saw maxed
+/// out but that isn't in a rate-limit cooldown (the usage probe's 429 doesn't
+/// set an inference cooldown). Returns `false` when there is no sample, the
+/// sample is older than the exhaustion staleness window, or it was usable.
+pub fn account_known_exhausted(config_dir: &str) -> bool {
+    if let Ok(snap) = USAGE_SNAPSHOT.lock() {
+        if let Some(map) = snap.as_ref() {
+            if let Some(sample) = map.get(config_dir) {
+                return sample.exhausted && sample.captured_at.elapsed() <= EXHAUSTION_STALE_TTL;
+            }
+        }
+    }
+    false
 }
 
 /// Rotate to the next available account after a rate-limit hit.
@@ -529,6 +554,18 @@ mod tests {
     #[test]
     fn usage_rank_none_when_unrecorded() {
         assert_eq!(usage_rank("/test/config/headroom_never"), None);
+    }
+
+    #[test]
+    fn account_known_exhausted_reflects_last_sample() {
+        let dir_ex = "/test/config/known_exhausted";
+        let dir_ok = "/test/config/known_usable";
+        record_account_usage(&[(dir_ex.to_string(), 1.0, Some(0.1), true)]);
+        record_account_usage(&[(dir_ok.to_string(), 0.5, Some(-0.1), false)]);
+        assert!(account_known_exhausted(dir_ex), "exhausted sample → true");
+        assert!(!account_known_exhausted(dir_ok), "usable sample → false");
+        // Unrecorded account is treated as not-known-exhausted (eligible).
+        assert!(!account_known_exhausted("/test/config/known_never"));
     }
 
     #[test]
