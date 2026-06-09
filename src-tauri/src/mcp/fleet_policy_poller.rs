@@ -120,6 +120,31 @@ struct FleetPolicyResponse {
     effective_level: Option<String>,
 }
 
+/// Subset of coord's `GET /health` response we read for the capability probe.
+///
+/// Coord ships a `capabilities` object (parallel coord PR), e.g.
+/// `{"capabilities":{"install_signatures":true,"fleet_policy":true}}`. We read
+/// ONLY `fleet_policy` to decide whether this poller should run at all.
+///
+/// FAIL-SAFE DECODE (the absent-field=capable default): `capabilities` is
+/// `Option` so a coord that PREDATES the field (no `capabilities` key) decodes
+/// to `None` ⇒ we ASSUME capable and poll as normal. Within `capabilities`,
+/// `fleet_policy` is `Option<bool>` so only an EXPLICIT `false` disables the
+/// poller; an absent `fleet_policy` key (coord ships other caps but not this
+/// one yet) also assumes capable. We never break against a coord that doesn't
+/// know the field.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct HealthResponse {
+    #[serde(default)]
+    capabilities: Option<Capabilities>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Capabilities {
+    #[serde(default)]
+    fleet_policy: Option<bool>,
+}
+
 // ===========================================================================
 // Poller state + supervised loop
 // ===========================================================================
@@ -185,7 +210,89 @@ enum PollOutcome {
     Kept(String),
 }
 
+/// Outcome of the one-shot capability probe done at poller start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapabilityCheck {
+    /// Coord advertises `capabilities` and `fleet_policy` is EXPLICITLY false —
+    /// the ONLY case that disables the poller.
+    Disabled,
+    /// Capable: coord said `fleet_policy:true`, OR `fleet_policy` was absent
+    /// from a present `capabilities`, OR there was no `capabilities` field at
+    /// all (older coord), OR the probe errored. Fail-safe — when in doubt, poll.
+    Capable,
+}
+
+/// One-shot `GET /health` capability probe (§5). Decides whether this poller
+/// should run at all by reading coord's `capabilities.fleet_policy`.
+///
+/// DEFENSIVE / FAIL-SAFE CONTRACT:
+/// - `fleet_policy == Some(false)` (explicitly disabled) ⇒ [`CapabilityCheck::Disabled`].
+/// - `fleet_policy == Some(true)` ⇒ Capable.
+/// - `fleet_policy` ABSENT but `capabilities` present ⇒ Capable (coord ships
+///   other caps but not this flag yet — don't disable).
+/// - NO `capabilities` field at all (coord predates it) ⇒ Capable.
+/// - ANY error (coord base unresolved / request / non-2xx / decode) ⇒ Capable.
+///   We never disable the poller because we couldn't reach `/health`.
+async fn check_fleet_policy_capability() -> CapabilityCheck {
+    let base = match crate::mcp::agent_worktrees::coord_http_base() {
+        Ok(b) => b,
+        // No coord base ⇒ assume capable; the poll loop's own per-tick base
+        // resolution + JWT gating handles an actually-unconfigured runner.
+        Err(_) => return CapabilityCheck::Capable,
+    };
+    let url = format!("{}/health", base.trim_end_matches('/'));
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return CapabilityCheck::Capable,
+    };
+
+    // `/health` is an unauthenticated liveness endpoint — no Bearer needed.
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(_) => return CapabilityCheck::Capable,
+    };
+    if !resp.status().is_success() {
+        return CapabilityCheck::Capable;
+    }
+    let body: HealthResponse = match resp.json().await {
+        Ok(b) => b,
+        Err(_) => return CapabilityCheck::Capable,
+    };
+
+    match body.capabilities {
+        // capabilities present + fleet_policy explicitly false ⇒ the only
+        // disable case.
+        Some(caps) if caps.fleet_policy == Some(false) => CapabilityCheck::Disabled,
+        // capabilities present, fleet_policy true or absent ⇒ capable.
+        // No capabilities field at all (older coord) ⇒ capable.
+        _ => CapabilityCheck::Capable,
+    }
+}
+
 async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<bool>) {
+    // §5 capability gate (one-shot at start): if coord EXPLICITLY advertises it
+    // lacks the fleet_policy capability, stay off and don't poll. Any other
+    // outcome (capable, absent flag, no capabilities field, or any probe error)
+    // proceeds to poll as normal — defensive default never breaks against an
+    // older coord that predates the `capabilities` field.
+    //
+    // We do NOT `return` on Disabled: the task supervisor respawns any loop that
+    // returns without a shutdown signal (task_supervisor.rs:108), which would
+    // re-run this probe + re-log every backoff window. Instead we log ONCE and
+    // PARK on the shutdown channel — the cache already reads the fail-safe
+    // `off`, so a non-polling parked loop is exactly the desired "stay off".
+    if check_fleet_policy_capability().await == CapabilityCheck::Disabled {
+        info!("fleet_policy_poller: coord lacks fleet_policy capability — staying off");
+        // Park until shutdown (the cache stays at the fail-safe DEFAULT_MODE).
+        let _ = shutdown_rx.changed().await;
+        info!("Fleet-policy poller shutting down (was parked: coord lacks capability)");
+        return;
+    }
+
     info!(
         "Fleet-policy poller started (domain={DOMAIN}, interval={}s, fail-safe default={DEFAULT_MODE})",
         POLL_INTERVAL.as_secs()
@@ -419,5 +526,43 @@ mod tests {
         assert_eq!(normalize(Some("bogus")), DEFAULT_MODE);
         assert_eq!(normalize(None), DEFAULT_MODE);
         assert_eq!(normalize(Some("")), DEFAULT_MODE);
+    }
+
+    #[test]
+    fn capability_decode_disables_only_on_explicit_false() {
+        // The §5 fail-safe contract: ONLY an explicit `fleet_policy:false`
+        // disables the poller. Absent flag, no capabilities object, and a
+        // decode of an older coord's body all ⇒ Capable (never break against a
+        // coord that predates the field). We exercise the pure decision the
+        // probe makes over the decoded `HealthResponse`.
+        let decide = |json: &str| -> CapabilityCheck {
+            let body: HealthResponse = serde_json::from_str(json).expect("decode");
+            match body.capabilities {
+                Some(caps) if caps.fleet_policy == Some(false) => CapabilityCheck::Disabled,
+                _ => CapabilityCheck::Capable,
+            }
+        };
+
+        // Explicit false ⇒ the ONLY disable case.
+        assert_eq!(
+            decide(r#"{"capabilities":{"fleet_policy":false}}"#),
+            CapabilityCheck::Disabled
+        );
+        // Explicit true ⇒ capable.
+        assert_eq!(
+            decide(r#"{"capabilities":{"fleet_policy":true}}"#),
+            CapabilityCheck::Capable
+        );
+        // capabilities present, fleet_policy absent (coord ships other caps but
+        // not this flag) ⇒ capable.
+        assert_eq!(
+            decide(r#"{"capabilities":{"install_signatures":true}}"#),
+            CapabilityCheck::Capable
+        );
+        // NO capabilities field at all (older coord predating the field) ⇒
+        // capable — the defensive default that must never disable.
+        assert_eq!(decide(r#"{"status":"ok"}"#), CapabilityCheck::Capable);
+        // Empty body ⇒ capable.
+        assert_eq!(decide(r#"{}"#), CapabilityCheck::Capable);
     }
 }

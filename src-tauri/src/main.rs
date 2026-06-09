@@ -484,17 +484,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // runner-bootable-when-coord-down property. See
     // `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2
     // and `fleet.rs::publish_on_startup`.
-    {
-        let fleet_pg = pg_db.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for fleet publish");
-        rt.block_on(fleet::publish_on_startup(
-            &fleet_pg,
-            fleet::MachineRole::Agent,
-        ));
-    }
+    //
+    // STARTUP-RESILIENCE (§8): this call is `await`-ed NOT here on the
+    // critical boot path, but inside the dedicated "fleet-publishers" thread
+    // below (after the heartbeat block). `publish_on_startup` is already
+    // fail-open at the value level, but on a coord 503 its exponential-backoff
+    // retry ([2,4,8,16,32,60]s + 10s timeouts) blocks ~60-120s. Running it
+    // synchronously here delayed `run_app()` from reaching the MCP `/health`
+    // bind (downstream in `.setup()` → `mcp_api::start_server`), so the
+    // supervisor health-probe killed the runner before it could come up
+    // (the 2026-06 startup outage). Detaching it onto the publishers runtime
+    // keeps coord-base latency entirely OFF the `/health`-bind critical path.
+    // The clone of `pg_db` for that thread is taken here so the borrow is
+    // resolved before `pg_db` is moved into later state.
+    let fleet_publish_pg = pg_db.clone();
 
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
     //
@@ -557,7 +560,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     std::thread::Builder::new()
         .name("fleet-publishers".to_string())
-        .spawn(|| {
+        .spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_all()
@@ -575,6 +578,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             rt.block_on(async {
+                // STARTUP-RESILIENCE (§8): the one-shot DeviceBudget publish,
+                // moved OFF the boot critical path (see the `fleet_publish_pg`
+                // comment up by the PG bootstrap). It's `await`-ed here on the
+                // publishers runtime so a coord 503 (its ~60-120s backoff
+                // ladder) can no longer delay `run_app()` reaching the MCP
+                // `/health` bind. Args are unchanged from the original
+                // synchronous call (`&fleet_pg`, `MachineRole::Agent`).
+                // Nothing downstream depends on its completion — it's a
+                // best-effort registry UPSERT; the periodic publishers /
+                // heartbeat below re-assert this device's presence regardless.
+                // It runs FIRST in this block so the initial registration
+                // still happens promptly once coord is reachable, before the
+                // periodic publishers begin their cadences.
+                fleet::publish_on_startup(&fleet_publish_pg, fleet::MachineRole::Agent).await;
+
                 // Plan 2026-05-19-coordinator-production-readiness.md
                 // Phase 1 — periodic primary-tree state publisher. These
                 // four tasks share one worker thread; they're all
