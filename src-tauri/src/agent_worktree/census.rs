@@ -1056,9 +1056,12 @@ mod tests {
         // No git repo → no origin/main ref → landed_in_main is the honest
         // unknown `None` (which coord's gate reads as not-landed).
         assert!(row.landed_in_main.is_none());
-        // G6 shadow probe always reports: a freshly-created tempdir has a
-        // root mtime inside the activity window → Some(true).
-        assert_eq!(row.building, Some(true));
+        // The census `building` probe is now held-cargo-lock-only
+        // (`probe_building_for_census`): a freshly-created tempdir has no
+        // `target/*/.cargo-lock` held by a live cargo, so it is NOT building.
+        // (The dropped root-mtime-recency heuristic is what over-reported the
+        // fleet `count_building` gauge — see this plan's Phase 2.)
+        assert_eq!(row.building, Some(false));
     }
 
     #[test]
