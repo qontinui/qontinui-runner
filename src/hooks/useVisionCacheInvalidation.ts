@@ -64,18 +64,43 @@ export function useVisionCacheInvalidation(opts?: { debounceMs?: number }): void
     };
 
     const schedule = () => {
-      if (timer) clearTimeout(timer);
+      // THROTTLE, not debounce-reset. The previous implementation did
+      // `clearTimeout(timer); timer = setTimeout(...)` on EVERY mutation
+      // batch, so a high-frequency mutation source churned one setTimeout
+      // per batch. Under sustained mutation (e.g. the UI Bridge
+      // auto-register scanner stamping `data-ui-bridge-id` attributes, a
+      // streaming text node, a re-render loop) that reached ~1,700
+      // setTimeout/sec — each allocating a closure — which pegged the
+      // WebView2 renderer's CPU and grew its heap ~150 MB/min until it
+      // hard-OOM-crashed ("Error code: out of memory" → reload → sign-in).
+      //
+      // Throttling arms at most one timer per `debounceMs` window
+      // regardless of mutation rate (so a 1,700/sec mutation storm yields
+      // ~4 setTimeout/sec), while still bumping the vision cache once per
+      // window during sustained mutation — which is actually a better
+      // freshness guarantee than the old trailing debounce that never
+      // fired at all while mutations kept arriving.
+      if (timer) return;
       timer = setTimeout(() => {
+        timer = null;
         void bump();
       }, debounceMs);
     };
 
     const observer = new MutationObserver(schedule);
+    // Observe structural (childList) and text (characterData) changes —
+    // what OCR actually re-reads. Deliberately NOT `attributes: true`:
+    // arbitrary attribute churn (the bridge's own `data-ui-bridge-id`
+    // stamps, `aria-*`/`data-*` live regions, class/style toggles) is a
+    // high-frequency, largely-OCR-irrelevant trigger, and watching the
+    // bridge's own attribute writes made this observer self-triggering.
+    // Control actions still bump the cache directly, and a `{force:true}`
+    // read overrides — cache freshness here is best-effort, not
+    // correctness-critical (see the hook doc above).
     observer.observe(document.body, {
       childList: true,
       subtree: true,
       characterData: true,
-      attributes: true,
     });
 
     return () => {
