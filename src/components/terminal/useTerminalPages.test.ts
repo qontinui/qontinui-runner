@@ -14,9 +14,38 @@
 
 import { describe, it, expect } from "vitest";
 
-import { reconcilePages, type TerminalPageConfig } from "./useTerminalPages";
+import {
+  reconcilePages,
+  pageIdsFromTerminals,
+  pageIdsFromSessions,
+  type TerminalPageConfig,
+} from "./useTerminalPages";
 
 const DEFAULT: TerminalPageConfig = { id: "default", name: "Terminal", createdAt: 0 };
+
+describe("pageIdsFromTerminals (wire-field contract)", () => {
+  it("reads the camelCase `pageId` field TerminalInfo actually serializes", () => {
+    // Regression guard: TerminalInfo is #[serde(rename_all = "camelCase")], so
+    // the live wire field is `pageId`. Reading `page_id` here silently lands
+    // every terminal on "default" — the bug caught by temp-runner verification.
+    expect(pageIdsFromTerminals([{ pageId: "minted-1" }, { pageId: "minted-2" }])).toEqual([
+      "minted-1",
+      "minted-2",
+    ]);
+  });
+
+  it("falls back to legacy snake_case `page_id` and to 'default' when absent", () => {
+    expect(pageIdsFromTerminals([{ page_id: "legacy" }])).toEqual(["legacy"]);
+    expect(pageIdsFromTerminals([{}])).toEqual(["default"]);
+    expect(pageIdsFromTerminals([{ pageId: "" }])).toEqual(["default"]);
+  });
+});
+
+describe("pageIdsFromSessions (wire-field contract)", () => {
+  it("reads the camelCase `pageId` field on durable restore records", () => {
+    expect(pageIdsFromSessions([{ pageId: "cold-1" }, {}])).toEqual(["cold-1", "default"]);
+  });
+});
 
 describe("reconcilePages", () => {
   it("appends a synthesized tab for a backend id absent from persisted (terminal_list source)", () => {

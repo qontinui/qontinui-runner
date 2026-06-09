@@ -41,6 +41,32 @@ function savePages(pages: TerminalPageConfig[]) {
  * Exported so the union/synthesis logic is unit-testable without booting React
  * or Tauri (same precedent as `fetchOpenRecords` / `shouldIngestCreatedTerminal`).
  */
+/**
+ * Normalized page_ids from a `terminal_list` `terminals` array.
+ *
+ * `TerminalInfo` is `#[serde(rename_all = "camelCase")]` (qontinui-schemas
+ * `terminal.rs`), so the wire field is `pageId` — reading `page_id` here
+ * silently lands EVERY terminal on `"default"` and the reconcile never
+ * synthesizes a tab (the bug live-verification on a temp runner caught). The
+ * `page_id` fallback is defensive only (legacy/round-trip forms). Exported so
+ * the wire-field contract is unit-testable without Tauri.
+ */
+export function pageIdsFromTerminals(
+  terminals: Array<{ pageId?: string; page_id?: string }>,
+): string[] {
+  return terminals.map((t) => t.pageId || t.page_id || "default");
+}
+
+/**
+ * Normalized page_ids from a `terminal_session_list_open` `sessions` array
+ * (durable restore records). `TerminalSessionRecord` is also camelCase, so the
+ * wire field is `pageId` (matches `fetchOpenRecords` in
+ * `useTerminalInitialization.ts`). Exported for the same contract test.
+ */
+export function pageIdsFromSessions(sessions: Array<{ pageId?: string }>): string[] {
+  return sessions.map((s) => s.pageId ?? "default");
+}
+
 export function reconcilePages(
   persisted: TerminalPageConfig[],
   backendPageIds: Iterable<string>,
@@ -97,10 +123,14 @@ export function useTerminalPages() {
     try {
       const result = await invoke<{
         success: boolean;
-        data?: { terminals: Array<{ id: string; page_id: string }> };
+        data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
       }>("terminal_list");
       if (result.success && result.data) {
-        const pageTerminals = result.data.terminals.filter((t) => (t.page_id || "default") === id);
+        // TerminalInfo is `#[serde(rename_all = "camelCase")]`, so the wire
+        // field is `pageId` (the `page_id` fallback is defensive only).
+        const pageTerminals = result.data.terminals.filter(
+          (t) => (t.pageId || t.page_id || "default") === id,
+        );
         for (const t of pageTerminals) {
           invoke("terminal_close", { terminalId: t.id }).catch(() => {});
         }
@@ -156,12 +186,10 @@ export function useTerminalPages() {
     try {
       const result = await invoke<{
         success: boolean;
-        data?: { terminals: Array<{ id: string; page_id: string }> };
+        data?: { terminals: Array<{ id: string; pageId?: string; page_id?: string }> };
       }>("terminal_list");
       if (result.success && result.data) {
-        for (const t of result.data.terminals) {
-          ids.add(t.page_id || "default");
-        }
+        for (const id of pageIdsFromTerminals(result.data.terminals)) ids.add(id);
       }
     } catch {
       // Best effort
@@ -178,9 +206,7 @@ export function useTerminalPages() {
       }>("terminal_session_list_open");
       const sessions = resp?.data?.sessions;
       if (Array.isArray(sessions)) {
-        for (const rec of sessions) {
-          ids.add(rec.pageId ?? "default");
-        }
+        for (const id of pageIdsFromSessions(sessions)) ids.add(id);
       }
     } catch {
       // Best effort
