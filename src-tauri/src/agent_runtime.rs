@@ -1848,6 +1848,14 @@ async fn run_continuation_terminal(
         title: title.clone(),
     });
 
+    // Provision `.mcp.json` so this continuation can reach coord coordination
+    // tools (`coord_register_gate` over /mcp) and `coord-acting-bearer.sh` for
+    // the operator-scoped write surface — closing the reach gap where gate
+    // continuations (a primary place follow-up gates get registered) had no
+    // coord identity and fell back to the operator-bearer stopgap. Uses the
+    // runner's own device JWT; guarded against non-verifying bearers + clobber.
+    provision_coord_mcp_for_session(workdir);
+
     let result = crate::commands::terminal::create_terminal_session_backend(
         &terminal_manager,
         &session_registry,
@@ -2104,8 +2112,10 @@ async fn run_agent_subprocess(
         .clone();
 
     // Write .mcp.json so the spawned claude process auto-discovers
-    // the coord MCP server for coordination tooling.
-    write_coord_mcp_config(&primary_wt, &payload);
+    // the coord MCP server for coordination tooling. Agent-spawns carry a
+    // coord-minted agent JWT and land in a freshly-allocated worktree, so the
+    // blind overwrite is safe here (no pre-existing user config to clobber).
+    write_coord_mcp_config(&primary_wt, &payload.jwt);
 
     let log_path = agent_log_path(payload.agent_id);
 
@@ -2335,15 +2345,21 @@ fn local_worktree_path(root: &Path, agent_id: uuid::Uuid, repo: &str) -> PathBuf
         .join(local_repo_name(repo))
 }
 
-/// Write `.mcp.json` into the agent's primary worktree directory so the
-/// spawned `claude` process auto-discovers the coord MCP server.
+/// Write `.mcp.json` into a session's working directory so the spawned
+/// `claude` process auto-discovers the coord MCP server.
 ///
 /// Targets the **coord-native** streamable-HTTP MCP server at
-/// `{COORD_HTTP_URL}/mcp` (Bearer-authenticated with the agent's own JWT),
-/// rather than spawning a local `coord-mcp.mjs` Node sidecar. The agent's
-/// identity (device_id, tenant_id, correlation topic) is derived server-side
-/// from the validated JWT claims, so no `AGENT_NAME`/`AGENT_LANE`/`TOPIC`/
-/// `DEVICE_ID` env vars are needed in the config.
+/// `{COORD_HTTP_URL}/mcp`, Bearer-authenticated with a coord-signed JWT — the
+/// coord-minted **agent** JWT for autonomous agent-spawns, or the runner's own
+/// **device** JWT for gate continuations (see
+/// [`provision_coord_mcp_for_session`]). Both subtypes carry `device_id` +
+/// `tenant_id`, which coord derives the caller's identity from server-side, so
+/// no `AGENT_NAME`/`AGENT_LANE`/`TOPIC`/`DEVICE_ID` env vars are needed.
+///
+/// This BLIND-overwrites `{primary_wt}/.mcp.json`; callers writing into a
+/// non-isolated directory (continuations that degrade to a canonical checkout)
+/// must guard against clobbering a user's own config — see
+/// [`provision_coord_mcp_for_session`].
 ///
 /// The coord-native `/mcp` endpoint is live (coord PR #277 Phase-2 cutover),
 /// so this no longer carries the prior "do not deploy" gate. If a target coord
@@ -2357,7 +2373,7 @@ fn local_worktree_path(root: &Path, agent_id: uuid::Uuid, repo: &str) -> PathBuf
 /// profile-configured runner (production → `coord.qontinui.io`) wrote a
 /// `localhost` MCP url into the agent's `.mcp.json`, silently pointing spawned
 /// agents at the wrong coord.
-fn write_coord_mcp_config(primary_wt: &str, payload: &LaunchPayload) {
+fn write_coord_mcp_config(primary_wt: &str, jwt: &str) {
     let coord_url = std::env::var("COORD_HTTP_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -2371,7 +2387,7 @@ fn write_coord_mcp_config(primary_wt: &str, payload: &LaunchPayload) {
                 "type": "http",
                 "url": mcp_url,
                 "headers": {
-                    "Authorization": format!("Bearer {}", payload.jwt),
+                    "Authorization": format!("Bearer {}", jwt),
                 }
             }
         }
@@ -2394,6 +2410,98 @@ fn write_coord_mcp_config(primary_wt: &str, payload: &LaunchPayload) {
                 primary_wt
             );
         }
+    }
+}
+
+/// Provision `.mcp.json` for a runner-spawned session that did NOT arrive with a
+/// coord-minted agent JWT — i.e. gate-continuation terminals. Uses the runner's
+/// own live **device** JWT (the same `SubType::Device` EdDSA token the coord
+/// `/mcp` relay presents) so the continuation can use `coord_register_gate` over
+/// MCP and `coord-acting-bearer.sh` (which mints an acting-user Service token
+/// from it). This closes the reach gap where continuations — a primary place
+/// follow-up gates get registered — otherwise fell back to the operator-bearer
+/// stopgap (plan 2026-06-09-provision-coord-mcp-on-all-runner-spawned-sessions).
+///
+/// Two guards the agent-spawn path does not need (it always writes a coord agent
+/// JWT into a fresh worktree):
+/// 1. **sub_type guard.** The `access_token` slot can hold a *Cognito* token
+///    rather than the coord device JWT on some pairing tiers
+///    (`device_jwt_refresher`); a Cognito bearer would 401 against coord's EdDSA
+///    verifier. Write only when the bearer decodes as `sub_type ∈ {device,
+///    agent}`; otherwise log + skip (never write a non-verifying bearer).
+/// 2. **non-clobber guard.** A continuation can degrade to a canonical repo
+///    checkout (worktree mode off / acquire declined), which may already hold
+///    the operator's own `.mcp.json`. Overwrite only when the file is absent or
+///    is solely our `coord-mcp` config (see [`coord_mcp_safe_to_write`]).
+fn provision_coord_mcp_for_session(workdir: &str) {
+    let jwt = match crate::auth::AuthManager::new().get_access_token() {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => {
+            info!(
+                "agent_runtime: no device JWT in access_token slot — skipping \
+                 coord-mcp provisioning for {workdir}"
+            );
+            return;
+        }
+    };
+
+    match jwt_unverified_claim(&jwt, "sub_type").as_deref() {
+        Some("device") | Some("agent") => {}
+        other => {
+            info!(
+                "agent_runtime: access_token bearer is not a coord device/agent \
+                 JWT (sub_type={other:?}) — skipping coord-mcp provisioning for \
+                 {workdir} (would 401 against coord's EdDSA verifier)"
+            );
+            return;
+        }
+    }
+
+    if !coord_mcp_safe_to_write(workdir) {
+        info!(
+            "agent_runtime: {workdir}/.mcp.json already holds a non-coord-mcp \
+             config — leaving it untouched (no coord-mcp provisioning)"
+        );
+        return;
+    }
+
+    write_coord_mcp_config(workdir, &jwt);
+}
+
+/// Decode an unverified string claim from a JWT payload. We do NOT verify the
+/// signature — coord re-validates the EdDSA signature on use; here we only need
+/// `sub_type` to avoid writing a non-coord-verifying bearer (e.g. a Cognito
+/// token) into `.mcp.json`. Mirror of `cognito::jwt_claim`, inlined because that
+/// fn lives in the lib crate (`pub(crate)`) and `agent_runtime` compiles into
+/// the bin crate, which does not re-declare `mod cognito`.
+fn jwt_unverified_claim(token: &str, claim: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let mut parts = token.splitn(3, '.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let _sig = parts.next()?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    json.get(claim).and_then(|v| v.as_str()).map(String::from)
+}
+
+/// True iff writing our coord-mcp `.mcp.json` into `workdir` would not clobber a
+/// user's own config: the file is absent/unreadable, OR it parses as a config
+/// whose `mcpServers` is solely our `coord-mcp` entry (a prior provisioning we
+/// own and may refresh). A foreign or unparseable file returns false (leave it).
+fn coord_mcp_safe_to_write(workdir: &str) -> bool {
+    let path = Path::new(workdir).join(".mcp.json");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return true, // absent (or unreadable) → safe to create
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&existing) {
+        Ok(v) => v,
+        Err(_) => return false, // unparseable foreign file → do not clobber
+    };
+    match parsed.get("mcpServers").and_then(|m| m.as_object()) {
+        Some(servers) => servers.len() == 1 && servers.contains_key("coord-mcp"),
+        None => false,
     }
 }
 
@@ -3100,7 +3208,7 @@ mod tests {
             correlation_topic: Some("my-coordination-topic".to_string()),
         };
 
-        write_coord_mcp_config(&primary_wt, &payload);
+        write_coord_mcp_config(&primary_wt, &payload.jwt);
 
         let written = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -3130,6 +3238,62 @@ mod tests {
             Some(p) => std::env::set_var("COORD_HTTP_URL", p),
             None => std::env::remove_var("COORD_HTTP_URL"),
         }
+    }
+
+    /// `coord_mcp_safe_to_write` — the non-clobber guard for the continuation
+    /// provisioning path (continuations can degrade to a real repo checkout that
+    /// already holds the operator's own `.mcp.json`).
+    #[test]
+    fn coord_mcp_safe_to_write_guards_user_config() {
+        let dir = std::env::temp_dir().join(format!("coord-mcp-safe-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().to_string();
+        let mcp = dir.join(".mcp.json");
+
+        // 1. Absent → safe to create.
+        assert!(coord_mcp_safe_to_write(&wd), "absent file must be writable");
+
+        // 2. Solely our coord-mcp config → safe to refresh (we own it).
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"https://c/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            coord_mcp_safe_to_write(&wd),
+            "a solely-coord-mcp config is ours — refreshable"
+        );
+
+        // 3. A user's own config (different server) → must NOT clobber.
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"my-server":{"type":"http","url":"https://x/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            !coord_mcp_safe_to_write(&wd),
+            "a foreign mcpServers config must be left untouched"
+        );
+
+        // 4. coord-mcp ALONGSIDE another server (2 keys) → not solely ours → skip.
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"coord-mcp":{"url":"https://c/mcp"},"other":{"url":"x"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            !coord_mcp_safe_to_write(&wd),
+            "coord-mcp plus a user server is the user's file — do not clobber"
+        );
+
+        // 5. Unparseable / non-JSON → conservatively do not clobber.
+        std::fs::write(&mcp, "not json {{{").unwrap();
+        assert!(
+            !coord_mcp_safe_to_write(&wd),
+            "an unparseable file must be left untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Smoke test using a fake claude binary fixture (the existing
