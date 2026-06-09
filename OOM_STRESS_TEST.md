@@ -134,6 +134,23 @@ FROM generate_series(1, 5000) AS i;
    - No "Out of Memory" crash
    - All pages remain responsive
 
+### Test 8: Dead-pane scrollback trim (the always-on leak)
+This guards the regression behind the most common "Error code: out of memory"
+crash during normal multi-session use: finished terminal panes stay mounted
+(only an explicit close disposes the backend) and each retains ~20MB of xterm
+cell storage at the live `scrollback: 10000` cap, so they accumulate until the
+renderer dies. On process exit `TerminalInstance` now trims the pane to
+`DEAD_TERMINAL_SCROLLBACK` (2000 lines).
+1. Open a terminal, run a command that emits >10K lines (e.g. `seq 1 200000`),
+   let it fill the scrollback, then let the shell process exit (`exit`).
+2. Take a heap snapshot before and after the exit message appears.
+3. **PASS criteria:**
+   - After exit, the pane's retained buffer drops to ~2000 lines worth of cells
+     (DevTools → Memory shows the large xterm buffer arrays shrink).
+   - The tail of the output is still scrollable/readable in the dead pane.
+   - Spawning + exiting many panes over a long session does NOT monotonically
+     grow WebView2 memory the way it did pre-fix.
+
 ## Failure Diagnosis
 
 If OOM occurs:

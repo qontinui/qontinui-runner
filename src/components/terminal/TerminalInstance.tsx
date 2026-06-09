@@ -128,6 +128,21 @@ const TERMINAL_OPTIONS = {
   },
 };
 
+/**
+ * Scrollback cap applied once a terminal's process has exited.
+ *
+ * A dead pane never produces more output, but it stays mounted (often
+ * indefinitely — see `useTerminalManager.closeTerminal`, the only path that
+ * disposes the backend) so the operator can still read its result. At the live
+ * `scrollback: 10000` cap each xterm buffer retains ~20MB of cell storage, and
+ * under a heavy multi-session workload these finished panes accumulate until
+ * the WebView2 renderer hits its memory ceiling and crashes with
+ * "Error code: out of memory". Trimming the buffer to its tail on exit releases
+ * the bulk of that storage while keeping the recent output readable (the full
+ * scrollback is persisted Rust-side for session restore regardless).
+ */
+const DEAD_TERMINAL_SCROLLBACK = 2000;
+
 export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInstanceProps>(
   function TerminalInstanceInner(
     {
@@ -894,6 +909,11 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           backend.write(
             `\r\n\x1b[90m[Process exited with code ${event.payload.exitCode ?? "unknown"}]\x1b[0m\r\n`,
           );
+          // Release the memory held by this now-dead pane. It will never emit
+          // more output, so trim its scrollback to the tail — this is the
+          // accumulator behind the WebView2 "out of memory" crash when many
+          // finished sessions stay mounted. See DEAD_TERMINAL_SCROLLBACK.
+          backend.setScrollback(DEAD_TERMINAL_SCROLLBACK);
           onExitRef.current?.(event.payload.exitCode ?? null);
         });
         if (disposed) return;
