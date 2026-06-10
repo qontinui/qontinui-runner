@@ -126,7 +126,20 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str) {
         }
     };
 
-    match jwt_unverified_claim(&jwt, "sub_type").as_deref() {
+    provision_coord_mcp_with_jwt(workdir, &jwt);
+}
+
+/// Apply an already-resolved bearer to `workdir`'s `.mcp.json`, enforcing the two
+/// guards: the bearer must decode `sub_type ∈ {device, agent}` (never write a
+/// non-coord-verifying token), and the non-clobber / no-downgrade guard
+/// ([`coord_mcp_safe_to_write`]) must allow it. Split out from
+/// [`provision_coord_mcp_for_session`] so the write-decision orchestration is
+/// unit-testable with a synthetic JWT — the live credential lives in the
+/// encrypted `AuthManager` slot, which a unit test cannot seed deterministically
+/// (and which would otherwise make the test pass/fail by whether the host happens
+/// to be paired).
+fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str) {
+    match jwt_unverified_claim(jwt, "sub_type").as_deref() {
         Some("device") | Some("agent") => {}
         other => {
             info!(
@@ -146,7 +159,7 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str) {
         return;
     }
 
-    write_coord_mcp_config(workdir, &jwt);
+    write_coord_mcp_config(workdir, jwt);
 }
 
 /// Decode an unverified string claim from a JWT payload. We do NOT verify the
@@ -332,5 +345,76 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Orchestration of `provision_coord_mcp_with_jwt` — the exact write-decision
+    /// body the gate-continuation path (`agent_runtime::run_continuation_terminal`)
+    /// and every `acquire_for_terminal` chokepoint caller run once a bearer is
+    /// resolved. Exercised through the JWT-injecting seam so it is deterministic
+    /// regardless of whether the host has a real device JWT in its encrypted slot.
+    /// Covers all four branches: device writes, agent writes, a non-coord bearer is
+    /// gated out, and a device bearer never downgrades an existing agent config.
+    #[test]
+    fn provision_with_jwt_orchestration() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        // Build an unsigned JWT (`h.<payload>.s`) carrying just the `sub_type`
+        // claim — all the orchestration inspects.
+        let mk = |sub_type: &str| {
+            let payload =
+                URL_SAFE_NO_PAD.encode(format!(r#"{{"sub_type":"{sub_type}"}}"#).as_bytes());
+            format!("h.{payload}.s")
+        };
+        let new_dir = || {
+            let d = std::env::temp_dir().join(format!("coord-mcp-prov-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let mcp_of = |d: &std::path::Path| d.join(".mcp.json");
+        let dev = mk("device");
+
+        // A) device bearer + clean dir → provisions our coord-mcp config with it.
+        let d = new_dir();
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev);
+        let written =
+            std::fs::read_to_string(mcp_of(&d)).expect("device bearer must provision .mcp.json");
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            v["mcpServers"]["coord-mcp"]["headers"]["Authorization"],
+            format!("Bearer {dev}"),
+            "the written bearer must be the resolved device JWT"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+
+        // B) agent bearer + clean dir → also provisions (agent is allowed).
+        let d = new_dir();
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &mk("agent"));
+        assert!(mcp_of(&d).exists(), "agent bearer must provision");
+        let _ = std::fs::remove_dir_all(&d);
+
+        // C) non-coord bearer (e.g. a Cognito access token, sub_type=access) →
+        //    sub_type gate skips; no file is written (would 401 coord's verifier).
+        let d = new_dir();
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &mk("access"));
+        assert!(
+            !mcp_of(&d).exists(),
+            "a non-device/agent bearer must NOT be written"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+
+        // D) device bearer into a dir already holding an AGENT-JWT coord-mcp config →
+        //    the no-downgrade guard vetoes; the agent config is preserved verbatim.
+        let d = new_dir();
+        let agent_cfg = format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"https://c/mcp","headers":{{"Authorization":"Bearer {}"}}}}}}}}"#,
+            mk("agent")
+        );
+        std::fs::write(mcp_of(&d), &agent_cfg).unwrap();
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev);
+        assert_eq!(
+            std::fs::read_to_string(mcp_of(&d)).unwrap(),
+            agent_cfg,
+            "a device bearer must not downgrade an existing agent-JWT config"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
