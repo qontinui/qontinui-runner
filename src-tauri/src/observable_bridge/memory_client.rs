@@ -36,24 +36,18 @@ pub fn build_client() -> Result<reqwest::Client> {
         .context("observable_bridge::memory_client: reqwest client build")
 }
 
-/// Resolve the coord HTTP base from the active profile's `coord_url`.
+/// Resolve the coord HTTP base. Delegates to the shared resolver in
+/// `crate::profiles` (this is a lib module, so `crate::profiles` resolves).
 ///
-/// Duplicated from `fleet.rs::coord_http_base` (private there) rather
-/// than re-exporting to keep the bridge self-contained. Five lines, no
-/// drift risk.
+/// Preserves `None` when nothing is configured (Option-family contract).
+/// NOTE: previously this was env-LESS (profile `coord_url` only); routing
+/// through the shared resolver now also honors `COORD_HTTP_URL`, which is the
+/// desirable behavior every other resolver already had.
 pub fn coord_http_base() -> Option<String> {
-    let coord_url = crate::profiles::load_strict().ok()?.coord_url?;
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http)
+    match crate::profiles::resolve_coord_base() {
+        crate::profiles::CoordBase::Configured(base) => Some(base),
+        _ => None,
+    }
 }
 
 /// `GET /coord/memory/list` — metadata-only catalog of every live

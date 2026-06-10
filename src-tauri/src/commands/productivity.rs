@@ -1908,18 +1908,10 @@ pub async fn add_task_dependency(
 /// profile `coord_url` (ws→http via `coord_ws_to_http`) → default
 /// `http://localhost:9870`.
 fn coord_http_base_for_fleet() -> String {
-    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    // `qontinui_runner_lib::profiles` (not `crate::profiles`) — same
-    // proven path as mcp::agent_worktrees::coord_http_base; `crate::`
-    // doesn't resolve `profiles` from this lib compilation unit.
-    if let Some(ws) = qontinui_runner_lib::profiles::load().coord_url.as_deref() {
-        return crate::agent_worktree::coord_ws_to_http(ws);
-    }
-    "http://localhost:9870".to_string()
+    // Delegates to the shared resolver; the dev-localhost guess is now logged
+    // once per process via `coord_base_or_dev_localhost`.
+    qontinui_runner_lib::profiles::coord_base_or_dev_localhost()
+        .unwrap_or_else(|| "http://localhost:9870".to_string())
 }
 
 /// `get_coord_http_base` — expose the runner's resolved coord HTTP base

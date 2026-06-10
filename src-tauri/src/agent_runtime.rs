@@ -229,26 +229,13 @@ fn agent_log_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
 /// `None` when neither is set — runtime no-ops in that case (no localhost
 /// fallback, unchanged).
 fn coord_http_base() -> Option<String> {
-    // env override first — the source-of-truth chain every other resolver uses.
-    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
-        if !v.is_empty() {
-            return Some(v);
-        }
+    // Delegates to the shared resolver, preserving the no-localhost-fallback
+    // posture: only an explicitly-configured base (env or profile) yields
+    // `Some`; nothing configured ⇒ `None` (runtime no-ops, unchanged).
+    match qontinui_runner_lib::profiles::resolve_coord_base() {
+        qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(base),
+        _ => None,
     }
-    let coord_url = qontinui_runner_lib::profiles::load_strict()
-        .ok()?
-        .coord_url?;
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http)
 }
 
 /// Resolve the coord WS URL from the active profile's `coord_url`,

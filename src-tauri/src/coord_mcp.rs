@@ -16,25 +16,13 @@ use tracing::{info, warn};
 /// Inline copy of `agent_runtime::coord_http_base` — kept local so this leaf
 /// module does NOT depend on `agent_runtime` (which depends back on us).
 fn coord_http_base() -> Option<String> {
-    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
-        if !v.is_empty() {
-            return Some(v);
-        }
+    // Delegates to the shared resolver. `None` when nothing is configured; the
+    // localhost fallback for the `.mcp.json` write is applied by the caller
+    // (`write_coord_mcp_config`), unchanged.
+    match qontinui_runner_lib::profiles::resolve_coord_base() {
+        qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(base),
+        _ => None,
     }
-    let coord_url = qontinui_runner_lib::profiles::load_strict()
-        .ok()?
-        .coord_url?;
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http)
 }
 
 /// The coord-native `/mcp` endpoint is live (coord PR #277 Phase-2 cutover),

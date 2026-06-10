@@ -101,29 +101,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// Resolve the coord HTTP base URL. Priority: `COORD_HTTP_URL` env →
 /// active profile (`profiles::load_strict().coord_url`, ws→http) →
 /// fallback `http://localhost:9870`.
+///
+/// Delegates to the shared resolver; the dev-localhost guess is now logged
+/// once per process via `coord_base_or_dev_localhost` instead of silently
+/// returned here.
 fn resolve_coord_url() -> String {
-    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
-        let t = v.trim();
-        if !t.is_empty() {
-            return t.trim_end_matches('/').to_string();
-        }
-    }
-    if let Ok(profile) = qontinui_runner_lib::profiles::load_strict() {
-        if let Some(coord_url) = profile.coord_url {
-            let trimmed = coord_url.trim_end_matches("/ws");
-            let with_http = trimmed
-                .strip_prefix("wss://")
-                .map(|rest| format!("https://{rest}"))
-                .or_else(|| {
-                    trimmed
-                        .strip_prefix("ws://")
-                        .map(|rest| format!("http://{rest}"))
-                })
-                .unwrap_or_else(|| trimmed.to_string());
-            return with_http.trim_end_matches('/').to_string();
-        }
-    }
-    DEFAULT_COORD_URL.to_string()
+    qontinui_runner_lib::profiles::coord_base_or_dev_localhost()
+        .unwrap_or_else(|| DEFAULT_COORD_URL.to_string())
 }
 
 // ---------------------------------------------------------------------------

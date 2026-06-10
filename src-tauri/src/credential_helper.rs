@@ -25,15 +25,10 @@ fn config_file_path(session_id: &str) -> PathBuf {
 }
 
 fn coord_http_base() -> String {
-    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    if let Some(ws) = qontinui_runner_lib::profiles::load().coord_url.as_deref() {
-        return crate::agent_worktree::coord_ws_to_http(ws);
-    }
-    "http://localhost:9870".to_string()
+    // Delegates to the shared resolver; the dev-localhost guess is now logged
+    // once per process via `coord_base_or_dev_localhost`.
+    qontinui_runner_lib::profiles::coord_base_or_dev_localhost()
+        .unwrap_or_else(|| "http://localhost:9870".to_string())
 }
 
 async fn fetch_push_token(coord_base: &str, session_id: &str) -> Result<String, String> {
