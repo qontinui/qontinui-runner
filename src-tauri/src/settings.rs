@@ -1860,24 +1860,41 @@ pub fn load_settings() -> Settings {
         settings.web_integration.enabled = true;
     }
 
+    // Machine-global Claude account roster overlay (claude-accounts.json).
+    // The roster (config dirs, selection mode, manual config_dir pin, launch
+    // commands) is a machine-global fact; the copies in per-instance
+    // settings.json files are stale shadows kept alive by whole-`Settings`
+    // saves. When the machine-global file exists it wins UNCONDITIONALLY for
+    // all four fields, for every instance (primary + temp + named). When it
+    // is absent, per-instance values load untouched (legacy behavior). Also
+    // runs the one-shot seed migration from the unscoped settings.json. See
+    // the module doc in `claude_accounts.rs` for the last-writer-wins model.
+    if let Some(roster) = crate::claude_accounts::load_with_migration() {
+        crate::claude_accounts::apply_roster_overlay(&mut settings, roster);
+    }
+
     // Tier + local_user_id migration / lazy init.
     //
     // Both branches may mutate the in-memory `settings` and request a
     // persist. The persist is best-effort (logged on failure) — an in-memory
     // value is still correct for the rest of this process's lifetime.
     //
-    // FOOTGUN GUARD: the persist below writes the SHARED settings.json
-    // (`dirs::config_dir()/com.qontinui.runner/settings.json` — the same file
-    // for primary + temp + named runners; `get_settings_path` is NOT
-    // instance-scoped). A supervisor-spawned temp/named runner has no
-    // `runner_token`, so `migrate_tier_in_place` infers `tier=Local` for it.
-    // If that secondary persisted, it would silently overwrite the primary's
-    // persisted Tier 2 (`qontinui_account`) state on disk, demoting the primary
-    // the next time it loads from `local`. Therefore: ONLY the primary runner
-    // may persist a tier/local_user_id migration. Secondaries (temp + named,
-    // i.e. any runner the supervisor launched with `QONTINUI_INSTANCE_NAME`)
-    // keep the migration in-memory only — correct for this process's lifetime,
-    // never written to the shared file. This mirrors the in-memory-only
+    // FOOTGUN GUARD: the persist below writes whatever file `get_settings_path`
+    // resolves. That path IS instance-scoped when `QONTINUI_CONFIG_DIR` is set
+    // (the supervisor sets it per spawned instance — `manager.rs` spawn env —
+    // so supervisor-spawned temp/named runners write their own file), but a
+    // secondary launched with only `QONTINUI_INSTANCE_NAME` (no
+    // `QONTINUI_CONFIG_DIR`) resolves the primary's SHARED
+    // `dirs::config_dir()/com.qontinui.runner/settings.json`. A secondary has
+    // no `runner_token`, so `migrate_tier_in_place` infers `tier=Local` for
+    // it. If such a secondary persisted into the shared file, it would
+    // silently overwrite the primary's persisted Tier 2 (`qontinui_account`)
+    // state on disk, demoting the primary the next time it loads from
+    // `local`. Therefore: ONLY the primary runner may persist a
+    // tier/local_user_id migration. Secondaries (temp + named, i.e. any
+    // runner the supervisor launched with `QONTINUI_INSTANCE_NAME`) keep the
+    // migration in-memory only — correct for this process's lifetime, never
+    // written to a settings file. This mirrors the in-memory-only
     // `QONTINUI_RUNNER_TIER` overlay just below.
     let mut needs_persist = false;
     if migrate_tier_in_place(&mut settings) {
@@ -2151,9 +2168,22 @@ pub fn get_ai_settings() -> AiSettings {
     crate::config_facade::get_setting::<AiSettings>()
 }
 
-/// Save AI settings
+/// Save AI settings.
+///
+/// The whole-`AiSettings` per-instance save stays as-is (its embedded
+/// `claude_cli.config_dir` / `account_selection_mode` copies become stale
+/// shadows — harmless, because the machine-global overlay in `load_settings`
+/// wins unconditionally). ADDITIONALLY mirrors those two roster fields into
+/// the machine-global `claude-accounts.json` so mode/pin changes made on any
+/// instance reach every instance.
 pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
-    crate::config_facade::save_setting(ai_settings)
+    let config_dir = ai_settings.claude_cli.config_dir.clone();
+    let selection_mode = ai_settings.claude_cli.account_selection_mode;
+    crate::config_facade::save_setting(ai_settings)?;
+    crate::claude_accounts::update(move |roster| {
+        roster.config_dir = config_dir;
+        roster.account_selection_mode = selection_mode;
+    })
 }
 
 /// Get the World State Verifier settings.
