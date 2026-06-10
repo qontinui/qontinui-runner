@@ -257,6 +257,7 @@ pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
     }
 
     // 2. Scan C:\claude\.claude-*\ (multi-account setups on Windows)
+    let mut found_per_account = false;
     let claude_root = std::path::Path::new("C:\\claude");
     if claude_root.is_dir() {
         if let Ok(entries) = std::fs::read_dir(claude_root) {
@@ -267,6 +268,7 @@ pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
                         if name.starts_with(".claude-") {
                             let label = name.to_string();
                             add(path, &label, "auto-detected");
+                            found_per_account = true;
                         }
                     }
                 }
@@ -275,9 +277,13 @@ pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
     }
 
     // 3. %USERPROFILE%\.claude (standard location)
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let home_claude = std::path::PathBuf::from(&home).join(".claude");
-        add(home_claude, ".claude", "home directory");
+    // Skip the default dir when per-account dirs exist — it always shares
+    // credentials with one of them and would show as a duplicate.
+    if !found_per_account {
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            let home_claude = std::path::PathBuf::from(&home).join(".claude");
+            add(home_claude, ".claude", "home directory");
+        }
     }
 
     // 4. %LOCALAPPDATA%\claude (alternate install location)
