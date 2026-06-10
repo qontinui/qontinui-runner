@@ -90,6 +90,10 @@ fn get_backup_files() -> Vec<(&'static str, Option<PathBuf>)> {
         ("settings.json", get_settings_path()),
         ("prompts.json", get_prompts_path()),
         ("playwright-tests.json", get_playwright_tests_path()),
+        (
+            "claude-accounts.json",
+            crate::claude_accounts::claude_accounts_file_path(),
+        ),
     ]
 }
 

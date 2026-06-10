@@ -653,11 +653,16 @@ pub fn get_claude_config_dirs() -> Vec<String> {
 }
 
 /// Save the configured Claude Code config directories.
+///
+/// Writes the machine-global `claude-accounts.json` (NOT the per-instance
+/// settings.json): the roster is a machine-global fact and the
+/// `load_settings()` overlay makes per-instance copies irrelevant.
 pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
-    info!("Saving {} Claude config dirs", dirs.len());
-    let mut settings = load_settings();
-    settings.claude_config_dirs = dirs;
-    save_settings(&settings)
+    info!(
+        "Saving {} Claude config dirs (machine-global claude-accounts.json)",
+        dirs.len()
+    );
+    crate::claude_accounts::update(move |roster| roster.claude_config_dirs = dirs)
 }
 
 /// Get custom launch commands per account config directory.
@@ -666,13 +671,17 @@ pub fn get_claude_account_launch_commands() -> std::collections::HashMap<String,
 }
 
 /// Save custom launch commands per account config directory.
+///
+/// Writes the machine-global `claude-accounts.json` (NOT the per-instance
+/// settings.json) — see `save_claude_config_dirs`.
 pub fn save_claude_account_launch_commands(
     commands: std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    info!("Saving {} account launch commands", commands.len());
-    let mut settings = load_settings();
-    settings.claude_account_launch_commands = commands;
-    save_settings(&settings)
+    info!(
+        "Saving {} account launch commands (machine-global claude-accounts.json)",
+        commands.len()
+    );
+    crate::claude_accounts::update(move |roster| roster.claude_account_launch_commands = commands)
 }
 
 /// Get the dev_logs_dir override (used by paths module).
