@@ -89,7 +89,7 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
     // Fixed-point iteration (the effect re-keys on layoutId; <= presets.length
     // iterations is plenty and guards against any loop bug).
     for (let i = 0; i < LAYOUT_PRESETS.length; i++) {
-      const next = computeAutoGrowLayoutId(layoutId, tabIds.length, false);
+      const next = computeAutoGrowLayoutId(layoutId, tabIds.length);
       if (!next) break;
       layoutId = next;
     }
@@ -100,9 +100,9 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
   it("converges in ONE step (grow-only target = pickLayout, no ping-pong)", () => {
     // The grow target is always `pickLayout(N)` directly, so the first
     // application already reaches the fixed point — a SECOND call returns null.
-    const first = computeAutoGrowLayoutId("single", 9, false);
+    const first = computeAutoGrowLayoutId("single", 9);
     expect(first).toBe("full-grid");
-    const second = computeAutoGrowLayoutId(first!, 9, false);
+    const second = computeAutoGrowLayoutId(first!, 9);
     expect(second).toBeNull();
   });
 
@@ -118,18 +118,19 @@ describe("Phase 1 auto-grow — layout grows to fit live tabs across ALL ingest 
     }
   });
 
-  it("operator-pinned layout is NOT overridden even when tabs overflow", () => {
-    // Operator pinned `split` (2 zones) but 6 tabs are live — auto-grow must
-    // stay null, leaving 4 tabs in the Unassigned list (the chip's job).
-    expect(computeAutoGrowLayoutId("split", 6, true)).toBeNull();
+  it("an explicit operator layout is grown too when tabs overflow (no pin latch)", () => {
+    // Operator chose `split` (2 zones) but 6 tabs are live — the removed
+    // `pinned` latch used to leave 4 sessions invisible here; now the layout
+    // grows so every live session gets a zone.
+    expect(computeAutoGrowLayoutId("split", 6)).toBe("six-pack");
     const tabIds = ["a", "b", "c", "d", "e", "f"];
-    const assignments = reconcileAssignments({}, tabIds, zoneCount("split"));
-    expect(unassignedCount(assignments, tabIds)).toBe(4);
+    const assignments = reconcileAssignments({}, tabIds, zoneCount("six-pack"));
+    expect(unassignedCount(assignments, tabIds)).toBe(0);
   });
 
   it("never shrinks: closing tabs below capacity does NOT reduce the layout", () => {
     // Grew to full-grid for 9 tabs; now only 2 remain. Auto-grow returns null
     // (shrinking is out of scope — grow only).
-    expect(computeAutoGrowLayoutId("full-grid", 2, false)).toBeNull();
+    expect(computeAutoGrowLayoutId("full-grid", 2)).toBeNull();
   });
 });

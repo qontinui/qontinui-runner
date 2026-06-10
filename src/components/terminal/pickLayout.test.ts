@@ -54,33 +54,35 @@ describe("pickLayout — smallest uniform preset that fits N tabs (cap full-grid
   });
 });
 
-describe("computeAutoGrowLayoutId — grow-only, pin-aware, capacity-gated", () => {
+describe("computeAutoGrowLayoutId — grow-only, capacity-gated", () => {
   it("grows single → split when a 2nd tab arrives", () => {
-    expect(computeAutoGrowLayoutId("single", 2, false)).toBe("split");
+    expect(computeAutoGrowLayoutId("single", 2)).toBe("split");
   });
 
   it("grows single → full-grid when 9 tabs arrive at once (reconnect ingest)", () => {
-    expect(computeAutoGrowLayoutId("single", 9, false)).toBe("full-grid");
+    expect(computeAutoGrowLayoutId("single", 9)).toBe("full-grid");
   });
 
   it("returns null when the current layout already fits (no thrash)", () => {
-    expect(computeAutoGrowLayoutId("quad", 4, false)).toBeNull();
-    expect(computeAutoGrowLayoutId("quad", 3, false)).toBeNull();
+    expect(computeAutoGrowLayoutId("quad", 4)).toBeNull();
+    expect(computeAutoGrowLayoutId("quad", 3)).toBeNull();
   });
 
   it("NEVER shrinks: more zones than tabs → null", () => {
-    expect(computeAutoGrowLayoutId("full-grid", 2, false)).toBeNull();
-    expect(computeAutoGrowLayoutId("six-pack", 1, false)).toBeNull();
+    expect(computeAutoGrowLayoutId("full-grid", 2)).toBeNull();
+    expect(computeAutoGrowLayoutId("six-pack", 1)).toBeNull();
   });
 
   it("stays put at full-grid even past the 9 ceiling (10+ tabs → null)", () => {
-    expect(computeAutoGrowLayoutId("full-grid", 10, false)).toBeNull();
-    expect(computeAutoGrowLayoutId("full-grid", 50, false)).toBeNull();
+    expect(computeAutoGrowLayoutId("full-grid", 10)).toBeNull();
+    expect(computeAutoGrowLayoutId("full-grid", 50)).toBeNull();
   });
 
-  it("operator-pinned layout is NEVER auto-grown", () => {
-    expect(computeAutoGrowLayoutId("single", 9, true)).toBeNull();
-    expect(computeAutoGrowLayoutId("split", 6, true)).toBeNull();
+  it("has NO pin escape hatch: overflow always grows, even from an explicit layout", () => {
+    // The removed `pinned` latch let these return null, hiding live
+    // gate-continuation sessions behind a small layout. Overflow must grow.
+    expect(computeAutoGrowLayoutId("single", 9)).toBe("full-grid");
+    expect(computeAutoGrowLayoutId("split", 6)).toBe("six-pack");
   });
 
   it("only grows to a STRICTLY larger preset (asymmetric presets never shrink zones)", () => {
@@ -93,7 +95,7 @@ describe("computeAutoGrowLayoutId — grow-only, pin-aware, capacity-gated", () 
       ["six-pack", 9],
     ];
     for (const [current, count] of cases) {
-      const target = computeAutoGrowLayoutId(current, count, false);
+      const target = computeAutoGrowLayoutId(current, count);
       expect(target).not.toBeNull();
       const cur = LAYOUT_PRESETS.find((l) => l.id === current)!;
       const tgt = LAYOUT_PRESETS.find((l) => l.id === target!)!;

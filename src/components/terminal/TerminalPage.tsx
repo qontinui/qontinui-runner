@@ -1162,9 +1162,7 @@ function TerminalPageInner({
         <div style={{ display: "none" }} aria-hidden>
           <ZoneLayoutPicker
             currentLayoutId={zoneLayout.layoutId}
-            // Picking a layout from the picker UI is an explicit operator
-            // choice — pin it so auto-grow stops overriding it.
-            onSelectLayout={(id) => zoneLayout.setLayoutId(id, { pinned: true })}
+            onSelectLayout={(id) => zoneLayout.setLayoutId(id)}
             tabCount={tabs.length}
           />
           <ZoneProfilePicker
@@ -1178,9 +1176,7 @@ function TerminalPageInner({
             tabs={tabs}
             initialized={initialized}
             onLoadProfile={async (profile) => {
-              // Loading a saved profile is a deliberate operator layout choice —
-              // pin it so auto-grow doesn't override the restored arrangement.
-              zoneLayout.setLayoutId(profile.layoutId, { pinned: true });
+              zoneLayout.setLayoutId(profile.layoutId);
               labelsAndTags.setZoneLabels(profile.labels);
               labelsAndTags.setZoneNotes(profile.notes);
               labelsAndTags.setPinnedZones(new Set(profile.pins));

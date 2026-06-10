@@ -106,7 +106,7 @@ interface UseTerminalInitializationParams {
   ) => void;
   zoneLayout: {
     layoutId: string;
-    setLayoutId: (id: string, opts?: { pinned?: boolean }) => void;
+    setLayoutId: (id: string) => void;
     assignTabToZone: (zoneIdx: number, tabId: string) => void;
     setFocusedZone: (zoneIdx: number) => void;
     assignments: Record<number, string>;
@@ -274,11 +274,11 @@ export function useTerminalInitialization({
         };
 
         // Restore the layout preset from the cosmetic snapshot if it differs.
-        // A saved snapshot is the operator's deliberate arrangement, so pin it
-        // — auto-grow must not override a restored layout.
+        // The restored layout is a starting point only — auto-grow may expand
+        // it later so every live session keeps a visible zone.
         if (saved && saved.layoutId !== zoneLayout.layoutId) {
           const preset = LAYOUT_PRESETS.find((p) => p.id === saved.layoutId);
-          if (preset) zoneLayout.setLayoutId(preset.id, { pinned: true });
+          if (preset) zoneLayout.setLayoutId(preset.id);
         }
 
         // 3) Bind every open Claude record to its RECORDED zone — Claude zones
