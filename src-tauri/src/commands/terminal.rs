@@ -162,6 +162,9 @@ pub async fn terminal_create(
         branch: None,
         plan_slug,
         correlation_topic,
+        // Deliberately None on the interactive create path — a PRESENT
+        // `page_id` is the coord-side "this is a gate continuation" marker.
+        page_id: None,
         declared_paths: working_dir
             .map(std::path::PathBuf::from)
             .into_iter()
@@ -985,6 +988,9 @@ pub(crate) fn create_terminal_session_backend(
         branch: None,
         plan_slug,
         correlation_topic,
+        // Gate-continuation create path — carry the chosen page tab into
+        // `coord.sessions.intent` so coord learns the placement.
+        page_id: page_id.clone(),
         declared_paths: vec![std::path::PathBuf::from(&working_dir)],
         share_output: true,
         redact_secrets: None,
