@@ -309,25 +309,13 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
 /// defaulting to `http://localhost:9870`) when nothing is configured, so the
 /// heartbeat cleanly skips instead of spamming connection errors every tick.
 fn coord_http_base() -> Option<String> {
-    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
-        if !v.is_empty() {
-            return Some(v);
-        }
+    // Delegates to the shared resolver, preserving the deliberate `None`
+    // (rather than localhost) when nothing is configured, so the heartbeat
+    // cleanly skips instead of spamming connection errors every tick.
+    match qontinui_runner_lib::profiles::resolve_coord_base() {
+        qontinui_runner_lib::profiles::CoordBase::Configured(base) => Some(base),
+        _ => None,
     }
-    let coord_url = qontinui_runner_lib::profiles::load_strict()
-        .ok()?
-        .coord_url?;
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http)
 }
 
 /// POST the budget payload with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s).

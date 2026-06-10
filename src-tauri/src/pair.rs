@@ -366,17 +366,17 @@ pub fn coord_http_base() -> Result<String, String> {
 /// Pure conversion: `ws[s]://host[:port][/ws]` → `http[s]://host[:port]`.
 /// Mirrors `qontinui-supervisor/src/fleet.rs::coord_http_base` so the
 /// register and pair paths agree on the recipe.
+///
+/// Thin re-export of the unified normalizer in
+/// [`crate::profiles::coord_ws_to_http`] (which is the superset
+/// of this fn's prior body — it additionally strips a bare trailing `/`, a
+/// no-op on every input this fn's callers / tests exercise). Kept under this
+/// name so the register/pair call site and the `coord_http_base_from_url`
+/// tests don't churn. `coord_http_base()` below stays ENV-LESS (profile-or-Err)
+/// — it deliberately does NOT route through the env-reading
+/// `profiles::resolve_coord_base`.
 pub fn coord_http_base_from_url(coord_url: &str) -> String {
-    let trimmed = coord_url.trim_end_matches("/ws");
-    trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string())
+    crate::profiles::coord_ws_to_http(coord_url)
 }
 
 /// Derive a `https://` web base from the coord HTTP base, assuming web

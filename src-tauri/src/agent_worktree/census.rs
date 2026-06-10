@@ -217,26 +217,16 @@ pub(crate) fn load_device_id_pub() -> Option<Uuid> {
 /// tick cleanly skips) when nothing is configured, matching
 /// `fleet::coord_http_base`.
 fn coord_http_base() -> Option<String> {
-    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
-        let t = v.trim();
-        if !t.is_empty() {
-            return Some(t.trim_end_matches('/').to_string());
+    // Delegates to the shared resolver, preserving `None` (the tick cleanly
+    // skips) when nothing is configured. The shared resolver already trims the
+    // trailing slash on both the env and ws→http paths; the extra trim here is
+    // a belt-and-suspenders no-op kept for byte-identical behavior.
+    match qontinui_runner_lib::profiles::resolve_coord_base() {
+        qontinui_runner_lib::profiles::CoordBase::Configured(base) => {
+            Some(base.trim_end_matches('/').to_string())
         }
+        _ => None,
     }
-    let coord_url = qontinui_runner_lib::profiles::load_strict()
-        .ok()?
-        .coord_url?;
-    let trimmed = coord_url.trim_end_matches('/').trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http.trim_end_matches('/').to_string())
 }
 
 /// Crate-visible alias of [`coord_http_base`] so the Phase 4 reclaim

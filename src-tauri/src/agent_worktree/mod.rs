@@ -1459,15 +1459,13 @@ fn checkout_shared_branch(
 /// get appended onto the WS upgrade path (which JWT-rejects with 401).
 /// Mirrors the supervisor's resolver at
 /// `qontinui-supervisor/src/fleet.rs::coord_http_base`.
+///
+/// Thin re-export of the unified normalizer in
+/// [`qontinui_runner_lib::profiles::coord_ws_to_http`] — kept under this name
+/// so its existing ~6 call sites (and the doc-comment cross-refs) don't churn.
+/// The unified fn is the byte-identical superset of this fn's prior body.
 pub fn coord_ws_to_http(coord_url: &str) -> String {
-    let trimmed = coord_url.trim_end_matches('/').trim_end_matches("/ws");
-    if let Some(rest) = trimmed.strip_prefix("ws://") {
-        format!("http://{}", rest)
-    } else if let Some(rest) = trimmed.strip_prefix("wss://") {
-        format!("https://{}", rest)
-    } else {
-        trimmed.to_string()
-    }
+    qontinui_runner_lib::profiles::coord_ws_to_http(coord_url)
 }
 
 #[cfg(test)]

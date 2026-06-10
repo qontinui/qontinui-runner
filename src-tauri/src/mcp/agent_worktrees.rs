@@ -14,19 +14,12 @@
 //! superseded it — so it was removed along with the unused no-claim
 //! `allocate_and_materialize` wrapper.
 
-use crate::agent_worktree::coord_ws_to_http;
-
 pub(crate) fn coord_http_base() -> Result<String, String> {
     // Source-of-truth chain: env `COORD_HTTP_URL` → profile `coord_url`
-    // (ws→http) → default `http://localhost:9870`.
-    if let Ok(v) = std::env::var("COORD_HTTP_URL") {
-        if !v.is_empty() {
-            return Ok(v);
-        }
-    }
-    let profile = qontinui_runner_lib::profiles::load();
-    if let Some(ws) = profile.coord_url.as_deref() {
-        return Ok(coord_ws_to_http(ws));
-    }
-    Ok("http://localhost:9870".to_string())
+    // (ws→http) → default `http://localhost:9870`. Delegates to the shared
+    // resolver; the dev-localhost guess is now logged once per process. This
+    // resolver never errored before (it always fell back to localhost-Ok), so
+    // the `Result` contract is preserved by always returning Ok.
+    Ok(qontinui_runner_lib::profiles::coord_base_or_dev_localhost()
+        .unwrap_or_else(|| "http://localhost:9870".to_string()))
 }
